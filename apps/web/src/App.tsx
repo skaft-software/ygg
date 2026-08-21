@@ -68,6 +68,7 @@ import {
   useYggStore,
 } from "./store";
 import { displaySessionTitle, isUntitledSession } from "./session-title";
+import { resolveDelegatedParentSessionId } from "./delegated-session";
 import {
   goalCommandHelp,
   goalStatusMessage,
@@ -898,9 +899,10 @@ export default function App() {
   const delegatedSessionReadOnly = Boolean(
     session?.sessionId.startsWith("agent-session:"),
   );
-  const delegatedReturnParentSessionId = delegatedSessionReadOnly
-    ? (delegatedParentSessionId ?? session?.delegatedParentSessionId ?? null)
-    : null;
+  const delegatedReturnParentSessionId = resolveDelegatedParentSessionId(
+    session,
+    delegatedParentSessionId,
+  );
   const terminalAvailable = Boolean(
     !delegatedSessionReadOnly && state.bootstrap?.capabilities.terminal,
   );

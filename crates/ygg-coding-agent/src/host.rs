@@ -1099,6 +1099,14 @@ async fn run_request(
                     )
                     .await?;
             }
+            AgentEvent::DelegationUpdated { snapshot } => {
+                emitter
+                    .emit(
+                        "delegation_updated",
+                        serde_json::json!({ "snapshot": snapshot }),
+                    )
+                    .await?;
+            }
             AgentEvent::RunFinished { head, reason } => {
                 terminal_head = Some(head.0);
                 break HostRunOutcome::from_finish_reason(
@@ -1306,6 +1314,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         skill_paths: request.skill_paths.clone(),
         extension_paths: request.extension_paths.clone(),
         enabled_extensions: request.enabled_extensions.clone(),
+        extension_activation_overridden: true,
         trusted_extensions: request.trusted_extensions.clone(),
         invocation_trusted_extensions: Vec::new(),
         tools,

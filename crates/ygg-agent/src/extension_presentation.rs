@@ -94,6 +94,38 @@ pub struct ExtensionPresentationReference {
     pub label: Option<String>,
 }
 
+/// Bounded, provider-accounted telemetry for one operational activity.
+///
+/// Token buckets remain disjoint: `input_tokens` excludes cache hits/writes,
+/// while `reasoning_tokens` is a subset of `output_tokens`. Frontends may sum
+/// the three input buckets for a compact prompt-token display, but must not add
+/// reasoning tokens to output a second time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionPresentationMetrics {
+    /// Host-observed tool calls admitted for the activity.
+    #[serde(default)]
+    pub tool_calls: u64,
+    /// Prompt tokens billed at the standard input rate.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Prompt tokens read from the provider cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the provider cache.
+    #[serde(default)]
+    pub cache_write_tokens: u64,
+    /// Generated output tokens, including reasoning tokens.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Reasoning tokens; a subset of `output_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Exact whole-microdollar activity cost when pricing is available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_microdollars: Option<u64>,
+}
+
 /// One bounded operational activity note.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -115,6 +147,9 @@ pub struct ExtensionPresentationActivity {
     /// Optional Unix timestamp in milliseconds for terminal state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<u64>,
+    /// Optional provider-accounted usage and host-observed tool-call totals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<ExtensionPresentationMetrics>,
     /// Opaque references associated with this activity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub references: Vec<ExtensionPresentationReference>,
@@ -269,6 +304,32 @@ impl ExtensionPresentationSnapshot {
             validate_label("activity summary", &activity.summary)?;
             validate_optional_label("activity provenance", activity.provenance.as_deref())?;
             validate_references(&activity.references)?;
+            if let Some(metrics) = activity.metrics {
+                let values = [
+                    metrics.tool_calls,
+                    metrics.input_tokens,
+                    metrics.cache_read_tokens,
+                    metrics.cache_write_tokens,
+                    metrics.output_tokens,
+                    metrics.reasoning_tokens,
+                ];
+                if values
+                    .into_iter()
+                    .chain(metrics.cost_microdollars)
+                    .any(|value| value > MAX_EXTENSION_PRESENTATION_REVISION)
+                {
+                    return Err(format!(
+                        "presentation activity {:?} has telemetry above the portable JSON integer limit",
+                        activity.id
+                    ));
+                }
+                if metrics.reasoning_tokens > metrics.output_tokens {
+                    return Err(format!(
+                        "presentation activity {:?} has reasoning tokens above output tokens",
+                        activity.id
+                    ));
+                }
+            }
             if !activity_ids.insert(activity.id.as_str()) {
                 return Err(format!(
                     "duplicate presentation activity id {:?}",
@@ -588,6 +649,7 @@ mod tests {
                 provenance: Some("local child".into()),
                 started_at_ms: Some(10),
                 completed_at_ms: None,
+                metrics: None,
                 references: vec![],
             }],
             collection: Some(ExtensionPresentationCollection {
@@ -657,6 +719,23 @@ mod tests {
             .validate(&["workers".into()])
             .unwrap_err()
             .contains("local or private"));
+    }
+
+    #[test]
+    fn rejects_invalid_activity_metrics() {
+        let mut snapshot = snapshot();
+        snapshot.activities[0].metrics = Some(ExtensionPresentationMetrics {
+            output_tokens: 4,
+            reasoning_tokens: 5,
+            ..ExtensionPresentationMetrics::default()
+        });
+        assert!(snapshot.validate(&["workers".into()]).is_err());
+
+        snapshot.activities[0].metrics = Some(ExtensionPresentationMetrics {
+            tool_calls: MAX_EXTENSION_PRESENTATION_REVISION + 1,
+            ..ExtensionPresentationMetrics::default()
+        });
+        assert!(snapshot.validate(&["workers".into()]).is_err());
     }
 
     #[test]

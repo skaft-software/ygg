@@ -8,17 +8,18 @@
 
 `Capabilities` keeps transport and model facts explicit. `responses_lite` selects
 a Responses wire contract, while `agent_delegation` records a collaboration
-protocol the model advertises; it does not imply that `ygg-ai` owns or can run an
-agent team. `ReasoningEffort::Ultra` is ordered above `Max`. OpenAI Responses
-requests backed by V2 delegation map Ultra to the model effort `"max"`; the host
-provides the delegation half of Ultra semantics. Defensive non-V2 routes that
-advertise Ultra retain the provider effort value `"ultra"`.
+protocol the model advertises; it does not imply that `ygg-ai` owns or can run
+an agent team. `ReasoningEffort::Ultra` is ordered above `Max`. OpenAI Responses
+requests backed by V2 delegation map Ultra to the model effort `"max"`; the
+coding product supplies the delegation half only through its observing
+`ygg-subagents` extension. Defensive non-V2 routes that advertise Ultra retain
+the provider effort value `"ultra"`.
 
 `ReasoningMode::Pro` remains deserializable only for older callers and persisted
 sessions. Protocol validation rejects it in strict mode (or reports
 `ignored_reasoning_mode` in lossy mode), and no codec serializes a
-`reasoning.mode` field. The product layer must migrate legacy Pro state after it
-has both model metadata and a host runtime.
+`reasoning.mode` field. The product layer must migrate legacy Pro state only
+after it has both model metadata and a live, trusted `ygg-subagents` observer.
 
 ## Responses Lite
 

@@ -442,6 +442,9 @@ pub struct Config {
     pub extension_paths: Vec<PathBuf>,
     /// Executable extensions selected for activation.
     pub enabled_extensions: Vec<String>,
+    /// True when project, environment, or command-line activation participates
+    /// in the effective list, making the user-config menu non-authoritative.
+    pub extension_activation_overridden: bool,
     /// Persistent executable trust grants: global names or `name@manifest-path`.
     pub trusted_extensions: Vec<String>,
     /// One-shot extension names trusted only for this process invocation.

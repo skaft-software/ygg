@@ -15,8 +15,8 @@ if [[ ! "$package_id" =~ ^[a-z][a-z0-9-]{0,63}$ ]]; then
     printf 'invalid extension bundle ID: %s\n' "$package_id" >&2
     exit 2
 fi
-if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    printf 'version must be a stable Ygg release tag such as v0.5.0: %s\n' "$version" >&2
+if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    printf 'version must be a canonical Ygg version tag such as v0.6.0-dev: %s\n' "$version" >&2
     exit 2
 fi
 for command in git python3; do

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 
 try:
     import tomllib
@@ -22,7 +24,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-mcp")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.5.0")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-mcp")
         self.assertTrue(manifest["capabilities"]["process"])
         self.assertFalse(manifest["capabilities"]["network"])
@@ -60,21 +62,28 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertFalse(example.servers[0].enabled)
         real = load_config(ROOT / "fixtures" / "configs" / "real-local.json")
         self.assertTrue(real.servers[0].enabled)
-        completed = subprocess.run(
-            [
-                str(ROOT / "ygg-mcp"),
-                "--config",
-                str(ROOT / "config.example.json"),
-                "--check-config",
-            ],
-            cwd=ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            staged_entrypoint = Path(directory) / "ygg-mcp"
+            staged_entrypoint.write_bytes((ROOT / "ygg-mcp").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
+            completed = subprocess.run(
+                [
+                    str(staged_entrypoint),
+                    "--config",
+                    str(ROOT / "config.example.json"),
+                    "--check-config",
+                ],
+                cwd=directory,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("valid MCP configuration", completed.stdout)
 

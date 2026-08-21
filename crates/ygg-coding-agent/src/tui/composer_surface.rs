@@ -262,8 +262,6 @@ fn render_plain_content(state: &super::view::ShellState, width: u16) -> Vec<Stri
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FooterKind {
     Identity,
-    Extension,
-    ExtensionStatus,
     Tokens,
     CacheHit,
     Context,
@@ -320,7 +318,7 @@ fn compact_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
     }
 }
 
-fn format_microdollars(microdollars: u64) -> String {
+pub(crate) fn format_microdollars(microdollars: u64) -> String {
     const MICRODOLLARS_PER_DOLLAR: u128 = 1_000_000;
     const SIGNIFICANT_FIGURES: i32 = 3;
 
@@ -483,26 +481,6 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
         FooterKind::Identity,
         identity_variants(&full_model, &model_names, thinking),
     )];
-    if let Some((text, _)) = state
-        .extension_footer
-        .as_ref()
-        .filter(|(text, _)| !text.trim().is_empty())
-    {
-        segments.push(FooterSegment::new(
-            FooterKind::Extension,
-            vec![text.clone()],
-        ));
-    }
-    if let Some((text, _)) = state
-        .extension_status
-        .as_ref()
-        .filter(|(text, _)| !text.trim().is_empty())
-    {
-        segments.push(FooterSegment::new(
-            FooterKind::ExtensionStatus,
-            vec![text.clone()],
-        ));
-    }
 
     let base_context = if active {
         state.run_context_estimate
@@ -571,7 +549,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     // This is the durable session total, not the cost accumulated by the
     // current autonomous run. Session spend remains meaningful when the
     // selected model changes, so it must not depend on turn telemetry ownership.
-    let cost = if let Some(cost) = state.session_cost_microdollars {
+    let cost = if let Some(cost) = state.displayed_session_cost_microdollars() {
         Some(format_microdollars(cost))
     } else {
         match price_display {
@@ -602,8 +580,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
 
     // The identity moves to the header when that surface is active. Footer
     // visibility controls its fallback placement; status-line visibility
-    // controls telemetry as semantic groups. Explicit extension contributions
-    // remain visible because they are independently enabled product surfaces.
+    // controls telemetry as semantic groups.
     if !layout.show_footer || layout.show_header {
         hide_footer_kind(&mut segments, FooterKind::Identity);
     }
@@ -625,12 +602,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     if footer_width(&segments, gap) > available {
         compact_footer_kind(&mut segments, FooterKind::Identity);
     }
-    for kind in [
-        FooterKind::CacheHit,
-        FooterKind::Tokens,
-        FooterKind::ExtensionStatus,
-        FooterKind::Extension,
-    ] {
+    for kind in [FooterKind::CacheHit, FooterKind::Tokens] {
         if footer_width(&segments, gap) > available {
             hide_footer_kind(&mut segments, kind);
         }
@@ -695,22 +667,6 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
             state.theme.fg("warning", segment.text())
         }
         FooterKind::Activity => state.theme.fg("foreground", segment.text()),
-        FooterKind::Extension => {
-            let role = state
-                .extension_footer
-                .as_ref()
-                .and_then(|(_, role)| role.as_deref())
-                .unwrap_or("extension.status");
-            state.theme.apply_semantic_role(role, segment.text())
-        }
-        FooterKind::ExtensionStatus => {
-            let role = state
-                .extension_status
-                .as_ref()
-                .and_then(|(_, role)| role.as_deref())
-                .unwrap_or("extension.status");
-            state.theme.apply_semantic_role(role, segment.text())
-        }
         _ => state.theme.fg("muted", segment.text()),
     };
 
@@ -758,16 +714,8 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
 
 pub(crate) fn status_footer_visible(state: &super::view::ShellState, width: u16) -> bool {
     let layout = state.theme.layout_for_width(width);
-    let has_extension = state
-        .extension_footer
-        .as_ref()
-        .is_some_and(|(text, _)| !text.trim().is_empty())
-        || state
-            .extension_status
-            .as_ref()
-            .is_some_and(|(text, _)| !text.trim().is_empty());
     let has_identity = layout.show_footer && !layout.show_header;
-    has_identity || layout.show_status_line || has_extension
+    has_identity || layout.show_status_line
 }
 
 fn append_status_footer(
@@ -782,7 +730,7 @@ fn append_status_footer(
 }
 
 /// Format a token count compactly: `1.2k`, `856`, `1.0m`.
-fn compact_token_count(n: u64) -> String {
+pub(crate) fn compact_token_count(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}m", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {

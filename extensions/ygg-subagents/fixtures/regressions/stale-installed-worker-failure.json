@@ -1,0 +1,29 @@
+{
+  "schema": "ygg.subagents.installed-bundle-regression.v1",
+  "extension": "ygg-subagents",
+  "manifest": {
+    "version": "0.1.0",
+    "api_version": "0.2",
+    "requires_ygg": "=0.6.0-dev",
+    "manifest_sha256": "5ef835df18df252a717b7f2b75061f177b6d645d9fb4c9786240a67a3b5445ef"
+  },
+  "installed_bundle": {
+    "source_kind": "local",
+    "installed_by_ygg": "0.6.0-dev",
+    "archive_sha256": "98be510993d092b8827f9aac45c6ede66e6287b6ce0dbf5a1da4cf5326f208ad",
+    "observed_stale_file": "ygg_subagents/model.py",
+    "stale_file_sha256": "343ff6003f948273ad928abede5e6b4f744b86ad529af1492a01343252c72b85",
+    "workspace_file_sha256": "bffbd73b8fcb4ed57137611de84fa1bb4329c306dcf6485918cce226dc58e6c1",
+    "missing_contract": "delegation_telemetry_v1"
+  },
+  "authoritative_failure_projection": {
+    "class": "host_state_invalid",
+    "message": "agent_sessions omitted the durable worker profile",
+    "child_status": "failed",
+    "child_failed_error": "provider failed: test authoritative cause",
+    "child_session": "agent-session:abc",
+    "transcript": "Delegated worker transcript · read-only\nParent / tool\ninspect failure\nWorker\nprovider failure was recorded by the host",
+    "metrics_present_in_stale_bundle": false
+  },
+  "remediation": "Rebuild and reinstall the ygg-subagents bundle from the current workspace checkout; do not rely on cargo run to update ~/.ygg/extensions."
+}

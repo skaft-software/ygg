@@ -4,11 +4,12 @@ import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRef } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fixtureBootstrap } from "./fixtures";
+import { fixtureBootstrap, fixtureSessions } from "./fixtures";
 
 vi.mock("@xterm/xterm", () => ({ Terminal: class {} }));
 
 import { SessionHeader, SessionSelectionErrorBanner } from "./App";
+import { resolveDelegatedParentSessionId } from "./delegated-session";
 
 function renderHeader(
   sessionExportAvailable: boolean,
@@ -113,6 +114,32 @@ describe("session header safe export", () => {
     );
     expect(download).toHaveAttribute("download");
     expect(download.tagName).toBe("A");
+  });
+});
+
+describe("delegated parent navigation", () => {
+  it("prefers authoritative snapshot metadata over stale inferred history", () => {
+    const delegated = {
+      ...fixtureSessions["session-fresh"],
+      sessionId: `agent-session:${"a".repeat(64)}`,
+      delegatedParentSessionId: "parent-two",
+    };
+
+    expect(resolveDelegatedParentSessionId(delegated, "parent-one")).toBe(
+      "parent-two",
+    );
+    expect(
+      resolveDelegatedParentSessionId(
+        { ...delegated, delegatedParentSessionId: undefined },
+        "parent-one",
+      ),
+    ).toBe("parent-one");
+    expect(
+      resolveDelegatedParentSessionId(
+        { ...delegated, sessionId: "ordinary-session" },
+        "parent-one",
+      ),
+    ).toBeNull();
   });
 });
 

@@ -454,6 +454,36 @@ fn select_list_filter_narrows_items_and_confirm_returns_original_index() {
 }
 
 #[test]
+fn live_subagent_refresh_preserves_selection_by_stable_node_id() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 24);
+    shell.open_panel(Panel::SelectList {
+        title: "Subagents".into(),
+        items: vec!["alpha".into(), "beta".into()],
+        descriptions: vec![Some("running".into()), Some("done".into())],
+        selected: 1,
+        filter: String::new(),
+        action: PanelAction::SelectSubagent(vec!["node-a".into(), "node-b".into()]),
+    });
+
+    shell.refresh_subagent_panel(
+        "Subagents · refreshed".into(),
+        vec!["beta".into(), "gamma".into()],
+        vec![Some("done".into()), Some("running".into())],
+        vec!["node-b".into(), "node-c".into()],
+    );
+
+    let (result, action) = shell
+        .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+        .expect("enter should confirm the stable refreshed selection");
+    assert_eq!(result, PanelResult::Confirm(0));
+    assert!(matches!(
+        action,
+        PanelAction::SelectSubagent(ids) if ids == ["node-b", "node-c"]
+    ));
+}
+
+#[test]
 fn select_list_filter_is_case_insensitive_and_matches_descriptions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
@@ -6736,6 +6766,191 @@ fn idle_footer_shows_accumulated_session_cost_without_opt_in() {
 }
 
 #[test]
+fn subagent_chrome_renders_live_metrics_and_rolls_cost_into_footer_once() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("openai", "gpt-5.6-luna", "high");
+    shell.state.borrow_mut().session_cost_microdollars = Some(91_400);
+    let snapshot: ygg_agent::ExtensionPresentationSnapshot =
+        serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "status": {"state": "active", "label": "Subagents"},
+            "activities": [{
+                "id": "activity:agent-1",
+                "kind": "subagent",
+                "state": "running",
+                "summary": "read-diffs · using read",
+                "metrics": {
+                    "tool_calls": 16,
+                    "input_tokens": 80_000,
+                    "cache_read_tokens": 8_200,
+                    "cache_write_tokens": 0,
+                    "output_tokens": 99,
+                    "reasoning_tokens": 20,
+                    "cost_microdollars": 208_600
+                }
+            }],
+            "actions": []
+        }))
+        .unwrap();
+
+    assert!(shell.set_subagent_presentation(Some(&snapshot), true));
+    let chrome = shell_chrome(&shell.state.borrow(), 120, Instant::now());
+    let activity = chrome
+        .subagents
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(activity.contains("Subagents"), "{activity}");
+    assert!(activity.contains("read-diffs · using read"), "{activity}");
+    assert!(
+        activity.contains("16 Tool Calls • ↑88.2k ↓99 • $0.209"),
+        "{activity}"
+    );
+    assert!(plain_footer(&shell, 120, Instant::now()).contains("$0.300"));
+
+    assert!(shell.set_subagent_presentation(Some(&snapshot), false));
+    let footer = plain_footer(&shell, 120, Instant::now());
+    assert!(footer.contains("$0.0914"), "{footer}");
+    assert!(!footer.contains("$0.300"), "{footer}");
+}
+
+#[test]
+fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
+    let mut shell = InteractiveShell::test_shell();
+    let child = |id: &str, task: &str, state: &str, reason: Option<&str>| {
+        ygg_agent::DelegationTelemetryChild {
+            child_id: id.into(),
+            task_name: task.into(),
+            profile: Some("explore".into()),
+            model: "cerebras-gemma-4-31b".into(),
+            state: state.into(),
+            phase: if state == "failed" {
+                "failed"
+            } else {
+                "using_tool"
+            }
+            .into(),
+            current_tool: (state == "running").then(|| "read".into()),
+            tool_use_count: 4,
+            input_tokens: 12_000,
+            cache_read_tokens: 800,
+            cache_write_tokens: 0,
+            output_tokens: 220,
+            reasoning_tokens: 60,
+            total_tokens: 13_020,
+            cost: None,
+            cost_microdollars: Some(7_200),
+            elapsed_ms: 42_000,
+            failure_class: reason.map(|_| "provider_failure".into()),
+            failure_reason: reason.map(str::to_owned),
+            session: Some("agent-session:opaque".into()),
+        }
+    };
+    let snapshot = ygg_agent::DelegationTelemetrySnapshot {
+        revision: 4,
+        captured_at_ms: 1_700_000_000_000,
+        children: vec![
+            child("agent-1", "Read release history", "running", None),
+            child(
+                "agent-2",
+                "Audit release surface",
+                "failed",
+                Some("provider request failed: upstream unavailable"),
+            ),
+        ],
+        total_cost_microdollars: Some(14_400),
+        failure_reason: Some("spawn rejected: worker limit reached".into()),
+        failure_class: Some("spawn_rejected".into()),
+    };
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated { snapshot });
+    let block = shell_chrome(&shell.state.borrow(), 120, Instant::now())
+        .subagents
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(block.contains("2 Explore agents"), "{block}");
+    assert!(block.contains("Read release history"), "{block}");
+    assert!(
+        block.contains("Failed: provider request failed: upstream unavailable"),
+        "{block}"
+    );
+    assert!(
+        block.contains("Failed: spawn rejected: worker limit reached"),
+        "{block}"
+    );
+    assert!(!shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
+        .join("\n")
+        .contains("Used subagent spawn"));
+
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 5,
+            captured_at_ms: 1_700_000_000_001,
+            children: Vec::new(),
+            total_cost_microdollars: None,
+            failure_reason: None,
+            failure_class: None,
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_none());
+
+    shell.on_agent_event(&ygg_agent::AgentEvent::ToolStarted {
+        id: ygg_ai::ToolCallId("spawn-call".into()),
+        name: "subagent_spawn".into(),
+        args: serde_json::json!({"name": "worker"}),
+    });
+    let transcript = shell.state.borrow().rendered_transcript(120).join("\n");
+    assert!(!transcript.contains("Used subagent spawn"), "{transcript}");
+}
+
+#[test]
+fn hydrating_a_replacement_session_clears_subagent_activity() {
+    let mut shell = InteractiveShell::test_shell();
+    let snapshot = ygg_agent::DelegationTelemetrySnapshot {
+        revision: 1,
+        captured_at_ms: 1_700_000_000_000,
+        children: vec![ygg_agent::DelegationTelemetryChild {
+            child_id: "agent-1".into(),
+            task_name: "Inspect tests".into(),
+            profile: Some("explore".into()),
+            model: "test-model".into(),
+            state: "running".into(),
+            phase: "using_tool".into(),
+            current_tool: Some("read".into()),
+            tool_use_count: 1,
+            input_tokens: 100,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 10,
+            reasoning_tokens: 0,
+            total_tokens: 110,
+            cost: None,
+            cost_microdollars: Some(1),
+            elapsed_ms: 500,
+            failure_class: None,
+            failure_reason: None,
+            session: Some("agent-session:opaque".into()),
+        }],
+        total_cost_microdollars: Some(1),
+        failure_reason: None,
+        failure_class: None,
+    };
+    assert!(shell.set_subagent_telemetry(Some(&snapshot), true));
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    let directory = tempfile::tempdir().unwrap();
+    let session = Session::create(directory.path().join("replacement.jsonl")).unwrap();
+
+    shell.hydrate(&session).unwrap();
+
+    assert!(shell.state.borrow().subagent_activity.is_none());
+}
+
+#[test]
 fn semantic_transcript_blocks_have_uniform_transition_spacing() {
     let theme = crate::tui::theme::test_theme();
     let rich_renderer = theme.rich_renderer();
@@ -7965,52 +8180,97 @@ fn theme_header_footer_status_and_composer_padding_have_narrow_fallbacks() {
     assert!(shell_chrome(&shell.state.borrow(), 40, now)
         .header
         .is_empty());
-
-    shell.set_extension_header(Some((
-        "EXT\x1b[31m red\ntail".into(),
-        Some("invalid role!".into()),
-    )));
-    shell.set_extension_status(Some(("branch main".into(), None)));
-    let narrow = shell_chrome(&shell.state.borrow(), 40, now);
-    assert_eq!(narrow.header.len(), 1);
-    let extension_header = strip_terminal_sequences(&narrow.header[0]);
-    assert!(
-        extension_header.contains("EXT red tail"),
-        "{extension_header:?}"
+    let narrow_composer = plain_composer_surface(&shell, 40, now);
+    assert_eq!(
+        narrow_composer.len(),
+        3,
+        "extensions cannot force persistent header or footer chrome"
     );
-    assert!(!extension_header.contains('\x1b'));
-    let composer = plain_composer_surface(&shell, 40, now);
-    assert_eq!(composer.len(), 4, "explicit status restores one footer row");
-    assert!(composer
-        .last()
-        .is_some_and(|line| line.contains("branch main")));
 }
 
 #[test]
-fn extension_activity_is_bounded_sanitized_and_coexists_with_the_composer() {
+fn read_only_document_panel_scrolls_and_returns_to_its_owner() {
     let mut shell = InteractiveShell::test_shell();
-    shell.set_size(80, 20);
-    shell.set_extension_activity(vec![
-        "Subagents  1 running".into(),
-        "├─ inspect-tests  running".into(),
-        "\x1b[31munsafe\nrow".into(),
-        "four".into(),
-        "five".into(),
-        "six".into(),
-        "must be dropped".into(),
-    ]);
-    let chrome = shell_chrome(&shell.state.borrow(), 80, Instant::now());
-    assert_eq!(chrome.activity.len(), 5.min((20_usize / 4).clamp(2, 6)));
-    let visible = chrome
-        .activity
-        .iter()
-        .map(|line| strip_terminal_sequences(line))
+    shell.set_size(60, 14);
+    shell.open_panel(Panel::ReadOnlyDocument {
+        title: "worker · read-only transcript".into(),
+        text: (0..30)
+            .map(|line| format!("transcript line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        scroll_from_bottom: 0,
+    });
+
+    let initial = render_panel(&shell.state.borrow(), 60)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(visible.contains("Subagents"));
-    assert!(visible.contains("unsafe row"));
-    assert!(!visible.contains("must be dropped"));
-    assert!(!chrome.composer.is_empty());
+    assert!(initial.contains("transcript line 29"), "{initial}");
+    assert!(!initial.contains("transcript line 00"), "{initial}");
+
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Home));
+    let top = render_panel(&shell.state.borrow(), 60)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(top.contains("transcript line 00"), "{top}");
+    assert!(!top.contains("transcript line 29"), "{top}");
+
+    shell.update_read_only_document(
+        (0..45)
+            .map(|line| format!("transcript line {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let refreshed_top = render_panel(&shell.state.borrow(), 60)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        refreshed_top.contains("transcript line 00"),
+        "{refreshed_top}"
+    );
+    assert!(
+        !refreshed_top.contains("transcript line 44"),
+        "{refreshed_top}"
+    );
+
+    assert!(matches!(
+        shell.panel_input(&panel_key(crossterm::event::KeyCode::Left)),
+        Some((PanelResult::Cancel, PanelAction::ReadOnlyDocument))
+    ));
+    assert!(!shell.has_panel());
+}
+
+#[test]
+fn read_only_document_home_reaches_top_with_wrapped_error_and_header_chrome() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(42, 16);
+    shell.set_identity("local", "model", "high");
+    shell.error(
+        "a wrapped error consumes several rows before the focused document panel can render"
+            .repeat(3),
+    );
+    shell.open_panel(Panel::ReadOnlyDocument {
+        title: "worker · read-only transcript".into(),
+        text: (0..40)
+            .map(|line| format!("document row {line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        scroll_from_bottom: 0,
+    });
+
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Home));
+    let rendered = shell_chrome(&shell.state.borrow(), 42, Instant::now())
+        .panel
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("document row 00"), "{rendered}");
 }
 
 #[test]
@@ -8116,8 +8376,6 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
         },
         None,
     )));
-    state.extension_header = Some(("workspace · main".into(), None));
-    state.extension_status = Some(("git clean".into(), None));
     state.editor = "draft a local patch".into();
 }
 

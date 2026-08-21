@@ -117,15 +117,8 @@ bold = true
 foreground = "accent"
 italic = true
 
-# Footer contributions use this conventional role unless they request one.
-[roles."extension.status"]
-foreground = "accent"
-bold = true
-
-# Header contributions have a separate conventional role.
-[roles."extension.header"]
-foreground = "accent"
-underline = true
+# Persistent extension header/status/footer contributions remain protocol data;
+# the coding TUI intentionally does not render them as ambient chrome.
 
 [glyphs]
 top_left = "╭"
@@ -244,12 +237,15 @@ render through Ygg's semantic-style API. A theme may style any such name under
 `[roles]`. Unknown role names remain terminal-neutral, which makes extension
 output readable even when the active theme predates the extension.
 
-`extension.header` and `extension.status` are the conventional roles for
-persistent extension chrome. Tool-renderer segments can request any other
-namespaced role; all eleven bundled themes demonstrate both conventional chrome
-roles and a distinct extension-specific role. Extension chrome is explicit:
-an enabled contribution remains visible even when a theme hides the matching
-built-in identity or telemetry surface.
+Extension-defined semantic names remain valid protocol vocabulary for frontends
+that choose to render them. The coding TUI deliberately keeps generic extension
+state out of persistent header, status, and footer chrome; themes therefore
+cannot make those ambient surfaces reappear. The host-owned live subagent block
+is a first-party observation surface above the composer, uses existing model/
+foreground/muted roles, and cannot be restyled into extension-controlled rows or
+a footer. On-demand `/extensions` and `/subagents` panels use host-owned panel
+roles and geometry. Tool-renderer segments may still carry namespaced roles as
+bounded internal presentation provenance.
 
 ## Current semantic coverage
 
@@ -259,9 +255,8 @@ outcomes, and narrow ASCII fallbacks. Markdown's internal list/detail/status
 glyphs still come from sexy-tui-rs's capability-aware glyph set; the remaining
 configured glyph names are validated vocabulary for completing that bridge.
 
-Role styles are live for rich Markdown/diff roles, extension tool-renderer
-segments, persistent extension header/status/footer contributions, and all
-three layers of each transcript surface: `surface.<kind>`,
+Role styles are live for rich Markdown/diff roles, host-owned interactive
+panels, and all three layers of each transcript surface: `surface.<kind>`,
 `surface.<kind>.border`, and `surface.<kind>.label`. The eight typed surface
 kinds are `user`, `assistant`, `reasoning`, `tool`, `shell`, `notice`, `outcome`,
 and `compaction`. Every layout field alters the current renderer:

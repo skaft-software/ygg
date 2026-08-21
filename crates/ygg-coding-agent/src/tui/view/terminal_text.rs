@@ -77,34 +77,6 @@ pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
     out
 }
 
-/// Normalize a process-supplied one-line semantic contribution at the TUI
-/// boundary. Extension text never gets to smuggle terminal controls or extra
-/// physical rows into persistent chrome, and an invalid role simply falls
-/// back to the conventional surface role.
-pub(super) fn sanitize_extension_surface(
-    contribution: Option<(String, Option<String>)>,
-) -> Option<(String, Option<String>)> {
-    contribution.and_then(|(text, role)| {
-        let text = sanitize_for_terminal(&text).replace('\n', " ");
-        let text = text.trim().to_owned();
-        if text.is_empty() {
-            return None;
-        }
-        let role = role.and_then(|role| {
-            let role = role.trim();
-            (role.len() <= 96
-                && !role.is_empty()
-                && !role.starts_with('.')
-                && !role.ends_with('.')
-                && role
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')))
-            .then(|| role.to_owned())
-        });
-        Some((text, role))
-    })
-}
-
 fn bounded_plain_prefix(mut text: String, byte_budget: usize) -> String {
     if text.len() <= byte_budget {
         return text;

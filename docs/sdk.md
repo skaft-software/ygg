@@ -20,6 +20,10 @@ From a checkout, install both binaries with:
 cargo install --locked --path crates/ygg-coding-agent --bins
 ```
 
+Cargo installs embed Ygg's text documentation in the binaries. On first use,
+Ygg materializes it under `${CARGO_HOME:-$HOME/.cargo}/share/ygg`; the managed
+copy is refreshed when the Cargo-channel `ygg update` installs a newer release.
+
 A consumer may use a configured host path, but should always send `hello` and
 validate the response before accepting work.
 
@@ -62,7 +66,7 @@ Request:
 Response:
 
 ```json
-{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.5.0","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
+{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.6.0-dev","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
 ```
 
 Consumers must reject a protocol mismatch, unknown request ID, run/session ID

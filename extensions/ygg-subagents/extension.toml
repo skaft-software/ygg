@@ -1,7 +1,7 @@
 name = "ygg-subagents"
 version = "0.1.0"
 api_version = "0.2"
-requires_ygg = "=0.5.0"
+requires_ygg = "=0.6.0-dev"
 description = "Bounded Claude Code-like background workers over host-owned Ygg agent sessions"
 
 [entrypoint]

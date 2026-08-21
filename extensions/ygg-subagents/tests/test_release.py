@@ -27,7 +27,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-subagents")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.5.0")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-subagents")
         self.assertEqual(manifest["capabilities"]["filesystem"], "none")
         self.assertFalse(manifest["capabilities"]["process"])
@@ -51,6 +51,7 @@ class ReleaseTests(unittest.TestCase):
             "vendor/ygg_extension/protocol.py",
             "skills/ygg-subagents/SKILL.md",
             "fixtures/fake_agent_sessions.py",
+            "fixtures/regressions/stale-installed-worker-failure.json",
             "release-smoke.py",
             "README.md",
             "CHANGELOG.md",
@@ -67,18 +68,25 @@ class ReleaseTests(unittest.TestCase):
                 "vendored SDK drift: %s" % name,
             )
 
-    def test_entrypoint_release_handshake_and_shutdown_smoke(self):
+    def test_host_staged_entrypoint_release_handshake_and_shutdown_smoke(self):
         frames = [initialize_request(), rpc_request(900, "shutdown", {})]
-        completed = subprocess.run(
-            [str(ROOT / "ygg-subagents")],
-            cwd=ROOT,
-            input="".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=8,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            staged_entrypoint = Path(directory) / "ygg-subagents"
+            staged_entrypoint.write_bytes((ROOT / "ygg-subagents").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
+            completed = subprocess.run(
+                [str(staged_entrypoint)],
+                cwd=REPOSITORY,
+                env=environment,
+                input="".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=8,
+                check=False,
+            )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         messages = [json.loads(line) for line in completed.stdout.splitlines() if line]
         initialized = next(message for message in messages if message.get("id") == 1)
@@ -122,6 +130,23 @@ class ReleaseTests(unittest.TestCase):
         )
         reconnect = fixtures["presentation/reconnect-resync.json"]
         self.assertEqual(reconnect["completion_delivery"]["duplicate_parent_turns"], 0)
+
+    def test_installed_bundle_regression_fixture_preserves_authoritative_failure_evidence(self):
+        fixture = json.loads(
+            (FIXTURES / "regressions" / "stale-installed-worker-failure.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(fixture["schema"], "ygg.subagents.installed-bundle-regression.v1")
+        evidence = fixture["authoritative_failure_projection"]
+        self.assertEqual(evidence["child_status"], "failed")
+        self.assertTrue(evidence["child_failed_error"])
+        self.assertTrue(evidence["transcript"])
+        self.assertFalse(evidence["metrics_present_in_stale_bundle"])
+        self.assertNotEqual(
+            fixture["installed_bundle"]["stale_file_sha256"],
+            fixture["installed_bundle"]["workspace_file_sha256"],
+        )
 
     def test_packaged_skill_is_explicit_read_only_and_non_recursive(self):
         skill = (ROOT / "skills" / "ygg-subagents" / "SKILL.md").read_text(encoding="utf-8")

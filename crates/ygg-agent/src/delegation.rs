@@ -16,11 +16,13 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
-use ygg_ai::{AssistantPart, ToolDef, Usage};
+use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
-use crate::events::{AgentEvent, FinishReason};
+use crate::events::{
+    AgentEvent, DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason,
+};
 use crate::extension::ExtensionHost;
 use crate::secure_fs::{self, SecureFileError};
 use crate::session::{Session, SessionError};
@@ -29,6 +31,7 @@ use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
 const ROOT_AGENT_ID: &str = "root";
 const ROOT_AGENT_PATH: &str = "/root";
 const COMMAND_CHANNEL_CAPACITY: usize = 32;
+const MAX_TELEMETRY_FAILURE_BYTES: usize = 4 * 1024;
 const MAX_PROVENANCE_TEXT_BYTES: usize = 128 * 1024;
 const MAX_MAILBOX_MESSAGES: usize = 64;
 const MAX_MAILBOX_BYTES: usize = 1024 * 1024;
@@ -42,8 +45,6 @@ const MAX_QUEUED_FOLLOW_UP_BYTES: usize =
     (COMMAND_CHANNEL_CAPACITY + 1) * MAX_PROVENANCE_TEXT_BYTES;
 const MAX_TOOL_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_EXTENSION_ACTIVE_CHILDREN: usize = 2;
-const MAX_EXTENSION_TOTAL_TOKEN_RESERVATION: u64 = 96_000;
-const MAX_EXTENSION_TOTAL_COST_RESERVATION: u64 = 500_000;
 /// Host-reserved names installed by V2 collaboration overlays.
 pub const COLLABORATION_TOOL_NAMES: [&str; 6] = [
     "spawn_agent",
@@ -53,6 +54,54 @@ pub const COLLABORATION_TOOL_NAMES: [&str; 6] = [
     "list_agents",
     "interrupt_agent",
 ];
+
+fn short_sha256(value: &str, bytes: usize) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    digest[..bytes]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn extension_owner_task_prefix(principal: &str, resource_owner: &str) -> String {
+    format!(
+        "ext-{}-{}",
+        short_sha256(principal, 6),
+        short_sha256(resource_owner, 4)
+    )
+}
+
+/// Returns whether a retained delegated-session path has the exact filename
+/// shape generated for an extension principal and resource owner.
+///
+/// This is a defense-in-depth check for hosts that reconstruct extension child
+/// authorization from durable provenance after a restart. Callers must still
+/// validate that provenance and bind the parent session independently.
+pub fn extension_delegated_session_matches_owner(
+    principal: &str,
+    resource_owner: &str,
+    session_path: &Path,
+) -> bool {
+    let Some(stem) = session_path.file_stem().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((sequence, task_name)) = stem.split_once('-') else {
+        return false;
+    };
+    if sequence.len() != 4 || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let task_prefix = format!(
+        "{}-task-",
+        extension_owner_task_prefix(principal, resource_owner)
+    );
+    task_name.strip_prefix(&task_prefix).is_some_and(|digest| {
+        digest.len() == 12
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
 
 /// Returns a path-free opaque reference for one host-owned delegated session.
 ///
@@ -273,7 +322,7 @@ pub(crate) struct ExtensionAgentSessionPolicy {
     pub(crate) max_depth: usize,
     pub(crate) max_concurrent_children: usize,
     pub(crate) max_turns: u64,
-    pub(crate) max_tokens: u64,
+    pub(crate) max_tokens: Option<u64>,
     pub(crate) max_cost_microdollars: u64,
     pub(crate) max_output_bytes: usize,
     pub(crate) timeout_ms: u64,
@@ -304,8 +353,11 @@ impl ExtensionAgentSessionPolicy {
         if !(1..=12).contains(&self.max_turns) {
             return Err("extension child max_turns must be between 1 and 12".into());
         }
-        if !(1_000..=64_000).contains(&self.max_tokens) {
-            return Err("extension child max_tokens must be between 1000 and 64000".into());
+        if self
+            .max_tokens
+            .is_some_and(|max_tokens| !(1_000..=64_000).contains(&max_tokens))
+        {
+            return Err("extension child max_tokens must be null or between 1000 and 64000".into());
         }
         if !(1..=500_000).contains(&self.max_cost_microdollars) {
             return Err(
@@ -336,7 +388,6 @@ pub(crate) struct ExtensionDelegationService {
     manager: Weak<DelegationManager>,
     principal: Arc<str>,
     parent_session_id: Arc<str>,
-    task_prefix: Arc<str>,
     state: Arc<Mutex<ExtensionDelegationState>>,
 }
 
@@ -403,8 +454,34 @@ impl DelegationBinding {
         &self.system_instructions
     }
 
+    pub(crate) fn is_root(&self) -> bool {
+        self.identity.id == ROOT_AGENT_ID
+    }
+
+    /// Attach the owning root run to the manager's loss-tolerant latest
+    /// telemetry stream. Child runs deliberately do not receive this stream.
+    pub(crate) fn telemetry_receiver(
+        &self,
+    ) -> Option<mpsc::UnboundedReceiver<DelegationTelemetrySnapshot>> {
+        self.is_root().then(|| self.manager.attach_telemetry())
+    }
+
+    pub(crate) fn detach_telemetry(&self) {
+        self.manager.detach_telemetry();
+    }
+
     pub(crate) fn request_shutdown(&self) {
         self.manager.request_shutdown_descendants(&self.identity.id);
+    }
+
+    pub(crate) async fn settle_descendants(&self, timeout: Duration) {
+        self.manager
+            .wait_for_descendants_to_settle(&self.identity.id, timeout)
+            .await;
+    }
+
+    pub(crate) fn delegated_usage_records(&self) -> Vec<DelegatedUsageRecord> {
+        self.manager.extension_usage_records(&self.identity.id)
     }
 
     pub(crate) fn prepare_owning_run(&self) -> Result<(), AgentError> {
@@ -463,19 +540,10 @@ impl DelegationBinding {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .root_resource_owner = Some(root_resource_owner);
-        let digest = Sha256::digest(principal.as_bytes());
-        let task_prefix = format!(
-            "ext-{}",
-            digest[..6]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        );
         Ok(ExtensionDelegationService {
             manager: Arc::downgrade(&self.manager),
             principal: Arc::from(principal),
             parent_session_id: Arc::from(parent_session_id),
-            task_prefix: Arc::from(task_prefix),
             state: Arc::new(Mutex::new(ExtensionDelegationState::default())),
         })
     }
@@ -565,15 +633,7 @@ impl ExtensionDelegationService {
     }
 
     fn owner_task_prefix(&self, resource_owner: &str) -> String {
-        let digest = Sha256::digest(resource_owner.as_bytes());
-        format!(
-            "{}-{}",
-            self.task_prefix,
-            digest[..4]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-        )
+        extension_owner_task_prefix(&self.principal, resource_owner)
     }
 
     fn validate_resource_owner(resource_owner: &str) -> Result<(), String> {
@@ -629,6 +689,17 @@ impl ExtensionDelegationService {
             return Err("spawn idempotency_key must be 1..=256 bytes".into());
         }
         let message_sha256 = format!("{:x}", Sha256::digest(message.as_bytes()));
+        let manager = self.manager()?;
+        let reject_spawn = |error: String| {
+            manager.publish_external_failure("spawn_rejected", &error);
+            error
+        };
+        if manager.template.model.spec.pricing.is_none() {
+            return Err(reject_spawn(
+                "bounded extension child requires trusted model pricing for its hard cost ceiling"
+                    .into(),
+            ));
+        }
         let mut service_state = self
             .state
             .lock()
@@ -637,6 +708,22 @@ impl ExtensionDelegationService {
             .owners
             .entry(resource_owner.to_owned())
             .or_default();
+        {
+            let manager_state = manager
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            owner_state
+                .owned_agents
+                .retain(|id| manager_state.records.contains_key(id));
+            owner_state.idempotent_spawns.retain(|_, spawn| {
+                spawn
+                    .result
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| manager_state.records.contains_key(id))
+            });
+        }
         if let Some(existing) = owner_state.idempotent_spawns.get(&idempotency_key) {
             if existing.task_name != task_name
                 || existing.profile != profile
@@ -644,7 +731,9 @@ impl ExtensionDelegationService {
                 || existing.message_sha256 != message_sha256
                 || existing.policy != policy
             {
-                return Err("spawn idempotency_key was reused with different input".into());
+                return Err(reject_spawn(
+                    "spawn idempotency_key was reused with different input".into(),
+                ));
             }
             return Ok(existing.result.clone());
         }
@@ -657,68 +746,33 @@ impl ExtensionDelegationService {
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         );
-        let manager = self.manager()?;
-        if manager.template.model.spec.pricing.is_none() {
-            return Err(
-                "bounded extension child requires trusted model pricing for its hard cost ceiling"
-                    .into(),
-            );
-        }
         let owner = self.owner_identity(&manager, resource_owner)?;
-        {
+        let rejection = {
             let manager_state = manager
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let active = owner_state
+            let active_count = owner_state
                 .owned_agents
                 .iter()
                 .filter_map(|id| manager_state.records.get(id))
                 .filter(|record| record.status.is_running())
-                .collect::<Vec<_>>();
-            if active.len() >= policy.max_concurrent_children {
-                return Err(format!(
+                .count();
+            if active_count >= policy.max_concurrent_children {
+                Some(format!(
                     "extension child concurrency limit reached ({})",
                     policy.max_concurrent_children
-                ));
+                ))
+            } else if owner_state.owned_agents.len() >= 16 {
+                Some("extension child total limit reached (16)".to_owned())
+            } else {
+                None
             }
-            if owner_state.owned_agents.len() >= 16 {
-                return Err("extension child total limit reached (16)".into());
-            }
-            let reserved_tokens = active.iter().fold(0u64, |total, record| {
-                total.saturating_add(
-                    record
-                        .extension_policy
-                        .as_ref()
-                        .map(|policy| policy.max_tokens)
-                        .unwrap_or_default(),
-                )
-            });
-            if reserved_tokens.saturating_add(policy.max_tokens)
-                > MAX_EXTENSION_TOTAL_TOKEN_RESERVATION
-            {
-                return Err(format!(
-                    "extension child token reservation limit reached ({MAX_EXTENSION_TOTAL_TOKEN_RESERVATION})"
-                ));
-            }
-            let reserved_cost = active.iter().fold(0u64, |total, record| {
-                total.saturating_add(
-                    record
-                        .extension_policy
-                        .as_ref()
-                        .map(|policy| policy.max_cost_microdollars)
-                        .unwrap_or_default(),
-                )
-            });
-            if reserved_cost.saturating_add(policy.max_cost_microdollars)
-                > MAX_EXTENSION_TOTAL_COST_RESERVATION
-            {
-                return Err(format!(
-                    "extension child cost reservation limit reached ({MAX_EXTENSION_TOTAL_COST_RESERVATION} microdollars)"
-                ));
-            }
+        };
+        if let Some(error) = rejection {
+            return Err(reject_spawn(error));
         }
-        let mut result = manager.spawn(
+        let mut result = match manager.spawn(
             &owner,
             SpawnRequest {
                 task_name: internal_task_name,
@@ -734,7 +788,13 @@ impl ExtensionDelegationService {
                     fingerprint: fingerprint.clone(),
                 }),
             },
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                manager.publish_external_failure("spawn_rejected", &error);
+                return Err(error);
+            }
+        };
         let agent_id = result
             .get("agent_id")
             .and_then(Value::as_str)
@@ -811,7 +871,7 @@ impl ExtensionDelegationService {
     pub(crate) fn list(&self, resource_owner: &str) -> Result<Value, String> {
         Self::validate_resource_owner(resource_owner)?;
         let manager = self.manager()?;
-        let owner = self.owner_identity(&manager, resource_owner)?;
+        self.owner_identity(&manager, resource_owner)?;
         let owned = self
             .state
             .lock()
@@ -824,7 +884,6 @@ impl ExtensionDelegationService {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        manager.ensure_owner_active_locked(&state, &owner)?;
         let owned_paths = owned
             .iter()
             .filter_map(|id| {
@@ -917,6 +976,7 @@ pub(crate) struct DelegationRuntimeSettings {
     pub(crate) completion_policy: CompletionPolicy,
     pub(crate) output_modalities: ygg_ai::OutputModalities,
     pub(crate) max_output_tokens: u64,
+    pub(crate) max_session_tokens: Option<u64>,
     pub(crate) max_session_cost_microdollars: Option<u64>,
     pub(crate) provider_retries_enabled: bool,
 }
@@ -937,6 +997,7 @@ pub(crate) struct DelegationTemplate {
 
 pub(crate) struct DelegationManager {
     config: DelegationConfig,
+    root_tools: bool,
     team_directory: PathBuf,
     team_storage: Option<Arc<secure_fs::PrivateDirectory>>,
     journal: ProvenanceJournal,
@@ -944,6 +1005,12 @@ pub(crate) struct DelegationManager {
     state: Mutex<ManagerState>,
     permits: RwLock<Arc<Semaphore>>,
     changed: Notify,
+    telemetry: Mutex<DelegationTelemetryState>,
+}
+
+struct DelegationTelemetryState {
+    revision: u64,
+    sender: Option<mpsc::UnboundedSender<DelegationTelemetrySnapshot>>,
 }
 
 struct ManagerState {
@@ -958,6 +1025,15 @@ struct ManagerState {
     shutting_down: bool,
     root_active: bool,
     root_resource_owner: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DelegatedUsageRecord {
+    pub(crate) agent_id: String,
+    pub(crate) usage: Usage,
+    pub(crate) cost: Option<Cost>,
+    pub(crate) turn_count: u64,
+    pub(crate) tool_call_count: u64,
 }
 
 struct AgentRecord {
@@ -985,7 +1061,10 @@ struct AgentRecord {
     started_at_ms: Option<u64>,
     completed_at_ms: Option<u64>,
     turn_count: u64,
+    tool_call_count: u64,
+    active_tools: BTreeMap<String, String>,
     usage: Usage,
+    cost: Option<Cost>,
     cost_microdollars: Option<u64>,
     deadline_at_ms: Option<u64>,
 }
@@ -1201,12 +1280,137 @@ impl ProvenanceJournal {
 }
 
 impl DelegationManager {
+    fn attach_telemetry(&self) -> mpsc::UnboundedReceiver<DelegationTelemetrySnapshot> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        {
+            let mut telemetry = self
+                .telemetry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            telemetry.sender = Some(sender);
+        }
+        self.publish_telemetry(None, None);
+        receiver
+    }
+
+    fn publish_external_failure(&self, class: &str, reason: &str) {
+        self.publish_telemetry(
+            Some(class.to_owned()),
+            Some(bounded_text_to(reason, MAX_TELEMETRY_FAILURE_BYTES)),
+        );
+    }
+
+    fn publish_telemetry(&self, failure_class: Option<String>, failure_reason: Option<String>) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let captured_at_ms = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+        let children = state
+            .records
+            .values()
+            .map(|record| {
+                let elapsed_end = record.completed_at_ms.unwrap_or(captured_at_ms);
+                let started = record.started_at_ms.unwrap_or(record.created_at_ms);
+                let (failure_class_for_child, failure_reason_for_child) = match &record.status {
+                    DelegatedAgentStatus::Failed { error } => (
+                        Some(classify_delegation_failure(error).to_owned()),
+                        Some(bounded_text_to(error, MAX_TELEMETRY_FAILURE_BYTES)),
+                    ),
+                    DelegatedAgentStatus::TimedOut => (
+                        Some("timeout".to_owned()),
+                        Some("worker exceeded its host-owned wall-time deadline".to_owned()),
+                    ),
+                    DelegatedAgentStatus::Interrupted => (
+                        Some("cancellation".to_owned()),
+                        Some("worker was interrupted by the owner".to_owned()),
+                    ),
+                    DelegatedAgentStatus::Shutdown => (
+                        Some("cancellation".to_owned()),
+                        Some("worker was shut down by its owning run".to_owned()),
+                    ),
+                    _ => (None, None),
+                };
+                DelegationTelemetryChild {
+                    child_id: record.identity.id.clone(),
+                    task_name: record
+                        .display_task_name
+                        .clone()
+                        .unwrap_or_else(|| record.task_name.clone()),
+                    profile: record.extension_profile.clone(),
+                    model: self.template.model.spec.id.0.clone(),
+                    state: record.status.label().to_owned(),
+                    phase: if !record.active_tools.is_empty() {
+                        "using_tool".to_owned()
+                    } else {
+                        match &record.status {
+                            DelegatedAgentStatus::Pending => "queued",
+                            DelegatedAgentStatus::Running => "thinking",
+                            DelegatedAgentStatus::Completed { .. } => "completed",
+                            DelegatedAgentStatus::Interrupted => "interrupted",
+                            DelegatedAgentStatus::Failed { .. } => "failed",
+                            DelegatedAgentStatus::TimedOut => "timed_out",
+                            DelegatedAgentStatus::Shutdown => "shutdown",
+                        }
+                        .to_owned()
+                    },
+                    current_tool: record.active_tools.values().next_back().cloned(),
+                    tool_use_count: record.tool_call_count,
+                    input_tokens: record.usage.input_tokens,
+                    cache_read_tokens: record.usage.cache_read_tokens,
+                    cache_write_tokens: record.usage.cache_write_tokens,
+                    output_tokens: record.usage.output_tokens,
+                    reasoning_tokens: record.usage.reasoning_tokens,
+                    total_tokens: record.usage.total_tokens,
+                    cost: record.cost,
+                    cost_microdollars: record.cost_microdollars,
+                    elapsed_ms: elapsed_end.saturating_sub(started),
+                    failure_class: failure_class_for_child,
+                    failure_reason: failure_reason_for_child,
+                    session: delegated_session_reference(&record.session_path),
+                }
+            })
+            .collect::<Vec<_>>();
+        drop(state);
+
+        let total_cost_microdollars = children
+            .iter()
+            .map(|child| child.cost_microdollars)
+            .try_fold(0u64, |total, cost| Some(total.saturating_add(cost?)));
+        let mut telemetry = self
+            .telemetry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        telemetry.revision = telemetry.revision.saturating_add(1);
+        let snapshot = DelegationTelemetrySnapshot {
+            revision: telemetry.revision,
+            captured_at_ms,
+            children,
+            total_cost_microdollars,
+            failure_reason,
+            failure_class,
+        };
+        if let Some(sender) = telemetry.sender.clone() {
+            if sender.send(snapshot).is_err() {
+                telemetry.sender = None;
+            }
+        }
+    }
+
+    fn detach_telemetry(&self) {
+        self.telemetry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sender = None;
+    }
+
     fn create(
         config: DelegationConfig,
         template: DelegationTemplate,
         root_session: &Path,
+        root_tools: bool,
     ) -> Result<Arc<Self>, DelegationError> {
-        Self::create_with_journal(config, template, root_session, |directory| {
+        Self::create_with_journal(config, template, root_session, root_tools, |directory| {
             Ok(ProvenanceJournal::create(directory)?)
         })
     }
@@ -1215,6 +1419,7 @@ impl DelegationManager {
         config: DelegationConfig,
         template: DelegationTemplate,
         root_session: &Path,
+        root_tools: bool,
         create_journal: impl FnOnce(
             &secure_fs::PrivateDirectory,
         ) -> Result<ProvenanceJournal, DelegationError>,
@@ -1227,6 +1432,7 @@ impl DelegationManager {
             let child_slots = config.limits.max_concurrent_agents - 1;
             let manager = Arc::new(Self {
                 config,
+                root_tools,
                 team_directory: team_directory.clone(),
                 team_storage: Some(Arc::clone(&team_storage)),
                 journal,
@@ -1246,6 +1452,10 @@ impl DelegationManager {
                 }),
                 permits: RwLock::new(Arc::new(Semaphore::new(child_slots))),
                 changed: Notify::new(),
+                telemetry: Mutex::new(DelegationTelemetryState {
+                    revision: 0,
+                    sender: None,
+                }),
             });
             manager.journal.append(&ProvenanceEvent::TeamStarted {
                 timestamp_ms: timestamp_ms(),
@@ -1278,7 +1488,11 @@ impl DelegationManager {
                 path: ROOT_AGENT_PATH.into(),
                 depth: 0,
             },
-            system_instructions: Arc::from(root_instructions(&self.config)),
+            system_instructions: Arc::from(if self.root_tools {
+                root_instructions(&self.config)
+            } else {
+                String::new()
+            }),
         }
     }
 
@@ -1353,6 +1567,7 @@ impl DelegationManager {
             drop(state);
             drop(permits);
             self.changed.notify_waiters();
+            self.publish_telemetry(None, None);
             return Ok(());
         }
 
@@ -1378,6 +1593,7 @@ impl DelegationManager {
         }
         drop(state);
         self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
         Ok(())
     }
 
@@ -1447,6 +1663,13 @@ impl DelegationManager {
                 .runtime
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(parent_tokens) = runtime.max_session_tokens {
+                policy.max_tokens = Some(
+                    policy
+                        .max_tokens
+                        .map_or(parent_tokens, |requested| requested.min(parent_tokens)),
+                );
+            }
             if let Some(parent_cost) = runtime.max_session_cost_microdollars {
                 policy.max_cost_microdollars = policy.max_cost_microdollars.min(parent_cost);
             }
@@ -1596,8 +1819,15 @@ impl DelegationManager {
                     started_at_ms: None,
                     completed_at_ms: None,
                     turn_count: 0,
+                    tool_call_count: 0,
+                    active_tools: BTreeMap::new(),
                     usage: Usage::default(),
-                    cost_microdollars: None,
+                    cost: (extension_policy.is_some()
+                        && self.template.model.spec.pricing.is_some())
+                    .then_some(Cost::default()),
+                    cost_microdollars: (extension_policy.is_some()
+                        && self.template.model.spec.pricing.is_some())
+                    .then_some(0),
                     deadline_at_ms,
                 },
             );
@@ -1623,6 +1853,7 @@ impl DelegationManager {
                 .await;
         });
         self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
 
         Ok(json!({
             "agent_id": identity.id,
@@ -1783,6 +2014,14 @@ impl DelegationManager {
                         },
                     )
                     .await;
+                self.update_agent_session_accounting(
+                    &identity.id,
+                    agent
+                        .as_ref()
+                        .expect("delegated agent remains initialized")
+                        .session(),
+                    self.template.model.spec.pricing.is_some(),
+                );
                 drop(permit);
 
                 let WorkerExecution {
@@ -2011,6 +2250,9 @@ impl DelegationManager {
             cache_retention: self.template.cache_retention,
             session_id: None,
         })?;
+        if extension_policy.is_some() {
+            agent.mark_ultra_observation_managed();
+        }
         if let Some(record) = self
             .state
             .lock()
@@ -2029,11 +2271,22 @@ impl DelegationManager {
         agent.set_completion_policy(runtime.completion_policy);
         agent.set_output_modalities(runtime.output_modalities);
         if let Some(policy) = extension_policy {
-            agent.inherit_max_output_tokens(runtime.max_output_tokens.min(policy.max_tokens));
-            agent.set_max_session_tokens(Some(policy.max_tokens));
-            agent.set_max_session_cost_microdollars(Some(policy.max_cost_microdollars));
+            agent.inherit_max_output_tokens(runtime.max_output_tokens);
+            let max_session_tokens = match (runtime.max_session_tokens, policy.max_tokens) {
+                (Some(parent), Some(requested)) => Some(parent.min(requested)),
+                (Some(parent), None) => Some(parent),
+                (None, requested) => requested,
+            };
+            let max_session_cost_microdollars = runtime
+                .max_session_cost_microdollars
+                .map_or(policy.max_cost_microdollars, |parent| {
+                    policy.max_cost_microdollars.min(parent)
+                });
+            agent.set_max_session_tokens(max_session_tokens);
+            agent.set_max_session_cost_microdollars(Some(max_session_cost_microdollars));
         } else {
             agent.inherit_max_output_tokens(runtime.max_output_tokens);
+            agent.set_max_session_tokens(runtime.max_session_tokens);
             agent.set_max_session_cost_microdollars(runtime.max_session_cost_microdollars);
         }
         agent.set_provider_retries_enabled(runtime.provider_retries_enabled);
@@ -2266,16 +2519,27 @@ impl DelegationManager {
                         acknowledged_follow_ups.add_usage(follow_up.usage());
                     }
                 }
+                Next::Event(Some(AgentEvent::ToolStarted { id, name, .. })) => {
+                    self.update_agent_tool_started(&identity.id, &id.0, name);
+                }
+                Next::Event(Some(AgentEvent::ToolFinished { id, .. })) => {
+                    self.update_agent_tool_finished(&identity.id, &id.0);
+                }
+                Next::Event(Some(AgentEvent::CandidateRejected { usage, .. })) => {
+                    self.update_agent_usage(&identity.id, usage, None, false);
+                }
                 Next::Event(Some(AgentEvent::TurnFinished {
                     message,
                     usage,
                     session_cost_microdollars,
                     ..
                 })) => {
-                    self.update_agent_usage(&identity.id, usage, session_cost_microdollars);
-                    if extension_policy
-                        .is_some_and(|policy| delegation_usage_tokens(&usage) > policy.max_tokens)
-                    {
+                    self.update_agent_usage(&identity.id, usage, session_cost_microdollars, true);
+                    if extension_policy.is_some_and(|policy| {
+                        policy
+                            .max_tokens
+                            .is_some_and(|limit| delegation_usage_tokens(&usage) > limit)
+                    }) {
                         control.abort();
                         requested_token_limit = true;
                     }
@@ -2331,7 +2595,7 @@ impl DelegationManager {
         }
     }
 
-    fn update_agent_usage(&self, id: &str, usage: Usage, cost_microdollars: Option<u64>) {
+    fn update_agent_tool_started(&self, id: &str, call_id: &str, name: String) {
         let mut state = self
             .state
             .lock()
@@ -2339,11 +2603,78 @@ impl DelegationManager {
         let Some(record) = state.records.get_mut(id) else {
             return;
         };
-        record.turn_count = record.turn_count.saturating_add(1);
-        record.usage = usage;
-        record.cost_microdollars = cost_microdollars;
+        record.tool_call_count = record.tool_call_count.saturating_add(1);
+        record.active_tools.insert(call_id.to_owned(), name);
         drop(state);
         self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
+    }
+
+    fn update_agent_tool_finished(&self, id: &str, call_id: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.records.get_mut(id) else {
+            return;
+        };
+        record.active_tools.remove(call_id);
+        drop(state);
+        self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
+    }
+
+    fn update_agent_usage(
+        &self,
+        id: &str,
+        usage: Usage,
+        cost_microdollars: Option<u64>,
+        completed_turn: bool,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.records.get_mut(id) else {
+            return;
+        };
+        if completed_turn {
+            record.turn_count = record.turn_count.saturating_add(1);
+        }
+        record.usage = usage;
+        if cost_microdollars.is_some() {
+            record.cost_microdollars = cost_microdollars;
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
+    }
+
+    fn update_agent_session_accounting(&self, id: &str, session: &Session, priced: bool) {
+        let mut usage = Usage::default();
+        let mut aggregate_cost = priced.then_some(Cost::default());
+        for record in session.usage_records() {
+            add_delegated_usage(&mut usage, &record.usage);
+            match (aggregate_cost.as_mut(), record.cost) {
+                (Some(total), Some(cost)) => add_delegated_cost(total, cost),
+                (Some(_), None) => aggregate_cost = None,
+                (None, _) => {}
+            }
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.records.get_mut(id) else {
+            return;
+        };
+        record.usage = usage;
+        record.cost = aggregate_cost;
+        record.cost_microdollars = aggregate_cost.map(|cost| cost.total);
+        record.active_tools.clear();
+        drop(state);
+        self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
     }
 
     fn set_status(&self, id: &str, status: DelegatedAgentStatus, notify_parent: bool) -> bool {
@@ -2355,6 +2686,9 @@ impl DelegationManager {
             return false;
         }
         let record = state.records.get(id).expect("checked child exists");
+        if matches!(&status, DelegatedAgentStatus::Shutdown) && !record.status.is_running() {
+            return true;
+        }
         if record.interrupt_requested
             && matches!(
                 status,
@@ -2421,6 +2755,7 @@ impl DelegationManager {
         }
         drop(state);
         self.changed.notify_waiters();
+        self.publish_telemetry(None, None);
         true
     }
 
@@ -3157,6 +3492,75 @@ impl DelegationManager {
         )
     }
 
+    async fn wait_for_descendants_to_settle(&self, owner_id: &str, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let active = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let owner_path = if owner_id == ROOT_AGENT_ID {
+                    Some(ROOT_AGENT_PATH)
+                } else {
+                    state
+                        .records
+                        .get(owner_id)
+                        .map(|record| record.identity.path.as_str())
+                };
+                owner_path.is_some_and(|owner_path| {
+                    state.records.values().any(|record| {
+                        is_descendant_path(&record.identity.path, owner_path)
+                            && record.status.is_running()
+                    })
+                })
+            };
+            if !active {
+                return;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return,
+                _ = &mut changed => {}
+            }
+        }
+    }
+
+    fn extension_usage_records(&self, owner_id: &str) -> Vec<DelegatedUsageRecord> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owner_path = if owner_id == ROOT_AGENT_ID {
+            Some(ROOT_AGENT_PATH)
+        } else {
+            state
+                .records
+                .get(owner_id)
+                .map(|record| record.identity.path.as_str())
+        };
+        let Some(owner_path) = owner_path else {
+            return Vec::new();
+        };
+        state
+            .records
+            .values()
+            .filter(|record| {
+                record.extension_principal.is_some()
+                    && is_descendant_path(&record.identity.path, owner_path)
+            })
+            .map(|record| DelegatedUsageRecord {
+                agent_id: record.identity.id.clone(),
+                usage: record.usage,
+                cost: record.cost,
+                turn_count: record.turn_count,
+                tool_call_count: record.tool_call_count,
+            })
+            .collect()
+    }
+
     fn request_shutdown_descendants(&self, owner_id: &str) {
         let mut state = self
             .state
@@ -3517,20 +3921,25 @@ pub(crate) fn enable_root_delegation(
     agent: &mut Agent,
     config: DelegationConfig,
     template: DelegationTemplate,
+    root_tools: bool,
 ) -> Result<DelegationBinding, DelegationError> {
-    for name in &COLLABORATION_TOOL_NAMES {
-        if agent
-            .registered_tool_names()
-            .iter()
-            .any(|registered| registered == name)
-        {
-            return Err(DelegationError::DuplicateTool((*name).into()));
+    if root_tools {
+        for name in &COLLABORATION_TOOL_NAMES {
+            if agent
+                .registered_tool_names()
+                .iter()
+                .any(|registered| registered == name)
+            {
+                return Err(DelegationError::DuplicateTool((*name).into()));
+            }
         }
     }
-    let manager = DelegationManager::create(config, template, agent.session().path())?;
+    let manager = DelegationManager::create(config, template, agent.session().path(), root_tools)?;
     let binding = manager.root_binding();
-    agent.append_system_instructions(binding.system_instructions().to_owned());
-    agent.install_delegation_tools(manager.tools(&binding.identity));
+    if manager.root_tools {
+        agent.append_system_instructions(binding.system_instructions().to_owned());
+        agent.install_delegation_tools(manager.tools(&binding.identity));
+    }
     Ok(binding)
 }
 
@@ -3846,6 +4255,34 @@ fn command_queue_error<T>(error: tokio::sync::mpsc::error::TrySendError<T>) -> S
     }
 }
 
+fn classify_delegation_failure(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("persist") || lower.contains("session descriptor") {
+        "persistence_failure"
+    } else if lower.contains("provider") || lower.contains("model response") {
+        "provider_failure"
+    } else if lower.contains("tool")
+        && (lower.contains("policy")
+            || lower.contains("scope")
+            || lower.contains("unavailable")
+            || lower.contains("denied"))
+    {
+        "tool_policy_failure"
+    } else if lower.contains("token")
+        || lower.contains("turn")
+        || lower.contains("cost")
+        || lower.contains("limit")
+    {
+        "limit"
+    } else if lower.contains("start") || lower.contains("construct") {
+        "child_construction_failure"
+    } else if lower.contains("interrupt") || lower.contains("abort") || lower.contains("cancel") {
+        "cancellation"
+    } else {
+        "child_failure"
+    }
+}
+
 fn status_message(path: &str, status: &DelegatedAgentStatus) -> String {
     match status {
         DelegatedAgentStatus::Completed { output } => {
@@ -3871,6 +4308,19 @@ fn list_value_locked(state: &ManagerState) -> Value {
 }
 
 fn agent_record_value(record: &AgentRecord) -> Value {
+    let phase = if !record.active_tools.is_empty() {
+        "using_tool"
+    } else {
+        match &record.status {
+            DelegatedAgentStatus::Pending => "queued",
+            DelegatedAgentStatus::Running => "thinking",
+            DelegatedAgentStatus::Completed { .. } => "completed",
+            DelegatedAgentStatus::Interrupted => "interrupted",
+            DelegatedAgentStatus::Failed { .. } => "failed",
+            DelegatedAgentStatus::TimedOut => "timed_out",
+            DelegatedAgentStatus::Shutdown => "shutdown",
+        }
+    };
     json!({
         "agent_id": record.identity.id,
         "agent_path": record.identity.path,
@@ -3887,6 +4337,9 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "started_at_ms": record.started_at_ms,
         "completed_at_ms": record.completed_at_ms,
         "turn_count": record.turn_count,
+        "tool_call_count": record.tool_call_count,
+        "phase": phase,
+        "tool_name": record.active_tools.values().next_back(),
         "usage": record.usage,
         "cost_microdollars": record.cost_microdollars,
         "deadline_at_ms": record.deadline_at_ms,
@@ -3950,6 +4403,37 @@ fn validate_durable_text(kind: &str, text: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn add_delegated_usage(total: &mut Usage, next: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(next.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(next.cache_write_tokens);
+    total.cache_write_1h_tokens = total
+        .cache_write_1h_tokens
+        .saturating_add(next.cache_write_1h_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.reasoning_tokens = total.reasoning_tokens.saturating_add(next.reasoning_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
+}
+
+fn add_delegated_cost(total: &mut Cost, next: Cost) {
+    total.input = total.input.saturating_add(next.input);
+    total.output = total.output.saturating_add(next.output);
+    total.reasoning = total.reasoning.saturating_add(next.reasoning);
+    total.cache_read = total.cache_read.saturating_add(next.cache_read);
+    total.cache_write = total.cache_write.saturating_add(next.cache_write);
+    let remainder = u64::from(total.total_picodollars_remainder)
+        .saturating_add(u64::from(next.total_picodollars_remainder));
+    total.total = total
+        .total
+        .saturating_add(next.total)
+        .saturating_add(remainder / u64::from(PICODOLLARS_PER_MICRODOLLAR));
+    total.total_picodollars_remainder = (remainder % u64::from(PICODOLLARS_PER_MICRODOLLAR)) as u32;
 }
 
 fn delegation_usage_tokens(usage: &Usage) -> u64 {
@@ -4050,7 +4534,7 @@ mod tests {
             max_depth: 1,
             max_concurrent_children: 2,
             max_turns: 4,
-            max_tokens: 32_000,
+            max_tokens: Some(32_000),
             max_cost_microdollars: 200_000,
             max_output_bytes: 8 * 1024,
             timeout_ms: 300_000,
@@ -4099,6 +4583,7 @@ mod tests {
                 completion_policy: CompletionPolicy::Natural,
                 output_modalities: ygg_ai::OutputModalities::Text,
                 max_output_tokens,
+                max_session_tokens: None,
                 max_session_cost_microdollars: None,
                 provider_retries_enabled: true,
             }),
@@ -4108,6 +4593,7 @@ mod tests {
     fn manager_with_journal(file: File, directory: &Path) -> Arc<DelegationManager> {
         Arc::new(DelegationManager {
             config: DelegationConfig::new(directory),
+            root_tools: true,
             team_directory: directory.to_path_buf(),
             team_storage: None,
             journal: ProvenanceJournal {
@@ -4129,6 +4615,10 @@ mod tests {
             }),
             permits: RwLock::new(Arc::new(Semaphore::new(3))),
             changed: Notify::new(),
+            telemetry: Mutex::new(DelegationTelemetryState {
+                revision: 0,
+                sender: None,
+            }),
         })
     }
 
@@ -4168,6 +4658,7 @@ mod tests {
             .unwrap();
         Arc::new(DelegationManager {
             config: DelegationConfig::new(directory),
+            root_tools: true,
             team_directory: directory.to_path_buf(),
             team_storage: None,
             journal: ProvenanceJournal {
@@ -4189,7 +4680,52 @@ mod tests {
             }),
             permits: RwLock::new(Arc::new(Semaphore::new(3))),
             changed: Notify::new(),
+            telemetry: Mutex::new(DelegationTelemetryState {
+                revision: 0,
+                sender: None,
+            }),
         })
+    }
+
+    #[tokio::test]
+    async fn telemetry_snapshots_are_monotonic_and_spawn_is_not_a_tool_use() {
+        let directory = tempfile::tempdir().unwrap();
+        let team_directory = directory.path().join("team-test");
+        std::fs::create_dir(&team_directory).unwrap();
+        let manager = writable_manager_with_core_tools(&team_directory);
+        let root = manager.root_binding();
+        let mut telemetry = root.telemetry_receiver().expect("root telemetry stream");
+        let first = telemetry.recv().await.expect("initial snapshot");
+        let service = root
+            .extension_service("principal", "parent-session", "owner")
+            .unwrap();
+        let result = service
+            .spawn(
+                "owner",
+                test_extension_spawn("explore", Some("explore"), None, "read", "telemetry-1"),
+            )
+            .unwrap();
+        let agent_id = result["agent_id"].as_str().unwrap().to_owned();
+        let spawned = telemetry.recv().await.expect("spawn snapshot");
+        let child = spawned
+            .children
+            .iter()
+            .find(|child| child.child_id == agent_id)
+            .unwrap();
+        assert!(spawned.revision > first.revision);
+        assert_eq!(child.tool_use_count, 0);
+        assert_eq!(child.task_name, "explore");
+
+        manager.update_agent_tool_started(&agent_id, "tool-1", "read".into());
+        let using_tool = telemetry.recv().await.expect("tool-start snapshot");
+        let child = using_tool
+            .children
+            .iter()
+            .find(|child| child.child_id == agent_id)
+            .unwrap();
+        assert!(using_tool.revision > spawned.revision);
+        assert_eq!(child.tool_use_count, 1);
+        assert_eq!(child.current_tool.as_deref(), Some("read"));
     }
 
     #[test]
@@ -4316,7 +4852,10 @@ mod tests {
                     started_at_ms: Some(1),
                     completed_at_ms: None,
                     turn_count: 0,
+                    tool_call_count: 0,
+                    active_tools: BTreeMap::new(),
                     usage: Usage::default(),
+                    cost: None,
                     cost_microdollars: None,
                     deadline_at_ms: None,
                 },
@@ -4580,6 +5119,7 @@ mod tests {
             DelegationConfig::new(&teams),
             test_template(&root),
             &root_session,
+            true,
             |directory| {
                 let path = directory.path().join("provenance.jsonl");
                 drop(directory.create_regular_file_for_append(&path)?);
@@ -4609,6 +5149,7 @@ mod tests {
             DelegationConfig::new(&teams),
             test_template(&root),
             &root.join("root.jsonl"),
+            true,
             |directory| {
                 std::fs::rename(directory.path(), &original).unwrap();
                 secure_fs::create_private_directory_all(directory.path()).unwrap();
@@ -4640,6 +5181,7 @@ mod tests {
             DelegationConfig::new(&teams),
             test_template(&root),
             &root.join("root.jsonl"),
+            true,
         )
         .unwrap();
         let team_directory = manager.team_directory.clone();
@@ -4714,7 +5256,10 @@ mod tests {
                 started_at_ms: Some(1),
                 completed_at_ms: None,
                 turn_count: 0,
+                tool_call_count: 0,
+                active_tools: BTreeMap::new(),
                 usage: Usage::default(),
+                cost: None,
                 cost_microdollars: None,
                 deadline_at_ms: None,
             },
@@ -4816,6 +5361,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_child_without_parent_or_requested_token_limit_is_unlimited() {
+        let directory = tempfile::tempdir().unwrap();
+        let team = directory.path().join("team-inherited-token-limit");
+        std::fs::create_dir(&team).unwrap();
+        let manager = writable_manager_with_core_tools(&team);
+        assert_eq!(
+            manager.template.runtime.read().unwrap().max_session_tokens,
+            None
+        );
+        let mut policy = test_extension_policy();
+        policy.max_tokens = None;
+        let session = Session::create(team.join("inherited-child.jsonl")).unwrap();
+        let identity = AgentIdentity {
+            id: "agent-inherited".into(),
+            path: "/root/inherited".into(),
+            depth: 1,
+        };
+        let child = manager
+            .build_child_agent(session, &identity, Some(&policy))
+            .unwrap();
+        assert_eq!(child.max_session_tokens(), None);
+        assert_eq!(
+            child.max_output_tokens(),
+            manager.template.runtime.read().unwrap().max_output_tokens
+        );
+
+        let binding = manager.root_binding();
+        let service = binding
+            .extension_service("extension-policy", "parent-session", "root-owner")
+            .unwrap();
+        let mut request = test_extension_spawn(
+            "inherited",
+            Some("review"),
+            None,
+            "inherit parent token policy",
+            "inherited-token-key",
+        );
+        request.policy.max_tokens = None;
+        let result = service.spawn("root-owner", request).unwrap();
+        assert!(result["policy"]["max_tokens"].is_null());
+        binding.request_shutdown();
+    }
+
+    #[tokio::test]
+    async fn extension_child_limits_are_clamped_to_parent_session_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let team = directory.path().join("team-parent-limits");
+        std::fs::create_dir(&team).unwrap();
+        let manager = writable_manager_with_core_tools(&team);
+        let binding = manager.root_binding();
+        let mut runtime = manager.template.runtime.read().unwrap().clone();
+        runtime.max_session_tokens = Some(48_000);
+        runtime.max_session_cost_microdollars = Some(125_000);
+        binding.update_runtime_settings(runtime);
+        let service = binding
+            .extension_service("extension-policy", "parent-session", "root-owner")
+            .unwrap();
+        let mut request = test_extension_spawn(
+            "bounded",
+            Some("review"),
+            None,
+            "respect parent limits",
+            "parent-limits-key",
+        );
+        request.policy.max_turns = 12;
+        request.policy.max_tokens = Some(64_000);
+        request.policy.max_cost_microdollars = 500_000;
+
+        let result = service.spawn("root-owner", request).unwrap();
+
+        assert_eq!(result["policy"]["max_turns"], 4);
+        assert_eq!(result["policy"]["max_tokens"], 48_000);
+        assert_eq!(result["policy"]["max_cost_microdollars"], 125_000);
+        binding.request_shutdown();
+    }
+
+    #[tokio::test]
     async fn extension_service_enforces_concurrency_depth_deadline_and_list_provenance() {
         let directory = tempfile::tempdir().unwrap();
         let team = directory.path().join("team-extension-policy");
@@ -4825,24 +5447,21 @@ mod tests {
         let service = binding
             .extension_service("extension-policy", "parent-session", "root-owner")
             .unwrap();
-        let first = service
-            .spawn(
-                "root-owner",
-                test_extension_spawn(
-                    "first",
-                    Some("review"),
-                    Some(&"f".repeat(64)),
-                    "first bounded task",
-                    "first-key",
-                ),
-            )
-            .unwrap();
-        let second = service
-            .spawn(
-                "root-owner",
-                test_extension_spawn("second", None, None, "second bounded task", "second-key"),
-            )
-            .unwrap();
+        let mut first_request = test_extension_spawn(
+            "first",
+            Some("review"),
+            Some(&"f".repeat(64)),
+            "first bounded task",
+            "first-key",
+        );
+        first_request.policy.max_tokens = Some(64_000);
+        first_request.policy.max_cost_microdollars = 500_000;
+        let first = service.spawn("root-owner", first_request).unwrap();
+        let mut second_request =
+            test_extension_spawn("second", None, None, "second bounded task", "second-key");
+        second_request.policy.max_tokens = Some(64_000);
+        second_request.policy.max_cost_microdollars = 500_000;
+        let second = service.spawn("root-owner", second_request).unwrap();
         let error = service
             .spawn(
                 "root-owner",
@@ -4855,7 +5474,24 @@ mod tests {
         {
             let mut state = manager.state.lock().unwrap();
             let record = state.records.get_mut(first_id).unwrap();
+            assert!(extension_delegated_session_matches_owner(
+                "extension-policy",
+                "root-owner",
+                &record.session_path,
+            ));
+            assert!(!extension_delegated_session_matches_owner(
+                "another-extension",
+                "root-owner",
+                &record.session_path,
+            ));
+            assert!(!extension_delegated_session_matches_owner(
+                "extension-policy",
+                "another-owner",
+                &record.session_path,
+            ));
             record.turn_count = 2;
+            record.tool_call_count = 3;
+            record.active_tools.insert("call-3".into(), "search".into());
             record.usage = Usage {
                 input_tokens: 10,
                 output_tokens: 5,
@@ -4874,6 +5510,9 @@ mod tests {
         assert_eq!(record["task_name"], "first");
         assert_eq!(record["policy"]["tools"], json!(["read", "search"]));
         assert_eq!(record["turn_count"], 2);
+        assert_eq!(record["tool_call_count"], 3);
+        assert_eq!(record["phase"], "using_tool");
+        assert_eq!(record["tool_name"], "search");
         assert_eq!(record["usage"]["total_tokens"], 15);
         assert_eq!(record["cost_microdollars"], 7);
         assert_eq!(record["profile"], "review");
@@ -4953,6 +5592,16 @@ mod tests {
             .unwrap_err();
         assert!(nested_error.contains("depth limit"), "{nested_error}");
         assert_eq!(second["policy"]["max_concurrent_children"], 2);
+        assert_eq!(first["policy"]["max_tokens"], 64_000);
+        assert_eq!(second["policy"]["max_tokens"], 64_000);
+        assert_eq!(first["policy"]["max_cost_microdollars"], 500_000);
+        assert_eq!(second["policy"]["max_cost_microdollars"], 500_000);
+
+        binding.request_shutdown();
+        assert!(
+            service.list("root-owner").is_ok(),
+            "owner-scoped observation must remain available after root settlement"
+        );
     }
 
     #[tokio::test]
@@ -5053,6 +5702,41 @@ mod tests {
         assert!(manager.state.lock().unwrap().records[&identity.id]
             .shutdown
             .is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn extension_spawn_idempotency_is_pruned_at_the_next_owning_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let team = directory.path().join("team-idempotency-runs");
+        std::fs::create_dir(&team).unwrap();
+        let manager = writable_manager_with_core_tools(&team);
+        let binding = manager.root_binding();
+        let service = binding
+            .extension_service("extension-a", "parent-session", "root-owner")
+            .unwrap();
+        let first = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn("research", None, None, "find it", "spawn-1"),
+            )
+            .unwrap();
+
+        manager.prepare_owning_run(&root_identity()).unwrap();
+        let second = service
+            .spawn(
+                "root-owner",
+                test_extension_spawn("research", None, None, "find it", "spawn-1"),
+            )
+            .unwrap();
+
+        assert_ne!(first["agent_id"], second["agent_id"]);
+        assert_eq!(
+            service.list("root-owner").unwrap()["agents"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -5694,6 +6378,7 @@ mod tests {
         settings.completion_policy = CompletionPolicy::TerminalGate;
         settings.output_modalities = audio.clone();
         settings.max_output_tokens = 777;
+        settings.max_session_tokens = Some(84_000);
         settings.max_session_cost_microdollars = Some(42);
         settings.provider_retries_enabled = false;
         binding.update_runtime_settings(settings);
@@ -5715,7 +6400,9 @@ mod tests {
         assert_eq!(child.completion_policy(), CompletionPolicy::TerminalGate);
         assert_eq!(child.output_modalities(), &audio);
         assert_eq!(child.max_output_tokens(), 777);
+        assert_eq!(child.max_session_tokens(), Some(84_000));
         let settings = manager.template.runtime.read().unwrap();
+        assert_eq!(settings.max_session_tokens, Some(84_000));
         assert_eq!(settings.max_session_cost_microdollars, Some(42));
         assert!(!settings.provider_retries_enabled);
     }
@@ -5852,7 +6539,10 @@ mod tests {
                     started_at_ms: Some(1),
                     completed_at_ms: None,
                     turn_count: 0,
+                    tool_call_count: 0,
+                    active_tools: BTreeMap::new(),
                     usage: Usage::default(),
+                    cost: None,
                     cost_microdollars: None,
                     deadline_at_ms: None,
                 },

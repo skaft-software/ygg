@@ -3,6 +3,10 @@
 # no installation or environment mutation; exec keeps one long-lived Python
 # process for the Ygg SDK and the selected Hermes provider.
 set -eu
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ -n "${YGG_EXTENSION_DIR:-}" ]; then
+    SCRIPT_DIR=$YGG_EXTENSION_DIR
+else
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fi
 PYTHON=${YGG_HERMES_PYTHON:-python3}
 exec "$PYTHON" "$SCRIPT_DIR/extension.py" "$@"

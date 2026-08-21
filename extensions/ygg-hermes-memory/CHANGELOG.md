@@ -7,8 +7,8 @@
 - Add metadata-only directory and installed-entry-point discovery with exact
   runtime/process trust fingerprints and explicit selection.
 - Map dynamic tools, fenced prompt context, successful turn sync, terminal
-  lifecycle cleanup, memory-write mirroring, health, cancellation, and bounded
-  shutdown onto Ygg API `0.2`.
+  lifecycle cleanup, memory-write mirroring, health, process-generation-fenced
+  timeout/cancellation, and bounded shutdown onto Ygg API `0.2`.
 - Add generic provider/read/write/sync presentation, `/memory` headless
   inspection/actions, adversarial and offline fixtures, synchronized SDK,
   conformance tests, and reproducible release smoke coverage.

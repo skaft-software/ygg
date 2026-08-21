@@ -130,22 +130,32 @@ def worker_secondary(worker: Worker, now_ms: int) -> str:
     turns = "?/%d turns" % worker.max_turns
     if worker.turn_count is not None:
         turns = "%d/%d turns" % (worker.turn_count, worker.max_turns)
-    tokens = "?/%d tok" % worker.max_tokens
-    if worker.tokens_used is not None:
-        tokens = "%d/%d tok" % (worker.tokens_used, worker.max_tokens)
+    if worker.max_tokens is None:
+        tokens = "%s tok · inherited no ceiling" % (
+            worker.tokens_used if worker.tokens_used is not None else "?"
+        )
+    else:
+        tokens = "?/%d tok" % worker.max_tokens
+        if worker.tokens_used is not None:
+            tokens = "%d/%d tok" % (worker.tokens_used, worker.max_tokens)
     cost = "%s/%s" % (
         cost_label(worker.cost_microdollars),
         cost_label(worker.max_cost_microdollars),
     )
     restart = " · restarted" if worker.recovered else ""
+    tool_calls = "%d tool call%s" % (
+        worker.tool_call_count,
+        "" if worker.tool_call_count == 1 else "s",
+    )
     return bounded_text(
-        "%s · %s · %s · %s/%s · %s · %s · %s%s"
+        "%s · %s · %s · %s/%s · %s · %s · %s · %s%s"
         % (
             state,
             duration_label(worker.elapsed_ms(now_ms)),
             phase,
             worker.profile,
             worker.effective_model,
+            tool_calls,
             turns,
             tokens,
             cost,
@@ -157,6 +167,12 @@ def worker_secondary(worker: Worker, now_ms: int) -> str:
 
 def detail_body(worker: Worker, now_ms: int) -> str:
     tools = ", ".join(worker.tools)
+    token_use = str(worker.tokens_used) if worker.tokens_used is not None else "not exposed"
+    token_limit = (
+        str(worker.max_tokens)
+        if worker.max_tokens is not None
+        else "inherited parent setting (no session ceiling)"
+    )
     lines = [
         "State: %s" % STATE_LABEL.get(worker.state, worker.state),
         "Worker: %s (%s)" % (worker.name, worker.agent_id),
@@ -166,7 +182,16 @@ def detail_body(worker: Worker, now_ms: int) -> str:
         "Current phase/tool: %s" % safe_label(worker.current_tool or worker.phase),
         "Requested tool policy: read-only [%s]" % tools,
         "Turn use: %s / %d" % (worker.turn_count if worker.turn_count is not None else "not exposed", worker.max_turns),
-        "Token use: %s / %d" % (worker.tokens_used if worker.tokens_used is not None else "not exposed", worker.max_tokens),
+        "Tool calls: %d" % worker.tool_call_count,
+        "Token use: %s / %s" % (token_use, token_limit),
+        "Token buckets: input %s + cache read %s + cache write %s; output %s (reasoning %s)."
+        % (
+            worker.input_tokens if worker.input_tokens is not None else "not exposed",
+            worker.cache_read_tokens if worker.cache_read_tokens is not None else "not exposed",
+            worker.cache_write_tokens if worker.cache_write_tokens is not None else "not exposed",
+            worker.output_tokens if worker.output_tokens is not None else "not exposed",
+            worker.reasoning_tokens if worker.reasoning_tokens is not None else "not exposed",
+        ),
         "Cost use: %s / %d microdollars" % (worker.cost_microdollars if worker.cost_microdollars is not None else "not exposed", worker.max_cost_microdollars),
         "Wall deadline: %d ms Unix time (%d second request)" % (worker.deadline_at_ms, worker.timeout_seconds),
         "Cwd/workspace: inherited from the parent Ygg session.",
@@ -248,6 +273,16 @@ def build_snapshot(
         nodes.append(node)
 
         phase = safe_label(worker.current_tool or worker.phase or worker.state)
+        metrics: Dict[str, Any] = {
+            "tool_calls": worker.tool_call_count,
+            "input_tokens": worker.input_tokens or 0,
+            "cache_read_tokens": worker.cache_read_tokens or 0,
+            "cache_write_tokens": worker.cache_write_tokens or 0,
+            "output_tokens": worker.output_tokens or 0,
+            "reasoning_tokens": worker.reasoning_tokens or 0,
+        }
+        if worker.cost_microdollars is not None:
+            metrics["cost_microdollars"] = worker.cost_microdollars
         activity: Dict[str, Any] = {
             "id": semantic_id("activity", worker.agent_id),
             "kind": "subagent",
@@ -256,6 +291,7 @@ def build_snapshot(
             "summary": bounded_text("%s · %s" % (worker.name, phase), 1024),
             "provenance": "Ygg agent_sessions · read-only",
             "started_at_ms": worker.started_at_ms,
+            "metrics": metrics,
             "references": worker_references(worker),
         }
         if worker.completed_at_ms is not None:

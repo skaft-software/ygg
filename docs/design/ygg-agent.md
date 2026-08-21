@@ -40,21 +40,29 @@ Writes use an advisory exclusive lock, compare the observed file length under th
 For explicit orchestration boundaries (hosted delegation vs local delegated children, sandbox/approval/env/cwd inheritance, extension trust propagation, and explicit non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
 
 `ygg-agent` owns host execution for `AgentDelegation::V2`; the model capability in
-`ygg-ai` is metadata only. `Agent::enable_v2_delegation` installs
-`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
-`interrupt_agent`. Available mode exposes the tools on demand; proactive mode
-also instructs the root to use sub-agents when parallel work would materially
-improve speed or quality and to verify child results before integrating them.
+`ygg-ai` is metadata only. The generic `Agent::enable_v2_delegation` API can
+install the native collaboration surface for embedders that explicitly choose
+it. The coding product instead enables the manager in extension-only mode: only
+the trusted, enabled `ygg-subagents` extension receives the owner-bound
+`agent_sessions` service, and the root model never receives the parallel native
+`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, or
+`interrupt_agent` tools. Available/proactive mode guidance applies only to the
+generic API; product orchestration and observation remain extension-owned.
 
 Each child has a stable ID and ancestry path, an isolated append-only `Session`,
 and its own agent loop. It inherits the effective root system prompt at spawn
 time, approved extension host/tool set, sandbox, model, reasoning and cache
 settings, compaction model/policy, completion policy, output modalities, resolved
-output-token limit, retry policy, turn limit, session cost ceiling, and the root's
-cloned effect broker. That clone preserves a shared policy/grant store; it is not
-yet child-specific authority attenuation. Controlled therefore denies the
-`Delegation` effect entirely, while UnsafeHost delegation must be treated as
-ambient-authority compatibility mode. Children
+context/output limits, retry policy, turn limit, optional session token ceiling,
+session cost ceiling, and the root's cloned effect broker. A missing root session
+token ceiling remains missing in the child; the host does not invent one. Each
+child starts a fresh independent context. Its settled usage is mirrored into the
+root ledger for accounting and cost-limit checks, never inserted into the
+parent's prompt context or charged to the parent's own-context token ceiling. The
+broker clone preserves a shared policy/grant store; it is not yet child-specific
+authority attenuation. Controlled therefore denies the `Delegation` effect
+entirely, while UnsafeHost delegation must be treated as ambient-authority
+compatibility mode. Children
 can message peers, steer active work, queue messages for an idle worker, receive
 follow-up runs, wait without lost notifications, and spawn within the remaining
 depth and concurrency bounds.
@@ -103,7 +111,13 @@ Cancellation propagates down ancestry. Every owning run terminal (including
 normal completion, failure, max-turn termination, explicit abort, and incomplete
 `Run` drop), root `Agent` drop, worker interruption/failure, closed command
 channels, and team shutdown cancel worker tokens and send shutdown commands;
-descendants are stopped with their parent.
+descendants are stopped with their parent. A normally driven root terminal also
+waits up to two seconds for extension-owned descendants to settle, aggregates
+each child session's durable disjoint usage and exact category cost (including
+picodollar remainder), and appends one `UsageRecordKind::DelegatedAgent` entry
+per child to the root session before its checkpoint. The child remains the
+detailed source of truth; the root mirror is the cumulative accounting and cost-
+limit ledger.
 
 ## Filesystem tools
 

@@ -32,15 +32,16 @@ use crate::delegation::{
 };
 use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
 use crate::events::{
-    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
-    OutputChannel, QueueDeliveryMode,
+    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
+    DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
-    EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
+    DelegatedUsage, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
+    UsageRecordKind,
 };
 use crate::tool::{
     CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
@@ -330,6 +331,9 @@ pub struct Agent {
     max_session_tokens: Option<u64>,
     max_session_cost_microdollars: Option<u64>,
     provider_retries_enabled: bool,
+    /// Child sessions owned by the delegation manager are observed by their
+    /// parent even when they do not carry a nested delegation binding.
+    ultra_observation_managed: bool,
     delegation: Option<DelegationBinding>,
     last_run_lifecycle: Option<Arc<RunLifecycle>>,
 }
@@ -2269,10 +2273,14 @@ fn usage_total_tokens(usage: &Usage) -> u64 {
     }
 }
 
-fn session_total_tokens(session: &Session) -> u64 {
-    session.usage_records().iter().fold(0u64, |total, record| {
-        total.saturating_add(usage_total_tokens(&record.usage))
-    })
+fn session_total_tokens_for_own_context(session: &Session) -> u64 {
+    session
+        .usage_records()
+        .iter()
+        .filter(|record| !matches!(&record.kind, UsageRecordKind::DelegatedAgent { .. }))
+        .fold(0u64, |total, record| {
+            total.saturating_add(usage_total_tokens(&record.usage))
+        })
 }
 
 fn reserve_request_tokens(
@@ -2284,7 +2292,7 @@ fn reserve_request_tokens(
     let Some(limit) = limit else {
         return Ok(());
     };
-    let current = session_total_tokens(session);
+    let current = session_total_tokens_for_own_context(session);
     let reserved = input_tokens.saturating_add(output_tokens);
     if current >= limit || current.saturating_add(reserved) > limit {
         return Err(AgentError::TokenLimit {
@@ -3016,6 +3024,7 @@ impl Agent {
             max_session_tokens: None,
             max_session_cost_microdollars: None,
             provider_retries_enabled: true,
+            ultra_observation_managed: false,
             delegation: None,
             last_run_lifecycle: None,
         })
@@ -3096,6 +3105,24 @@ impl Agent {
         &mut self,
         config: DelegationConfig,
     ) -> Result<std::path::PathBuf, DelegationError> {
+        self.enable_v2_delegation_with_surface(config, true)
+    }
+
+    /// Enables the bounded V2 runtime without exposing native root
+    /// collaboration tools. Product layers use this when an extension owns the
+    /// user-facing orchestration and observation surface.
+    pub fn enable_v2_delegation_extension_only(
+        &mut self,
+        config: DelegationConfig,
+    ) -> Result<std::path::PathBuf, DelegationError> {
+        self.enable_v2_delegation_with_surface(config, false)
+    }
+
+    fn enable_v2_delegation_with_surface(
+        &mut self,
+        config: DelegationConfig,
+        root_tools: bool,
+    ) -> Result<std::path::PathBuf, DelegationError> {
         if self.delegation.is_some() {
             return Err(DelegationError::AlreadyEnabled);
         }
@@ -3112,7 +3139,7 @@ impl Agent {
             cache_retention: self.cache_retention,
             runtime: std::sync::RwLock::new(self.delegation_runtime_settings()),
         };
-        let binding = enable_root_delegation(self, config, template)?;
+        let binding = enable_root_delegation(self, config, template, root_tools)?;
         let team_directory = binding.team_directory().to_path_buf();
         self.delegation = Some(binding);
         Ok(team_directory)
@@ -3178,6 +3205,7 @@ impl Agent {
             completion_policy: self.completion_policy,
             output_modalities: self.output_modalities.clone(),
             max_output_tokens: self.max_output_tokens,
+            max_session_tokens: self.max_session_tokens,
             max_session_cost_microdollars: self.max_session_cost_microdollars,
             provider_retries_enabled: self.provider_retries_enabled,
         }
@@ -3211,6 +3239,10 @@ impl Agent {
         }
         self.delegation = Some(binding);
         Ok(())
+    }
+
+    pub(crate) fn mark_ultra_observation_managed(&mut self) {
+        self.ultra_observation_managed = true;
     }
 
     /// Set the stable semantic creator/source key persisted with future user
@@ -3269,6 +3301,7 @@ impl Agent {
     /// estimated input plus maximum output before network I/O.
     pub(crate) fn set_max_session_tokens(&mut self, limit: Option<u64>) {
         self.max_session_tokens = limit;
+        self.sync_delegation_runtime_settings();
     }
 
     /// Configure a conservative hard ceiling for billable session requests.
@@ -3435,6 +3468,11 @@ impl Agent {
     /// Output-token reservation applied to each normal provider request.
     pub fn max_output_tokens(&self) -> u64 {
         self.max_output_tokens
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_session_tokens(&self) -> Option<u64> {
+        self.max_session_tokens
     }
 
     /// Apply the root agent's resolved output reservation to a delegated child.
@@ -3703,6 +3741,14 @@ impl Agent {
     /// failed, or max-turns — is reported by exactly one
     /// [`AgentEvent::RunFinished`].
     pub async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError> {
+        if self.reasoning == ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+            && self.delegation.is_none()
+            && !self.ultra_observation_managed
+        {
+            return Err(AgentError::Delegation(
+                "Ultra requires an enabled child-session observation runtime".into(),
+            ));
+        }
         // Direct library callers may not have an explicit construction
         // boundary. Keep this idempotent fallback so their first owning run
         // cannot leave dynamic publishers waiting forever.
@@ -3794,6 +3840,10 @@ impl Agent {
         let provider_retries_enabled = self.provider_retries_enabled;
         let stream_delegation = self.delegation.clone();
         let run_delegation = self.delegation.clone();
+        let mut delegation_telemetry = self
+            .delegation
+            .as_ref()
+            .and_then(DelegationBinding::telemetry_receiver);
         let stream_lifecycle = lifecycle.clone();
         let session = &mut self.session;
 
@@ -4146,6 +4196,7 @@ impl Agent {
                 enum Next {
                     Event(Option<Result<StreamEvent, AiError>>),
                     Ctl(Option<Control>),
+                    Delegation(Option<DelegationTelemetrySnapshot>),
                     Abort,
                 }
                 let mut attempt_saw_generation = false;
@@ -4153,6 +4204,12 @@ impl Agent {
                     let next = tokio::select! {
                         ev = response_stream.next() => Next::Event(ev),
                         c = control_rx.recv(), if control_open => Next::Ctl(c),
+                        snapshot = async {
+                            match &mut delegation_telemetry {
+                                Some(receiver) => receiver.recv().await,
+                                None => std::future::pending().await,
+                            }
+                        }, if delegation_telemetry.is_some() => Next::Delegation(snapshot),
                         _ = abort.wait() => Next::Abort,
                     };
                     match next {
@@ -4164,6 +4221,12 @@ impl Agent {
                         Next::Ctl(Some(Control::SetSteeringMode(mode))) => steering_mode = mode,
                         Next::Ctl(Some(Control::SetFollowUpMode(mode))) => follow_up_mode = mode,
                         Next::Ctl(None) => control_open = false,
+                        Next::Delegation(Some(snapshot)) => {
+                            let event = AgentEvent::DelegationUpdated { snapshot };
+                            notify_observers(&observers, &event);
+                            yield event;
+                        }
+                        Next::Delegation(None) => delegation_telemetry = None,
                         Next::Event(None) => {
                             let error = AiError::StreamProtocol(
                                 ygg_ai::StreamProtocolError::MissingFinish,
@@ -5101,6 +5164,37 @@ impl Agent {
                     reason = FinishReason::Failed(error);
                 }
             }
+            if let Some(delegation) = &stream_delegation {
+                // Stop and briefly settle extension-owned children before the
+                // root checkpoint so their durable provider records can be
+                // mirrored into the root accounting ledger exactly once.
+                delegation.request_shutdown();
+                delegation
+                    .settle_descendants(Duration::from_secs(2))
+                    .await;
+                for delegated in delegation.delegated_usage_records() {
+                    if let Err(error) = session.record_delegated_agent_usage(DelegatedUsage {
+                        agent_id: delegated.agent_id,
+                        turn_count: delegated.turn_count,
+                        tool_call_count: delegated.tool_call_count,
+                        endpoint: model.endpoint.id.clone(),
+                        model: model.spec.id.clone(),
+                        usage: delegated.usage,
+                        cost: delegated.cost,
+                    }) {
+                        reason = FinishReason::Failed(error.into());
+                        break;
+                    }
+                }
+                if let Some(receiver) = delegation_telemetry.as_mut() {
+                    while let Ok(snapshot) = receiver.try_recv() {
+                        let event = AgentEvent::DelegationUpdated { snapshot };
+                        notify_observers(&observers, &event);
+                        yield event;
+                    }
+                }
+                delegation.detach_telemetry();
+            }
             let checkpoint_usage = (completed_turns > 0).then_some(run_usage);
             let checkpoint_cost = model
                 .spec
@@ -5115,12 +5209,6 @@ impl Agent {
                 reason = FinishReason::Failed(error.into());
             }
             let head = session.head().unwrap_or(first_entry);
-            if let Some(delegation) = &stream_delegation {
-                // A delegation team is scoped to this owning run. Stop any
-                // worker, deferred follow-up, or permit waiter that outlives
-                // the root/parent result, regardless of terminal reason.
-                delegation.request_shutdown();
-            }
             stream_context.run_finished(&reason);
             stream_lifecycle.finished.store(true, Ordering::Release);
             let ev = AgentEvent::RunFinished { head, reason };
@@ -6209,6 +6297,32 @@ mod tests {
                 limit: 1_000
             }
         ));
+    }
+
+    #[test]
+    fn delegated_usage_is_accounting_not_parent_context_token_consumption() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("delegated-ledger.jsonl")).unwrap();
+        session
+            .record_delegated_agent_usage(DelegatedUsage {
+                agent_id: "agent-1".into(),
+                turn_count: 2,
+                tool_call_count: 1,
+                endpoint: ygg_ai::EndpointId("test-endpoint".into()),
+                model: ygg_ai::ModelId("test-model".into()),
+                usage: Usage {
+                    input_tokens: 40_000,
+                    output_tokens: 10_000,
+                    total_tokens: 50_000,
+                    ..Usage::default()
+                },
+                cost: None,
+            })
+            .unwrap();
+
+        assert_eq!(session_total_tokens_for_own_context(&session), 0);
+        assert!(reserve_request_tokens(&session, 700, 200, Some(1_000)).is_ok());
+        assert_eq!(session.usage_records()[0].usage.total_tokens, 50_000);
     }
 
     #[tokio::test]

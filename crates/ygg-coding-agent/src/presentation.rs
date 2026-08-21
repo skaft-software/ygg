@@ -814,6 +814,7 @@ impl RunTracker {
                 );
             }
             AgentEvent::ToolProgress { .. } => {}
+            AgentEvent::DelegationUpdated { .. } => {}
             AgentEvent::ToolFinished { id, result } => {
                 run.pending_tools.remove(&id.0);
                 if let Some(tool) = run.tools.get(&id.0) {
@@ -971,6 +972,18 @@ pub fn summarize_tool_with_workspace(
         "write" => path_tool(args, "writing", "wrote", "writing", "write", workspace),
         // `exec` is retained only as a renderer for pre-rename sessions.
         "bash" | "exec" => summarize_bash(args, workspace),
+        "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_stop" => ToolDisplay {
+            active: "delegating to read-only workers".to_owned(),
+            success: "delegation updated".to_owned(),
+            failure: "delegation failed".to_owned(),
+            compact_active: "delegating".to_owned(),
+            compact_success: "delegated".to_owned(),
+            compact_failure: "delegation failed".to_owned(),
+            plain_tag: "delegation",
+            label: "delegation".to_owned(),
+            shell_command: None,
+            changed_path: None,
+        },
         other => {
             let readable = other.replace(['_', '-'], " ");
             ToolDisplay {

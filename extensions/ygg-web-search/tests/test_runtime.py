@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +25,7 @@ OWNER_CONTEXT = {
     "host": {"session_id": "fixture-session"},
 }
 
-from provider import ProviderFailed  # noqa: E402
+from provider import AuthenticationFailed, CredentialRequired, ProviderFailed  # noqa: E402
 
 
 class StubCache:
@@ -110,6 +111,11 @@ class FailingService(StubService):
         raise ProviderFailed("the configured search provider returned HTTP 503")
 
 
+class AuthenticationFailingService(StubService):
+    def search(self, config, **kwargs):
+        raise AuthenticationFailed("Brave Search rejected the configured API key")
+
+
 class SlowService(StubService):
     def search(self, config, **kwargs):
         token = kwargs["cancellation"]
@@ -162,6 +168,7 @@ def initialize():
             "api_version": "0.2",
             "contributes": {
                 "tools": ["web_search", "web_open", "web_find"],
+                "commands": ["web-search"],
                 "ui": ["status"],
                 "presentation": True,
             },
@@ -314,6 +321,92 @@ class RuntimeTests(unittest.TestCase):
                 "web · Fixture Search",
             )
 
+    def test_brave_setup_prompts_for_a_secret_key_and_search_reuses_it(self):
+        module = load_extension()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.json"
+            credential = root / "brave.key"
+            module.RUNTIME = module.Runtime(config, StubService(), credential)
+            prompts = []
+
+            def answer(prompt, secret=False):
+                prompts.append((prompt, secret))
+                return "fixture-api-key"
+
+            with mock.patch.object(module.ext, "request_input", side_effect=answer):
+                setup = module.web_search_command(["setup", "brave"], {})
+            self.assertIn("Brave Search selected", setup["text"])
+            self.assertEqual(len(prompts), 1)
+            self.assertTrue(prompts[0][1])
+            self.assertIn("https://api.search.brave.com/app/keys", prompts[0][0])
+            self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(credential.stat().st_mode & 0o777, 0o600)
+            self.assertNotIn("fixture-api-key", config.read_text(encoding="utf-8"))
+            self.assertEqual(
+                module.collect_status({"surface": "status"})["text"],
+                "web · Brave Search",
+            )
+
+            with mock.patch.object(
+                module.ext,
+                "request_input",
+                side_effect=AssertionError("stored key should be reused"),
+            ):
+                result = module.web_search({"query": "fixture"}, OWNER_CONTEXT)
+            self.assertEqual(result["structured_content"]["status"], "ok")
+            self.assertEqual(result["metadata"]["source"]["adapter"], "brave")
+
+    def test_searxng_setup_prompts_for_endpoint_when_none_was_saved(self):
+        module = load_extension()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.RUNTIME = module.Runtime(
+                root / "config.json",
+                StubService(),
+                root / "brave.key",
+            )
+            prompts = []
+
+            def answer(prompt, secret=False):
+                prompts.append((prompt, secret))
+                return "https://search.example.com/search"
+
+            with mock.patch.object(module.ext, "request_input", side_effect=answer):
+                setup = module.web_search_command(["setup", "searxng"], {})
+            self.assertIn("SearXNG selected", setup["text"])
+            self.assertEqual(prompts, [("SearXNG JSON search endpoint:", False)])
+            self.assertEqual(
+                module.collect_status({"surface": "status"})["text"],
+                "web · SearXNG",
+            )
+
+    def test_rejected_brave_key_is_removed_without_becoming_result_data(self):
+        module = load_extension()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            module.RUNTIME = module.Runtime(
+                root / "config.json",
+                AuthenticationFailingService(),
+                root / "brave.key",
+            )
+            module.RUNTIME.store_brave_api_key("rejected-api-key")
+            module.RUNTIME.select_provider("brave")
+            result = module.web_search({"query": "fixture"}, OWNER_CONTEXT)
+
+            self.assertTrue(result["is_error"])
+            self.assertEqual(
+                result["structured_content"]["status"],
+                "authentication_failed",
+            )
+            self.assertNotIn("rejected-api-key", json.dumps(result))
+            with self.assertRaises(CredentialRequired):
+                module.RUNTIME.brave_api_key()
+            self.assertEqual(
+                module.collect_status({"surface": "status"})["text"],
+                "web · Brave Search setup required",
+            )
+
     def test_protocol_negotiates_progress_and_emits_one_terminal_result(self):
         module = load_extension()
         with tempfile.TemporaryDirectory() as temporary:
@@ -351,6 +444,10 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(
             {item["name"] for item in initialized["tools"]},
             {"web_search", "web_open", "web_find"},
+        )
+        self.assertEqual(
+            {item["name"] for item in initialized["commands"]},
+            {"web-search"},
         )
         result = terminal[0]["result"]
         self.assertEqual(result["structured_content"]["status"], "ok")

@@ -69,8 +69,10 @@ def rpc_request(request_id: Any, method: str, params: Optional[Mapping[str, Any]
 
 def initialize_request(*, agent_sessions: bool = True):
     optional = ["lifecycle_events"]
+    required = ["request_cancellation", "content_parts"]
     if agent_sessions:
         optional.append("agent_sessions")
+        required.append("delegation_telemetry_v1")
     return rpc_request(
         1,
         "initialize",
@@ -95,7 +97,7 @@ def initialize_request(*, agent_sessions: bool = True):
             },
             "protocol": {
                 "version": "0.2",
-                "required_features": ["request_cancellation", "content_parts"],
+                "required_features": required,
                 "optional_features": optional,
                 "limits": {"max_concurrent_requests": 8},
             },

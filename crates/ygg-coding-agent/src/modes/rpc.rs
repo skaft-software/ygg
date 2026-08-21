@@ -28,7 +28,8 @@ use ygg_ai::{
 
 use crate::app::bootstrap::{build_app, rebuild_app, resolve_launch_print, Bootstrap};
 use crate::app::{
-    apply_reconfig, reasoning_label, supported_levels, thinking_to_reasoning, App, Reconfig,
+    apply_reconfig, reasoning_label, supported_levels_with_subagents,
+    thinking_to_reasoning_with_subagents, App, Reconfig,
 };
 use crate::compaction::{attempt_compaction, estimate_text_tokens, CompactionOutcome};
 use crate::config::{CompactionMode, ThinkingLevel};
@@ -1627,6 +1628,7 @@ impl EventTranslator {
                     self.finish_pending_turn(output)?;
                 }
             }
+            AgentEvent::DelegationUpdated { .. } => {}
             AgentEvent::RunFinished { reason, .. } => {
                 let outcome = HostRunOutcome::from_finish_reason(
                     &reason,
@@ -2141,7 +2143,7 @@ async fn handle_idle_command(
             id.as_deref(),
             &kind,
             Some(json!({
-                "levels": supported_levels(&app.model)
+                "levels": supported_levels_with_subagents(&app.model, app.subagents_available())
                     .into_iter()
                     .map(|level| level.label())
                     .collect::<Vec<_>>()
@@ -2192,7 +2194,11 @@ async fn handle_idle_command(
                 Ok(level) => level,
                 Err(error) => respond_error!(error),
             };
-            let reasoning = match thinking_to_reasoning(level, &app.model) {
+            let reasoning = match thinking_to_reasoning_with_subagents(
+                level,
+                &app.model,
+                app.subagents_available(),
+            ) {
                 Ok(reasoning) => reasoning,
                 Err(error) => respond_error!(error),
             };
@@ -2200,7 +2206,7 @@ async fn handle_idle_command(
             output.success(id.as_deref(), &kind, None)?;
         }
         "cycle_thinking_level" => {
-            let levels = supported_levels(&app.model);
+            let levels = supported_levels_with_subagents(&app.model, app.subagents_available());
             if levels.len() <= 1 {
                 output.success(id.as_deref(), &kind, Some(Value::Null))?;
             } else {
@@ -2210,7 +2216,11 @@ async fn handle_idle_command(
                     .position(|level| level.label() == current)
                     .unwrap_or_default();
                 let level = levels[(index + 1) % levels.len()];
-                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                let reasoning = thinking_to_reasoning_with_subagents(
+                    level,
+                    &app.model,
+                    app.subagents_available(),
+                )?;
                 app = apply_reconfig(app, Reconfig::Thinking(reasoning))?;
                 output.success(id.as_deref(), &kind, Some(json!({"level": level.label()})))?;
             }

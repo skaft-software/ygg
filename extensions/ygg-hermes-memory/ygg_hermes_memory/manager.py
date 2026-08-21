@@ -136,6 +136,13 @@ class CallOutcome:
     error_code: Optional[str] = None
 
 
+class ProviderGenerationFenced(RuntimeError):
+    """An unfinished provider call requires terminating this process generation."""
+
+
+_BACKGROUND_STOP = object()
+
+
 class MemoryBridge:
     """One process, at most one imported provider instance per Ygg owner."""
 
@@ -148,11 +155,15 @@ class MemoryBridge:
         discovery: Optional[DiscoverySnapshot] = None,
         loader: Callable[..., LoadedProvider] = load_selected_provider,
         config_error_code: Optional[str] = None,
+        abort_generation: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.extension = extension
         self.config = config
         self._clock = clock or (lambda: int(time.time() * 1000))
         self._loader = loader
+        self._abort_generation = abort_generation or (lambda _reason: None)
+        self._generation_fenced = threading.Event()
+        self._generation_fence_reason: Optional[str] = None
         if config_error_code is not None and discovery is None:
             self._discovery = DiscoverySnapshot(
                 (),
@@ -174,6 +185,7 @@ class MemoryBridge:
         self._lock = threading.RLock()
         self._call_lock = threading.Lock()
         self._active_call_threads: Dict[threading.Thread, Tuple[str, str]] = {}
+        self._control_threads: set[threading.Thread] = set()
         self._catalog_lock = threading.Lock()
         self._presentation_publish_lock = threading.Lock()
         self._presentation_timer: Optional[threading.Timer] = None
@@ -196,6 +208,45 @@ class MemoryBridge:
         )
 
     # -- Process lifecycle -------------------------------------------------
+
+    def _fence_generation(self, kind: str, cause: str) -> None:
+        reason = f"unfinished_provider_{safe_identifier(kind, fallback='call')}_{safe_identifier(cause, fallback='failed')}"
+        with self._lock:
+            first = not self._generation_fenced.is_set()
+            if first:
+                self._generation_fence_reason = reason
+                self._generation_fenced.set()
+                self._accepting = False
+                self._started = False
+        self._shutdown_event.set()
+        if first:
+            self._abort_generation(reason)
+        raise ProviderGenerationFenced("unfinished provider work fenced this process generation")
+
+    def _require_provider_shutdown(self, kind: str, outcome: CallOutcome) -> None:
+        if outcome.state != "succeeded":
+            self._fence_generation(kind, outcome.error_code or outcome.state)
+
+    def _start_control_thread(self, name: str, target: Callable[[], None]) -> None:
+        def run() -> None:
+            try:
+                target()
+            finally:
+                with self._call_lock:
+                    self._control_threads.discard(threading.current_thread())
+
+        try:
+            thread = threading.Thread(target=run, name=name, daemon=True)
+        except BaseException:
+            self._fence_generation(name, "thread_create_failed")
+        with self._call_lock:
+            self._control_threads.add(thread)
+        try:
+            thread.start()
+        except BaseException:
+            with self._call_lock:
+                self._control_threads.discard(thread)
+            self._fence_generation(name, "thread_start_failed")
 
     def start(self, initialization: Optional[Mapping[str, Any]] = None) -> None:
         """Start the bounded worker after the API 0.2 handshake is flushed."""
@@ -236,6 +287,11 @@ class MemoryBridge:
             self._revision += 1
         self._stop_presentation_publisher()
         self._shutdown_event.set()
+        if self._background_thread.is_alive():
+            try:
+                self._background_queue.put_nowait(_BACKGROUND_STOP)
+            except queue.Full:
+                pass
         timeout = self.config.limits.shutdown_timeout_ms / 1000.0
         deadline = time.monotonic() + timeout
         drain_deadline = time.monotonic() + timeout / 2.0
@@ -246,6 +302,8 @@ class MemoryBridge:
             self._background_thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
 
         shutdown_events = []
+        shutdown_failures: List[str] = []
+        shutdown_failure_lock = threading.Lock()
         for owner in owners:
             loaded = owner.provider
             if loaded is None:
@@ -255,8 +313,9 @@ class MemoryBridge:
             def stop_provider(provider: Any = loaded.provider, settled: threading.Event = done) -> None:
                 try:
                     provider.shutdown()
-                except BaseException:
-                    pass
+                except BaseException as error:
+                    with shutdown_failure_lock:
+                        shutdown_failures.append(safe_error_code(error))
                 finally:
                     settled.set()
 
@@ -272,6 +331,29 @@ class MemoryBridge:
             if remaining <= 0:
                 break
             done.wait(remaining)
+        if self._background_thread.is_alive():
+            self._background_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        with self._call_lock:
+            control_threads = list(self._control_threads)
+        for thread in control_threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        with self._call_lock:
+            unfinished_calls = any(thread.is_alive() for thread in self._active_call_threads)
+            unfinished_controls = any(thread.is_alive() for thread in self._control_threads)
+        if (
+            self._background_thread.is_alive()
+            or unfinished_calls
+            or unfinished_controls
+            or any(not done.is_set() for done in shutdown_events)
+            or shutdown_failures
+        ):
+            self._fence_generation(
+                "shutdown",
+                shutdown_failures[0] if shutdown_failures else "unfinished",
+            )
 
         for owner in owners:
             with self._lock:
@@ -336,7 +418,7 @@ class MemoryBridge:
         ]
         session_hash = hashlib.sha256(raw_session.encode("utf-8")).hexdigest()
 
-        stale_provider = None
+        retired_providers: List[Tuple[OwnerState, LoadedProvider]] = []
         stale_catalog = False
         with self._lock:
             key = next(
@@ -358,7 +440,8 @@ class MemoryBridge:
                 )
             )
             if fences_changed:
-                stale_provider = owner.provider
+                if owner.provider is not None:
+                    retired_providers.append((owner, owner.provider))
                 stale_catalog = self._catalog_owner_key == owner.key
                 owner.activation += 1
                 owner.provider = None
@@ -377,10 +460,13 @@ class MemoryBridge:
                 owner = None
             if owner is None:
                 if len(self._owners) >= self.config.limits.max_owners:
-                    owner = self._evict_oldest_owner_locked()
-                    stale_provider = stale_provider or owner.provider
-                    stale_catalog = stale_catalog or self._catalog_owner_key == owner.key
-                    self._owners.pop(owner.key, None)
+                    evicted_owner = self._evict_oldest_owner_locked()
+                    if evicted_owner.provider is not None:
+                        retired_providers.append((evicted_owner, evicted_owner.provider))
+                    stale_catalog = (
+                        stale_catalog or self._catalog_owner_key == evicted_owner.key
+                    )
+                    self._owners.pop(evicted_owner.key, None)
                 owner_key_material = (
                     f"{session_hash}\0{instance_id or 'provisional'}\0"
                     f"{generation if generation is not None else 'provisional'}"
@@ -406,8 +492,8 @@ class MemoryBridge:
             self._current_owner_key = owner.key
         if stale_catalog:
             self._clear_catalog()
-        if stale_provider is not None:
-            self._shutdown_loaded_async(stale_provider)
+        for retired_owner, retired_provider in retired_providers:
+            self._shutdown_loaded_async(retired_owner, retired_provider)
         return owner
 
     def _evict_oldest_owner_locked(self) -> OwnerState:
@@ -587,13 +673,14 @@ class MemoryBridge:
                     self.config.limits.sync_timeout_ms,
                     cancellation=None,
                 )
-            self._call_bounded(
+            shutdown_outcome = self._call_bounded(
                 owner,
                 "shutdown",
                 old_provider.provider.shutdown,
                 self.config.limits.shutdown_timeout_ms,
                 cancellation=None,
             )
+            self._require_provider_shutdown("shutdown", shutdown_outcome)
         if self._catalog_owner_key == owner.key:
             # A failed replacement must never leave handlers for a provider
             # that has already been shut down.
@@ -617,7 +704,7 @@ class MemoryBridge:
         )
         if not self._accept_call_outcome(owner, activation, outcome, "provider_load"):
             if isinstance(outcome.value, LoadedProvider):
-                self._shutdown_loaded_async(outcome.value)
+                self._shutdown_loaded_async(owner, outcome.value)
             return
         loaded = outcome.value
 
@@ -629,7 +716,7 @@ class MemoryBridge:
             cancellation=cancellation,
         )
         if not self._accept_call_outcome(owner, activation, available, "provider_availability"):
-            self._shutdown_loaded_async(loaded)
+            self._shutdown_loaded_async(owner, loaded)
             return
         if available.value is not True:
             reason_method = getattr(loaded.provider, "unavailable_reason", None)
@@ -645,13 +732,13 @@ class MemoryBridge:
                     with self._lock:
                         owner.setup_hint = safe_detail(reason.value, maximum=512)
             self._activation_failed(owner, activation, "provider_reported_unavailable", state="unavailable")
-            self._shutdown_loaded_async(loaded)
+            self._shutdown_loaded_async(owner, loaded)
             return
 
         environment = self.config.environment
         if environment is None or environment.hermes_home is None:
             self._activation_failed(owner, activation, "hermes_home_not_configured")
-            self._shutdown_loaded_async(loaded)
+            self._shutdown_loaded_async(owner, loaded)
             return
         workspace = os.environ.get("YGG_WORKSPACE", "workspace")
         workspace_name = safe_label(os.path.basename(workspace) or "workspace", maximum=128)
@@ -670,7 +757,7 @@ class MemoryBridge:
             cancellation=cancellation,
         )
         if not self._accept_call_outcome(owner, activation, initialized, "provider_initialize"):
-            self._shutdown_loaded_async(loaded)
+            self._shutdown_loaded_async(owner, loaded)
             return
 
         static_context = None
@@ -731,7 +818,7 @@ class MemoryBridge:
 
         with self._lock:
             if owner.activation != activation or owner.selected_id != candidate.id:
-                self._shutdown_loaded_async(loaded)
+                self._shutdown_loaded_async(owner, loaded)
                 return
             owner.provider = loaded
             owner.tools = tuple(tools)
@@ -842,13 +929,14 @@ class MemoryBridge:
                     self.config.limits.sync_timeout_ms,
                     cancellation=None,
                 )
-            self._call_bounded(
+            shutdown_outcome = self._call_bounded(
                 owner,
                 "shutdown",
                 loaded.provider.shutdown,
                 self.config.limits.shutdown_timeout_ms,
                 cancellation=None,
             )
+            self._require_provider_shutdown("shutdown", shutdown_outcome)
         if self._catalog_owner_key == owner.key:
             self._clear_catalog()
         self._add_activity(
@@ -1430,6 +1518,7 @@ class MemoryBridge:
                 ignore_shutdown=True,
                 terminal=True,
             )
+            self._require_provider_shutdown("settle_owner", shutdown_outcome)
             with self._lock:
                 if owner.activation != activation:
                     return
@@ -1450,11 +1539,16 @@ class MemoryBridge:
                     )
             self._changed(owner)
 
-        threading.Thread(
-            target=settle,
-            name=f"hermes-settle-{owner.owner_reference[-8:]}",
-            daemon=True,
-        ).start()
+        def settle_fenced() -> None:
+            try:
+                settle()
+            except ProviderGenerationFenced:
+                return
+
+        self._start_control_thread(
+            f"hermes-settle-{owner.owner_reference[-8:]}",
+            settle_fenced,
+        )
 
     # -- Background lifecycle mappings -----------------------------------
 
@@ -1550,8 +1644,13 @@ class MemoryBridge:
                 task = self._background_queue.get(timeout=0.05)
             except queue.Empty:
                 continue
+            if task is _BACKGROUND_STOP:
+                self._background_queue.task_done()
+                return
             try:
                 self._execute_background(task)
+            except ProviderGenerationFenced:
+                return
             finally:
                 with self._lock:
                     owner = self._owners.get(task.owner_key)
@@ -1693,6 +1792,9 @@ class MemoryBridge:
                 task = self._background_queue.get_nowait()
             except queue.Empty:
                 return
+            if task is _BACKGROUND_STOP:
+                self._background_queue.task_done()
+                continue
             with self._lock:
                 owner = self._owners.get(task.owner_key)
                 if owner is not None:
@@ -1741,28 +1843,41 @@ class MemoryBridge:
             hard_maximum = maximum + self.config.limits.max_owners if terminal else maximum
             if len(self._active_call_threads) >= hard_maximum:
                 return CallOutcome("overloaded", None, 0, "provider_call_capacity_exhausted")
-            thread = threading.Thread(
-                target=run,
-                name=f"hermes-{safe_identifier(kind, fallback='call', maximum=32)}-{owner.owner_reference[-8:]}",
-                daemon=True,
-            )
-            self._active_call_threads[thread] = (owner.key, kind)
-            started = time.monotonic()
-            thread.start()
+            thread: Optional[threading.Thread] = None
+            try:
+                thread = threading.Thread(
+                    target=run,
+                    name=f"hermes-{safe_identifier(kind, fallback='call', maximum=32)}-{owner.owner_reference[-8:]}",
+                    daemon=True,
+                )
+                self._active_call_threads[thread] = (owner.key, kind)
+                started = time.monotonic()
+                thread.start()
+            except BaseException as error:
+                if thread is not None and thread.is_alive():
+                    self._fence_generation(kind, "thread_start_ambiguous")
+                if thread is not None:
+                    self._active_call_threads.pop(thread, None)
+                return CallOutcome(
+                    "failed",
+                    None,
+                    0,
+                    safe_error_code(error, prefix="provider_thread"),
+                )
         deadline = started + timeout_ms / 1000.0
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return CallOutcome("timeout", None, int((time.monotonic() - started) * 1000), f"{safe_identifier(kind)}_timeout")
+                self._fence_generation(kind, "timeout")
             if done.wait(min(0.02, remaining)):
                 duration = int((time.monotonic() - started) * 1000)
                 if "error_code" in box:
                     return CallOutcome("failed", None, duration, box["error_code"])
                 return CallOutcome("succeeded", box.get("value"), duration)
             if cancellation is not None and getattr(cancellation, "cancelled", False):
-                return CallOutcome("cancelled", None, int((time.monotonic() - started) * 1000), f"{safe_identifier(kind)}_cancelled")
+                self._fence_generation(kind, "cancelled")
             if self._shutdown_event.is_set() and not ignore_shutdown:
-                return CallOutcome("cancelled", None, int((time.monotonic() - started) * 1000), f"{safe_identifier(kind)}_shutdown")
+                self._fence_generation(kind, "shutdown")
 
     # -- Activities, health, presentation ---------------------------------
 
@@ -2108,19 +2223,21 @@ class MemoryBridge:
         self._changed(owner)
 
         def activate_default() -> None:
-            self._activate(
-                owner,
-                candidate,
-                cancellation=None,
-                selection_kind="selected",
-                preserve_turn=True,
-            )
+            try:
+                self._activate(
+                    owner,
+                    candidate,
+                    cancellation=None,
+                    selection_kind="selected",
+                    preserve_turn=True,
+                )
+            except ProviderGenerationFenced:
+                return
 
-        threading.Thread(
-            target=activate_default,
-            name=f"hermes-default-{owner.owner_reference[-8:]}",
-            daemon=True,
-        ).start()
+        self._start_control_thread(
+            f"hermes-default-{owner.owner_reference[-8:]}",
+            activate_default,
+        )
 
     def _tool_operation(self, candidate: ProviderCandidate, tool_name: str) -> str:
         if tool_name in candidate.write_tools:
@@ -2164,14 +2281,23 @@ class MemoryBridge:
             else:
                 os.environ[name] = value
 
-    def _shutdown_loaded_async(self, loaded: LoadedProvider) -> None:
+    def _shutdown_loaded_async(self, owner: OwnerState, loaded: LoadedProvider) -> None:
         def stop() -> None:
             try:
-                loaded.provider.shutdown()
-            except BaseException:
-                pass
+                outcome = self._call_bounded(
+                    owner,
+                    "retire_provider",
+                    loaded.provider.shutdown,
+                    self.config.limits.shutdown_timeout_ms,
+                    cancellation=None,
+                    ignore_shutdown=True,
+                    terminal=True,
+                )
+                self._require_provider_shutdown("retire_provider", outcome)
+            except ProviderGenerationFenced:
+                return
 
-        threading.Thread(target=stop, name="hermes-provider-retire", daemon=True).start()
+        self._start_control_thread("hermes-provider-retire", stop)
 
 
 def _accepts_keyword(function: Callable[..., Any], keyword: str) -> bool:

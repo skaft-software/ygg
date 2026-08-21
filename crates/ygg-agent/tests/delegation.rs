@@ -12,6 +12,7 @@ use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CoreTools, DelegationConfig, DelegationLimits, EffectBroker,
     EffectPolicy, EntryValue, ExtensionHost, FinishReason, SandboxConfig, Session,
+    COLLABORATION_TOOL_NAMES,
 };
 use ygg_ai::{
     AiClient, Auth, Capabilities, Endpoint, EndpointId, Message, ModalitySet, Model, ModelId,
@@ -551,6 +552,14 @@ struct EnabledAgent {
 }
 
 fn build_enabled_agent(server: &MockServer, limits: DelegationLimits) -> EnabledAgent {
+    build_enabled_agent_with_mode(server, limits, false)
+}
+
+fn build_enabled_agent_with_mode(
+    server: &MockServer,
+    limits: DelegationLimits,
+    extension_only: bool,
+) -> EnabledAgent {
     let workspace_dir = tempfile::tempdir().unwrap();
     let session_dir = tempfile::tempdir().unwrap();
     let workspace = workspace_dir.path().canonicalize().unwrap();
@@ -578,7 +587,11 @@ fn build_enabled_agent(server: &MockServer, limits: DelegationLimits) -> Enabled
     .unwrap();
     let mut config = DelegationConfig::new(session_dir.path().join("delegation"));
     config.limits = limits;
-    let team_directory = agent.enable_v2_delegation(config).unwrap();
+    let team_directory = if extension_only {
+        agent.enable_v2_delegation_extension_only(config).unwrap()
+    } else {
+        agent.enable_v2_delegation(config).unwrap()
+    };
     EnabledAgent {
         agent,
         team_directory,
@@ -662,6 +675,18 @@ fn listed_agent<'a>(value: &'a serde_json::Value, path: &str) -> &'a serde_json:
         .iter()
         .find(|agent| agent["agent_path"] == path)
         .unwrap_or_else(|| panic!("missing listed agent {path}: {value}"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extension_only_delegation_hides_native_root_surface() {
+    let server = MockServer::start().await;
+    let enabled = build_enabled_agent_with_mode(&server, DelegationLimits::default(), true);
+    assert!(enabled
+        .agent
+        .registered_tool_names()
+        .iter()
+        .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str())));
+    assert!(!enabled.agent.system_prompt().contains("ygg_multi_agent_v2"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

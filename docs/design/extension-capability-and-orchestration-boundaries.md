@@ -35,17 +35,35 @@ This document defines how Ygg assigns capability ownership across host, extensio
 ### 4a) Server-hosted delegation
 
 - **Owner of scheduling:** external provider (server-side subagent APIs).
-- **Orchestration boundary:** the provider selects concrete subagent lifecycle, budgets, and completion policy.
-- **State model:** results are returned as provider response artifacts; there is no shared local tool session tree owned by Ygg.
-- **Failure and cancellation:** failure taxonomy is governed by provider semantics. Ygg cannot infer local process-level lifecycle details beyond provider responses.
+- **Orchestration boundary:** the provider selects concrete subagent lifecycle,
+  budgets, and completion policy; Ygg must not enable an unobservable provider
+  subagent tier.
+- **State model:** results are returned as provider response artifacts; there is
+  no shared local tool session tree owned by Ygg.
+- **Failure and cancellation:** failure taxonomy is governed by provider
+  semantics. Ygg cannot infer local process-level lifecycle details beyond
+  provider responses.
 
 ### 4b) In-harness delegated children
 
-- **Owner of scheduling:** `ygg-agent`.
-- **Orchestration boundary:** Ygg owns child `Agent` sessions, mailboxing, persistence, ancestry trees, and lifecycle cancellation.
-- **State model:** each child has its own append-only session and durable delegation state; child runs inherit the parent’s approval, sandbox policy, model/reasoning settings, compaction policy, and output/turn policy.
-- **Failure and cancellation:** parent outcomes and shutdown requests propagate through delegation tokens and cancellation paths; child failures do not terminate sibling trees unless resource/queue policy requires.
-- **Resource ownership:** artifact/resource handles and resource-owner tracing remain keyed through the owning parent context.
+- **Owner of user-facing orchestration:** the `ygg-subagents` extension. It is
+  the required observation and control surface for every coding-product child,
+  regardless of whether the child was requested by a model tool or another
+  local frontend.
+- **Kernel boundary:** `ygg-agent` owns child `Agent` sessions, mailboxing,
+  persistence, ancestry trees, resource limits, and lifecycle cancellation
+  behind the extension's owner-bound `agent_sessions` service.
+- **State model:** each child has its own append-only session and durable
+  delegation state; child runs inherit the parent’s approval, sandbox policy,
+  model/reasoning settings, compaction policy, and output/turn policy.
+- **Failure and cancellation:** parent outcomes and shutdown requests propagate
+  through delegation tokens and cancellation paths; child failures do not
+  terminate sibling trees unless resource/queue policy requires.
+- **Resource ownership:** artifact/resource handles and resource-owner tracing
+  remain keyed through the owning parent context.
+- **Safety gate:** Ultra is not selectable unless the trusted, enabled
+  `ygg-subagents` extension has successfully negotiated its observation service.
+  The coding host does not expose a parallel native root collaboration surface.
 
 ## Trust and policy inheritance for extensions and children
 

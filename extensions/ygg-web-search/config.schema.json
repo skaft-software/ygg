@@ -5,9 +5,8 @@
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "provider"],
-  "properties": {
-    "version": {"const": 1},
-    "provider": {
+  "$defs": {
+    "searxng": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "endpoint"],
@@ -26,6 +25,32 @@
           "description": "Allow only the explicitly configured provider endpoint to resolve privately. Direct web_open/web_find destinations remain public-only."
         }
       }
+    },
+    "brave": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {"const": "brave"},
+        "label": {"type": "string", "minLength": 1, "maxLength": 48}
+      }
+    }
+  },
+  "properties": {
+    "version": {"const": 1},
+    "provider": {
+      "oneOf": [
+        {"$ref": "#/$defs/brave"},
+        {"$ref": "#/$defs/searxng"}
+      ]
+    },
+    "provider_settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "searxng": {"$ref": "#/$defs/searxng"}
+      },
+      "description": "Provider-specific settings retained when switching providers in the extension menu."
     },
     "limits": {
       "type": "object",

@@ -102,6 +102,15 @@ prompts without the field may derive a deterministic display fallback from
 their own historical `prompt_model`; the currently selected model is never
 used to recolour history.
 
+`usage` operation kinds are assistant turns, rejected Responses turns,
+compaction, terminal gates, and `delegated_agent`. A delegated record names the
+host-created child, its completed turn/tool-call counts, the child's aggregated
+disjoint token buckets, route/model, exact category cost, and picodollar
+remainder. The child JSONL remains the detailed transcript; this root mirror is
+written once before the owning checkpoint so cumulative session cost, `/cost`,
+the footer, export, resume, and later cost-limit checks all include delegated
+spend without reopening private child paths.
+
 A head record is the only branch-selection mutation:
 
 ```json

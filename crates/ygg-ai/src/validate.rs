@@ -29,7 +29,8 @@ pub(crate) fn provider_ref_is_usable(
 
 /// Returns a request-local reasoning selection with portable effort clamped to
 /// the model's advertised range. Ultra is an orchestration tier and is capped
-/// at Max unless the same metadata advertises V2 delegation.
+/// at Max unless the same metadata advertises V2 delegation; the coding product
+/// additionally gates selection on its observing subagents extension.
 pub(crate) fn normalize_reasoning_config<'a>(
     reasoning: &'a ReasoningConfig,
     caps: &Capabilities,

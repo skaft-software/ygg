@@ -47,11 +47,12 @@ class ReleaseAndFixtureTests(unittest.TestCase):
         manifest = (ROOT / "extension.toml").read_text(encoding="utf-8")
         for exact in (
             'name = "ygg-web-search"',
-            'version = "0.1.0"',
+            'version = "0.2.0"',
             'api_version = "0.2"',
-            'requires_ygg = "=0.5.0"',
+            'requires_ygg = "=0.6.0-dev"',
             'command = "extension.py"',
             'tools = ["web_search", "web_open", "web_find"]',
+            'commands = ["web-search"]',
             "presentation = true",
             "network = true",
         ):
@@ -70,6 +71,7 @@ class ReleaseAndFixtureTests(unittest.TestCase):
                 "api_version": "0.2",
                 "contributes": {
                     "tools": ["web_search", "web_open", "web_find"],
+                    "commands": ["web-search"],
                     "ui": ["status"],
                     "presentation": True,
                 },
@@ -88,9 +90,15 @@ class ReleaseAndFixtureTests(unittest.TestCase):
             "params": {},
         }
         with tempfile.TemporaryDirectory() as temporary:
+            staged_entrypoint = Path(temporary) / "staged-extension.py"
+            staged_entrypoint.write_bytes((ROOT / "extension.py").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
             completed = subprocess.run(
-                [str(ROOT / "extension.py")],
+                [str(staged_entrypoint)],
                 cwd=temporary,
+                env=environment,
                 input=json.dumps(initialize) + "\n" + json.dumps(shutdown) + "\n",
                 text=True,
                 stdout=subprocess.PIPE,
@@ -103,14 +111,28 @@ class ReleaseAndFixtureTests(unittest.TestCase):
         initialized = next(item for item in messages if item.get("id") == 1)
         self.assertEqual(initialized["result"]["api_version"], "0.2")
         self.assertEqual(len(initialized["result"]["tools"]), 3)
+        self.assertEqual(
+            [item["name"] for item in initialized["result"]["commands"]],
+            ["web-search"],
+        )
 
     def test_configuration_schema_and_example_match_runtime(self):
         schema = json.loads((ROOT / "config.schema.json").read_text(encoding="utf-8"))
         example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
         parsed = parse_configuration(example)
-        self.assertEqual(schema["properties"]["provider"]["properties"]["kind"]["const"], "searxng")
+        provider_refs = {
+            item["$ref"] for item in schema["properties"]["provider"]["oneOf"]
+        }
+        self.assertEqual(
+            provider_refs,
+            {"#/$defs/brave", "#/$defs/searxng"},
+        )
+        self.assertEqual(parsed.provider.kind, "searxng")
         self.assertEqual(parsed.provider.label, "SearXNG")
         self.assertFalse(parsed.provider.allow_private_endpoint)
+        brave = parse_configuration({"version": 1, "provider": {"kind": "brave"}})
+        self.assertEqual(brave.provider.kind, "brave")
+        self.assertEqual(brave.provider.label, "Brave Search")
 
     def test_skill_is_small_explicit_and_names_only_shipped_tools(self):
         skill = (ROOT / "skills" / "ygg-web-search" / "SKILL.md").read_text(

@@ -43,6 +43,22 @@ while True:
 """
 
 
+# Darwin's sockaddr_un.sun_path has 104 bytes including its terminating NUL.
+# OpenSSH first binds ControlPath with a randomized suffix before renaming it,
+# so validate the exact adapter basename with conservative suffix headroom.
+_UNIX_SOCKET_PATH_BYTES = 104
+_OPENSSH_CONTROL_PATH_SUFFIX_HEADROOM = 24
+_CONTROL_PATH_BASENAME_SAMPLE = "cm-" + "0" * 24
+
+
+def _control_path_fits(directory: Path) -> bool:
+    control_path = directory / _CONTROL_PATH_BASENAME_SAMPLE
+    return (
+        len(os.fsencode(control_path)) + _OPENSSH_CONTROL_PATH_SUFFIX_HEADROOM
+        < _UNIX_SOCKET_PATH_BYTES
+    )
+
+
 class SshProcessError(RuntimeError):
     """A bounded local OpenSSH operation failed."""
 
@@ -130,23 +146,53 @@ class OpenSshBackend:
         # still works, and a missing credential fails closed in BatchMode.
         self.environment["SSH_ASKPASS_REQUIRE"] = "never"
         self.agent_socket_available = bool(self.environment.get("SSH_AUTH_SOCK"))
+
         requested = Path(runtime_directory) if runtime_directory is not None else None
-        self._temporary_runtime = False
-        if requested is not None:
-            requested.mkdir(mode=0o700, parents=True, exist_ok=True)
-            try:
-                requested.chmod(0o700)
-            except OSError:
-                pass
-        if requested is None or len(os.fsencode(str(requested / ("cm-" + "0" * 24)))) > 96:
-            requested = Path(tempfile.mkdtemp(prefix="ygg-ssh-control-"))
-            requested.chmod(0o700)
-            self._temporary_runtime = True
-        self.runtime_directory = requested
+        self.runtime_directory, self._temporary_runtime = self._find_runtime_directory(
+            requested
+        )
         self._active: set[subprocess.Popen[bytes]] = set()
         self._watchdogs: dict[subprocess.Popen[bytes], subprocess.Popen[bytes]] = {}
         self._active_lock = threading.RLock()
         self._closed = False
+
+    @staticmethod
+    def _find_runtime_directory(requested: Optional[Path]) -> tuple[Path, bool]:
+        if requested is not None and _control_path_fits(requested):
+            try:
+                requested.mkdir(mode=0o700, parents=True, exist_ok=True)
+                requested.chmod(0o700)
+            except OSError:
+                pass
+            else:
+                return requested, False
+
+        temporary_roots: list[Optional[str]] = []
+        if os.name == "posix":
+            # macOS's default TMPDIR is long enough to exhaust sun_path after
+            # OpenSSH adds its temporary suffix. A private mkdtemp directory
+            # below the short /tmp spelling avoids that expansion.
+            temporary_roots.append("/tmp")
+        temporary_roots.append(None)
+
+        for temporary_root in temporary_roots:
+            candidate: Optional[Path] = None
+            try:
+                candidate = Path(
+                    tempfile.mkdtemp(prefix="ygg-ssh-", dir=temporary_root)
+                )
+                if _control_path_fits(candidate):
+                    candidate.chmod(0o700)
+                    return candidate, True
+            except OSError:
+                pass
+            if candidate is not None:
+                shutil.rmtree(candidate, ignore_errors=True)
+
+        raise SshProcessError(
+            "control_path_too_long",
+            "no private local path fits the OpenSSH control socket limit",
+        )
 
     @staticmethod
     def _resolve_binary(value: Optional[Union[os.PathLike[str], str]]) -> str:

@@ -2,7 +2,7 @@
 set -eu
 
 repository="skaft-software/ygg"
-version="0.5.0"
+version="0.6.0-dev"
 tag="v$version"
 release_source_commit="__YGG_RELEASE_SOURCE_COMMIT__"
 release_base="https://github.com/$repository/releases/download/$tag"
@@ -235,7 +235,8 @@ verified_archive_sha256() {
     validate_release_source_commit
     install_pinned_cosign
 
-    identity='^https://github\.com/skaft-software/ygg/\.github/workflows/release-ygg\.yml@refs/tags/(v0\.5\.0|ygg-binaries-v0\.5\.0)$'
+    identity_version=$(printf '%s' "$version" | sed 's/\./\\./g')
+    identity="^https://github\\.com/skaft-software/ygg/\\.github/workflows/release-ygg\\.yml@refs/tags/(v${identity_version}|ygg-binaries-v${identity_version})$"
     python3 - \
         "$checksums" \
         "$bundle" \
@@ -254,9 +255,9 @@ manifest_path, bundle_path, cosign_path = sys.argv[1:4]
 identity, repository, source_commit, archive_name = sys.argv[4:8]
 expected_names = {
     "install-ygg.sh",
-    "ygg-0.5.0-aarch64-apple-darwin.tar.gz",
-    "ygg-0.5.0-x86_64-apple-darwin.tar.gz",
-    "ygg-0.5.0-x86_64-unknown-linux-gnu.tar.gz",
+    "ygg-0.6.0-dev-aarch64-apple-darwin.tar.gz",
+    "ygg-0.6.0-dev-x86_64-apple-darwin.tar.gz",
+    "ygg-0.6.0-dev-x86_64-unknown-linux-gnu.tar.gz",
 }
 line_pattern = re.compile(r"^([0-9A-Fa-f]{64})  (?:\./)?([A-Za-z0-9_.-]+)$")
 
@@ -694,6 +695,7 @@ install_assets() {
     cp -R "$source_root/docs" "$assets_temporary/docs"
     cp -R "$source_root/examples" "$assets_temporary/examples"
     cp -R "$source_root/sdk" "$assets_temporary/sdk"
+    printf '%s\n' "$version" > "$assets_temporary/.ygg-version"
 
     if { [ -e "$data_directory" ] || [ -L "$data_directory" ]; } \
         && [ ! -d "$data_directory" ]; then

@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -111,20 +112,10 @@ fn ygg_documentation_paths(workspace: &Path) -> Option<[PathBuf; 5]> {
     ])
 }
 
-fn installed_documentation_paths_from(
-    candidates: impl IntoIterator<Item = PathBuf>,
-) -> Option<[PathBuf; 4]> {
-    candidates
-        .into_iter()
-        .find_map(|candidate| documentation_paths(&candidate))
-}
+const EMBEDDED_DOCUMENTATION_VERSION_FILE: &str = ".ygg-version";
+const EMBEDDED_DOCUMENTATION_ARCHIVE: &[u8] = include_bytes!(env!("YGG_EMBEDDED_DOCS_ARCHIVE"));
 
-/// Resolve the documentation shipped with a packaged Ygg binary.
-///
-/// This mirrors Pi's package-asset lookup: an override is useful for packaged
-/// installs, then assets beside the executable are preferred, followed by the
-/// conventional `share/ygg` directory used by the shell installer.
-fn installed_documentation_paths() -> Option<[PathBuf; 4]> {
+fn installed_documentation_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(directory) = std::env::var_os("YGG_PACKAGE_DIR") {
         if let Some(directory) = absolute_path(PathBuf::from(directory)) {
@@ -147,7 +138,147 @@ fn installed_documentation_paths() -> Option<[PathBuf; 4]> {
             }
         }
     }
-    installed_documentation_paths_from(candidates)
+    candidates
+}
+
+fn embedded_documentation_target() -> Option<PathBuf> {
+    if let Some(directory) = std::env::var_os("YGG_DATA_DIR") {
+        return absolute_path(PathBuf::from(directory));
+    }
+
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?.to_owned();
+    // Cargo installs binaries below <root>/bin. Do not materialize assets for
+    // ordinary target/debug or target/release development binaries.
+    (directory.file_name() == Some(std::ffi::OsStr::new("bin")))
+        .then(|| directory.parent().unwrap_or(&directory).join("share/ygg"))
+}
+
+fn documentation_version(root: &Path) -> Option<String> {
+    let file = fs::File::open(root.join(EMBEDDED_DOCUMENTATION_VERSION_FILE)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(128).read_to_end(&mut bytes).ok()?;
+    if bytes.len() == 128 {
+        return None;
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .map(|version| version.trim().to_owned())
+        .filter(|version| !version.is_empty())
+}
+
+fn documentation_version_is_current(root: &Path) -> bool {
+    documentation_version(root).as_deref() == Some(env!("CARGO_PKG_VERSION"))
+}
+
+fn validate_embedded_documentation_path(path: &Path) -> anyhow::Result<()> {
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(first)) = components.next() else {
+        anyhow::bail!("embedded documentation contains an empty path");
+    };
+    if !matches!(
+        first.to_str(),
+        Some("README.md" | "docs" | "examples" | "sdk")
+    ) {
+        anyhow::bail!("embedded documentation contains an unexpected root");
+    }
+    for component in components {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            anyhow::bail!("embedded documentation contains an unsafe path");
+        }
+    }
+    Ok(())
+}
+
+fn unpack_embedded_documentation(destination: &Path) -> anyhow::Result<()> {
+    let decoder = flate2::read::GzDecoder::new(EMBEDDED_DOCUMENTATION_ARCHIVE);
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_mtime(false);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        validate_embedded_documentation_path(&path)?;
+        if !entry.header().entry_type().is_dir() && !entry.header().entry_type().is_file() {
+            anyhow::bail!("embedded documentation contains a non-regular entry");
+        }
+        entry.unpack_in(destination)?;
+    }
+
+    if documentation_paths(destination).is_none() {
+        anyhow::bail!("embedded documentation is incomplete");
+    }
+    fs::write(
+        destination.join(EMBEDDED_DOCUMENTATION_VERSION_FILE),
+        env!("CARGO_PKG_VERSION"),
+    )?;
+    Ok(())
+}
+
+fn materialize_embedded_documentation(target: &Path) -> anyhow::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("documentation target has no parent"))?;
+    fs::create_dir_all(parent)?;
+    if let Ok(metadata) = fs::symlink_metadata(target) {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            anyhow::bail!("documentation target is not a directory");
+        }
+    }
+
+    let staged = tempfile::Builder::new()
+        .prefix(".ygg-docs-")
+        .tempdir_in(parent)?;
+    unpack_embedded_documentation(staged.path())?;
+    let staged_path = staged.path().to_owned();
+    let previous = parent.join(format!(".ygg-docs-previous-{}", std::process::id()));
+    if fs::symlink_metadata(&previous).is_ok() {
+        fs::remove_dir_all(&previous)?;
+    }
+
+    let had_target = fs::symlink_metadata(target).is_ok();
+    if had_target {
+        fs::rename(target, &previous)?;
+    }
+    if let Err(error) = fs::rename(&staged_path, target) {
+        if had_target {
+            let _ = fs::rename(&previous, target);
+        }
+        return Err(error.into());
+    }
+    if had_target {
+        let _ = fs::remove_dir_all(previous);
+    }
+    Ok(())
+}
+
+/// Resolve the documentation shipped with a packaged Ygg binary.
+///
+/// This mirrors Pi's package-asset lookup: an override is useful for packaged
+/// installs, then assets beside the executable are preferred, followed by the
+/// conventional `share/ygg` directory used by the shell installer. Cargo
+/// installs have no arbitrary-asset installation phase, so the same text
+/// documentation is embedded in the binary and materialized under the Cargo
+/// root's `share/ygg` directory on first use and after an update.
+fn installed_documentation_paths() -> Option<[PathBuf; 4]> {
+    let candidates = installed_documentation_candidates();
+    let target = embedded_documentation_target();
+
+    for candidate in &candidates {
+        if documentation_paths(candidate).is_some() {
+            if target.as_deref() == Some(candidate.as_path())
+                && !documentation_version_is_current(candidate)
+                && documentation_version(candidate).is_some()
+                && materialize_embedded_documentation(candidate).is_ok()
+            {
+                return documentation_paths(candidate);
+            }
+            return documentation_paths(candidate);
+        }
+    }
+
+    let target = target?;
+    materialize_embedded_documentation(&target).ok()?;
+    documentation_paths(&target)
 }
 
 fn documentation_prompt(
@@ -365,7 +496,7 @@ pub fn compose_instructions(config: &Config) -> anyhow::Result<String> {
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use ygg_agent::skills::{
     LoadedSkill, SkillDescriptor, SkillDiagnostic, SkillId, SkillLoadError, SkillQuery,
     SkillRegistry, SkillSearchResult, SkillSource, SkillTrust,
@@ -1413,6 +1544,7 @@ mod tests {
             skill_paths: vec![],
             extension_paths: vec![],
             enabled_extensions: vec![],
+            extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![],
             tools: crate::config::ToolPolicy::default(),
@@ -1516,12 +1648,49 @@ Environment:
         std::fs::create_dir_all(root.path().join("sdk")).unwrap();
         std::fs::write(root.path().join("README.md"), "# Ygg").unwrap();
 
-        let [readme, docs, examples, sdk] =
-            installed_documentation_paths_from([root.path().to_owned()]).unwrap();
+        let [readme, docs, examples, sdk] = documentation_paths(root.path()).unwrap();
         assert_eq!(readme, root.path().join("README.md"));
         assert_eq!(docs, root.path().join("docs"));
         assert_eq!(examples, root.path().join("examples"));
         assert_eq!(sdk, root.path().join("sdk"));
+    }
+
+    #[test]
+    fn embedded_documentation_materializes_a_versioned_cargo_asset_root() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("share/ygg");
+
+        materialize_embedded_documentation(&target).unwrap();
+
+        assert!(documentation_paths(&target).is_some());
+        assert_eq!(
+            documentation_version(&target).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn managed_embedded_documentation_is_replaced_on_version_change() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("share/ygg");
+        materialize_embedded_documentation(&target).unwrap();
+        fs::write(target.join(EMBEDDED_DOCUMENTATION_VERSION_FILE), "0.0.0\n").unwrap();
+
+        materialize_embedded_documentation(&target).unwrap();
+
+        assert_eq!(
+            documentation_version(&target).as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert!(fs::read_dir(root.path().join("share"))
+            .unwrap()
+            .all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".ygg-docs-previous-")
+            }));
     }
 
     #[test]

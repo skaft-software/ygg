@@ -15,8 +15,8 @@ if [[ -z "$target" || -z "$version" || -z "$source_directory" ]]; then
     printf 'target, version, and source directory must not be empty\n' >&2
     exit 2
 fi
-if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    printf 'version must be a canonical release tag such as v0.5.0: %s\n' "$version" >&2
+if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    printf 'version must be a canonical release tag such as v0.6.0-dev: %s\n' "$version" >&2
     exit 2
 fi
 case "$target" in

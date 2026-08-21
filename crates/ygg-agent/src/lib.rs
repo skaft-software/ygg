@@ -118,8 +118,9 @@ pub use context::{
     RunPhase, RunTerminalState,
 };
 pub use delegation::{
-    delegated_session_reference, delegation_runtime_supports, DelegatedAgentStatus,
-    DelegationConfig, DelegationError, DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
+    delegated_session_reference, delegation_runtime_supports,
+    extension_delegated_session_matches_owner, DelegatedAgentStatus, DelegationConfig,
+    DelegationError, DelegationLimits, DelegationMode, COLLABORATION_TOOL_NAMES,
 };
 pub use effect::{
     EffectAuthorization, EffectBroker, EffectBrokerError, EffectGrantToken, EffectIntent,
@@ -127,8 +128,9 @@ pub use effect::{
     MAX_EFFECT_GRANT_TTL, MAX_EFFECT_INTENT_BYTES,
 };
 pub use events::{
-    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control, FinishReason,
-    OutputChannel, QueueDeliveryMode,
+    AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
+    DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason, OutputChannel,
+    QueueDeliveryMode,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_policy::{
@@ -138,8 +140,8 @@ pub use extension_policy::{
 };
 pub use extension_presentation::{
     ExtensionPresentationAction, ExtensionPresentationActivity, ExtensionPresentationCollection,
-    ExtensionPresentationCollectionKind, ExtensionPresentationDetail, ExtensionPresentationNode,
-    ExtensionPresentationReference, ExtensionPresentationReferenceKind,
+    ExtensionPresentationCollectionKind, ExtensionPresentationDetail, ExtensionPresentationMetrics,
+    ExtensionPresentationNode, ExtensionPresentationReference, ExtensionPresentationReferenceKind,
     ExtensionPresentationSnapshot, ExtensionPresentationState, ExtensionPresentationStatus,
     MAX_EXTENSION_PRESENTATION_ACTIONS, MAX_EXTENSION_PRESENTATION_ACTIVITIES,
     MAX_EXTENSION_PRESENTATION_BYTES, MAX_EXTENSION_PRESENTATION_DEPTH,
@@ -168,9 +170,10 @@ pub use extension_process::{
     ExtensionSource, ExtensionStatusContribution, ExtensionTrust, ExtensionUiSurface,
     RenderedToolCall, ToolCallOutput as ExtensionToolCallOutput, ToolCatalogUpdateResponse,
     ToolDefinition as ExtensionToolDefinition, ToolRegistrationRequest, ToolRenderSegment,
-    ToolUnregistrationRequest, EXTENSION_API_VERSION, EXTENSION_API_VERSION_0_1,
+    DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION, EXTENSION_API_VERSION_0_1,
     EXTENSION_API_VERSION_0_2, EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_APPROVALS,
-    EXTENSION_FEATURE_ARTIFACTS, EXTENSION_FEATURE_CONTENT_PARTS, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_FEATURE_ARTIFACTS, EXTENSION_FEATURE_CONTENT_PARTS,
+    EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_FEATURE_LIFECYCLE_EVENTS, EXTENSION_FEATURE_POLICY_INTENTS,
     EXTENSION_FEATURE_REQUEST_CANCELLATION, EXTENSION_FEATURE_REQUEST_PROGRESS,
     EXTENSION_FEATURE_SECRETS, EXTENSION_MANIFEST_FILENAME,

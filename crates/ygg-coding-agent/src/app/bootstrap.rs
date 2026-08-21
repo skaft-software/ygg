@@ -14,7 +14,6 @@ use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
     EffectBroker, EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry,
-    COLLABORATION_TOOL_NAMES,
 };
 use ygg_ai::{
     AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
@@ -25,10 +24,10 @@ use ygg_ai::{
 
 use crate::app::{
     level_from_reasoning, model_supports_ultra, normalize_reasoning_for_model,
-    normalize_reasoning_selection_for_model, thinking_to_reasoning, App,
+    normalize_reasoning_selection_for_model_with_subagents, thinking_to_reasoning, App,
 };
 use crate::config::{CompactionMode, Config, ResumeSelector};
-use crate::extensions::ExecutableExtensions;
+use crate::extensions::{ExecutableExtensions, SUBAGENTS_EXTENSION_NAME};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
@@ -3854,13 +3853,6 @@ fn configured_extensions(
     let model_supports_tools = model.spec.capabilities.tools;
     extensions
         .set_tool_policy(move |name| model_supports_tools && tool_config.tool_available(name));
-    if matches!(
-        reasoning,
-        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
-    ) && model_supports_ultra(model)
-    {
-        extensions.reserve_tool_names(COLLABORATION_TOOL_NAMES);
-    }
     extensions.finalize_tool_surface();
     let executable_extensions = ExecutableExtensions::discover_and_start(
         config,
@@ -3898,18 +3890,41 @@ fn terminal_goal_session_id(session: &Session) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("current session has no valid goal identity"))
 }
 
+fn subagents_surface_available(
+    executable_extensions: &ExecutableExtensions,
+    extensions: &ExtensionHost,
+    model: &Model,
+) -> bool {
+    executable_extensions.has_agent_session_service()
+        && model.spec.capabilities.tools
+        && extensions
+            .tool_definitions()
+            .iter()
+            .any(|definition| definition.name == "subagent_spawn")
+}
+
 fn configure_v2_delegation(
     agent: &mut Agent,
     model: &Model,
     reasoning: &ReasoningConfig,
+    service_available: bool,
 ) -> anyhow::Result<()> {
-    if !matches!(
-        reasoning,
-        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
-    ) {
+    if !service_available {
+        if matches!(
+            reasoning,
+            ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+        ) {
+            anyhow::bail!(
+                "Ultra requires the trusted {SUBAGENTS_EXTENSION_NAME} extension to observe delegated work"
+            );
+        }
         return Ok(());
     }
-    if !model_supports_ultra(model) {
+    if matches!(
+        reasoning,
+        ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+    ) && !model_supports_ultra(model)
+    {
         anyhow::bail!(
             "Ultra requires an available V2 delegation runtime for model {}",
             model.spec.id.0
@@ -3921,8 +3936,10 @@ fn configure_v2_delegation(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("session path has no parent directory"))?;
     agent
-        .enable_v2_delegation(DelegationConfig::new(session_parent.join(".delegation")).proactive())
-        .with_context(|| "could not initialize the Ultra V2 delegation runtime")?;
+        .enable_v2_delegation_extension_only(DelegationConfig::new(
+            session_parent.join(".delegation"),
+        ))
+        .with_context(|| "could not initialize the extension-owned delegation runtime")?;
     Ok(())
 }
 
@@ -3972,16 +3989,9 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     let mut prepared_session = prepared_session.into_inner();
     let mut session = open_launch_session(&mut prepared_session, launch.session)?;
 
-    let (reasoning, reasoning_mode, migration_diagnostic) =
-        normalize_reasoning_selection_for_model(&launch.reasoning, launch.reasoning_mode, &model)?;
-    if let Some(diagnostic) = migration_diagnostic {
-        crate::output::stderr!("warning: {diagnostic}");
-    }
+    let requested_reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
+    let requested_reasoning_mode = launch.reasoning_mode;
     validate_native_compaction_replay(config.compaction.mode, &session, &model)?;
-    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
-    config.model = Some(model.spec.id.clone());
-    config.reasoning = reasoning.clone();
-    config.reasoning_mode = reasoning_mode;
 
     let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new_with_invocation(
         config.workspace.clone(),
@@ -3996,7 +4006,24 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         config.workspace_trusted,
     ));
     let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &reasoning, &sessions);
+        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions);
+    let service_available = executable_extensions.has_agent_session_service();
+    let subagents_available = service_available
+        && subagents_surface_available(&executable_extensions, &extensions, &model);
+    let (reasoning, reasoning_mode, migration_diagnostic) =
+        normalize_reasoning_selection_for_model_with_subagents(
+            &requested_reasoning,
+            requested_reasoning_mode,
+            &model,
+            subagents_available,
+        )?;
+    if let Some(diagnostic) = migration_diagnostic {
+        crate::output::stderr!("warning: {diagnostic}");
+    }
+    config.model = Some(model.spec.id.clone());
+    config.reasoning = reasoning.clone();
+    config.reasoning_mode = reasoning_mode;
+    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     validate_explicit_tool_policy(
         &config,
         &extensions,
@@ -4029,7 +4056,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
-    configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    configure_v2_delegation(&mut agent, &model, &reasoning, service_available)?;
     executable_extensions.bind_agent_sessions(&agent)?;
     agent.finalize_tool_surface();
     let system_tokens = estimate_text_tokens(agent.system_prompt());
@@ -4109,7 +4136,7 @@ pub fn rebuild_app(
         .or(restored_model)
         .unwrap_or_else(|| old_model.clone());
     validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
-    let reasoning = match (new_reasoning, persisted.reasoning) {
+    let requested_reasoning = match (new_reasoning, persisted.reasoning) {
         (Some(reasoning), _) => normalize_reasoning_for_model(&reasoning, &model)?,
         (None, Some(reasoning)) => normalize_reasoning_for_model(&reasoning, &model)?,
         (None, None) if changing_model => {
@@ -4127,11 +4154,6 @@ pub fn rebuild_app(
     } else {
         persisted.reasoning_mode.unwrap_or(reasoning_mode)
     };
-    let (reasoning, reasoning_mode, migration_diagnostic) =
-        normalize_reasoning_selection_for_model(&reasoning, requested_reasoning_mode, &model)?;
-    if let Some(diagnostic) = migration_diagnostic {
-        crate::output::stderr!("warning: {diagnostic}");
-    }
     let candidate_session = match selection.as_ref() {
         Some(SessionSelection::OpenExisting(_)) => prepared_session.as_ref(),
         Some(SessionSelection::CreateNew(_)) => None,
@@ -4167,13 +4189,9 @@ pub fn rebuild_app(
             Session::open_with_file(current_path, file)?
         }
     };
-    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     let goal_session_id = terminal_goal_session_id(&session)?;
     let goal_driver = GoalDriver::new(goal_store.clone(), goal_session_id.clone());
 
-    config.model = Some(model.spec.id.clone());
-    config.reasoning = reasoning.clone();
-    config.reasoning_mode = reasoning_mode;
     let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new_with_invocation(
         config.workspace.clone(),
         config.invocation_cwd.clone(),
@@ -4187,7 +4205,24 @@ pub fn rebuild_app(
         config.workspace_trusted,
     ));
     let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &reasoning, &sessions);
+        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions);
+    let service_available = executable_extensions.has_agent_session_service();
+    let subagents_available = service_available
+        && subagents_surface_available(&executable_extensions, &extensions, &model);
+    let (reasoning, reasoning_mode, migration_diagnostic) =
+        normalize_reasoning_selection_for_model_with_subagents(
+            &requested_reasoning,
+            requested_reasoning_mode,
+            &model,
+            subagents_available,
+        )?;
+    if let Some(diagnostic) = migration_diagnostic {
+        crate::output::stderr!("warning: {diagnostic}");
+    }
+    config.model = Some(model.spec.id.clone());
+    config.reasoning = reasoning.clone();
+    config.reasoning_mode = reasoning_mode;
+    append_config_if_changed(&mut session, &model.spec.id, &reasoning, reasoning_mode)?;
     validate_explicit_tool_policy(
         &config,
         &extensions,
@@ -4217,7 +4252,7 @@ pub fn rebuild_app(
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
-    configure_v2_delegation(&mut agent, &model, &reasoning)?;
+    configure_v2_delegation(&mut agent, &model, &reasoning, service_available)?;
     executable_extensions.bind_agent_sessions(&agent)?;
     agent.finalize_tool_surface();
     let system_tokens = estimate_text_tokens(agent.system_prompt());

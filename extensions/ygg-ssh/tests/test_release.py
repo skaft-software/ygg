@@ -28,7 +28,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-ssh")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.5.0")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-ssh")
         self.assertEqual(manifest["capabilities"]["environment"], ["SSH_AUTH_SOCK"])
         self.assertTrue(manifest["capabilities"]["network"])
@@ -62,16 +62,23 @@ class ReleaseSmokeTests(unittest.TestCase):
     def test_official_catalog_and_offline_config_check(self):
         catalog = (ROOT.parent / "release-catalog.txt").read_text(encoding="utf-8").splitlines()
         self.assertIn("ygg-ssh", catalog)
-        completed = subprocess.run(
-            [str(ROOT / "ygg-ssh"), "--config", str(ROOT / "config.example.json"), "--check-config"],
-            cwd=ROOT,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory() as directory:
+            staged_entrypoint = Path(directory) / "ygg-ssh"
+            staged_entrypoint.write_bytes((ROOT / "ygg-ssh").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
+            completed = subprocess.run(
+                [str(staged_entrypoint), "--config", str(ROOT / "config.example.json"), "--check-config"],
+                cwd=directory,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("valid SSH configuration", completed.stdout)
 
@@ -92,7 +99,7 @@ class ReleaseSmokeTests(unittest.TestCase):
                 environment = dict(os.environ)
                 environment["SOURCE_DATE_EPOCH"] = "1700000000"
                 completed = subprocess.run(
-                    [str(script), "ygg-ssh", str(destination), "v0.5.0", str(source)],
+                    [str(script), "ygg-ssh", str(destination), "v0.6.0-dev", str(source)],
                     cwd=REPOSITORY,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -102,7 +109,7 @@ class ReleaseSmokeTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(completed.returncode, 0, completed.stderr)
-                outputs.append(destination / "ygg-ssh-0.5.0.tar.gz")
+                outputs.append(destination / "ygg-ssh-0.6.0-dev.tar.gz")
             self.assertEqual(hashlib.sha256(outputs[0].read_bytes()).digest(), hashlib.sha256(outputs[1].read_bytes()).digest())
             with tarfile.open(outputs[0], "r:gz") as archive:
                 members = archive.getmembers()

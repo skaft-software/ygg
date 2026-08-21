@@ -14,11 +14,35 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Added deterministic release packaging, complete tracked-file inclusion checks,
   local install/remove smoke coverage, and post-publication install/update smoke
   coverage for every catalog bundle.
+- Added an interactive `/extensions` installed-bundle activation menu that
+  persists only enablement, never trust, rebuilds the extension host at the idle
+  boundary, and becomes read-only when a higher-precedence activation source is
+  authoritative.
+- Added a native `/subagents` worker browser with arrow-key selection,
+  owner-bound authoritative live refresh, stable-ID focus, and scrollable,
+  owner-authorized read-only delegated transcripts.
+- Cargo-installed binaries now embed the text documentation and materialize a
+  versioned `share/ygg/` tree that refreshes after Cargo-channel updates.
 
 ### Changed
 
 - Kept the target-specific Ygg Serve `package.toml` application archive distinct
   from generic executable-extension `extension.toml` bundles.
+- Removed ambient executable-extension header/status/footer and presentation
+  activity from TUI chrome; extension and worker state now appears only in
+  explicit interactive views.
+- Routed the coding product's in-harness child sessions through the trusted,
+  owner-bound `ygg-subagents` extension. Ultra is now unavailable without its
+  live observation service, and the root no longer receives a parallel native
+  collaboration tool surface.
+- Removed the fixed aggregate subagent token/cost reservation pool. First-party
+  children now have fresh contexts and inherit the parent's context/output and
+  optional session-token settings exactly; an unlimited parent remains unlimited.
+
+### Fixed
+
+- Clear composer-adjacent subagent activity when hydrating a different session,
+  so worker telemetry cannot persist across a session switch.
 
 ## 0.5.0 — 2026-08-19
 

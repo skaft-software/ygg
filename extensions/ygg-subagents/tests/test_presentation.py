@@ -34,7 +34,7 @@ class PresentationTests(unittest.TestCase):
             timeout_seconds=300,
             max_turns=8,
             max_output_bytes=8192,
-            max_tokens=32000,
+            max_tokens=None,
             max_cost_microdollars=200000,
             session="/sessions/fixture.jsonl",
             generation=1,
@@ -65,6 +65,7 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual(detail["title"], "parent > fixture-worker")
         self.assertIn("read-only [read, search]", detail["body"])
         self.assertIn("shared", detail["body"].lower())
+        self.assertIn("no session ceiling", detail["body"])
 
     def test_terminal_summary_controls_are_escaped_before_generic_presentation(self):
         worker = self.worker(
@@ -189,6 +190,10 @@ class PresentationTests(unittest.TestCase):
             (FIXTURES / "presentation" / "session-inspection.json").read_text(encoding="utf-8")
         )
         self.assertTrue(inspection["worker"]["read_only"])
+        self.assertIsNone(inspection["worker"]["budget"]["tokens"]["limit"])
+        self.assertEqual(
+            inspection["worker"]["budget"]["tokens"]["source"], "inherited_parent"
+        )
         self.assertFalse(inspection["parent_head_changed_by_inspection"])
         narrow = (FIXTURES / "presentation" / "narrow-terminal.txt").read_text(encoding="utf-8")
         self.assertIn("/subagents inspect", narrow)

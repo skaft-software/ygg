@@ -69,6 +69,11 @@ pub const EXTENSION_FEATURE_POLICY_INTENTS: &str = "policy_intents";
 pub const EXTENSION_FEATURE_DYNAMIC_TOOLS: &str = "dynamic_tools";
 /// API `0.2` host-owned child model-session service.
 pub const EXTENSION_FEATURE_AGENT_SESSIONS: &str = "agent_sessions";
+/// API `0.2` first-party delegation telemetry contract.
+pub const EXTENSION_FEATURE_DELEGATION_TELEMETRY: &str = "delegation_telemetry_v1";
+/// Stable schema label shown by `/extensions status`.
+pub const DELEGATION_TELEMETRY_SCHEMA: &str = "ygg.delegation.telemetry.v1";
+
 /// API `0.2` single-use host approval capability service.
 pub const EXTENSION_FEATURE_APPROVALS: &str = "approvals";
 /// API `0.2` owner-scoped host secret lookup service.
@@ -1737,8 +1742,10 @@ pub struct AgentSessionPolicy {
     pub max_concurrent_children: usize,
     /// Maximum model turns in the child run.
     pub max_turns: u64,
-    /// Maximum cumulative provider-reported tokens.
-    pub max_tokens: u64,
+    /// Optional cumulative provider-token ceiling. `None` inherits the parent
+    /// session setting, including an unlimited parent.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
     /// Maximum cumulative priced session cost.
     pub max_cost_microdollars: u64,
     /// Maximum UTF-8 bytes returned as the child summary.
@@ -3175,6 +3182,7 @@ struct ExtensionProcessInner {
     events: broadcast::Sender<ExtensionEvent>,
     initial_events: StdMutex<Option<broadcast::Receiver<ExtensionEvent>>>,
     answered_confirmations: StdMutex<AnsweredConfirmations>,
+    answered_inputs: StdMutex<AnsweredConfirmations>,
     generation: AtomicU64,
     next_generation: AtomicU64,
     instance_id: String,
@@ -3392,6 +3400,7 @@ impl ExtensionProcess {
                 events,
                 initial_events: StdMutex::new(Some(initial_events)),
                 answered_confirmations: StdMutex::new(AnsweredConfirmations::default()),
+                answered_inputs: StdMutex::new(AnsweredConfirmations::default()),
                 generation: AtomicU64::new(generation),
                 next_generation: AtomicU64::new(generation.saturating_add(1)),
                 instance_id,
@@ -4037,7 +4046,28 @@ impl ExtensionProcess {
                 "input/request requires API 0.2".into(),
             ));
         }
-        connection.send_child_response(request_id, &response).await
+        {
+            let mut answered = lock_std_mutex(&self.inner.answered_inputs);
+            if !answered.insert(generation, request_id.clone()) {
+                return Ok(());
+            }
+        }
+        let mut reservation = AnsweredConfirmationReservation {
+            answered: &self.inner.answered_inputs,
+            generation,
+            request_id: request_id.clone(),
+            committed: false,
+        };
+        connection
+            .send_child_response(request_id, &response)
+            .await?;
+        reservation.commit();
+        Ok(())
+    }
+
+    /// Whether an interactive owner already answered this input request.
+    pub fn input_answered(&self, request_id: &ExtensionRequestId, generation: u64) -> bool {
+        lock_std_mutex(&self.inner.answered_inputs).contains(generation, request_id)
     }
 
     /// Sends a non-veto lifecycle observation to a subscribed API `0.2`
@@ -4534,6 +4564,7 @@ impl ExtensionProcess {
             .approval_store
             .invalidate_generation(previous.generation);
         lock_std_mutex(&self.inner.answered_confirmations).retain_generation(generation);
+        lock_std_mutex(&self.inner.answered_inputs).retain_generation(generation);
         Ok(ExtensionReloadReport {
             generation,
             previous_shutdown_graceful,
@@ -6757,6 +6788,15 @@ async fn spawn_connection(
         secrets: config.secret_broker.is_some()
             && !descriptor.manifest.capabilities.secrets.is_empty(),
     };
+    let mut required_features = API_0_2_REQUIRED_FEATURES
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect::<Vec<_>>();
+    let requires_delegation_telemetry =
+        offered_host_services.agent_sessions && descriptor.manifest.name == "ygg-subagents";
+    if requires_delegation_telemetry {
+        required_features.push(EXTENSION_FEATURE_DELEGATION_TELEMETRY.to_owned());
+    }
     let mut optional_features = API_0_2_OPTIONAL_FEATURES
         .iter()
         .map(|feature| (*feature).to_owned())
@@ -6786,10 +6826,7 @@ async fn spawn_connection(
         protocol: (descriptor.manifest.api_version == EXTENSION_API_VERSION_0_2).then(|| {
             ExtensionProtocolRequest {
                 version: EXTENSION_API_VERSION_0_2.to_owned(),
-                required_features: API_0_2_REQUIRED_FEATURES
-                    .iter()
-                    .map(|feature| (*feature).to_owned())
-                    .collect(),
+                required_features,
                 optional_features,
                 limits: ExtensionProtocolLimits {
                     max_concurrent_requests: config.max_pending_requests,
@@ -7009,6 +7046,9 @@ fn negotiate_contributions_with_host_services(
                 .collect::<BTreeSet<_>>();
             if offered_host_services.agent_sessions {
                 allowed.insert(EXTENSION_FEATURE_AGENT_SESSIONS);
+                if manifest.name == "ygg-subagents" {
+                    allowed.insert(EXTENSION_FEATURE_DELEGATION_TELEMETRY);
+                }
             }
             if offered_host_services.approvals {
                 allowed.insert(EXTENSION_FEATURE_APPROVALS);
@@ -7030,6 +7070,14 @@ fn negotiate_contributions_with_host_services(
             {
                 return Err(ExtensionRuntimeError::Protocol(format!(
                     "extension is missing required feature `{feature}`"
+                )));
+            }
+            if offered_host_services.agent_sessions
+                && manifest.name == "ygg-subagents"
+                && !features.contains(EXTENSION_FEATURE_DELEGATION_TELEMETRY)
+            {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "first-party ygg-subagents requires `{EXTENSION_FEATURE_DELEGATION_TELEMETRY}`; reinstall the current workspace bundle"
                 )));
             }
             if features.contains(EXTENSION_FEATURE_APPROVALS)
@@ -8875,7 +8923,16 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         }
                         drop(worker);
                     });
-                } else {
+                } else if state
+                    .events
+                    .send(ExtensionEvent::InputRequested {
+                        request_id: id.clone(),
+                        generation: state.generation,
+                        parent_request_id: request.parent_request_id,
+                        request: request.clone(),
+                    })
+                    .is_err()
+                {
                     try_queue_child_response(
                         &state.child_requests,
                         &id,
@@ -10912,8 +10969,55 @@ confirmations = true
     }
 
     #[test]
+    fn non_tool_input_is_delivered_to_an_event_consumer() {
+        let (events, mut events_rx) = broadcast::channel(4);
+        let (state, mut frames) =
+            protocol_read_state_for_test(ManifestContributions::default(), events);
+        *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
+            version: EXTENSION_API_VERSION_0_2.into(),
+            features: API_0_2_REQUIRED_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            max_concurrent_requests: 1,
+            lifecycle_events: BTreeSet::new(),
+        };
+        let (reply, _reply_rx) = oneshot::channel();
+        lock_std_mutex(&state.pending).insert(
+            7,
+            PendingRequest {
+                sender: reply,
+                terminal: Arc::new(AtomicU8::new(REQUEST_ACTIVE)),
+                frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
+                cancellation_sent: Arc::new(AtomicBool::new(false)),
+                progress: None,
+                resource_owner: None,
+                last_progress_sequence: None,
+            },
+        );
+        handle_protocol_line(
+            br#"{"jsonrpc":"2.0","id":"py:1","method":"input/request","params":{"parent_request_id":7,"prompt":"Token?","secret":true}}"#,
+            &state,
+        )
+        .expect("input event delivery");
+        assert!(frames.try_recv().is_err());
+        assert!(matches!(
+            events_rx.try_recv(),
+            Ok(ExtensionEvent::InputRequested {
+                request_id: ExtensionRequestId::String(id),
+                generation: 1,
+                parent_request_id: 7,
+                request: ExtensionInputRequest { prompt, secret: true, .. },
+            }) if id == "py:1" && prompt == "Token?"
+        ));
+        assert!(lock_std_mutex(&state.child_requests)
+            .contains_key(&ExtensionRequestId::String("py:1".into())));
+    }
+
+    #[test]
     fn non_tool_input_fails_closed_without_an_event_consumer() {
-        let (events, _events_rx) = broadcast::channel(4);
+        let (events, events_rx) = broadcast::channel(4);
+        drop(events_rx);
         let (state, mut frames) =
             protocol_read_state_for_test(ManifestContributions::default(), events);
         *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
@@ -11335,7 +11439,51 @@ command = "agent-service"
     }
 
     #[test]
-    fn agent_spawn_requires_a_complete_host_enforced_policy() {
+    fn first_party_subagents_requires_native_telemetry_contract() {
+        let manifest = ExtensionManifest::parse(
+            r#"name = "ygg-subagents"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "ygg-subagents"
+"#,
+        )
+        .unwrap();
+        let response = InitializeResponse {
+            api_version: EXTENSION_API_VERSION_0_2.into(),
+            tools: Vec::new(),
+            commands: Vec::new(),
+            protocol: Some(ExtensionProtocolResponse {
+                version: EXTENSION_API_VERSION_0_2.into(),
+                features: API_0_2_REQUIRED_FEATURES
+                    .iter()
+                    .copied()
+                    .chain([EXTENSION_FEATURE_AGENT_SESSIONS])
+                    .map(str::to_owned)
+                    .collect(),
+                limits: ExtensionProtocolLimits {
+                    max_concurrent_requests: 1,
+                },
+                lifecycle_events: Vec::new(),
+            }),
+        };
+        let error = negotiate_contributions_with_host_services(
+            &manifest,
+            response,
+            DEFAULT_PENDING_REQUESTS,
+            OfferedHostServices {
+                agent_sessions: true,
+                ..OfferedHostServices::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, ExtensionRuntimeError::Protocol(message)
+            if message.contains("delegation_telemetry_v1")
+                && message.contains("reinstall")));
+    }
+
+    #[test]
+    fn agent_spawn_requires_host_policy_and_defaults_tokens_to_parent_inheritance() {
         let missing = serde_json::json!({
             "parent_request_id": 7,
             "task_name": "inspect",
@@ -11354,7 +11502,6 @@ command = "agent-service"
                 "max_depth": 1,
                 "max_concurrent_children": 2,
                 "max_turns": 8,
-                "max_tokens": 32000,
                 "max_cost_microdollars": 200000,
                 "max_output_bytes": 8192,
                 "timeout_ms": 300000
@@ -11363,6 +11510,13 @@ command = "agent-service"
         let request: AgentSessionSpawnRequest = serde_json::from_value(valid).unwrap();
         let policy: ExtensionAgentSessionPolicy = request.policy.into();
         assert!(policy.validate().is_ok());
+        assert_eq!(policy.max_tokens, None);
+        let mut invalid_tokens = policy.clone();
+        invalid_tokens.max_tokens = Some(999);
+        assert!(invalid_tokens
+            .validate()
+            .unwrap_err()
+            .contains("max_tokens"));
 
         let mut invalid = policy;
         invalid.tools.push("write".into());

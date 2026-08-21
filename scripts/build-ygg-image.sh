@@ -7,13 +7,13 @@ Usage:
   scripts/build-ygg-image.sh [IMAGE]
   scripts/build-ygg-image.sh --context OUTPUT_DIRECTORY
 
-Build the pinned linux/amd64 Ygg image (default: ygg:0.5.0), or materialize
+Build the pinned linux/amd64 Ygg image (default: ygg:0.6.0-dev), or materialize
 the exact clean tracked Docker context for inspection.
 EOF
 }
 
 mode=build
-image=ygg:0.5.0
+image=ygg:0.6.0-dev
 output_directory=
 case $# in
     0) ;;

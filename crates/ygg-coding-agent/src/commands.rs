@@ -58,7 +58,8 @@ pub enum AutoCompactSetting {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtensionsSubcommand {
-    List,
+    Menu,
+    Status,
     Reload,
     Inspect { reference: String },
     Action { extension: String, action: String },
@@ -218,8 +219,8 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
     ),
     slash!(
         "extensions",
-        "/extensions [reload|inspect <agent-session:…>|action <extension> <action-id>]",
-        "inspect, reload, or invoke a declared executable-extension action",
+        "/extensions [status|reload|inspect <agent-session:…>|action <extension> <action-id>]",
+        "enable, disable, inspect, or reload executable extensions",
         true
     ),
     slash!(
@@ -268,7 +269,7 @@ pub fn help_text(workspace: &Path, topic: Option<&str>) -> String {
             text.push_str(&format!("  {} — {}\n", command.usage, command.description));
         }
         text.push_str(
-            "\nProject prompt templates, skills, and executable extensions are discovered at runtime; use /prompt, /skills, and /extensions to inspect them.\n\n",
+            "\nProject prompt templates, skills, and executable extensions are discovered at runtime; use /prompt, /skills, and /extensions status to inspect them (bare /extensions manages activation).\n\n",
         );
     }
 
@@ -384,7 +385,8 @@ pub fn parse(input: &str) -> Command {
     if full_name == "extensions" {
         let args = parts.collect::<Vec<_>>();
         return match args.as_slice() {
-            [] => Command::Extensions(ExtensionsSubcommand::List),
+            [] | ["list"] => Command::Extensions(ExtensionsSubcommand::Menu),
+            ["status"] => Command::Extensions(ExtensionsSubcommand::Status),
             ["reload"] => Command::Extensions(ExtensionsSubcommand::Reload),
             ["inspect", reference] => Command::Extensions(ExtensionsSubcommand::Inspect {
                 reference: (*reference).to_owned(),
@@ -653,6 +655,9 @@ pub fn cost_text(session: &Session, model: &Model) -> String {
             UsageRecordKind::AssistantTurn { .. } => {
                 assistant_turn += 1;
                 assistant_turn.to_string()
+            }
+            UsageRecordKind::DelegatedAgent { ref agent_id, .. } => {
+                format!("sub:{}", agent_id.trim_start_matches("agent-"))
             }
             UsageRecordKind::Compaction => "cmp".to_owned(),
             UsageRecordKind::RejectedResponsesTurn => "rejected".to_owned(),
@@ -1014,6 +1019,18 @@ mod tests {
             Command::Skills(SkillsSubcommand::Off("audit".into()))
         );
         assert_eq!(
+            parse("/extensions"),
+            Command::Extensions(ExtensionsSubcommand::Menu)
+        );
+        assert_eq!(
+            parse("/extensions list"),
+            Command::Extensions(ExtensionsSubcommand::Menu)
+        );
+        assert_eq!(
+            parse("/extensions status"),
+            Command::Extensions(ExtensionsSubcommand::Status)
+        );
+        assert_eq!(
             parse("/extensions inspect agent-session:abc"),
             Command::Extensions(ExtensionsSubcommand::Inspect {
                 reference: "agent-session:abc".into(),
@@ -1138,6 +1155,7 @@ mod tests {
             skill_paths: vec![],
             extension_paths: vec![],
             enabled_extensions: vec![],
+            extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![],
             tools: crate::config::ToolPolicy::default(),

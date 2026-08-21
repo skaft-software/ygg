@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 from ygg_extension import (
     CancelledError,
@@ -19,7 +19,6 @@ from .model import (
     MAX_COST_MICRODOLLARS,
     MAX_OUTPUT_BYTES,
     MAX_TASK_BYTES,
-    MAX_TOKEN_BUDGET,
     MAX_TURNS,
     MAX_WALL_SECONDS,
     PROFILE_INSTRUCTIONS,
@@ -81,12 +80,6 @@ SPAWN_SCHEMA: Dict[str, Any] = {
             "minimum": 512,
             "maximum": MAX_OUTPUT_BYTES,
             "default": 8192,
-        },
-        "max_tokens": {
-            "type": "integer",
-            "minimum": 1000,
-            "maximum": MAX_TOKEN_BUDGET,
-            "default": 32000,
         },
         "max_cost_microdollars": {
             "type": "integer",
@@ -158,7 +151,7 @@ class SdkAgentSessions:
         max_depth: int,
         max_concurrent_children: int,
         max_turns: int,
-        max_tokens: int,
+        max_tokens: Optional[int],
         max_cost_microdollars: int,
         max_output_bytes: int,
         timeout_ms: int,
@@ -219,11 +212,22 @@ class PresentationPublisher:
 
 
 def _require_agent_sessions(extension: Extension) -> None:
-    if "agent_sessions" not in extension.negotiated_features:
-        raise SubagentError(
-            "the selected Ygg model/reasoning mode did not offer API 0.2 agent_sessions",
-            code="agent_sessions_unavailable",
-        )
+    required = {"agent_sessions", "delegation_telemetry_v1"}
+    missing = sorted(required.difference(extension.negotiated_features))
+    if not missing:
+        return
+    if "agent_sessions" in missing:
+        message = (
+            "the trusted ygg-subagents extension does not have an active owner-bound API 0.2 "
+            "agent_sessions service; missing: %s"
+        ) % ", ".join(missing)
+    else:
+        message = (
+            "the trusted ygg-subagents extension does not have the required delegation telemetry "
+            "contract `%s`; restart Ygg after reinstalling a matching current host and "
+            "ygg-subagents bundle"
+        ) % "delegation_telemetry_v1"
+    raise SubagentError(message, code="agent_sessions_unavailable")
 
 
 def _compact_metadata(result: Mapping[str, Any]) -> Dict[str, Any]:
@@ -368,6 +372,7 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
             "content_parts",
             "lifecycle_events",
             "agent_sessions",
+            "delegation_telemetry_v1",
         ),
     )
     publisher = PresentationPublisher(extension)
@@ -408,7 +413,7 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
     @extension.tool(
         name="subagent_spawn",
         description=(
-            "Launch one named, depth-one, read/search-only Ygg worker with bounded profile, inherited model, timeout, turns, output, tokens, and cost. "
+            "Launch one named, depth-one, read/search-only Ygg worker with bounded profile, inherited model and token/context ceilings, timeout, turns, output, and cost. "
             "Defaults to background and is retry-safe through an idempotency key. Maximum two active children; no writers, graph, swarm, team chat, or arbitrary recursive spawn."
         ),
         parameters=SPAWN_SCHEMA,
@@ -449,11 +454,31 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
 
     @extension.command(
         name="subagents",
-        description="Show the cached narrow worker list or inspect cached worker detail",
+        description="Browse workers and inspect read-only delegated transcripts",
         usage="/subagents [list|inspect <name-or-id>|stop <name-or-id|all>]",
     )
     def subagents_command(arguments: list[str], context: Mapping[str, Any]):
         try:
+            live_list = not arguments or (
+                len(arguments) == 1 and arguments[0] in {"list", "status"}
+            )
+            if live_list and isinstance(context.get("resource_owner"), Mapping):
+                # Interactive frontends may keep the explicit worker browser
+                # open while children finish. Refresh through the same
+                # owner-bound host service used by the tool; cached state alone
+                # cannot observe delegated lifecycle changes.
+                _require_agent_sessions(extension)
+                authenticated_owner = Owner.from_context(context)
+                result = orchestrator.status(
+                    sessions,
+                    authenticated_owner,
+                    {},
+                    current_cancellation(),
+                )
+                return {
+                    "text": _result_text("status", result),
+                    "notifications": [],
+                }
             if (
                 len(arguments) == 2
                 and arguments[0] == "stop"

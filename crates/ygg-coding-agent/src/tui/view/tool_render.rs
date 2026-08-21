@@ -76,6 +76,7 @@ pub(super) fn tool_display_label(name: &str) -> &'static str {
         "search" => "Explored",
         "edit" => "Edit",
         "write" => "Write",
+        "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_stop" => "Delegated",
         _ => "Used",
     }
 }

@@ -473,7 +473,8 @@ async fn run_prompt(
                         }
                     }
                     AgentEvent::SteeringDelivered { .. }
-                    | AgentEvent::FollowUpDelivered { .. } => {}
+                    | AgentEvent::FollowUpDelivered { .. }
+                    | AgentEvent::DelegationUpdated { .. } => {}
                     AgentEvent::RunFinished { reason, .. } => {
                         let outcome = HostRunOutcome::from_finish_reason(
                             reason,

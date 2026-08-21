@@ -27,7 +27,7 @@ portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-ygg-agent = { version = "=0.5.0", path = "../../crates/ygg-agent" }
+ygg-agent = { version = "=0.6.0-dev", path = "../../crates/ygg-agent" }
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

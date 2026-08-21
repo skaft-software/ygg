@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import re
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 
 VERSION = "0.1.0"
@@ -22,12 +22,8 @@ MAX_TURNS = 12
 DEFAULT_TURNS = 8
 MAX_WALL_SECONDS = 15 * 60
 DEFAULT_WALL_SECONDS = 5 * 60
-MAX_TOKEN_BUDGET = 64_000
-DEFAULT_TOKEN_BUDGET = 32_000
-MAX_TOTAL_TOKEN_RESERVATION = 96_000
 MAX_COST_MICRODOLLARS = 500_000
 DEFAULT_COST_MICRODOLLARS = 200_000
-MAX_TOTAL_COST_RESERVATION = 500_000
 MAX_ERROR_BYTES = 4 * 1024
 MAX_LABEL_BYTES = 1_024
 READ_ONLY_TOOLS = ("read", "search")
@@ -148,7 +144,6 @@ class SpawnRequest:
     timeout_seconds: int
     max_turns: int
     max_output_bytes: int
-    max_tokens: int
     max_cost_microdollars: int
     background: bool
     idempotency_key: str
@@ -167,7 +162,6 @@ class SpawnRequest:
             "timeout_seconds",
             "max_turns",
             "max_output_bytes",
-            "max_tokens",
             "max_cost_microdollars",
             "background",
             "idempotency_key",
@@ -231,12 +225,6 @@ class SpawnRequest:
             512,
             MAX_OUTPUT_BYTES,
         )
-        max_tokens = bounded_int(
-            arguments.get("max_tokens", DEFAULT_TOKEN_BUDGET),
-            "max_tokens",
-            1_000,
-            MAX_TOKEN_BUDGET,
-        )
         max_cost = bounded_int(
             arguments.get("max_cost_microdollars", DEFAULT_COST_MICRODOLLARS),
             "max_cost_microdollars",
@@ -256,7 +244,6 @@ class SpawnRequest:
             "timeout_seconds": timeout_seconds,
             "max_turns": max_turns,
             "max_output_bytes": max_output_bytes,
-            "max_tokens": max_tokens,
             "max_cost_microdollars": max_cost,
             "background": background,
         }
@@ -278,7 +265,6 @@ class SpawnRequest:
             timeout_seconds=timeout_seconds,
             max_turns=max_turns,
             max_output_bytes=max_output_bytes,
-            max_tokens=max_tokens,
             max_cost_microdollars=max_cost,
             background=background,
             idempotency_key=key,
@@ -306,7 +292,7 @@ HARD ORCHESTRATION BOUNDARIES
 BOUNDS
 - Wall-time request: {self.timeout_seconds} seconds.
 - Turn budget request: {self.max_turns} turns.
-- Token reservation: {self.max_tokens} tokens.
+- Token/context ceilings: inherit the parent session exactly; no separate child token budget is requested.
 - Cost reservation: {self.max_cost_microdollars} microdollars.
 - Final output must be no more than {self.max_output_bytes} UTF-8 bytes.
 Ygg owns the actual session, persistence, approvals, cancellation, hard limits, and descendant cleanup. Stop earlier if a host limit is lower.
@@ -354,7 +340,7 @@ class Worker:
     timeout_seconds: int
     max_turns: int
     max_output_bytes: int
-    max_tokens: int
+    max_tokens: Optional[int]
     max_cost_microdollars: int
     idempotency_key: Optional[str] = None
     fingerprint: Optional[str] = None
@@ -362,6 +348,12 @@ class Worker:
     export_reference: Optional[str] = None
     completed_at_ms: Optional[int] = None
     turn_count: Optional[int] = None
+    tool_call_count: int = 0
+    input_tokens: Optional[int] = None
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
     tokens_used: Optional[int] = None
     cost_microdollars: Optional[int] = None
     current_tool: Optional[str] = None
@@ -406,6 +398,12 @@ class Worker:
             "elapsed_ms": self.elapsed_ms(now_ms),
             "turn_count": self.turn_count,
             "turn_limit": self.max_turns,
+            "tool_call_count": self.tool_call_count,
+            "input_tokens": self.input_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "output_tokens": self.output_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "tokens_used": self.tokens_used,
             "token_budget": self.max_tokens,
             "cost_microdollars": self.cost_microdollars,
@@ -520,23 +518,56 @@ def depth_from_record(record: Mapping[str, Any]) -> int:
     return 0
 
 
-def aggregate_usage(record: Mapping[str, Any], status: Mapping[str, Any]) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+def aggregate_usage(
+    record: Mapping[str, Any], status: Mapping[str, Any]
+) -> Tuple[
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+    Optional[int],
+]:
     usage = record.get("usage")
     if not isinstance(usage, Mapping):
         usage = status.get("usage")
     if not isinstance(usage, Mapping):
         usage = {}
-    turns = first_nonnegative_int(record.get("turn_count"), status.get("turn_count"), usage.get("turns"))
-    tokens = first_nonnegative_int(usage.get("total_tokens"), record.get("tokens_used"))
-    if tokens is None:
-        input_tokens = first_nonnegative_int(usage.get("input_tokens"))
-        output_tokens = first_nonnegative_int(usage.get("output_tokens"))
-        if input_tokens is not None or output_tokens is not None:
-            tokens = (input_tokens or 0) + (output_tokens or 0)
-    cost = first_nonnegative_int(
-        usage.get("cost_microdollars"), record.get("cost_microdollars")
+    turns = first_nonnegative_int(
+        record.get("turn_count"), status.get("turn_count"), usage.get("turns")
     )
-    return turns, tokens, cost
+    tool_calls = first_nonnegative_int(
+        record.get("tool_call_count"), status.get("tool_call_count"), usage.get("tool_calls")
+    )
+    input_tokens = first_nonnegative_int(usage.get("input_tokens"))
+    cache_read_tokens = first_nonnegative_int(usage.get("cache_read_tokens"))
+    cache_write_tokens = first_nonnegative_int(usage.get("cache_write_tokens"))
+    output_tokens = first_nonnegative_int(usage.get("output_tokens"))
+    reasoning_tokens = first_nonnegative_int(usage.get("reasoning_tokens"))
+    tokens = first_nonnegative_int(usage.get("total_tokens"), record.get("tokens_used"))
+    bucket_values = (input_tokens, cache_read_tokens, cache_write_tokens, output_tokens)
+    bucket_total = sum(value or 0 for value in bucket_values)
+    if (tokens is None or (tokens == 0 and bucket_total > 0)) and any(
+        value is not None for value in bucket_values
+    ):
+        tokens = bucket_total
+    cost = first_nonnegative_int(
+        record.get("cost_microdollars"), usage.get("cost_microdollars")
+    )
+    return (
+        turns,
+        tool_calls,
+        input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        output_tokens,
+        reasoning_tokens,
+        tokens,
+        cost,
+    )
 
 
 def first_nonnegative_int(*values: Any) -> Optional[int]:
@@ -577,13 +608,3 @@ def parse_artifacts(record: Mapping[str, Any], status: Mapping[str, Any]) -> Lis
             )
         )
     return results
-
-
-def active_reservations(workers: Iterable[Worker]) -> Tuple[int, int]:
-    tokens = 0
-    cost = 0
-    for worker in workers:
-        if worker.active:
-            tokens += worker.max_tokens
-            cost += worker.max_cost_microdollars
-    return tokens, cost

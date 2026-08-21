@@ -151,12 +151,16 @@ and caps `max_concurrent_requests` at its configured local maximum. Unknown
 optional features are ignored. The SDK currently supports
 `request_cancellation`, `content_parts`, `request_progress`, `artifacts`,
 `lifecycle_events`, `policy_intents`, `dynamic_tools`, `agent_sessions`,
-`approvals`, and `secrets`. The host offers `agent_sessions` only when its
-bounded V2 delegation service is available for the selected model/reasoning
-mode. It offers `approvals` only when approval issuance is enabled, and
-`secrets` only when a broker is configured and the manifest secret allowlist is
-non-empty. `approvals` also requires `policy_intents`. The coding product
-currently leaves approvals off, configures no secret broker, and answers
+`delegation_telemetry_v1`, `approvals`, and `secrets`. The host requires
+`delegation_telemetry_v1` for the first-party `ygg-subagents` bundle whenever it
+offers `agent_sessions`; incompatible installed bundles fail initialization
+with a reinstall diagnostic. The host offers `agent_sessions` only when its
+configured, owner-bound child-session service is available for the extension;
+the coding product enables that service only for the trusted, enabled
+`ygg-subagents` extension. It offers `approvals` only when approval issuance is
+enabled, and `secrets` only when a broker is configured and the manifest secret
+allowlist is non-empty. `approvals` also requires `policy_intents`. The coding
+product currently leaves approvals off, configures no secret broker, and answers
 generic policy intents with `deny`, so neither conditional feature is offered
 there.
 
@@ -272,7 +276,7 @@ def orchestrate(args):
         max_depth=1,
         max_concurrent_children=2,
         max_turns=8,
-        max_tokens=32_000,
+        max_tokens=None,
         max_cost_microdollars=200_000,
         max_output_bytes=8_192,
         timeout_ms=300_000,
@@ -291,7 +295,7 @@ def orchestrate(args):
 The exact helpers are:
 
 - `spawn_agent(*, task_name, message, idempotency_key, tools, max_depth,
-  max_concurrent_children, max_turns, max_tokens, max_cost_microdollars,
+  max_concurrent_children, max_turns, max_tokens=None, max_cost_microdollars,
   max_output_bytes, timeout_ms, profile=None, fingerprint=None,
   parent_request_id=...)`;
 - `send_agent_message(target, message, *, parent_request_id=...)`;
@@ -299,6 +303,14 @@ The exact helpers are:
 - `list_agents(*, parent_request_id=...)`;
 - `wait_agents(*, timeout_ms=30_000, parent_request_id=...)`; and
 - `interrupt_agent(target, *, parent_request_id=...)`.
+
+`max_tokens=None` requests exact inheritance of the parent's optional cumulative
+session-token ceiling; if the parent has no ceiling, neither does the child. A
+non-null 1,000..=64,000 value is an optional stricter cap. This setting does not
+share prompt context: every child has a fresh context and inherits the parent
+model's context window and resolved per-request output limit. Child usage may be
+mirrored into the root session ledger for accounting without becoming parent
+prompt tokens or consuming the parent's own-context token ceiling.
 
 Inside a model-tool or host-owned command handler, the SDK supplies the ambient
 parent automatically. Outside one, pass an explicit active model-tool/command

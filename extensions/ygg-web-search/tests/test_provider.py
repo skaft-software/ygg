@@ -22,10 +22,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from provider import (  # noqa: E402
+    AuthenticationFailed,
     BoundedCache,
+    BRAVE_SEARCH_ENDPOINT,
     ConfigError,
+    CredentialRequired,
     DestinationRejected,
     HttpClient,
+    HttpPayload,
     InvalidInput,
     ProviderFailed,
     RequestTimedOut,
@@ -34,10 +38,14 @@ from provider import (  # noqa: E402
     UnsupportedContent,
     WebService,
     citation_id,
+    load_brave_api_key,
     load_configuration,
     parse_configuration,
+    remove_brave_api_key,
     requested_domains,
     sanitize_url,
+    select_provider,
+    store_brave_api_key,
 )
 
 
@@ -211,6 +219,36 @@ class Cancellation:
             raise FakeCancelled("cancelled")
 
 
+class BraveHttp:
+    def __init__(self, status=200):
+        self.status = status
+        self.calls = []
+
+    def fetch(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        body = json.dumps(
+            {
+                "web": {
+                    "results": [
+                        {
+                            "title": "Brave result",
+                            "url": "https://example.com/brave?utm_source=tracker",
+                            "description": "Brave &amp; bounded snippet.",
+                            "page_age": "2026-08-21",
+                        }
+                    ]
+                }
+            }
+        ).encode("utf-8")
+        return HttpPayload(
+            url,
+            self.status,
+            {"content-type": "application/json; charset=utf-8"},
+            body,
+            0,
+        )
+
+
 class ProviderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -265,6 +303,119 @@ class ProviderTests(unittest.TestCase):
         query = parse_qs(self.server.queries[-1])
         self.assertEqual(query["format"], ["json"])
         self.assertEqual(query["safesearch"], ["1"])
+
+    def test_brave_search_uses_fixed_endpoint_secret_header_and_response_shape(self):
+        config = parse_configuration(
+            {"version": 1, "provider": {"kind": "brave"}}
+        )
+        http = BraveHttp()
+        service = WebService(http=http, cache=BoundedCache())
+
+        result = service.search(
+            config,
+            query="bounded evidence",
+            max_results=3,
+            api_key="fixture-api-key",
+        )
+        cached = service.search(
+            config,
+            query="bounded evidence",
+            max_results=3,
+            api_key="fixture-api-key",
+        )
+        service.search(
+            config,
+            query="bounded evidence",
+            max_results=3,
+            api_key="different-api-key",
+        )
+
+        self.assertEqual(result["result_count"], 1)
+        self.assertEqual(cached["cache"], "hit")
+        self.assertEqual(len(http.calls), 2)
+        self.assertEqual(result["results"][0]["title"], "Brave result")
+        self.assertEqual(result["results"][0]["url"], "https://example.com/brave")
+        self.assertEqual(result["results"][0]["published_at"], "2026-08-21")
+        self.assertEqual(result["sources"][0]["engines"], ["Brave Search"])
+        url, options = http.calls[0]
+        self.assertTrue(url.startswith(BRAVE_SEARCH_ENDPOINT + "?"))
+        query = parse_qs(urlsplit(url).query)
+        self.assertEqual(query["count"], ["3"])
+        self.assertEqual(query["safesearch"], ["moderate"])
+        self.assertEqual(options["headers"], {"X-Subscription-Token": "fixture-api-key"})
+        self.assertEqual(options["max_redirects"], 0)
+        self.assertNotIn("fixture-api-key", url)
+
+    def test_brave_search_requires_and_rejects_invalid_credentials(self):
+        config = parse_configuration(
+            {"version": 1, "provider": {"kind": "brave"}}
+        )
+        service = WebService(http=BraveHttp(), cache=BoundedCache())
+        with self.assertRaises(CredentialRequired):
+            service.search(config, query="missing key")
+
+        rejected = WebService(http=BraveHttp(status=401), cache=BoundedCache())
+        with self.assertRaises(AuthenticationFailed):
+            rejected.search(config, query="invalid key", api_key="fixture-api-key")
+
+    def test_provider_selection_preserves_searxng_and_credentials_are_private(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config" / "web.json"
+            credential_path = root / "credentials" / "brave.key"
+            config_path.parent.mkdir()
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "provider": {
+                            "kind": "searxng",
+                            "endpoint": "https://search.example.com/search",
+                            "label": "Private Search",
+                        },
+                        "limits": {"default_results": 3},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            brave = select_provider("brave", path=config_path)
+            self.assertEqual(brave.provider.kind, "brave")
+            stored = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                stored["provider_settings"]["searxng"]["endpoint"],
+                "https://search.example.com/search",
+            )
+            self.assertEqual(stored["limits"]["default_results"], 3)
+
+            store_brave_api_key("fixture-api-key", credential_path)
+            self.assertNotIn("fixture-api-key", config_path.read_text(encoding="utf-8"))
+            self.assertEqual(load_brave_api_key(credential_path), "fixture-api-key")
+            self.assertEqual(credential_path.stat().st_mode & 0o777, 0o600)
+
+            searxng = select_provider("searxng", path=config_path)
+            self.assertEqual(searxng.provider.kind, "searxng")
+            self.assertEqual(searxng.provider.label, "Private Search")
+            self.assertTrue(remove_brave_api_key(credential_path))
+            with self.assertRaises(CredentialRequired):
+                load_brave_api_key(credential_path)
+
+    def test_new_searxng_selection_requires_and_persists_an_endpoint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "state" / "web.json"
+            with self.assertRaises(ConfigError):
+                select_provider("searxng", path=config_path)
+            selected = select_provider(
+                "searxng",
+                path=config_path,
+                searxng_endpoint="https://search.example.com/search",
+            )
+            self.assertEqual(selected.provider.kind, "searxng")
+            self.assertEqual(
+                selected.provider.endpoint,
+                "https://search.example.com/search",
+            )
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
 
     def test_citation_is_stable_for_sanitized_url(self):
         one = sanitize_url("https://Example.COM/a?utm_source=x&b=2&a=1#frag")
@@ -383,6 +534,8 @@ class ProviderTests(unittest.TestCase):
         for provider in (
             {"kind": "searxng", "endpoint": "https://user:secret@example.com"},
             {"kind": "searxng", "endpoint": "https://example.com", "api_key": "no"},
+            {"kind": "brave", "api_key": "no"},
+            {"kind": "brave", "endpoint": "https://attacker.example/search"},
         ):
             with self.assertRaises(ConfigError):
                 parse_configuration({"version": 1, "provider": provider})
@@ -457,6 +610,26 @@ class ProviderTests(unittest.TestCase):
                 with mock.patch("provider.os.getuid", return_value=os.getuid() + 1):
                     with self.assertRaises(ConfigError):
                         load_configuration(path)
+
+    def test_brave_credential_requires_owner_private_regular_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            credential = root / "brave.key"
+            credential.write_text("fixture-api-key\n", encoding="utf-8")
+            credential.chmod(0o644)
+            with self.assertRaises(ConfigError):
+                load_brave_api_key(credential)
+
+            credential.chmod(0o600)
+            self.assertEqual(load_brave_api_key(credential), "fixture-api-key")
+            target = root / "target.key"
+            credential.replace(target)
+            try:
+                credential.symlink_to(target)
+            except (OSError, NotImplementedError):
+                return
+            with self.assertRaises(ConfigError):
+                load_brave_api_key(credential)
 
 
 if __name__ == "__main__":

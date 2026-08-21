@@ -77,6 +77,27 @@ directly below the composer. While matches are visible, the suggestion surface
 temporarily replaces the model and token status row; the status returns as soon
 as completion closes. Matches use compact rows with action hints in a footer,
 and the active match and hint keys use the selected model's adaptive accent.
+Executable-extension status/header/footer contributions never occupy that row.
+Generic presentation snapshots do not create persistent chrome. The first-party
+`ygg-subagents` observation surface is the bounded exception: while an owning
+run has workers, the host renders its owner-fenced `subagent` activities in a
+live block immediately above the composer. Each worker uses a content-free task/
+phase line and a structured `Tool Calls • ↑input ↓output • cost` line. A
+nonblocking 250 ms host tick invokes the owner-scoped status command, coalesces
+with normal extension events, and retains the last accepted snapshot on failure.
+Live child cost is added to the host-owned cumulative footer only until root
+settlement persists matching `delegated_agent` usage records; idle rendering
+therefore cannot count it twice.
+
+`/extensions` opens an interactive installed-bundle activation panel instead.
+The no-argument `/subagents` command supplied by `ygg-subagents` opens a
+frontend-owned worker list; Up/Down moves focus, Enter opens the selected bounded
+read-only transcript, and Escape or Left returns from the transcript to the
+list. While open, the same owner-bound status command reconciles the host's
+authoritative worker state and publishes complete presentation revisions; the
+frontend preserves focus by stable node ID and revalidates the latest typed
+session reference immediately before opening. Transcript panels start at the
+live tail and support arrow, PageUp/PageDown, Home, and End scrolling.
 Directory completions retain their trailing separator so completion can continue
 one level at a time, and whitespace in completed names is backslash-escaped.
 Media is capability-gated at attachment time and remains ordered with text when
@@ -158,6 +179,18 @@ at an idle boundary.
 Model selection is available through a picker or direct `/model <id>`. Thinking
 choices include only the active model's advertised `min_effort..=max_effort`
 range.
+
+`/extensions` lists managed executable bundles only; the separately packaged
+`ygg-serve` application is not an activation target. Enter updates only the
+selected name in the user config's `enabled_extensions`, never trust, then
+rebuilds the Agent and extension host at the idle boundary so enable and disable
+take effect immediately. A project or explicit definition shadowing the managed
+global bundle is visible but not toggleable from this menu. If project,
+environment, or command-line activation participates in the effective list, the
+menu is read-only rather than claiming a user-config edit will survive the next
+launch; project precedence is rechecked at action time. Enabled-but-unavailable
+bundles remain disable-only, while source-changing trust, tool collisions, and
+explicit required-tool removal fail closed.
 
 ## Active-run controls
 

@@ -66,7 +66,7 @@ use self::status_telemetry::{
 #[cfg(test)]
 use self::surface_frame::event_margin_marker;
 pub use self::terminal_text::bounded_append;
-use self::terminal_text::{sanitize_extension_surface, sanitize_extension_tool_render_segments};
+use self::terminal_text::sanitize_extension_tool_render_segments;
 pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
@@ -88,7 +88,17 @@ use self::viewport::{
 #[cfg(test)]
 use self::viewport::{render_shell_viewport_at, render_shell_viewport_update};
 
-/// A compact tool row keeps enough terminal context to recognize a result
+const SUBAGENT_TOOL_NAMES: [&str; 4] = [
+    "subagent_spawn",
+    "subagent_status",
+    "subagent_wait",
+    "subagent_stop",
+];
+
+fn is_subagent_tool(name: &str) -> bool {
+    SUBAGENT_TOOL_NAMES.contains(&name)
+}
+
 /// while preventing noisy output from swallowing the transcript.
 const COMPACT_EXEC_OUTPUT_LINES: usize = 5;
 
@@ -254,6 +264,13 @@ pub(crate) enum Panel {
         /// What to do with the confirmed index.
         action: PanelAction,
     },
+    /// Scrollable, read-only document used for delegated worker transcripts.
+    ReadOnlyDocument {
+        title: String,
+        text: String,
+        /// Visual rows retained below the current viewport tail.
+        scroll_from_bottom: usize,
+    },
 }
 
 /// What happens when the user confirms a panel selection.
@@ -270,6 +287,12 @@ pub(crate) enum PanelAction {
     SelectReasoningMode(Vec<ygg_ai::ReasoningMode>),
     /// Select a theme name.
     SelectTheme(Vec<String>),
+    /// Select an installed executable-extension bundle.
+    SelectExtension(Vec<String>),
+    /// Select one subagent presentation node.
+    SelectSubagent(Vec<String>),
+    /// Navigate a read-only transcript document.
+    ReadOnlyDocument,
     /// Confirm or deny a typed executable-extension request.
     ExtensionConfirmation,
 }
@@ -281,6 +304,70 @@ pub(crate) enum PanelResult {
     Confirm(usize),
     /// User cancelled (Esc).
     Cancel,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SubagentActivityView {
+    pub(crate) status_label: String,
+    pub(crate) activities: Vec<ygg_agent::ExtensionPresentationActivity>,
+    pub(crate) telemetry: Vec<ygg_agent::DelegationTelemetryChild>,
+    pub(crate) failure_class: Option<String>,
+    pub(crate) failure_reason: Option<String>,
+    pub(crate) include_cost_in_session_total: bool,
+}
+
+fn subagent_status_label(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> String {
+    let active = snapshot
+        .children
+        .iter()
+        .filter(|child| matches!(child.state.as_str(), "pending" | "running"))
+        .count();
+    let failed = snapshot
+        .children
+        .iter()
+        .filter(|child| child.state == "failed" || child.failure_reason.is_some())
+        .count();
+    let profile = snapshot
+        .children
+        .iter()
+        .find_map(|child| child.profile.as_deref())
+        .unwrap_or("explore");
+    let mut chars = profile.chars();
+    let profile = format!(
+        "{}{}",
+        chars.next().unwrap_or('e').to_ascii_uppercase(),
+        chars.as_str()
+    );
+    let external_failure = snapshot.failure_reason.is_some();
+    if failed > 0 || external_failure {
+        if active > 0 {
+            format!(
+                "● {} {profile} agents · {} failed (ctrl+o to expand)",
+                snapshot.children.len(),
+                failed.saturating_add(usize::from(external_failure))
+            )
+        } else if failed > 0 {
+            format!(
+                "● {failed} {profile} agent{} failed (ctrl+o to expand)",
+                if failed == 1 { "" } else { "s" }
+            )
+        } else {
+            "● Subagent spawn failed (ctrl+o to expand)".to_owned()
+        }
+    } else if active > 0 {
+        format!(
+            "● Running {active} {profile} agent{}… (ctrl+o to expand)",
+            if active == 1 { "" } else { "s" }
+        )
+    } else if snapshot.children.is_empty() && snapshot.failure_reason.is_some() {
+        "● Subagent spawn failed (ctrl+o to expand)".to_owned()
+    } else {
+        let count = snapshot.children.len();
+        format!(
+            "● {count} {profile} agent{} finished (ctrl+o to expand)",
+            if count == 1 { "" } else { "s" }
+        )
+    }
 }
 
 #[derive(Default)]
@@ -354,17 +441,16 @@ pub(crate) struct ShellState {
     prompt_templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
     skill_commands: Arc<[(String, String)]>,
     extension_commands: Arc<[(String, String)]>,
+    /// Live, owner-scoped telemetry from the first-party subagent presentation.
+    /// This is transient chrome; authoritative usage is mirrored into the root
+    /// session ledger before the owning run settles.
+    pub(crate) subagent_activity: Option<SubagentActivityView>,
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
     /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
     pub(crate) editor_cursor: usize,
     status_detail: String,
-    pub(crate) extension_header: Option<(String, Option<String>)>,
-    pub(crate) extension_status: Option<(String, Option<String>)>,
-    pub(crate) extension_footer: Option<(String, Option<String>)>,
-    /// Bounded frontend-neutral activity rows pinned above the composer.
-    pub(crate) extension_activity: Vec<String>,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
     tool_panels: HashMap<ToolCallId, usize>,
@@ -590,6 +676,30 @@ impl ShellState {
         }
         self.last_turn_usage
             .map(|usage| (usage.output_tokens, false))
+    }
+
+    pub(crate) fn displayed_session_cost_microdollars(&self) -> Option<u64> {
+        let live_subagent_cost = self
+            .subagent_activity
+            .as_ref()
+            .filter(|view| view.include_cost_in_session_total)
+            .and_then(|view| {
+                if !view.telemetry.is_empty() {
+                    view.telemetry.iter().try_fold(0u64, |total, child| {
+                        Some(total.saturating_add(child.cost_microdollars?))
+                    })
+                } else {
+                    view.activities.iter().try_fold(0u64, |total, activity| {
+                        Some(total.saturating_add(activity.metrics?.cost_microdollars?))
+                    })
+                }
+            });
+        match (self.session_cost_microdollars, live_subagent_cost) {
+            (Some(session), Some(delegated)) => Some(session.saturating_add(delegated)),
+            (Some(session), None) => Some(session),
+            (None, Some(delegated)) => Some(delegated),
+            (None, None) => None,
+        }
     }
 
     fn touch_block(&mut self, index: usize) {
@@ -1406,6 +1516,10 @@ impl InteractiveShell {
         let mut state = self.state.borrow_mut();
         state.run_label.clear();
         state.clear_turn_telemetry();
+        // A delegation team is scoped to one owning run. Do not carry the
+        // previous run's already-accounted worker costs into the new live
+        // overlay while its first authoritative refresh is still pending.
+        state.subagent_activity = None;
         state.run_model = Some(state.model.clone());
         state.run_model_lab = state.model_lab;
         state.run_prompt_color = state.prompt_color.clone();
@@ -1617,23 +1731,25 @@ impl InteractiveShell {
             AgentEvent::ToolStarted { id, name, args } => {
                 state.close_streaming_blocks();
                 state.event_dot_visible = true;
-                let index = state.transcript.len();
-                let workspace = state.workspace.clone();
-                let display = summarize_tool_with_workspace(name, args, workspace.as_deref());
-                let model_lab = state.executing_model_lab();
-                state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
-                    id.clone(),
-                    name.clone(),
-                    args.to_string(),
-                    display,
-                    String::new(),
-                    false,
-                    false,
-                    None,
-                    model_lab,
-                ))));
-                state.tool_panels.insert(id.clone(), index);
-                state.register_active_event(index);
+                if !is_subagent_tool(name) {
+                    let index = state.transcript.len();
+                    let workspace = state.workspace.clone();
+                    let display = summarize_tool_with_workspace(name, args, workspace.as_deref());
+                    let model_lab = state.executing_model_lab();
+                    state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+                        id.clone(),
+                        name.clone(),
+                        args.to_string(),
+                        display,
+                        String::new(),
+                        false,
+                        false,
+                        None,
+                        model_lab,
+                    ))));
+                    state.tool_panels.insert(id.clone(), index);
+                    state.register_active_event(index);
+                }
             }
             AgentEvent::ToolProgress { id, progress } => {
                 let index = state.tool_panels.get(id).copied();
@@ -1769,7 +1885,29 @@ impl InteractiveShell {
                 state.run_cost_microdollars = *run_cost_microdollars;
                 state.run_cost_available = true;
             }
-            AgentEvent::RunFinished { .. } => state.close_streaming_blocks(),
+            AgentEvent::DelegationUpdated { snapshot } => {
+                if snapshot.children.is_empty() && snapshot.failure_reason.is_none() {
+                    state.subagent_activity = None;
+                } else {
+                    state.subagent_activity = Some(SubagentActivityView {
+                        status_label: subagent_status_label(snapshot),
+                        activities: Vec::new(),
+                        telemetry: snapshot.children.clone(),
+                        failure_class: snapshot.failure_class.clone(),
+                        failure_reason: snapshot.failure_reason.clone(),
+                        include_cost_in_session_total: true,
+                    });
+                }
+            }
+            AgentEvent::RunFinished { .. } => {
+                state.close_streaming_blocks();
+                if let Some(view) = state.subagent_activity.as_mut() {
+                    // The root ledger is committed before RunFinished is
+                    // emitted; from this boundary onward the footer must use
+                    // the durable amount, not provisional child spend.
+                    view.include_cost_in_session_total = false;
+                }
+            }
         }
         if let Some(outcome) = update.outcome {
             Self::append_outcome(&mut state, outcome);
@@ -2182,7 +2320,65 @@ impl InteractiveShell {
         state.slash_scroll = 0;
     }
 
-    /// Complete the trailing path token. `@` mentions retain their attachment
+    #[allow(dead_code)]
+    pub fn set_subagent_presentation(
+        &mut self,
+        snapshot: Option<&ygg_agent::ExtensionPresentationSnapshot>,
+        include_cost_in_session_total: bool,
+    ) -> bool {
+        let next = snapshot.and_then(|snapshot| {
+            let activities = snapshot
+                .activities
+                .iter()
+                .filter(|activity| activity.kind == "subagent")
+                .cloned()
+                .collect::<Vec<_>>();
+            (!activities.is_empty()).then(|| SubagentActivityView {
+                status_label: snapshot
+                    .status
+                    .as_ref()
+                    .map(|status| status.label.clone())
+                    .unwrap_or_else(|| "Subagents".to_owned()),
+                activities,
+                telemetry: Vec::new(),
+                failure_class: None,
+                failure_reason: None,
+                include_cost_in_session_total,
+            })
+        });
+        let mut state = self.state.borrow_mut();
+        if state.subagent_activity == next {
+            return false;
+        }
+        state.subagent_activity = next;
+        true
+    }
+
+    /// Replace the host-owned delegation telemetry for the active root run.
+    /// Unlike generic extension presentation, this path is fed directly by
+    /// `AgentEvent::DelegationUpdated` and never polls a slash command.
+    #[allow(dead_code)]
+    pub fn set_subagent_telemetry(
+        &mut self,
+        snapshot: Option<&ygg_agent::DelegationTelemetrySnapshot>,
+        include_cost_in_session_total: bool,
+    ) -> bool {
+        let next = snapshot.map(|snapshot| SubagentActivityView {
+            status_label: subagent_status_label(snapshot),
+            activities: Vec::new(),
+            telemetry: snapshot.children.clone(),
+            failure_class: snapshot.failure_class.clone(),
+            failure_reason: snapshot.failure_reason.clone(),
+            include_cost_in_session_total,
+        });
+        let mut state = self.state.borrow_mut();
+        if state.subagent_activity == next {
+            return false;
+        }
+        state.subagent_activity = next;
+        true
+    }
+
     /// behavior; literal paths are inserted as text. Directory completions omit
     /// the trailing space so another Tab can descend into them.
     pub fn complete_path(&mut self) {
@@ -2312,26 +2508,6 @@ impl InteractiveShell {
 
     pub fn set_status_detail(&mut self, detail: String) {
         self.state.borrow_mut().status_detail = detail;
-    }
-
-    pub fn set_extension_header(&mut self, text: Option<(String, Option<String>)>) {
-        self.state.borrow_mut().extension_header = sanitize_extension_surface(text);
-    }
-
-    pub fn set_extension_status(&mut self, text: Option<(String, Option<String>)>) {
-        self.state.borrow_mut().extension_status = sanitize_extension_surface(text);
-    }
-
-    pub fn set_extension_activity(&mut self, lines: Vec<String>) {
-        self.state.borrow_mut().extension_activity = lines
-            .into_iter()
-            .take(6)
-            .map(|line| sanitize_for_terminal(&line).replace(['\n', '\r'], " "))
-            .collect();
-    }
-
-    pub fn set_extension_footer(&mut self, text: Option<(String, Option<String>)>) {
-        self.state.borrow_mut().extension_footer = sanitize_extension_surface(text);
     }
 
     pub fn apply_extension_tool_renderer(
@@ -2960,7 +3136,92 @@ impl InteractiveShell {
         self.state.borrow().panel.is_some()
     }
 
-    /// Handle a keyboard event destined for the active panel. Returns
+    /// Replace a live subagent list without losing its filter or stable-node
+    /// selection while presentation revisions arrive in the background.
+    pub fn refresh_subagent_panel(
+        &mut self,
+        title: String,
+        items: Vec<String>,
+        descriptions: Vec<Option<String>>,
+        node_ids: Vec<String>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let Some(Panel::SelectList {
+            title: current_title,
+            items: current_items,
+            descriptions: current_descriptions,
+            selected,
+            filter,
+            action,
+        }) = state.panel.as_mut()
+        else {
+            return;
+        };
+        let PanelAction::SelectSubagent(current_ids) = action else {
+            return;
+        };
+        let current_raw = filtered_indices(current_items, current_descriptions, filter)
+            .get(*selected)
+            .copied();
+        let current_id = current_raw
+            .and_then(|index| current_ids.get(index))
+            .cloned();
+
+        *current_title = title;
+        *current_items = items;
+        *current_descriptions = descriptions;
+        *current_ids = node_ids;
+        let filtered = filtered_indices(current_items, current_descriptions, filter);
+        *selected = current_id
+            .as_ref()
+            .and_then(|id| current_ids.iter().position(|candidate| candidate == id))
+            .and_then(|raw| filtered.iter().position(|candidate| *candidate == raw))
+            .unwrap_or_else(|| (*selected).min(filtered.len().saturating_sub(1)));
+    }
+
+    /// Replace the body of a read-only document without changing its title or
+    /// scroll anchor. A reader browsing upward stays at that logical offset;
+    /// a reader at the tail follows newly appended transcript rows.
+    pub fn update_read_only_document(&mut self, text: String) {
+        let mut state = self.state.borrow_mut();
+        let (old_text, old_scroll) = match state.panel.as_ref() {
+            Some(Panel::ReadOnlyDocument {
+                text: current_text,
+                scroll_from_bottom,
+                ..
+            }) => (current_text.clone(), *scroll_from_bottom),
+            _ => return,
+        };
+        let panel_rows = self::panel_render::render_panel_with_limit(
+            &state,
+            state.size.0,
+            usize::from(state.size.1.max(5)).saturating_sub(4),
+        )
+        .len();
+        let viewport_rows =
+            self::panel_render::document_body_rows(&state, state.size.0, panel_rows);
+        let old_max = self::panel_render::document_visual_row_count(&old_text, state.size.0)
+            .saturating_sub(viewport_rows);
+        let new_text = crate::tui::view::sanitize_for_terminal(&text);
+        let new_max = self::panel_render::document_visual_row_count(&new_text, state.size.0)
+            .saturating_sub(viewport_rows);
+        let old_top = old_max.saturating_sub(old_scroll.min(old_max));
+        let new_scroll = if old_scroll == 0 {
+            0
+        } else {
+            new_max.saturating_sub(old_top).min(new_max)
+        };
+        if let Some(Panel::ReadOnlyDocument {
+            text: current_text,
+            scroll_from_bottom,
+            ..
+        }) = state.panel.as_mut()
+        {
+            *current_text = new_text;
+            *scroll_from_bottom = new_scroll;
+        }
+    }
+
     /// `Some((result, action))` when the panel has finished; `None` when
     /// the panel consumed the event but remains open.
     pub fn panel_input(
@@ -2968,11 +3229,16 @@ impl InteractiveShell {
         event: &crossterm::event::Event,
     ) -> Option<(PanelResult, PanelAction)> {
         let mut state = self.state.borrow_mut();
-        let page_step = usize::from(state.size.1).saturating_sub(8).max(1);
+        let size = state.size;
+        let page_step = usize::from(size.1).saturating_sub(8).max(1);
+        let document_rows = shell_chrome(&state, size.0, Instant::now()).panel.len();
+        let document_page_step =
+            self::panel_render::document_body_rows(&state, size.0, document_rows);
         let panel = state.panel.as_mut()?;
         // Snapshot the action before we potentially mutate/drop the panel.
         let action = match panel {
             Panel::SelectList { action, .. } => action.clone(),
+            Panel::ReadOnlyDocument { .. } => PanelAction::ReadOnlyDocument,
         };
         let confirmation = matches!(&action, PanelAction::ExtensionConfirmation);
         match panel {
@@ -3055,6 +3321,57 @@ impl InteractiveShell {
                             KeyCode::Backspace if !confirmation && key.modifiers.is_empty() => {
                                 filter.pop();
                                 *selected = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Resize(columns, rows) => {
+                        drop(state);
+                        self.set_size(*columns, *rows);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            Panel::ReadOnlyDocument {
+                text,
+                scroll_from_bottom,
+                ..
+            } => {
+                use crossterm::event::{Event, KeyCode};
+                let viewport_rows = document_page_step;
+                let visual_rows = self::panel_render::document_visual_row_count(text, size.0);
+                let maximum = visual_rows.saturating_sub(viewport_rows);
+                *scroll_from_bottom = (*scroll_from_bottom).min(maximum);
+                match event {
+                    Event::Key(key) if crate::tui::keymap::accepts_key_event(key) => {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Left if key.modifiers.is_empty() => {
+                                drop(state);
+                                self.close_panel();
+                                return Some((PanelResult::Cancel, action));
+                            }
+                            KeyCode::Up if key.modifiers.is_empty() => {
+                                *scroll_from_bottom =
+                                    scroll_from_bottom.saturating_add(1).min(maximum);
+                            }
+                            KeyCode::Down if key.modifiers.is_empty() => {
+                                *scroll_from_bottom = scroll_from_bottom.saturating_sub(1);
+                            }
+                            KeyCode::PageUp if key.modifiers.is_empty() => {
+                                *scroll_from_bottom = scroll_from_bottom
+                                    .saturating_add(document_page_step)
+                                    .min(maximum);
+                            }
+                            KeyCode::PageDown if key.modifiers.is_empty() => {
+                                *scroll_from_bottom =
+                                    scroll_from_bottom.saturating_sub(document_page_step);
+                            }
+                            KeyCode::Home if key.modifiers.is_empty() => {
+                                *scroll_from_bottom = maximum;
+                            }
+                            KeyCode::End if key.modifiers.is_empty() => {
+                                *scroll_from_bottom = 0;
                             }
                             _ => {}
                         }
@@ -3273,6 +3590,10 @@ impl InteractiveShell {
         state.run_cost_microdollars = checkpoint_cost.unwrap_or_default();
         state.run_cost_available = checkpoint_cost.is_some();
         state.run.clear();
+        // Delegation telemetry belongs to the previously active root run. A
+        // session hydrate may reuse this shell, so clear the composer block
+        // before the replacement app can publish its own owner-fenced snapshot.
+        state.subagent_activity = None;
         state.session_work_elapsed = Duration::ZERO;
         state.run_model = None;
         state.run_model_lab = None;

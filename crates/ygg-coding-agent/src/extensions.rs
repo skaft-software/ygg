@@ -10,7 +10,6 @@
 #[cfg(feature = "serve")]
 pub mod serve;
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -20,32 +19,59 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
     DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
-    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputResponse,
-    ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest, ExtensionPolicy,
-    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
+    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
+    ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
+    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
     ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest,
-    ToolRenderSegment, EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_DYNAMIC_TOOLS,
-    EXTENSION_MANIFEST_FILENAME,
+    ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
+    EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_DELEGATION_TELEMETRY,
+    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME,
 };
 use ygg_agent::{
     Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
 };
 use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
 
-use crate::app::model_supports_ultra;
 use crate::config::Config;
 use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
 };
 use crate::session_store::SessionStore;
 
+/// The first-party extension that owns every in-harness child-session surface.
+pub const SUBAGENTS_EXTENSION_NAME: &str = "ygg-subagents";
 const MAX_CONTEXT_CONTRIBUTION_BYTES: usize = 64 * 1024;
+/// Returns whether configuration is eligible to launch the trusted observer.
+///
+/// The live process/handshake check remains authoritative; this conservative
+/// preflight is used only to avoid advertising Ultra in a frontend before its
+/// worker app has been built.
+#[cfg(feature = "serve")]
+pub fn subagents_extension_activation_configured(config: &Config) -> bool {
+    config.effect_policy == ygg_agent::EffectPolicy::UnsafeHost
+        && config.sandbox.process_execution_allowed()
+        && config
+            .enabled_extensions
+            .iter()
+            .any(|name| name == SUBAGENTS_EXTENSION_NAME)
+        && (config
+            .invocation_trusted_extensions
+            .iter()
+            .any(|name| name == SUBAGENTS_EXTENSION_NAME)
+            || config.trusted_extensions.iter().any(|grant| {
+                grant == SUBAGENTS_EXTENSION_NAME
+                    || grant.starts_with(&format!("{SUBAGENTS_EXTENSION_NAME}@"))
+            }))
+}
+
 const MAX_EXTENSION_CONTEXT_BYTES: usize = 256 * 1024;
 const MAX_CONTEXT_LABEL_BYTES: usize = 1024;
 const MAX_PENDING_CONTEXT_ITEMS: usize = 256;
@@ -54,7 +80,6 @@ const MAX_DIAGNOSTIC_BYTES: usize = 256 * 1024;
 const MAX_DIAGNOSTIC_ENTRIES: usize = 256;
 const PROMPT_RPC_DEADLINE: Duration = Duration::from_secs(5);
 const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
-const STATUS_RPC_DEADLINE: Duration = Duration::from_millis(250);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
@@ -186,6 +211,65 @@ fn persistent_trust_grant(descriptor: &DiscoveredExtension) -> String {
     }
 }
 
+fn sha256_manifest(path: &Path) -> String {
+    match std::fs::read(path) {
+        Ok(bytes) => format!("{:x}", Sha256::digest(&bytes)),
+        Err(_) => "unavailable".to_owned(),
+    }
+}
+
+fn installed_bundle_digest(manifest_path: &Path) -> Option<String> {
+    let install_path = manifest_path.parent()?.join("install.json");
+    let bytes = std::fs::read(&install_path).ok()?;
+    if bytes.len() > 64 * 1024 {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let digest = value.get("archive_sha256")?.as_str()?;
+    (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
+fn extension_compatibility(
+    name: &str,
+    running: bool,
+    features: &[String],
+    health: Option<&ExtensionHealthSnapshot>,
+) -> (Option<String>, String) {
+    if name != SUBAGENTS_EXTENSION_NAME {
+        return (None, "not_applicable".to_owned());
+    }
+    if features
+        .iter()
+        .any(|feature| feature == EXTENSION_FEATURE_DELEGATION_TELEMETRY)
+    {
+        return (
+            Some(DELEGATION_TELEMETRY_SCHEMA.to_owned()),
+            "compatible".to_owned(),
+        );
+    }
+    if running {
+        return (
+            None,
+            "incompatible: delegation telemetry was not negotiated; rebuild/reinstall the current workspace bundle"
+                .to_owned(),
+        );
+    }
+    let error = health
+        .and_then(|health| health.last_error.as_deref())
+        .unwrap_or_default();
+    if error.contains(EXTENSION_FEATURE_DELEGATION_TELEMETRY)
+        || error.contains("required API 0.2 features")
+    {
+        (
+            None,
+            "incompatible: rebuild/reinstall the current workspace bundle".to_owned(),
+        )
+    } else {
+        (None, "unavailable".to_owned())
+    }
+}
+
 fn load_extension_descriptor(
     resolver: &ResourceResolver,
     resource: &ResolvedResource,
@@ -236,6 +320,51 @@ pub trait ExtensionConfirmationHandler {
         extension: &'a str,
         request: &'a ConfirmationRequest,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + 'a>>;
+
+    fn input<'a>(
+        &'a mut self,
+        _extension: &'a str,
+        _request: &'a ExtensionInputRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
+        Box::pin(std::future::ready(Ok(None)))
+    }
+}
+
+struct PreapprovedExtensionConfirmation<'a, H: ?Sized> {
+    // One action-level approval may satisfy only the first confirmation emitted
+    // by that same manifest-scoped command; later prompts still reach the UI.
+    inner: &'a mut H,
+    remaining: usize,
+}
+
+impl<H> ExtensionConfirmationHandler for PreapprovedExtensionConfirmation<'_, H>
+where
+    H: ExtensionConfirmationHandler + ?Sized,
+{
+    fn wait_for_cancel<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+        self.inner.wait_for_cancel()
+    }
+
+    fn confirm<'a>(
+        &'a mut self,
+        extension: &'a str,
+        request: &'a ConfirmationRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + 'a>> {
+        if self.remaining > 0 {
+            self.remaining -= 1;
+            Box::pin(std::future::ready(Ok(true)))
+        } else {
+            self.inner.confirm(extension, request)
+        }
+    }
+
+    fn input<'a>(
+        &'a mut self,
+        extension: &'a str,
+        request: &'a ExtensionInputRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
+        self.inner.input(extension, request)
+    }
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -243,12 +372,16 @@ pub struct ExtensionSummary {
     pub name: String,
     pub version: String,
     pub manifest_path: PathBuf,
+    pub manifest_digest: String,
+    pub bundle_digest: Option<String>,
     pub source: ExtensionSource,
     pub enabled: bool,
     pub trusted: bool,
     pub running: bool,
     pub api_version: String,
     pub negotiated_features: Vec<String>,
+    pub telemetry_schema: Option<String>,
+    pub compatibility: String,
     pub health: Option<ExtensionHealthSnapshot>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
@@ -495,11 +628,8 @@ pub struct ExecutableExtensions {
     diagnostics: BoundedDiagnostics,
     pending_context: PendingContext,
     presentations: BTreeMap<String, ExtensionPresentationView>,
-    presentation_dirty: bool,
     background_tx: mpsc::Sender<ExtensionBackgroundUpdate>,
     background_rx: mpsc::Receiver<ExtensionBackgroundUpdate>,
-    status_generation: u64,
-    status_task: Option<JoinHandle<()>>,
     renderer_tasks: Vec<JoinHandle<()>>,
     event_drain_cursor: usize,
     confirmation_denials: VecDeque<PendingConfirmationDenial>,
@@ -692,11 +822,8 @@ impl Default for ExecutableExtensions {
             diagnostics: BoundedDiagnostics::default(),
             pending_context: PendingContext::default(),
             presentations: BTreeMap::new(),
-            presentation_dirty: false,
             background_tx,
             background_rx,
-            status_generation: 0,
-            status_task: None,
             renderer_tasks: Vec::new(),
             event_drain_cursor: 0,
             confirmation_denials: VecDeque::new(),
@@ -715,13 +842,6 @@ impl Default for ExecutableExtensions {
     }
 }
 
-#[derive(Default)]
-pub struct ExtensionUiSnapshot {
-    pub header: Option<(String, Option<String>)>,
-    pub status: Option<(String, Option<String>)>,
-    pub footer: Option<(String, Option<String>)>,
-}
-
 pub struct ExtensionToolRenderUpdate {
     pub id: ToolCallId,
     pub segments: Vec<ToolRenderSegment>,
@@ -729,16 +849,10 @@ pub struct ExtensionToolRenderUpdate {
 
 #[derive(Default)]
 pub struct ExtensionBackgroundUpdates {
-    pub ui: Option<ExtensionUiSnapshot>,
     pub rendered_tools: Vec<ExtensionToolRenderUpdate>,
 }
 
 enum ExtensionBackgroundUpdate {
-    Status {
-        generation: u64,
-        snapshot: ExtensionUiSnapshot,
-        diagnostics: Vec<String>,
-    },
     Renderer {
         update: Option<ExtensionToolRenderUpdate>,
         diagnostic: Option<String>,
@@ -867,17 +981,16 @@ impl ExecutableExtensions {
         } else {
             let workspace = config.workspace.clone();
             let state = host_state.clone();
-            let agent_sessions = matches!(
-                reasoning,
-                ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
-            ) && model_supports_ultra(model);
+            let subagents_tool_available =
+                model.spec.capabilities.tools && config.tool_available("subagent_spawn");
             match block_on_runtime(async move {
                 let starts = FuturesUnordered::new();
                 for (index, descriptor) in startable.into_iter().enumerate() {
                     let name = descriptor.manifest.name.clone();
                     let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
                     runtime.host_state = state.clone();
-                    runtime.agent_sessions = agent_sessions;
+                    runtime.agent_sessions =
+                        name == SUBAGENTS_EXTENSION_NAME && subagents_tool_available;
                     starts.push(async move {
                         (
                             index,
@@ -945,10 +1058,34 @@ impl ExecutableExtensions {
                     .iter()
                     .find(|process| process.descriptor().manifest.name == descriptor.manifest.name);
                 let contributions = process.map(ExtensionProcess::contributions);
+                let health = process.map(ExtensionProcess::health_snapshot).or_else(|| {
+                    start_failures.get(&descriptor.manifest.name).map(|error| {
+                        ExtensionHealthSnapshot {
+                            state: ExtensionHealthState::Parked,
+                            generation: 0,
+                            pending_requests: 0,
+                            last_error: Some(error.clone()),
+                        }
+                    })
+                });
+                let negotiated_features: Vec<String> = process
+                    .map(|process| process.negotiated_features().iter().cloned().collect())
+                    .unwrap_or_default();
+                let (telemetry_schema, compatibility) = extension_compatibility(
+                    &descriptor.manifest.name,
+                    running.contains(&descriptor.manifest.name),
+                    &negotiated_features,
+                    health.as_ref(),
+                );
+                let manifest_path = descriptor.manifest_path;
+                let manifest_digest = sha256_manifest(&manifest_path);
+                let bundle_digest = installed_bundle_digest(&manifest_path);
                 ExtensionSummary {
                     name: descriptor.manifest.name.clone(),
                     version: descriptor.manifest.version,
-                    manifest_path: descriptor.manifest_path,
+                    manifest_path,
+                    manifest_digest,
+                    bundle_digest,
                     source: descriptor.source,
                     enabled: descriptor.activation.enabled,
                     trusted: descriptor.activation.trust == ExtensionTrust::Trusted,
@@ -956,19 +1093,10 @@ impl ExecutableExtensions {
                     api_version: process
                         .map(|process| process.api_version().to_owned())
                         .unwrap_or_else(|| descriptor.manifest.api_version.clone()),
-                    negotiated_features: process
-                        .map(|process| process.negotiated_features().iter().cloned().collect())
-                        .unwrap_or_default(),
-                    health: process.map(ExtensionProcess::health_snapshot).or_else(|| {
-                        start_failures.get(&descriptor.manifest.name).map(|error| {
-                            ExtensionHealthSnapshot {
-                                state: ExtensionHealthState::Parked,
-                                generation: 0,
-                                pending_requests: 0,
-                                last_error: Some(error.clone()),
-                            }
-                        })
-                    }),
+                    negotiated_features,
+                    telemetry_schema,
+                    compatibility,
+                    health,
                     tools: contributions
                         .map(|value| value.tools.iter().map(|tool| tool.name.clone()).collect())
                         .unwrap_or_else(|| descriptor.manifest.contributes.tools.clone()),
@@ -1240,6 +1368,14 @@ impl ExecutableExtensions {
             summary.health = Some(health);
             summary.api_version = process.api_version().to_owned();
             summary.negotiated_features = process.negotiated_features().iter().cloned().collect();
+            let (telemetry_schema, compatibility) = extension_compatibility(
+                &summary.name,
+                summary.running,
+                &summary.negotiated_features,
+                summary.health.as_ref(),
+            );
+            summary.telemetry_schema = telemetry_schema;
+            summary.compatibility = compatibility;
             summary.tools = process
                 .tool_definitions()
                 .into_iter()
@@ -1249,14 +1385,19 @@ impl ExecutableExtensions {
         summaries
     }
 
-    /// Returns and clears the live-presentation repaint marker.
-    pub fn take_presentation_dirty(&mut self) -> bool {
-        std::mem::take(&mut self.presentation_dirty)
-    }
-
-    /// Compact live activity/tree rows for the interactive shell chrome.
-    pub fn presentation_activity_lines(&self) -> Vec<String> {
-        compact_presentation_activity_lines(&self.presentation_views())
+    /// Returns whether the observing first-party subagents extension has a
+    /// live, negotiated child-session service.
+    pub fn has_agent_session_service(&self) -> bool {
+        self.processes.iter().any(|process| {
+            process.descriptor().manifest.name == SUBAGENTS_EXTENSION_NAME
+                && process.is_running()
+                && process
+                    .negotiated_features()
+                    .contains(EXTENSION_FEATURE_AGENT_SESSIONS)
+                && process
+                    .negotiated_features()
+                    .contains(EXTENSION_FEATURE_DELEGATION_TELEMETRY)
+        })
     }
 
     /// Returns the latest accepted semantic state for each running extension.
@@ -1342,6 +1483,19 @@ impl ExecutableExtensions {
                     state,
                     extension.source,
                     extension.manifest_path.display()
+                ));
+                lines.push(format!(
+                    "  manifest sha256: {} · bundle sha256: {}",
+                    extension.manifest_digest,
+                    extension.bundle_digest.as_deref().unwrap_or("unpackaged"),
+                ));
+                lines.push(format!(
+                    "  compatibility: {} · telemetry schema: {}",
+                    extension.compatibility,
+                    extension
+                        .telemetry_schema
+                        .as_deref()
+                        .unwrap_or("not negotiated"),
                 ));
                 if let Some(health) = &extension.health {
                     lines.push(format!(
@@ -1650,6 +1804,7 @@ impl ExecutableExtensions {
                 "extension presentation action {extension:?}/{action_id:?} is unavailable or stale"
             )
             })?;
+        let mut approval_budget = 0;
         if action.destructive {
             let request = ConfirmationRequest {
                 parent_request_id: None,
@@ -1661,12 +1816,17 @@ impl ExecutableExtensions {
             if !confirmations.confirm(extension, &request).await? {
                 anyhow::bail!("extension presentation action was denied");
             }
+            approval_budget = 1;
         }
+        let mut command_confirmations = PreapprovedExtensionConfirmation {
+            inner: confirmations,
+            remaining: approval_budget,
+        };
         self.execute_command_with_confirmation_scoped(
             Some(extension),
             &action.command,
             action.arguments,
-            confirmations,
+            &mut command_confirmations,
         )
         .await?
         .ok_or_else(|| {
@@ -1840,15 +2000,24 @@ impl ExecutableExtensions {
                         request_id,
                         generation,
                         parent_request_id,
-                        ..
+                        request,
                     }) if operation
                         .is_some_and(|operation| operation.owns(generation, parent_request_id)) =>
                     {
+                        if process.input_answered(&request_id, generation) {
+                            continue;
+                        }
+                        let value = confirmations
+                            .input(&extension_name, &request)
+                            .await
+                            .with_context(|| {
+                                format!("input UI failed for extension {extension_name:?}")
+                            })?;
                         process
                             .respond_to_input(
                                 request_id,
                                 generation,
-                                ExtensionInputResponse { value: None },
+                                ExtensionInputResponse { value },
                             )
                             .await?;
                     }
@@ -1886,7 +2055,6 @@ impl ExecutableExtensions {
     /// failed invocation because no trusted confirmation surface is available to
     /// the caller. Commands that do not request confirmation retain ordinary
     /// output and queued-context handling.
-    #[cfg(any(feature = "serve", test))]
     pub async fn execute_command_without_confirmation(
         &mut self,
         name: &str,
@@ -1896,7 +2064,6 @@ impl ExecutableExtensions {
             .await
     }
 
-    #[cfg(any(feature = "serve", test))]
     async fn execute_command_headless_scoped(
         &mut self,
         extension: Option<&str>,
@@ -2024,27 +2191,6 @@ impl ExecutableExtensions {
         Ok(Some(blocks.join("\n")))
     }
 
-    /// input/render path. A newer request cancels the older generation.
-    pub fn request_status_refresh(&mut self) {
-        if let Some(task) = self.status_task.take() {
-            task.abort();
-        }
-        self.status_generation = self.status_generation.saturating_add(1);
-        let generation = self.status_generation;
-        let processes = self.processes.clone();
-        let sender = self.background_tx.clone();
-        self.status_task = Some(tokio::spawn(async move {
-            let (snapshot, diagnostics) = collect_ui_snapshot(processes).await;
-            let _ = sender
-                .send(ExtensionBackgroundUpdate::Status {
-                    generation,
-                    snapshot,
-                    diagnostics,
-                })
-                .await;
-        }));
-    }
-
     /// Start a semantic tool renderer without stalling Agent events or input.
     /// Returns whether a matching renderer was registered.
     pub fn request_tool_render(
@@ -2109,56 +2255,21 @@ impl ExecutableExtensions {
         true
     }
 
-    /// Drain completed background work without waiting. Stale status
-    /// generations are ignored; tool renderer results retain completion order.
+    /// Drain completed renderer work without waiting, retaining completion order.
     pub fn drain_background_updates(&mut self) -> ExtensionBackgroundUpdates {
         let mut updates = ExtensionBackgroundUpdates::default();
-        loop {
-            match self.background_rx.try_recv() {
-                Ok(ExtensionBackgroundUpdate::Status {
-                    generation,
-                    snapshot,
-                    diagnostics,
-                }) if generation == self.status_generation => {
-                    self.diagnostics.extend(diagnostics);
-                    updates.ui = Some(snapshot);
-                }
-                Ok(ExtensionBackgroundUpdate::Status { .. }) => {}
-                Ok(ExtensionBackgroundUpdate::Renderer { update, diagnostic }) => {
+        while let Ok(update) = self.background_rx.try_recv() {
+            match update {
+                ExtensionBackgroundUpdate::Renderer { update, diagnostic } => {
                     self.diagnostics.extend(diagnostic);
                     updates.rendered_tools.extend(update);
                 }
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
-                }
-            }
-        }
-        if let Some((extension, status)) =
-            self.presentations.iter().find_map(|(extension, view)| {
-                view.snapshot
-                    .status
-                    .as_ref()
-                    .map(|status| (extension, status))
-            })
-        {
-            let ui = updates.ui.get_or_insert_with(ExtensionUiSnapshot::default);
-            if ui.status.is_none() {
-                ui.status = Some((
-                    format!("{extension} · {}", status.label),
-                    Some(format!(
-                        "extension.presentation.{}",
-                        format!("{:?}", status.state).to_lowercase()
-                    )),
-                ));
             }
         }
         updates
     }
 
     fn cancel_background_work(&mut self) {
-        if let Some(task) = self.status_task.take() {
-            task.abort();
-        }
         for task in self.renderer_tasks.drain(..) {
             task.abort();
         }
@@ -2362,8 +2473,10 @@ impl ExecutableExtensions {
                             contribution,
                         );
                     }
-                    Ok(ExtensionEvent::StatusContributed { contribution }) => {
-                        messages.push(format!("[{name}] {}", contribution.text));
+                    Ok(ExtensionEvent::StatusContributed { .. }) => {
+                        // Header/status/footer contributions remain available as
+                        // protocol data, but the coding TUI never turns them
+                        // into ambient transcript or composer chrome.
                     }
                     Ok(ExtensionEvent::PresentationUpdated {
                         generation,
@@ -2391,7 +2504,7 @@ impl ExecutableExtensions {
                             .expect("extension event receivers align with processes")
                             .extension_instance_id()
                             .to_owned();
-                        match reduce_presentation_update(
+                        if let Err(error) = reduce_presentation_update(
                             &mut self.presentations,
                             name.clone(),
                             active_generation,
@@ -2400,10 +2513,7 @@ impl ExecutableExtensions {
                             generation,
                             snapshot,
                         ) {
-                            Ok(_compact) => self.presentation_dirty = true,
-                            Err(error) => {
-                                self.diagnostics.push(format!("warning: {name}: {error}"))
-                            }
+                            self.diagnostics.push(format!("warning: {name}: {error}"));
                         }
                     }
                     Ok(ExtensionEvent::Diagnostic { message }) => {
@@ -2452,6 +2562,14 @@ impl ExecutableExtensions {
                         request,
                         ..
                     }) => {
+                        if process
+                            .as_ref()
+                            .is_some_and(|process| process.input_answered(&request_id, generation))
+                        {
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        }
                         messages.push(format!(
                             "[{name}] input cancelled (no active input owner): {}",
                             request.prompt
@@ -2483,7 +2601,6 @@ impl ExecutableExtensions {
         }
         self.event_drain_cursor = (start + visited.max(1)) % receiver_count;
         let active_owner = self.resource_owner.as_deref();
-        let presentation_count = self.presentations.len();
         self.presentations.retain(|name, view| {
             (view.resource_owner.is_none() || view.resource_owner.as_deref() == active_owner)
                 && self.processes.iter().any(|process| {
@@ -2492,9 +2609,6 @@ impl ExecutableExtensions {
                         && process.health_snapshot().generation == view.generation
                 })
         });
-        if self.presentations.len() != presentation_count {
-            self.presentation_dirty = true;
-        }
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         messages
@@ -2559,69 +2673,6 @@ fn clip_lifecycle_reason(reason: &str, limit: usize) -> String {
         end = end.saturating_sub(1);
     }
     format!("{}{marker}", &reason[..end])
-}
-
-async fn collect_ui_snapshot(
-    processes: Vec<ExtensionProcess>,
-) -> (ExtensionUiSnapshot, Vec<String>) {
-    let mut requests = Vec::new();
-    for process in processes {
-        for surface in [
-            ExtensionUiSurface::Header,
-            ExtensionUiSurface::Status,
-            ExtensionUiSurface::Footer,
-        ] {
-            if !process.contributions().ui.contains(&surface) {
-                continue;
-            }
-            let process = process.clone();
-            let name = process.descriptor().manifest.name.clone();
-            requests.push(async move {
-                let result = tokio::time::timeout(
-                    STATUS_RPC_DEADLINE,
-                    process.collect_status(surface, process.current_context()),
-                )
-                .await;
-                (name, surface, result)
-            });
-        }
-    }
-
-    let mut contributions = Vec::new();
-    let mut diagnostics = Vec::new();
-    for (name, surface, result) in futures_util::future::join_all(requests).await {
-        match result {
-            Err(_) => diagnostics.push(format!(
-                "warning: extension {name:?} {surface:?} status exceeded {STATUS_RPC_DEADLINE:?}"
-            )),
-            Ok(Err(error)) => diagnostics.push(format!(
-                "warning: extension {name:?} {surface:?} status failed: {error}"
-            )),
-            Ok(Ok(Some(contribution))) => contributions.push(contribution),
-            Ok(Ok(None)) => {}
-        }
-    }
-    contributions.sort_by_key(|contribution| Reverse(contribution.priority));
-
-    let mut snapshot = ExtensionUiSnapshot::default();
-    for contribution in contributions {
-        let value = (contribution.text, contribution.style_role);
-        match contribution.surface {
-            ExtensionUiSurface::Header if snapshot.header.is_none() => {
-                snapshot.header = Some(value);
-            }
-            ExtensionUiSurface::Status if snapshot.status.is_none() => {
-                snapshot.status = Some(value);
-            }
-            ExtensionUiSurface::Footer if snapshot.footer.is_none() => {
-                snapshot.footer = Some(value);
-            }
-            ExtensionUiSurface::Header
-            | ExtensionUiSurface::Status
-            | ExtensionUiSurface::Footer => {}
-        }
-    }
-    (snapshot, diagnostics)
 }
 
 pub struct ExtensionPromptComposition {
@@ -2733,56 +2784,6 @@ fn join_around(prefix: Vec<String>, center: String, suffix: Vec<String>) -> Stri
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-fn compact_presentation_activity_lines(views: &[ExtensionPresentationView]) -> Vec<String> {
-    const MAX_ROWS: usize = 6;
-    let mut lines = Vec::new();
-    for view in views {
-        if lines.len() >= MAX_ROWS {
-            break;
-        }
-        let label = view
-            .snapshot
-            .status
-            .as_ref()
-            .map(|status| status.label.as_str())
-            .unwrap_or("activity");
-        lines.push(format!("{}  {label}", view.extension));
-        if let Some(collection) = &view.snapshot.collection {
-            let parents = collection
-                .nodes
-                .iter()
-                .map(|node| (node.id.as_str(), node.parent_id.as_deref()))
-                .collect::<BTreeMap<_, _>>();
-            for node in &collection.nodes {
-                if lines.len() >= MAX_ROWS {
-                    break;
-                }
-                let mut depth = 0usize;
-                let mut parent = node.parent_id.as_deref();
-                while let Some(id) = parent {
-                    depth = depth.saturating_add(1);
-                    parent = parents.get(id).copied().flatten();
-                }
-                let state = format!("{:?}", node.state).to_lowercase();
-                let branch = if depth == 0 { "├─" } else { "└─" };
-                lines.push(format!(
-                    "{}{} {}  {state}",
-                    "  ".repeat(depth),
-                    branch,
-                    node.label
-                ));
-            }
-        } else if let Some(activity) = view.snapshot.activities.last() {
-            let state = format!("{:?}", activity.state).to_lowercase();
-            lines.push(format!("├─ {}  {state}", activity.summary));
-        }
-    }
-    if !lines.is_empty() && lines.len() < MAX_ROWS {
-        lines.push("Enter /extensions to inspect details or invoke an action".into());
-    }
-    lines
 }
 
 fn format_presentation_views(views: &[ExtensionPresentationView]) -> String {
@@ -2980,6 +2981,49 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_party_status_marks_missing_delegation_telemetry_incompatible() {
+        let (schema, compatibility) = extension_compatibility(
+            SUBAGENTS_EXTENSION_NAME,
+            true,
+            &[EXTENSION_FEATURE_AGENT_SESSIONS.to_owned()],
+            None,
+        );
+        assert_eq!(schema, None);
+        assert!(compatibility.contains("rebuild/reinstall"));
+
+        let (schema, compatibility) = extension_compatibility(
+            SUBAGENTS_EXTENSION_NAME,
+            true,
+            &[
+                EXTENSION_FEATURE_AGENT_SESSIONS.to_owned(),
+                EXTENSION_FEATURE_DELEGATION_TELEMETRY.to_owned(),
+            ],
+            None,
+        );
+        assert_eq!(schema.as_deref(), Some(DELEGATION_TELEMETRY_SCHEMA));
+        assert_eq!(compatibility, "compatible");
+    }
+
+    #[test]
+    fn status_contributions_never_become_ambient_messages() {
+        let (sender, receiver) = broadcast::channel(4);
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(receiver);
+        sender
+            .send(ExtensionEvent::StatusContributed {
+                contribution: ygg_agent::extension_process::ExtensionStatusContribution {
+                    surface: ExtensionUiSurface::Footer,
+                    text: "persistent extension status".into(),
+                    style_role: None,
+                    priority: 0,
+                },
+            })
+            .unwrap();
+
+        assert!(extensions.drain_events().is_empty());
+    }
+
+    #[test]
     fn semantic_presentation_reducer_fences_revision_generation_and_owner() {
         let owner = ygg_agent::extension_process::ExtensionResourceOwner {
             session_id: "owner-a".into(),
@@ -3015,13 +3059,6 @@ mod tests {
             .unwrap(),
             "1 worker"
         );
-        let activity_lines = compact_presentation_activity_lines(
-            &presentations.values().cloned().collect::<Vec<_>>(),
-        );
-        assert!(activity_lines
-            .iter()
-            .any(|line| line.contains("test-review")));
-        assert!(activity_lines.len() <= 6);
         let rendered =
             format_presentation_views(&presentations.values().cloned().collect::<Vec<_>>());
         assert!(rendered.contains("Reviewing tests"));
@@ -3179,6 +3216,7 @@ command = "does-not-exist"
             skill_paths: vec![],
             extension_paths: vec![extension_root.to_owned()],
             enabled_extensions: vec![name.to_owned()],
+            extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![name.to_owned()],
             tools: crate::config::ToolPolicy::default(),
@@ -3593,6 +3631,8 @@ command = "lifecycle-fixture.sh"
     #[derive(Default)]
     struct RecordingConfirmationHandler {
         calls: Vec<(String, String)>,
+        input_calls: Vec<(String, String, bool)>,
+        input_value: Option<String>,
     }
 
     #[cfg(unix)]
@@ -3606,6 +3646,21 @@ command = "lifecycle-fixture.sh"
                 self.calls
                     .push((extension.to_owned(), request.prompt.clone()));
                 Ok(true)
+            })
+        }
+
+        fn input<'a>(
+            &'a mut self,
+            extension: &'a str,
+            request: &'a ExtensionInputRequest,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
+            Box::pin(async move {
+                self.input_calls.push((
+                    extension.to_owned(),
+                    request.prompt.clone(),
+                    request.secret,
+                ));
+                Ok(self.input_value.take())
             })
         }
     }
@@ -4099,6 +4154,142 @@ commands = ["shared"]
         extensions.shutdown().await;
     }
 
+    #[cfg(all(unix, feature = "serve"))]
+    #[tokio::test]
+    async fn confirmed_presentation_action_funds_one_command_requested_confirmation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("serve-confirmation-fixture.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+request_id() { sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'; }
+IFS= read -r initialize
+id=$(printf '%s' "$initialize" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{"api_version":"0.1","tools":[],"commands":[{"name":"setup","description":"Confirmed setup","usage":"/setup"}]}}\n' "$id"
+count=0
+while [ "$count" -lt 2 ]; do
+  IFS= read -r command
+  id=$(printf '%s' "$command" | request_id)
+  confirmation_id="setup-confirmation-$count"
+  printf '{"jsonrpc":"2.0","id":"%s","method":"confirmation/request","params":{"prompt":"Install runtime?","destructive":false,"default":false}}\n' "$confirmation_id"
+  IFS= read -r confirmation
+  case "$confirmation" in
+    *\"id\":\"$confirmation_id\"*'"confirmed":true'*) ;;
+    *) exit 41 ;;
+  esac
+  printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"setup started","notifications":[],"context":[]}}\n' "$id"
+  count=$((count + 1))
+done
+IFS= read -r shutdown
+id=$(printf '%s' "$shutdown" | request_id)
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "serve-confirmation-fixture"
+version = "0.1.0"
+api_version = "0.1"
+[entrypoint]
+command = "serve-confirmation-fixture.sh"
+[contributes]
+commands = ["setup"]
+confirmations = true
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+        let mut snapshot: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        snapshot.actions.truncate(1);
+        snapshot.actions[0].id = "setup".into();
+        snapshot.actions[0].label = "Set up browser".into();
+        snapshot.actions[0].command = "setup".into();
+        snapshot.actions[0].arguments.clear();
+        snapshot.actions[0].destructive = true;
+        let generation = process.health_snapshot().generation;
+        let extension_instance_id = process.extension_instance_id().to_owned();
+        let revision = snapshot.revision;
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        extensions.presentations.insert(
+            "serve-confirmation-fixture".into(),
+            ExtensionPresentationView {
+                extension: "serve-confirmation-fixture".into(),
+                generation,
+                extension_instance_id: extension_instance_id.clone(),
+                resource_owner: None,
+                snapshot,
+            },
+        );
+
+        let mut confirmations = RecordingConfirmationHandler::default();
+        let interactive = extensions
+            .execute_presentation_action_with_confirmation(
+                "serve-confirmation-fixture",
+                "setup",
+                &mut confirmations,
+            )
+            .await
+            .unwrap();
+        assert_eq!(interactive, "setup started");
+        assert_eq!(
+            confirmations.calls,
+            vec![(
+                "serve-confirmation-fixture".to_owned(),
+                "Run Set up browser?".to_owned(),
+            )]
+        );
+
+        let denied = extensions
+            .execute_presentation_action_for_serve(
+                "serve-confirmation-fixture",
+                &extension_instance_id,
+                generation,
+                revision,
+                "setup",
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("requires explicit confirmation"));
+        let output = extensions
+            .execute_presentation_action_for_serve(
+                "serve-confirmation-fixture",
+                &extension_instance_id,
+                generation,
+                revision,
+                "setup",
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output, "setup started");
+        assert!(process.shutdown().await);
+    }
+
     #[tokio::test]
     async fn event_drain_obeys_the_per_extension_frame_budget() {
         let (sender, receiver) = broadcast::channel(128);
@@ -4213,6 +4404,91 @@ confirmations = true
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn command_input_is_routed_through_the_interactive_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("input-fixture.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.2","tools":[],"commands":[{"name":"configure","description":"Collect one secret","usage":"/configure"}],"protocol":{"version":"0.2","features":["request_cancellation","content_parts"],"limits":{"max_concurrent_requests":1}}}}'
+IFS= read -r command
+id=$(printf '%s\n' "$command" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":"fixture-input","method":"input/request","params":{"parent_request_id":%s,"prompt":"API key:","secret":true}}\n' "$id"
+IFS= read -r answer
+case "$answer" in
+  *'fixture-secret'*) ;;
+  *) exit 42 ;;
+esac
+printf '{"jsonrpc":"2.0","id":%s,"result":{"text":"configured","notifications":[],"context":[]}}\n' "$id"
+IFS= read -r shutdown
+id=$(printf '%s\n' "$shutdown" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "input-fixture"
+version = "0.1.0"
+api_version = "0.2"
+
+[entrypoint]
+command = "input-fixture.sh"
+
+[contributes]
+commands = ["configure"]
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join("extension.toml"),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process.clone());
+        let mut interaction = RecordingConfirmationHandler {
+            input_value: Some("fixture-secret".to_owned()),
+            ..RecordingConfirmationHandler::default()
+        };
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            extensions.execute_command_with_confirmation("configure", Vec::new(), &mut interaction),
+        )
+        .await
+        .expect("command remained blocked waiting for input")
+        .unwrap()
+        .expect("fixture command was not registered");
+
+        assert_eq!(output, "configured");
+        assert_eq!(
+            interaction.input_calls,
+            vec![("input-fixture".to_owned(), "API key:".to_owned(), true)]
+        );
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn noninteractive_command_confirmation_is_denied() {
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::Duration;
@@ -4290,7 +4566,7 @@ confirmations = true
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn hung_status_and_renderer_rpc_never_block_the_interactive_boundary() {
+    async fn hung_renderer_rpc_never_blocks_the_interactive_boundary() {
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::{Duration, Instant};
 
@@ -4355,7 +4631,6 @@ tool_renderers = ["slow"]
         extensions.receivers.push(process.subscribe());
         extensions.processes.push(process.clone());
         let started = Instant::now();
-        extensions.request_status_refresh();
         assert!(extensions.request_tool_render(
             ToolCallId("call-1".into()),
             "slow",
@@ -4370,12 +4645,7 @@ tool_renderers = ["slow"]
 
         tokio::time::sleep(Duration::from_millis(700)).await;
         let updates = extensions.drain_background_updates();
-        assert!(updates.ui.is_some());
         assert!(updates.rendered_tools.is_empty());
-        assert!(extensions
-            .diagnostics
-            .iter()
-            .any(|message| message.contains("status exceeded")));
         assert!(extensions
             .diagnostics
             .iter()

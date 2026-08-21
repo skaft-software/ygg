@@ -67,10 +67,11 @@ use ygg_serve_backend::{
 };
 
 use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
-use crate::app::{reasoning_label, supported_levels, App, Reconfig};
+use crate::app::{reasoning_label, supported_levels_with_subagents, App, Reconfig};
 use crate::commands;
 use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
+use crate::extensions::subagents_extension_activation_configured;
 use crate::modes::HostRunOutcome;
 use crate::resources::{compose_instructions, validate_skill_requirements};
 use crate::session_store::{
@@ -496,22 +497,6 @@ fn is_extension_resource_owner(value: &str) -> bool {
     value
         .strip_prefix("session-")
         .is_some_and(is_lower_hex_digest)
-}
-
-fn extension_principal_owns_child(principal: &str, child: &Path) -> bool {
-    let digest = Sha256::digest(principal.as_bytes());
-    let prefix = format!(
-        "ext-{}-task-",
-        digest[..6]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
-    child
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.split_once('-').map(|(_, task)| task))
-        .is_some_and(|task| task.starts_with(&prefix))
 }
 
 fn delegated_session_provenance(team: &Path, child: &Path) -> DelegatedSessionProvenance {
@@ -1404,7 +1389,7 @@ impl YggHost {
             .extension_resource_owner
             .as_deref()
             .ok_or(ServiceError::NotFound)?;
-        if !extension_principal_owns_child(principal, child) {
+        if !ygg_agent::extension_delegated_session_matches_owner(principal, resource_owner, child) {
             return Err(ServiceError::NotFound);
         }
         let parent_is_bound = self
@@ -5226,7 +5211,11 @@ async fn invoke_idle_slash_command(
                 Ok(level) => level,
                 Err(_) => return (Some(app), Err(ServiceError::InvalidBoundary)),
             };
-            let reasoning = match crate::app::thinking_to_reasoning(level, &app.model) {
+            let reasoning = match crate::app::thinking_to_reasoning_with_subagents(
+                level,
+                &app.model,
+                app.subagents_available(),
+            ) {
                 Ok(reasoning) => reasoning,
                 Err(_) => return (Some(app), Err(ServiceError::InvalidBoundary)),
             };
@@ -5263,7 +5252,9 @@ async fn invoke_idle_slash_command(
         ),
         commands::Command::Name(None)
         | commands::Command::Prompt(None)
-        | commands::Command::Extensions(commands::ExtensionsSubcommand::List) => (
+        | commands::Command::Extensions(
+            commands::ExtensionsSubcommand::Menu | commands::ExtensionsSubcommand::Status,
+        ) => (
             Some(app),
             Ok(SlashInvocationOutcome::immediate(
                 DriverCommandOutcome::default(),
@@ -8239,6 +8230,10 @@ async fn project_agent_event(
                 messages.len(),
             )?;
         }
+        AgentEvent::DelegationUpdated { .. } => {
+            // Serve projects owner-fenced subagent state through extension
+            // presentation snapshots; native telemetry is TUI-local run chrome.
+        }
         AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionFinished { .. } => {}
     }
     Ok(None)
@@ -10511,11 +10506,12 @@ fn graphical_input_pricing(pricing: Option<&ygg_ai::Pricing>) -> Option<ModelInp
 }
 
 fn graphical_model_catalog(catalog: &ModelCatalog, config: &Config) -> Vec<ModelSummary> {
+    let subagents_available = subagents_extension_activation_configured(config);
     let models = catalog
         .models()
         .filter_map(|spec| catalog.resolve(&spec.id).ok())
         .map(|model| {
-            let reasoning = supported_levels(&model)
+            let reasoning = supported_levels_with_subagents(&model, subagents_available)
                 .into_iter()
                 .map(thinking_label)
                 .collect::<Vec<_>>();
@@ -10619,10 +10615,11 @@ fn selection_for_model(
     let portable = crate::app::level_from_reasoning(&normalized, model)
         .map(thinking_label)
         .unwrap_or_else(|_| reasoning_label(&normalized));
-    let choices = supported_levels(model)
-        .into_iter()
-        .map(thinking_label)
-        .collect::<Vec<_>>();
+    let choices =
+        supported_levels_with_subagents(model, subagents_extension_activation_configured(config))
+            .into_iter()
+            .map(thinking_label)
+            .collect::<Vec<_>>();
     let portable = choices
         .iter()
         .find(|choice| choice.as_str() == portable.as_str())
@@ -11433,6 +11430,7 @@ mod tests {
             skill_paths: Vec::new(),
             extension_paths: Vec::new(),
             enabled_extensions: Vec::new(),
+            extension_activation_overridden: false,
             trusted_extensions: Vec::new(),
             invocation_trusted_extensions: Vec::new(),
             tools: crate::config::ToolPolicy::default(),
@@ -11558,12 +11556,19 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
+        let owner_digest = Sha256::digest(parent_resource_owner.as_bytes());
+        let owner_prefix = owner_digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let team = sessions
             .dir()
             .join(".delegation")
             .join("team-0123456789abcdef");
         ygg_agent::secure_fs::create_private_directory_all(&team).unwrap();
-        let path = team.join(format!("0001-ext-{principal_prefix}-task-cafebabe.jsonl"));
+        let path = team.join(format!(
+            "0001-ext-{principal_prefix}-{owner_prefix}-task-cafebabefeed.jsonl"
+        ));
         let mut child = Session::create(&path).unwrap();
         child
             .append(EntryValue::Message(Message::User(UserMessage {

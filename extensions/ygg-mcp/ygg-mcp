@@ -2,10 +2,11 @@
 """Self-contained launcher for the bundled ygg-mcp extension."""
 
 from pathlib import Path
+import os
 import sys
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("YGG_EXTENSION_DIR", Path(__file__).resolve().parent)).resolve()
 # Release bundles carry the exact dependency-free SDK wire implementation they
 # were tested with. No install-time pip invocation or ambient site package is
 # required.

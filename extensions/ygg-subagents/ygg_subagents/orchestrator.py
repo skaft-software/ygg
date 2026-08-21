@@ -10,17 +10,10 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from .model import (
-    DEFAULT_COST_MICRODOLLARS,
-    DEFAULT_OUTPUT_BYTES,
-    DEFAULT_TOKEN_BUDGET,
-    DEFAULT_TURNS,
-    DEFAULT_WALL_SECONDS,
     MAX_ACTIVE_CHILDREN,
     MAX_DEPTH,
     MAX_ERROR_BYTES,
     MAX_OWNER_CACHES,
-    MAX_TOTAL_COST_RESERVATION,
-    MAX_TOTAL_TOKEN_RESERVATION,
     MAX_WORKERS_PER_OWNER,
     PROFILE_INSTRUCTIONS,
     READ_ONLY_TOOLS,
@@ -28,7 +21,6 @@ from .model import (
     SubagentError,
     Owner,
     Worker,
-    active_reservations,
     aggregate_usage,
     bounded_int,
     depth_from_record,
@@ -47,7 +39,9 @@ _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-def _host_policy(record: Mapping[str, Any]) -> Tuple[Tuple[str, ...], int, int, int, int, int, int]:
+def _host_policy(
+    record: Mapping[str, Any],
+) -> Tuple[Tuple[str, ...], int, Optional[int], int, int, int, int]:
     policy = record.get("policy")
     deadline_at_ms = record.get("deadline_at_ms")
     if not isinstance(policy, Mapping):
@@ -67,9 +61,9 @@ def _host_policy(record: Mapping[str, Any]) -> Tuple[Tuple[str, ...], int, int, 
             "agent_sessions returned an invalid effective child tool policy",
             code="host_state_invalid",
         )
+    max_tokens = policy.get("max_tokens")
     values = (
         policy.get("max_turns"),
-        policy.get("max_tokens"),
         policy.get("max_cost_microdollars"),
         policy.get("max_output_bytes"),
         policy.get("timeout_ms"),
@@ -78,15 +72,21 @@ def _host_policy(record: Mapping[str, Any]) -> Tuple[Tuple[str, ...], int, int, 
     if any(
         not isinstance(value, int) or isinstance(value, bool) or value < 0
         for value in values
+    ) or (
+        max_tokens is not None
+        and (
+            not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or max_tokens < 0
+        )
     ):
         raise SubagentError(
             "agent_sessions returned invalid host-enforced child limits",
             code="host_state_invalid",
         )
-    max_turns, max_tokens, max_cost, max_output, timeout_ms, deadline = values
+    max_turns, max_cost, max_output, timeout_ms, deadline = values
     if (
         max_turns < 1
-        or max_tokens < 1
         or max_cost < 0
         or max_output < 1
         or timeout_ms < 1
@@ -180,7 +180,7 @@ class AgentSessions(Protocol):
         max_depth: int,
         max_concurrent_children: int,
         max_turns: int,
-        max_tokens: int,
+        max_tokens: Optional[int],
         max_cost_microdollars: int,
         max_output_bytes: int,
         timeout_ms: int,
@@ -266,7 +266,7 @@ class Orchestrator:
                 max_depth=MAX_DEPTH,
                 max_concurrent_children=MAX_ACTIVE_CHILDREN,
                 max_turns=request.max_turns,
-                max_tokens=request.max_tokens,
+                max_tokens=None,
                 max_cost_microdollars=request.max_cost_microdollars,
                 max_output_bytes=request.max_output_bytes,
                 timeout_ms=request.timeout_seconds * 1000,
@@ -506,10 +506,6 @@ class Orchestrator:
                 )
             with self._lock:
                 worker = state.workers.get(agent_id)
-                if worker is not None and requested:
-                    worker.state = "stopped"
-                    worker.phase = "stop accepted by host"
-                    worker.completed_at_ms = self._now_ms()
                 outcomes.append(
                     {
                         "id": agent_id,
@@ -738,7 +734,6 @@ class Orchestrator:
                 "agent_sessions exceeded the extension's 64-record observation bound",
                 code="host_state_invalid",
             )
-        now = self._now_ms()
         observed = set()
         with self._lock:
             for raw in records:
@@ -775,12 +770,20 @@ class Orchestrator:
                         state.idempotency[worker.idempotency_key] = recovered
                 self._update_worker_from_record(worker, raw)
                 state.workers.move_to_end(agent_id)
-            for worker in state.workers.values():
-                if worker.agent_id not in observed and worker.active:
-                    worker.state = "orphaned"
-                    worker.phase = "missing from authoritative owned-tree snapshot"
-                    worker.last_error = "The host no longer lists this active worker."
-                    worker.completed_at_ms = now
+            stale_ids = [
+                worker.agent_id
+                for worker in state.workers.values()
+                if worker.agent_id not in observed
+            ]
+            for agent_id in stale_ids:
+                state.workers.pop(agent_id, None)
+            if stale_ids:
+                stale = set(stale_ids)
+                state.idempotency = {
+                    key: value
+                    for key, value in state.idempotency.items()
+                    if value[1] not in stale
+                }
             self._trim_workers_locked(state)
             persistence_error = snapshot.get("persistence_error")
             if isinstance(persistence_error, str) and persistence_error.strip():
@@ -962,8 +965,10 @@ class Orchestrator:
             worker.current_tool = safe_label(tool_name)
             worker.phase = "using %s" % worker.current_tool
         elif isinstance(phase, str) and phase.strip():
+            worker.current_tool = None
             worker.phase = safe_label(phase)
         else:
+            worker.current_tool = None
             worker.phase = {
                 "queued": "queued by host",
                 "running": "running in host session",
@@ -977,9 +982,31 @@ class Orchestrator:
                 "restarted": "recovered after restart",
                 "stopping": "host interrupt requested",
             }.get(worker.state, "unknown")
-        turns, tokens, cost = aggregate_usage(record, status)
+        (
+            turns,
+            tool_calls,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            output_tokens,
+            reasoning_tokens,
+            tokens,
+            cost,
+        ) = aggregate_usage(record, status)
         if turns is not None:
             worker.turn_count = turns
+        if tool_calls is not None:
+            worker.tool_call_count = tool_calls
+        if input_tokens is not None:
+            worker.input_tokens = input_tokens
+        if cache_read_tokens is not None:
+            worker.cache_read_tokens = cache_read_tokens
+        if cache_write_tokens is not None:
+            worker.cache_write_tokens = cache_write_tokens
+        if output_tokens is not None:
+            worker.output_tokens = output_tokens
+        if reasoning_tokens is not None:
+            worker.reasoning_tokens = reasoning_tokens
         if tokens is not None:
             worker.tokens_used = tokens
         if cost is not None:
@@ -1013,16 +1040,16 @@ class Orchestrator:
             self._check_cancelled(cancellation)
             try:
                 client.interrupt_agent(agent_id)
-                error = "Recursive child was interrupted: V1 permits depth one only."
+                error = "Recursive child interrupt requested: V1 permits depth one only."
             except Exception as exception:
                 error = "Recursive child violated depth one; host interrupt failed: %s" % exception
             with self._lock:
                 worker = state.workers.get(agent_id)
                 if worker is not None:
-                    worker.state = "orphaned"
-                    worker.phase = "rejected recursive descendant"
+                    worker.stop_requested = True
+                    worker.state = "stopping"
+                    worker.phase = "interrupting rejected recursive descendant"
                     worker.last_error = sanitize_document(error, MAX_ERROR_BYTES)
-                    worker.completed_at_ms = self._now_ms()
 
     def _reserve_spawn_locked(self, state: OwnerState, request: SpawnRequest) -> None:
         if request.idempotency_key in state.pending_spawns:
@@ -1052,19 +1079,6 @@ class Orchestrator:
             raise SubagentError(
                 "subagent total worker limit reached for this parent (16)",
                 code="worker_limit",
-            )
-        tokens, cost = active_reservations(state.workers.values())
-        tokens += sum(value.max_tokens for value in state.pending_spawns.values())
-        cost += sum(value.max_cost_microdollars for value in state.pending_spawns.values())
-        if tokens + request.max_tokens > MAX_TOTAL_TOKEN_RESERVATION:
-            raise SubagentError(
-                "subagent token reservation limit reached (96000)",
-                code="token_budget",
-            )
-        if cost + request.max_cost_microdollars > MAX_TOTAL_COST_RESERVATION:
-            raise SubagentError(
-                "subagent cost reservation limit reached (500000 microdollars)",
-                code="cost_budget",
             )
         state.pending_spawns[request.idempotency_key] = request
 

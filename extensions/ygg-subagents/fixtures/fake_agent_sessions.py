@@ -80,6 +80,7 @@ class FakeAgent:
     status: Dict[str, Any] = field(default_factory=lambda: {"state": "pending"})
     phase: str = "queued"
     usage: Dict[str, int] = field(default_factory=dict)
+    tool_call_count: int = 0
     artifacts: List[Dict[str, Any]] = field(default_factory=list)
     export_reference: Optional[str] = None
     delivery_enqueued: bool = False
@@ -104,6 +105,7 @@ class FakeAgent:
             "completed_at_ms": self.completed_at_ms,
             "deadline_at_ms": self.deadline_at_ms,
             "turn_count": self.usage.get("turns", 0),
+            "tool_call_count": self.tool_call_count,
             "usage": {
                 "input_tokens": self.usage.get("input_tokens", 0),
                 "cache_read_tokens": 0,
@@ -167,6 +169,7 @@ class FakeHostState:
                 agent.started_at_ms = self.clock()
             agent.phase = phase
             if tool_name:
+                agent.tool_call_count += 1
                 agent.status["tool_name"] = tool_name
 
     def complete(
@@ -392,7 +395,7 @@ class FakeAgentSessions:
         max_depth: int,
         max_concurrent_children: int,
         max_turns: int,
-        max_tokens: int,
+        max_tokens: Optional[int],
         max_cost_microdollars: int,
         max_output_bytes: int,
         timeout_ms: int,
@@ -444,14 +447,6 @@ class FakeAgentSessions:
                 raise FakeAgentSessionsError("host delegation concurrency limit reached")
             if len(self.host.owners.get((self.principal, self.owner), [])) >= 16:
                 raise FakeAgentSessionsError("host extension child total limit reached")
-            if sum(agent.policy["max_tokens"] for agent in active) + max_tokens > 96_000:
-                raise FakeAgentSessionsError("host extension child token reservation limit reached")
-            if (
-                sum(agent.policy["max_cost_microdollars"] for agent in active)
-                + max_cost_microdollars
-                > 500_000
-            ):
-                raise FakeAgentSessionsError("host extension child cost reservation limit reached")
             number = self.host.next_agent
             self.host.next_agent += 1
             agent_id = "agent-%d" % number

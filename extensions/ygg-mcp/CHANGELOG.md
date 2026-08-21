@@ -1,10 +1,11 @@
 # ygg-mcp changelog
 
-## 0.1.0 — Ygg 0.5.0
+## 0.1.0 — Ygg 0.6.0-dev
 
 - Add the first API `0.2` dynamic-catalog MCP bridge.
 - Support explicit user and digest-pinned trusted-project configuration for
-  bounded local stdio tool servers.
+  bounded local stdio tool servers, with private permissions required whenever
+  explicit environment values are present.
 - Add epoch-aware add/replace/remove publication, conservative approval,
   cancellation, timeout, reconnect/backoff/parking, bounded logs, and graceful
   cleanup.

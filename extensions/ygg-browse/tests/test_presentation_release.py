@@ -81,6 +81,8 @@ class PresentationTests(unittest.TestCase):
         self.assertEqual(model.process_status(), "Browse · degraded")
         self.assertEqual(snapshot["activities"][-1]["references"][0]["kind"], "artifact")
         self.assertEqual({action["command"] for action in snapshot["actions"]}, {"browse"})
+        setup = next(action for action in snapshot["actions"] if action["id"] == "setup")
+        self.assertTrue(setup["destructive"])
         reset = next(action for action in snapshot["actions"] if action["id"] == "reset-profile")
         self.assertTrue(reset["destructive"])
 
@@ -189,6 +191,8 @@ class PresentationTests(unittest.TestCase):
                 self.assertIsInstance(value["activities"], list)
                 self.assertIn(value["collection"]["kind"], {"list", "tree"})
                 self.assertEqual({action["command"] for action in value["actions"]}, {"browse"})
+                setup = next(action for action in value["actions"] if action["id"] == "setup")
+                self.assertTrue(setup["destructive"])
                 encoded = json.dumps(value)
                 self.assertLess(len(encoded.encode("utf-8")), 256 * 1024)
                 self.assertNotIn("?token=", encoded)
@@ -202,7 +206,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-browse")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.5.0")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(set(manifest["contributes"]["tools"]), TOOLS)
         self.assertEqual(manifest["contributes"]["commands"], ["browse"])
         self.assertTrue(manifest["contributes"]["confirmations"])
@@ -278,7 +282,7 @@ class PackageTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.5.0",
+                    "ygg_version": "0.6.0-dev",
                     "extension": {
                         "name": "ygg-browse",
                         "version": "0.1.0",
@@ -321,8 +325,12 @@ class PackageTests(unittest.TestCase):
             environment = os.environ.copy()
             environment["HOME"] = home
             environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["YGG_EXTENSION_DIR"] = str(PACKAGE)
+            staged_entrypoint = Path(home) / "extension.py"
+            staged_entrypoint.write_bytes((PACKAGE / "extension.py").read_bytes())
+            staged_entrypoint.chmod(0o755)
             process = subprocess.run(
-                [str(PACKAGE / "extension.py")],
+                [str(staged_entrypoint)],
                 input=(
                     json.dumps(initialize)
                     + "\n"
@@ -352,7 +360,7 @@ class PackageTests(unittest.TestCase):
             self.skipTest("generic extension release packager is not present")
         with tempfile.TemporaryDirectory() as output:
             process = subprocess.run(
-                [str(script), "ygg-browse", output, "v0.5.0", str(PACKAGE)],
+                [str(script), "ygg-browse", output, "v0.6.0-dev", str(PACKAGE)],
                 cwd=REPOSITORY,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -360,7 +368,7 @@ class PackageTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            archive = Path(output) / "ygg-browse-0.5.0.tar.gz"
+            archive = Path(output) / "ygg-browse-0.6.0-dev.tar.gz"
             self.assertTrue(archive.is_file())
             with tarfile.open(archive, "r:gz") as bundle:
                 names = set(bundle.getnames())

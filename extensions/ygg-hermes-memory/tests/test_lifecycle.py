@@ -7,7 +7,7 @@ import unittest
 
 from .helpers import FakeExtension, load_fixture_config, mock_descriptor, owner_context, temporary_directory, wait_until
 from .test_loader_manager import fixture_mode
-from ygg_hermes_memory.manager import MemoryBridge
+from ygg_hermes_memory.manager import MemoryBridge, ProviderGenerationFenced
 
 
 def active_bridge(directory, *, limits=None):
@@ -157,22 +157,23 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual(len([item for item in provider.events if item["event"] == "on_memory_write"]), 1)
             bridge.shutdown()
 
-    def test_slow_failing_sync_is_bounded_and_health_is_degraded(self):
+    def test_slow_sync_fences_generation_instead_of_reporting_false_terminal_state(self):
         with fixture_mode("slow-sync"):
             with temporary_directory() as directory:
                 bridge, _, context = active_bridge(
                     directory, limits={"syncTimeoutMs": 30, "maxQueueDepth": 2}
                 )
+                aborted = []
+                bridge._abort_generation = aborted.append
                 owner = bridge.owner_for_context(context)
                 bridge.before_prompt({"prompt": "user"}, context)
                 started = time.monotonic()
                 bridge.after_response({"response": "assistant"}, context)
                 self.assertLess(time.monotonic() - started, 0.2)
-                self.assertTrue(wait_until(lambda: owner.queue_depth == 0))
-                self.assertEqual(owner.last_sync["outcome"], "timeout")
-                self.assertEqual(owner.state, "degraded")
-                presentation = bridge.presentation_snapshot(owner)
-                self.assertEqual(presentation["status"]["state"], "degraded")
+                self.assertTrue(wait_until(bridge._generation_fenced.is_set))
+                self.assertEqual(aborted, ["unfinished_provider_sync_turn_timeout"])
+                self.assertNotIn("outcome", owner.last_sync)
+                self.assertNotIn(owner.state, {"stopped", "failed"})
                 bridge.shutdown()
 
     def test_queue_depth_is_bounded_and_late_work_fails_soft(self):
@@ -223,20 +224,43 @@ class LifecycleTests(unittest.TestCase):
                 self.assertEqual(owner.state, "stopped")
                 self.assertEqual(owner.queue_depth, 0)
 
-    def test_multiple_slow_provider_shutdowns_share_one_total_deadline(self):
+    def test_shutdown_failure_fences_instead_of_reporting_stopped(self):
+        with temporary_directory() as directory:
+            bridge, _, context = active_bridge(directory)
+            owner = bridge.owner_for_context(context)
+            aborted = []
+            bridge._abort_generation = aborted.append
+
+            def fail_shutdown():
+                raise RuntimeError("private provider detail")
+
+            owner.provider.provider.shutdown = fail_shutdown
+            with self.assertRaises(ProviderGenerationFenced):
+                bridge.shutdown()
+            self.assertEqual(
+                aborted,
+                ["unfinished_provider_shutdown_provider_runtimeerror"],
+            )
+            self.assertEqual(owner.state, "stopping")
+
+    def test_multiple_uncooperative_shutdowns_fence_one_process_generation(self):
         with fixture_mode("slow-shutdown"):
             with temporary_directory() as directory:
                 bridge, _, first_context = active_bridge(
                     directory, limits={"shutdownTimeoutMs": 60}
                 )
+                aborted = []
+                bridge._abort_generation = aborted.append
                 candidate = bridge._discovery.by_id("directory:mock")
                 second_context = owner_context("second-owner")
                 bridge.execute_command(["select", candidate.id], second_context)
                 started = time.monotonic()
-                bridge.shutdown()
+                with self.assertRaises(ProviderGenerationFenced):
+                    bridge.shutdown()
                 self.assertLess(time.monotonic() - started, 0.3)
-                self.assertEqual(bridge.owner_for_context(first_context).state, "stopped")
-                self.assertEqual(bridge.owner_for_context(second_context).state, "stopped")
+                self.assertEqual(aborted, ["unfinished_provider_shutdown_unfinished"])
+                self.assertEqual(bridge.owner_for_context(first_context).state, "stopping")
+                self.assertEqual(bridge.owner_for_context(second_context).state, "stopping")
 
     def test_status_exposes_only_safe_operational_measurements(self):
         with temporary_directory() as directory:

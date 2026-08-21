@@ -435,16 +435,147 @@ pub fn persist_reasoning_mode(mode: ygg_ai::ReasoningMode) -> anyhow::Result<()>
     persist_key_to_path("reasoning_mode", value, &path)
 }
 
+/// Persist one executable extension's activation without copying merged
+/// project, environment, or command-line activation into the user config.
+pub fn persist_extension_enabled(name: &str, enabled: bool) -> anyhow::Result<Vec<String>> {
+    let path = global_config_path().ok_or_else(|| {
+        anyhow::anyhow!("cannot persist extension activation: user home directory is unavailable")
+    })?;
+    persist_extension_enabled_to_path(name, enabled, &path)
+}
+
+/// Revalidate that the user config remains the next-launch authority before an
+/// interactive extension toggle mutates it. A newly added trusted-project layer
+/// fails closed instead of making a global edit look durable when it is not.
+pub fn extension_activation_menu_authoritative(config: &Config) -> anyhow::Result<bool> {
+    if config.extension_activation_overridden {
+        return Ok(false);
+    }
+    if !config.workspace_trusted {
+        return Ok(true);
+    }
+    let project = read_layer(
+        &project_config_path(&config.workspace),
+        ConfigSourceKind::Project,
+    )?;
+    Ok(project.values.enabled_extensions.is_none())
+}
+
+fn persist_extension_enabled_to_path(
+    name: &str,
+    enabled: bool,
+    path: &std::path::Path,
+) -> anyhow::Result<Vec<String>> {
+    let name = normalize_extension_name(name)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _config_lock = config_update_lock(path)?;
+
+    let original = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let content = original.as_deref().unwrap_or_default();
+    let mut document = if content.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        content.parse::<toml_edit::DocumentMut>().map_err(|error| {
+            anyhow::anyhow!("cannot update invalid config {}: {error}", path.display())
+        })?
+    };
+    let mut names = std::collections::BTreeSet::new();
+    if let Some(item) = document.get("enabled_extensions") {
+        let values = item.as_array().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot update config {}: enabled_extensions must be an array of names",
+                path.display()
+            )
+        })?;
+        for value in values {
+            let value = value.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "cannot update config {}: enabled_extensions must contain only strings",
+                    path.display()
+                )
+            })?;
+            names.insert(normalize_extension_name(value)?);
+        }
+    }
+    if enabled {
+        names.insert(name);
+    } else {
+        names.remove(&name);
+    }
+
+    let mut values = toml_edit::Array::new();
+    for name in &names {
+        values.push(name.as_str());
+    }
+    document["enabled_extensions"] = toml_edit::value(values);
+    write_config_atomically(path, &document.to_string(), original.as_deref())?;
+    Ok(names.into_iter().collect())
+}
+
+fn config_update_lock(path: &std::path::Path) -> anyhow::Result<std::fs::File> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("config path {} has no file name", path.display()))?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    let lock_path = path.with_file_name(lock_name);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(&lock_path)?;
+    #[cfg(unix)]
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
+        anyhow::anyhow!(
+            "another config update is in progress for {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+fn write_config_atomically(
+    path: &std::path::Path,
+    content: &str,
+    expected: Option<&str>,
+) -> anyhow::Result<()> {
+    const MAX_CONFIG_BYTES: usize = 1024 * 1024;
+    ygg_agent::secure_fs::write_atomic_if_unchanged(
+        path,
+        expected.map(str::as_bytes),
+        content.as_bytes(),
+        MAX_CONFIG_BYTES,
+    )
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "could not atomically update config {} without overwriting a concurrent edit: {error}",
+            path.display()
+        )
+    })
+}
+
 fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let _config_lock = config_update_lock(path)?;
 
-    let content = if path.exists() {
-        std::fs::read_to_string(path)?
-    } else {
-        String::new()
+    let original = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
     };
+    let content = original.as_deref().unwrap_or_default();
     let mut document = if content.trim().is_empty() {
         toml_edit::DocumentMut::new()
     } else {
@@ -458,12 +589,10 @@ fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow
     document[key] = toml_edit::value(value);
     let new_content = document.to_string();
 
-    // Atomic write: write to a sibling temp file then rename over the
-    // real path so a crash mid-write cannot leave a truncated config.
-    let tmp_path = path.with_extension("tmp");
-    std::fs::write(&tmp_path, &new_content)?;
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+    // Atomic write: write to a unique sibling temp file then rename over the
+    // real path so a crash or concurrent config writer cannot leave a partial
+    // or collide with this writer's staging file.
+    write_config_atomically(path, &new_content, original.as_deref())
 }
 
 #[cfg(test)]
@@ -925,9 +1054,12 @@ fn build_config_with_global_path(
     } else {
         LoadedConfigLayer::default()
     };
+    let environment = environment_layer()?;
+    let extension_activation_overridden = project.values.enabled_extensions.is_some()
+        || environment.enabled_extensions.is_some()
+        || !cli.enable_extensions.is_empty();
     let mut diagnostics = global.diagnostics;
     diagnostics.extend(project.diagnostics);
-    let environment = environment_layer()?;
     let mut values = global.values;
     values.merge_project(project.values);
     values.merge(environment);
@@ -1185,6 +1317,7 @@ fn build_config_with_global_path(
         skill_paths: cli.skill_dirs,
         extension_paths: cli.extension_dirs,
         enabled_extensions,
+        extension_activation_overridden,
         trusted_extensions,
         invocation_trusted_extensions,
         tools,
@@ -1734,8 +1867,33 @@ mod tests {
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
 
         assert_eq!(config.enabled_extensions, vec!["project-tool"]);
+        assert!(config.extension_activation_overridden);
         assert_eq!(config.trusted_extensions, vec!["user-tool"]);
         assert!(config.invocation_trusted_extensions.is_empty());
+    }
+
+    #[test]
+    fn activation_menu_revalidates_a_project_override_added_after_startup() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "enabled_extensions = ['global-tool']\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert!(!config.extension_activation_overridden);
+        assert!(extension_activation_menu_authoritative(&config).unwrap());
+
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "enabled_extensions = ['project-tool']\n",
+        )
+        .unwrap();
+        assert!(!extension_activation_menu_authoritative(&config).unwrap());
+
+        std::fs::write(directory.path().join(".ygg/config.toml"), "not valid = [\n").unwrap();
+        assert!(extension_activation_menu_authoritative(&config).is_err());
     }
 
     #[test]
@@ -1753,6 +1911,7 @@ mod tests {
         let config = build_config_with_global_path(cli, directory.path(), None).unwrap();
 
         assert!(config.enabled_extensions.is_empty());
+        assert!(!config.extension_activation_overridden);
         assert!(config.trusted_extensions.is_empty());
         assert!(config.invocation_trusted_extensions.is_empty());
     }
@@ -1766,6 +1925,21 @@ mod tests {
             global_config_path_from_home(Some(absolute_home.clone())),
             Some(absolute_home.join(".ygg/config.toml"))
         );
+    }
+
+    #[test]
+    fn cli_activation_marks_the_interactive_user_config_menu_non_authoritative() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "enabled_extensions = ['global-tool']\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.enable_extensions.push("cli-tool".into());
+
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+
+        assert_eq!(config.enabled_extensions, ["cli-tool", "global-tool"]);
+        assert!(config.extension_activation_overridden);
     }
 
     #[test]
@@ -1883,6 +2057,128 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.compaction.mode, CompactionMode::Disabled);
+    }
+
+    // --- extension activation persistence ---
+
+    #[test]
+    fn persist_extension_activation_changes_only_the_selected_user_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\nenabled_extensions = [\"ygg-browse\", \"ygg-ssh\"]\ntrusted_extensions = [\"ygg-browse\", \"ygg-ssh\"]\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            persist_extension_enabled_to_path("ygg-web-search", true, &path).unwrap(),
+            vec!["ygg-browse", "ygg-ssh", "ygg-web-search"]
+        );
+        assert_eq!(
+            persist_extension_enabled_to_path("ygg-browse", false, &path).unwrap(),
+            vec!["ygg-ssh", "ygg-web-search"]
+        );
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&content).unwrap();
+        let enabled = parsed["enabled_extensions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(enabled, ["ygg-ssh", "ygg-web-search"]);
+        assert_eq!(
+            parsed["trusted_extensions"].as_array().unwrap().len(),
+            2,
+            "trust is an independent decision"
+        );
+        assert!(content.contains("# keep this comment"), "{content}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_config_update_preserves_existing_permissions_and_uses_private_new_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.toml");
+        std::fs::write(&existing, "enabled_extensions = []\n").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        persist_extension_enabled_to_path("ygg-ssh", true, &existing).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        let new = dir.path().join("new.toml");
+        persist_extension_enabled_to_path("ygg-ssh", true, &new).unwrap();
+        assert_eq!(
+            std::fs::metadata(&new).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let staging_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(staging_files, 0, "atomic staging files must be removed");
+    }
+
+    #[test]
+    fn atomic_config_publish_rejects_a_non_locking_external_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "enabled_extensions = [\"ygg-browse\"]\n";
+        let external = "enabled_extensions = [\"ygg-ssh\"]\ntrusted_extensions = [\"ygg-ssh\"]\n";
+        std::fs::write(&path, original).unwrap();
+        let expected = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, external).unwrap();
+
+        let error = write_config_atomically(&path, "enabled_extensions = []\n", Some(&expected))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            !name.contains(".tmp-") && !name.contains(".ygg-tmp-")
+        }));
+    }
+
+    #[test]
+    fn concurrent_config_update_fails_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = "enabled_extensions = [\"ygg-browse\"]\n";
+        std::fs::write(&path, original).unwrap();
+        let lock = config_update_lock(&path).unwrap();
+
+        let error = persist_extension_enabled_to_path("ygg-ssh", true, &path).unwrap_err();
+        assert!(
+            error.to_string().contains("another config update"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        drop(lock);
+
+        assert_eq!(
+            persist_extension_enabled_to_path("ygg-ssh", true, &path).unwrap(),
+            ["ygg-browse", "ygg-ssh"]
+        );
+    }
+
+    #[test]
+    fn persist_extension_activation_rejects_a_non_array_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let invalid = "enabled_extensions = \"ygg-browse\"\n";
+        std::fs::write(&path, invalid).unwrap();
+
+        assert!(persist_extension_enabled_to_path("ygg-ssh", true, &path).is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), invalid);
     }
 
     // --- persist_model_to_path ---

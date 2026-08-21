@@ -24,6 +24,7 @@ class PolicyTests(unittest.TestCase):
             ({"name": "worker", "task": "x", "tools": ["write"]}, "mutation_scope_denied"),
             ({"name": "worker", "task": "x", "tools": ["read", "bash"]}, "mutation_scope_denied"),
             ({"name": "worker", "task": "x", "model": "other"}, "unsupported_model"),
+            ({"name": "worker", "task": "x", "max_tokens": 64000}, "invalid_request"),
             ({"name": "Worker", "task": "x"}, "invalid_request"),
             ({"name": "worker", "task": "bad\x1b[31m"}, "invalid_request"),
         ):
@@ -80,7 +81,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertTrue(self.snapshots)
         self.assertEqual(self.snapshots[-1]["collection"]["nodes"][0]["id"], "worker:agent-1")
 
-    def test_concurrency_and_aggregate_reservations_are_enforced_before_host_spawn(self):
+    def test_concurrency_is_enforced_and_children_inherit_no_token_ceiling(self):
         self.spawn("one")
         self.spawn("two")
         with self.assertRaises(SubagentError) as raised:
@@ -91,18 +92,28 @@ class OrchestrationTests(unittest.TestCase):
         host = FakeHostState(self.clock)
         client = host.client()
         orchestrator = Orchestrator(now_ms=self.clock)
-        orchestrator.spawn(
+        first = orchestrator.spawn(
             client,
             self.owner,
-            {"name": "large-one", "task": "x", "max_tokens": 64000},
+            {
+                "name": "inherited-one",
+                "task": "x",
+                "max_cost_microdollars": 500000,
+            },
         )
-        with self.assertRaises(SubagentError) as raised:
-            orchestrator.spawn(
-                client,
-                self.owner,
-                {"name": "large-two", "task": "x", "max_tokens": 64000},
-            )
-        self.assertEqual(raised.exception.code, "token_budget")
+        second = orchestrator.spawn(
+            client,
+            self.owner,
+            {
+                "name": "inherited-two",
+                "task": "x",
+                "max_cost_microdollars": 500000,
+            },
+        )
+        self.assertIsNone(first["worker"]["token_budget"])
+        self.assertIsNone(second["worker"]["token_budget"])
+        self.assertTrue(all(agent.policy["max_tokens"] is None for agent in host.agents.values()))
+        self.assertEqual(len(host.agents), 2)
 
     def test_idempotent_duplicate_returns_same_child_and_conflicting_reuse_fails(self):
         first = self.spawn(idempotency_key="stable-key")
@@ -165,6 +176,7 @@ class OrchestrationTests(unittest.TestCase):
         worker = status["worker"]
         self.assertEqual(worker["state"], "running")
         self.assertEqual(worker["current_tool"], "search")
+        self.assertEqual(worker["tool_call_count"], 1)
         self.assertIsNone(worker["summary"])
         tree = self.snapshots[-1]
         encoded = str(tree)
@@ -187,8 +199,15 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(worker["state"], "done")
         self.assertEqual(worker["summary"], "Auth ownership is fenced in src/auth.rs:41.")
         self.assertEqual(worker["turn_count"], 3)
+        self.assertEqual(worker["tool_call_count"], 0)
+        self.assertEqual(worker["input_tokens"], 1000)
+        self.assertEqual(worker["output_tokens"], 250)
         self.assertEqual(worker["tokens_used"], 1250)
         self.assertEqual(worker["cost_microdollars"], 1750)
+        metrics = self.snapshots[-1]["activities"][0]["metrics"]
+        self.assertEqual(metrics["input_tokens"], 1000)
+        self.assertEqual(metrics["output_tokens"], 250)
+        self.assertEqual(metrics["cost_microdollars"], 1750)
         self.assertEqual(worker["artifacts"], [])
         self.assertEqual(worker["session"], fake_session_reference(agent_id))
         detail = self.snapshots[-1]["collection"]["detail"]
@@ -221,15 +240,21 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("running", command["text"])
         self.assertEqual(self.host.agents[agent_id].status["state"], "running")
 
-    def test_stop_one_and_all_settle_immediately_after_host_acceptance(self):
+    def test_stop_one_and_all_remain_stopping_until_host_state_refresh(self):
         first = self.spawn("one")["worker"]["id"]
         second = self.spawn("two")["worker"]["id"]
         self.host.start(first)
         self.host.start(second)
-        stopped = self.orchestrator.stop(self.client, self.owner, {"target": first})
-        self.assertEqual(stopped["workers"][0]["state"], "stopped")
-        all_stopped = self.orchestrator.stop(self.client, self.owner, {"all": True})
-        self.assertEqual(all_stopped["workers"][0]["id"], second)
+        stopping = self.orchestrator.stop(self.client, self.owner, {"target": first})
+        self.assertEqual(stopping["workers"][0]["state"], "stopping")
+        self.assertIsNone(stopping["workers"][0]["completed_at_ms"])
+        stopped = self.orchestrator.status(self.client, self.owner, {"target": first})
+        self.assertEqual(stopped["worker"]["state"], "stopped")
+        self.assertIsNotNone(stopped["worker"]["completed_at_ms"])
+
+        all_stopping = self.orchestrator.stop(self.client, self.owner, {"all": True})
+        self.assertEqual(all_stopping["workers"][0]["id"], second)
+        self.assertEqual(all_stopping["workers"][0]["state"], "stopping")
         self.assertEqual(self.host.agents[second].status["state"], "interrupted")
 
     def test_restart_resync_and_same_key_retry_do_not_duplicate_spawn(self):
@@ -324,7 +349,7 @@ class OrchestrationTests(unittest.TestCase):
                 max_depth=1,
                 max_concurrent_children=2,
                 max_turns=4,
-                max_tokens=32000,
+                max_tokens=None,
                 max_cost_microdollars=200000,
                 max_output_bytes=8192,
                 timeout_ms=300000,

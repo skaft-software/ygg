@@ -78,7 +78,7 @@ The **first** host request, sent immediately after the child process starts.
   "method": "initialize",
   "params": {
     "api_version": "0.1",
-    "ygg_version": "0.5.0",
+    "ygg_version": "0.6.0-dev",
     "extension": {
       "name": "hello-world",
       "version": "0.1.0",
@@ -217,10 +217,13 @@ empty, all six events are subscribed. Otherwise it must be an exact subset of
 the six names above. A non-empty subscription without the feature is invalid.
 
 The working-tree coding host conditionally appends `agent_sessions` to
-`optional_features` only when bounded V2 delegation is available for the
-selected model/reasoning mode. A response may negotiate it only when it was
-offered. The service is bound after the Agent is constructed; calls without a
-bound service/resource owner fail deterministically with `-32002`.
+`optional_features` only for the trusted, enabled first-party
+`ygg-subagents` extension when its child-session service can be bound. The
+service is available independently of the selected reasoning effort; Ultra is
+separately gated on the live provider's V2 metadata. A response may negotiate
+it only when it was offered. The service is bound after the Agent is
+constructed; calls without a bound service/resource owner fail deterministically
+with `-32002`.
 
 The host likewise appends `approvals` only when single-use approval issuance is
 enabled, and appends `secrets` only when a secret broker is configured and the
@@ -540,7 +543,9 @@ Host requests prompt context contributions.
 
 ### 1.6 `status/collect`
 
-Host requests a TUI status/header/footer contribution.
+Host requests an optional status/header/footer contribution. The coding TUI
+intentionally does not request or render these as persistent chrome; the method
+remains protocol vocabulary for other host-owned frontends.
 
 **Request:**
 
@@ -843,7 +848,9 @@ Notification (no `id`).
 
 ### 2.4 `status/contribution`
 
-Unsolicited TUI surface contribution.
+Unsolicited semantic status contribution. It does not force any frontend to
+create persistent chrome; the coding TUI keeps extension state in explicit
+views.
 
 ```json
 {
@@ -880,6 +887,9 @@ snapshot as a JSON-RPC notification:
       "id":"worker:1","kind":"delegation","state":"running",
       "summary":"Reviewing tests","provenance":"local child",
       "started_at_ms":1721000000000,
+      "metrics":{"tool_calls":4,"input_tokens":12000,"cache_read_tokens":800,
+        "cache_write_tokens":0,"output_tokens":220,"reasoning_tokens":60,
+        "cost_microdollars":7200},
       "references":[]
     }],
     "collection":{
@@ -918,7 +928,11 @@ a newer process generation may restart it. `status` is optional. `activities`
 and `actions` default to empty arrays; `collection` is optional. Collection kind
 is `list` or `tree`. IDs are stable extension-scoped identifiers. Nodes use
 optional `parent_id`; lists cannot have parents, trees cannot contain a missing
-parent, cycle, or depth over 16. A detail `node_id` must match the current
+parent, cycle, or depth over 16. Activities may include optional `metrics` with
+`tool_calls`, disjoint `input_tokens`, `cache_read_tokens`, and
+`cache_write_tokens`, `output_tokens`, its `reasoning_tokens` subset, and
+optional `cost_microdollars`. Every counter uses the portable JSON integer
+bound and reasoning cannot exceed output. A detail `node_id` must match the current
 `selected_node_id`. Generic states are `empty`, `loading`, `pending`, `active`,
 `running`, `succeeded`, `failed`, `cancelled`, `degraded`, `stopped`, and
 `unavailable`.
@@ -945,7 +959,12 @@ produces at most one diagnostic for that window. The host validates the complete
 snapshot atomically,
 attaches manifest identity, a non-repeating process-instance fence, generation,
 and active resource owner, ignores or diagnoses stale updates, and retains the
-latest accepted replacement for TUI, Serve, and bounded headless fallbacks. It
+latest accepted replacement for explicit TUI views, Serve, and bounded headless
+fallbacks. Generic snapshots do not become ambient chrome. The coding TUI
+recognizes owner-fenced `ygg-subagents` activities as a first-party observed
+surface, renders their structured metrics above the composer during the owning
+run from native `AgentEvent::DelegationUpdated` events, and does not poll a
+status command; the extension cannot supply footer text or terminal rows. It
 clears stale state on owner/process replacement; Serve action identity includes
 the instance fence, generation, and revision before routing the selected
 manifest process's command. The notification never invokes an action, repeats
@@ -1266,7 +1285,7 @@ model session:
       "max_depth": 1,
       "max_concurrent_children": 2,
       "max_turns": 8,
-      "max_tokens": 32000,
+      "max_tokens": null,
       "max_cost_microdollars": 200000,
       "max_output_bytes": 8192,
       "timeout_ms": 300000
@@ -1278,15 +1297,22 @@ model session:
 The host derives the resource owner from `parent_request_id`; the extension
 cannot submit an owner. `policy` is mandatory. Its tools are a non-empty,
 duplicate-free subset of `read`/`search`; depth is exactly one; concurrency is
-1..=2; and turns, cumulative tokens/cost, returned UTF-8 bytes, and wall time
-are positive host-capped values. Ygg freezes a detached effective tool snapshot,
-installs no collaboration tools, applies lower inherited turn/cost ceilings,
-and owns limit settlement even when the extension is idle or restarted.
+1..=2; and turns, optional cumulative token cap, cumulative cost, returned UTF-8
+bytes, and wall time are host-bounded. `max_tokens: null` means exact inheritance
+of the parent's optional cumulative session-token setting, so a parent with no
+ceiling produces a child with no ceiling; a non-null 1,000..=64,000 value may
+request a stricter cap. Every child starts with a fresh context while inheriting
+the parent model's context window and resolved per-request output limit. Ygg
+freezes a detached effective tool snapshot, installs no collaboration tools,
+applies lower inherited turn/cost ceilings, and owns limit settlement even when
+the extension is idle or restarted.
 
 The idempotency key is 1..=256 bytes and scoped to the extension principal plus
 that owner. Retrying identical `task_name`/`profile`/`fingerprint`/`message`/
-`policy` returns the same result. Reusing the key with different input fails
-with `-32002`. `task_name` and optional `profile` are 1..=48 lowercase ASCII
+`policy` while the owning-run child record is retained returns the same result.
+Reuse with different input fails with `-32002`. At the next owning run, stale
+idempotency entries are pruned with their missing child records rather than
+returning a nonexistent session. `task_name` and optional `profile` are 1..=48 lowercase ASCII
 letters, digits, underscores, or hyphens. Optional `fingerprint` is one
 lowercase SHA-256 digest used only as opaque recovery metadata. The message is
 capped at 128 KiB. Success includes `agent_id`, `agent_path`, caller-visible
@@ -1353,16 +1379,32 @@ agent record contains `agent_id`, `agent_path`, `parent_id`, public
 `task_name`, optional `profile`, durable `idempotency_key`/`fingerprint`,
 `depth`, opaque `agent-session:*` resource reference, tagged `status`, effective
 `policy`, host-owned `created_at_ms`/`started_at_ms`/`completed_at_ms`,
-`deadline_at_ms`, `turn_count`, cumulative `usage`, optional
+`deadline_at_ms`, `turn_count`, host-observed `tool_call_count`, structured
+`phase` and optional `tool_name`, cumulative disjoint `usage`, optional
 `cost_microdollars`, and principal/owner `provenance`. States are `pending`,
 `running`, `completed` (with host-byte-capped `output`), `interrupted`,
 `timed_out`, `failed` (with bounded `error`), and `shutdown`. Private delegation
 JSONL paths are never returned. A current owner-scoped presentation may route
-the opaque reference into Serve or `/extensions inspect` as a locked read-only
-transcript; the resolver separately verifies host-written parent-session,
-extension-principal, and resource-owner provenance. All mutation continues
+the opaque reference into Serve, `/extensions inspect`, or the native
+`/subagents` arrow-key browser as a locked read-only transcript; the resolver
+separately verifies host-written parent-session, extension-principal, and
+resource-owner provenance. The TUI transcript panel starts at the live tail,
+supports bounded scrolling, and returns to the worker list on Escape or Left.
+All mutation continues
 through the owner-bound `agent_sessions` methods. The list contains only roots
-spawned by this principal/owner and their descendants.
+spawned by this principal/owner and their descendants. Child contexts remain
+independent and their tokens never become parent prompt context. Before the root
+run settles, Ygg stops and briefly joins these children, aggregates each child
+session's durable usage and exact cost (including picodollar remainder), and
+appends one `delegated_agent` usage record per child to the root session. The
+live TUI adds the current presentation cost only until those records are
+committed, so the cumulative footer never double-counts delegated spend; this
+ledger mirror is accounting rather than context sharing and is not charged to
+the parent's own-context token ceiling.
+Owner-scoped `agent/list`/`agent/wait` observation remains available after the
+owning root becomes inactive so the final terminal snapshot and transcript
+picker can settle; spawn/message/follow-up/interrupt mutation still requires an
+active owner and fails closed.
 
 ---
 
@@ -1572,6 +1614,7 @@ reference, safety, parentage, and bound rules.
 | `policy_intents` | no | Correlated `policy/evaluate` requests |
 | `dynamic_tools` | no | Transactional `tools/register`, `tools/unregister`, and revision-pinned `tool/call` |
 | `agent_sessions` | conditional | Principal/owner-scoped `agent/*` child model-session service |
+| `delegation_telemetry_v1` | conditional first-party requirement | Native owner-run `AgentEvent::DelegationUpdated` child telemetry; required by `ygg-subagents` when `agent_sessions` is offered |
 | `approvals` | conditional | Original-intent/active-owner-bound single-use `policy/evaluate` retry tokens; also requires `policy_intents` |
 | `secrets` | conditional | Owner-scoped `secret/get` for exact manifest-allowlisted names |
 
@@ -1589,10 +1632,10 @@ starting -> initializing -> ready -> draining -> stopped
                               +-> degraded/crashed
 ```
 
-`/extensions` inspection exposes each running process generation, negotiated
-features, pending request count, health state, and bounded last error. The
-supervisor uses `backoff` after an unexpected exit or terminal transport failure
-and `parked` after its retry budget or a permanent
+`/extensions status` inspection exposes each running process generation,
+negotiated features, pending request count, health state, and bounded last
+error. The supervisor uses `backoff` after an unexpected exit or terminal
+transport failure and `parked` after its retry budget or a permanent
 manifest/version/re-registration error.
 
 **Reload:** Ygg starts and fully negotiates candidate generation `N+1` while

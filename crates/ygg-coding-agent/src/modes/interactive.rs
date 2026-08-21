@@ -21,8 +21,8 @@ use crate::app::bootstrap::{
     build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
 };
 use crate::app::{
-    apply_reconfig, level_from_reasoning, reasoning_label, supported_levels, thinking_to_reasoning,
-    App, Reconfig,
+    apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
+    thinking_to_reasoning_with_subagents, App, Reconfig,
 };
 use crate::commands::{self, Command};
 use crate::compaction::{
@@ -37,8 +37,9 @@ use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
-    confirmation_picker, extension_confirmation_picker, optional_model_picker, session_picker,
-    theme_picker, thinking_picker, tool_input_picker,
+    confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
+    optional_model_picker, read_only_document, read_only_document_live, session_picker,
+    subagent_picker, theme_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
 };
 use crate::tui::theme::{
     available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
@@ -109,6 +110,22 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                     extension,
                     request,
                 ) => result,
+            }
+        })
+    }
+
+    fn input<'a>(
+        &'a mut self,
+        _extension: &'a str,
+        request: &'a ygg_agent::extension_process::ExtensionInputRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                    anyhow::bail!("shutdown requested while awaiting extension input")
+                }
+                result = extension_input_picker(self.shell, self.input, request) => result,
             }
         })
     }
@@ -1406,11 +1423,6 @@ where
                             for message in executable_extensions.drain_events() {
                                 shell.notice(message);
                             }
-                            if executable_extensions.take_presentation_dirty() {
-                                shell.set_extension_activity(
-                                    executable_extensions.presentation_activity_lines(),
-                                );
-                            }
                         }
                     }
                     if let AgentEvent::TurnFinished {
@@ -1547,12 +1559,8 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
         &app.reasoning,
         &app.sessions,
     );
-    app.executable_extensions.request_status_refresh();
     for message in app.executable_extensions.drain_events() {
         shell.notice(message);
-    }
-    if app.executable_extensions.take_presentation_dirty() {
-        shell.set_extension_activity(app.executable_extensions.presentation_activity_lines());
     }
 }
 
@@ -1562,22 +1570,12 @@ fn apply_extension_background(
 ) -> bool {
     let updates = executable_extensions.drain_background_updates();
     let mut changed = false;
-    if let Some(ui) = updates.ui {
-        shell.set_extension_header(ui.header);
-        shell.set_extension_status(ui.status);
-        shell.set_extension_footer(ui.footer);
-        changed = true;
-    }
     for update in updates.rendered_tools {
         shell.apply_extension_tool_renderer(&update.id, &update.segments);
         changed = true;
     }
     for message in executable_extensions.drain_events() {
         shell.notice(message);
-        changed = true;
-    }
-    if executable_extensions.take_presentation_dirty() {
-        shell.set_extension_activity(executable_extensions.presentation_activity_lines());
         changed = true;
     }
     changed
@@ -1736,8 +1734,384 @@ async fn reload_resources(
     Ok(app)
 }
 
+#[derive(Clone, Debug)]
+struct InstalledExtensionChoice {
+    name: String,
+    label: String,
+    description: String,
+    enabled: bool,
+    toggleable: bool,
+}
+
+fn installed_extension_choices(app: &App) -> anyhow::Result<Vec<InstalledExtensionChoice>> {
+    let root = crate::extension_package::extensions_root()?;
+    let installed = crate::extension_bundle::list_installed(&root)?;
+    let summaries = app.executable_extensions.summaries();
+    let explicitly_required = app
+        .config
+        .tools
+        .explicit_names()
+        .into_iter()
+        .flatten()
+        .collect::<std::collections::BTreeSet<_>>();
+    let current_tools = app
+        .agent
+        .registered_tool_names()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(installed
+        .into_iter()
+        .map(|bundle| {
+            let summary = summaries.iter().find(|summary| summary.name == bundle.id);
+            let enabled = app
+                .config
+                .enabled_extensions
+                .iter()
+                .any(|name| name == &bundle.id);
+            let global_source = summary.is_some_and(|summary| {
+                matches!(
+                    summary.source,
+                    ygg_agent::extension_process::ExtensionSource::Global
+                )
+            });
+            let unavailable_disable = summary.is_none() && enabled;
+            let one_shot_trust_enable = !enabled
+                && app
+                    .config
+                    .invocation_trusted_extensions
+                    .iter()
+                    .any(|name| name == &bundle.id);
+            let alternate_source_trust_enable = !enabled
+                && app.config.trusted_extensions.iter().any(|grant| {
+                    grant
+                        .split_once('@')
+                        .is_some_and(|(name, _)| name == bundle.id.as_str())
+                });
+            let required_tools = summary
+                .map(|summary| {
+                    summary
+                        .tools
+                        .iter()
+                        .filter(|tool| explicitly_required.contains(tool.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let required_by_explicit_tools = enabled && !required_tools.is_empty();
+            let colliding_tools = if enabled {
+                Vec::new()
+            } else {
+                summary
+                    .map(|summary| {
+                        summary
+                            .tools
+                            .iter()
+                            .filter(|tool| current_tools.contains(tool.as_str()))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            };
+            let activation_authoritative = !app.config.extension_activation_overridden;
+            let toggleable = (global_source || unavailable_disable)
+                && activation_authoritative
+                && !one_shot_trust_enable
+                && !alternate_source_trust_enable
+                && !required_by_explicit_tools
+                && colliding_tools.is_empty();
+            let marker = if enabled { "[x]" } else { "[ ]" };
+            let description = match summary {
+                Some(_) if !activation_authoritative => format!(
+                    "installed {} · activation controlled by project, environment, or CLI; menu is read-only",
+                    bundle.version
+                ),
+                Some(_) if one_shot_trust_enable => format!(
+                    "installed {} · one-shot name trust can change source during rebuild; enable on a clean next launch",
+                    bundle.version
+                ),
+                Some(_) if alternate_source_trust_enable => format!(
+                    "installed {} · another manifest source has an exact trust grant; enable on a clean next launch",
+                    bundle.version
+                ),
+                Some(_) if required_by_explicit_tools => format!(
+                    "installed {} · required by explicit tool(s) {}; disable after removing that allowlist",
+                    bundle.version,
+                    required_tools.join(", ")
+                ),
+                Some(_) if !colliding_tools.is_empty() => format!(
+                    "installed {} · tool name collision with {}; enable after resolving the active provider",
+                    bundle.version,
+                    colliding_tools.join(", ")
+                ),
+                Some(summary) if toggleable => format!(
+                    "{} · {} · {} · API {}",
+                    if summary.running {
+                        "running"
+                    } else {
+                        "stopped"
+                    },
+                    if summary.trusted {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    },
+                    bundle.version,
+                    summary.api_version,
+                ),
+                Some(summary) => format!(
+                    "installed {} · shadowed by {:?} source; toggle unavailable",
+                    bundle.version, summary.source
+                ),
+                None if unavailable_disable && activation_authoritative => format!(
+                    "installed {} · enabled but unavailable in discovery; Enter disables safely",
+                    bundle.version
+                ),
+                None if unavailable_disable => format!(
+                    "installed {} · enabled but unavailable; activation override makes the menu read-only",
+                    bundle.version
+                ),
+                None => format!(
+                    "installed {} · unavailable in current discovery; cannot enable (see /extensions status)",
+                    bundle.version
+                ),
+            };
+            InstalledExtensionChoice {
+                name: bundle.id.clone(),
+                label: format!("{marker} {}", bundle.id),
+                description,
+                enabled,
+                toggleable,
+            }
+        })
+        .collect())
+}
+
+const WEB_SEARCH_EXTENSION_NAME: &str = "ygg-web-search";
+const WEB_SEARCH_COMMAND_NAME: &str = "web-search";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WebSearchMenuAction {
+    Configured,
+    Disable,
+    Back,
+}
+
+fn web_search_menu_entries(allow_disable: bool) -> (Vec<String>, Vec<Option<String>>) {
+    let mut items = vec![
+        "Brave Search (recommended)".to_owned(),
+        "SearXNG".to_owned(),
+    ];
+    let mut descriptions = vec![
+        Some(
+            "Hosted Brave Search API · setup asks for an API key and provides the signup link"
+                .to_owned(),
+        ),
+        Some("Use an existing self-hosted or public SearXNG JSON endpoint".to_owned()),
+    ];
+    if allow_disable {
+        items.push("Disable ygg-web-search".to_owned());
+        descriptions.push(Some("Stop the extension and remove its tools".to_owned()));
+    }
+    (items, descriptions)
+}
+
+async fn web_search_management_menu(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    allow_disable: bool,
+) -> anyhow::Result<WebSearchMenuAction> {
+    let (items, descriptions) = web_search_menu_entries(allow_disable);
+    let Some(index) = extension_picker(
+        shell,
+        input,
+        "Web search provider · Enter selects · Esc returns",
+        items,
+        descriptions,
+        0,
+    )
+    .await?
+    else {
+        return Ok(WebSearchMenuAction::Back);
+    };
+    if allow_disable && index == 2 {
+        return Ok(WebSearchMenuAction::Disable);
+    }
+    let provider = if index == 0 { "brave" } else { "searxng" };
+    let output = {
+        let mut interaction = InteractiveExtensionConfirmations { shell, input };
+        app.executable_extensions
+            .execute_command_with_confirmation(
+                WEB_SEARCH_COMMAND_NAME,
+                vec!["setup".to_owned(), provider.to_owned()],
+                &mut interaction,
+            )
+            .await
+    };
+    match output {
+        Ok(Some(output)) => {
+            if !output.trim().is_empty() {
+                shell.notice(output);
+            }
+            shell.clear_error();
+            request_extension_ui(shell, app);
+        }
+        Ok(None) => shell.error(
+            "ygg-web-search is running but its setup command is unavailable; see /extensions status"
+                .to_owned(),
+        ),
+        Err(error) => shell.error(format!("web search provider was not changed: {error}")),
+    }
+    Ok(WebSearchMenuAction::Configured)
+}
+
+async fn extension_management_menu(
+    mut app: App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<App> {
+    let mut selected = 0usize;
+    loop {
+        let choices = match installed_extension_choices(&app) {
+            Ok(choices) => choices,
+            Err(error) => {
+                shell.error(format!(
+                    "extension menu could not inspect installed bundles: {error}"
+                ));
+                return Ok(app);
+            }
+        };
+        if choices.is_empty() {
+            read_only_document(
+                shell,
+                input,
+                "Extensions",
+                "No executable extension bundles are installed.\n\nInstall one with `ygg extension install <name>`.".into(),
+            )
+            .await?;
+            return Ok(app);
+        }
+        let items = choices.iter().map(|choice| choice.label.clone()).collect();
+        let descriptions = choices
+            .iter()
+            .map(|choice| Some(choice.description.clone()))
+            .collect();
+        let Some(index) = extension_picker(
+            shell,
+            input,
+            "Extensions · Enter manages/toggles · Esc closes",
+            items,
+            descriptions,
+            selected,
+        )
+        .await?
+        else {
+            return Ok(app);
+        };
+        selected = index;
+        let choice = &choices[index];
+        if choice.enabled
+            && choice.name == WEB_SEARCH_EXTENSION_NAME
+            && app
+                .executable_extensions
+                .command_owner(WEB_SEARCH_COMMAND_NAME)
+                .as_deref()
+                == Some(WEB_SEARCH_EXTENSION_NAME)
+        {
+            match web_search_management_menu(&mut app, shell, input, choice.toggleable).await? {
+                WebSearchMenuAction::Disable => {}
+                WebSearchMenuAction::Configured | WebSearchMenuAction::Back => continue,
+            }
+        }
+        if !choice.toggleable {
+            shell.error(format!(
+                "{} cannot be toggled from this menu: {}",
+                choice.name, choice.description
+            ));
+            continue;
+        }
+
+        let authoritative = match crate::cli::extension_activation_menu_authoritative(&app.config) {
+            Ok(authoritative) => authoritative,
+            Err(error) => {
+                shell.error(format!(
+                    "{} was not changed: could not revalidate activation precedence: {error}",
+                    choice.name
+                ));
+                continue;
+            }
+        };
+        if !authoritative {
+            shell.error(format!(
+                "{} was not changed: project, environment, or CLI activation now makes the user config read-only",
+                choice.name
+            ));
+            continue;
+        }
+
+        let enabled = !choice.enabled;
+        let persisted = match crate::cli::persist_extension_enabled(&choice.name, enabled) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                shell.error(format!(
+                    "{} was not changed: could not update user configuration: {error}",
+                    choice.name
+                ));
+                continue;
+            }
+        };
+        app.config.enabled_extensions = persisted;
+        app = match reload_resources(app, shell, input).await {
+            Ok(app) => app,
+            Err(error) => {
+                let rollback = crate::cli::persist_extension_enabled(&choice.name, choice.enabled);
+                return match rollback {
+                    Ok(_) => Err(error.context(format!(
+                        "{} runtime rebuild failed; the user-config activation change was rolled back",
+                        choice.name
+                    ))),
+                    Err(rollback_error) => Err(error.context(format!(
+                        "{} runtime rebuild failed and user-config rollback also failed: {rollback_error}",
+                        choice.name
+                    ))),
+                };
+            }
+        };
+        request_extension_ui(shell, &mut app);
+        let summary = app
+            .executable_extensions
+            .summaries()
+            .into_iter()
+            .find(|summary| summary.name == choice.name);
+        let detail = if enabled && summary.as_ref().is_some_and(|summary| !summary.trusted) {
+            "; trust remains a separate explicit decision"
+        } else {
+            ""
+        };
+        shell.notice(format!(
+            "{} {}{detail}",
+            choice.name,
+            if enabled { "enabled" } else { "disabled" }
+        ));
+        shell.clear_error();
+        if enabled
+            && choice.name == WEB_SEARCH_EXTENSION_NAME
+            && summary
+                .as_ref()
+                .is_some_and(|summary| summary.running && summary.trusted)
+            && app
+                .executable_extensions
+                .command_owner(WEB_SEARCH_COMMAND_NAME)
+                .as_deref()
+                == Some(WEB_SEARCH_EXTENSION_NAME)
+        {
+            let _ = web_search_management_menu(&mut app, shell, input, false).await?;
+        }
+    }
+}
+
 fn next_thinking_level(app: &App) -> anyhow::Result<ThinkingLevel> {
-    let levels = supported_levels(&app.model);
+    let levels = supported_levels_with_subagents(&app.model, app.subagents_available());
     let current = level_from_reasoning(&app.reasoning, &app.model)?;
     let index = levels
         .iter()
@@ -1754,7 +2128,7 @@ async fn thinking_configuration_picker(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
 ) -> anyhow::Result<Option<(ReasoningMode, ThinkingLevel)>> {
-    let levels = supported_levels(&app.model);
+    let levels = supported_levels_with_subagents(&app.model, app.subagents_available());
     let Some(level) = thinking_picker(shell, input, &levels).await? else {
         return Ok(None);
     };
@@ -1775,13 +2149,12 @@ fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
     }
 
     let context = session.context()?;
-    let mut output = String::from(
-        "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n",
-    );
-    for message in context
-        .iter()
-        .skip(context.len().saturating_sub(MAX_MESSAGES))
-    {
+    let header =
+        "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n";
+    let omitted_marker = "\n\n[older transcript entries omitted]";
+    let recent_start = context.len().saturating_sub(MAX_MESSAGES);
+    let mut blocks = Vec::new();
+    for message in context.iter().skip(recent_start) {
         let mut block = String::new();
         match message {
             ygg_ai::Message::User(user) => {
@@ -1834,19 +2207,350 @@ fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
                 }
             }
         }
-        if block.is_empty() {
-            continue;
+        if !block.is_empty() {
+            blocks.push(bounded(&block, MAX_BLOCK_BYTES).to_owned());
         }
-        let remaining = MAX_TOTAL_BYTES.saturating_sub(output.len());
-        if remaining == 0 {
+    }
+
+    // Fill from the newest complete block backwards so the live tail and final
+    // worker result can never be displaced by older verbose output. Reserve the
+    // omission marker before admitting each older block.
+    let mut selected_start = blocks.len();
+    let mut selected_bytes = 0usize;
+    for index in (0..blocks.len()).rev() {
+        let older_would_be_omitted = recent_start > 0 || index > 0;
+        let marker_bytes = usize::from(older_would_be_omitted) * omitted_marker.len();
+        if header
+            .len()
+            .saturating_add(selected_bytes)
+            .saturating_add(blocks[index].len())
+            .saturating_add(marker_bytes)
+            > MAX_TOTAL_BYTES
+        {
             break;
         }
-        output.push_str(bounded(&block, remaining));
+        selected_start = index;
+        selected_bytes += blocks[index].len();
     }
-    if context.len() > MAX_MESSAGES {
-        output.push_str("\n\n[older transcript entries omitted]");
+
+    let omitted = recent_start > 0 || selected_start > 0;
+    let mut output = String::with_capacity(
+        header.len() + selected_bytes + usize::from(omitted) * omitted_marker.len(),
+    );
+    output.push_str(header);
+    for block in &blocks[selected_start..] {
+        output.push_str(block);
     }
+    if omitted {
+        output.insert_str(header.len(), omitted_marker);
+    }
+    debug_assert!(output.len() <= MAX_TOTAL_BYTES);
     Ok(output)
+}
+
+#[derive(Clone, Debug)]
+struct SubagentViewEntry {
+    node_id: String,
+    label: String,
+    description: String,
+    session_reference: Option<String>,
+    fallback_detail: String,
+}
+
+fn subagent_view_entries_from_presentation(
+    view: crate::extensions::ExtensionPresentationView,
+) -> Option<(String, Vec<SubagentViewEntry>)> {
+    let title = view
+        .snapshot
+        .status
+        .as_ref()
+        .map(|status| status.label.clone())
+        .unwrap_or_else(|| "Subagents".into());
+    let collection = view.snapshot.collection?;
+    let detail = collection.detail;
+    let entries = collection
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let state = format!("{:?}", node.state).to_lowercase();
+            let description = node.secondary.clone().unwrap_or_else(|| state.clone());
+            let session_reference = node
+                .references
+                .iter()
+                .find(|reference| {
+                    reference.kind == ygg_agent::ExtensionPresentationReferenceKind::Session
+                })
+                .map(|reference| reference.id.clone());
+            let fallback_detail = detail
+                .as_ref()
+                .filter(|detail| detail.node_id.as_deref() == Some(node.id.as_str()))
+                .map(|detail| detail.body.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}\n\nState: {state}\nTranscript is not available yet.",
+                        node.label
+                    )
+                });
+            SubagentViewEntry {
+                node_id: node.id,
+                label: node.label,
+                description,
+                session_reference,
+                fallback_detail,
+            }
+        })
+        .collect();
+    Some((title, entries))
+}
+
+fn subagent_view_entries(
+    extensions: &crate::extensions::ExecutableExtensions,
+) -> Option<(String, Vec<SubagentViewEntry>)> {
+    let view = extensions
+        .presentation_views()
+        .into_iter()
+        .find(|view| view.extension == "ygg-subagents")?;
+    subagent_view_entries_from_presentation(view)
+}
+
+fn subagent_picker_snapshot(
+    title: &str,
+    entries: &[SubagentViewEntry],
+    notices: Vec<String>,
+) -> SubagentPickerSnapshot {
+    SubagentPickerSnapshot {
+        title: format!("{title} · Enter views transcript · Esc closes"),
+        items: entries.iter().map(|entry| entry.label.clone()).collect(),
+        descriptions: entries
+            .iter()
+            .map(|entry| Some(entry.description.clone()))
+            .collect(),
+        node_ids: entries.iter().map(|entry| entry.node_id.clone()).collect(),
+        notices,
+    }
+}
+
+struct SubagentRefreshContext<'a> {
+    extensions: &'a mut crate::extensions::ExecutableExtensions,
+    last_error: Option<String>,
+}
+
+fn refresh_subagent_snapshot<'a, 'extensions>(
+    context: &'a mut SubagentRefreshContext<'extensions>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = SubagentPickerSnapshot> + 'a>> {
+    Box::pin(async move {
+        let refresh_result = tokio::time::timeout(
+            Duration::from_millis(750),
+            context
+                .extensions
+                .execute_command_without_confirmation("subagents", vec!["status".into()]),
+        )
+        .await;
+        let refresh_error = match refresh_result {
+            Err(_) => Some(
+                "subagent view live refresh timed out; showing the last accepted state".to_owned(),
+            ),
+            Ok(Ok(Some(output))) if output.contains("failed closed") => Some(
+                "subagent view live refresh failed closed; showing the last accepted state"
+                    .to_owned(),
+            ),
+            Ok(Ok(Some(_))) => None,
+            Ok(Ok(None)) => Some(
+                "subagent view live refresh is unavailable; showing the last accepted state"
+                    .to_owned(),
+            ),
+            Ok(Err(error)) => Some(format!(
+                "subagent view live refresh failed; showing the last accepted state: {error}"
+            )),
+        };
+        let mut notices = context.extensions.drain_events();
+        if refresh_error != context.last_error {
+            if let Some(error) = refresh_error.as_ref() {
+                notices.push(error.clone());
+            }
+            context.last_error = refresh_error;
+        }
+        match subagent_view_entries(context.extensions) {
+            Some((title, entries)) => subagent_picker_snapshot(&title, &entries, notices),
+            None => SubagentPickerSnapshot {
+                title: "Subagents · waiting for current state · Esc closes".into(),
+                items: Vec::new(),
+                descriptions: Vec::new(),
+                node_ids: Vec::new(),
+                notices,
+            },
+        }
+    })
+}
+
+async fn subagents_view(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    command_output: String,
+) -> anyhow::Result<()> {
+    let unavailable = (!command_output.trim().is_empty()).then_some(command_output);
+    if unavailable.as_deref().is_some_and(|output| {
+        output.contains("failed closed")
+            || output.contains(" Warning]")
+            || output.contains(" Error]")
+            || output.contains("confirmation denied")
+            || output.contains("input cancelled")
+            || output.contains("extension events because the consumer lagged")
+            || output
+                .lines()
+                .any(|line| line.starts_with("warning:") || line.starts_with("error:"))
+    }) {
+        shell.notice(
+            "subagent command reported extension diagnostics; showing the last accepted state (see /extensions status)",
+        );
+    }
+    let mut selected_node_id = None::<String>;
+    loop {
+        let notices = app.executable_extensions.drain_events();
+        let Some((title, entries)) = subagent_view_entries(&app.executable_extensions) else {
+            for notice in notices {
+                shell.notice(notice);
+            }
+            read_only_document(
+                shell,
+                input,
+                "Subagents",
+                unavailable
+                    .as_deref()
+                    .unwrap_or("No subagents for this session.")
+                    .to_owned(),
+            )
+            .await?;
+            return Ok(());
+        };
+        if entries.is_empty() {
+            for notice in notices {
+                shell.notice(notice);
+            }
+            read_only_document(
+                shell,
+                input,
+                "Subagents",
+                unavailable
+                    .as_deref()
+                    .unwrap_or("No subagents for this session.")
+                    .to_owned(),
+            )
+            .await?;
+            return Ok(());
+        }
+        let initial_selected = selected_node_id
+            .as_ref()
+            .and_then(|id| entries.iter().position(|entry| &entry.node_id == id))
+            .unwrap_or(0);
+        let initial = subagent_picker_snapshot(&title, &entries, notices);
+        let selected_id = {
+            let mut refresh = SubagentRefreshContext {
+                extensions: &mut app.executable_extensions,
+                last_error: None,
+            };
+            subagent_picker(
+                shell,
+                input,
+                initial,
+                initial_selected,
+                &mut refresh,
+                refresh_subagent_snapshot,
+            )
+            .await?
+        };
+        let Some(selected_id) = selected_id else {
+            return Ok(());
+        };
+        selected_node_id = Some(selected_id.clone());
+
+        // Revalidate the stable node and typed reference against the newest
+        // accepted presentation revision immediately before opening it.
+        for notice in app.executable_extensions.drain_events() {
+            shell.notice(notice);
+        }
+        let Some((_, current_entries)) = subagent_view_entries(&app.executable_extensions) else {
+            shell.error("subagent state changed before the transcript could open".into());
+            continue;
+        };
+        let Some(entry) = current_entries
+            .iter()
+            .find(|entry| entry.node_id == selected_id)
+        else {
+            shell.error("the selected subagent is no longer available".into());
+            continue;
+        };
+        let reference = entry.session_reference.clone();
+        let principal = reference.as_deref().and_then(|reference| {
+            app.executable_extensions
+                .presentation_session_reference_principal(reference)
+        });
+        let node_id = entry.node_id.clone();
+        let fallback_detail = entry.fallback_detail.clone();
+        let initial_text = if let (Some(principal), Some(reference)) =
+            (principal.as_deref(), reference.as_deref())
+        {
+            match app
+                .agent
+                .open_delegated_session_reference(principal, reference)
+            {
+                Ok(Some(session)) => delegated_session_text(&session)?,
+                Ok(None) => format!(
+                    "{}\n\nThe delegated transcript is no longer available for this parent session.",
+                    fallback_detail
+                ),
+                Err(error) => format!(
+                    "{}\n\nFailed to open the delegated transcript: {error}",
+                    fallback_detail
+                ),
+            }
+        } else {
+            fallback_detail.clone()
+        };
+        let refresh = || {
+            let current_fallback = subagent_view_entries(&app.executable_extensions)
+                .and_then(|(_, entries)| {
+                    entries
+                        .into_iter()
+                        .find(|candidate| candidate.node_id == node_id)
+                })
+                .map(|candidate| candidate.fallback_detail)
+                .unwrap_or_else(|| fallback_detail.clone());
+            let result: anyhow::Result<Option<String>> = if let (Some(principal), Some(reference)) =
+                (principal.as_deref(), reference.as_deref())
+            {
+                match app
+                    .agent
+                    .open_delegated_session_reference(principal, reference)
+                {
+                    Ok(Some(session)) => delegated_session_text(&session).map(Some),
+                    Ok(None) => Ok(Some(format!(
+                        "{}\n\nThe delegated transcript is no longer available for this parent session.",
+                        current_fallback
+                    ))),
+                    Err(error) => Ok(Some(format!(
+                        "{}\n\nFailed to open the delegated transcript: {error}",
+                        current_fallback
+                    ))),
+                }
+            } else {
+                Ok(Some(current_fallback))
+            };
+            std::future::ready(result)
+        };
+        read_only_document_live(
+            shell,
+            input,
+            format!("{} · read-only transcript", entry.label),
+            initial_text,
+            refresh,
+        )
+        .await?;
+        if shell.close_requested() {
+            return Ok(());
+        }
+    }
 }
 
 fn session_tree_text(session: &Session) -> String {
@@ -1977,19 +2681,27 @@ async fn apply_pending_actions(
                 shell.notice("queued thinking change applied");
             }
             PendingIdleAction::ChangeThinkingLevel(level) => {
-                if let Err(e) = crate::cli::persist_reasoning(level.label()) {
+                let reasoning = thinking_to_reasoning_with_subagents(
+                    level,
+                    &app.model,
+                    app.subagents_available(),
+                )?;
+                if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {e}"));
                 }
-                let reasoning = thinking_to_reasoning(level, &app.model)?;
                 app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice("queued thinking change applied");
             }
             PendingIdleAction::CycleThinking => {
                 let level = next_thinking_level(&app)?;
-                if let Err(e) = crate::cli::persist_reasoning(level.label()) {
+                let reasoning = thinking_to_reasoning_with_subagents(
+                    level,
+                    &app.model,
+                    app.subagents_available(),
+                )?;
+                if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {e}"));
                 }
-                let reasoning = thinking_to_reasoning(level, &app.model)?;
                 app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice(format!("thinking changed to {}", level.label()));
             }
@@ -2046,7 +2758,11 @@ async fn apply_pending_actions(
                     if let Err(error) = crate::cli::persist_reasoning_mode(mode) {
                         shell.error(format!("failed to save reasoning mode preference: {error}"));
                     }
-                    let reasoning = thinking_to_reasoning(level, &app.model)?;
+                    let reasoning = thinking_to_reasoning_with_subagents(
+                        level,
+                        &app.model,
+                        app.subagents_available(),
+                    )?;
                     app = transition(
                         app,
                         shell,
@@ -2407,7 +3123,10 @@ async fn run_idle_command(
                 Err(error) => shell.error(error.to_string()),
             }
         }
-        Command::Extensions(commands::ExtensionsSubcommand::List) => {
+        Command::Extensions(commands::ExtensionsSubcommand::Menu) => {
+            app = extension_management_menu(app, shell, input).await?;
+        }
+        Command::Extensions(commands::ExtensionsSubcommand::Status) => {
             request_extension_ui(shell, &mut app);
             shell.show_overlay_text(app.executable_extensions.inspect_text());
         }
@@ -2513,8 +3232,9 @@ async fn run_idle_command(
         }
         Command::Thinking(Some(level)) => {
             let level = ThinkingLevel::parse(&level)?;
-            let reasoning = thinking_to_reasoning(level, &app.model)?;
-            if let Err(e) = crate::cli::persist_reasoning(level.label()) {
+            let reasoning =
+                thinking_to_reasoning_with_subagents(level, &app.model, app.subagents_available())?;
+            if let Err(e) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                 shell.error(format!("failed to save thinking preference: {e}"));
             }
             app = transition(app, shell, input, Reconfig::Thinking(reasoning)).await?;
@@ -2534,7 +3254,11 @@ async fn run_idle_command(
                 if let Err(error) = crate::cli::persist_reasoning_mode(mode) {
                     shell.error(format!("failed to save reasoning mode preference: {error}"));
                 }
-                let reasoning = thinking_to_reasoning(level, &app.model)?;
+                let reasoning = thinking_to_reasoning_with_subagents(
+                    level,
+                    &app.model,
+                    app.subagents_available(),
+                )?;
                 app = transition(
                     app,
                     shell,
@@ -2651,6 +3375,9 @@ async fn run_idle_command(
                 })
                 .unwrap_or_default();
             let presentation_owner = app.executable_extensions.command_owner(&extension_name);
+            let open_subagents = extension_name == "subagents"
+                && extension_arguments.is_empty()
+                && presentation_owner.as_deref() == Some("ygg-subagents");
             let result = {
                 let mut confirmations = InteractiveExtensionConfirmations { shell, input };
                 app.executable_extensions
@@ -2662,6 +3389,9 @@ async fn run_idle_command(
                     .await
             };
             match result {
+                Ok(Some(output)) if open_subagents => {
+                    subagents_view(&mut app, shell, input, output).await?;
+                }
                 Ok(Some(output)) => {
                     let presentation = presentation_owner
                         .as_deref()
@@ -3120,10 +3850,14 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             }
             Idle::CycleThinking => {
                 let level = next_thinking_level(&app)?;
-                if let Err(error) = crate::cli::persist_reasoning(level.label()) {
+                let reasoning = thinking_to_reasoning_with_subagents(
+                    level,
+                    &app.model,
+                    app.subagents_available(),
+                )?;
+                if let Err(error) = crate::cli::persist_reasoning(&reasoning_label(&reasoning)) {
                     shell.error(format!("failed to save thinking preference: {error}"));
                 }
-                let reasoning = thinking_to_reasoning(level, &app.model)?;
                 app =
                     transition(app, &mut shell, &mut input, Reconfig::Thinking(reasoning)).await?;
                 shell.notice(format!("thinking changed to {}", level.label()));
@@ -3626,6 +4360,25 @@ mod tests {
     use ygg_agent::EntryValue;
 
     #[test]
+    fn web_search_menu_recommends_brave_and_keeps_searxng_and_disable() {
+        let (items, descriptions) = web_search_menu_entries(true);
+        assert_eq!(
+            items,
+            [
+                "Brave Search (recommended)",
+                "SearXNG",
+                "Disable ygg-web-search"
+            ]
+        );
+        assert!(descriptions[0]
+            .as_deref()
+            .is_some_and(|description| description.contains("API key")));
+
+        let (items, _) = web_search_menu_entries(false);
+        assert_eq!(items, ["Brave Search (recommended)", "SearXNG"]);
+    }
+
+    #[test]
     fn delegated_session_overlay_is_bounded_path_free_and_read_only_labeled() {
         let directory = tempfile::tempdir().unwrap();
         let private_path = directory.path().join("private-child.jsonl");
@@ -3642,6 +4395,66 @@ mod tests {
         assert!(text.contains("Inspect the worker result."));
         assert!(!text.contains(private_path.to_str().unwrap()));
         assert!(text.len() <= 128 * 1024);
+    }
+
+    #[test]
+    fn delegated_session_overlay_keeps_newest_output_within_the_exact_byte_cap() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("child.jsonl")).unwrap();
+        for index in 0..20 {
+            let marker = if index == 19 {
+                "NEWEST-FINAL-WORKER-RESULT"
+            } else {
+                "older-worker-output"
+            };
+            session
+                .append(EntryValue::Message(ygg_ai::Message::Assistant(
+                    ygg_ai::AssistantMessage {
+                        content: vec![ygg_ai::AssistantPart::Text(format!(
+                            "block-{index:02}-{marker}-{}",
+                            "x".repeat(16 * 1024)
+                        ))],
+                        model: ygg_ai::ModelId("worker-test".into()),
+                        protocol: ygg_ai::Protocol::OpenAiChat,
+                    },
+                )))
+                .unwrap();
+        }
+
+        let text = delegated_session_text(&session).unwrap();
+        assert!(text.contains("NEWEST-FINAL-WORKER-RESULT"), "{text}");
+        assert!(!text.contains("block-00-older-worker-output"));
+        assert!(text.contains("[older transcript entries omitted]"));
+        assert!(text.len() <= 128 * 1024, "{}", text.len());
+    }
+
+    #[test]
+    fn subagent_presentation_becomes_navigable_rows_with_opaque_session_references() {
+        let mut snapshot: ygg_agent::ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../../fixtures/extension-presentation.json"))
+                .unwrap();
+        let collection = snapshot.collection.as_mut().unwrap();
+        collection.nodes[0].references = collection.detail.as_ref().unwrap().references.clone();
+        let (title, entries) =
+            subagent_view_entries_from_presentation(crate::extensions::ExtensionPresentationView {
+                extension: "ygg-subagents".into(),
+                generation: 1,
+                extension_instance_id: "instance".into(),
+                resource_owner: Some("owner".into()),
+                snapshot,
+            })
+            .unwrap();
+
+        assert_eq!(title, "1 worker");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "test-review");
+        assert!(entries[0].description.contains("running"));
+        assert_eq!(
+            entries[0].session_reference.as_deref(),
+            Some("session-worker-1")
+        );
+        assert!(entries[0].fallback_detail.contains("bounded child session"));
+        assert!(!entries[0].fallback_detail.contains(".jsonl"));
     }
 
     #[tokio::test]

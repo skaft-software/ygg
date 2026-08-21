@@ -1,20 +1,22 @@
 name = "ygg-web-search"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.5.0"
-description = "Bounded SearXNG-backed web search and public-page retrieval with stable citations"
+requires_ygg = "=0.6.0-dev"
+description = "Selectable Brave Search or SearXNG web search with bounded public-page retrieval and stable citations"
 
 [entrypoint]
 command = "extension.py"
 
 [capabilities]
-# The runtime reads only ~/.config/ygg/ygg-web-search.json, but that fixed user
-# path lies outside the active workspace and must therefore be declared honestly.
+# The runtime manages ~/.config/ygg/ygg-web-search.json and an owner-private
+# Brave API key under ~/.ygg/credentials; both fixed user paths are outside the
+# active workspace.
 filesystem = "unrestricted"
 process = false
 network = true
 
 [contributes]
 tools = ["web_search", "web_open", "web_find"]
+commands = ["web-search"]
 ui = ["status"]
 presentation = true

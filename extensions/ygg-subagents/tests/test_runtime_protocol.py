@@ -70,12 +70,15 @@ class RuntimeProtocolTests(unittest.TestCase):
             [
                 "request_cancellation",
                 "content_parts",
+                "delegation_telemetry_v1",
                 "lifecycle_events",
                 "agent_sessions",
             ],
         )
         self.assertEqual(result["protocol"]["lifecycle_events"], ["session/settled"])
         self.assertEqual(result["protocol"]["limits"]["max_concurrent_requests"], 4)
+        spawn = next(tool for tool in result["tools"] if tool["name"] == "subagent_spawn")
+        self.assertNotIn("max_tokens", spawn["parameters"]["properties"])
 
     def test_spawn_is_owner_correlated_idempotent_and_publishes_tree(self):
         self.running.start()
@@ -111,7 +114,7 @@ class RuntimeProtocolTests(unittest.TestCase):
                 "max_depth": 1,
                 "max_concurrent_children": 2,
                 "max_turns": 8,
-                "max_tokens": 32000,
+                "max_tokens": None,
                 "max_cost_microdollars": 200000,
                 "max_output_bytes": 8192,
                 "timeout_ms": 300000,
@@ -223,7 +226,35 @@ class RuntimeProtocolTests(unittest.TestCase):
         )
         response = self.running.writer.wait_for(lambda message: message.get("id") == 20)
         self.assertTrue(response["result"]["is_error"])
-        self.assertIn("did not offer API 0.2 agent_sessions", response["result"]["content"][0]["text"])
+        self.assertIn("active owner-bound API 0.2 agent_sessions service", response["result"]["content"][0]["text"])
+        self.assertEqual(self.responder.reverse, [])
+
+    def test_stale_host_without_telemetry_contract_reports_matched_reinstall(self):
+        request = initialize_request()
+        request["params"]["protocol"]["required_features"].remove(
+            "delegation_telemetry_v1"
+        )
+        initialized = self.running.start(request)
+        self.assertIn("agent_sessions", initialized["result"]["protocol"]["features"])
+        self.assertNotIn(
+            "delegation_telemetry_v1", initialized["result"]["protocol"]["features"]
+        )
+        self.running.reader.feed(
+            rpc_request(
+                21,
+                "tool/call",
+                {
+                    "name": "subagent_status",
+                    "arguments": {},
+                    "context": tool_context(),
+                },
+            )
+        )
+        response = self.running.writer.wait_for(lambda message: message.get("id") == 21)
+        self.assertTrue(response["result"]["is_error"])
+        text = response["result"]["content"][0]["text"]
+        self.assertIn("delegation_telemetry_v1", text)
+        self.assertIn("matching current host and ygg-subagents bundle", text)
         self.assertEqual(self.responder.reverse, [])
 
     def test_owner_is_never_accepted_from_model_arguments_or_missing_context(self):
@@ -335,6 +366,38 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(
             self.responder.host.agents["agent-1"].status["state"], "interrupted"
         )
+
+    def test_authenticated_list_command_refreshes_authoritative_completion(self):
+        self.running.start()
+        self.running.reader.feed(
+            rpc_request(
+                44,
+                "tool/call",
+                {
+                    "name": "subagent_spawn",
+                    "arguments": {"name": "live-list", "task": "Inspect live refresh."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        self.running.writer.wait_for(lambda message: message.get("id") == 44)
+        self.responder.host.start("agent-1")
+        self.responder.host.complete("agent-1", "Finished while the picker was open.")
+        reverse_before = len(self.responder.reverse)
+
+        self.running.reader.feed(
+            rpc_request(
+                45,
+                "command/execute",
+                {"name": "subagents", "arguments": ["status"], "context": tool_context()},
+            )
+        )
+        refreshed = self.running.writer.wait_for(lambda message: message.get("id") == 45)
+
+        self.assertIn("done", refreshed["result"]["text"])
+        calls = self.responder.reverse[reverse_before:]
+        self.assertEqual([call["method"] for call in calls], ["agent/list"])
+        self.assertEqual(calls[0]["params"]["parent_request_id"], 45)
 
     def test_wait_tool_cancellation_is_cooperative_and_child_survives(self):
         self.running.start()

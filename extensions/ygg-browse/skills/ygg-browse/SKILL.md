@@ -1,5 +1,5 @@
 ---
-name: Visible Isolated Browser
+name: ygg-browse
 version: 0.1.0
 description: Inspect and operate bounded semantic web pages in Ygg Browse's visible isolated Chromium while keeping authentication manual.
 required-tools:

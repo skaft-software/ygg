@@ -376,6 +376,31 @@ pub fn write_private_atomic(path: &Path, data: &[u8], limit: usize) -> Result<()
     imp::PreparedMutation::prepare_private(path, limit)?.commit_private(data, &|| false)
 }
 
+/// Atomically publish regular-file bytes only if the target still matches an
+/// earlier caller snapshot. The descriptor-bound mutation revalidates both
+/// bytes and file identity, uses no-replace creation for a missing target, and
+/// uses rollback-safe exchange for an existing target where the platform
+/// supports it.
+pub fn write_atomic_if_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+    data: &[u8],
+    limit: usize,
+) -> Result<(), SecureFileError> {
+    validate_absolute_file_path(path)?;
+    if data.len() > limit {
+        return Err(SecureFileError::TooLarge {
+            actual: data.len() as u64,
+            limit,
+        });
+    }
+    let prepared = PreparedMutation::prepare(path, true, limit)?;
+    if prepared.original() != expected {
+        return Err(SecureFileError::Changed);
+    }
+    prepared.commit_if(data, || false)
+}
+
 /// Identity captured after a private lock file has been acquired and repaired.
 ///
 /// Retain this value and revalidate it immediately before releasing the
@@ -3504,6 +3529,20 @@ mod tests {
             Err(SecureFileError::InvalidPath(_))
         ));
         assert!(!parent.exists());
+    }
+
+    #[test]
+    fn public_conditional_atomic_write_rejects_a_stale_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("target.txt");
+        std::fs::write(&path, "newer version").unwrap();
+
+        assert!(matches!(
+            write_atomic_if_unchanged(&path, Some(b"older version"), b"stale replacement", 1024,),
+            Err(SecureFileError::Changed)
+        ));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "newer version");
     }
 
     #[test]

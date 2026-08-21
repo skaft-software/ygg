@@ -2,7 +2,7 @@
 
 Ygg Browse is the official opt-in API `0.2` executable-extension bundle for bounded semantic browser work. It always launches Playwright's bundled Chromium visibly (`headless=False`) with a persistent profile owned only by Ygg Browse. It never pairs with, copies, discovers, or launches a normal Chrome/Chromium profile.
 
-Version `0.1.0` requires Ygg `0.5.0` exactly and pins `playwright==1.57.0` exactly.
+Version `0.1.0` requires Ygg `0.6.0-dev` exactly and pins `playwright==1.57.0` exactly.
 
 ## Install and activate
 

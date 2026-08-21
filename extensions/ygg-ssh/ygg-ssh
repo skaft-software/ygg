@@ -2,10 +2,11 @@
 """Self-contained launcher for the bundled ygg-ssh extension."""
 
 from pathlib import Path
+import os
 import sys
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get("YGG_EXTENSION_DIR", Path(__file__).resolve().parent)).resolve()
 # Release bundles vendor the exact dependency-free SDK revision used in tests.
 sys.path.insert(0, str(ROOT / "vendor"))
 sys.path.insert(0, str(ROOT))

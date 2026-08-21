@@ -73,8 +73,8 @@ Discovery remains available under every effect policy, but process startup
 requires all three independent gates: enablement, an exact trust grant, and the
 default full-access policy. `--safe-mode` never starts an executable extension,
 even when the process/shell sandbox flags are enabled, and reports that blocked
-startup in `/extensions`. An admitted extension runs as the current user, so use
-full-access mode only inside separate OS-level isolation.
+startup in `/extensions status`. An admitted extension runs as the current user,
+so use full-access mode only inside separate OS-level isolation.
 
 ## Layout and discovery
 
@@ -153,7 +153,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.5.0"
+requires_ygg = "=0.6.0-dev"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -260,20 +260,29 @@ this exact negotiation while keeping those top-level fields:
 
 The host request names required `request_cancellation` and `content_parts` and
 optional `request_progress`, `artifacts`, `lifecycle_events`, `policy_intents`,
-and `dynamic_tools`. It conditionally appends `agent_sessions`, `approvals`, and
-`secrets` only when the corresponding host service is configured;
-`approvals` also requires negotiated `policy_intents`, while `secrets` requires
-a configured broker and a non-empty manifest allowlist. Missing required,
-unknown, or duplicate response features, an API/version mismatch, or a zero
-concurrency limit rejects the process. The host caps the accepted limit.
+and `dynamic_tools`. For the enabled first-party `ygg-subagents` process, the
+host additionally requires `delegation_telemetry_v1` whenever it offers
+`agent_sessions`; an older bundle is rejected during initialization with an
+actionable reinstall diagnostic instead of silently losing metrics. The native
+schema is `ygg.delegation.telemetry.v1` and `/extensions status` shows it with
+the manifest and bundle digests. It conditionally appends `agent_sessions`,
+`approvals`, and `secrets` only when the corresponding host service is
+configured; `approvals` also requires negotiated `policy_intents`, while
+`secrets` requires a configured broker and a non-empty manifest allowlist.
+Missing required, unknown, or duplicate response features, an API/version
+mismatch, or a zero concurrency limit rejects the process. The host caps the
+accepted limit.
 Omitting the lifecycle subscription list while negotiating that feature
 subscribes to all six session/turn/tool start/settle notifications. API `0.1`
 omits `protocol` entirely and forbids `output_schema`.
 
-When bounded V2 delegation is enabled for the selected model/reasoning mode,
-the working-tree host also offers `agent_sessions`. It is not advertised when
-that service is unavailable, and an extension must not return a feature the
-host did not offer.
+When the trusted, enabled `ygg-subagents` extension successfully negotiates
+its child-session service, the working-tree host offers `agent_sessions` and
+creates the extension-only V2 delegation manager used by that service. The
+service is available independently of the parent's reasoning effort, while
+Ultra additionally requires matching provider V2 metadata. It is not advertised
+when the observing extension is unavailable, and an extension must not return a
+feature the host did not offer.
 
 Host-to-extension methods are typed in
 `ygg_agent::extension_process::methods`:
@@ -422,6 +431,12 @@ the newest complete snapshot is emitted in the next window, with one bounded
 diagnostic per throttled window. Stable IDs are extension-scoped.
 States are `empty`, `loading`, `pending`, `active`, `running`, `succeeded`,
 `failed`, `cancelled`, `degraded`, `stopped`, and `unavailable`.
+An activity may also carry optional bounded `metrics`: `tool_calls`, disjoint
+`input_tokens`, `cache_read_tokens`, and `cache_write_tokens`, `output_tokens`,
+its `reasoning_tokens` subset, and optional exact whole-microdollar
+`cost_microdollars`. Every counter uses the portable JSON integer bound;
+reasoning may not exceed output. Frontends may sum the three input buckets for
+a compact `↑input ↓output` display but must not add reasoning to output again.
 
 References are typed as `session`, `artifact`, `resource`, or `url`. A `url`
 contains a sanitized absolute HTTP(S) URL in `id`; the host rejects credentials,
@@ -430,12 +445,28 @@ literal IP targets. Frontends expose it only as a user-clicked link. Secrets,
 queries, retrieved content, typed values, and other untrusted data do not belong
 in status labels, node titles, provenance, or reconnect state.
 
-Every action names an already manifest-declared extension command. The TUI pins
-a bounded live activity/tree block above the composer without interleaving child
-prose into the transcript, and uses `/extensions` as its keyboard-accessible
-detail fallback, `/extensions inspect <agent-session:…>` for a current
-parent-bound delegated transcript, and
-`/extensions action <extension> <action-id>` for validated interactive routing.
+Every action names an already manifest-declared extension command. Generic
+extension state stays out of persistent chrome. The coding TUI makes one
+first-party observed exception for `ygg-subagents`: while the owning root run
+has workers, it renders the latest owner-fenced `subagent` activities directly
+above the composer from native `AgentEvent::DelegationUpdated` telemetry. The
+footer remains host-owned; it adds live priced child spend while the run is
+active, then uses the root session's durable delegated-usage records after
+settlement, never an extension-supplied footer string.
+`/extensions` instead opens a host-owned menu for managing installed executable
+bundles; Enter toggles ordinary bundles and opens the enabled first-party web
+search provider picker, while trust remains a separate decision. The activation
+portion fails closed to read-only when project, environment, or command-line
+activation makes the user config non-authoritative.
+`/extensions status` is the keyboard-accessible diagnostic and presentation
+fallback, `/extensions inspect <agent-session:…>` opens a
+current parent-bound delegated transcript, and
+`/extensions action <extension> <action-id>` performs validated interactive
+routing. The enabled `ygg-subagents` package specializes its no-argument
+`/subagents` command into a live arrow-key worker list whose owner-bound refresh
+reconciles authoritative `agent_sessions` state and preserves focus by stable
+node ID; Enter revalidates and opens the selected worker's bounded read-only
+transcript, and Escape/Left returns to the list.
 Serve carries the same complete state through its authenticated snapshot/event
 reducer and uses
 `extension.invokeAction {extension, extensionInstanceId, generation, revision,
@@ -455,23 +486,32 @@ authoritative evidence path.
 ### Child model-session service
 
 The working-tree `agent_sessions` feature is the narrow reverse service a
-subagent-orchestrator extension needs. Every request includes the active
-`parent_request_id`; Ygg derives the durable resource owner from that host
-model-tool call or declared command invocation rather than accepting one from
-child parameters. Command ownership is what lets a validated presentation
-action inspect or stop an existing child without switching the parent session.
+subagent-orchestrator extension needs. In the coding product, the
+`ygg-subagents` extension is the sole owner and observer of this service: its
+successful negotiation creates an extension-only V2 manager, and the host does
+not expose the parallel native root collaboration tools. Every in-harness child
+therefore enters the owner-bound extension tree before it can run. Every
+request includes the active `parent_request_id`; Ygg derives the durable resource
+owner from that host model-tool call or declared command invocation rather than
+accepting one from child parameters. Command ownership is what lets a validated
+presentation action inspect or stop an existing child without switching the
+parent session.
 Calls without a bound owner/service fail with `-32002`.
 
 `agent/spawn` takes `{parent_request_id, task_name, profile?, fingerprint?,
 message, idempotency_key, policy}`. `profile`, when present, is a bounded stable
 label; `fingerprint`, when present, is a lowercase SHA-256 digest retained only
 for recovery. `policy` is mandatory and contains `tools`,
-`max_depth`, `max_concurrent_children`, `max_turns`, `max_tokens`,
+`max_depth`, `max_concurrent_children`, `max_turns`, optional/null `max_tokens`,
 `max_cost_microdollars`, `max_output_bytes`, and `timeout_ms`. The current
 bounded service accepts only a non-empty subset of `read`/`search`, depth one,
 and at most two active children (sixteen retained); it freezes a detached tool
-snapshot, applies the lower parent turn/cost ceiling, reserves aggregate token
-and cost capacity, caps returned UTF-8 output, and owns the absolute wall timer.
+snapshot, applies lower parent turn/cost ceilings, inherits the parent's resolved
+model context/output limits, and treats null `max_tokens` as exact inheritance of
+the parent's optional cumulative session ceiling (including no ceiling). A
+non-null value is an optional stricter extension-requested cap. The host caps
+returned UTF-8 output and owns the absolute wall timer; there is no separate
+fixed aggregate extension reservation pool.
 A constrained child receives no collaboration tools and cannot run a follow-up.
 `agent/list` exposes the public task name, optional profile, idempotency key and
 fingerprint, effective policy, host-created/started/completed/deadline
@@ -479,15 +519,31 @@ timestamps, turn/token/cost usage, terminal `timed_out` state, and
 owner/principal provenance. Its `session` value is an opaque `agent-session:*`
 resource reference, never the private delegation JSONL path. Serve resolves it
 only through a host-written parent-session/extension-principal/resource-owner
-binding and creates a locked read-only inspector. The TUI accepts the same
-current owner-scoped presentation reference through `/extensions inspect`; it
-opens only the current parent's delegation team. Mutation remains exclusively
-on owner-bound `agent_sessions`.
+binding and creates a locked read-only inspector. The host record also exposes
+current structured phase/tool, host-observed tool-call count, turn count,
+disjoint token buckets, and exact priced whole-microdollar cost. Every child has
+a fresh independent model context; child tokens are never inserted into the
+parent's request context. On root settlement Ygg stops and briefly joins the
+child set, aggregates each child's durable usage/cost records including
+picodollar remainders, and appends one `delegated_agent` usage record per child
+to the root session before its checkpoint. That root ledger is accounting, not
+context sharing: it makes delegated spend cumulative, durable, and
+non-duplicated in the footer and subsequent cost-limit checks. The TUI
+accepts the same current owner-scoped presentation reference through
+`/extensions inspect`; it opens only the current parent's delegation team.
+Read-only `agent/list` and `agent/wait` remain owner-scoped after the root
+becomes inactive so final telemetry and inspection can settle;
+spawn/message/follow-up/interrupt mutation still requires an active owner and
+fails closed.
 
 The key is scoped to the extension principal and resource owner: retrying the
-same task/profile/fingerprint/input and policy returns the same child, while
-reuse with different input fails. The stable principal contains the manifest
-name plus a SHA-256 manifest-identity digest, never the manifest path.
+same task/profile/fingerprint/input and policy while its owning-run record is
+retained returns the same child, while reuse with different input fails. At the
+next owning run, the host prunes idempotency entries whose child records were
+cleared, so a stale key can never return a nonexistent worker. The stable
+principal contains the manifest name plus a SHA-256 manifest-identity digest,
+never the manifest path.
+
 Malformed parameters with a parseable request ID return `-32602`;
 service, ownership, delegation-limit, persistence, and operation failures return
 `-32002`. Message, follow-up, list, wait, and interrupt accept only IDs or paths
@@ -596,15 +652,19 @@ delivery. The extension still receives an ordinary process-memory string, so
 this is not end-to-end zeroization; it must keep the value short-lived and out
 of results, progress, diagnostics, and storage.
 
-All TUI contributions contain plain text and optional semantic style roles.
-Raw terminal escape sequences are not part of the extension API.
+All frontend contributions contain plain text and optional semantic style
+roles. Raw terminal escape sequences are not part of the extension API.
 Tool-renderer segments are accepted and retained as internal extension
 provenance, but are never rendered in the TUI or exposed through Ctrl+O,
 `/verbose`, transcript selection, or copy. The original tool result
 remains immutable evidence for the agent's required protocol result,
 session persistence, and export redaction policy; it is not a presentation
 surface. Extension header, status, footer, notification, and confirmation
-features remain separate Ygg UI surfaces.
+features remain separate protocol surfaces. The coding TUI does not request or
+render generic persistent extension header/status/footer contributions. Its one
+composer-adjacent exception is the host-owned renderer for owner-fenced
+`ygg-subagents` activity metrics described above; the extension supplies
+semantic data, never rows or a footer value.
 
 In the interactive frontend, confirmation requests made while an extension
 tool or command is running open a typed allow/deny panel. Dropping the request
@@ -621,11 +681,24 @@ damaging unrelated calls, cancels correlated child requests, and terminates a
 generation that remains non-cooperative after the bounded grace period.
 Cancellation never claims rollback and unsafe ambiguous work is not replayed.
 
-Use `/extensions` to inspect discovered, enabled, trusted, and running state.
-Each entry includes the selected manifest path. An enabled-but-untrusted entry
-reports the exact copyable persistent grant as well as the one-shot CLI form.
-Use `/extensions reload` to replace each running process after a successful
-handshake. The general `/reload` command re-runs resource discovery and rebuilds
+Use `/extensions` to open the installed executable-bundle activation menu.
+Up/Down moves, Enter toggles the selected bundle, and Escape closes it. Selecting
+an enabled `ygg-web-search` opens a nested provider picker; Brave Search is
+recommended and requests its API key through correlated secret input, while
+SearXNG remains available. The menu updates only `enabled_extensions`; provider
+state remains extension-owned, and it never creates or removes a trust grant.
+If project, environment, or command-line activation participates in the
+effective list, activation controls are read-only because the user config is not
+the next-launch authority; extension-owned setup for an already running web
+search process remains available. Activation precedence is revalidated
+immediately before each write. An enabled unavailable bundle remains
+disable-only. Source-changing trust, tool-name collisions, and explicit
+required-tool removal fail closed rather than starting or tearing down an
+ambiguous candidate. Use `/extensions status` to inspect discovered, enabled,
+trusted, and running state. Each entry includes the
+selected manifest path. An enabled-but-untrusted entry reports the exact copyable
+persistent grant as well as the one-shot CLI form. Use `/extensions reload` to
+replace each running process after a successful handshake. The general `/reload` command re-runs resource discovery and rebuilds
 the product boundary.
 
 ## Python SDK
@@ -707,7 +780,7 @@ operations cannot cross generations.
 
 Shutdown is requested gracefully and bounded by a short timeout. A process
 that does not exit is killed, and dropping the last runtime handle also uses
-kill-on-drop cleanup. `/extensions` shows the process generation, API,
+kill-on-drop cleanup. `/extensions status` shows the process generation, API,
 negotiated features, pending count, health, and last bounded error.
 
 The supervisor watches every successfully initialized resident process. On an
@@ -785,9 +858,9 @@ compatibility alongside its independent extension version:
 
 ```toml
 name = "ygg-web-search"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.5.0"
+requires_ygg = "=0.6.0-dev"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present
@@ -835,8 +908,10 @@ artifacts, browser profiles, and other data must live outside it and are not
 removed.
 
 Installing or discovering a bundle never enables, trusts, or starts its
-process and never grants a capability. The normal independent
-`--enable-extension` and `--trust-extension` gates still apply. Packaged skills
+process and never grants a capability. The TUI `/extensions` menu may persist
+activation after installation, but trust remains independent and explicit. The
+normal `--enable-extension` and `--trust-extension` gates remain available for
+one-shot invocation. Packaged skills
 under `skills/*/SKILL.md` are discovered as user-installed skill candidates,
 but remain inactive until the user explicitly loads them. A user skill under
 `~/.ygg/skills` and an explicit `--skill-dir` retain higher precedence.
@@ -869,7 +944,7 @@ Official installs download the matching target archive and shared release
 `SHA256SUMS`; local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.5.0-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.6.0-dev-TARGET.tar.gz
 ```
 
 The application archive keeps its existing strict two-file payload contract and

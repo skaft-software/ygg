@@ -219,6 +219,36 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.servers[0].environment["TOKEN"], "sensitive")
             self.assertNotIn("sensitive", repr(config.servers[0]))
 
+    @unittest.skipUnless(hasattr(os, "getuid"), "requires POSIX file ownership")
+    def test_explicit_environment_requires_private_config_permissions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            self.write_json(
+                path,
+                {
+                    "version": 1,
+                    "servers": {
+                        "fixture": {
+                            "command": "server",
+                            "env": {"TOKEN": "sensitive"},
+                        }
+                    },
+                },
+            )
+            path.chmod(0o644)
+            with self.assertRaisesRegex(ConfigError, "must not be accessible"):
+                load_config(path)
+
+            self.write_json(
+                path,
+                {
+                    "version": 1,
+                    "servers": {"fixture": {"command": "server", "env": {}}},
+                },
+            )
+            path.chmod(0o644)
+            self.assertEqual(len(load_config(path).servers), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

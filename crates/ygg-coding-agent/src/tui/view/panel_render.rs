@@ -1,6 +1,6 @@
 //! Select-list panel filtering, layout, and rendering.
 
-use sexy_tui_rs::{visible_width, CURSOR_MARKER};
+use sexy_tui_rs::{visible_width, wrap_text_with_ansi, CURSOR_MARKER};
 use unicode_segmentation::UnicodeSegmentation;
 
 use super::{fit_line, subdued_text, Panel, ShellState};
@@ -40,6 +40,32 @@ pub(super) fn filtered_indices(
 
 fn panel_cell(text: &str) -> String {
     super::sanitize_for_terminal(text).replace('\n', " ")
+}
+
+fn document_visual_lines(text: &str, width: u16) -> Vec<String> {
+    let inset = usize::from(width >= 5) * 2;
+    let available = usize::from(width)
+        .saturating_sub(inset.saturating_mul(2))
+        .max(1);
+    let text = super::sanitize_for_terminal(text);
+    let mut lines = Vec::new();
+    for source in text.split('\n') {
+        let wrapped = wrap_text_with_ansi(source, available);
+        if wrapped.is_empty() {
+            lines.push(" ".repeat(inset));
+        } else {
+            lines.extend(
+                wrapped
+                    .into_iter()
+                    .map(|line| format!("{}{line}", " ".repeat(inset))),
+            );
+        }
+    }
+    lines
+}
+
+pub(super) fn document_visual_row_count(text: &str, width: u16) -> usize {
+    document_visual_lines(text, width).len()
 }
 
 fn is_confirmation_panel(action: &super::PanelAction) -> bool {
@@ -260,12 +286,24 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             let chrome_rows = if confirmation { 1 } else { 2 };
             (body + chrome_rows + border_rows).min(max_panel)
         }
+        Panel::ReadOnlyDocument { text, .. } => {
+            let border_rows = usize::from(
+                state.theme.layout_for_width(width).show_panel_borders && max_panel >= 5,
+            ) * 2;
+            (document_visual_row_count(text, width) + 2 + border_rows).min(max_panel)
+        }
     }
 }
 
 #[cfg(test)]
 pub(super) fn render_panel(state: &ShellState, width: u16) -> Vec<String> {
     render_panel_with_limit(state, width, panel_rows(state, width))
+}
+
+pub(super) fn document_body_rows(state: &ShellState, width: u16, max_rows: usize) -> usize {
+    let show_borders = state.theme.layout_for_width(width).show_panel_borders && max_rows >= 5;
+    let border_rows = usize::from(show_borders) * 2;
+    max_rows.saturating_sub(border_rows + 2).max(1)
 }
 
 pub(super) fn render_panel_with_limit(
@@ -364,6 +402,49 @@ pub(super) fn render_panel_with_limit(
             if show_borders {
                 lines.push(dim(&rule));
             }
+            lines
+        }
+        Panel::ReadOnlyDocument {
+            title,
+            text,
+            scroll_from_bottom,
+        } => {
+            let show_borders =
+                state.theme.layout_for_width(width).show_panel_borders && max_rows >= 5;
+            let body_rows = document_body_rows(state, width, max_rows);
+            let visual = document_visual_lines(text, width);
+            let maximum = visual.len().saturating_sub(body_rows);
+            let scroll = (*scroll_from_bottom).min(maximum);
+            let end = visual.len().saturating_sub(scroll);
+            let start = end.saturating_sub(body_rows);
+            let mut lines = Vec::with_capacity(max_rows);
+            if show_borders {
+                lines.push(dim(&rule));
+            }
+            lines.push(panel_header(
+                &state.theme,
+                title,
+                0,
+                visual.len(),
+                false,
+                width,
+            ));
+            lines.extend(visual[start..end].iter().map(|line| fit_line(line, width)));
+            let range = if visual.is_empty() {
+                "0/0".to_owned()
+            } else {
+                format!("{}-{}/{}", start + 1, end, visual.len())
+            };
+            let hint = if state.theme.unicode() {
+                format!("  {range} · ↑↓ scroll · esc/← back")
+            } else {
+                format!("  {range} · up/down scroll · esc/left back")
+            };
+            lines.push(fit_line(&dim(&hint), width));
+            if show_borders {
+                lines.push(dim(&rule));
+            }
+            lines.truncate(max_rows);
             lines
         }
     }

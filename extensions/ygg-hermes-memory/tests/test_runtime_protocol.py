@@ -99,7 +99,7 @@ class RuntimeHarness:
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.5.0",
+                    "ygg_version": "0.6.0-dev",
                     "extension": {
                         "name": "ygg-hermes-memory",
                         "version": "0.1.0",
@@ -182,6 +182,31 @@ def trusted_config(directory: Path, *, limits=None) -> Path:
 
 
 class RuntimeProtocolTests(unittest.TestCase):
+    def test_generation_fence_uses_exit_bound_before_provider_import(self):
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            [str(ROOT / "vendor"), str(ROOT), environment.get("PYTHONPATH", "")]
+        )
+        process = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from ygg_hermes_memory import runtime; "
+                    "runtime.os._exit=lambda code: (_ for _ in ()).throw(RuntimeError(code)); "
+                    "runtime._abort_provider_generation('fixture')"
+                ),
+            ],
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        self.assertEqual(process.returncode, 70, process.stderr)
+
     def test_api_02_dynamic_tools_context_lifecycle_presentation_and_shutdown(self):
         with temporary_directory() as directory:
             config = trusted_config(directory)
@@ -295,7 +320,7 @@ class RuntimeProtocolTests(unittest.TestCase):
             finally:
                 harness.close()
 
-    def test_request_cancellation_returns_standard_error_and_does_not_wedge(self):
+    def test_request_cancellation_fences_uncooperative_provider_generation(self):
         with temporary_directory() as directory:
             config = trusted_config(directory, limits={"prefetchTimeoutMs": 1000})
             harness = RuntimeHarness(config, mode="slow-prefetch")
@@ -313,6 +338,9 @@ class RuntimeProtocolTests(unittest.TestCase):
                 harness.next(lambda item: item.get("id") == 10)
                 if not harness.registrations:
                     harness.next(lambda item: item.get("method") == "tools/register")
+                # The reverse registration response unblocks activation; wait for
+                # that owner assignment before starting the cancellable call.
+                time.sleep(0.1)
                 harness.send(
                     {
                         "jsonrpc": "2.0",
@@ -329,18 +357,8 @@ class RuntimeProtocolTests(unittest.TestCase):
                         "params": {"id": 11, "reason": "test"},
                     }
                 )
-                cancelled = harness.next(lambda item: item.get("id") == 11, timeout=2)
-                self.assertEqual(cancelled["error"]["code"], -32800)
-                harness.send(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 12,
-                        "method": "command/execute",
-                        "params": {"name": "memory", "arguments": ["status"], "context": context},
-                    }
-                )
-                self.assertIn("memory", harness.next(lambda item: item.get("id") == 12)["result"]["text"])
-                harness.shutdown()
+                harness.process.wait(timeout=2)
+                self.assertEqual(harness.process.returncode, 70)
             finally:
                 harness.close()
 

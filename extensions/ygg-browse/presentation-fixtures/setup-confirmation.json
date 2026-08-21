@@ -46,7 +46,7 @@
       "arguments": [
         "setup"
       ],
-      "destructive": false
+      "destructive": true
     },
     {
       "id": "open",

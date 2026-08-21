@@ -28,7 +28,7 @@ The boundaries are deliberately narrow:
 - `BatchMode=yes` and `NumberOfPasswordPrompts=0` prohibit password, OTP, and
   keyboard-interactive collection. The extension has no password/input flow,
   never copies private keys, and never runs credential discovery.
-- The manifest explicitly allowlists the ambient `SSH_AUTH_SOCK`. Ygg `0.5.0`
+- The manifest explicitly allowlists the ambient `SSH_AUTH_SOCK`. Ygg `0.6.0-dev`
   forwards only that named value to this extension; the default sanitized
   subprocess environment still excludes it for other tools/extensions. When it
   is absent, status reports that fact and OpenSSH may still use config-selected
@@ -57,7 +57,7 @@ extensions; it is not a way to silently enable remote execution.
 
 ## Requirements and installation
 
-- Ygg exactly `0.5.0` (`requires_ygg = "=0.5.0"`)
+- Ygg exactly `0.6.0-dev` (`requires_ygg = "=0.6.0-dev"`)
 - Python 3.9 or newer
 - a system OpenSSH `ssh` client
 - a non-interactive, already authenticated OpenSSH alias

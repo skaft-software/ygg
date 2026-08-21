@@ -16,7 +16,7 @@
     },
     "budget": {
       "turns": {"used": 3, "limit": 8},
-      "tokens": {"used": 1450, "limit": 32000},
+      "tokens": {"used": 1450, "limit": null, "source": "inherited_parent"},
       "cost_microdollars": {"used": 1800, "limit": 200000}
     },
     "artifacts": [

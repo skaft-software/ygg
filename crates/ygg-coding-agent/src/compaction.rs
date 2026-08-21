@@ -646,6 +646,7 @@ pub(crate) mod tests {
             skill_paths: vec![],
             extension_paths: vec![],
             enabled_extensions: vec![],
+            extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![],
             tools: crate::config::ToolPolicy::default(),

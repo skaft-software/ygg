@@ -31,7 +31,7 @@ from ygg_hermes_memory.loader import (
     _extract_provider,
     load_selected_provider,
 )
-from ygg_hermes_memory.manager import MemoryBridge
+from ygg_hermes_memory.manager import MemoryBridge, ProviderGenerationFenced
 
 
 @contextmanager
@@ -277,7 +277,7 @@ class LoaderAndManagerTests(unittest.TestCase):
                 self.assertNotIn("Useful remembered fact", serialized)
                 bridge.shutdown()
 
-    def test_oversized_and_slow_prefetch_degrade_without_blocking_direct_coding(self):
+    def test_oversized_and_failed_prefetch_degrade_while_slow_prefetch_fences(self):
         with fixture_mode("oversized-memory"):
             with temporary_directory() as directory:
                 bridge, _, context, _, _ = activate_mock(
@@ -295,11 +295,14 @@ class LoaderAndManagerTests(unittest.TestCase):
                     limits={"prefetchTimeoutMs": 30, "maxContextBytes": 1024},
                 )
                 bridge.before_prompt({"prompt": "slow"}, context)
+                aborted = []
+                bridge._abort_generation = aborted.append
                 started = time.monotonic()
-                result = bridge.collect_context({"prompt": "slow"}, context)
+                with self.assertRaises(ProviderGenerationFenced):
+                    bridge.collect_context({"prompt": "slow"}, context)
                 self.assertLess(time.monotonic() - started, 0.4)
-                self.assertTrue(result)  # frozen static block remains available
-                self.assertEqual(bridge.owner_for_context(context).state, "degraded")
+                self.assertEqual(aborted, ["unfinished_provider_prefetch_timeout"])
+                self.assertNotEqual(bridge.owner_for_context(context).state, "stopped")
                 bridge.shutdown()
         with fixture_mode("fail-prefetch"):
             with temporary_directory() as directory:
@@ -422,23 +425,102 @@ class LoaderAndManagerTests(unittest.TestCase):
             self.assertEqual(bridge.collect_context({"prompt": "x"}, new_context), [])
             bridge.shutdown()
 
-    def test_bounded_call_observes_cancellation_and_leaves_no_unbounded_wait(self):
+    def test_retirement_control_thread_start_failure_fences_generation(self):
+        with temporary_directory() as directory:
+            bridge, _, context, _, _ = activate_mock(directory)
+            old_provider = bridge.owner_for_context(context).provider.provider
+            aborted = []
+            bridge._abort_generation = aborted.append
+            with mock.patch(
+                "ygg_hermes_memory.manager.threading.Thread.start",
+                side_effect=RuntimeError("thread unavailable"),
+            ):
+                with self.assertRaises(ProviderGenerationFenced):
+                    bridge.owner_for_context(owner_context("session-a", generation=2))
+            self.assertTrue(bridge._generation_fenced.is_set())
+            self.assertFalse(old_provider.closed)
+            self.assertEqual(len(aborted), 1)
+            self.assertTrue(aborted[0].endswith("_thread_start_failed"))
+            bridge.shutdown()
+
+    def test_uncooperative_stale_provider_retirement_fences_generation(self):
+        with fixture_mode("slow-shutdown"):
+            with temporary_directory() as directory:
+                bridge, _, context, _, _ = activate_mock(
+                    directory, limits={"shutdownTimeoutMs": 30}
+                )
+                aborted = []
+                bridge._abort_generation = aborted.append
+                bridge.owner_for_context(owner_context("session-a", generation=2))
+                self.assertTrue(wait_until(bridge._generation_fenced.is_set))
+                self.assertEqual(
+                    aborted,
+                    ["unfinished_provider_retire_provider_timeout"],
+                )
+                bridge.shutdown()
+
+    def test_required_provider_call_thread_start_failure_fences_generation(self):
+        with temporary_directory() as directory:
+            bridge, _, context, _, _ = activate_mock(directory)
+            owner = bridge.owner_for_context(context)
+            provider = owner.provider.provider
+            aborted = []
+            bridge._abort_generation = aborted.append
+            with mock.patch(
+                "ygg_hermes_memory.manager.threading.Thread.start",
+                side_effect=RuntimeError("thread unavailable"),
+            ):
+                with self.assertRaises(ProviderGenerationFenced):
+                    bridge.execute_command(["off"], context)
+            self.assertFalse(provider.closed)
+            self.assertEqual(
+                aborted,
+                ["unfinished_provider_shutdown_provider_thread_runtimeerror"],
+            )
+            bridge.shutdown()
+
+    def test_uncooperative_cancellation_fences_the_provider_generation(self):
         class Token:
             cancelled = False
 
         with temporary_directory() as directory:
             bridge, _, context, _, _ = activate_mock(directory)
             owner = bridge.owner_for_context(context)
+            aborted = []
+            bridge._abort_generation = aborted.append
             token = Token()
             timer = threading.Timer(0.03, lambda: setattr(token, "cancelled", True))
             timer.start()
             started = time.monotonic()
-            outcome = bridge._call_bounded(
-                owner, "test_cancel", lambda: time.sleep(1), 1000, cancellation=token
-            )
-            self.assertEqual(outcome.state, "cancelled")
+            with self.assertRaises(ProviderGenerationFenced):
+                bridge._call_bounded(
+                    owner, "test_cancel", lambda: time.sleep(1), 1000, cancellation=token
+                )
             self.assertLess(time.monotonic() - started, 0.3)
+            self.assertEqual(aborted, ["unfinished_provider_test_cancel_cancelled"])
+            self.assertTrue(bridge._generation_fenced.is_set())
             bridge.shutdown()
+
+    def test_uncooperative_tool_timeout_fences_without_false_write_settlement(self):
+        with fixture_mode("slow-tool"):
+            with temporary_directory() as directory:
+                bridge, extension, context, _, _ = activate_mock(
+                    directory, limits={"toolTimeoutMs": 30}
+                )
+                aborted = []
+                bridge._abort_generation = aborted.append
+                owner = bridge.owner_for_context(context)
+                with self.assertRaises(ProviderGenerationFenced):
+                    extension.tools["remember_mock"]["handler"](
+                        {"content": "ambiguous write"}, context
+                    )
+                self.assertEqual(
+                    aborted,
+                    ["unfinished_provider_tool_remember_mock_timeout"],
+                )
+                self.assertEqual(owner.activities[-1].state, "running")
+                self.assertIsNone(owner.activities[-1].completed_at_ms)
+                bridge.shutdown()
 
     def test_slow_trusted_default_activation_never_blocks_admitting_prompt(self):
         with fixture_mode("slow-availability"):
@@ -446,7 +528,7 @@ class LoaderAndManagerTests(unittest.TestCase):
                 base = load_fixture_config(
                     directory,
                     providers=[mock_descriptor()],
-                    limits={"availabilityTimeoutMs": 100, "shutdownTimeoutMs": 30},
+                    limits={"availabilityTimeoutMs": 1000, "shutdownTimeoutMs": 30},
                 )
                 candidate = discover_providers(base).by_id("directory:mock")
                 config = replace(
@@ -455,6 +537,8 @@ class LoaderAndManagerTests(unittest.TestCase):
                     default_provider=candidate.id,
                 )
                 bridge = MemoryBridge(FakeExtension(), config)
+                aborted = []
+                bridge._abort_generation = aborted.append
                 bridge.start({"host": {"session_id": "display"}})
                 context = dict(owner_context("durable"))
                 context["host"] = {"session_id": "display", "active_skills": []}
@@ -465,7 +549,25 @@ class LoaderAndManagerTests(unittest.TestCase):
                 self.assertEqual(owner.state, "loading")
                 self.assertEqual(owner.user_text, "direct coding continues")
                 self.assertEqual(bridge.collect_context({"prompt": "direct coding continues"}, context), [])
-                bridge.shutdown()
+
+                def availability_call_started():
+                    with bridge._call_lock:
+                        return any(
+                            kind == "is_available"
+                            for _, kind in bridge._active_call_threads.values()
+                        )
+
+                self.assertTrue(wait_until(availability_call_started))
+                with self.assertRaises(ProviderGenerationFenced):
+                    bridge.shutdown()
+                self.assertEqual(len(aborted), 1)
+                self.assertIn(
+                    aborted[0],
+                    {
+                        "unfinished_provider_is_available_shutdown",
+                        "unfinished_provider_shutdown_unfinished",
+                    },
+                )
 
     def test_realistic_offline_provider_runs_end_to_end_without_network(self):
         with temporary_directory() as directory:

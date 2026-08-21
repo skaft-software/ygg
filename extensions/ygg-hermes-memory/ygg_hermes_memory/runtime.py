@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+import os
 from pathlib import Path
 import threading
 from typing import Any, Optional
@@ -42,6 +43,13 @@ class ProtocolReadyExtension(Extension):
             self.protocol_ready.set()
 
 
+def _abort_provider_generation(reason: str, _exit: Any = os._exit) -> None:
+    """Fence uncooperative in-process provider code before it can finish late."""
+
+    del reason
+    _exit(70)
+
+
 def build_runtime(
     *,
     config_path: Optional[Path] = None,
@@ -62,7 +70,12 @@ def build_runtime(
         cancellation_grace=0.25,
         supported_features=SUPPORTED_FEATURES,
     )
-    bridge = MemoryBridge(extension, config, config_error_code=config_error)
+    bridge = MemoryBridge(
+        extension,
+        config,
+        config_error_code=config_error,
+        abort_generation=_abort_provider_generation,
+    )
 
     @extension.command(
         name="memory",

@@ -106,7 +106,7 @@ class RuntimeProtocolTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.5.0",
+                    "ygg_version": "0.6.0-dev",
                     "extension": {
                         "name": "ygg-ssh",
                         "version": "0.1.0",

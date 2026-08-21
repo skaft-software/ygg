@@ -962,9 +962,9 @@ pub enum ReasoningEffort {
     Xhigh,
     /// Maximum ordinary reasoning effort.
     Max,
-    /// Highest Codex reasoning tier. Models may pair this effort with
-    /// host-managed proactive task delegation when they separately advertise a
-    /// supported collaboration protocol.
+    /// Highest Codex reasoning tier. The coding product may pair this effort
+    /// with extension-owned task delegation only when the observing
+    /// `ygg-subagents` surface is active.
     Ultra,
 }
 

@@ -2,11 +2,79 @@
 
 use std::time::Duration;
 
-use ygg_ai::{AssistantMessage, Media, ToolCallId, Usage};
+use serde::Serialize;
+use ygg_ai::{AssistantMessage, Cost, Media, ToolCallId, Usage};
 
 use crate::agent::AgentError;
 use crate::session::EntryId;
 use crate::tool::{ToolError, ToolOutput, ToolProgress};
+
+/// A bounded, host-owned live view of one delegated child.
+///
+/// The fields are observations from the child session, not extension-supplied
+/// prose. Token buckets are disjoint; `reasoning_tokens` is a subset of
+/// `output_tokens`. The opaque session reference is safe for a frontend to pass
+/// back to the host for read-only inspection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DelegationTelemetryChild {
+    /// Stable host-created child ID.
+    pub child_id: String,
+    /// Public task name selected by the orchestrator.
+    pub task_name: String,
+    /// Orchestrator profile, when the child was created by an extension.
+    pub profile: Option<String>,
+    /// Effective inherited model identifier.
+    pub model: String,
+    /// Current lifecycle state (`pending`, `running`, or a terminal state).
+    pub state: String,
+    /// Structured phase such as `queued`, `thinking`, or `using_tool`.
+    pub phase: String,
+    /// Current child tool, if one is executing.
+    pub current_tool: Option<String>,
+    /// Host-observed child tool starts. The spawn call itself is not included.
+    pub tool_use_count: u64,
+    /// Prompt tokens billed at the uncached input rate.
+    pub input_tokens: u64,
+    /// Prompt tokens read from cache.
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to cache.
+    pub cache_write_tokens: u64,
+    /// Generated output tokens.
+    pub output_tokens: u64,
+    /// Reasoning tokens, a subset of output tokens.
+    pub reasoning_tokens: u64,
+    /// Provider-reported total tokens for the child session.
+    pub total_tokens: u64,
+    /// Exact priced cost when the inherited model has pricing.
+    pub cost: Option<Cost>,
+    /// Whole microdollar cost for compact frontend rendering.
+    pub cost_microdollars: Option<u64>,
+    /// Elapsed child wall time in milliseconds.
+    pub elapsed_ms: u64,
+    /// Bounded machine-readable terminal failure class.
+    pub failure_class: Option<String>,
+    /// Bounded authoritative terminal failure reason, when applicable.
+    pub failure_reason: Option<String>,
+    /// Opaque host-owned child transcript reference.
+    pub session: Option<String>,
+}
+
+/// Complete monotonic telemetry for the current delegation team.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DelegationTelemetrySnapshot {
+    /// Monotonic revision within the owning delegation manager.
+    pub revision: u64,
+    /// Host capture time in Unix milliseconds.
+    pub captured_at_ms: u64,
+    /// Current children in stable manager order.
+    pub children: Vec<DelegationTelemetryChild>,
+    /// Sum of the currently observed child whole-microdollar costs.
+    pub total_cost_microdollars: Option<u64>,
+    /// Bounded failure outside a child row, such as a rejected spawn.
+    pub failure_reason: Option<String>,
+    /// Bounded machine-readable class for `failure_reason`.
+    pub failure_class: Option<String>,
+}
 
 /// Events emitted by a [`Run`](crate::Run).
 ///
@@ -132,6 +200,15 @@ pub enum AgentEvent {
         /// The execution outcome. `Err` and a marked rich `Ok` output both
         /// become error tool results.
         result: Result<ToolOutput, ToolError>,
+    },
+
+    /// A complete host-owned snapshot of delegated child activity.
+    ///
+    /// This is emitted on the owning root run stream. It is never persisted in
+    /// the conversation and does not represent a model-visible tool result.
+    DelegationUpdated {
+        /// Monotonic child/session telemetry for the current delegation team.
+        snapshot: DelegationTelemetrySnapshot,
     },
 
     /// A complete no-tool assistant turn was rejected by the terminal gate.

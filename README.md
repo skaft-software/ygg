@@ -58,6 +58,11 @@ ygg currently supports macOS and Linux and requires
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
 silicon. Linux musl is not supported by this release.
 
+> **Version note:** This README tracks the current `0.6.0-dev` checkout. The
+> interactive extension-management and subagent-browser sections below are
+> unreleased and are not present in the published `v0.5.0` binaries; use the
+> checkout installation to dogfood them.
+
 ### Installer
 
 The version-pinned installer detects the current operating system and
@@ -103,6 +108,11 @@ Ensure Cargo's binary directory is on `PATH`:
 ```sh
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 ```
+
+Cargo installs from Ygg's git or source checkout embed Ygg's text documentation
+and materialize it under `${CARGO_HOME:-$HOME/.cargo}/share/ygg` on first use. A
+later `ygg update` refreshes that managed documentation tree along with the
+installed binary.
 
 ### From a checkout
 
@@ -152,7 +162,18 @@ ygg extension list
 
 Published bundles are checksum-verified and installed atomically under
 `~/.ygg/extensions/<id>`. Installation does **not** enable, trust, or start the
-process. Explicitly opt in when launching Ygg:
+process. In the TUI, `/extensions` opens an interactive installed-bundle menu;
+use Up/Down and Enter to enable or disable the selected executable extension.
+Selecting the enabled first-party `ygg-web-search` bundle opens its provider
+picker, with Brave Search recommended and SearXNG retained as an option. Brave
+setup requests its API key through a private input surface. Trust remains a
+separate decision and is never granted by the menu. If project,
+environment, or command-line activation overrides the user list, the menu stays
+read-only and identifies that source boundary. Enabled bundles that have become
+unavailable may still be disabled; enabling fails closed when one-shot or
+alternate-source trust could change the executable selected during rebuild, and
+disabling is blocked while an explicit tool allowlist still requires that
+bundle. For a one-shot launch instead:
 
 ```sh
 ygg --enable-extension ygg-web-search --trust-extension ygg-web-search
@@ -199,11 +220,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.5.0
+scripts/build-ygg-image.sh ygg:0.6.0-dev
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.5.0 --model claude-sonnet-4-6
+  ygg:0.6.0-dev --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -239,17 +260,25 @@ ygg --model gpt-5.6
 ```
 
 When that account's live Codex catalog advertises both the `ultra` effort and
-V2 collaboration for the selected model, Ultra enables maximum reasoning plus
-automatic bounded task delegation:
+V2 collaboration for the selected model, Ultra is available only while the
+trusted, enabled `ygg-subagents` extension is live. Install and activate that
+extension first so every child session has an observable `/subagents` surface:
 
 ```sh
-ygg --model gpt-5.6-sol --reasoning ultra
+ygg extension install ygg-subagents
+ygg --enable-extension ygg-subagents --trust-extension ygg-subagents \
+  --model gpt-5.6-sol --reasoning ultra
 ```
 
-Ygg does not infer Ultra, collaboration, or the Responses Lite transport from a
-model name or subscription plan. Account-scoped cached live metadata is honored;
-a missing or unusable cache falls back conservatively without those capabilities.
+For a checkout build, rebuild and replace the installed bundle deterministically
+with `./scripts/reinstall-ygg-subagents.sh`; `cargo run` does not update
+`~/.ygg/extensions` automatically.
 
+The extension owns the model-facing `subagent_*` tools and the host's bounded
+child-session service; the coding product does not expose a parallel native
+collaboration tool surface. Ygg still does not infer Ultra, collaboration, or
+Responses Lite from a model name or subscription plan; missing or unusable
+account-scoped metadata falls back conservatively.
 ### Use custom OpenAI-compatible providers
 
 Configure all custom endpoints together in `~/.ygg/credentials/custom.json`:
@@ -458,27 +487,23 @@ ygg --reasoning high
 ```
 
 The available choices are narrowed to the selected model. `ultra` appears only
-when the model advertises Ultra effort and a V2 collaboration protocol that this
-Ygg build can execute. Selecting it installs six collaboration tools
-(`spawn_agent`, `followup_task`, `send_message`, `wait_agent`, `list_agents`, and
-`interrupt_agent`) and tells the root agent to delegate when parallel work would
-materially improve speed or quality. Safe mode does not grant `delegation`;
-executing those tools requires the default full-access policy.
+when the model advertises Ultra/V2 support and the trusted, enabled
+`ygg-subagents` extension has a live child-session service. All in-harness child
+work goes through its `subagent_*` tools and owner-bound `/subagents` browser;
+the root agent never receives a parallel native collaboration surface. Without
+the extension, Ultra is clamped to the highest ordinary safe effort.
 
-One Ultra team defaults to four concurrent agents including the root, depth two,
-and sixteen total agents during each owning run. Children use isolated durable
-sessions and inherit the root's effective current prompt, approved tools,
-sandbox, model, reasoning, compaction, completion, output, resolved output-token,
-retry, turn, and cost policies. Accepted tasks, direct messages, and follow-ups
-are rejected on overflow instead of being truncated or evicted; interruption and
-run failure preserve unacknowledged work in FIFO order. Bounded `wait_agent`
-pages stay leased until their complete tool result is durably recorded, then use
-UTF-8-safe continuation pages as needed. Children and their descendants are
-cancelled when the owning run stops. Team state lives under the session
-directory's private `.delegation/team-*` tree with a synced
-`provenance.jsonl`; persistence failure stops the team rather than continuing
-without an audit trail, and failed activation securely removes its empty private
-team directory.
+Extension workers are read/search-only, depth-one, and bounded to two active
+children with sixteen retained records. Each worker has an isolated durable
+session, inherited policy limits, host-owned cancellation and cost/token
+ceilings, and an owner-authorized read-only transcript. While a root run is
+active, the TUI keeps an owner-scoped `Subagents` block directly above the
+composer and keeps each worker's phase, tool-call count, disjoint input/cache
+and output token totals, and priced spend current. Completed child usage is
+copied from the child sessions into a dedicated root-session accounting record
+before the root run settles, so delegated spend is durable and appears exactly
+once in the cumulative footer. It also participates in later session cost-limit
+checks. Install, enable, and trust `ygg-subagents` before selecting Ultra.
 
 Token-budget reasoning is also available for compatible models with
 `--reasoning budget=N`.
@@ -536,6 +561,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets committed transcript rows flow into terminal history.
 - The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. Ordinary frames reuse the retained stable prefix and render only the mutable/new suffix.
 - Slash/path completions, panels, reports, and other temporary chrome repaint a bounded screen surface without entering native history. If streamed Markdown contracts across the committed seam, the renderer holds that ledger until it can reconcile stable rows exactly once.
+- Generic extension state remains on demand, but `ygg-subagents` is the observed exception: while an owning run has workers, an owner-scoped live block is pinned immediately above the composer with worker phase, tool calls, input/output tokens, and spend. Its 250 ms host refresh is nonblocking and retains the last fenced snapshot on failure. `/subagents` remains the arrow-key list/inspector whose Enter action opens a scrollable read-only worker transcript; no extension contribution is allowed to replace the cumulative footer.
 - A terminal resize reflows the retained semantic transcript at the new width, resets terminal saved lines, and replays Ygg's retained transcript once.
 - `--mouse app` explicitly captures the mouse and uses a bounded semantic viewport. In that mode, scrolling above the tail stays anchored while streamed Markdown grows, reports new output, and lets PageDown return to live output.
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
@@ -608,7 +634,8 @@ Type `/` in the composer to open live command discovery.
 | `/export [path]` | Export the current session with redaction. |
 | `/prompt [name] [arguments]` | List or expand named prompt templates. |
 | `/skills ...` | List, search, inspect, load, unload, or reload skills. |
-| `/extensions [reload]` | Inspect discovered extensions or replace running UnsafeHost extension processes. |
+| `/extensions [status\|reload]` | Open the installed-extension enable/disable menu, or inspect/reload extension state. |
+| `/subagents` | With `ygg-subagents` enabled, navigate workers and open individual read-only transcripts. |
 | `/quit` | Exit ygg. |
 
 Useful keys:
@@ -760,7 +787,9 @@ binary's package assets. The default system prompt points the model to their
 absolute paths and tells it to read them when answering Ygg questions or making
 Ygg changes. The shell installer places those assets under the matching
 `share/ygg/` data directory; `YGG_PACKAGE_DIR` or `YGG_DATA_DIR` can override
-that asset root for other layouts.
+that asset root for other layouts. Cargo-installed binaries embed the text
+portion of the same assets and materialize a versioned copy under the Cargo
+root's `share/ygg/` directory, refreshing it after a Cargo-channel update.
 
 When Ygg runs from its source checkout, the system prompt instead points to
 that checkout's `README.md`, `docs/`, `examples/`, `sdk/`, `crates/`, and
@@ -793,13 +822,19 @@ The provider-independent inference crate owns canonical messages, media, tools, 
 The agent runtime is the kernel: it owns sessions, model conversations, context
 reconstruction, compaction, tool execution, steering, cancellation, retries,
 checkpoints, usage records, cache accounting, the frontend event stream,
-extension transport/supervision, and bounded child-session services. The
-current native V2 delegation runtime is a transitional consumer of those child
-sessions; domain-specific orchestration belongs behind the extension boundary.
+extension transport/supervision, and bounded child-session services. The coding
+product exposes that child-session service only through the observing
+`ygg-subagents` extension; no parallel native root delegation surface is
+installed.
 
 ### `ygg-coding-agent`
 
-The product crate owns configuration, provider discovery, credentials, prompts, resources, extensions, session commands, hydration, terminal presentation, themes, and the three user-facing modes. It decides whether live metadata and the available host runtime form complete Ultra semantics and enables proactive V2 delegation only for that selection.
+The product crate owns configuration, provider discovery, credentials, prompts,
+resources, extensions, session commands, hydration, terminal presentation,
+themes, and the three user-facing modes. It creates extension-owned child
+sessions at every effort when `ygg-subagents` is active, and permits Ultra only
+when live model metadata and that owner-bound observation service form complete
+Ultra semantics.
 
 ### `sexy-tui-rs`
 
@@ -815,7 +850,7 @@ ygg is intentionally honest about where its boundary ends.
 - **Bounded inputs:** provider streams, discovery payloads, configuration, credentials, context, sessions, tool arguments/results, and local reads have byte/count limits.
 - **Crash behavior:** complete records survive; a torn final append is narrowly repairable; unresolved mutation is reported as indeterminate and never replayed.
 - **Cancellation:** provider streams, retry waits, compaction, tools, delegated agents, and descendant process/agent groups observe cancellation.
-- **Delegation provenance:** Ultra team directories and files are owner-private and created through descriptor-relative, no-follow operations. Spawns, messages, follow-ups, status changes, and interrupts are synced before becoming visible; a journal failure cancels the team and rejects further work.
+- **Delegation provenance:** subagent-extension team directories and files are owner-private and created through descriptor-relative, no-follow operations. Spawns, status changes, and interrupts are synced before becoming visible; a journal failure cancels the team and rejects further work.
 - **Network recovery:** non-timeout connection-establishment failures and response-body disconnects retry up to five times with visible diagnostics; provisional TUI output is discarded before replacement. Full transport timeouts are terminal. Failures while sending a POST or awaiting response headers are also terminal because provider acceptance is ambiguous.
 - **Secret handling:** credential files are owner-private, sensitive headers are marked, redirects are disabled, provider diagnostics redact request credentials, debug formatting redacts secrets, and session export applies bounded deterministic redaction.
 - **Terminal safety:** untrusted terminal controls are neutralized; terminal capabilities degrade without changing semantic content.

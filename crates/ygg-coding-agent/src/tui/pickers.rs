@@ -1,8 +1,11 @@
 #![allow(missing_docs)]
 
+use std::future::Future;
+use std::pin::Pin;
+
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use ygg_agent::extension_process::ConfirmationRequest;
+use ygg_agent::extension_process::{ConfirmationRequest, ExtensionInputRequest};
 use ygg_agent::tool::{ToolConfirmation, ToolInputRequest};
 use ygg_ai::{ModelCatalog, ModelId};
 
@@ -12,6 +15,10 @@ use crate::session_store::{SessionMeta, SessionStore};
 use crate::tui::view::{InteractiveShell, Panel, PanelAction, PanelResult};
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
+#[cfg(not(test))]
+const SUBAGENT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const SUBAGENT_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 #[derive(Default)]
 struct SecretInputBuffer(Vec<u8>);
@@ -141,6 +148,92 @@ where
     }
 }
 
+/// Give one extension command exclusive ownership of terminal input. Secret
+/// answers never enter the ordinary editor or rendered frame; non-secret setup
+/// values use the same temporary composer surface and are echoed while typed.
+pub async fn extension_input_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    request: &ExtensionInputRequest,
+) -> anyhow::Result<Option<String>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    shell.set_tool_input_prompt(Some(request.prompt.clone()));
+    shell.render();
+    let mut value = SecretInputBuffer::default();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => None,
+            next = input.next() => next,
+        };
+        let event = match next {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                shell.set_tool_input_prompt(None);
+                shell.render();
+                return Err(error.into());
+            }
+            None => {
+                shell.set_tool_input_prompt(None);
+                shell.render();
+                return Ok(None);
+            }
+        };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.set_tool_input_prompt(None);
+            shell.request_close();
+            shell.render();
+            return Ok(None);
+        }
+        match event {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                match key.code {
+                    KeyCode::Enter => {
+                        let bytes = value.take();
+                        let answer = String::from_utf8(bytes)
+                            .map_err(|_| anyhow::anyhow!("extension input was not valid UTF-8"))?;
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(Some(answer));
+                    }
+                    KeyCode::Esc => {
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(None);
+                    }
+                    KeyCode::Backspace => value.backspace(),
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        shell.set_tool_input_prompt(None);
+                        shell.render();
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key.modifiers.intersects(
+                            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                        ) =>
+                    {
+                        value.push(character)
+                    }
+                    _ => {}
+                }
+            }
+            Event::Paste(pasted) => value.extend_paste(&pasted),
+            Event::Resize(columns, rows) => shell.set_size(columns, rows),
+            _ => {}
+        }
+        let shown = if request.secret {
+            request.prompt.clone()
+        } else {
+            let entered = std::str::from_utf8(&value.0).unwrap_or_default();
+            format!("{} {}", request.prompt, entered)
+        };
+        shell.set_tool_input_prompt(Some(shown));
+        shell.render();
+    }
+}
+
 /// Drive a panel-based selection list. Owns the event loop while the panel is open.
 async fn pick_list<S>(
     shell: &mut InteractiveShell,
@@ -148,6 +241,7 @@ async fn pick_list<S>(
     title: &str,
     items: Vec<String>,
     descriptions: Vec<Option<String>>,
+    initial_selected: usize,
     action: PanelAction,
 ) -> anyhow::Result<Option<usize>>
 where
@@ -159,11 +253,12 @@ where
         return Ok(None);
     }
 
+    let initial_selected = initial_selected.min(items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
         title: title.into(),
         items,
         descriptions,
-        selected: 0,
+        selected: initial_selected,
         filter: String::new(),
         action,
     });
@@ -211,7 +306,258 @@ where
     }
 }
 
-/// Convert persistent session metadata to select-list items.
+/// Select one installed executable extension. Enter confirms the highlighted
+/// row; Escape closes the management view without changing configuration.
+pub async fn extension_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    title: &str,
+    items: Vec<String>,
+    descriptions: Vec<Option<String>>,
+    initial_selected: usize,
+) -> anyhow::Result<Option<usize>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let action_items = items.clone();
+    pick_list(
+        shell,
+        input,
+        title,
+        items,
+        descriptions,
+        initial_selected,
+        PanelAction::SelectExtension(action_items),
+    )
+    .await
+}
+
+/// Complete live subagent list replacement supplied by the owning product loop.
+pub struct SubagentPickerSnapshot {
+    pub title: String,
+    pub items: Vec<String>,
+    pub descriptions: Vec<Option<String>>,
+    pub node_ids: Vec<String>,
+    pub notices: Vec<String>,
+}
+
+/// Select one subagent node while periodically refreshing presentation state.
+/// Selection is preserved by stable node ID and the returned ID is revalidated
+/// by the caller before opening a transcript.
+pub async fn subagent_picker<S, C, F>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    initial: SubagentPickerSnapshot,
+    initial_selected: usize,
+    context: &mut C,
+    mut refresh: F,
+) -> anyhow::Result<Option<String>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+    F: for<'a> FnMut(&'a mut C) -> Pin<Box<dyn Future<Output = SubagentPickerSnapshot> + 'a>>,
+{
+    if initial.items.is_empty() {
+        return Ok(None);
+    }
+    let selected = initial_selected.min(initial.items.len().saturating_sub(1));
+    shell.open_panel(Panel::SelectList {
+        title: initial.title,
+        items: initial.items,
+        descriptions: initial.descriptions,
+        selected,
+        filter: String::new(),
+        action: PanelAction::SelectSubagent(initial.node_ids),
+    });
+    for notice in initial.notices {
+        shell.notice(notice);
+    }
+    shell.render();
+
+    let mut refresh_tick = tokio::time::interval(SUBAGENT_REFRESH_INTERVAL);
+    refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let _ = refresh_tick.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                shell.close_panel();
+                shell.request_close();
+                shell.render();
+                return Ok(None);
+            }
+            next = input.next() => {
+                let event = match next {
+                    Some(Ok(event)) => event,
+                    Some(Err(error)) => {
+                        shell.close_panel();
+                        return Err(error.into());
+                    }
+                    None => {
+                        shell.close_panel();
+                        return Ok(None);
+                    }
+                };
+                if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+                    shell.close_panel();
+                    shell.request_close();
+                    shell.render();
+                    return Ok(None);
+                }
+                if matches!(event, Event::Mouse(_)) {
+                    continue;
+                }
+                if let Some((result, action)) = shell.panel_input(&event) {
+                    shell.render();
+                    return Ok(match (result, action) {
+                        (PanelResult::Confirm(index), PanelAction::SelectSubagent(node_ids)) => {
+                            node_ids.get(index).cloned()
+                        }
+                        (PanelResult::Cancel, _) => None,
+                        _ => None,
+                    });
+                }
+                shell.render();
+            }
+            _ = refresh_tick.tick() => {
+                let snapshot = refresh(context).await;
+                for notice in snapshot.notices {
+                    shell.notice(notice);
+                }
+                shell.refresh_subagent_panel(
+                    snapshot.title,
+                    snapshot.items,
+                    snapshot.descriptions,
+                    snapshot.node_ids,
+                );
+                shell.render();
+            }
+        }
+    }
+}
+
+/// Show a bounded read-only document. Arrow and page keys scroll; Escape or
+/// Left returns to the owning list instead of closing the Ygg session.
+pub async fn read_only_document<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    title: impl Into<String>,
+    text: String,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    shell.open_panel(Panel::ReadOnlyDocument {
+        title: title.into(),
+        text: crate::tui::view::sanitize_for_terminal(&text),
+        scroll_from_bottom: 0,
+    });
+    shell.render();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                shell.close_panel();
+                shell.request_close();
+                return Ok(());
+            }
+            next = input.next() => next,
+        };
+        let event = match next {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                shell.close_panel();
+                return Err(error.into());
+            }
+            None => {
+                shell.close_panel();
+                shell.request_close();
+                return Ok(());
+            }
+        };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.close_panel();
+            shell.request_close();
+            shell.render();
+            return Ok(());
+        }
+        if matches!(event, Event::Mouse(_)) {
+            continue;
+        }
+        if shell.panel_input(&event).is_some() {
+            shell.render();
+            return Ok(());
+        }
+        shell.render();
+    }
+}
+
+/// Show a live bounded read-only document. Refreshes replace the body without
+/// moving a reader who has scrolled upward; the tail follows new rows.
+pub async fn read_only_document_live<S, F, Fut>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    title: impl Into<String>,
+    text: String,
+    mut refresh: F,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<String>>>,
+{
+    shell.open_panel(Panel::ReadOnlyDocument {
+        title: title.into(),
+        text: crate::tui::view::sanitize_for_terminal(&text),
+        scroll_from_bottom: 0,
+    });
+    shell.render();
+    let mut refresh_tick = tokio::time::interval(SUBAGENT_REFRESH_INTERVAL);
+    refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                shell.close_panel();
+                shell.request_close();
+                return Ok(());
+            }
+            next = input.next() => {
+                let event = match next {
+                    Some(Ok(event)) => event,
+                    Some(Err(error)) => {
+                        shell.close_panel();
+                        return Err(error.into());
+                    }
+                    None => {
+                        shell.close_panel();
+                        shell.request_close();
+                        return Ok(());
+                    }
+                };
+                if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+                    shell.close_panel();
+                    shell.render();
+                    return Ok(());
+                }
+                if matches!(event, Event::Mouse(_)) {
+                    continue;
+                }
+                if shell.panel_input(&event).is_some() {
+                    shell.render();
+                    return Ok(());
+                }
+                shell.render();
+            }
+            _ = refresh_tick.tick() => {
+                if let Ok(Some(text)) = refresh().await {
+                    shell.update_read_only_document(text);
+                    shell.render();
+                }
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub fn session_items(store: &SessionStore) -> Vec<String> {
     store
@@ -245,6 +591,7 @@ pub async fn session_picker(
         "Select session",
         items,
         descs,
+        0,
         PanelAction::SelectSession(vec![]), // dummy — blocking path ignores this
     )
     .await?
@@ -268,6 +615,7 @@ pub async fn theme_picker(
         "Select theme",
         items,
         vec![None; names.len()],
+        0,
         PanelAction::SelectTheme(action_names),
     )
     .await?
@@ -291,6 +639,7 @@ pub async fn thinking_picker(
         "Select thinking level",
         items,
         vec![None; levels.len()],
+        0,
         PanelAction::SelectThinking(action_levels),
     )
     .await?
@@ -377,6 +726,7 @@ where
         &title,
         items,
         descriptions,
+        0,
         PanelAction::ExtensionConfirmation,
     )
     .await?;
@@ -473,6 +823,7 @@ pub async fn optional_model_picker(
         "Select model",
         items,
         descs,
+        0,
         PanelAction::SelectModel(model_ids),
     )
     .await?
@@ -523,6 +874,7 @@ mod tests {
             "Choose",
             vec!["one".into()],
             vec![None],
+            0,
             PanelAction::SelectTheme(vec!["one".into()]),
         )
         .await
@@ -531,6 +883,62 @@ mod tests {
         assert_eq!(selected, None);
         assert!(!shell.has_panel());
         assert!(shell.close_requested());
+    }
+
+    struct LivePickerRefresh {
+        calls: usize,
+    }
+
+    fn refresh_live_picker(
+        context: &mut LivePickerRefresh,
+    ) -> Pin<Box<dyn Future<Output = SubagentPickerSnapshot> + '_>> {
+        Box::pin(async move {
+            context.calls += 1;
+            SubagentPickerSnapshot {
+                title: "Subagents · refreshed".into(),
+                items: vec!["beta".into(), "gamma".into()],
+                descriptions: vec![Some("done".into()), Some("running".into())],
+                node_ids: vec!["node-b".into(), "node-c".into()],
+                notices: Vec::new(),
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn live_subagent_picker_refreshes_and_keeps_the_stable_selection() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            sender
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::NONE,
+                ))))
+                .await
+                .unwrap();
+        });
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+        let mut refresh = LivePickerRefresh { calls: 0 };
+        let selected = subagent_picker(
+            &mut shell,
+            &mut input,
+            SubagentPickerSnapshot {
+                title: "Subagents".into(),
+                items: vec!["alpha".into(), "beta".into()],
+                descriptions: vec![Some("running".into()), Some("running".into())],
+                node_ids: vec!["node-a".into(), "node-b".into()],
+                notices: Vec::new(),
+            },
+            1,
+            &mut refresh,
+            refresh_live_picker,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected.as_deref(), Some("node-b"));
+        assert!(refresh.calls >= 1);
     }
 
     #[test]

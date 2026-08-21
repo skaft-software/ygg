@@ -1,7 +1,8 @@
 # ygg-web-search
 
 `ygg-web-search` is an opt-in API `0.2` executable extension for bounded web
-search and public-page retrieval with stable citations. V1 uses one explicitly
+search and public-page retrieval with stable citations. It supports
+[Brave Search API](https://brave.com/search/api/) (recommended) and an explicitly
 configured [SearXNG](https://docs.searxng.org/) JSON endpoint. It is search and
 fetch only: it has no browser tabs, cookies, login, JavaScript, form submission,
 image search, crawler, or computer-use authority.
@@ -9,8 +10,8 @@ image search, crawler, or computer-use authority.
 The bundle is inert after installation. Discovery does not execute it, install
 does not enable or trust it, and `--safe-mode` keeps it stopped. A running
 extension has the current user's operating-system authority; the manifest's
-network and fixed user-config-file declarations are visible consent metadata,
-not a sandbox.
+network and fixed user-state declarations are visible consent metadata, not a
+sandbox.
 
 ## Install and opt in
 
@@ -49,11 +50,44 @@ installation performs no `pip install`, model call, service setup, or other
 arbitrary code. Python 3.9 or newer must be available as `python3`.
 
 Release compatibility is recorded directly in `extension.toml`: bundle
-`0.1.0`, extension API `0.2`, exact Ygg `0.5.0`.
+`0.2.0`, extension API `0.2`, exact Ygg `0.6.0-dev`.
 
-## Configure one SearXNG endpoint
+## Choose a provider
 
-Create the fixed, user-owned configuration file:
+Open `/extensions` and select `ygg-web-search`. Enabling a running trusted copy
+opens a second picker using the same interface:
+
+1. **Brave Search (recommended)**
+2. **SearXNG**
+
+Selecting an already enabled `ygg-web-search` opens that provider picker again
+and also offers to disable the extension. `/web-search status`,
+`/web-search setup brave`, `/web-search setup searxng`, and
+`/web-search logout` provide keyboard/scriptable fallbacks.
+
+### Brave Search (recommended)
+
+On first selection, Ygg shows the key-management link and opens a private input
+surface for the API key:
+
+<https://api.search.brave.com/app/keys>
+
+The key is stored at `~/.ygg/credentials/ygg-web-search-brave.key` as an
+owner-private regular file. It is never placed in ordinary configuration,
+queries, URLs, tool results, status, presentation state, or diagnostics. Brave
+requests use the fixed HTTPS endpoint and `X-Subscription-Token`; credentialed
+requests never follow redirects. If setup was skipped, the first `web_search`
+call asks for the key through the same private input channel. An HTTP 401/403
+invalidates the stored key so the next setup/search can ask again.
+
+### SearXNG
+
+Existing `~/.config/ygg/ygg-web-search.json` SearXNG configurations continue to
+work unchanged. The provider picker preserves those settings while Brave is
+selected and restores them when switching back. If no SearXNG endpoint has been
+configured, setup asks for one.
+
+Manual configuration remains available:
 
 ```console
 mkdir -p ~/.config/ygg
@@ -69,7 +103,7 @@ current user and is not group- or world-writable; unknown fields are rejected.
 Configuration changes are adopted only when no extension tool operation is
 active; changing a file never changes an in-flight request.
 
-Minimal configuration:
+Minimal SearXNG configuration:
 
 ```json
 {
@@ -83,15 +117,10 @@ Minimal configuration:
 }
 ```
 
-The SearXNG instance must permit JSON search responses (`format=json`). The
-endpoint is deliberately non-secret. V1 has no API-key, header, cookie, secret
-broker, or prompt-based credential path; credential-bearing URLs and unknown
-credential fields are rejected, and endpoint or credential values are not
-logged or returned. Use a separately reviewed secret-broker prerequisite if a
-future provider needs credentials.
-
-A self-hosted SearXNG endpoint on loopback or a private address requires the
-explicit `allow_private_endpoint: true` setting. That exception applies only to
+The SearXNG instance must permit JSON search responses (`format=json`). Its
+endpoint is deliberately non-secret; credential-bearing URLs and unknown
+credential fields are rejected. A self-hosted endpoint on loopback or a private
+address requires `allow_private_endpoint: true`. That exception applies only to
 the configured provider hostname. Model-supplied `web_open` and `web_find`
 destinations and every redirect remain public-address-only.
 
@@ -101,9 +130,9 @@ that configuration but cannot widen it.
 
 ## Tools and bounds
 
-| Tool | Purpose | Hard V1 bounds |
+| Tool | Purpose | Hard bounds |
 | --- | --- | --- |
-| `web_search` | Query the configured SearXNG JSON adapter | 512-byte query, 5 requested domains, 10 results, 20 seconds, 512 KiB provider response, 3 redirects |
+| `web_search` | Query the selected Brave Search or SearXNG adapter | 512-byte query, 5 requested domains, 10 results, 20 seconds, 512 KiB provider response; Brave credentialed requests do not redirect |
 | `web_open` | Normalize one public HTML or plain-text URL | HTTP(S) ports 80/443, 20 seconds, 3 redirects, 512 KiB download, 128 KiB normalized content |
 | `web_find` | Find a literal pattern and return excerpts | 256-byte pattern, 20 matches, 512-byte excerpts, the same fetch bounds as `web_open` |
 
@@ -130,11 +159,11 @@ terminal result is marked partial.
 
 ## Trust, egress, and result visibility
 
-Search sends the query and selected domain filters to the configured SearXNG
-service. Open/find sends the sanitized URL to that public origin and performs
-normal DNS and TLS traffic. This is the extension's only network egress; the
-configured SearXNG service remains external and is neither vendored nor managed
-by Ygg.
+Search sends the query and selected domain filters to the selected provider:
+the fixed Brave Search API endpoint or the configured SearXNG service. Open/find
+sends the sanitized URL to that public origin and performs normal DNS and TLS
+traffic. Both search services remain external and are neither vendored nor
+managed by Ygg.
 
 Every successful text result begins with an explicit **UNTRUSTED WEB DATA**
 frame. Titles, URLs, snippets, excerpts, page text, and publication metadata are
@@ -175,9 +204,10 @@ retrieved text.
 
 The optional status contribution is compact and passive:
 
-- `web · Off` when the config is absent;
+- `web · Off` when no provider configuration exists;
+- `web · Brave Search setup required` when Brave is selected without a key;
 - `web · <label>` when configured/ready; and
-- an explicit degraded, offline, or rate-limited state after failure.
+- an explicit authentication, degraded, offline, or rate-limited state after failure.
 
 It performs no health-check request and never exposes the endpoint.
 

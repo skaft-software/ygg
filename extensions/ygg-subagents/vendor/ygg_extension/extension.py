@@ -50,6 +50,7 @@ API_V02_FEATURES = (
     "policy_intents",
     "dynamic_tools",
     "agent_sessions",
+    "delegation_telemetry_v1",
     "approvals",
     "secrets",
 )
@@ -1281,7 +1282,7 @@ class Extension:
         max_depth: int,
         max_concurrent_children: int,
         max_turns: int,
-        max_tokens: int,
+        max_tokens: Optional[int] = None,
         max_cost_microdollars: int,
         max_output_bytes: int,
         timeout_ms: int,
@@ -1328,7 +1329,6 @@ class Extension:
             "max_depth": (max_depth, 1, 1),
             "max_concurrent_children": (max_concurrent_children, 1, 2),
             "max_turns": (max_turns, 1, 12),
-            "max_tokens": (max_tokens, 1_000, 64_000),
             "max_cost_microdollars": (max_cost_microdollars, 1, 500_000),
             "max_output_bytes": (max_output_bytes, 512, 16 * 1024),
             "timeout_ms": (timeout_ms, 5_000, 15 * 60 * 1_000),
@@ -1342,6 +1342,14 @@ class Extension:
                 raise ValueError(
                     f"agent {name} must be an integer between {minimum} and {maximum}"
                 )
+        if max_tokens is not None and (
+            not isinstance(max_tokens, int)
+            or isinstance(max_tokens, bool)
+            or not 1_000 <= max_tokens <= 64_000
+        ):
+            raise ValueError(
+                "agent max_tokens must be null or an integer between 1000 and 64000"
+            )
         self._require_feature("agent_sessions")
         params: dict[str, Any] = {
             "task_name": task_name,

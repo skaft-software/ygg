@@ -57,7 +57,7 @@ transcript files.
 
 ## Requirements and installation
 
-- Ygg exactly `0.5.0` (`requires_ygg = "=0.5.0"`)
+- Ygg exactly `0.6.0-dev` (`requires_ygg = "=0.6.0-dev"`)
 - an already provisioned Hermes Agent `0.20.1` environment (upstream currently
   requires Python 3.11 through 3.13)
 - any provider dependencies installed by the user in that environment
@@ -352,10 +352,11 @@ initializes, retries, reads, writes, or refreshes provider state.
 | retained session snippets | 32 × 16 KiB | fixed |
 
 Provider calls run on capped daemon workers and are waited with cancellation and
-deadlines. Python cannot kill an arbitrary stuck provider thread; after timeout
-it is detached under a strict live-call cap, memory degrades, and direct coding
-continues. Bounded provider shutdown plus Ygg's process-group cleanup is the
-final fence.
+deadlines. Python cannot safely kill an arbitrary provider thread, so an
+uncooperative timeout, cancellation, or shutdown immediately terminates the
+entire extension process generation instead of detaching work or reporting a
+false terminal state. Ygg's supervised process replacement/process-group cleanup
+is the fence; the interrupted call remains ambiguous and is never replayed.
 
 ## Health and recovery
 

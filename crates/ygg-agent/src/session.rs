@@ -74,6 +74,17 @@ pub enum UsageRecordKind {
     /// A billable Responses turn rejected before assistant persistence because
     /// explicit native replay mode did not receive authoritative raw output.
     RejectedResponsesTurn,
+    /// Provider usage produced by one bounded delegated child during the
+    /// owning root interaction. The child session remains independently
+    /// durable; this record is the root session's accounting ledger entry.
+    DelegatedAgent {
+        /// Stable host-created child identifier within the owning run.
+        agent_id: String,
+        /// Completed model turns observed for the child.
+        turn_count: u64,
+        /// Host-observed child tool calls.
+        tool_call_count: u64,
+    },
     /// A tool-free call used to produce a context-compaction summary.
     Compaction,
     /// A bounded one-token decision about whether a candidate response may
@@ -82,6 +93,18 @@ pub enum UsageRecordKind {
         /// `Some(true)` returns, `Some(false)` continues, and `None` is invalid.
         returned: Option<bool>,
     },
+}
+
+/// One child session's exact usage mirror for the owning root ledger.
+#[derive(Clone, Debug)]
+pub(crate) struct DelegatedUsage {
+    pub(crate) agent_id: String,
+    pub(crate) turn_count: u64,
+    pub(crate) tool_call_count: u64,
+    pub(crate) endpoint: EndpointId,
+    pub(crate) model: ModelId,
+    pub(crate) usage: Usage,
+    pub(crate) cost: Option<Cost>,
 }
 
 /// Provider usage and cost recorded for one durable operation.
@@ -1597,6 +1620,43 @@ impl Session {
             kind: UsageRecordKind::AssistantTurn { assistant },
             usage,
             stop_reason,
+            endpoint: Some(endpoint),
+            model: Some(model),
+            completed_at_unix_ms: Some(now_unix_millis()),
+            cost,
+            cost_microdollars: cost.map(|cost| cost.total),
+            session_cost_microdollars: None,
+            session_cost_picodollars_remainder: None,
+        })
+    }
+
+    /// Persist root-ledger usage for one bounded delegated child session.
+    ///
+    /// `cost` is the exact aggregate of the child's durable provider records,
+    /// including its picodollar remainder. The child session remains the
+    /// detailed source of truth; this root record makes cumulative accounting
+    /// and cost limits include delegated work without replaying child files.
+    pub(crate) fn record_delegated_agent_usage(
+        &mut self,
+        delegated: DelegatedUsage,
+    ) -> Result<(), SessionError> {
+        let DelegatedUsage {
+            agent_id,
+            turn_count,
+            tool_call_count,
+            endpoint,
+            model,
+            usage,
+            cost,
+        } = delegated;
+        self.record_usage(UsageRecord {
+            kind: UsageRecordKind::DelegatedAgent {
+                agent_id,
+                turn_count,
+                tool_call_count,
+            },
+            usage,
+            stop_reason: None,
             endpoint: Some(endpoint),
             model: Some(model),
             completed_at_unix_ms: Some(now_unix_millis()),
@@ -3287,6 +3347,57 @@ mod tests {
         assert_eq!(reopened.usage_records(), expected);
         assert_eq!(reopened.total_cost_microdollars(), 43);
         assert_eq!(reopened.total_cost_picodollars_remainder(), 200_000);
+    }
+
+    #[test]
+    fn delegated_usage_is_durable_and_contributes_exact_session_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let usage = Usage {
+            input_tokens: 1_000,
+            cache_read_tokens: 250,
+            output_tokens: 80,
+            reasoning_tokens: 20,
+            total_tokens: 1_330,
+            ..Usage::default()
+        };
+        let cost = Cost {
+            input: 10,
+            output: 4,
+            reasoning: 1,
+            cache_read: 1,
+            total: 15,
+            total_picodollars_remainder: 750_000,
+            ..Cost::default()
+        };
+        session
+            .record_delegated_agent_usage(DelegatedUsage {
+                agent_id: "agent-1".into(),
+                turn_count: 3,
+                tool_call_count: 7,
+                endpoint: EndpointId("provider".into()),
+                model: ModelId("worker-model".into()),
+                usage,
+                cost: Some(cost),
+            })
+            .unwrap();
+        assert_eq!(session.total_cost_microdollars(), 15);
+        assert_eq!(session.total_cost_picodollars_remainder(), 750_000);
+        assert!(matches!(
+            &session.usage_records()[0].kind,
+            UsageRecordKind::DelegatedAgent {
+                agent_id,
+                turn_count: 3,
+                tool_call_count: 7,
+            } if agent_id == "agent-1"
+        ));
+        drop(session);
+
+        let reopened = Session::open(path).unwrap();
+        assert_eq!(reopened.total_cost_microdollars(), 15);
+        assert_eq!(reopened.usage_records()[0].usage, usage);
+        assert_eq!(reopened.usage_records()[0].cost, Some(cost));
     }
 
     #[test]

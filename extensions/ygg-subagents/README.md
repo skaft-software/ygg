@@ -2,7 +2,7 @@
 
 `ygg-subagents` is a small API `0.2` executable extension for Claude Code-like background workers. It launches named, single-purpose child conversations through Ygg's **host-owned `agent_sessions` service**. It is not an agent team, graph/recipe runtime, swarm, hosted-agent scheduler, or second Agent loop.
 
-Version `0.1.0` targets exactly Ygg `0.5.0`.
+Version `0.1.0` targets exactly Ygg `0.6.0-dev`.
 
 ## Safety model
 
@@ -13,8 +13,8 @@ V1 is deliberately read-only and bounded:
 - four predefined profiles (`explore`, `review`, `test-analysis`, `research`);
 - inherited model only (`model: "inherit"`), because the API `0.2` service does not accept a model override;
 - requested tool scope is a non-empty subset of `read` and `search` only;
-- 5–900 second wall-time request, 1–12 turns, 512–16384 output bytes, 1k–64k tokens, and bounded microdollar reservations;
-- aggregate reservations of 96k tokens and 500,000 microdollars;
+- 5–900 second wall-time request, 1–12 turns, 512–16384 returned output bytes, and a bounded microdollar request;
+- fresh child contexts inherit the parent's model, context/output limits, and optional session token ceiling exactly; an unlimited parent remains unlimited and the model-facing spawn schema has no separate token-budget field;
 - strict owner derivation from `tool/call.context.resource_owner`; no tool schema accepts an owner;
 - retry-safe spawn keys, bounded output/error retention, cooperative cancellation, and explicit stop.
 
@@ -23,11 +23,15 @@ Mutation tool names cannot enter the child request through model-generated `tool
 API `0.2` creates the child with inherited model, cwd/workspace, environment,
 sandbox, approval policy, and extension policy, but `agent/spawn.policy` is the
 hard per-child boundary: Ygg installs a detached `read`/`search` tool snapshot
-(no mutation or collaboration tools), lowers parent turns/cost when stricter,
-accounts cumulative tokens/cost, caps UTF-8 summary bytes, and owns the absolute
-wall deadline. The two-child/depth-one/aggregate reservation limits are also
-checked by the real host service, so extension restart or absence of polling
-cannot relax them. A shared cwd/filesystem is **not isolation**.
+(no mutation or collaboration tools), applies lower parent turn/cost ceilings,
+inherits the parent's context/output and optional session-token settings without
+inventing a child ceiling, accounts cumulative tokens/cost, caps UTF-8 summary
+bytes, and owns the absolute wall deadline. Each child starts a fresh context;
+its usage is mirrored into the root ledger for accounting only, never inserted
+into the parent's model context, and never charged to the parent's own-context
+token ceiling. The two-child/depth-one/retention limits are also checked by the
+real host service. Extension restart or absence of polling cannot relax those
+limits. A shared cwd/filesystem is **not isolation**.
 
 The host returns an opaque `agent-session:*` reference rather than the private
 delegation JSONL path. Serve resolves that reference only by inventorying its
@@ -64,18 +68,31 @@ It does not use `agent/message`/`agent/follow_up`, the graph/recipe spike, built
 The release archive has one root directory named `ygg-subagents`. Install a local archive with:
 
 ```console
-ygg extension install --path ./ygg-subagents-0.1.0.tar.gz
+ygg extension install --path ./ygg-subagents-0.6.0-dev.tar.gz
 ```
 
 Installation/discovery is inert: it does not enable, trust, or start the process. Explicitly enable and trust the selected manifest in full-access mode, preferably inside separate OS isolation:
 
+The current workspace bundle can be rebuilt and installed deterministically with:
+
 ```console
-ygg \
-  --enable-extension ygg-subagents \
-  --trust-extension ygg-subagents
+./scripts/reinstall-ygg-subagents.sh
 ```
 
-`--safe-mode` never starts executable extensions. Use `/extensions` to inspect source, trust, API, generation, and negotiated features. The tools return an explicit unavailable result when the selected model/reasoning mode does not offer `agent_sessions`.
+This updates `~/.ygg/extensions/ygg-subagents`; rebuilding `ygg` with
+`cargo run` alone does not replace an already installed extension bundle.
+
+Enable and trust it explicitly:
+
+```console
+ygg --enable-extension ygg-subagents --trust-extension ygg-subagents
+```
+
+`--safe-mode` never starts executable extensions. Use `/extensions` to enable or
+disable installed executable bundles, and `/extensions status` to inspect source,
+trust, API, generation, and negotiated features. Enabling never grants trust. The
+tools return an explicit unavailable result when the trusted extension is not
+running or the host has not offered its owner-bound `agent_sessions` service.
 
 The bundle is self-contained and has no install hook or third-party dependency. `vendor/ygg_extension/` is a synchronized copy of Ygg's dependency-free Python SDK. Python 3.9+ is required at runtime.
 
@@ -97,14 +114,17 @@ Launch a worker in the background by default:
   "timeout_seconds": 300,
   "max_turns": 8,
   "max_output_bytes": 8192,
-  "max_tokens": 32000,
   "max_cost_microdollars": 200000,
   "background": true,
   "idempotency_key": "auth-audit-v1"
 }
 ```
 
-If no key is supplied, the extension derives one from the complete canonical request. Keys are scoped by Ygg to the extension principal and durable session owner. Identical retries return the same child; reuse with different input fails. The orchestration fingerprint is also placed in the canonical child message so a restart cannot accidentally make host-visible input equality narrower than extension input equality.
+There is intentionally no `max_tokens` argument. The child gets a fresh model
+context with the parent's model context/output limits and inherits the parent's
+optional cumulative session-token ceiling exactly (`null` remains unlimited).
+
+If no key is supplied, the extension derives one from the complete canonical request. Keys are scoped by Ygg to the extension principal and durable session owner. Identical retries return the same retained owning-run child; when a new root run clears that tree, both the host and extension prune the stale key instead of returning a nonexistent worker. Reuse with different input fails. The orchestration fingerprint is also placed in the canonical child message so a restart cannot accidentally make host-visible input equality narrower than extension input equality.
 
 The immediate result is an acknowledgement, not completion. Continue independent parent work and let Ygg deliver the worker's concise final output through its durable parent mailbox. Set `background: false` only when a bounded foreground wait is actually useful.
 
@@ -130,7 +150,7 @@ or:
 {"all": true}
 ```
 
-The host validates the target against the extension principal and current resource owner and interrupts the selected descendant tree. Repeated stop on a terminal worker is a bounded no-op.
+The host validates the target against the extension principal and current resource owner and interrupts the selected descendant tree. An accepted request remains `stopping` until a subsequent authoritative `agent/list` or `agent/wait` record reports the terminal interruption; acknowledgement alone is never presented as completion. Repeated stop on a terminal worker is a bounded no-op.
 
 ## Lifecycle and restart behavior
 
@@ -169,16 +189,42 @@ The extension emits complete monotonic `presentation/update` snapshots using the
 - declared inspect, stop, and stop-all actions routed only to the manifest command.
 
 Prompts, tool arguments/results, and running model prose never appear in the
-tree. The opaque worker resource reference is stable and owner-scoped. Serve
-opens it only after host-written provenance binds the exact parent session,
+worker list or composer-adjacent activity block. The host returns per-worker
+structured phase/current tool, host-observed tool calls, disjoint provider token
+buckets, turn count, and priced cost. The extension places those values in
+generic activity `metrics`; it never supplies terminal rows or footer text. In
+the TUI, Ygg renders the latest owner-fenced worker activities immediately
+above the composer from native `AgentEvent::DelegationUpdated` events; it does
+not poll `/subagents status` for the composer block. A worker row has the
+compact form `N Tool Calls • ↑input ↓output • $cost`; input includes the three
+disjoint uncached/cache-read/cache-write buckets, while reasoning remains a
+subset of output.
+
+Before the root run settles, Ygg stops and briefly joins its children, sums each
+child session's durable usage/cost records including picodollar remainders, and
+writes one `delegated_agent` usage record per worker into the root session. The
+live child total is included in the footer only until that durable handoff, so
+delegated spend contributes exactly once to cumulative session cost and later
+cost-limit checks.
+
+The opaque worker resource reference is stable and owner-scoped.
+Serve opens it only after host-written provenance binds the exact parent session,
 path-free extension principal, and resource owner; the web view is locked and
-read-only. The TUI routes the same current presentation reference through
-`/extensions inspect agent-session:<digest>` and opens only a child in the
-current parent's delegation team. Neither frontend can submit prompts or mutate
-a worker; all mutation remains on owner-bound `agent_sessions`. The package
-supplies no Rust TUI plugin, web code, or frontend scheduler. Generic rendering,
-selection/navigation, reconnect and instance/generation fencing, authenticated
-action routing, and Serve transport are host-owned.
+read-only. The TUI's live block is host-rendered from semantic activity metrics;
+no extension status or footer contribution is rendered. The no-argument
+`/subagents` command opens a host-owned list: Up/Down moves between workers,
+Enter opens the selected scrollable read-only transcript, and Escape or Left
+returns to the list. The same owner-bound status command used by the live tick
+and open panel reconciles authoritative `agent_sessions` state and publishes the
+next complete presentation revision; the frontend keeps focus by stable node ID
+and revalidates the latest owner-scoped reference before opening it.
+`/extensions inspect agent-session:<digest>` remains the explicit reference
+fallback. Both paths open only a child in the current parent's delegation team.
+Neither frontend can submit prompts or mutate a worker; all mutation remains on
+owner-bound `agent_sessions`. The package supplies no Rust TUI plugin, web code,
+or frontend scheduler. Generic rendering, selection/navigation, reconnect and
+instance/generation fencing, authenticated action routing, and Serve transport
+are host-owned.
 
 ### `/subagents` headless/narrow fallback
 

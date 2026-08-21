@@ -13,6 +13,7 @@ use ygg_ai::{
 
 use crate::config::Config;
 use crate::config::ThinkingLevel;
+use crate::extensions::SUBAGENTS_EXTENSION_NAME;
 use crate::prompts::PromptRegistry;
 use crate::session_store::SessionStore;
 
@@ -142,6 +143,27 @@ pub fn thinking_to_reasoning(
     }
 }
 
+/// Translate a thinking selection while enforcing the product's subagent
+/// observability boundary.
+pub fn thinking_to_reasoning_with_subagents(
+    level: ThinkingLevel,
+    model: &Model,
+    subagents_available: bool,
+) -> anyhow::Result<ReasoningConfig> {
+    let reasoning = thinking_to_reasoning(level, model)?;
+    if !subagents_available && reasoning == ReasoningConfig::Effort(ReasoningEffort::Ultra) {
+        let fallback = thinking_to_reasoning(ThinkingLevel::Max, model)?;
+        return Ok(
+            if fallback != ReasoningConfig::Effort(ReasoningEffort::Ultra) {
+                fallback
+            } else {
+                ReasoningConfig::Off
+            },
+        );
+    }
+    Ok(reasoning)
+}
+
 /// Clamp a requested effort down to the model's highest supported tier.
 fn clamp_effort(effort: ReasoningEffort, ceiling: ReasoningEffort) -> ReasoningEffort {
     effort.min(ceiling)
@@ -210,12 +232,46 @@ pub fn normalize_reasoning_for_model(
 /// Persisted Pro selections become Ultra only when live metadata advertises
 /// both Ultra effort and V2 delegation. Otherwise the wire mode is removed and
 /// the independently selected effort is normalized normally.
+#[allow(dead_code)]
 pub fn normalize_reasoning_selection_for_model(
     reasoning: &ReasoningConfig,
     mode: ReasoningMode,
     model: &Model,
 ) -> anyhow::Result<(ReasoningConfig, ReasoningMode, Option<String>)> {
+    normalize_reasoning_selection_for_model_with_subagents(reasoning, mode, model, true)
+}
+
+/// Normalize reasoning while enforcing the product's subagent observability
+/// boundary. Ultra is not a safe standalone model tier: the active first-party
+/// subagents extension must provide the owner-bound observation surface before
+/// Ygg can select it.
+pub fn normalize_reasoning_selection_for_model_with_subagents(
+    reasoning: &ReasoningConfig,
+    mode: ReasoningMode,
+    model: &Model,
+    subagents_available: bool,
+) -> anyhow::Result<(ReasoningConfig, ReasoningMode, Option<String>)> {
     let normalized = normalize_reasoning_for_model(reasoning, model)?;
+    if !subagents_available
+        && (normalized == ReasoningConfig::Effort(ReasoningEffort::Ultra)
+            || (mode == ReasoningMode::Pro && model_supports_ultra(model)))
+    {
+        let fallback =
+            normalize_reasoning_for_model(&ReasoningConfig::Effort(ReasoningEffort::Max), model)?;
+        let fallback = if fallback != ReasoningConfig::Effort(ReasoningEffort::Ultra) {
+            fallback
+        } else {
+            ReasoningConfig::Off
+        };
+        return Ok((
+            fallback,
+            ReasoningMode::Standard,
+            Some(format!(
+                "Ultra is disabled until the trusted {SUBAGENTS_EXTENSION_NAME} extension is active; using standard reasoning for {}",
+                model.spec.id.0
+            )),
+        ));
+    }
     if mode == ReasoningMode::Standard {
         return Ok((normalized, ReasoningMode::Standard, None));
     }
@@ -285,9 +341,18 @@ pub fn level_from_reasoning(
     }
 }
 
-/// Levels the current model can safely offer in the thinking picker. `xhigh`
-/// and `max` appear only when the model advertises them via `max_effort`.
+/// Levels the model can offer through the legacy model-only API. `xhigh` and
+/// `max` appear only when the model advertises them via `max_effort`; Ultra is
+/// intentionally omitted without the product's subagent observation boundary.
+#[allow(dead_code)]
 pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
+    supported_levels_for_model(model)
+        .into_iter()
+        .filter(|level| *level != ThinkingLevel::Ultra)
+        .collect()
+}
+
+fn supported_levels_for_model(model: &Model) -> Vec<ThinkingLevel> {
     let Some(capability) = &model.spec.capabilities.reasoning else {
         return vec![ThinkingLevel::Off];
     };
@@ -346,6 +411,18 @@ pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
         }),
     );
     levels
+}
+
+/// Returns the model's portable thinking levels after applying the product's
+/// subagent observability gate.
+pub fn supported_levels_with_subagents(
+    model: &Model,
+    subagents_available: bool,
+) -> Vec<ThinkingLevel> {
+    supported_levels_for_model(model)
+        .into_iter()
+        .filter(|level| *level != ThinkingLevel::Ultra || subagents_available)
+        .collect()
 }
 
 /// An Agent-owning runtime transition. These are valid only while idle.
@@ -415,6 +492,18 @@ pub struct App {
 }
 
 impl App {
+    /// Whether this application has the owner-bound subagent observer needed
+    /// before Ultra may be selected or submitted.
+    pub fn subagents_available(&self) -> bool {
+        self.model.spec.capabilities.tools
+            && self
+                .agent
+                .registered_tool_names()
+                .iter()
+                .any(|name| name == "subagent_spawn")
+            && self.executable_extensions.has_agent_session_service()
+    }
+
     /// Current provider-visible tool schema reserve, including live extension
     /// catalog changes published after application bootstrap.
     pub fn current_tool_schema_tokens(&self) -> u64 {
@@ -492,6 +581,46 @@ mod tests {
         assert!(diagnostic.unwrap().contains("migrated"));
     }
 
+    #[test]
+    fn ultra_requires_the_observing_subagents_extension() {
+        let base = model_with(Some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: true,
+            effort_budgets: None,
+            openai_chat_mode: ygg_ai::OpenAiChatReasoningMode::Standard,
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::Ultra,
+        }));
+        let mut spec = (*base.spec).clone();
+        spec.capabilities.agent_delegation = Some(AgentDelegation::V2);
+        let model = Model {
+            spec: Arc::new(spec),
+            endpoint: base.endpoint,
+        };
+        assert!(!supported_levels(&model).contains(&ThinkingLevel::Ultra));
+        assert!(supported_levels_with_subagents(&model, true).contains(&ThinkingLevel::Ultra));
+
+        let (reasoning, mode, diagnostic) = normalize_reasoning_selection_for_model_with_subagents(
+            &ReasoningConfig::Effort(ReasoningEffort::Ultra),
+            ReasoningMode::Standard,
+            &model,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reasoning, ReasoningConfig::Effort(ReasoningEffort::Max));
+        assert_eq!(mode, ReasoningMode::Standard);
+        assert!(diagnostic.unwrap().contains("ygg-subagents"));
+
+        let (reasoning, _, _) = normalize_reasoning_selection_for_model_with_subagents(
+            &ReasoningConfig::Effort(ReasoningEffort::Ultra),
+            ReasoningMode::Standard,
+            &model,
+            true,
+        )
+        .unwrap();
+        assert_eq!(reasoning, ReasoningConfig::Effort(ReasoningEffort::Ultra));
+    }
     #[test]
     fn ultra_floor_cannot_override_the_effective_runtime_ceiling() {
         let model = model_with(Some(ReasoningCapability {

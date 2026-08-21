@@ -18,7 +18,7 @@ workspace = true
 benchmarks = []
 
 [dependencies]
-ygg-ai = { version = "=0.5.0", path = "../ygg-ai" }
+ygg-ai = { version = "=0.6.0-dev", path = "../ygg-ai" }
 bytes = "1"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time", "process", "io-util", "net"] }
 serde = { version = "1", features = ["derive"] }

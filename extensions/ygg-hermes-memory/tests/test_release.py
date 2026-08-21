@@ -29,7 +29,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-hermes-memory")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.5.0")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-hermes-memory")
         self.assertTrue(manifest["capabilities"]["network"])
         self.assertTrue(manifest["capabilities"]["process"])
@@ -74,32 +74,40 @@ class ReleaseSmokeTests(unittest.TestCase):
                 relative,
             )
 
-    def test_entrypoint_config_and_contract_smoke_do_not_install_or_import_provider(self):
-        contract = subprocess.run(
-            [str(ROOT / "ygg-hermes-memory"), "--contract"],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        self.assertEqual(contract.returncode, 0, contract.stderr)
-        self.assertIn("7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397", contract.stdout)
-        checked = subprocess.run(
-            [
-                str(ROOT / "ygg-hermes-memory"),
-                "--config",
-                str(ROOT / "config.example.json"),
-                "--check-config",
-            ],
-            cwd=ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+    def test_host_staged_entrypoint_config_and_contract_smoke_do_not_install_or_import_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staged_entrypoint = Path(directory) / "ygg-hermes-memory"
+            staged_entrypoint.write_bytes((ROOT / "ygg-hermes-memory").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
+            contract = subprocess.run(
+                [str(staged_entrypoint), "--contract"],
+                cwd=directory,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(contract.returncode, 0, contract.stderr)
+            self.assertIn("7095e23eb2066fe9a2f93b99cdbfe0e2b5ece397", contract.stdout)
+            checked = subprocess.run(
+                [
+                    str(staged_entrypoint),
+                    "--config",
+                    str(ROOT / "config.example.json"),
+                    "--check-config",
+                ],
+                cwd=directory,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertIn("valid Hermes memory configuration", checked.stdout)
         combined = (checked.stdout + checked.stderr).lower()
@@ -163,7 +171,7 @@ class ReleaseSmokeTests(unittest.TestCase):
                 str(REPOSITORY / "scripts" / "package-ygg-extension-release.sh"),
                 "ygg-hermes-memory",
                 str(first),
-                "v0.5.0",
+                "v0.6.0-dev",
                 str(source),
             ]
             completed = subprocess.run(

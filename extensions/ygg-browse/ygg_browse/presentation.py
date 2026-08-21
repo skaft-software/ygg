@@ -308,7 +308,7 @@ class BrowsePresentation:
                     "label": "Set up browser",
                     "command": "browse",
                     "arguments": ["setup"],
-                    "destructive": False,
+                    "destructive": True,
                 },
                 {
                     "id": "open",

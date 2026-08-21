@@ -83,8 +83,10 @@ while the contract acknowledges extension and skill tools supplied alongside
 them. When the workspace has the Ygg source-checkout markers, the base prompt
 also includes absolute paths to the README, `docs/`, `examples/`, `crates/`, and
 the coding-agent crate and tells the model to consult them for Ygg questions or
-changes. Behavioral changes require regression tests rather than model-specific
-prompt tuning.
+changes. Packaged installs resolve the matching README, docs, examples, and
+SDK assets beside the binary or under `share/ygg`; Cargo installs materialize the
+text assets from the binary into that same data layout. Behavioral changes
+require regression tests rather than model-specific prompt tuning.
 
 Global and trusted workspace `AGENTS.md` files retain root-to-leaf precedence
 and are wrapped in path-labelled `<project_instructions>` blocks. Active skill
@@ -134,14 +136,24 @@ template.
 
 For explicit capability/orchestration boundaries (search vs browser vs computer use, hosted vs in-harness delegation, trust/cwd/approval/sandbox inheritance, and scope non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
 
-When the normalized effort is Ultra, bootstrap enables proactive V2 delegation
-under a private random team directory inside the session's `.delegation`
-storage. Lower reasoning efforts never install those tools. The coding host
-chooses this activation policy, while `ygg-agent` enforces execution, isolation,
-provenance, limits, and cancellation; `ygg-ai` only reports the provider
-capability. Delegated children inherit the root's approved extensions, sandbox,
-model/reasoning and cache settings, compaction/completion/output policy, retry
-and turn bounds, and cost ceiling.
+The coding host creates an extension-only V2 delegation manager whenever the
+trusted, enabled `ygg-subagents` extension successfully negotiates its
+`agent_sessions` service. The manager is available at every reasoning effort so
+client-level child work uses the same observed tree; it never installs the
+native root collaboration tools or their hidden prompt instructions. Ultra is
+selected only when that service is live and the model also advertises Ultra plus
+V2 delegation. Without the service, Ultra is clamped to the highest ordinary
+safe effort. The coding host chooses this activation policy, while `ygg-agent`
+enforces execution, isolation, provenance, limits, and cancellation;
+`ygg-ai` only reports the provider capability. Delegated children inherit the
+root's approved extensions, sandbox, model/reasoning and cache settings,
+compaction/completion/output policy, retry and turn bounds, and cost ceiling.
+During an active interactive run, the product schedules one nonblocking
+owner-scoped subagent status refresh every 250 ms, reduces the resulting fenced
+semantic snapshot, and renders at most two worker activities above the composer.
+It temporarily adds their structured priced cost to the host-owned footer; after
+`ygg-agent` mirrors the settled child usage into root `delegated_agent` records,
+the idle footer reads only the durable session total.
 
 ## Skills
 
@@ -198,7 +210,8 @@ need Agent/session ownership.
 - `/name [name]`, `/export [path]` — name and safely export the current session.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.
-- `/extensions [reload]` — inspect discovery or reload running full-access extensions; safe mode keeps executable extensions stopped.
+- `/extensions [status|reload]` — interactively enable/disable managed executable bundles, inspect diagnostics, or reload running full-access extensions; enablement never grants trust and safe mode keeps processes stopped.
+- `/subagents` — when supplied by the enabled `ygg-subagents` package, navigate workers with arrow keys and open owner-authorized read-only transcripts with Enter.
 - `/help [command]` — show local command help and Ygg self-documentation.
 - `/status`, `/quit` — product status and lifecycle controls.
 
@@ -210,6 +223,18 @@ future messages therefore fork without deleting the abandoned branch.
 current reload generation. A malformed manifest, rejected link, or ID mismatch
 does not prevent healthy skills from loading and no longer disappears into
 startup-only stderr.
+
+The extension menu enumerates managed executable bundles rather than the
+separate `ygg-serve` application. It edits only the selected name in the user
+config's `enabled_extensions`, preserves independent trust grants and unrelated
+activation, refuses to redirect a shadowed global bundle to project/explicit
+code, and performs a full idle-boundary rebuild so the new process set is live.
+If project, environment, or command-line activation contributes to the effective
+list, the menu remains inspectable but read-only because a global edit would not
+be authoritative for the next launch, and trusted-project precedence is
+revalidated at action time. Enabled unavailable bundles are disable-only;
+source-changing trust, tool collisions, and explicit required-tool removal fail
+closed.
 
 ## OpenAI Codex discovery and Ultra
 

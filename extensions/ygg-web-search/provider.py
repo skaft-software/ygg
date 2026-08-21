@@ -1,9 +1,10 @@
-"""Bounded SearXNG search and public-web retrieval for ygg-web-search.
+"""Bounded provider-backed search and public-web retrieval for ygg-web-search.
 
 This module intentionally uses only the Python standard library.  It owns the
-provider adapter, URL and destination validation, bounded HTTP transport,
-normalization, citations, and an in-memory cache.  Retrieved bytes are always
-untrusted data; callers add the model-visible trust frame.
+provider adapters, URL and destination validation, bounded HTTP transport,
+normalization, citations, credential persistence, and an in-memory cache.
+Retrieved bytes are always untrusted data; callers add the model-visible trust
+frame.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import socket
 import ssl
 import stat
@@ -54,8 +56,11 @@ MAX_LABEL_BYTES = 48
 MAX_CACHE_ENTRIES = 64
 MAX_CACHE_BYTES = 2 * 1024 * 1024
 MAX_CACHE_TTL_SECONDS = 15 * 60
+MAX_BRAVE_API_KEY_BYTES = 1024
+BRAVE_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_SEARCH_KEY_URL = "https://api.search.brave.com/app/keys"
 OPEN_PORTS = frozenset((80, 443))
-USER_AGENT = "ygg-web-search/0.1 (+https://github.com/skaft-software/ygg)"
+USER_AGENT = "ygg-web-search/0.2 (+https://github.com/skaft-software/ygg)"
 TRACKING_QUERY_NAMES = frozenset(
     (
         "fbclid",
@@ -95,6 +100,10 @@ class Disabled(ConfigError):
     outcome = "disabled"
 
 
+class CredentialRequired(ConfigError):
+    outcome = "unconfigured"
+
+
 class DestinationRejected(WebError):
     outcome = "blocked"
 
@@ -115,6 +124,10 @@ class ProviderFailed(WebError):
     outcome = "provider_failed"
 
 
+class AuthenticationFailed(ProviderFailed):
+    outcome = "authentication_failed"
+
+
 class RateLimited(WebError):
     outcome = "rate_limited"
 
@@ -132,6 +145,7 @@ class ProviderConfig:
     endpoint: str
     label: str = "SearXNG"
     allow_private_endpoint: bool = False
+    kind: str = "searxng"
 
 
 @dataclass(frozen=True)
@@ -268,6 +282,162 @@ def default_config_path() -> Path:
     return Path.home() / ".config" / "ygg" / "ygg-web-search.json"
 
 
+def default_brave_credentials_path() -> Path:
+    return Path.home() / ".ygg" / "credentials" / "ygg-web-search-brave.key"
+
+
+def validate_brave_api_key(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("Brave Search API key must be text")
+    key = value.strip()
+    try:
+        encoded = key.encode("ascii", errors="strict")
+    except UnicodeEncodeError as error:
+        raise ConfigError("Brave Search API key must contain ASCII characters only") from error
+    if not key or len(encoded) > MAX_BRAVE_API_KEY_BYTES:
+        raise ConfigError("Brave Search API key must contain 1 to 1024 bytes")
+    if any(character.isspace() or ord(character) < 0x20 or ord(character) == 0x7F for character in key):
+        raise ConfigError("Brave Search API key cannot contain whitespace or control characters")
+    return key
+
+
+def _ensure_private_parent(path: Path) -> None:
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    except OSError as error:
+        raise ConfigError("web search state directory could not be created safely") from error
+    try:
+        info = os.lstat(str(parent))
+    except OSError as error:
+        raise ConfigError("web search state directory could not be inspected safely") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ConfigError("web search state directory must be a regular directory")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ConfigError("web search state directory must be owned by the current user")
+
+
+def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    _ensure_private_parent(path)
+    try:
+        existing = os.lstat(str(path))
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise ConfigError("web search state file could not be inspected safely") from error
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+            raise ConfigError("web search state file must be a regular non-symlink file")
+        if hasattr(os, "getuid") and existing.st_uid != os.getuid():
+            raise ConfigError("web search state file must be owned by the current user")
+
+    temporary = path.parent / (".%s.%s.tmp" % (path.name, secrets.token_hex(8)))
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: Optional[int] = None
+    try:
+        descriptor = os.open(str(temporary), flags, mode)
+        os.fchmod(descriptor, mode)
+        view = memoryview(data)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("short write")
+            written += count
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(str(temporary), str(path))
+        try:
+            directory = os.open(str(path.parent), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        except OSError:
+            directory = None
+        if directory is not None:
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as error:
+        raise ConfigError("web search state file could not be written safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def load_brave_api_key(path: Optional[Path] = None) -> str:
+    credential_path = default_brave_credentials_path() if path is None else Path(path)
+    try:
+        before = os.lstat(str(credential_path))
+        if stat.S_ISLNK(before.st_mode):
+            raise ConfigError("Brave Search credential cannot be a symbolic link")
+    except FileNotFoundError as error:
+        raise CredentialRequired(
+            "Brave Search needs an API key; get one at %s" % BRAVE_SEARCH_KEY_URL
+        ) from error
+    except OSError as error:
+        raise ConfigError("Brave Search credential could not be inspected safely") from error
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(str(credential_path), flags)
+    except FileNotFoundError as error:
+        raise CredentialRequired(
+            "Brave Search needs an API key; get one at %s" % BRAVE_SEARCH_KEY_URL
+        ) from error
+    except OSError as error:
+        raise ConfigError("Brave Search credential could not be opened safely") from error
+    try:
+        info = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (info.st_dev, info.st_ino):
+            raise ConfigError("Brave Search credential changed while it was opened")
+        if not stat.S_ISREG(info.st_mode):
+            raise ConfigError("Brave Search credential must be a regular file")
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise ConfigError("Brave Search credential must be owned by the current user")
+        if info.st_mode & 0o077:
+            raise ConfigError("Brave Search credential must not be accessible by group or other users")
+        if info.st_size > MAX_BRAVE_API_KEY_BYTES + 1:
+            raise ConfigError("Brave Search credential exceeds 1024 bytes")
+        data = os.read(descriptor, MAX_BRAVE_API_KEY_BYTES + 2)
+        if len(data) > MAX_BRAVE_API_KEY_BYTES + 1:
+            raise ConfigError("Brave Search credential exceeds 1024 bytes")
+        try:
+            return validate_brave_api_key(data.decode("utf-8").rstrip("\n"))
+        except UnicodeDecodeError as error:
+            raise ConfigError("Brave Search credential is not valid UTF-8") from error
+    finally:
+        os.close(descriptor)
+
+
+def store_brave_api_key(value: Any, path: Optional[Path] = None) -> None:
+    credential_path = default_brave_credentials_path() if path is None else Path(path)
+    key = validate_brave_api_key(value)
+    _atomic_write(credential_path, key.encode("utf-8") + b"\n", 0o600)
+
+
+def remove_brave_api_key(path: Optional[Path] = None) -> bool:
+    credential_path = default_brave_credentials_path() if path is None else Path(path)
+    try:
+        info = os.lstat(str(credential_path))
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ConfigError("Brave Search credential could not be inspected safely") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ConfigError("Brave Search credential must be a regular non-symlink file")
+    if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        raise ConfigError("Brave Search credential must be owned by the current user")
+    try:
+        credential_path.unlink()
+    except OSError as error:
+        raise ConfigError("Brave Search credential could not be removed safely") from error
+    return True
+
+
 def _bounded_regular_file(path: Path) -> bytes:
     try:
         before = os.lstat(str(path))
@@ -328,36 +498,74 @@ def load_configuration(path: Optional[Path] = None) -> Configuration:
     return parse_configuration(value)
 
 
-def parse_configuration(value: Any) -> Configuration:
-    root = _object(value, "configuration", ("version", "provider", "limits"))
-    version = root.get("version")
-    if isinstance(version, bool) or version != CONFIG_VERSION:
-        raise ConfigError("configuration.version must be 1")
-
+def _parse_searxng_provider(value: Any, label_prefix: str) -> ProviderConfig:
     provider_value = _object(
-        root.get("provider"),
-        "configuration.provider",
+        value,
+        label_prefix,
         ("kind", "endpoint", "label", "allow_private_endpoint"),
     )
     if provider_value.get("kind") != "searxng":
-        raise ConfigError("configuration.provider.kind must be 'searxng'")
+        raise ConfigError("%s.kind must be 'searxng'" % label_prefix)
     endpoint_value = provider_value.get("endpoint")
     if not isinstance(endpoint_value, str) or not endpoint_value.strip():
-        raise ConfigError("configuration.provider.endpoint must be a non-empty URL")
+        raise ConfigError("%s.endpoint must be a non-empty URL" % label_prefix)
     try:
         endpoint_with_fragment = sanitize_url(endpoint_value, keep_fragment=True)
     except WebError as error:
-        raise ConfigError("configuration.provider.endpoint must be a credential-free HTTP(S) URL") from error
+        raise ConfigError(
+            "%s.endpoint must be a credential-free HTTP(S) URL" % label_prefix
+        ) from error
     parsed_endpoint = urlsplit(endpoint_with_fragment)
     if parsed_endpoint.query:
-        raise ConfigError("configuration.provider.endpoint cannot contain a query")
+        raise ConfigError("%s.endpoint cannot contain a query" % label_prefix)
     if parsed_endpoint.fragment:
-        raise ConfigError("configuration.provider.endpoint cannot contain a fragment")
+        raise ConfigError("%s.endpoint cannot contain a fragment" % label_prefix)
     endpoint = sanitize_url(endpoint_with_fragment, keep_fragment=False)
     label = _bounded_label(provider_value.get("label", "SearXNG"))
     allow_private = provider_value.get("allow_private_endpoint", False)
     if not isinstance(allow_private, bool):
-        raise ConfigError("configuration.provider.allow_private_endpoint must be a boolean")
+        raise ConfigError("%s.allow_private_endpoint must be a boolean" % label_prefix)
+    return ProviderConfig(endpoint, label, allow_private, "searxng")
+
+
+def _parse_active_provider(value: Any) -> ProviderConfig:
+    if not isinstance(value, dict):
+        raise ConfigError("configuration.provider must be an object")
+    kind = value.get("kind")
+    if kind == "searxng":
+        return _parse_searxng_provider(value, "configuration.provider")
+    if kind == "brave":
+        provider_value = _object(
+            value,
+            "configuration.provider",
+            ("kind", "label"),
+        )
+        label = _bounded_label(provider_value.get("label", "Brave Search"))
+        return ProviderConfig(BRAVE_SEARCH_ENDPOINT, label, False, "brave")
+    raise ConfigError("configuration.provider.kind must be 'brave' or 'searxng'")
+
+
+def parse_configuration(value: Any) -> Configuration:
+    root = _object(
+        value,
+        "configuration",
+        ("version", "provider", "provider_settings", "limits"),
+    )
+    version = root.get("version")
+    if isinstance(version, bool) or version != CONFIG_VERSION:
+        raise ConfigError("configuration.version must be 1")
+
+    provider = _parse_active_provider(root.get("provider"))
+    settings = _object(
+        root.get("provider_settings", {}),
+        "configuration.provider_settings",
+        ("searxng",),
+    )
+    if "searxng" in settings:
+        _parse_searxng_provider(
+            settings["searxng"],
+            "configuration.provider_settings.searxng",
+        )
 
     limits_value = _object(
         root.get("limits", {}),
@@ -448,7 +656,7 @@ def parse_configuration(value: Any) -> Configuration:
     canonical = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return Configuration(
-        provider=ProviderConfig(endpoint, label, allow_private),
+        provider=provider,
         limits=Limits(
             allowed_domains=allowed_domains,
             default_results=default_results,
@@ -464,6 +672,71 @@ def parse_configuration(value: Any) -> Configuration:
         ),
         fingerprint=fingerprint,
     )
+
+
+def _configuration_value_for_update(path: Path) -> Dict[str, Any]:
+    try:
+        raw = _bounded_regular_file(path)
+    except Disabled:
+        return {"version": CONFIG_VERSION, "limits": {}}
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ConfigError("web search configuration is not valid UTF-8 JSON") from error
+    parse_configuration(value)
+    return copy.deepcopy(value)
+
+
+def select_provider(
+    kind: str,
+    *,
+    path: Optional[Path] = None,
+    searxng_endpoint: Optional[str] = None,
+) -> Configuration:
+    if kind not in ("brave", "searxng"):
+        raise ConfigError("web search provider must be 'brave' or 'searxng'")
+    config_path = default_config_path() if path is None else Path(path)
+    value = _configuration_value_for_update(config_path)
+    current = value.get("provider")
+    settings_value = value.get("provider_settings", {})
+    settings = copy.deepcopy(settings_value) if isinstance(settings_value, dict) else {}
+    if isinstance(current, dict) and current.get("kind") == "searxng":
+        settings["searxng"] = copy.deepcopy(current)
+
+    if kind == "brave":
+        provider: Dict[str, Any] = {"kind": "brave", "label": "Brave Search"}
+    else:
+        saved = settings.get("searxng")
+        if isinstance(current, dict) and current.get("kind") == "searxng":
+            provider = copy.deepcopy(current)
+        elif isinstance(saved, dict):
+            provider = copy.deepcopy(saved)
+        elif searxng_endpoint is not None:
+            provider = {
+                "kind": "searxng",
+                "endpoint": searxng_endpoint,
+                "label": "SearXNG",
+                "allow_private_endpoint": False,
+            }
+        else:
+            raise ConfigError("SearXNG setup needs a search endpoint URL")
+        settings["searxng"] = copy.deepcopy(provider)
+
+    updated: Dict[str, Any] = {
+        "version": CONFIG_VERSION,
+        "provider": provider,
+    }
+    if settings:
+        updated["provider_settings"] = settings
+    limits = value.get("limits")
+    if isinstance(limits, dict) and limits:
+        updated["limits"] = copy.deepcopy(limits)
+    config = parse_configuration(updated)
+    encoded = (json.dumps(updated, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(encoded) > MAX_CONFIG_BYTES:
+        raise ConfigError("web search configuration exceeds 64 KiB")
+    _atomic_write(config_path, encoded, 0o600)
+    return config
 
 
 def _object(value: Any, label: str, fields: Sequence[str]) -> Dict[str, Any]:
@@ -819,6 +1092,7 @@ class HttpClient:
         allowed_ports: Optional[Sequence[int]] = OPEN_PORTS,
         allow_private: bool = False,
         accept: str = "text/html, text/plain;q=0.9, application/xhtml+xml;q=0.8",
+        headers: Optional[Mapping[str, str]] = None,
     ) -> HttpPayload:
         current = sanitize_url(url, keep_fragment=False)
         redirects = 0
@@ -838,6 +1112,7 @@ class HttpClient:
                 deadline=deadline,
                 max_bytes=max_bytes,
                 accept=accept,
+                headers=headers,
             )
             if payload.status not in REDIRECT_STATUSES:
                 return HttpPayload(current, payload.status, payload.headers, payload.body, redirects)
@@ -863,6 +1138,7 @@ class HttpClient:
         deadline: Deadline,
         max_bytes: int,
         accept: str,
+        headers: Optional[Mapping[str, str]],
     ) -> HttpPayload:
         parsed = urlsplit(url)
         host = parsed.hostname or ""
@@ -870,6 +1146,18 @@ class HttpClient:
         target = parsed.path or "/"
         if parsed.query:
             target += "?" + parsed.query
+        request_headers = {
+            "Accept": accept,
+            "Accept-Encoding": "identity",
+            "Connection": "close",
+            "User-Agent": USER_AGENT,
+        }
+        for name, value in (headers or {}).items():
+            if not isinstance(name, str) or not isinstance(value, str):
+                raise ProviderFailed("the provider request headers are invalid")
+            if "\r" in name or "\n" in name or "\r" in value or "\n" in value:
+                raise ProviderFailed("the provider request headers are invalid")
+            request_headers[name] = value
         last_error: Optional[BaseException] = None
         for resolved in addresses:
             deadline.checkpoint()
@@ -885,12 +1173,7 @@ class HttpClient:
                 connection.request(
                     "GET",
                     target,
-                    headers={
-                        "Accept": accept,
-                        "Accept-Encoding": "identity",
-                        "Connection": "close",
-                        "User-Agent": USER_AGENT,
-                    },
+                    headers=request_headers,
                 )
                 response = connection.getresponse()
                 deadline.checkpoint()
@@ -1130,6 +1413,12 @@ def _search_url(endpoint: str, query: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, urlencode(pairs), ""))
 
 
+def _brave_search_url(query: str, count: int) -> str:
+    parsed = urlsplit(BRAVE_SEARCH_ENDPOINT)
+    pairs = (("q", query), ("count", str(count)), ("safesearch", "moderate"))
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(pairs), ""))
+
+
 def _provider_query(query: str, domains: Sequence[str]) -> str:
     if not domains:
         return query
@@ -1140,10 +1429,24 @@ def _provider_query(query: str, domains: Sequence[str]) -> str:
     return combined
 
 
+def _raw_search_results(value: Any, provider_kind: str) -> List[Any]:
+    if not isinstance(value, dict):
+        raise ProviderFailed("the configured provider returned an invalid result shape")
+    if provider_kind == "brave":
+        web = value.get("web")
+        results = web.get("results") if isinstance(web, dict) else None
+    else:
+        results = value.get("results")
+    if not isinstance(results, list):
+        raise ProviderFailed("the configured provider returned an invalid result shape")
+    return results
+
+
 def _normalize_search_results(
     payload: HttpPayload,
     domains: Sequence[str],
     max_results: int,
+    provider_kind: str,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
     media_type, charset = _media_type(payload.headers)
     if media_type not in SEARCH_TYPES:
@@ -1152,13 +1455,12 @@ def _normalize_search_results(
         value = json.loads(_decode_text(payload.body, charset))
     except (json.JSONDecodeError, UnicodeError) as error:
         raise ProviderFailed("the configured provider returned invalid JSON") from error
-    if not isinstance(value, dict) or not isinstance(value.get("results"), list):
-        raise ProviderFailed("the configured provider returned an invalid result shape")
+    raw_results = _raw_search_results(value, provider_kind)
     normalized: List[Dict[str, Any]] = []
     sources: List[Dict[str, Any]] = []
     seen = set()
     dropped = 0
-    for raw in value["results"][: max(MAX_RESULTS * 5, max_results)]:
+    for raw in raw_results[: max(MAX_RESULTS * 5, max_results)]:
         if len(normalized) >= max_results:
             break
         if not isinstance(raw, dict):
@@ -1187,7 +1489,10 @@ def _normalize_search_results(
             if not title:
                 title = host or "Untitled source"
             snippet = _sanitize_search_fragment(
-                raw.get("content") or raw.get("snippet") or "",
+                raw.get("content")
+                or raw.get("description")
+                or raw.get("snippet")
+                or "",
                 MAX_SNIPPET_BYTES,
             )
             result: Dict[str, Any] = {
@@ -1197,12 +1502,20 @@ def _normalize_search_results(
                 "origin": origin_for(url),
                 "snippet": snippet,
             }
-            published = raw.get("publishedDate") or raw.get("published_date") or raw.get("date")
+            published = (
+                raw.get("publishedDate")
+                or raw.get("published_date")
+                or raw.get("page_age")
+                or raw.get("age")
+                or raw.get("date")
+            )
             if published:
                 result["published_at"] = sanitize_text(published, MAX_PUBLICATION_BYTES)
             normalized.append(result)
             engine_values = raw.get("engines")
-            if not isinstance(engine_values, list):
+            if provider_kind == "brave":
+                engine_values = ["Brave Search"]
+            elif not isinstance(engine_values, list):
                 engine_values = [raw.get("engine")] if raw.get("engine") else []
             engines = []
             for engine in engine_values[:8]:
@@ -1215,12 +1528,18 @@ def _normalize_search_results(
     return normalized, sources, dropped
 
 
-def _check_status(payload: HttpPayload, provider: bool) -> None:
+def _check_status(
+    payload: HttpPayload,
+    provider: bool,
+    provider_kind: Optional[str] = None,
+) -> None:
     status = payload.status
     if 200 <= status < 300:
         return
     if status == 429:
         raise RateLimited("the configured search provider is rate limited")
+    if provider_kind == "brave" and status in (401, 403):
+        raise AuthenticationFailed("Brave Search rejected the configured API key")
     if status in (408, 504):
         raise RequestTimedOut("the remote service reached its time limit")
     if provider:
@@ -1238,7 +1557,7 @@ def _cache_key(kind: str, fingerprint: str, value: Mapping[str, Any]) -> str:
 
 
 class WebService:
-    """One configured SearXNG adapter plus bounded public fetch operations."""
+    """One selected search provider plus bounded public fetch operations."""
 
     def __init__(self, http: Optional[HttpClient] = None, cache: Optional[BoundedCache] = None) -> None:
         self.http = http or HttpClient()
@@ -1256,6 +1575,7 @@ class WebService:
         domains: Any = None,
         max_results: Any = None,
         timeout_seconds: Any = None,
+        api_key: Optional[str] = None,
         cancellation: Any = None,
         progress: Optional[Callable[[str, Optional[int], Optional[int], Optional[str]], None]] = None,
     ) -> Dict[str, Any]:
@@ -1266,10 +1586,24 @@ class WebService:
             max_results, config.limits.default_results, 1, MAX_RESULTS, "max_results"
         )
         timeout = bounded_timeout(timeout_seconds, config.limits.default_timeout_seconds)
+        validated_api_key: Optional[str] = None
+        credential_scope: Optional[str] = None
+        if config.provider.kind == "brave":
+            if api_key is None:
+                raise CredentialRequired(
+                    "Brave Search needs an API key; get one at %s" % BRAVE_SEARCH_KEY_URL
+                )
+            validated_api_key = validate_brave_api_key(api_key)
+            credential_scope = hashlib.sha256(validated_api_key.encode("ascii")).hexdigest()
         key = _cache_key(
             "search",
             config.fingerprint,
-            {"query": clean_query, "domains": selected_domains, "results": result_limit},
+            {
+                "query": clean_query,
+                "domains": selected_domains,
+                "results": result_limit,
+                "credential_scope": credential_scope,
+            },
         )
         cached = self.cache.get(key)
         if cached is not None:
@@ -1279,22 +1613,35 @@ class WebService:
             progress("searching", 0, result_limit, "results")
         deadline = Deadline(timeout, cancellation)
         provider_query = _provider_query(clean_query, selected_domains)
-        endpoint = _search_url(config.provider.endpoint, provider_query)
+        request_headers: Optional[Mapping[str, str]] = None
+        max_redirects = config.limits.max_redirects
+        if config.provider.kind == "brave":
+            assert validated_api_key is not None
+            endpoint = _brave_search_url(provider_query, result_limit)
+            request_headers = {"X-Subscription-Token": validated_api_key}
+            # Never forward a credential across even a same-origin redirect.
+            max_redirects = 0
+        else:
+            endpoint = _search_url(config.provider.endpoint, provider_query)
         provider_host = urlsplit(config.provider.endpoint).hostname or ""
         payload = self.http.fetch(
             endpoint,
             deadline=deadline,
             max_bytes=config.limits.max_provider_bytes,
-            max_redirects=config.limits.max_redirects,
+            max_redirects=max_redirects,
             allowed_domains=(provider_host,),
             allowed_ports=None,
             allow_private=config.provider.allow_private_endpoint,
             accept="application/json",
+            headers=request_headers,
         )
-        _check_status(payload, provider=True)
+        _check_status(payload, provider=True, provider_kind=config.provider.kind)
         deadline.checkpoint()
         results, sources, dropped = _normalize_search_results(
-            payload, selected_domains, result_limit
+            payload,
+            selected_domains,
+            result_limit,
+            config.provider.kind,
         )
         if progress:
             progress("normalizing", len(results), result_limit, "results")
@@ -1307,7 +1654,8 @@ class WebService:
             "sources": sources,
             "result_count": len(results),
             "normalized_bytes": normalized_bytes,
-            "truncated": dropped > 0 or len(value_results(payload)) > len(results),
+            "truncated": dropped > 0
+            or len(value_results(payload, config.provider.kind)) > len(results),
             "dropped_results": dropped,
             "cache": "miss",
             "redirects": payload.redirects,
@@ -1434,12 +1782,11 @@ class WebService:
         }
 
 
-def value_results(payload: HttpPayload) -> List[Any]:
+def value_results(payload: HttpPayload, provider_kind: str = "searxng") -> List[Any]:
     """Best-effort raw result count used only for truncation metadata."""
 
     try:
         value = json.loads(payload.body.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError):
+        return _raw_search_results(value, provider_kind)
+    except (UnicodeError, json.JSONDecodeError, ProviderFailed):
         return []
-    results = value.get("results") if isinstance(value, dict) else None
-    return results if isinstance(results, list) else []

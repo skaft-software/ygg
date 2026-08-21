@@ -8,7 +8,10 @@ trap 'rm -rf "$work_directory"' EXIT
 assets="$work_directory/assets"
 fake_bin="$work_directory/fake-bin"
 installer="$work_directory/install-ygg.sh"
-package="ygg-0.5.0-aarch64-apple-darwin"
+version=0.6.0-dev
+identity_version=${version//./\\.}
+expected_identity="^https://github\\.com/skaft-software/ygg/\\.github/workflows/release-ygg\\.yml@refs/tags/(v${identity_version}|ygg-binaries-v${identity_version})$"
+package="ygg-$version-aarch64-apple-darwin"
 archive_name="$package.tar.gz"
 release_commit=0123456789abcdef0123456789abcdef01234567
 mkdir -p "$assets" "$fake_bin"
@@ -29,7 +32,7 @@ if [ "${YGG_TEST_BAD_SIGNATURE:-0}" = 1 ]; then
 fi
 [ "${1:-}" = verify-blob ] || exit 2
 shift
-identity='^https://github\.com/skaft-software/ygg/\.github/workflows/release-ygg\.yml@refs/tags/(v0\.5\.0|ygg-binaries-v0\.5\.0)$'
+identity=${YGG_TEST_EXPECTED_IDENTITY:?}
 expected_sha=0123456789abcdef0123456789abcdef01234567
 saw_bundle=false
 saw_identity=false
@@ -132,7 +135,7 @@ files = {
     "README.md": b"# Ygg\n",
     "ygg": b'''#!/bin/sh
 case "${1:-}" in
-    --version) printf '%s\\n' 'ygg 0.5.0' ;;
+    --version) printf '%s\\n' 'ygg 0.6.0-dev' ;;
     --help) printf '%s\\n' 'fake Ygg help' ;;
     *) exit 0 ;;
 esac
@@ -141,7 +144,7 @@ esac
 IFS= read -r request
 case "$request" in
     *'"request_id":"installer-probe"'*)
-        printf '%s\\n' '{"protocol_version":1,"request_id":"installer-probe","seq":1,"type":"hello","data":{"sdk_version":"0.5.0"}}'
+        printf '%s\\n' '{"protocol_version":1,"request_id":"installer-probe","seq":1,"type":"hello","data":{"sdk_version":"0.6.0-dev"}}'
         ;;
     *) exit 2 ;;
 esac
@@ -233,8 +236,8 @@ PY
     {
         printf '%064d  ./install-ygg.sh\n' 0
         printf '%s  ./%s\n' "$(sha256_file "$assets/$archive_name")" "$archive_name"
-        printf '%064d  ./ygg-0.5.0-x86_64-apple-darwin.tar.gz\n' 0
-        printf '%064d  ./ygg-0.5.0-x86_64-unknown-linux-gnu.tar.gz\n' 0
+        printf '%064d  ./ygg-0.6.0-dev-x86_64-apple-darwin.tar.gz\n' 0
+        printf '%064d  ./ygg-0.6.0-dev-x86_64-unknown-linux-gnu.tar.gz\n' 0
     } > "$assets/YGG_SHA256SUMS"
 }
 
@@ -285,12 +288,12 @@ while [ "$#" -gt 0 ]; do
 done
 name=${url##*/}
 source="$YGG_TEST_ASSETS/$name"
-if [ "${YGG_TEST_HARDLINK_ARCHIVE:-0}" = 1 ] && [ "$name" = ygg-0.5.0-aarch64-apple-darwin.tar.gz ]; then
+if [ "${YGG_TEST_HARDLINK_ARCHIVE:-0}" = 1 ] && [ "$name" = ygg-0.6.0-dev-aarch64-apple-darwin.tar.gz ]; then
     ln "$source" "$output"
 else
     cp "$source" "$output"
 fi
-if [ "${YGG_TEST_TAMPER_ARCHIVE:-0}" = 1 ] && [ "$name" = ygg-0.5.0-aarch64-apple-darwin.tar.gz ]; then
+if [ "${YGG_TEST_TAMPER_ARCHIVE:-0}" = 1 ] && [ "$name" = ygg-0.6.0-dev-aarch64-apple-darwin.tar.gz ]; then
     printf 'tampered' >> "$output"
 fi
 if [ "${YGG_TEST_TAMPER_COSIGN:-0}" = 1 ] && [ "$name" = cosign-darwin-arm64 ]; then
@@ -316,6 +319,7 @@ run_installer() {
         YGG_NO_MODIFY_PATH=1 \
         YGG_TEST_ASSETS="$assets" \
         YGG_TEST_COSIGN_LOG="$work_directory/cosign.log" \
+        YGG_TEST_EXPECTED_IDENTITY="$expected_identity" \
         "$@" \
         sh "$installer"
 }
@@ -341,12 +345,13 @@ test -x "$positive_home/bin/ygg"
 test -x "$positive_home/bin/ygg-host"
 printf '%s\n' '{"protocol_version":1,"request_id":"installer-probe","command":"hello"}' \
     | "$positive_home/bin/ygg-host" \
-    | grep -F '"sdk_version":"0.5.0"' >/dev/null
-test "$("$positive_home/bin/ygg" --version)" = 'ygg 0.5.0'
+    | grep -F '"sdk_version":"0.6.0-dev"' >/dev/null
+test "$("$positive_home/bin/ygg" --version)" = 'ygg 0.6.0-dev'
 test -f "$positive_home/share/ygg/README.md"
 test -f "$positive_home/share/ygg/docs/index.md"
 test -f "$positive_home/share/ygg/examples/README.md"
 test -f "$positive_home/share/ygg/sdk/README.md"
+test "$(cat "$positive_home/share/ygg/.ygg-version")" = "$version"
 grep -Fx verified "$work_directory/cosign.log" >/dev/null
 
 upgrade_home="$work_directory/upgrade-home"
@@ -368,15 +373,16 @@ printf '%s\n' 'keep config' > "$upgrade_home/.ygg/config.toml"
 printf '%s\n' 'keep session' > "$upgrade_home/.ygg/sessions/session.jsonl"
 printf '%s\n' 'remove old docs' > "$upgrade_home/share/ygg/docs/old.md"
 run_installer "$upgrade_home" > "$work_directory/upgrade.out"
-test "$("$upgrade_home/bin/ygg" --version)" = 'ygg 0.5.0'
+test "$("$upgrade_home/bin/ygg" --version)" = 'ygg 0.6.0-dev'
 printf '%s\n' '{"protocol_version":1,"request_id":"installer-probe","command":"hello"}' \
     | "$upgrade_home/bin/ygg-host" \
-    | grep -F '"sdk_version":"0.5.0"' >/dev/null
+    | grep -F '"sdk_version":"0.6.0-dev"' >/dev/null
 grep -Fx 'keep helper' "$upgrade_home/bin/unrelated-helper" >/dev/null
 grep -Fx 'keep config' "$upgrade_home/.ygg/config.toml" >/dev/null
 grep -Fx 'keep session' "$upgrade_home/.ygg/sessions/session.jsonl" >/dev/null
 test ! -e "$upgrade_home/share/ygg/docs/old.md"
 test -f "$upgrade_home/share/ygg/docs/index.md"
+test "$(cat "$upgrade_home/share/ygg/.ygg-version")" = "$version"
 
 override_home="$work_directory/override-home"
 override_data="$work_directory/override-data"

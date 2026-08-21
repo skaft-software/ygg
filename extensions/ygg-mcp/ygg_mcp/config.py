@@ -213,8 +213,11 @@ def _read_json_file(path: Path) -> tuple[dict[str, Any], bytes, Path]:
         raise ConfigError("cannot resolve MCP configuration directory") from error
     canonical_path = canonical_parent / path.name
     descriptor = _open_regular_descriptor(canonical_path)
+    metadata = os.fstat(descriptor)
     data = _read_config_descriptor(descriptor)
-    return _decode_json_config(data), data, canonical_path
+    decoded = _decode_json_config(data)
+    _validate_sensitive_config_permissions(metadata, decoded)
+    return decoded, data, canonical_path
 
 
 def _read_project_json_file(
@@ -252,6 +255,7 @@ def _read_project_json_file(
             current = _open_directory_descriptor(component, directory_fd=current)
             directories.append(current)
         descriptor = _open_regular_descriptor(relative.parts[-1], directory_fd=current)
+        metadata = os.fstat(descriptor)
         data = _read_config_descriptor(descriptor)
     finally:
         for directory in reversed(directories):
@@ -260,7 +264,9 @@ def _read_project_json_file(
             except OSError:
                 pass
     canonical_path = project_root.joinpath(*relative.parts)
-    return _decode_json_config(data), data, canonical_path
+    decoded = _decode_json_config(data)
+    _validate_sensitive_config_permissions(metadata, decoded)
+    return decoded, data, canonical_path
 
 
 def _open_directory_descriptor(
@@ -342,6 +348,27 @@ def _validate_config_metadata(metadata: os.stat_result) -> None:
         raise ConfigError("MCP configuration must be owned by the current user")
     if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
         raise ConfigError("MCP configuration cannot be group- or world-writable")
+
+
+def _validate_sensitive_config_permissions(
+    metadata: os.stat_result, value: Mapping[str, Any]
+) -> None:
+    if not hasattr(os, "getuid"):
+        return
+    servers = value.get("servers")
+    if not isinstance(servers, Mapping):
+        return
+    has_explicit_environment = any(
+        isinstance(descriptor, Mapping)
+        and isinstance(descriptor.get("env"), Mapping)
+        and bool(descriptor["env"])
+        for descriptor in servers.values()
+    )
+    if has_explicit_environment and metadata.st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ConfigError(
+            "MCP configuration with explicit environment values must not be accessible "
+            "by group or other users"
+        )
 
 
 def _read_config_descriptor(descriptor: int) -> bytes:
