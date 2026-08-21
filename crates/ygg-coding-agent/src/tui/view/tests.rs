@@ -6878,6 +6878,12 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
     assert!(block.contains("Read release history"), "{block}");
     assert!(block.contains("Audit release surface"), "{block}");
     assert!(block.contains("failed"), "{block}");
+    // Live tool-call and token/cost telemetry must render in the transcript
+    // event, matching the composer chrome strip.
+    assert!(block.contains("4 calls"), "{block}");
+    assert!(block.contains("12.8k"), "{block}");
+    assert!(block.contains("↓220") || block.contains("out 220"), "{block}");
+    assert!(block.contains("$0.007"), "{block}");
     assert!(
         block.contains("provider request failed: upstream unavailable")
             || shell

@@ -89,6 +89,30 @@ fn render_subagent_activity_panel(
                 "{calls} call{}",
                 if calls == 1 { "" } else { "s" }
             ));
+            // Live token and cost telemetry, matching the composer chrome
+            // strip. Input buckets all occupy context, so cache reads and
+            // writes are folded into the prompt-side count.
+            let input = child
+                .input_tokens
+                .saturating_add(child.cache_read_tokens)
+                .saturating_add(child.cache_write_tokens);
+            if unicode {
+                detail.push_str(&format!(
+                    " · ↑{} ↓{}",
+                    crate::tui::composer_surface::compact_token_count(input),
+                    crate::tui::composer_surface::compact_token_count(child.output_tokens),
+                ));
+            } else {
+                detail.push_str(&format!(
+                    " · in {} out {}",
+                    crate::tui::composer_surface::compact_token_count(input),
+                    crate::tui::composer_surface::compact_token_count(child.output_tokens),
+                ));
+            }
+            if let Some(cost) = child.cost_microdollars {
+                detail.push_str(if unicode { " • " } else { " - " });
+                detail.push_str(&crate::tui::composer_surface::format_microdollars(cost));
+            }
             lines.push(fit_line(
                 &format!(
                     "  {} {} {}",

@@ -5263,6 +5263,26 @@ impl Agent {
                                                 }
                                             }
                                         },
+                                        snapshot = async {
+                                            match &mut delegation_telemetry {
+                                                Some(receiver) => receiver.recv().await,
+                                                None => std::future::pending().await,
+                                            }
+                                        }, if delegation_telemetry.is_some() => {
+                                            // Keep delegated-worker telemetry
+                                            // flowing while a long root tool is
+                                            // executing, not only while the root
+                                            // streams from the provider.
+                                            match snapshot {
+                                                Some(snapshot) => {
+                                                    let event =
+                                                        AgentEvent::DelegationUpdated { snapshot };
+                                                    notify_observers(&observers, &event);
+                                                    yield event;
+                                                }
+                                                None => delegation_telemetry = None,
+                                            }
+                                        },
                                     }
                                 };
                                 let result = match outcome {
