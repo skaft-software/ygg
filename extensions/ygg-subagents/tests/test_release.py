@@ -25,7 +25,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIsNotNone(tomllib)
         manifest = tomllib.loads((ROOT / "extension.toml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "ygg-subagents")
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"], "0.2.0")
         self.assertEqual(manifest["api_version"], "0.2")
         self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-subagents")
@@ -34,7 +34,13 @@ class ReleaseTests(unittest.TestCase):
         self.assertFalse(manifest["capabilities"]["network"])
         self.assertEqual(
             manifest["contributes"]["tools"],
-            ["subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop"],
+            [
+                "subagent_spawn",
+                "subagent_status",
+                "subagent_wait",
+                "subagent_stop",
+                "subagent_continue",
+            ],
         )
         self.assertEqual(manifest["contributes"]["commands"], ["subagents"])
         self.assertTrue(manifest["contributes"]["presentation"])
@@ -99,7 +105,7 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_archive_has_one_regular_portable_root(self):
         with tempfile.TemporaryDirectory() as directory:
-            archive = Path(directory) / "ygg-subagents-0.1.0.tar.gz"
+            archive = Path(directory) / "ygg-subagents-0.2.0.tar.gz"
             with tarfile.open(archive, "w:gz") as bundle:
                 for path in sorted(ROOT.rglob("*")):
                     if "__pycache__" in path.parts or ".pytest_cache" in path.parts:
@@ -148,13 +154,21 @@ class ReleaseTests(unittest.TestCase):
             fixture["installed_bundle"]["workspace_file_sha256"],
         )
 
-    def test_packaged_skill_is_explicit_read_only_and_non_recursive(self):
+    def test_packaged_skill_documents_default_read_only_scope_granted_writers_and_non_recursive(self):
         skill = (ROOT / "skills" / "ygg-subagents" / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill.startswith("---\n"))
-        for tool in ("subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop"):
+        for tool in (
+            "subagent_spawn",
+            "subagent_status",
+            "subagent_wait",
+            "subagent_stop",
+            "subagent_continue",
+        ):
             self.assertIn("  - %s" % tool, skill)
         self.assertIn("read-only", skill)
-        self.assertIn("V1 has no writer profile", skill)
+        self.assertNotIn("V1 has no writer profile", skill)
+        self.assertIn("8 concurrent", skill)
+        self.assertIn("32 total per owner", skill)
         self.assertIn("shared filesystem is not isolation", skill)
         self.assertIn("Do not use this skill to create team chat", skill)
 
@@ -190,7 +204,7 @@ class ReleaseTests(unittest.TestCase):
         for required in (
             "Explicitly enable and trust",
             "shared cwd/filesystem is **not isolation**",
-            "There is no writer profile in V1",
+            "There is no dedicated writer profile in V1",
             "host-owned `agent_sessions` service",
             "completion mailbox claim/ack",
             "presentation/update",

@@ -22,6 +22,8 @@ class ServiceResponder:
         self.client = self.host.client()
         self.reverse = []
         self.ignore_wait = False
+        self.steers = self.host.steers
+        self.follow_ups = self.host.follow_ups
 
     def __call__(self, message):
         method = message.get("method")
@@ -41,6 +43,10 @@ class ServiceResponder:
             result = self.client.wait_agents(**params)
         elif method == "agent/interrupt":
             result = self.client.interrupt_agent(params["target"])
+        elif method == "agent/message":
+            result = self.client.send_agent_message(params["target"], params["message"])
+        elif method == "agent/follow_up":
+            result = self.client.follow_up_agent(params["target"], params["message"])
         else:
             raise AssertionError("unexpected reverse method %s" % method)
         return {"jsonrpc": "2.0", "id": message["id"], "result": result}
@@ -62,7 +68,13 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(result["api_version"], "0.2")
         self.assertEqual(
             [tool["name"] for tool in result["tools"]],
-            ["subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop"],
+            [
+                "subagent_spawn",
+                "subagent_status",
+                "subagent_wait",
+                "subagent_stop",
+                "subagent_continue",
+            ],
         )
         self.assertEqual([command["name"] for command in result["commands"]], ["subagents"])
         self.assertEqual(
@@ -112,12 +124,12 @@ class RuntimeProtocolTests(unittest.TestCase):
             {
                 "tools": ["read", "search"],
                 "max_depth": 1,
-                "max_concurrent_children": 2,
-                "max_turns": 8,
+                "max_concurrent_children": 8,
+                "max_turns": None,
                 "max_tokens": None,
-                "max_cost_microdollars": 200000,
+                "max_cost_microdollars": None,
                 "max_output_bytes": 8192,
-                "timeout_ms": 300000,
+                "timeout_ms": None,
             },
         )
         self.assertIn("Use only these exact requested tools: read, search", calls[0]["params"]["message"])
@@ -209,6 +221,89 @@ class RuntimeProtocolTests(unittest.TestCase):
         terminal = presentations[-1]["params"]["snapshot"]
         self.assertNotIn("The owner tests cover", terminal["collection"]["nodes"][0]["secondary"])
         self.assertIn("The owner tests cover", terminal["collection"]["detail"]["body"])
+
+    def test_continue_steers_active_worker_and_resumes_terminal_worker(self):
+        self.running.start()
+        self.running.reader.feed(
+            rpc_request(
+                30,
+                "tool/call",
+                {
+                    "name": "subagent_spawn",
+                    "arguments": {"name": "audit", "task": "Audit the extension."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        self.running.writer.wait_for(lambda message: message.get("id") == 30)
+        self.running.reader.feed(
+            rpc_request(
+                31,
+                "tool/call",
+                {
+                    "name": "subagent_continue",
+                    "arguments": {"target": "agent-1", "message": "Adjust scope: also check docs/."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        steered = self.running.writer.wait_for(lambda message: message.get("id") == 31)
+        self.assertFalse(steered["result"]["is_error"])
+        self.assertEqual(steered["result"]["metadata"]["action"], "steered")
+        self.assertTrue(steered["result"]["metadata"]["accepted"])
+        self.assertEqual(self.responder.steers, [("agent-1", "Adjust scope: also check docs/.")])
+        self.assertEqual(self.responder.follow_ups, [])
+
+        self.responder.host.complete("agent-1", "The audit is complete.", turns=3, artifacts=[])
+        self.running.reader.feed(
+            rpc_request(
+                32,
+                "tool/call",
+                {
+                    "name": "subagent_continue",
+                    "arguments": {"target": "agent-1", "message": "Follow up: also inspect the config."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        resumed = self.running.writer.wait_for(lambda message: message.get("id") == 32)
+        self.assertFalse(resumed["result"]["is_error"])
+        self.assertEqual(resumed["result"]["metadata"]["action"], "resumed")
+        self.assertTrue(resumed["result"]["metadata"]["accepted"])
+        self.assertEqual(self.responder.follow_ups, [("agent-1", "Follow up: also inspect the config.")])
+        self.assertEqual(self.responder.steers, [("agent-1", "Adjust scope: also check docs/.")])
+
+    def test_continue_rejects_orphaned_worker_with_stable_error(self):
+        self.running.start()
+        self.running.reader.feed(
+            rpc_request(
+                40,
+                "tool/call",
+                {
+                    "name": "subagent_spawn",
+                    "arguments": {"name": "audit", "task": "Audit the extension."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        self.running.writer.wait_for(lambda message: message.get("id") == 40)
+        self.responder.host.shut_down()
+        self.running.reader.feed(
+            rpc_request(
+                41,
+                "tool/call",
+                {
+                    "name": "subagent_continue",
+                    "arguments": {"target": "agent-1", "message": "Keep going."},
+                    "context": tool_context(),
+                },
+            )
+        )
+        response = self.running.writer.wait_for(lambda message: message.get("id") == 41)
+        self.assertTrue(response["result"]["is_error"])
+        self.assertEqual(response["result"]["metadata"]["code"], "orphaned")
+        self.assertEqual(self.responder.steers, [])
+        self.assertEqual(self.responder.follow_ups, [])
 
     def test_missing_agent_sessions_feature_fails_tool_without_reverse_request(self):
         initialized = self.running.start(initialize_request(agent_sessions=False))

@@ -21,6 +21,16 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Added a native `/subagents` worker browser with arrow-key selection,
   owner-bound authoritative live refresh, stable-ID focus, and scrollable,
   owner-authorized read-only delegated transcripts.
+- Added `subagent_continue` to the first-party `ygg-subagents` extension:
+  it steers an active worker through `agent/message` or resumes a settled
+  worker as a new run of its durable session through `agent/follow_up`. A
+  resumed worker keeps its conversation context, and the host clears the
+  stale completion timestamp and re-anchors an elapsed wall deadline so the
+  new run owns a fresh budget.
+- Workers in `ygg-subagents` can now be granted `edit`, `write`, and `bash`
+  per spawn through the spawn `tools` list. The host's scoped tool snapshot
+  is the enforcement boundary; the default remains the read-only
+  `read`/`search` pair.
 - Cargo-installed binaries now embed the text documentation and materialize a
   versioned `share/ygg/` tree that refreshes after Cargo-channel updates.
 
@@ -38,6 +48,22 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Removed the fixed aggregate subagent token/cost reservation pool. First-party
   children now have fresh contexts and inherit the parent's context/output and
   optional session-token settings exactly; an unlimited parent remains unlimited.
+- Raised first-party subagent limits from 2 active/16 retained children per
+  owner to 8 active/32 retained, with explicit ceilings of 256 turns,
+  50,000,000 microdollars, and 24 hours of wall time.
+- Made per-child turn, cost, and wall-time ceilings optional in
+  `agent/spawn.policy`: `null` (or omitted) inherits the parent session's
+  ceiling, so an unlimited parent policy with no ceiling produces an unlimited
+  child.
+- Reworked the TUI composer-adjacent subagent activity strip: it appears only
+  while workers are pending or running, uses `•`/`└` glyphs with model-matched
+  colours, and `Ctrl+O` expands it from the two to the five most recent
+  workers while it is visible (falling back to the verbose tool-output toggle
+  only when no strip is shown).
+- `agent/follow_up` on a settled extension child is now a resume instead of a
+  rejection: the child's persistent worker task and durable transcript survive
+  between runs, the stale completion timestamp is cleared, and an elapsed wall
+  deadline is re-anchored from the child's requested timeout.
 
 ### Fixed
 

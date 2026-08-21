@@ -1,8 +1,8 @@
 name = "ygg-subagents"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.2"
 requires_ygg = "=0.6.0-dev"
-description = "Bounded Claude Code-like background workers over host-owned Ygg agent sessions"
+description = "Claude Code-like background workers over host-owned Ygg agent sessions, with per-spawn mutation grants and continue/resume"
 
 [entrypoint]
 command = "ygg-subagents"
@@ -17,7 +17,7 @@ process = false
 network = false
 
 [contributes]
-tools = ["subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop"]
+tools = ["subagent_spawn", "subagent_status", "subagent_wait", "subagent_stop", "subagent_continue"]
 commands = ["subagents"]
 ui = ["status"]
 presentation = true

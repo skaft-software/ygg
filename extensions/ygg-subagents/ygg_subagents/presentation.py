@@ -127,9 +127,14 @@ def worker_references(worker: Worker) -> List[Dict[str, Any]]:
 def worker_secondary(worker: Worker, now_ms: int) -> str:
     state = STATE_LABEL.get(worker.state, safe_label(worker.state))
     phase = safe_label(worker.current_tool or worker.phase or state)
-    turns = "?/%d turns" % worker.max_turns
-    if worker.turn_count is not None:
-        turns = "%d/%d turns" % (worker.turn_count, worker.max_turns)
+    if worker.max_turns is None:
+        turns = "%s turns, no ceiling" % (
+            worker.turn_count if worker.turn_count is not None else "?"
+        )
+    else:
+        turns = "?/%d turns" % worker.max_turns
+        if worker.turn_count is not None:
+            turns = "%d/%d turns" % (worker.turn_count, worker.max_turns)
     if worker.max_tokens is None:
         tokens = "%s tok · inherited no ceiling" % (
             worker.tokens_used if worker.tokens_used is not None else "?"
@@ -138,10 +143,13 @@ def worker_secondary(worker: Worker, now_ms: int) -> str:
         tokens = "?/%d tok" % worker.max_tokens
         if worker.tokens_used is not None:
             tokens = "%d/%d tok" % (worker.tokens_used, worker.max_tokens)
-    cost = "%s/%s" % (
-        cost_label(worker.cost_microdollars),
-        cost_label(worker.max_cost_microdollars),
-    )
+    if worker.max_cost_microdollars is None:
+        cost = "%s / no ceiling" % cost_label(worker.cost_microdollars)
+    else:
+        cost = "%s/%s" % (
+            cost_label(worker.cost_microdollars),
+            cost_label(worker.max_cost_microdollars),
+        )
     restart = " · restarted" if worker.recovered else ""
     tool_calls = "%d tool call%s" % (
         worker.tool_call_count,
@@ -180,8 +188,17 @@ def detail_body(worker: Worker, now_ms: int) -> str:
         "Elapsed: %s" % duration_label(worker.elapsed_ms(now_ms)),
         "Model/profile: %s (inherited) / %s" % (worker.effective_model, worker.profile),
         "Current phase/tool: %s" % safe_label(worker.current_tool or worker.phase),
-        "Requested tool policy: read-only [%s]" % tools,
-        "Turn use: %s / %d" % (worker.turn_count if worker.turn_count is not None else "not exposed", worker.max_turns),
+        "Requested tool policy: %s"
+        % (
+            "read-only [%s]" % tools
+            if worker.read_only
+            else "granted mutation scope [%s]" % tools
+        ),
+        "Turn use: %s / %s"
+        % (
+            worker.turn_count if worker.turn_count is not None else "not exposed",
+            "unlimited" if worker.max_turns is None else worker.max_turns,
+        ),
         "Tool calls: %d" % worker.tool_call_count,
         "Token use: %s / %s" % (token_use, token_limit),
         "Token buckets: input %s + cache read %s + cache write %s; output %s (reasoning %s)."
@@ -192,8 +209,27 @@ def detail_body(worker: Worker, now_ms: int) -> str:
             worker.output_tokens if worker.output_tokens is not None else "not exposed",
             worker.reasoning_tokens if worker.reasoning_tokens is not None else "not exposed",
         ),
-        "Cost use: %s / %d microdollars" % (worker.cost_microdollars if worker.cost_microdollars is not None else "not exposed", worker.max_cost_microdollars),
-        "Wall deadline: %d ms Unix time (%d second request)" % (worker.deadline_at_ms, worker.timeout_seconds),
+        "Cost use: %s / %s microdollars"
+        % (
+            worker.cost_microdollars
+            if worker.cost_microdollars is not None
+            else "not exposed",
+            "unlimited"
+            if worker.max_cost_microdollars is None
+            else worker.max_cost_microdollars,
+        ),
+        "Wall deadline: %s"
+        % (
+            "not set (the host enforces no wall deadline)"
+            if worker.deadline_at_ms is None
+            else "%d ms Unix time%s"
+            % (
+                worker.deadline_at_ms,
+                ""
+                if worker.timeout_seconds is None
+                else " (%d second request)" % worker.timeout_seconds,
+            )
+        ),
         "Cwd/workspace: inherited from the parent Ygg session.",
         "Sandbox/approval/environment/extensions: inherited and host-enforced; API 0.2 agent_sessions does not expose exact values to this view.",
         "Isolation: the cwd/filesystem may be shared and is not an isolation boundary.",

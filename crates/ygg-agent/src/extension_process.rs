@@ -1734,24 +1734,34 @@ pub struct ToolCatalogUpdateResponse {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSessionPolicy {
-    /// Requested upper-bound tool allowlist. V1 accepts only `read`/`search`.
+    /// Requested upper-bound tool allowlist. Accepted standard tools are
+    /// `read`, `search`, `edit`, `write`, and `bash`.
     pub tools: Vec<String>,
     /// Maximum absolute delegation depth. V1 requires one.
     pub max_depth: usize,
-    /// Maximum active children for this principal/owner. V1 caps this at two.
+    /// Maximum active children for this principal/owner. The host caps this
+    /// at eight.
     pub max_concurrent_children: usize,
-    /// Maximum model turns in the child run.
-    pub max_turns: u64,
+    /// Maximum model turns in the child run. `None` inherits the parent
+    /// session limit exactly (unlimited parents stay unlimited).
+    #[serde(default)]
+    pub max_turns: Option<u64>,
     /// Optional cumulative provider-token ceiling. `None` inherits the parent
     /// session setting, including an unlimited parent.
     #[serde(default)]
     pub max_tokens: Option<u64>,
-    /// Maximum cumulative priced session cost.
-    pub max_cost_microdollars: u64,
+    /// Optional hard cumulative priced-session cost ceiling in whole
+    /// microdollars. `None` removes the child-specific ceiling; the parent
+    /// session ceiling still applies.
+    #[serde(default)]
+    pub max_cost_microdollars: Option<u64>,
     /// Maximum UTF-8 bytes returned as the child summary.
     pub max_output_bytes: usize,
-    /// Absolute wall duration from successful spawn admission.
-    pub timeout_ms: u64,
+    /// Optional hard wall-clock duration from successful spawn admission, in
+    /// milliseconds. `None` runs without a wall-clock kill; explicit values
+    /// are capped at 24 hours.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl From<AgentSessionPolicy> for ExtensionAgentSessionPolicy {
@@ -11518,9 +11528,19 @@ command = "ygg-subagents"
             .unwrap_err()
             .contains("max_tokens"));
 
-        let mut invalid = policy;
-        invalid.tools.push("write".into());
-        assert!(invalid.validate().unwrap_err().contains("read and search"));
+        let mut invalid = policy.clone();
+        invalid.tools.push("browser".into());
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .contains("duplicate-free subset of read, search, edit, write, and bash"));
+
+        let mut elevated = policy.clone();
+        elevated.tools = vec!["read".into(), "bash".into()];
+        assert!(
+            elevated.validate().is_ok(),
+            "standard mutating tools are admissible child tools"
+        );
     }
 
     #[test]

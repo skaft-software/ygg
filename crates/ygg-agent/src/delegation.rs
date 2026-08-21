@@ -44,7 +44,24 @@ const MAX_QUEUED_FOLLOW_UPS: usize = COMMAND_CHANNEL_CAPACITY;
 const MAX_QUEUED_FOLLOW_UP_BYTES: usize =
     (COMMAND_CHANNEL_CAPACITY + 1) * MAX_PROVENANCE_TEXT_BYTES;
 const MAX_TOOL_TIMEOUT_MS: u64 = 3_600_000;
-const MAX_EXTENSION_ACTIVE_CHILDREN: usize = 2;
+/// Extension children share one host permit pool; eight active workers leave
+/// headroom for root-side native children as well.
+const MAX_EXTENSION_ACTIVE_CHILDREN: usize = 8;
+/// Bounded history retained per extension resource owner.
+const MAX_EXTENSION_OWNED_CHILDREN: usize = 32;
+/// Per-run turn budgets may be set up to 256 turns; `None` inherits the
+/// parent session limit exactly (unlimited parents stay unlimited).
+const MAX_EXTENSION_TURNS: u64 = 256;
+/// Explicit child cost ceilings may be set up to $50; `None` removes the
+/// child-specific ceiling while the parent session ceiling still applies.
+const MAX_EXTENSION_COST_MICRODOLLARS: u64 = 50_000_000;
+/// Optional hard worker wall clock up to 24 hours; `None` runs without a
+/// wall-clock kill (workers can still be interrupted or stopped).
+const MAX_EXTENSION_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1_000;
+/// Standard tools an extension child may hold. Read/search workers are the
+/// conservative default; edit/write/bash workers inherit the parent session's
+/// approval policy through the shared effect broker.
+const EXTENSION_CHILD_TOOLS: [&str; 5] = ["read", "search", "edit", "write", "bash"];
 /// Host-reserved names installed by V2 collaboration overlays.
 pub const COLLABORATION_TOOL_NAMES: [&str; 6] = [
     "spawn_agent",
@@ -170,9 +187,9 @@ pub struct DelegationLimits {
 impl Default for DelegationLimits {
     fn default() -> Self {
         Self {
-            max_concurrent_agents: 4,
+            max_concurrent_agents: 10,
             max_depth: 2,
-            max_total_agents: 16,
+            max_total_agents: 32,
         }
     }
 }
@@ -318,29 +335,51 @@ pub(crate) struct DelegationBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ExtensionAgentSessionPolicy {
+    /// Child tool scope: a non-empty duplicate-free subset of the standard
+    /// tools `read`, `search`, `edit`, `write`, and `bash`.
     pub(crate) tools: Vec<String>,
+    /// Child depth relative to the root; extension children are exactly one.
     pub(crate) max_depth: usize,
+    /// Maximum active children this owner may hold; host cap is eight.
     pub(crate) max_concurrent_children: usize,
-    pub(crate) max_turns: u64,
+    /// Child turn budget. `None` inherits the parent session limit exactly
+    /// (unlimited parents stay unlimited).
+    #[serde(default)]
+    pub(crate) max_turns: Option<u64>,
+    /// Optional child token ceiling. `None` inherits the parent session
+    /// limit exactly (unlimited parents stay unlimited).
+    #[serde(default)]
     pub(crate) max_tokens: Option<u64>,
-    pub(crate) max_cost_microdollars: u64,
+    /// Optional hard whole-microdollar child cost ceiling. `None` imposes no
+    /// child-specific ceiling; the parent session ceiling still applies.
+    #[serde(default)]
+    pub(crate) max_cost_microdollars: Option<u64>,
+    /// Bounded worker result size in UTF-8 bytes.
     pub(crate) max_output_bytes: usize,
-    pub(crate) timeout_ms: u64,
+    /// Optional hard worker wall clock in milliseconds. `None` runs without a
+    /// wall-clock kill; the worker can still be interrupted or stopped.
+    #[serde(default)]
+    pub(crate) timeout_ms: Option<u64>,
 }
 
 impl ExtensionAgentSessionPolicy {
     pub(crate) fn validate(&self) -> Result<(), String> {
-        if self.tools.is_empty() || self.tools.len() > 2 {
-            return Err("child tools must be a non-empty subset of read and search".into());
+        if self.tools.is_empty() || self.tools.len() > EXTENSION_CHILD_TOOLS.len() {
+            return Err(
+                "child tools must be a non-empty subset of the standard child tool names".into(),
+            );
         }
         let tools = self.tools.iter().collect::<BTreeSet<_>>();
         if tools.len() != self.tools.len()
             || self
                 .tools
                 .iter()
-                .any(|tool| !matches!(tool.as_str(), "read" | "search"))
+                .any(|tool| !EXTENSION_CHILD_TOOLS.contains(&tool.as_str()))
         {
-            return Err("child tools must be a duplicate-free subset of read and search".into());
+            return Err(
+                "child tools must be a duplicate-free subset of read, search, edit, write, and bash"
+                    .into(),
+            );
         }
         if self.max_depth != 1 {
             return Err("extension child max_depth must be exactly 1".into());
@@ -348,10 +387,17 @@ impl ExtensionAgentSessionPolicy {
         if self.max_concurrent_children == 0
             || self.max_concurrent_children > MAX_EXTENSION_ACTIVE_CHILDREN
         {
-            return Err("extension child concurrency must be between 1 and 2".into());
+            return Err(format!(
+                "extension child concurrency must be between 1 and {MAX_EXTENSION_ACTIVE_CHILDREN}"
+            ));
         }
-        if !(1..=12).contains(&self.max_turns) {
-            return Err("extension child max_turns must be between 1 and 12".into());
+        if self
+            .max_turns
+            .is_some_and(|max_turns| !(1..=MAX_EXTENSION_TURNS).contains(&max_turns))
+        {
+            return Err(format!(
+                "extension child max_turns must be null or between 1 and {MAX_EXTENSION_TURNS}"
+            ));
         }
         if self
             .max_tokens
@@ -359,16 +405,26 @@ impl ExtensionAgentSessionPolicy {
         {
             return Err("extension child max_tokens must be null or between 1000 and 64000".into());
         }
-        if !(1..=500_000).contains(&self.max_cost_microdollars) {
-            return Err(
-                "extension child max_cost_microdollars must be between 1 and 500000".into(),
-            );
+        if self
+            .max_cost_microdollars
+            .is_some_and(|max_cost| !(1..=MAX_EXTENSION_COST_MICRODOLLARS).contains(&max_cost))
+        {
+            return Err(format!(
+                "extension child max_cost_microdollars must be null or between 1 and {}",
+                MAX_EXTENSION_COST_MICRODOLLARS
+            ))
+            .into();
         }
         if !(512..=16 * 1024).contains(&self.max_output_bytes) {
             return Err("extension child max_output_bytes must be between 512 and 16384".into());
         }
-        if !(5_000..=15 * 60 * 1_000).contains(&self.timeout_ms) {
-            return Err("extension child timeout_ms must be between 5000 and 900000".into());
+        if self
+            .timeout_ms
+            .is_some_and(|timeout| !(5_000..=MAX_EXTENSION_TIMEOUT_MS).contains(&timeout))
+        {
+            return Err(format!(
+                "extension child timeout_ms must be null or between 5000 and {MAX_EXTENSION_TIMEOUT_MS}"
+            ));
         }
         Ok(())
     }
@@ -694,10 +750,11 @@ impl ExtensionDelegationService {
             manager.publish_external_failure("spawn_rejected", &error);
             error
         };
-        if manager.template.model.spec.pricing.is_none() {
+        if policy.max_cost_microdollars.is_some()
+            && manager.template.model.spec.pricing.is_none()
+        {
             return Err(reject_spawn(
-                "bounded extension child requires trusted model pricing for its hard cost ceiling"
-                    .into(),
+                "extension children with a cost ceiling require trusted model pricing".into(),
             ));
         }
         let mut service_state = self
@@ -763,8 +820,10 @@ impl ExtensionDelegationService {
                     "extension child concurrency limit reached ({})",
                     policy.max_concurrent_children
                 ))
-            } else if owner_state.owned_agents.len() >= 16 {
-                Some("extension child total limit reached (16)".to_owned())
+            } else if owner_state.owned_agents.len() >= MAX_EXTENSION_OWNED_CHILDREN {
+                Some(format!(
+                    "extension child total limit reached ({MAX_EXTENSION_OWNED_CHILDREN})"
+                ))
             } else {
                 None
             }
@@ -839,19 +898,6 @@ impl ExtensionDelegationService {
         let manager = self.manager()?;
         let owner = self.owner_identity(&manager, resource_owner)?;
         let target = self.resolve_owned_target(&manager, resource_owner, target)?;
-        {
-            let state = manager
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state
-                .records
-                .get(&target)
-                .is_some_and(|record| record.extension_policy.is_some())
-            {
-                return Err("follow-up runs are disabled for bounded extension children".into());
-            }
-        }
         manager
             .follow_up(&owner, FollowUpRequest { target, message })
             .await
@@ -1160,6 +1206,7 @@ struct WorkerStartup {
     initial_permit: OwnedSemaphorePermit,
     extension_policy: Option<ExtensionAgentSessionPolicy>,
     deadline: Option<tokio::time::Instant>,
+    deadline_ms: Option<u64>,
 }
 
 struct ChildRunContext<'a> {
@@ -1656,7 +1703,10 @@ impl DelegationManager {
             let (_, effective_tools) = self.template.extensions.scoped_tool_snapshot(&allowed)?;
             policy.tools = effective_tools;
             if let Some(parent_turns) = self.template.max_turns {
-                policy.max_turns = policy.max_turns.min(parent_turns);
+                policy.max_turns = match policy.max_turns {
+                    Some(requested) => Some(requested.min(parent_turns)),
+                    None => Some(parent_turns),
+                };
             }
             let runtime = self
                 .template
@@ -1671,7 +1721,10 @@ impl DelegationManager {
                 );
             }
             if let Some(parent_cost) = runtime.max_session_cost_microdollars {
-                policy.max_cost_microdollars = policy.max_cost_microdollars.min(parent_cost);
+                policy.max_cost_microdollars = match policy.max_cost_microdollars {
+                    Some(requested) => Some(requested.min(parent_cost)),
+                    None => Some(parent_cost),
+                };
             }
         }
         let initial_task = message;
@@ -1686,12 +1739,15 @@ impl DelegationManager {
         })?;
 
         let created_at_ms = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
-        let deadline = extension_policy
-            .as_ref()
-            .map(|policy| tokio::time::Instant::now() + Duration::from_millis(policy.timeout_ms));
+        let deadline = extension_policy.as_ref().and_then(|policy| {
+            policy
+                .timeout_ms
+                .map(|timeout_ms| tokio::time::Instant::now() + Duration::from_millis(timeout_ms))
+        });
         let deadline_at_ms = extension_policy
             .as_ref()
-            .map(|policy| created_at_ms.saturating_add(policy.timeout_ms));
+            .and_then(|policy| policy.timeout_ms)
+            .map(|timeout_ms| created_at_ms.saturating_add(timeout_ms));
 
         let (identity, session, command_rx, shutdown, task_name) = {
             let mut state = self
@@ -1849,6 +1905,7 @@ impl DelegationManager {
                     initial_permit: permit,
                     extension_policy,
                     deadline,
+                    deadline_ms: deadline_at_ms,
                 })
                 .await;
         });
@@ -1886,7 +1943,8 @@ impl DelegationManager {
             shutdown,
             initial_permit,
             extension_policy,
-            deadline,
+            mut deadline,
+            mut deadline_ms,
         } = startup;
         let session_path = session.path().to_path_buf();
         let mut unopened_session = Some(session);
@@ -1896,6 +1954,10 @@ impl DelegationManager {
         let mut retry_undelivered_task = false;
         let mut retry_pending_messages = 0;
         loop {
+            // A follow-up accepted for a settled worker may re-anchor the
+            // host-owned wall budget; adopt a newer deadline before the
+            // local, spawn-frozen budget can end the resumed worker.
+            self.adopt_host_deadline(&identity, &mut deadline, &mut deadline_ms);
             if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
                 self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
                 self.request_shutdown_descendants(&identity.id);
@@ -2137,9 +2199,18 @@ impl DelegationManager {
                         tokio::time::sleep_until(deadline).await;
                     }
                 }, if deadline.is_some() => {
-                    self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
-                    self.request_shutdown_descendants(&identity.id);
-                    return;
+                    // The local budget elapsed. The manager may have
+                    // re-anchored the host-owned deadline for a resumed run
+                    // in the same instant; adopt it before settling.
+                    self.adopt_host_deadline(&identity, &mut deadline, &mut deadline_ms);
+                    if deadline
+                        .is_some_and(|deadline| deadline <= tokio::time::Instant::now())
+                    {
+                        self.set_status(&identity.id, DelegatedAgentStatus::TimedOut, true);
+                        self.request_shutdown_descendants(&identity.id);
+                        return;
+                    }
+                    continue;
                 }
                 _ = &mut notified => {
                     if retry_undelivered_task
@@ -2174,6 +2245,37 @@ impl DelegationManager {
                     return;
                 }
             }
+        }
+    }
+
+    /// A follow-up accepted for a settled worker starts a new run. When the
+    /// original wall budget already elapsed, the manager re-anchors the
+    /// record deadline; the worker's own deadline was frozen at spawn, so
+    /// adopt the newer host-owned value before the local budget can end the
+    /// resumed worker.
+    fn adopt_host_deadline(
+        &self,
+        identity: &AgentIdentity,
+        deadline: &mut Option<tokio::time::Instant>,
+        deadline_ms: &mut Option<u64>,
+    ) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(record) = state.records.get(&identity.id) else {
+            return;
+        };
+        let (Some(local), Some(host)) = (*deadline_ms, record.deadline_at_ms) else {
+            return;
+        };
+        if host > local {
+            let now = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+            *deadline = Some(
+                tokio::time::Instant::now()
+                    + tokio::time::Duration::from_millis(host.saturating_sub(now)),
+            );
+            *deadline_ms = Some(host);
         }
     }
 
@@ -2212,12 +2314,19 @@ impl DelegationManager {
                     "effective extension child tool scope changed after spawn admission".into(),
                 ));
             }
+            let scope_note = if policy
+                .tools
+                .iter()
+                .all(|tool| matches!(tool.as_str(), "read" | "search"))
+            {
+                "Only the listed read/search tools are installed; mutation, shell, and collaboration tools are unavailable."
+            } else {
+                "The listed standard file and shell tools are installed for this task; collaboration tools are unavailable. Mutating tools remain subject to the inherited approval policy; host policy is authoritative."
+            };
             (
-                format!(
-                    "{base_system}\n\nThis is a host-enforced depth-one child session. Only the listed read-only tools are installed; collaboration and mutation tools are unavailable."
-                ),
+                format!("{base_system}\n\nThis is a host-enforced depth-one child session. {scope_note}"),
                 extensions,
-                Some(policy.max_turns),
+                policy.max_turns,
             )
         } else {
             (
@@ -2277,13 +2386,16 @@ impl DelegationManager {
                 (Some(parent), None) => Some(parent),
                 (None, requested) => requested,
             };
-            let max_session_cost_microdollars = runtime
-                .max_session_cost_microdollars
-                .map_or(policy.max_cost_microdollars, |parent| {
-                    policy.max_cost_microdollars.min(parent)
-                });
+            let max_session_cost_microdollars = match (
+                runtime.max_session_cost_microdollars,
+                policy.max_cost_microdollars,
+            ) {
+                (Some(parent), Some(requested)) => Some(parent.min(requested)),
+                (Some(parent), None) => Some(parent),
+                (None, requested) => requested,
+            };
             agent.set_max_session_tokens(max_session_tokens);
-            agent.set_max_session_cost_microdollars(Some(max_session_cost_microdollars));
+            agent.set_max_session_cost_microdollars(max_session_cost_microdollars);
         } else {
             agent.inherit_max_output_tokens(runtime.max_output_tokens);
             agent.set_max_session_tokens(runtime.max_session_tokens);
@@ -3260,11 +3372,31 @@ impl DelegationManager {
                     self.fail_persistence_locked(&mut state, &error);
                     return Err(message);
                 }
-                state
+                let record = state
                     .records
                     .get_mut(&target_id)
-                    .expect("resolved child exists")
-                    .status = DelegatedAgentStatus::Pending;
+                    .expect("resolved child exists");
+                record.status = DelegatedAgentStatus::Pending;
+                // A resumed worker is no longer terminal; drop the stale
+                // completion timestamp so elapsed-time consumers do not see
+                // a frozen first-run interval.
+                record.completed_at_ms = None;
+                // A follow-up to a settled worker starts a new run. If the
+                // original wall budget already elapsed while the worker was
+                // idle, the spawn-frozen deadline would start an instantly
+                // expired run; re-anchor it from the requested timeout so
+                // the resumed run owns a fresh budget.
+                if let (Some(deadline), Some(timeout)) = (
+                    record.deadline_at_ms,
+                    record.extension_policy
+                        .as_ref()
+                        .and_then(|policy| policy.timeout_ms),
+                ) {
+                    let now = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+                    if deadline <= now {
+                        record.deadline_at_ms = Some(now.saturating_add(timeout));
+                    }
+                }
             }
             let usage = follow_up.usage();
             state
@@ -4533,11 +4665,11 @@ mod tests {
             tools: vec!["read".into(), "search".into()],
             max_depth: 1,
             max_concurrent_children: 2,
-            max_turns: 4,
+            max_turns: Some(4),
             max_tokens: Some(32_000),
-            max_cost_microdollars: 200_000,
+            max_cost_microdollars: Some(200_000),
             max_output_bytes: 8 * 1024,
-            timeout_ms: 300_000,
+            timeout_ms: Some(300_000),
         }
     }
 
@@ -5308,8 +5440,8 @@ mod tests {
             depth: 1,
         };
         let mut policy = test_extension_policy();
-        policy.max_turns = 8;
-        policy.max_cost_microdollars = 200;
+        policy.max_turns = Some(8);
+        policy.max_cost_microdollars = Some(200);
         let allowed = policy.tools.iter().cloned().collect::<BTreeSet<_>>();
         let (_, effective) = manager
             .template
@@ -5317,8 +5449,8 @@ mod tests {
             .scoped_tool_snapshot(&allowed)
             .unwrap();
         policy.tools = effective;
-        policy.max_turns = policy.max_turns.min(manager.template.max_turns.unwrap());
-        policy.max_cost_microdollars = 50;
+        policy.max_turns = Some(2);
+        policy.max_cost_microdollars = Some(50);
         let session = Session::create(directory.path().join("policy-child.jsonl")).unwrap();
         let child = manager
             .build_child_agent(session, &identity, Some(&policy))
@@ -5425,9 +5557,9 @@ mod tests {
             "respect parent limits",
             "parent-limits-key",
         );
-        request.policy.max_turns = 12;
+        request.policy.max_turns = Some(12);
         request.policy.max_tokens = Some(64_000);
-        request.policy.max_cost_microdollars = 500_000;
+        request.policy.max_cost_microdollars = Some(500_000);
 
         let result = service.spawn("root-owner", request).unwrap();
 
@@ -5455,12 +5587,12 @@ mod tests {
             "first-key",
         );
         first_request.policy.max_tokens = Some(64_000);
-        first_request.policy.max_cost_microdollars = 500_000;
+        first_request.policy.max_cost_microdollars = Some(500_000);
         let first = service.spawn("root-owner", first_request).unwrap();
         let mut second_request =
             test_extension_spawn("second", None, None, "second bounded task", "second-key");
         second_request.policy.max_tokens = Some(64_000);
-        second_request.policy.max_cost_microdollars = 500_000;
+        second_request.policy.max_cost_microdollars = Some(500_000);
         let second = service.spawn("root-owner", second_request).unwrap();
         let error = service
             .spawn(
@@ -5628,6 +5760,92 @@ mod tests {
             .await;
         assert!(matches!(outcome.outcome, WorkerOutcome::TimedOut));
         assert!(agent.session().entries().is_empty());
+    }
+
+    #[tokio::test]
+    async fn follow_up_reanchors_an_elapsed_deadline_for_a_settled_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = writable_manager(directory.path());
+        let root = manager.root_binding().identity;
+        let (identity, _commands) =
+            insert_test_record(&manager, DelegatedAgentStatus::Completed {
+                output: "first run settled".into(),
+            });
+        {
+            let mut state = manager.state.lock().unwrap();
+            let record = state
+                .records
+                .get_mut(&identity.id)
+                .expect("test record exists");
+            record.extension_policy = Some(test_extension_policy());
+            record.deadline_at_ms = Some(1);
+            record.completed_at_ms = Some(2);
+        }
+
+        let resumed = manager
+            .follow_up(
+                &root,
+                FollowUpRequest {
+                    target: identity.id.clone(),
+                    message: "second run".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed["delivery"], "new_run");
+
+        let state = manager.state.lock().unwrap();
+        let record = &state.records[&identity.id];
+        assert_eq!(record.status, DelegatedAgentStatus::Pending);
+        assert!(record.completed_at_ms.is_none());
+        let deadline = record
+            .deadline_at_ms
+            .expect("elapsed deadline was re-anchored");
+        let now = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+        assert!(deadline > now + 290_000);
+        assert!(deadline <= now + 310_000);
+    }
+
+    #[tokio::test]
+    async fn follow_up_preserves_a_future_deadline_for_a_settled_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = writable_manager(directory.path());
+        let root = manager.root_binding().identity;
+        let (identity, _commands) =
+            insert_test_record(&manager, DelegatedAgentStatus::Completed {
+                output: "first run settled".into(),
+            });
+        let preserved =
+            u64::try_from(timestamp_ms()).unwrap_or(u64::MAX) + 1_000_000;
+        {
+            let mut state = manager.state.lock().unwrap();
+            let record = state
+                .records
+                .get_mut(&identity.id)
+                .expect("test record exists");
+            record.extension_policy = Some(test_extension_policy());
+            record.deadline_at_ms = Some(preserved);
+            record.completed_at_ms = Some(
+                u64::try_from(timestamp_ms()).unwrap_or(u64::MAX),
+            );
+        }
+
+        manager
+            .follow_up(
+                &root,
+                FollowUpRequest {
+                    target: identity.id.clone(),
+                    message: "second run".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let state = manager.state.lock().unwrap();
+        assert_eq!(
+            state.records[&identity.id].deadline_at_ms,
+            Some(preserved)
+        );
     }
 
     #[test]

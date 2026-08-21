@@ -1283,12 +1283,12 @@ model session:
     "policy": {
       "tools": ["read", "search"],
       "max_depth": 1,
-      "max_concurrent_children": 2,
-      "max_turns": 8,
+      "max_concurrent_children": 8,
+      "max_turns": null,
       "max_tokens": null,
-      "max_cost_microdollars": 200000,
+      "max_cost_microdollars": null,
       "max_output_bytes": 8192,
-      "timeout_ms": 300000
+      "timeout_ms": null
     }
   }
 }
@@ -1296,16 +1296,22 @@ model session:
 
 The host derives the resource owner from `parent_request_id`; the extension
 cannot submit an owner. `policy` is mandatory. Its tools are a non-empty,
-duplicate-free subset of `read`/`search`; depth is exactly one; concurrency is
-1..=2; and turns, optional cumulative token cap, cumulative cost, returned UTF-8
-bytes, and wall time are host-bounded. `max_tokens: null` means exact inheritance
+duplicate-free subset of `read`, `search`, `edit`, `write`, and `bash`
+(`read`/`search` is the default and recommended scope); depth is exactly one;
+concurrency is 1..=8; returned UTF-8 bytes are 512..=16,384. The turn, cost,
+and wall-time ceilings are optional per child: `max_turns: null`,
+`max_cost_microdollars: null`, and `timeout_ms: null` inherit the parent
+session's ceilings (an unlimited parent produces an unlimited child);
+explicit values are 1..=256 turns, 1..=50,000,000 microdollars, and
+5,000..=86,400,000 milliseconds. `max_tokens: null` means exact inheritance
 of the parent's optional cumulative session-token setting, so a parent with no
 ceiling produces a child with no ceiling; a non-null 1,000..=64,000 value may
 request a stricter cap. Every child starts with a fresh context while inheriting
 the parent model's context window and resolved per-request output limit. Ygg
-freezes a detached effective tool snapshot, installs no collaboration tools,
-applies lower inherited turn/cost ceilings, and owns limit settlement even when
-the extension is idle or restarted.
+freezes a detached effective tool snapshot containing only the granted tools
+(no collaboration or agent tools), applies the requested ceilings or inherits
+the parent's ceilings when they are omitted, and owns limit settlement even
+when the extension is idle or restarted.
 
 The idempotency key is 1..=256 bytes and scoped to the extension principal plus
 that owner. Retrying identical `task_name`/`profile`/`fingerprint`/`message`/
@@ -1364,10 +1370,18 @@ Queue a subsequent run on an owned child:
 }
 ```
 
-Success returns `agent_id`, `agent_path`, and `delivery` (`follow_up` when the
-child is running, otherwise `new_run`). Ownership checks match
-`agent/message`; the follow-up is capped at 128 KiB. Host-bounded extension
-children reject follow-up runs so their turn/deadline contract cannot reset.
+Success returns `agent_id`, `agent_path`, and `delivery`: `follow_up` when the
+child is active (the message is queued on the running session) and `new_run`
+when the child is settled (the child's durable session resumes as a new run).
+Ownership checks match
+`agent/message`; the follow-up is capped at 128 KiB. Follow-ups reject
+shut-down targets, targets with an interrupt in flight, and a full follow-up
+queue.
+A resumed run re-enters the host's turn/cost accounting; when the child's
+wall deadline has already elapsed the host re-anchors it from the child's
+requested timeout so the new run owns a fresh budget instead of starting an
+already-expired one, a still-future deadline is preserved across the resume,
+and a child without a timeout stays unlimited.
 
 ---
 

@@ -85,6 +85,7 @@ def initialize_request(*, agent_sessions: bool = True):
                     "subagent_status",
                     "subagent_wait",
                     "subagent_stop",
+                    "subagent_continue",
                 ],
                 "commands": ["subagents"],
                 "ui": ["status"],

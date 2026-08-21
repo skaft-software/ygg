@@ -316,12 +316,25 @@ pub(crate) struct SubagentActivityView {
     pub(crate) include_cost_in_session_total: bool,
 }
 
-fn subagent_status_label(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> String {
+/// The activity strip is only shown while at least one child is still
+/// working; once every worker settles (or a spawn fails outright), the
+/// permanent record is the transcript, not the chrome.
+fn subagent_has_active_children(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> bool {
+    snapshot
+        .children
+        .iter()
+        .any(|child| matches!(child.state.as_str(), "pending" | "running"))
+}
+
+fn subagent_status_label(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> Option<String> {
     let active = snapshot
         .children
         .iter()
         .filter(|child| matches!(child.state.as_str(), "pending" | "running"))
         .count();
+    if active == 0 {
+        return None;
+    }
     let failed = snapshot
         .children
         .iter()
@@ -340,33 +353,16 @@ fn subagent_status_label(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> S
     );
     let external_failure = snapshot.failure_reason.is_some();
     if failed > 0 || external_failure {
-        if active > 0 {
-            format!(
-                "● {} {profile} agents · {} failed (ctrl+o to expand)",
-                snapshot.children.len(),
-                failed.saturating_add(usize::from(external_failure))
-            )
-        } else if failed > 0 {
-            format!(
-                "● {failed} {profile} agent{} failed (ctrl+o to expand)",
-                if failed == 1 { "" } else { "s" }
-            )
-        } else {
-            "● Subagent spawn failed (ctrl+o to expand)".to_owned()
-        }
-    } else if active > 0 {
-        format!(
-            "● Running {active} {profile} agent{}… (ctrl+o to expand)",
-            if active == 1 { "" } else { "s" }
-        )
-    } else if snapshot.children.is_empty() && snapshot.failure_reason.is_some() {
-        "● Subagent spawn failed (ctrl+o to expand)".to_owned()
+        Some(format!(
+            "• {} {profile} agents · {} failed (ctrl+o to expand)",
+            snapshot.children.len(),
+            failed.saturating_add(usize::from(external_failure))
+        ))
     } else {
-        let count = snapshot.children.len();
-        format!(
-            "● {count} {profile} agent{} finished (ctrl+o to expand)",
-            if count == 1 { "" } else { "s" }
-        )
+        Some(format!(
+            "• Running {active} {profile} agent{}… (ctrl+o to expand)",
+            if active == 1 { "" } else { "s" }
+        ))
     }
 }
 
@@ -445,6 +441,9 @@ pub(crate) struct ShellState {
     /// This is transient chrome; authoritative usage is mirrored into the root
     /// session ledger before the owning run settles.
     pub(crate) subagent_activity: Option<SubagentActivityView>,
+    /// Whether the subagent activity strip is showing all children instead of
+    /// the latest two (ctrl+o toggle). Reset whenever the strip is cleared.
+    pub(crate) subagent_activity_expanded: bool,
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
@@ -1520,6 +1519,7 @@ impl InteractiveShell {
         // previous run's already-accounted worker costs into the new live
         // overlay while its first authoritative refresh is still pending.
         state.subagent_activity = None;
+        state.subagent_activity_expanded = false;
         state.run_model = Some(state.model.clone());
         state.run_model_lab = state.model_lab;
         state.run_prompt_color = state.prompt_color.clone();
@@ -1886,17 +1886,21 @@ impl InteractiveShell {
                 state.run_cost_available = true;
             }
             AgentEvent::DelegationUpdated { snapshot } => {
-                if snapshot.children.is_empty() && snapshot.failure_reason.is_none() {
-                    state.subagent_activity = None;
-                } else {
+                if subagent_has_active_children(snapshot) {
                     state.subagent_activity = Some(SubagentActivityView {
-                        status_label: subagent_status_label(snapshot),
+                        status_label: subagent_status_label(snapshot).unwrap_or_default(),
                         activities: Vec::new(),
                         telemetry: snapshot.children.clone(),
                         failure_class: snapshot.failure_class.clone(),
                         failure_reason: snapshot.failure_reason.clone(),
                         include_cost_in_session_total: true,
                     });
+                } else {
+                    // Every worker reached a terminal state (or the spawn
+                    // itself failed): the permanent record is the transcript,
+                    // not a chrome strip, so the overlay goes away.
+                    state.subagent_activity = None;
+                    state.subagent_activity_expanded = false;
                 }
             }
             AgentEvent::RunFinished { .. } => {
@@ -1906,6 +1910,19 @@ impl InteractiveShell {
                     // emitted; from this boundary onward the footer must use
                     // the durable amount, not provisional child spend.
                     view.include_cost_in_session_total = false;
+                }
+                // Guard against a final snapshot never arriving: once the root
+                // run ends, no worker can still be active, so a strip that
+                // still claims one is stale.
+                if let Some(view) = state.subagent_activity.as_ref() {
+                    if !view
+                        .telemetry
+                        .iter()
+                        .any(|child| matches!(child.state.as_str(), "pending" | "running"))
+                    {
+                        state.subagent_activity = None;
+                        state.subagent_activity_expanded = false;
+                    }
                 }
             }
         }
@@ -2333,7 +2350,18 @@ impl InteractiveShell {
                 .filter(|activity| activity.kind == "subagent")
                 .cloned()
                 .collect::<Vec<_>>();
-            (!activities.is_empty()).then(|| SubagentActivityView {
+            let active = activities.iter().any(|activity| {
+                matches!(
+                    activity.state,
+                    ygg_agent::ExtensionPresentationState::Loading
+                        | ygg_agent::ExtensionPresentationState::Pending
+                        | ygg_agent::ExtensionPresentationState::Active
+                        | ygg_agent::ExtensionPresentationState::Running
+                )
+            });
+            // Mirror the telemetry path: the strip only persists while at
+            // least one published activity is still in flight.
+            (!activities.is_empty() && active).then(|| SubagentActivityView {
                 status_label: snapshot
                     .status
                     .as_ref()
@@ -2350,6 +2378,9 @@ impl InteractiveShell {
         if state.subagent_activity == next {
             return false;
         }
+        if next.is_none() {
+            state.subagent_activity_expanded = false;
+        }
         state.subagent_activity = next;
         true
     }
@@ -2363,17 +2394,22 @@ impl InteractiveShell {
         snapshot: Option<&ygg_agent::DelegationTelemetrySnapshot>,
         include_cost_in_session_total: bool,
     ) -> bool {
-        let next = snapshot.map(|snapshot| SubagentActivityView {
-            status_label: subagent_status_label(snapshot),
-            activities: Vec::new(),
-            telemetry: snapshot.children.clone(),
-            failure_class: snapshot.failure_class.clone(),
-            failure_reason: snapshot.failure_reason.clone(),
-            include_cost_in_session_total,
-        });
+        let next = snapshot
+            .filter(|snapshot| subagent_has_active_children(snapshot))
+            .map(|snapshot| SubagentActivityView {
+                status_label: subagent_status_label(snapshot).unwrap_or_default(),
+                activities: Vec::new(),
+                telemetry: snapshot.children.clone(),
+                failure_class: snapshot.failure_class.clone(),
+                failure_reason: snapshot.failure_reason.clone(),
+                include_cost_in_session_total,
+            });
         let mut state = self.state.borrow_mut();
         if state.subagent_activity == next {
             return false;
+        }
+        if next.is_none() {
+            state.subagent_activity_expanded = false;
         }
         state.subagent_activity = next;
         true
@@ -3067,7 +3103,17 @@ impl InteractiveShell {
 
     /// Toggle the global transcript disclosure mode (ctrl+o).
     pub fn expand_focused_tool(&mut self) {
-        self.toggle_verbose_tools();
+        // ctrl+o is the documented way to expand the subagent activity strip
+        // (its label says "ctrl+o to expand"). Only fall back to verbose tool
+        // output when no subagent activity is visible, so that hint stays
+        // truthful.
+        let activity_visible = self.state.borrow().subagent_activity.is_some();
+        if activity_visible {
+            let mut state = self.state.borrow_mut();
+            state.subagent_activity_expanded = !state.subagent_activity_expanded;
+        } else {
+            self.toggle_verbose_tools();
+        }
     }
 
     pub fn show_compaction_summary(&mut self) {
@@ -3594,6 +3640,7 @@ impl InteractiveShell {
         // session hydrate may reuse this shell, so clear the composer block
         // before the replacement app can publish its own owner-fenced snapshot.
         state.subagent_activity = None;
+        state.subagent_activity_expanded = false;
         state.session_work_elapsed = Duration::ZERO;
         state.run_model = None;
         state.run_model_lab = None;

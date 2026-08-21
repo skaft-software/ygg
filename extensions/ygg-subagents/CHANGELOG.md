@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.0
+
+### Added
+
+- `subagent_continue`: steer an active worker through `agent/message` or
+  resume a settled worker through `agent/follow_up`. A resumed worker keeps
+  its durable conversation context; the host clears the stale completion
+  timestamp and re-anchors an elapsed wall deadline so the new run owns a
+  fresh budget.
+- Per-spawn mutation grants: workers may be granted `edit`, `write`, and
+  `bash` through the spawn `tools` list (the default remains the read-only
+  `read, search` pair). The host's scoped tool snapshot is the enforcement
+  boundary, not the worker's self-discipline.
+- Per-spawn ceilings are now optional: omitted (or `null`) `timeout_seconds`,
+  `max_turns`, and `max_cost_microdollars` inherit the parent session's
+  ceilings, so an unlimited parent produces an unlimited child.
+- Regression tests for granted mutation scope, the continue tool (steer,
+  resume, stopping, and orphaned rejections), and protocol-level policy
+  handling.
+
+### Changed
+
+- Raised limits from 2 active/16 retained to **8 active/32 retained**
+  children per owner, with explicit ceilings raised to 256 turns, 50,000,000
+  microdollars, and 24 hours of wall time (all overridable per spawn, all
+  optional).
+- The TUI composer-adjacent activity strip now appears only while workers
+  are actively working, uses `•`/`└` glyphs with model-matched colours, and
+  `Ctrl+O` expands it from the two to the five most recent workers (falling
+  back to the verbose tool-output toggle only when no strip is visible).
+- `agent/follow_up` on a settled child is a resume, not a rejection; the
+  worker's persistent task and transcript survive between runs.
+
 ## 0.1.0
 
 - Add four bounded API `0.2` subagent tools over the host-owned `agent_sessions` service.

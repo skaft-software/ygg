@@ -448,8 +448,11 @@ in status labels, node titles, provenance, or reconnect state.
 Every action names an already manifest-declared extension command. Generic
 extension state stays out of persistent chrome. The coding TUI makes one
 first-party observed exception for `ygg-subagents`: while the owning root run
-has workers, it renders the latest owner-fenced `subagent` activities directly
-above the composer from native `AgentEvent::DelegationUpdated` telemetry. The
+has active (pending or running) workers, it renders the latest owner-fenced
+`subagent` activities directly above the composer from native
+`AgentEvent::DelegationUpdated` telemetry; the strip disappears once every
+worker settles and `Ctrl+O` expands it from the two most recent workers to the
+five most recent while it is visible. The
 footer remains host-owned; it adds live priced child spend while the run is
 active, then uses the root session's durable delegated-usage records after
 settlement, never an extension-supplied footer string.

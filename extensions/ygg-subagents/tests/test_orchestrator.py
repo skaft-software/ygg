@@ -19,10 +19,23 @@ from ygg_subagents.orchestrator import Orchestrator
 
 
 class PolicyTests(unittest.TestCase):
-    def test_spawn_schema_policy_rejects_mutation_model_override_and_controls(self):
+    def test_spawn_schema_policy_allows_whitelisted_mutation_and_rejects_outliers(self):
+        for arguments in (
+            {"name": "worker", "task": "x", "tools": ["write"]},
+            {"name": "worker", "task": "x", "tools": ["read", "bash"]},
+            {
+                "name": "worker",
+                "task": "x",
+                "tools": ["read", "search", "edit", "write", "bash"],
+            },
+        ):
+            with self.subTest(arguments=arguments):
+                request = SpawnRequest.parse(arguments)
+                self.assertEqual(request.tools, tuple(arguments["tools"]))
         for arguments, code in (
-            ({"name": "worker", "task": "x", "tools": ["write"]}, "mutation_scope_denied"),
-            ({"name": "worker", "task": "x", "tools": ["read", "bash"]}, "mutation_scope_denied"),
+            ({"name": "worker", "task": "x", "tools": ["read", "browser"]}, "invalid_request"),
+            ({"name": "worker", "task": "x", "tools": ["read", "subagent_spawn"]}, "invalid_request"),
+            ({"name": "worker", "task": "x", "tools": ["read", "read"]}, "invalid_request"),
             ({"name": "worker", "task": "x", "model": "other"}, "unsupported_model"),
             ({"name": "worker", "task": "x", "max_tokens": 64000}, "invalid_request"),
             ({"name": "Worker", "task": "x"}, "invalid_request"),
@@ -49,6 +62,24 @@ class PolicyTests(unittest.TestCase):
         self.assertIn("Work at delegation depth one", message)
         self.assertIn("Orchestration fingerprint: %s" % request.fingerprint, message)
         self.assertNotIn("tools: search, read, write", message)
+
+    def test_granted_mutation_scope_is_stated_without_read_only_boundary(self):
+        request = SpawnRequest.parse(
+            {
+                "name": "implement-fix",
+                "task": "Apply the agreed fix.",
+                "tools": ["read", "write"],
+                "idempotency_key": "mutation-fixture",
+            }
+        )
+        message = request.child_message(owner())
+        self.assertIn("Use only these exact requested tools: read, write", message)
+        self.assertIn(
+            "File edits, file writes, and shell commands are permitted only through those tools",
+            message,
+        )
+        self.assertNotIn("Never use shell/process/bash, edit, write", message)
+        self.assertNotIn("read/search-only", message)
 
 
 class OrchestrationTests(unittest.TestCase):
@@ -82,12 +113,12 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(self.snapshots[-1]["collection"]["nodes"][0]["id"], "worker:agent-1")
 
     def test_concurrency_is_enforced_and_children_inherit_no_token_ceiling(self):
-        self.spawn("one")
-        self.spawn("two")
+        for number in range(1, 9):
+            self.spawn("worker-%02d" % number)
         with self.assertRaises(SubagentError) as raised:
-            self.spawn("three")
+            self.spawn("worker-09")
         self.assertEqual(raised.exception.code, "concurrency_limit")
-        self.assertEqual(len(self.host.agents), 2)
+        self.assertEqual(len(self.host.agents), 8)
 
         host = FakeHostState(self.clock)
         client = host.client()

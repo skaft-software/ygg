@@ -16,12 +16,15 @@ from ygg_extension import (
 )
 
 from .model import (
+    CHILD_TOOLS,
+    MAX_CHILD_MESSAGE_BYTES,
     MAX_COST_MICRODOLLARS,
     MAX_OUTPUT_BYTES,
     MAX_TASK_BYTES,
     MAX_TURNS,
     MAX_WALL_SECONDS,
     PROFILE_INSTRUCTIONS,
+    READ_ONLY_TOOLS,
     SubagentError,
     Owner,
     bounded_text,
@@ -57,23 +60,27 @@ SPAWN_SCHEMA: Dict[str, Any] = {
         },
         "tools": {
             "type": "array",
-            "items": {"type": "string", "enum": ["read", "search"]},
+            "items": {"type": "string", "enum": list(CHILD_TOOLS)},
             "minItems": 1,
-            "maxItems": 2,
+            "maxItems": len(CHILD_TOOLS),
             "uniqueItems": True,
-            "default": ["read", "search"],
+            "default": list(READ_ONLY_TOOLS),
+            "description": (
+                "Host-enforced tool whitelist for the child; defaults to read-only [read, search]. "
+                "edit, write, and bash grant bounded mutation scope in the shared workspace."
+            ),
         },
         "timeout_seconds": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 5,
             "maximum": MAX_WALL_SECONDS,
-            "default": 300,
+            "description": "Optional wall deadline; omit or null to let the worker run until it settles.",
         },
         "max_turns": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 1,
             "maximum": MAX_TURNS,
-            "default": 8,
+            "description": "Optional turn ceiling; omit or null to inherit the parent session's ceiling.",
         },
         "max_output_bytes": {
             "type": "integer",
@@ -82,10 +89,10 @@ SPAWN_SCHEMA: Dict[str, Any] = {
             "default": 8192,
         },
         "max_cost_microdollars": {
-            "type": "integer",
+            "type": ["integer", "null"],
             "minimum": 1,
             "maximum": MAX_COST_MICRODOLLARS,
-            "default": 200000,
+            "description": "Optional cost ceiling; omit or null to inherit the parent session's ceiling.",
         },
         "background": {"type": "boolean", "default": True},
         "idempotency_key": {
@@ -131,6 +138,28 @@ STOP_SCHEMA: Dict[str, Any] = {
     },
     "additionalProperties": False,
 }
+CONTINUE_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "target": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "description": "Worker name, stable agent ID, or host agent path.",
+        },
+        "message": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": MAX_CHILD_MESSAGE_BYTES,
+            "description": (
+                "Steer an active worker, or queue a follow-up task for a settled worker; "
+                "the worker's existing task, profile, tools, and ceilings are preserved."
+            ),
+        },
+    },
+    "required": ["target", "message"],
+    "additionalProperties": False,
+}
 
 
 class SdkAgentSessions:
@@ -150,11 +179,11 @@ class SdkAgentSessions:
         tools,
         max_depth: int,
         max_concurrent_children: int,
-        max_turns: int,
+        max_turns: Optional[int],
         max_tokens: Optional[int],
-        max_cost_microdollars: int,
+        max_cost_microdollars: Optional[int],
         max_output_bytes: int,
-        timeout_ms: int,
+        timeout_ms: Optional[int],
     ) -> Mapping[str, Any]:
         return self.extension.spawn_agent(
             task_name=task_name,
@@ -180,6 +209,12 @@ class SdkAgentSessions:
 
     def interrupt_agent(self, target: str) -> Mapping[str, Any]:
         return self.extension.interrupt_agent(target)
+
+    def send_agent_message(self, target: str, message: str) -> Mapping[str, Any]:
+        return self.extension.send_agent_message(target, message)
+
+    def follow_up_agent(self, target: str, message: str) -> Mapping[str, Any]:
+        return self.extension.follow_up_agent(target, message)
 
 
 class PresentationPublisher:
@@ -269,6 +304,9 @@ def _compact_metadata(result: Mapping[str, Any]) -> Dict[str, Any]:
         metadata["wait_timed_out"] = result["wait_timed_out"]
     if "duplicate" in result:
         metadata["duplicate"] = result["duplicate"]
+    if metadata["operation"] == "continue":
+        metadata["action"] = result.get("action", "unknown")
+        metadata["accepted"] = bool(result.get("accepted"))
     return metadata
 
 
@@ -322,6 +360,19 @@ def _result_text(operation: str, result: Mapping[str, Any]) -> str:
             lines.append("The bounded wait expired; workers continue in the background unless their wall deadline settled them.")
         else:
             lines.append("Completion summaries are delivered through Ygg's host-owned claim/ack parent-turn boundary.")
+    elif operation == "continue":
+        worker = result.get("worker")
+        if isinstance(worker, Mapping):
+            lines.append(
+                "Queued %s continuation for %s [%s] (%s)"
+                % (
+                    result.get("action", "unknown"),
+                    worker.get("name", "worker"),
+                    worker.get("id", "unknown"),
+                    worker.get("state", "unknown"),
+                )
+            )
+            lines.append("The worker keeps its original task, profile, tools, and ceilings. Use subagent_wait to observe the outcome.")
     elif operation == "stop":
         outcomes = result.get("outcomes")
         lines.append("Subagent stop results:")
@@ -392,6 +443,8 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
                 result = orchestrator.wait(sessions, owner, arguments, token)
             elif operation == "stop":
                 result = orchestrator.stop(sessions, owner, arguments, token)
+            elif operation == "continue":
+                result = orchestrator.continue_worker(sessions, owner, arguments, token)
             else:  # pragma: no cover - closed registration set
                 raise SubagentError("unknown operation")
             return tool_result(
@@ -413,8 +466,9 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
     @extension.tool(
         name="subagent_spawn",
         description=(
-            "Launch one named, depth-one, read/search-only Ygg worker with bounded profile, inherited model and token/context ceilings, timeout, turns, output, and cost. "
-            "Defaults to background and is retry-safe through an idempotency key. Maximum two active children; no writers, graph, swarm, team chat, or arbitrary recursive spawn."
+            "Launch one named, depth-one Ygg worker with a bounded profile, inherited model, and an optional (host-enforced) tool whitelist, wall deadline, turn ceiling, output size, and cost ceiling. "
+            "Ceilings default to inherited/unlimited, so a minimal spawn is just name and task. Defaults to background and is retry-safe through an idempotency key. "
+            "At most 8 active children per parent (32 total); no writers beyond the granted tools, no graph, swarm, team chat, or recursive spawn."
         ),
         parameters=SPAWN_SCHEMA,
     )
@@ -451,6 +505,17 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
     )
     def subagent_stop(arguments: Mapping[str, Any], context: Mapping[str, Any]):
         return invoke("stop", arguments, context)
+
+    @extension.tool(
+        name="subagent_continue",
+        description=(
+            "Continue one owned worker with a new instruction: it is steered while active, or resumed through its durable host session after settlement. "
+            "The worker's original task, profile, tools, and ceilings are preserved. The call returns once the host accepts the instruction; use subagent_wait to observe the outcome."
+        ),
+        parameters=CONTINUE_SCHEMA,
+    )
+    def subagent_continue(arguments: Mapping[str, Any], context: Mapping[str, Any]):
+        return invoke("continue", arguments, context)
 
     @extension.command(
         name="subagents",

@@ -74,7 +74,7 @@ class FakeAgent:
     session: str
     policy: Dict[str, Any]
     created_at_ms: int
-    deadline_at_ms: int
+    deadline_at_ms: Optional[int]
     started_at_ms: Optional[int] = None
     completed_at_ms: Optional[int] = None
     status: Dict[str, Any] = field(default_factory=lambda: {"state": "pending"})
@@ -142,6 +142,8 @@ class FakeHostState:
         self.deliveries: Dict[Tuple[str, str], List[FakeDelivery]] = {}
         self.spawn_messages: List[str] = []
         self.calls: List[Tuple[str, str, str]] = []
+        self.steers: List[Tuple[str, str]] = []
+        self.follow_ups: List[Tuple[str, str]] = []
         self.persistence_error: Optional[str] = None
         self._lock = threading.RLock()
 
@@ -303,11 +305,17 @@ class FakeHostState:
                     agent.status = {"state": "shutdown"}
                     agent.phase = "host shutdown"
 
+    def shut_down(self) -> None:
+        """Model a host shutdown: every owned descendant becomes orphaned."""
+        for principal in [key[0] for key in self.owners]:
+            self.shutdown_principal(principal)
+
     def _expire_deadlines(self) -> None:
         now = self.clock()
         for agent in self.agents.values():
             if (
-                agent.status.get("state") in {"pending", "running"}
+                agent.deadline_at_ms is not None
+                and agent.status.get("state") in {"pending", "running"}
                 and now >= agent.deadline_at_ms
             ):
                 agent.completed_at_ms = now
@@ -394,11 +402,11 @@ class FakeAgentSessions:
         tools,
         max_depth: int,
         max_concurrent_children: int,
-        max_turns: int,
+        max_turns: Optional[int],
         max_tokens: Optional[int],
-        max_cost_microdollars: int,
+        max_cost_microdollars: Optional[int],
         max_output_bytes: int,
-        timeout_ms: int,
+        timeout_ms: Optional[int],
     ) -> Mapping[str, Any]:
         self._maybe_cancel("spawn")
         policy = {
@@ -430,9 +438,12 @@ class FakeAgentSessions:
             if (
                 not policy["tools"]
                 or len(set(policy["tools"])) != len(policy["tools"])
-                or any(tool not in {"read", "search"} for tool in policy["tools"])
+                or any(
+                    tool not in {"read", "search", "edit", "write", "bash"}
+                    for tool in policy["tools"]
+                )
             ):
-                raise FakeAgentSessionsError("host rejected non-read-only child tools")
+                raise FakeAgentSessionsError("host rejected child tools outside the whitelist")
             parent_depth = max(
                 0, len([part for part in self.owner_path.split("/") if part]) - 1
             )
@@ -445,7 +456,7 @@ class FakeAgentSessions:
             ]
             if len(active) >= min(self.max_active, max_concurrent_children):
                 raise FakeAgentSessionsError("host delegation concurrency limit reached")
-            if len(self.host.owners.get((self.principal, self.owner), [])) >= 16:
+            if len(self.host.owners.get((self.principal, self.owner), [])) >= 32:
                 raise FakeAgentSessionsError("host extension child total limit reached")
             number = self.host.next_agent
             self.host.next_agent += 1
@@ -455,6 +466,7 @@ class FakeAgentSessions:
                 raise FakeAgentSessionsError("task name already exists under owner")
             depth = max(0, len([part for part in path.split("/") if part]) - 1)
             parent_id = "root" if self.owner_path == "/root" else self.owner_path.rsplit("/", 1)[-1]
+            now = self.host.clock()
             agent = FakeAgent(
                 agent_id=agent_id,
                 agent_path=path,
@@ -466,8 +478,8 @@ class FakeAgentSessions:
                 depth=depth,
                 session=fake_session_reference(agent_id),
                 policy=dict(policy),
-                created_at_ms=self.host.clock(),
-                deadline_at_ms=self.host.clock() + timeout_ms,
+                created_at_ms=now,
+                deadline_at_ms=(now + timeout_ms) if timeout_ms is not None else None,
             )
             self.host.agents[agent_id] = agent
             self.host.owners.setdefault((self.principal, self.owner), []).append(agent_id)
@@ -541,6 +553,56 @@ class FakeAgentSessions:
                 "agent_path": agent.agent_path,
                 "previous_status": previous,
                 "interrupt_requested": requested,
+            }
+
+    def send_agent_message(self, target: str, message: str) -> Mapping[str, Any]:
+        self._maybe_cancel("message")
+        if not isinstance(message, str) or not message:
+            raise FakeAgentSessionsError("agent message must be a non-empty string")
+        with self.host._lock:
+            self.host.calls.append((self.principal, self.owner, "message"))
+            agent = self.host._resolve(target)
+            owned = self.host._owned_ids(self.principal, self.owner)
+            if agent.agent_id not in owned:
+                raise FakeAgentSessionsError("extension principal may access only owned trees")
+            if agent.status["state"] == "shutdown":
+                raise FakeAgentSessionsError("target is shut down")
+            self.host.steers.append((agent.agent_id, message))
+            return {"agent_id": agent.agent_id, "queued": True}
+
+    def follow_up_agent(self, target: str, message: str) -> Mapping[str, Any]:
+        self._maybe_cancel("follow_up")
+        if not isinstance(message, str) or not message:
+            raise FakeAgentSessionsError("agent message must be a non-empty string")
+        with self.host._lock:
+            self.host.calls.append((self.principal, self.owner, "follow_up"))
+            agent = self.host._resolve(target)
+            owned = self.host._owned_ids(self.principal, self.owner)
+            if agent.agent_id not in owned:
+                raise FakeAgentSessionsError("extension principal may access only owned trees")
+            if agent.status["state"] == "shutdown":
+                raise FakeAgentSessionsError("target is shut down")
+            previous = agent.status["state"]
+            if previous in {"pending", "running"}:
+                # A live session absorbs the message; no new run starts.
+                self.host.follow_ups.append((agent.agent_id, message))
+                return {
+                    "agent_id": agent.agent_id,
+                    "agent_path": agent.agent_path,
+                    "previous_status": previous,
+                    "delivery": "follow_up",
+                }
+            # A settled session is resumed: the host marks it pending and
+            # drops the stale completion timestamp (see the delegation host).
+            agent.status = {"state": "pending"}
+            agent.phase = "follow-up queued"
+            agent.completed_at_ms = None
+            self.host.follow_ups.append((agent.agent_id, message))
+            return {
+                "agent_id": agent.agent_id,
+                "agent_path": agent.agent_path,
+                "previous_status": previous,
+                "delivery": "new_run",
             }
 
     def _maybe_cancel(self, operation: str) -> None:

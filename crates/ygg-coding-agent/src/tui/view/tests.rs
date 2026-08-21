@@ -6951,6 +6951,204 @@ fn hydrating_a_replacement_session_clears_subagent_activity() {
 }
 
 #[test]
+fn terminal_subagent_snapshots_hide_the_activity_strip() {
+    let mut shell = InteractiveShell::test_shell();
+    let child = |id: &str, state: &str| ygg_agent::DelegationTelemetryChild {
+        child_id: id.into(),
+        task_name: "Inspect tests".into(),
+        profile: Some("explore".into()),
+        model: "test-model".into(),
+        state: state.into(),
+        phase: "using_tool".into(),
+        current_tool: Some("read".into()),
+        tool_use_count: 1,
+        input_tokens: 100,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 10,
+        reasoning_tokens: 0,
+        total_tokens: 110,
+        cost: None,
+        cost_microdollars: Some(1),
+        elapsed_ms: 500,
+        failure_class: None,
+        failure_reason: None,
+        session: Some("agent-session:opaque".into()),
+    };
+
+    // A live worker keeps the strip visible...
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 1,
+            captured_at_ms: 1_700_000_000_000,
+            children: vec![child("agent-1", "running")],
+            total_cost_microdollars: Some(1),
+            failure_reason: None,
+            failure_class: None,
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_some());
+
+    // ...and the final settlement (which the host always flushes before
+    // RunFinished) removes the strip instead of parking a finished label in
+    // the chrome after the run.
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 2,
+            captured_at_ms: 1_700_000_000_001,
+            children: vec![child("agent-1", "completed")],
+            total_cost_microdollars: Some(1),
+            failure_reason: None,
+            failure_class: None,
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_none());
+
+    // A spawn that fails outright is transcript material, not chrome: with
+    // nothing active the strip stays hidden.
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 3,
+            captured_at_ms: 1_700_000_000_002,
+            children: Vec::new(),
+            total_cost_microdollars: None,
+            failure_reason: Some("spawn rejected: worker limit reached".into()),
+            failure_class: Some("spawn_rejected".into()),
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_none());
+}
+
+#[test]
+fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
+    let mut shell = InteractiveShell::test_shell();
+    let child = |id: &str, task: &str, state: &str| ygg_agent::DelegationTelemetryChild {
+        child_id: id.into(),
+        task_name: task.into(),
+        profile: Some("explore".into()),
+        model: "test-model".into(),
+        state: state.into(),
+        phase: "using_tool".into(),
+        current_tool: (state == "running").then(|| "read".into()),
+        tool_use_count: 2,
+        input_tokens: 100,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 10,
+        reasoning_tokens: 0,
+        total_tokens: 110,
+        cost: None,
+        cost_microdollars: Some(1),
+        elapsed_ms: 500,
+        failure_class: None,
+        failure_reason: None,
+        session: Some("agent-session:opaque".into()),
+    };
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 1,
+            captured_at_ms: 1_700_000_000_000,
+            children: vec![
+                child("agent-1", "Read release history", "running"),
+                child("agent-2", "Audit release surface", "running"),
+                child("agent-3", "Scan changelog", "completed"),
+            ],
+            total_cost_microdollars: Some(3),
+            failure_reason: None,
+            failure_class: None,
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(!shell.state.borrow().subagent_activity_expanded);
+    let collapsed = shell_chrome(&shell.state.borrow(), 120, Instant::now())
+        .subagents
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(collapsed.contains("Audit release surface"), "{collapsed}");
+    assert!(!collapsed.contains("Read release history"), "{collapsed}");
+    assert!(collapsed.contains("ctrl+o to expand"), "{collapsed}");
+
+    // ctrl+o toggles the strip between the two most recent children and the
+    // five most recent, and the hint in the label follows the toggle.
+    shell.expand_focused_tool();
+    assert!(shell.state.borrow().subagent_activity_expanded);
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    let expanded = shell_chrome(&shell.state.borrow(), 120, Instant::now())
+        .subagents
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(expanded.contains("Read release history"), "{expanded}");
+    assert!(expanded.contains("Audit release surface"), "{expanded}");
+    assert!(expanded.contains("Scan changelog"), "{expanded}");
+    assert!(expanded.contains("ctrl+o to collapse"), "{expanded}");
+
+    shell.expand_focused_tool();
+    assert!(!shell.state.borrow().subagent_activity_expanded);
+
+    // With nothing active the strip is gone and ctrl+o falls back to the
+    // verbose tool output toggle.
+    shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
+        snapshot: ygg_agent::DelegationTelemetrySnapshot {
+            revision: 2,
+            captured_at_ms: 1_700_000_000_001,
+            children: vec![
+                child("agent-1", "Read release history", "completed"),
+                child("agent-2", "Audit release surface", "completed"),
+                child("agent-3", "Scan changelog", "completed"),
+            ],
+            total_cost_microdollars: Some(3),
+            failure_reason: None,
+            failure_class: None,
+        },
+    });
+    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(!shell.verbose_tools());
+    shell.expand_focused_tool();
+    assert!(shell.verbose_tools());
+}
+
+#[test]
+fn extension_presentation_hides_terminal_subagent_activities() {
+    let mut shell = InteractiveShell::test_shell();
+    let snapshot =
+        |state: &str| -> ygg_agent::ExtensionPresentationSnapshot {
+            serde_json::from_value(serde_json::json!({
+                "revision": 1,
+                "status": {"state": "active", "label": "Subagents"},
+                "activities": [{
+                    "id": "activity:agent-1",
+                    "kind": "subagent",
+                    "state": state,
+                    "summary": "read-diffs · using read",
+                    "metrics": {
+                        "tool_calls": 16,
+                        "input_tokens": 80_000,
+                        "cache_read_tokens": 8_200,
+                        "cache_write_tokens": 0,
+                        "output_tokens": 99,
+                        "reasoning_tokens": 20,
+                        "cost_microdollars": 208_600
+                    }
+                }],
+                "actions": []
+            }))
+            .unwrap()
+        };
+
+    assert!(shell.set_subagent_presentation(Some(&snapshot("running")), true));
+    assert!(shell.state.borrow().subagent_activity.is_some());
+
+    // Terminal extension activities must not keep the strip parked after the
+    // run, mirroring the host telemetry path.
+    assert!(shell.set_subagent_presentation(Some(&snapshot("succeeded")), true));
+    assert!(shell.state.borrow().subagent_activity.is_none());
+}
+
+#[test]
 fn semantic_transcript_blocks_have_uniform_transition_spacing() {
     let theme = crate::tui::theme::test_theme();
     let rich_renderer = theme.rich_renderer();

@@ -646,7 +646,7 @@ Useful keys:
 | `Shift+Enter` | Insert a newline when the terminal reports enhanced key events. |
 | `Ctrl+C` | Clear a nonempty draft; with an empty draft, abort active work and do nothing when idle. |
 | `Ctrl+D` | Close ygg from any interactive input surface, settling active work and child-process cleanup first. |
-| `Ctrl+O` | Expand or collapse reasoning, tool evidence, or shell output. |
+| `Ctrl+O` | Expand or collapse the subagent activity strip while workers are active; otherwise expand or collapse reasoning, tool evidence, or shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
 | `Tab` | Complete trailing `./`, `../`, `~/`, and absolute path tokens. Directories remain open for continued completion, and spaces are backslash-escaped. |
 | `@` | Fuzzy-complete gitignore-aware workspace file mentions; path-prefixed mentions also use filesystem completion. |

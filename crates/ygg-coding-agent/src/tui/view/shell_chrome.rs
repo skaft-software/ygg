@@ -78,17 +78,28 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     let Some(view) = state.subagent_activity.as_ref() else {
         return Vec::new();
     };
+    // When the strip is expanded (ctrl+o), the hint in the label flips so it
+    // keeps telling the truth about what ctrl+o will do next.
+    let status_label = if state.subagent_activity_expanded {
+        view.status_label.replace("ctrl+o to expand", "ctrl+o to collapse")
+    } else {
+        view.status_label.clone()
+    };
     let mut lines = vec![fit_line(
         &state.theme.bold(
             &state
                 .theme
-                .fg("model_accent", &sanitize_for_terminal(&view.status_label)),
+                .fg("model_accent", &sanitize_for_terminal(&status_label)),
         ),
         width,
     )];
     let unicode = state.theme.unicode();
+    // Collapsed: the two most recent children. Expanded: the five most
+    // recent, so a large team cannot push the whole frame past the viewport
+    // (the full roster stays one /subagents away).
+    let limit = if state.subagent_activity_expanded { 5 } else { 2 };
     if !view.telemetry.is_empty() {
-        let children = view.telemetry.iter().rev().take(2).collect::<Vec<_>>();
+        let children = view.telemetry.iter().rev().take(limit).collect::<Vec<_>>();
         for (index, child) in children.iter().rev().enumerate() {
             let last = index + 1 == children.len();
             let branch = match (unicode, last) {
@@ -163,7 +174,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
                 &format!(
                     "{}{} {}",
                     state.theme.fg("muted", continuation),
-                    state.theme.fg("muted", if unicode { "⎿" } else { "|_" }),
+                    state.theme.fg("muted", if unicode { "└" } else { "|_" }),
                     state.theme.fg("muted", &detail),
                 ),
                 width,
@@ -184,7 +195,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             lines.push(fit_line(
                 &format!(
                     "{} {}",
-                    state.theme.fg("error", if unicode { "⎿" } else { "|_" }),
+                    state.theme.fg("error", if unicode { "└" } else { "|_" }),
                     state.theme.fg(
                         "error",
                         &format!("Failed: {}", sanitize_for_terminal(reason)),
@@ -197,7 +208,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
         lines.push(fit_line(
             &format!(
                 "{} {}",
-                state.theme.fg("error", if unicode { "⎿" } else { "|_" }),
+                state.theme.fg("error", if unicode { "└" } else { "|_" }),
                 state.theme.fg(
                     "error",
                     &format!("Failed: {}", sanitize_for_terminal(reason))
@@ -206,7 +217,11 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             width,
         ));
     } else {
-        let activities = view.activities.iter().rev().take(2).collect::<Vec<_>>();
+        let activities = view.activities
+            .iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>();
         for (index, activity) in activities.iter().rev().enumerate() {
             let last = index + 1 == activities.len();
             let branch = match (unicode, last) {
@@ -263,7 +278,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
                     &format!(
                         "{}{} {}",
                         state.theme.fg("muted", continuation),
-                        state.theme.fg("muted", if unicode { "⎿" } else { "|_" }),
+                        state.theme.fg("muted", if unicode { "└" } else { "|_" }),
                         state.theme.fg("muted", &telemetry),
                     ),
                     width,

@@ -2,34 +2,41 @@
 
 `ygg-subagents` is a small API `0.2` executable extension for Claude Code-like background workers. It launches named, single-purpose child conversations through Ygg's **host-owned `agent_sessions` service**. It is not an agent team, graph/recipe runtime, swarm, hosted-agent scheduler, or second Agent loop.
 
-Version `0.1.0` targets exactly Ygg `0.6.0-dev`.
+Version `0.2.0` targets exactly Ygg `0.6.0-dev`.
 
 ## Safety model
 
-V1 is deliberately read-only and bounded:
+V1 is deliberately bounded, with a read-only default tool scope:
 
-- at most **two active children** and sixteen retained workers per parent owner;
+- at most **eight active children** and thirty-two retained workers per parent owner;
 - depth one; a recursively admitted descendant is immediately interrupted when its host path/depth is observed;
 - four predefined profiles (`explore`, `review`, `test-analysis`, `research`);
 - inherited model only (`model: "inherit"`), because the API `0.2` service does not accept a model override;
-- requested tool scope is a non-empty subset of `read` and `search` only;
-- 5–900 second wall-time request, 1–12 turns, 512–16384 returned output bytes, and a bounded microdollar request;
+- requested tool scope is a non-empty duplicate-free subset of `read`, `search`, `edit`, `write`, and `bash`; `read, search` is the default and the recommended scope;
+- wall-time, turn, and cost ceilings are optional per spawn: when omitted they inherit the parent session's ceilings (an unlimited parent remains unlimited); explicit values are bounded to 5 s–24 h, 1–256 turns, and 1–50,000,000 microdollars; returned output is 512–16,384 bytes;
 - fresh child contexts inherit the parent's model, context/output limits, and optional session token ceiling exactly; an unlimited parent remains unlimited and the model-facing spawn schema has no separate token-budget field;
 - strict owner derivation from `tool/call.context.resource_owner`; no tool schema accepts an owner;
-- retry-safe spawn keys, bounded output/error retention, cooperative cancellation, and explicit stop.
+- retry-safe spawn keys, bounded output/error retention, cooperative cancellation, explicit stop, and continue (steer active / resume settled).
 
-Mutation tool names cannot enter the child request through model-generated `tools` data: the JSON Schema and runtime both accept only `read` and `search`. The canonical child policy also prohibits shell/process, edit/write, network/browser/computer control, mailbox/team primitives, recursion, and manager-generated commands. Repository content and task text are explicitly data, not policy.
+`edit`, `write`, and `bash` may enter the child request through `tools` when
+explicitly granted, but the JSON Schema and runtime accept only that
+five-tool whitelist: network, browser, computer control, mailbox/team
+primitives, another agent primitive, and any other tool are rejected. The
+canonical child policy keeps repository content and task text as data, not
+policy, and never grants recursion or manager-generated commands.
 
 API `0.2` creates the child with inherited model, cwd/workspace, environment,
 sandbox, approval policy, and extension policy, but `agent/spawn.policy` is the
-hard per-child boundary: Ygg installs a detached `read`/`search` tool snapshot
-(no mutation or collaboration tools), applies lower parent turn/cost ceilings,
-inherits the parent's context/output and optional session-token settings without
-inventing a child ceiling, accounts cumulative tokens/cost, caps UTF-8 summary
-bytes, and owns the absolute wall deadline. Each child starts a fresh context;
-its usage is mirrored into the root ledger for accounting only, never inserted
-into the parent's model context, and never charged to the parent's own-context
-token ceiling. The two-child/depth-one/retention limits are also checked by the
+hard per-child boundary: Ygg installs a detached tool snapshot containing only
+the granted tools (never collaboration or agent primitives), applies the
+requested per-child turn/cost ceilings or inherits the parent's ceilings when
+they are omitted, inherits the parent's context/output and optional
+session-token settings without inventing a child ceiling, accounts cumulative
+tokens/cost, caps UTF-8 summary bytes, and owns the absolute wall deadline.
+Each child starts a fresh context; its usage is mirrored into the root ledger
+for accounting only, never inserted into the parent's model context, and never
+charged to the parent's own-context token ceiling. The
+eight-active/depth-one/thirty-two-retained limits are also checked by the
 real host service. Extension restart or absence of polling cannot relax those
 limits. A shared cwd/filesystem is **not isolation**.
 
@@ -40,7 +47,11 @@ no-follow descriptor, and exposes a locked read-only session projection. The
 reference carries no filesystem path and cannot be used to submit another
 prompt or bypass the worker policy.
 
-There is no writer profile in V1. Adding one requires evidence from the read-only path plus a host-enforced, single-writer approval/tool-policy boundary. Cooperative prompts alone are not sufficient.
+There is no dedicated writer profile in V1: mutation capability is granted per
+spawn through the requested tool list and is enforced by the host's scoped
+tool snapshot, not by cooperative prompts alone. A worker granted `edit`,
+`write`, or `bash` operates inside the same shared filesystem the parent sees,
+so grant mutation only for tightly scoped, verifiable work.
 
 ## Kernel boundary
 
@@ -59,9 +70,13 @@ The extension calls only these SDK helpers, which map directly to API `0.2`:
 - `spawn_agent` → `agent/spawn`;
 - `list_agents` → `agent/list`;
 - `wait_agents` → `agent/wait`;
-- `interrupt_agent` → `agent/interrupt`.
+- `interrupt_agent` → `agent/interrupt`;
+- `send_agent_message` → `agent/message`;
+- `follow_up_agent` → `agent/follow_up`.
 
-It does not use `agent/message`/`agent/follow_up`, the graph/recipe spike, built-in team mailboxes, or another scheduler.
+`agent/message` steers an active worker and `agent/follow_up` resumes a
+settled one; both are exposed only through `subagent_continue`. It does not
+use the graph/recipe spike, built-in team mailboxes, or another scheduler.
 
 ## Install, enable, and trust
 
@@ -151,6 +166,23 @@ or:
 ```
 
 The host validates the target against the extension principal and current resource owner and interrupts the selected descendant tree. An accepted request remains `stopping` until a subsequent authoritative `agent/list` or `agent/wait` record reports the terminal interruption; acknowledgement alone is never presented as completion. Repeated stop on a terminal worker is a bounded no-op.
+
+### `subagent_continue`
+
+Provide a `target` (displayed name, stable agent ID, or host path) and a `message`:
+
+```json
+{"target": "explore-auth", "message": "Also check the revocation path."}
+```
+
+An active worker receives the message through `agent/message` as a queued
+turn on its running session; a settled worker (`done`, `failed`,
+`cancelled`, `stopped`, or `timed_out`) is resumed through `agent/follow_up`
+as a new run of the worker's durable session, so the earlier conversation
+context is retained. Workers still draining a stop (`stopping`) and orphaned
+workers (host shutdown) are rejected with stable errors rather than raced.
+The host clears a settled record's completion timestamp on resume, so elapsed
+time always measures the current run.
 
 ## Lifecycle and restart behavior
 

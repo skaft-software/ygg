@@ -18,7 +18,8 @@ pub enum InputAction {
     SlashMenu(SlashMenuAction),
     CompletePath,
     ShowCompactionSummary,
-    /// Toggle verbose transcript mode for all expandable blocks (ctrl+o).
+    /// Toggle verbose tool output (ctrl+o). While the subagent activity
+    /// strip is visible, toggles its expanded view (all children) instead.
     ExpandFocusedTool,
     /// Cycle to the next thinking level supported by the active model.
     CycleThinking,

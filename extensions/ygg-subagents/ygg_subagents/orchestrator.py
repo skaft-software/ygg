@@ -10,13 +10,14 @@ import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 
 from .model import (
+    CHILD_TOOLS,
     MAX_ACTIVE_CHILDREN,
+    MAX_CHILD_MESSAGE_BYTES,
     MAX_DEPTH,
     MAX_ERROR_BYTES,
     MAX_OWNER_CACHES,
     MAX_WORKERS_PER_OWNER,
     PROFILE_INSTRUCTIONS,
-    READ_ONLY_TOOLS,
     SpawnRequest,
     SubagentError,
     Owner,
@@ -29,6 +30,7 @@ from .model import (
     parse_target,
     safe_label,
     sanitize_document,
+    validate_plain_text,
 )
 from .presentation import build_snapshot, detail_body, narrow_list
 
@@ -41,7 +43,9 @@ _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 
 def _host_policy(
     record: Mapping[str, Any],
-) -> Tuple[Tuple[str, ...], int, Optional[int], int, int, int, int]:
+) -> Tuple[
+    Tuple[str, ...], Optional[int], Optional[int], Optional[int], int, Optional[int], Optional[int]
+]:
     policy = record.get("policy")
     deadline_at_ms = record.get("deadline_at_ms")
     if not isinstance(policy, Mapping):
@@ -49,55 +53,66 @@ def _host_policy(
             "agent_sessions omitted the host-enforced child policy",
             code="host_state_invalid",
         )
-    tools = policy.get("tools")
+    raw_tools = policy.get("tools")
     if (
-        not isinstance(tools, list)
-        or not tools
-        or len(tools) > 2
-        or any(tool not in READ_ONLY_TOOLS for tool in tools)
-        or len(set(tools)) != len(tools)
+        not isinstance(raw_tools, list)
+        or not raw_tools
+        or len(raw_tools) > len(CHILD_TOOLS)
+        or any(tool not in CHILD_TOOLS for tool in raw_tools)
+        or len(set(raw_tools)) != len(raw_tools)
     ):
         raise SubagentError(
             "agent_sessions returned an invalid effective child tool policy",
             code="host_state_invalid",
         )
     max_tokens = policy.get("max_tokens")
+    # Omitted (null) child-specific ceilings are valid: they inherit the
+    # parent session's limits, which may themselves be unlimited.
     values = (
         policy.get("max_turns"),
         policy.get("max_cost_microdollars"),
-        policy.get("max_output_bytes"),
         policy.get("timeout_ms"),
         deadline_at_ms,
     )
-    if any(
-        not isinstance(value, int) or isinstance(value, bool) or value < 0
-        for value in values
-    ) or (
-        max_tokens is not None
-        and (
-            not isinstance(max_tokens, int)
-            or isinstance(max_tokens, bool)
-            or max_tokens < 0
-        )
+    for value in values:
+        if value is not None and (
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+        ):
+            raise SubagentError(
+                "agent_sessions returned invalid host-enforced child limits",
+                code="host_state_invalid",
+            )
+    max_output = policy.get("max_output_bytes")
+    if (
+        not isinstance(max_output, int)
+        or isinstance(max_output, bool)
+        or max_output < 1
     ):
         raise SubagentError(
             "agent_sessions returned invalid host-enforced child limits",
             code="host_state_invalid",
         )
-    max_turns, max_cost, max_output, timeout_ms, deadline = values
+    if max_tokens is not None and (
+        not isinstance(max_tokens, int)
+        or isinstance(max_tokens, bool)
+        or max_tokens < 0
+    ):
+        raise SubagentError(
+            "agent_sessions returned invalid host-enforced child limits",
+            code="host_state_invalid",
+        )
+    max_turns, max_cost, timeout_ms, deadline = values
     if (
-        max_turns < 1
-        or max_cost < 0
-        or max_output < 1
-        or timeout_ms < 1
-        or deadline < 1
+        (max_turns is not None and max_turns < 1)
+        or (timeout_ms is not None and timeout_ms < 1)
+        or (deadline is not None and deadline < 1)
     ):
         raise SubagentError(
             "agent_sessions returned non-positive host-enforced child limits",
             code="host_state_invalid",
         )
     return (
-        tuple(tools),
+        tuple(raw_tools),
         max_turns,
         max_tokens,
         max_cost,
@@ -108,7 +123,7 @@ def _host_policy(
 
 
 def _host_timestamps(
-    record: Mapping[str, Any], state_name: str, deadline_at_ms: int
+    record: Mapping[str, Any], state_name: str, deadline_at_ms: Optional[int]
 ) -> Tuple[int, int, Optional[int]]:
     created = record.get("created_at_ms")
     started = record.get("started_at_ms")
@@ -117,7 +132,7 @@ def _host_timestamps(
         not isinstance(created, int)
         or isinstance(created, bool)
         or created < 0
-        or created > deadline_at_ms
+        or (deadline_at_ms is not None and created > deadline_at_ms)
     ):
         raise SubagentError(
             "agent_sessions omitted a valid host-created worker timestamp",
@@ -157,6 +172,10 @@ def _host_timestamps(
             "agent_sessions returned an invalid worker completion timestamp",
             code="host_state_invalid",
         )
+    if not terminal and completed is not None:
+        # A resumed worker can still expose the previous run's completion
+        # timestamp from an older host; an active record is not completed.
+        completed = None
     if terminal and completed is None:
         raise SubagentError(
             "agent_sessions omitted the worker completion timestamp",
@@ -179,11 +198,11 @@ class AgentSessions(Protocol):
         tools: Sequence[str],
         max_depth: int,
         max_concurrent_children: int,
-        max_turns: int,
+        max_turns: Optional[int],
         max_tokens: Optional[int],
-        max_cost_microdollars: int,
+        max_cost_microdollars: Optional[int],
         max_output_bytes: int,
-        timeout_ms: int,
+        timeout_ms: Optional[int],
     ) -> Mapping[str, Any]: ...
 
     def list_agents(self) -> Mapping[str, Any]: ...
@@ -191,6 +210,14 @@ class AgentSessions(Protocol):
     def wait_agents(self, *, timeout_ms: int) -> Mapping[str, Any]: ...
 
     def interrupt_agent(self, target: str) -> Mapping[str, Any]: ...
+
+    def send_agent_message(self, target: str, message: str) -> Mapping[str, Any]:
+        """Steer a running child, or queue the message for an idle one."""
+        ...
+
+    def follow_up_agent(self, target: str, message: str) -> Mapping[str, Any]:
+        """Queue a follow-up task; resumes a settled worker's durable session."""
+        ...
 
 
 class Cancellation(Protocol):
@@ -269,7 +296,11 @@ class Orchestrator:
                 max_tokens=None,
                 max_cost_microdollars=request.max_cost_microdollars,
                 max_output_bytes=request.max_output_bytes,
-                timeout_ms=request.timeout_seconds * 1000,
+                timeout_ms=(
+                    None
+                    if request.timeout_seconds is None
+                    else request.timeout_seconds * 1000
+                ),
             )
             worker = self._worker_from_spawn(owner, request, response)
             if worker.depth > MAX_DEPTH:
@@ -315,7 +346,12 @@ class Orchestrator:
             waited = self.wait(
                 client,
                 owner,
-                {"target": result["worker"]["id"], "timeout_seconds": min(60, request.timeout_seconds)},
+                {
+                    "target": result["worker"]["id"],
+                    "timeout_seconds": 60
+                    if request.timeout_seconds is None
+                    else min(60, request.timeout_seconds),
+                },
                 cancellation,
             )
             result["foreground_wait"] = waited
@@ -522,6 +558,72 @@ class Orchestrator:
             ]
         self._publish(publish)
         return {"operation": "stop", "outcomes": outcomes, "workers": public_workers}
+
+    def continue_worker(
+        self,
+        client: AgentSessions,
+        owner: Owner,
+        arguments: Mapping[str, Any],
+        cancellation: Optional[Cancellation] = None,
+    ) -> Dict[str, Any]:
+        """Continue one owned worker: steer it if active, resume it if settled."""
+        if not isinstance(arguments, Mapping):
+            raise SubagentError("subagent_continue arguments must be an object")
+        unknown = set(arguments) - {"target", "message"}
+        if unknown:
+            raise SubagentError(
+                "unknown subagent_continue fields: %s" % ", ".join(sorted(unknown))
+            )
+        target = parse_target(arguments)
+        message = arguments.get("message")
+        if not isinstance(message, str) or not message.strip():
+            raise SubagentError("message must be a non-empty string")
+        if len(message.encode("utf-8")) > MAX_CHILD_MESSAGE_BYTES:
+            raise SubagentError("message exceeds the 64 KiB bound")
+        validate_plain_text(message, "message", allow_newline=True)
+
+        state = self._owner_state(owner)
+        self._refresh(client, state, cancellation)
+        with self._lock:
+            worker = self._resolve_locked(state, target)
+            state.selected_agent_id = worker.agent_id
+            display = worker.name
+            if worker.state == "orphaned":
+                raise SubagentError(
+                    "worker %s was orphaned by a host shutdown and cannot be resumed"
+                    % display,
+                    code="orphaned",
+                )
+            if worker.state == "stopping":
+                raise SubagentError(
+                    "worker %s is stopping; wait for it to settle before continuing"
+                    % display,
+                    code="worker_stopping",
+                )
+            action = "resumed" if worker.terminal else "steered"
+            if worker.terminal:
+                client.follow_up_agent(worker.agent_id, message)
+                # The host accepted the resume, so the previous run is closed.
+                # Clear the sticky flags or the next refresh would re-map the
+                # fresh run back to "stopping"/"timed out" and this worker
+                # could never be continued again.
+                worker.stop_requested = False
+                worker.timeout_requested = False
+            else:
+                client.send_agent_message(worker.agent_id, message)
+        self._check_cancelled(cancellation)
+        self._refresh(client, state, cancellation)
+        with self._lock:
+            worker = self._resolve_locked(state, target)
+            result: Dict[str, Any] = {
+                "operation": "continue",
+                "accepted": True,
+                "action": action,
+                "worker": worker.public(self._now_ms()),
+            }
+            publish = self._snapshot_locked(state)
+        self._publish(publish)
+        return result
 
     def command(
         self, arguments: Sequence[Any], context: Mapping[str, Any]
@@ -855,7 +957,9 @@ class Orchestrator:
             created_at_ms=created_at_ms,
             started_at_ms=started_at_ms,
             deadline_at_ms=deadline_at_ms,
-            timeout_seconds=max(1, timeout_ms // 1000),
+            timeout_seconds=(
+                None if timeout_ms is None else max(1, timeout_ms // 1000)
+            ),
             max_turns=max_turns,
             max_output_bytes=max_output,
             max_tokens=max_tokens,
@@ -919,7 +1023,9 @@ class Orchestrator:
         worker.max_tokens = max_tokens
         worker.max_cost_microdollars = max_cost
         worker.max_output_bytes = max_output
-        worker.timeout_seconds = max(1, timeout_ms // 1000)
+        worker.timeout_seconds = (
+            None if timeout_ms is None else max(1, timeout_ms // 1000)
+        )
         worker.deadline_at_ms = deadline_at_ms
         profile = record.get("profile")
         idempotency_key = record.get("idempotency_key")
@@ -1072,12 +1178,14 @@ class Orchestrator:
         active = sum(worker.active for worker in state.workers.values()) + len(state.pending_spawns)
         if active >= MAX_ACTIVE_CHILDREN:
             raise SubagentError(
-                "subagent concurrency limit reached (2 active children)",
+                "subagent concurrency limit reached (%d active children)"
+                % MAX_ACTIVE_CHILDREN,
                 code="concurrency_limit",
             )
         if len(state.workers) + len(state.pending_spawns) >= MAX_WORKERS_PER_OWNER:
             raise SubagentError(
-                "subagent total worker limit reached for this parent (16)",
+                "subagent total worker limit reached for this parent (%d)"
+                % MAX_WORKERS_PER_OWNER,
                 code="worker_limit",
             )
         state.pending_spawns[request.idempotency_key] = request
@@ -1166,7 +1274,9 @@ class Orchestrator:
             created_at_ms=created_at_ms,
             started_at_ms=started_at_ms,
             deadline_at_ms=deadline_at_ms,
-            timeout_seconds=max(1, timeout_ms // 1000),
+            timeout_seconds=(
+                None if timeout_ms is None else max(1, timeout_ms // 1000)
+            ),
             max_turns=max_turns,
             max_output_bytes=max_output,
             max_tokens=max_tokens,
