@@ -75,13 +75,20 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
 }
 
 fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
+    // Delegated workers now render as persistent transcript tool blocks. Keep
+    // this compatibility path empty so older shell-chrome callers cannot
+    // duplicate the event below the transcript.
+    if state.subagent_activity_block.is_some() {
+        return Vec::new();
+    }
     let Some(view) = state.subagent_activity.as_ref() else {
         return Vec::new();
     };
     // When the strip is expanded (ctrl+o), the hint in the label flips so it
     // keeps telling the truth about what ctrl+o will do next.
     let status_label = if state.subagent_activity_expanded {
-        view.status_label.replace("ctrl+o to expand", "ctrl+o to collapse")
+        view.status_label
+            .replace("ctrl+o to expand", "ctrl+o to collapse")
     } else {
         view.status_label.clone()
     };
@@ -97,7 +104,11 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     // Collapsed: the two most recent children. Expanded: the five most
     // recent, so a large team cannot push the whole frame past the viewport
     // (the full roster stays one /subagents away).
-    let limit = if state.subagent_activity_expanded { 5 } else { 2 };
+    let limit = if state.subagent_activity_expanded {
+        5
+    } else {
+        2
+    };
     if !view.telemetry.is_empty() {
         let children = view.telemetry.iter().rev().take(limit).collect::<Vec<_>>();
         for (index, child) in children.iter().rev().enumerate() {
@@ -217,11 +228,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             width,
         ));
     } else {
-        let activities = view.activities
-            .iter()
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>();
+        let activities = view.activities.iter().rev().take(limit).collect::<Vec<_>>();
         for (index, activity) in activities.iter().rev().enumerate() {
             let last = index + 1 == activities.len();
             let branch = match (unicode, last) {

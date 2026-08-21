@@ -65,7 +65,13 @@ Endpoints resolve static, environment, or dynamic credentials immediately before
 
 ## Deterministic catalog
 
-Normal builds generate display-name aliases only from the checked-in `models/models-dev-names.json` snapshot and never contact the network. Runtime discovery is a coding-product concern and can be disabled with `--offline`/`YGG_OFFLINE=true`.
+Normal builds generate display-name aliases and trusted provider pricing only
+from the checked-in `models/models-dev-names.json` and
+`models/models-dev-pricing.json` snapshots. They never contact the network.
+Pricing is provider-scoped, represented as integer microdollars per million
+tokens, and is used as a fallback for discovered built-in routes; explicit
+`CatalogConfig` pricing remains authoritative. Runtime discovery is a
+coding-product concern and can be disabled with `--offline`/`YGG_OFFLINE=true`.
 
 ## Cost accounting
 

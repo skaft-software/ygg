@@ -750,9 +750,7 @@ impl ExtensionDelegationService {
             manager.publish_external_failure("spawn_rejected", &error);
             error
         };
-        if policy.max_cost_microdollars.is_some()
-            && manager.template.model.spec.pricing.is_none()
-        {
+        if policy.max_cost_microdollars.is_some() && manager.template.model.spec.pricing.is_none() {
             return Err(reject_spawn(
                 "extension children with a cost ceiling require trusted model pricing".into(),
             ));
@@ -3388,7 +3386,8 @@ impl DelegationManager {
                 // the resumed run owns a fresh budget.
                 if let (Some(deadline), Some(timeout)) = (
                     record.deadline_at_ms,
-                    record.extension_policy
+                    record
+                        .extension_policy
                         .as_ref()
                         .and_then(|policy| policy.timeout_ms),
                 ) {
@@ -5767,10 +5766,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = writable_manager(directory.path());
         let root = manager.root_binding().identity;
-        let (identity, _commands) =
-            insert_test_record(&manager, DelegatedAgentStatus::Completed {
+        let (identity, _commands) = insert_test_record(
+            &manager,
+            DelegatedAgentStatus::Completed {
                 output: "first run settled".into(),
-            });
+            },
+        );
         {
             let mut state = manager.state.lock().unwrap();
             let record = state
@@ -5811,12 +5812,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = writable_manager(directory.path());
         let root = manager.root_binding().identity;
-        let (identity, _commands) =
-            insert_test_record(&manager, DelegatedAgentStatus::Completed {
+        let (identity, _commands) = insert_test_record(
+            &manager,
+            DelegatedAgentStatus::Completed {
                 output: "first run settled".into(),
-            });
-        let preserved =
-            u64::try_from(timestamp_ms()).unwrap_or(u64::MAX) + 1_000_000;
+            },
+        );
+        let preserved = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX) + 1_000_000;
         {
             let mut state = manager.state.lock().unwrap();
             let record = state
@@ -5825,9 +5827,7 @@ mod tests {
                 .expect("test record exists");
             record.extension_policy = Some(test_extension_policy());
             record.deadline_at_ms = Some(preserved);
-            record.completed_at_ms = Some(
-                u64::try_from(timestamp_ms()).unwrap_or(u64::MAX),
-            );
+            record.completed_at_ms = Some(u64::try_from(timestamp_ms()).unwrap_or(u64::MAX));
         }
 
         manager
@@ -5842,10 +5842,7 @@ mod tests {
             .unwrap();
 
         let state = manager.state.lock().unwrap();
-        assert_eq!(
-            state.records[&identity.id].deadline_at_ms,
-            Some(preserved)
-        );
+        assert_eq!(state.records[&identity.id].deadline_at_ms, Some(preserved));
     }
 
     #[test]

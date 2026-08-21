@@ -139,15 +139,202 @@ pub enum AgentError {
 
 /// Format an agent failure for a public frontend.
 ///
-/// Provider-originated failures retain only the configured endpoint/model route
-/// and execution phase. Provider payloads, status and error codes, request IDs,
-/// URLs, and transport details are intentionally omitted. Local agent failures
-/// retain their ordinary diagnostic.
+/// Provider failures retain operationally useful, bounded metadata: the route,
+/// execution phase, HTTP status/class, provider error code, safe provider
+/// message, retry hint, and request ID when supplied. Request bodies, URLs,
+/// credentials, and arbitrary response payloads are never copied into this
+/// string. The AI client redacts at the transport boundary; this function
+/// applies the final field allow-list and byte bound for UI/RPC consumers.
 pub fn public_error_diagnostic(error: &AgentError, endpoint: &str, model: &str) -> String {
-    match provider_failure_phase(error) {
-        Some(phase) => provider_phase_diagnostic(endpoint, model, phase),
-        None => error.to_string(),
+    match error {
+        AgentError::Ai(error) => public_ai_error_diagnostic(error, endpoint, model),
+        _ => match provider_failure_phase(error) {
+            Some(phase) => provider_phase_diagnostic(endpoint, model, phase),
+            None => error.to_string(),
+        },
     }
+}
+
+/// Format an inference-layer error for a user-facing retry or terminal event.
+/// The same allow-list is used for both paths so retry messages cannot expose
+/// more provider data than the final failure message.
+fn public_ai_error_diagnostic(error: &AiError, endpoint: &str, model: &str) -> String {
+    let context = |phase| provider_phase_diagnostic(endpoint, model, phase);
+    match error {
+        AiError::Http(http) => format_http_diagnostic(&context("HTTP response"), http),
+        AiError::Provider(provider) => {
+            let mut diagnostic = context("response body (provider error)");
+            append_provider_field(&mut diagnostic, "code", provider.code.as_deref());
+            append_provider_field(&mut diagnostic, "kind", provider.kind.as_deref());
+            append_provider_field(&mut diagnostic, "detail", Some(&provider.message));
+            append_provider_field(
+                &mut diagnostic,
+                "request_id",
+                provider.request_id.as_deref(),
+            );
+            truncate_public_diagnostic(&mut diagnostic);
+            diagnostic
+        }
+        AiError::Transport(transport) => {
+            let phase = match (transport.phase, transport.timeout) {
+                (ygg_ai::TransportPhase::Connect, false) => "connection",
+                (ygg_ai::TransportPhase::Connect, true) => "connection timeout",
+                (ygg_ai::TransportPhase::ResponseHeaders, false) => "response headers",
+                (ygg_ai::TransportPhase::ResponseHeaders, true) => "response headers timeout",
+                (ygg_ai::TransportPhase::Body, false) => "response body",
+                (ygg_ai::TransportPhase::Body, true) => "response body timeout",
+            };
+            let mut diagnostic = context(phase);
+            append_provider_field(&mut diagnostic, "detail", Some(&transport.message));
+            truncate_public_diagnostic(&mut diagnostic);
+            diagnostic
+        }
+        _ => context(ai_error_phase(error)),
+    }
+}
+
+const MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES: usize = 2 * 1024;
+const MAX_PUBLIC_PROVIDER_FIELD_BYTES: usize = 512;
+
+fn format_http_diagnostic(prefix: &str, error: &ygg_ai::HttpError) -> String {
+    let mut diagnostic = format!("{prefix} status={}", error.status.as_u16());
+    if let Some(summary) = http_status_summary(error.status.as_u16()) {
+        diagnostic.push_str(" (");
+        diagnostic.push_str(summary);
+        diagnostic.push(')');
+    }
+    append_provider_field(&mut diagnostic, "code", error.provider_code.as_deref());
+    if let Some(message) = provider_error_message(error.body_snippet.as_deref()) {
+        append_provider_field(&mut diagnostic, "detail", Some(&message));
+    }
+    if let Some(delay) = error.retry_after {
+        append_provider_field(
+            &mut diagnostic,
+            "retry_after",
+            Some(&format!("{}s", delay.as_secs())),
+        );
+    }
+    append_provider_field(&mut diagnostic, "request_id", error.request_id.as_deref());
+    truncate_public_diagnostic(&mut diagnostic);
+    diagnostic
+}
+
+fn provider_error_message(body: Option<&str>) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body?).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    ["message", "detail", "description"]
+        .iter()
+        .find_map(|field| error.get(*field).and_then(serde_json::Value::as_str))
+        .map(ToOwned::to_owned)
+        .filter(|message| !message.trim().is_empty())
+}
+
+fn append_provider_field(output: &mut String, name: &str, value: Option<&str>) {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let value = compact_public_provider_field(value);
+    if value.is_empty() {
+        return;
+    }
+    output.push(' ');
+    output.push_str(name);
+    output.push('=');
+    output.push_str(&value);
+}
+
+fn compact_public_provider_field(value: &str) -> String {
+    let value = redact_common_secret_patterns(value);
+    let mut output = String::with_capacity(value.len().min(MAX_PUBLIC_PROVIDER_FIELD_BYTES));
+    for character in value.chars() {
+        if character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+        {
+            continue;
+        }
+        if output
+            .len()
+            .saturating_add(character.len_utf8())
+            .saturating_add('…'.len_utf8())
+            > MAX_PUBLIC_PROVIDER_FIELD_BYTES
+        {
+            output.push('…');
+            break;
+        }
+        output.push(character);
+    }
+    output
+}
+
+/// Defense in depth for callers that construct `AgentError` values without
+/// passing through ygg-ai's credential redactor. The normal transport path
+/// performs exact credential redaction; these common bearer/key forms prevent
+/// accidental leakage from provider-authentication messages at the UI boundary.
+fn redact_common_secret_patterns(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut rest = value;
+    while !rest.is_empty() {
+        let lower = rest.to_ascii_lowercase();
+        let Some((offset, marker)) = ["sk-", "bearer ", "api_key=", "https://", "http://"]
+            .iter()
+            .filter_map(|marker| lower.find(marker).map(|offset| (offset, *marker)))
+            .min_by_key(|(offset, _)| *offset)
+        else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..offset]);
+        output.push_str(match marker {
+            "bearer " => "Bearer [REDACTED]",
+            "https://" | "http://" => "[URL]",
+            _ => "[REDACTED]",
+        });
+        let token_start = offset + marker.len();
+        let token_end = rest[token_start..]
+            .find(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '"' | '\'' | ')' | ']' | '}' | ',' | ';')
+            })
+            .map_or(rest.len(), |end| token_start + end);
+        rest = &rest[token_end..];
+    }
+    output
+}
+
+fn truncate_public_diagnostic(diagnostic: &mut String) {
+    if diagnostic.len() <= MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES {
+        return;
+    }
+    let mut end = MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES - '…'.len_utf8();
+    while end > 0 && !diagnostic.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostic.truncate(end);
+    diagnostic.push('…');
+}
+
+fn http_status_summary(status: u16) -> Option<&'static str> {
+    Some(match status {
+        400 => "bad request",
+        401 => "authentication failed",
+        402 => "payment or credits required",
+        403 => "forbidden",
+        404 => "route or model not found",
+        408 => "request timeout",
+        409 => "conflict",
+        413 => "request too large",
+        422 => "request rejected",
+        429 => "rate limited",
+        500..=599 => "provider unavailable",
+        _ => return None,
+    })
 }
 
 fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
@@ -1522,15 +1709,11 @@ fn retry_after(error: &AiError, attempt: usize) -> Duration {
 }
 
 fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
-    let context = provider_phase_diagnostic(
-        &model.endpoint.id.0,
-        &model.spec.id.0,
-        ai_error_phase(error),
-    );
+    let diagnostic = public_ai_error_diagnostic(error, &model.endpoint.id.0, &model.spec.id.0);
     if is_replayable_network_failure(error) {
-        format!("Network connection lost. Are you connected to the internet? {context}")
+        format!("Network connection lost. Are you connected to the internet? {diagnostic}")
     } else {
-        context
+        diagnostic
     }
 }
 
@@ -2368,6 +2551,48 @@ struct CapacityEstimate {
     active_system: String,
 }
 
+/// An immutable request snapshot assembled only after context capacity has
+/// been established. Compaction and dynamic tool publication can both cross
+/// an await before the provider request is opened, so the snapshot carries the
+/// durable cursor and the exact prompt/tool generations it was built from.
+struct PreparedTurn {
+    durable_head: Option<EntryId>,
+    active_system: String,
+    tool_generation: u64,
+    request: Request,
+    input_tokens: u64,
+}
+
+impl PreparedTurn {
+    fn new(
+        durable_head: Option<EntryId>,
+        active_system: String,
+        tool_generation: u64,
+        request: Request,
+        input_tokens: u64,
+    ) -> Self {
+        Self {
+            durable_head,
+            active_system,
+            tool_generation,
+            request,
+            input_tokens,
+        }
+    }
+
+    /// The request may be sent only while all inputs used to prepare it still
+    /// describe the authoritative session. A mismatch is retried through the
+    /// normal turn-boundary path, which rebuilds context and tool maps instead
+    /// of mixing generations in one provider call.
+    fn is_current(&self, session: &Session, active_system: &str, tool_generation: u64) -> bool {
+        self.durable_head == session.head()
+            && self.active_system == active_system
+            && self.tool_generation == tool_generation
+            && self.request.system.as_deref()
+                == (!active_system.is_empty()).then_some(active_system)
+    }
+}
+
 impl<'a> CompactionContext<'a> {
     #[allow(clippy::too_many_arguments)] // Mirrors the borrowed request-run state held by the context.
     fn new(
@@ -3028,6 +3253,50 @@ impl Agent {
             delegation: None,
             last_run_lifecycle: None,
         })
+    }
+
+    /// Builds an owned startup request that can establish the Responses
+    /// WebSocket while the frontend is idle. The request contains only the
+    /// current durable context and uses `generate=false` in `AiClient`; it is
+    /// never part of agent accounting or persistence.
+    pub fn responses_prewarm_request(
+        &self,
+    ) -> Result<Option<(AiClient, Model, Request)>, AgentError> {
+        if !matches!(
+            self.model.endpoint.transport,
+            ygg_ai::EndpointTransport::WebSocketPreferred
+        ) || self.model.spec.protocol != Protocol::OpenAiResponses
+        {
+            return Ok(None);
+        }
+        let responses = match self.auto_compaction_mode {
+            AgentCompactionMode::NativeResponses => Some(native_responses_options(
+                &self.session,
+                &self.model,
+                &self.system,
+            )?),
+            AgentCompactionMode::Local | AgentCompactionMode::Disabled => {
+                durable_responses_options(&self.session, &self.model, &self.system)
+            }
+        };
+        let request = Request {
+            system: (!self.system.is_empty()).then(|| self.system.clone()),
+            messages: self.session.context()?,
+            tools: self.extensions.tool_definitions(),
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: Some(self.max_output_tokens),
+            temperature: None,
+            stop: Vec::new(),
+            reasoning: self.reasoning.clone(),
+            reasoning_mode: self.reasoning_mode,
+            responses,
+            output_format: OutputFormat::Text,
+            output_modalities: self.output_modalities.clone(),
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: self.cache_retention,
+            session_id: Some(self.session_id.clone()),
+        };
+        Ok(Some((self.client.clone(), self.model.clone(), request)))
     }
 
     /// Read-only access to the agent's session (its entries and head).
@@ -4052,7 +4321,7 @@ impl Agent {
                     };
 
                 let request = Request {
-                    system: if active_system.is_empty() { None } else { Some(active_system) },
+                    system: if active_system.is_empty() { None } else { Some(active_system.clone()) },
                     messages,
                     tools: request_tool_defs.clone(),
                     tool_choice: ToolChoice::Auto,
@@ -4068,6 +4337,22 @@ impl Agent {
                     cache_retention,
                     session_id: Some(session_id.clone()),
                 };
+                let prepared = PreparedTurn::new(
+                    session.head(),
+                    active_system.clone(),
+                    tool_revision,
+                    request,
+                    input_tokens,
+                );
+                let current_tool_generation = extension_host.tool_snapshot().0;
+                if !prepared.is_current(session, &active_system, current_tool_generation) {
+                    // Re-enter the boundary so a publication or append that
+                    // crossed compaction cannot pair an old request with a new
+                    // tool map or durable cursor.
+                    continue 'run;
+                }
+                let input_tokens = prepared.input_tokens;
+                let request = prepared.request;
 
                 if let Err(error) = reserve_request_tokens(
                     session,
@@ -4472,34 +4757,19 @@ impl Agent {
                     });
                 }
 
-                let assistant_entry = match session
-                    .append(EntryValue::Message(Message::Assistant(assistant.clone())))
-                {
-                    Ok(entry) => entry,
-                    Err(error) => break 'run FinishReason::Failed(error.into()),
-                };
-                add_usage(&mut run_usage, &turn_usage);
-                let turn_cost = response.cost;
-                if let Err(error) = session.record_assistant_usage_with_stop_reason(
-                    assistant_entry.clone(),
+                if let Err(error) = session.append_assistant_turn(
+                    assistant.clone(),
                     model.endpoint.id.clone(),
                     model.spec.id.clone(),
                     turn_usage,
-                    turn_cost,
+                    response.cost,
                     stop_reason.clone(),
+                    raw_responses_output,
                 ) {
                     break 'run FinishReason::Failed(error.into());
                 }
-                if let Some(output) = raw_responses_output {
-                    if let Err(error) = session.append_responses_turn(
-                        assistant_entry.clone(),
-                        model.endpoint.id.clone(),
-                        model.spec.id.clone(),
-                        output,
-                    ) {
-                        break 'run FinishReason::Failed(error.into());
-                    }
-                }
+                add_usage(&mut run_usage, &turn_usage);
+                let turn_cost = response.cost;
                 run_cost.add(turn_cost);
                 let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);
                 let needs_continuation = matches!(stop_reason, StopReason::MaxTokens | StopReason::PauseTurn)
@@ -5312,6 +5582,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_turn_rejects_stale_durable_head_system_and_tool_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("prepared-turn.jsonl")).unwrap();
+        let request = Request {
+            system: Some("system".into()),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: Some(16),
+            temperature: None,
+            stop: Vec::new(),
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: CacheRetention::default(),
+            session_id: Some("session".into()),
+        };
+        let prepared = PreparedTurn::new(session.head(), "system".into(), 7, request, 3);
+
+        assert!(prepared.is_current(&session, "system", 7));
+        assert!(!prepared.is_current(&session, "changed", 7));
+        assert!(!prepared.is_current(&session, "system", 8));
+
+        session
+            .append(user_message(UserInput::from("new durable input")))
+            .unwrap();
+        assert!(!prepared.is_current(&session, "system", 7));
+    }
+    #[test]
     fn provisional_delivery_rolls_back_when_generic_tool_output_limiting_truncates_it() {
         use std::sync::atomic::{AtomicI8, Ordering};
 
@@ -5408,54 +5710,54 @@ mod tests {
     }
 
     #[test]
-    fn provider_retry_diagnostics_omit_provider_details_and_secrets() {
+    fn provider_retry_diagnostics_include_bounded_operational_details() {
         let model = tool_media_model(Protocol::OpenAiChat, ygg_ai::ModalitySet::none());
         let errors = [
             AiError::Http(ygg_ai::HttpError {
                 status: http::StatusCode::TOO_MANY_REQUESTS,
-                request_id: Some("secret-request-id".into()),
-                retry_after: None,
-                provider_code: Some("secret-provider-code".into()),
-                body_snippet: Some("secret-provider-body with secret-api-key".into()),
+                request_id: Some("req-429".into()),
+                retry_after: Some(Duration::from_secs(3)),
+                provider_code: Some("rate_limit_exceeded".into()),
+                body_snippet: Some(r#"{"error":{"message":"temporarily rate limited"}}"#.into()),
                 retryable: true,
             }),
             AiError::Provider(ygg_ai::ProviderError {
-                code: Some("secret-stream-code".into()),
-                kind: Some("secret-stream-kind".into()),
-                message: "secret-stream-body with user prompt".into(),
-                request_id: Some("secret-stream-request-id".into()),
+                code: Some("upstream_error".into()),
+                kind: Some("server_error".into()),
+                message: "upstream temporarily unavailable".into(),
+                request_id: Some("req-stream".into()),
             }),
             AiError::Transport(ygg_ai::TransportError {
                 phase: ygg_ai::TransportPhase::Connect,
                 timeout: false,
-                message: "secret transport detail with secret-api-key".into(),
+                message: "connection reset by peer".into(),
             }),
         ];
 
-        for error in &errors {
+        let retry = provider_retry_diagnostic(&model, &errors[0]);
+        assert!(retry.contains("status=429 (rate limited)"), "{retry}");
+        assert!(retry.contains("code=rate_limit_exceeded"), "{retry}");
+        assert!(retry.contains("retry_after=3s"), "{retry}");
+        assert!(retry.contains("request_id=req-429"), "{retry}");
+
+        for error in &errors[1..] {
             let diagnostic = provider_retry_diagnostic(&model, error);
             assert!(diagnostic.contains("provider="), "{diagnostic}");
             assert!(diagnostic.contains("model="), "{diagnostic}");
             assert!(diagnostic.contains("phase="), "{diagnostic}");
-            for secret in [
-                "secret-request-id",
-                "secret-provider-code",
-                "secret-provider-body",
-                "secret-api-key",
-                "secret-stream-code",
-                "secret-stream-kind",
-                "secret-stream-body",
-                "secret-stream-request-id",
-                "user prompt",
-                "secret transport detail",
-                "429",
-            ] {
-                assert!(
-                    !diagnostic.contains(secret),
-                    "leaked {secret:?}: {diagnostic}"
-                );
-            }
         }
+
+        let credential_error = AiError::Http(ygg_ai::HttpError {
+            status: http::StatusCode::UNAUTHORIZED,
+            request_id: Some("req-auth".into()),
+            retry_after: None,
+            provider_code: Some("invalid_api_key".into()),
+            body_snippet: Some(r#"{"error":{"message":"invalid api key: sk-secret"}}"#.into()),
+            retryable: false,
+        });
+        let diagnostic = provider_retry_diagnostic(&model, &credential_error);
+        assert!(diagnostic.contains("status=401 (authentication failed)"));
+        assert!(!diagnostic.contains("sk-secret"));
     }
 
     #[test]
@@ -5514,72 +5816,60 @@ mod tests {
     }
 
     #[test]
-    fn public_provider_failures_are_route_and_phase_only() {
+    fn public_provider_failures_include_safe_operational_details() {
         let errors = [
             (
                 AgentError::Ai(AiError::Http(ygg_ai::HttpError {
                     status: http::StatusCode::BAD_REQUEST,
-                    request_id: Some("secret-request-id".into()),
+                    request_id: Some("req-400".into()),
                     retry_after: None,
-                    provider_code: Some("secret-provider-code".into()),
-                    body_snippet: Some("secret body https://user:password@example.test".into()),
+                    provider_code: Some("invalid_request".into()),
+                    body_snippet: Some(
+                        r#"{"error":{"message":"model does not support this request"}}"#
+                            .into(),
+                    ),
                     retryable: false,
                 })),
-                "HTTP response",
+                "status=400 (bad request) code=invalid_request detail=model does not support this request request_id=req-400",
             ),
             (
                 AgentError::Ai(AiError::Provider(ygg_ai::ProviderError {
-                    code: Some("secret-stream-code".into()),
-                    kind: Some("secret-stream-kind".into()),
-                    message: "secret prompt and credential".into(),
-                    request_id: Some("secret-stream-request-id".into()),
+                    code: Some("upstream_error".into()),
+                    kind: Some("server_error".into()),
+                    message: "upstream temporarily unavailable".into(),
+                    request_id: Some("req-stream".into()),
                 })),
-                "response body (provider error)",
+                "phase=response body (provider error) code=upstream_error kind=server_error detail=upstream temporarily unavailable request_id=req-stream",
             ),
             (
                 AgentError::Ai(AiError::Transport(ygg_ai::TransportError {
                     phase: ygg_ai::TransportPhase::Body,
                     timeout: true,
-                    message: "secret transport detail".into(),
+                    message: "stream idle beyond its timeout".into(),
                 })),
-                "response body timeout",
-            ),
-            (
-                AgentError::IncompleteResponse {
-                    stop_reason: "secret stop code".into(),
-                },
-                "response completion",
-            ),
-            (
-                AgentError::NetworkUnavailable {
-                    retries: 5,
-                    detail: "secret network detail".into(),
-                },
-                "connection",
+                "phase=response body timeout detail=stream idle beyond its timeout",
             ),
         ];
 
-        for (error, phase) in errors {
+        for (error, suffix) in errors {
             let diagnostic = public_error_diagnostic(&error, "openai", "gpt-test");
-            assert_eq!(
-                diagnostic,
-                format!("provider=openai model=gpt-test phase={phase}")
-            );
-            for secret in [
-                "400",
-                "secret",
-                "https://",
-                "example.test",
-                "password",
-                "credential",
-                "prompt",
-            ] {
-                assert!(
-                    !diagnostic.contains(secret),
-                    "leaked {secret:?}: {diagnostic}"
-                );
-            }
+            assert!(diagnostic.ends_with(suffix), "{diagnostic}");
+            assert!(diagnostic.starts_with("provider=openai model=gpt-test "));
         }
+
+        let error = AgentError::Ai(AiError::Http(ygg_ai::HttpError {
+            status: http::StatusCode::UNAUTHORIZED,
+            request_id: Some("req-auth".into()),
+            retry_after: None,
+            provider_code: Some("invalid_api_key".into()),
+            body_snippet: Some(r#"{"error":{"message":"invalid api key: sk-secret"}}"#.into()),
+            retryable: false,
+        }));
+        let diagnostic = public_error_diagnostic(&error, "openrouter", "openrouter/test");
+        assert!(diagnostic.contains("status=401 (authentication failed)"));
+        assert!(diagnostic.contains("code=invalid_api_key"));
+        assert!(diagnostic.contains("request_id=req-auth"));
+        assert!(!diagnostic.contains("sk-secret"));
 
         assert_eq!(
             public_error_diagnostic(&AgentError::RunEnded, "openai", "gpt-test"),

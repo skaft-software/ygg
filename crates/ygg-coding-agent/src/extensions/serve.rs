@@ -11365,32 +11365,31 @@ mod tests {
     };
 
     #[test]
-    fn provider_failure_diagnostics_are_phase_specific_and_omit_provider_bodies() {
+    fn provider_failure_diagnostics_include_status_and_request_id() {
         let error = AgentError::Ai(AiError::Http(ygg_ai::HttpError {
             status: http::StatusCode::BAD_REQUEST,
-            request_id: Some("request-secret".to_owned()),
+            request_id: Some("req-400".to_owned()),
             retry_after: None,
-            provider_code: Some("provider-secret".to_owned()),
-            body_snippet: Some("credential-secret".to_owned()),
+            provider_code: Some("invalid_request".to_owned()),
+            body_snippet: Some(
+                r#"{"error":{"message":"model does not support this request"}}"#.into(),
+            ),
             retryable: false,
         }));
         let message = ygg_agent::public_error_diagnostic(&error, "custom/e2e", "e2e-model");
-        assert_eq!(
-            message,
-            "provider=custom/e2e model=e2e-model phase=HTTP response"
-        );
-        assert!(!message.contains("secret"));
-        assert!(!message.contains("400"));
+        assert!(message.contains("status=400 (bad request)"));
+        assert!(message.contains("code=invalid_request"));
+        assert!(message.contains("request_id=req-400"));
 
         let timeout = AgentError::Ai(AiError::Transport(ygg_ai::TransportError {
             phase: TransportPhase::Body,
             timeout: true,
-            message: "credential-secret".to_owned(),
+            message: "stream idle beyond its timeout".to_owned(),
         }));
-        assert_eq!(
-            ygg_agent::public_error_diagnostic(&timeout, "custom/e2e", "e2e-model"),
-            "provider=custom/e2e model=e2e-model phase=response body timeout"
-        );
+        let timeout_message =
+            ygg_agent::public_error_diagnostic(&timeout, "custom/e2e", "e2e-model");
+        assert!(timeout_message.contains("phase=response body timeout"));
+        assert!(timeout_message.contains("detail=stream idle beyond its timeout"));
     }
 
     fn serve_test_config(directory: &Path) -> Config {

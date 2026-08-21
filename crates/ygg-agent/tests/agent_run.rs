@@ -1449,8 +1449,11 @@ async fn repeated_connect_failure_is_visible_and_bounded() {
         .all(|(_, _, error)| error.contains("Are you connected to the internet?")));
     assert!(retries[0].2.contains("provider=test model=scripted"));
     assert!(retries[0].2.contains("phase=connection"));
-    assert!(!retries[0].2.contains("Connect"));
-    assert!(!retries[0].2.contains("closed"));
+    // Bounded transport detail is intentional. It may include the hyper/OS
+    // connect label (for example "client error (Connect)"), but never the
+    // endpoint URL, credentials, or internal enum path.
+    assert!(retries[0].2.contains("detail="), "{}", retries[0].2);
+    assert!(!retries[0].2.contains("TransportPhase"));
     assert!(!retries[0].2.contains(&uri));
     assert!(!retries[0].2.contains("test-key"));
     assert_eq!(calls.load(Ordering::SeqCst), MAX_CONNECT_ATTEMPTS_FOR_TEST);

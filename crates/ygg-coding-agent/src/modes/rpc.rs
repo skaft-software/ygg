@@ -2645,28 +2645,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rpc_failure_diagnostic_omits_provider_payloads_and_codes() {
+    fn rpc_failure_diagnostic_includes_safe_operational_details() {
         let model = ygg_ai::ModelCatalog::builtin()
             .unwrap()
             .resolve(&ModelId("gpt-4o-mini".into()))
             .unwrap();
         let error = AgentError::Ai(ygg_ai::AiError::Http(ygg_ai::HttpError {
             status: http::StatusCode::BAD_REQUEST,
-            request_id: Some("secret-request-id".into()),
+            request_id: Some("req-400".into()),
             retry_after: None,
-            provider_code: Some("secret-provider-code".into()),
-            body_snippet: Some("secret provider body with user prompt".into()),
+            provider_code: Some("invalid_request".into()),
+            body_snippet: Some(
+                r#"{"error":{"message":"model does not support this request"}}"#.into(),
+            ),
             retryable: false,
         }));
 
         let diagnostic = rpc_error_diagnostic(&model, &error);
-        assert_eq!(
-            diagnostic,
-            "provider=openai model=gpt-4o-mini phase=HTTP response"
-        );
-        assert!(!diagnostic.contains("secret"));
-        assert!(!diagnostic.contains("400"));
-        assert!(!diagnostic.contains("prompt"));
+        assert!(diagnostic.contains("status=400 (bad request)"));
+        assert!(diagnostic.contains("code=invalid_request"));
+        assert!(diagnostic.contains("request_id=req-400"));
     }
 
     #[test]

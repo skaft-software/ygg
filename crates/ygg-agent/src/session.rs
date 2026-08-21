@@ -1870,6 +1870,162 @@ impl Session {
         })
     }
 
+    /// Appends a completed assistant turn, its usage record, and an optional
+    /// authoritative Responses sidecar in one durable write.
+    ///
+    /// The assistant entry and its final head are written before usage, matching
+    /// the historical record order. A Responses sidecar, when present, is then
+    /// written as the direct child of that assistant. Keeping all records in one
+    /// `persist` call removes redundant filesystem sync barriers without
+    /// weakening the crash boundary: a successful return means the complete
+    /// turn is durable, while a failed write mutates no in-memory state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_assistant_turn(
+        &mut self,
+        assistant: ygg_ai::AssistantMessage,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: StopReason,
+        responses_output: Option<ygg_ai::ResponsesOutput>,
+    ) -> Result<EntryId, SessionError> {
+        let output_is_valid = responses_output.as_ref().is_none_or(|output| {
+            !output.is_empty()
+                && assistant.protocol == ygg_ai::Protocol::OpenAiResponses
+                && assistant.model == model
+        });
+        if !output_is_valid {
+            return Err(SessionError::InvalidResponsesSidecar(format!(
+                "Responses output is not attached to a non-empty Responses assistant from model {}",
+                model.0
+            )));
+        }
+
+        let assistant_id = EntryId(format!("{:03}", self.next_id));
+        let sidecar_id = responses_output
+            .as_ref()
+            .map(|_| EntryId(format!("{:03}", self.next_id.saturating_add(1))));
+        let ids_used = if sidecar_id.is_some() { 2 } else { 1 };
+        let next_id = self
+            .next_id
+            .checked_add(ids_used)
+            .ok_or_else(|| SessionError::Limit("session entry ID space is exhausted".to_owned()))?;
+        let parent = self.head.clone();
+        let assistant_message = Message::Assistant(assistant);
+        let assistant_entry = Entry {
+            id: assistant_id.clone(),
+            parent,
+            metadata: None,
+            timestamp_unix_ms: Some(now_unix_millis()),
+            value: EntryValue::Message(assistant_message.clone()),
+        };
+
+        let request_remainder = cost
+            .map(|value| value.total_picodollars_remainder)
+            .unwrap_or_default();
+        let remainder_sum = u64::from(self.total_cost_picodollars_remainder)
+            .saturating_add(u64::from(request_remainder));
+        let carry = remainder_sum / u64::from(PICODOLLARS_PER_MICRODOLLAR);
+        let new_total = self
+            .total_cost_microdollars
+            .saturating_add(cost.map(|value| value.total).unwrap_or_default())
+            .saturating_add(carry);
+        let new_remainder = (remainder_sum % u64::from(PICODOLLARS_PER_MICRODOLLAR)) as u32;
+        let usage_record = UsageRecord {
+            kind: UsageRecordKind::AssistantTurn {
+                assistant: assistant_id.clone(),
+            },
+            usage,
+            stop_reason: Some(stop_reason),
+            endpoint: Some(endpoint),
+            model: Some(model.clone()),
+            completed_at_unix_ms: Some(now_unix_millis()),
+            cost,
+            cost_microdollars: cost.map(|value| value.total),
+            session_cost_microdollars: Some(new_total),
+            session_cost_picodollars_remainder: Some(new_remainder),
+        };
+
+        let mut buffer = Vec::with_capacity(512);
+        write_json_line(&mut buffer, &SessionRecordRef::Entry(&assistant_entry))?;
+        write_json_line(
+            &mut buffer,
+            &SessionRecordRef::Head {
+                id: &assistant_id,
+                total_cost_microdollars: &self.total_cost_microdollars,
+                total_cost_picodollars_remainder: &self.total_cost_picodollars_remainder,
+            },
+        )?;
+        write_json_line(
+            &mut buffer,
+            &SessionRecordRef::Usage {
+                record: &usage_record,
+            },
+        )?;
+
+        let sidecar_entry = responses_output.map(|output| Entry {
+            id: sidecar_id
+                .clone()
+                .expect("sidecar id exists for Responses output"),
+            parent: Some(assistant_id.clone()),
+            metadata: None,
+            timestamp_unix_ms: Some(now_unix_millis()),
+            value: EntryValue::ResponsesTurn {
+                assistant: assistant_id.clone(),
+                endpoint: usage_record
+                    .endpoint
+                    .clone()
+                    .expect("assistant usage endpoint exists"),
+                model: usage_record
+                    .model
+                    .clone()
+                    .expect("assistant usage model exists"),
+                output,
+            },
+        });
+        if let Some(sidecar_entry) = sidecar_entry.as_ref() {
+            write_json_line(&mut buffer, &SessionRecordRef::Entry(sidecar_entry))?;
+            let sidecar_id = &sidecar_entry.id;
+            write_json_line(
+                &mut buffer,
+                &SessionRecordRef::Head {
+                    id: sidecar_id,
+                    total_cost_microdollars: &new_total,
+                    total_cost_picodollars_remainder: &new_remainder,
+                },
+            )?;
+        }
+
+        self.persist(&buffer)?;
+
+        self.entries.push(assistant_entry);
+        self.index
+            .insert(assistant_id.clone(), self.entries.len().saturating_sub(1));
+        if let Some(sidecar_entry) = sidecar_entry {
+            let id = sidecar_entry.id.clone();
+            self.index.insert(id, self.entries.len());
+            self.entries.push(sidecar_entry);
+            self.head = Some(
+                self.entries
+                    .last()
+                    .expect("sidecar just appended")
+                    .id
+                    .clone(),
+            );
+        } else {
+            self.head = Some(assistant_id.clone());
+        }
+        self.next_id = next_id;
+        self.total_cost_microdollars = new_total;
+        self.total_cost_picodollars_remainder = new_remainder;
+        self.usage_records.push(usage_record);
+        if let Some(messages) = self.context_cache.get_mut() {
+            append_context_message(messages, &assistant_message);
+        }
+        Ok(assistant_id)
+    }
+
     /// Appends an authoritative Responses turn sidecar.
     ///
     /// The canonical assistant must be the current head. Requiring the sidecar

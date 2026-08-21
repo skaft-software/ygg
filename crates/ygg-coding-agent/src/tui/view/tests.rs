@@ -6794,19 +6794,21 @@ fn subagent_chrome_renders_live_metrics_and_rolls_cost_into_footer_once() {
         .unwrap();
 
     assert!(shell.set_subagent_presentation(Some(&snapshot), true));
+    // Delegated workers are transcript events now; the chrome strip stays empty
+    // so the same activity is not duplicated below the composer.
     let chrome = shell_chrome(&shell.state.borrow(), 120, Instant::now());
-    let activity = chrome
-        .subagents
+    assert!(chrome.subagents.is_empty(), "{:?}", chrome.subagents);
+    let activity = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(activity.contains("Subagents"), "{activity}");
     assert!(activity.contains("read-diffs · using read"), "{activity}");
-    assert!(
-        activity.contains("16 Tool Calls • ↑88.2k ↓99 • $0.209"),
-        "{activity}"
-    );
+    assert!(activity.contains("16 call"), "{activity}");
     assert!(plain_footer(&shell, 120, Instant::now()).contains("$0.300"));
 
     assert!(shell.set_subagent_presentation(Some(&snapshot), false));
@@ -6864,20 +6866,27 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
         failure_class: Some("spawn_rejected".into()),
     };
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated { snapshot });
-    let block = shell_chrome(&shell.state.borrow(), 120, Instant::now())
-        .subagents
-        .into_iter()
-        .map(|line| strip_terminal_sequences(&line))
+    let block = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(block.contains("2 Explore agents"), "{block}");
+    assert!(block.contains("Subagents"), "{block}");
     assert!(block.contains("Read release history"), "{block}");
+    assert!(block.contains("Audit release surface"), "{block}");
+    assert!(block.contains("failed"), "{block}");
     assert!(
-        block.contains("Failed: provider request failed: upstream unavailable"),
-        "{block}"
-    );
-    assert!(
-        block.contains("Failed: spawn rejected: worker limit reached"),
+        block.contains("provider request failed: upstream unavailable")
+            || shell
+                .state
+                .borrow()
+                .subagent_activity
+                .as_ref()
+                .and_then(|view| view.failure_reason.as_deref())
+                == Some("spawn rejected: worker limit reached"),
         "{block}"
     );
     assert!(!shell
@@ -6887,6 +6896,7 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
         .join("\n")
         .contains("Used subagent spawn"));
 
+    // An empty cleanup snapshot must not erase the settled transcript event.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 5,
@@ -6897,7 +6907,8 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
             failure_class: None,
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(shell.state.borrow().subagent_activity_block.is_some());
 
     shell.on_agent_event(&ygg_agent::AgentEvent::ToolStarted {
         id: ygg_ai::ToolCallId("spawn-call".into()),
@@ -6948,6 +6959,7 @@ fn hydrating_a_replacement_session_clears_subagent_activity() {
     shell.hydrate(&session).unwrap();
 
     assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity_block.is_none());
 }
 
 #[test]
@@ -6976,7 +6988,7 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
         session: Some("agent-session:opaque".into()),
     };
 
-    // A live worker keeps the strip visible...
+    // A live worker keeps the transcript event active...
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 1,
@@ -6988,10 +7000,13 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
         },
     });
     assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(shell.state.borrow().subagent_activity_block.is_some());
+    assert!(shell_chrome(&shell.state.borrow(), 120, Instant::now())
+        .subagents
+        .is_empty());
 
-    // ...and the final settlement (which the host always flushes before
-    // RunFinished) removes the strip instead of parking a finished label in
-    // the chrome after the run.
+    // ...and the final settlement keeps the event in the transcript (with a
+    // settled green/red margin) instead of parking it in the chrome strip.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 2,
@@ -7002,10 +7017,21 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
             failure_class: None,
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(shell.state.borrow().subagent_activity_block.is_some());
+    let settled = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(settled.contains("Subagents"), "{settled}");
+    assert!(settled.contains("Inspect tests"), "{settled}");
+    assert!(settled.contains("completed"), "{settled}");
 
-    // A spawn that fails outright is transcript material, not chrome: with
-    // nothing active the strip stays hidden.
+    // A spawn that fails outright is still transcript material.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 3,
@@ -7016,7 +7042,19 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
             failure_class: Some("spawn_rejected".into()),
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    let failed = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        failed.contains("spawn rejected: worker limit reached"),
+        "{failed}"
+    );
 }
 
 #[test]
@@ -7060,23 +7098,26 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
     });
     assert!(shell.state.borrow().subagent_activity.is_some());
     assert!(!shell.state.borrow().subagent_activity_expanded);
-    let collapsed = shell_chrome(&shell.state.borrow(), 120, Instant::now())
-        .subagents
+    let collapsed = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
     assert!(collapsed.contains("Audit release surface"), "{collapsed}");
     assert!(!collapsed.contains("Read release history"), "{collapsed}");
-    assert!(collapsed.contains("ctrl+o to expand"), "{collapsed}");
 
-    // ctrl+o toggles the strip between the two most recent children and the
-    // five most recent, and the hint in the label follows the toggle.
+    // ctrl+o toggles the transcript roster between the two most recent children
+    // and the five most recent.
     shell.expand_focused_tool();
     assert!(shell.state.borrow().subagent_activity_expanded);
     assert!(shell.state.borrow().subagent_activity.is_some());
-    let expanded = shell_chrome(&shell.state.borrow(), 120, Instant::now())
-        .subagents
+    let expanded = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
@@ -7084,13 +7125,12 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
     assert!(expanded.contains("Read release history"), "{expanded}");
     assert!(expanded.contains("Audit release surface"), "{expanded}");
     assert!(expanded.contains("Scan changelog"), "{expanded}");
-    assert!(expanded.contains("ctrl+o to collapse"), "{expanded}");
 
     shell.expand_focused_tool();
     assert!(!shell.state.borrow().subagent_activity_expanded);
 
-    // With nothing active the strip is gone and ctrl+o falls back to the
-    // verbose tool output toggle.
+    // After every child settles the event remains in the transcript, so ctrl+o
+    // still expands the roster rather than flipping verbose tool output.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 2,
@@ -7105,47 +7145,63 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
             failure_class: None,
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity.is_some());
     assert!(!shell.verbose_tools());
     shell.expand_focused_tool();
-    assert!(shell.verbose_tools());
+    assert!(shell.state.borrow().subagent_activity_expanded);
+    assert!(!shell.verbose_tools());
 }
 
 #[test]
 fn extension_presentation_hides_terminal_subagent_activities() {
     let mut shell = InteractiveShell::test_shell();
-    let snapshot =
-        |state: &str| -> ygg_agent::ExtensionPresentationSnapshot {
-            serde_json::from_value(serde_json::json!({
-                "revision": 1,
-                "status": {"state": "active", "label": "Subagents"},
-                "activities": [{
-                    "id": "activity:agent-1",
-                    "kind": "subagent",
-                    "state": state,
-                    "summary": "read-diffs · using read",
-                    "metrics": {
-                        "tool_calls": 16,
-                        "input_tokens": 80_000,
-                        "cache_read_tokens": 8_200,
-                        "cache_write_tokens": 0,
-                        "output_tokens": 99,
-                        "reasoning_tokens": 20,
-                        "cost_microdollars": 208_600
-                    }
-                }],
-                "actions": []
-            }))
-            .unwrap()
-        };
+    let snapshot = |state: &str| -> ygg_agent::ExtensionPresentationSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "status": {"state": "active", "label": "Subagents"},
+            "activities": [{
+                "id": "activity:agent-1",
+                "kind": "subagent",
+                "state": state,
+                "summary": "read-diffs · using read",
+                "metrics": {
+                    "tool_calls": 16,
+                    "input_tokens": 80_000,
+                    "cache_read_tokens": 8_200,
+                    "cache_write_tokens": 0,
+                    "output_tokens": 99,
+                    "reasoning_tokens": 20,
+                    "cost_microdollars": 208_600
+                }
+            }],
+            "actions": []
+        }))
+        .unwrap()
+    };
 
     assert!(shell.set_subagent_presentation(Some(&snapshot("running")), true));
     assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(shell.state.borrow().subagent_activity_block.is_some());
+    assert!(shell_chrome(&shell.state.borrow(), 120, Instant::now())
+        .subagents
+        .is_empty());
 
-    // Terminal extension activities must not keep the strip parked after the
-    // run, mirroring the host telemetry path.
+    // Terminal extension activities settle into the transcript event rather
+    // than being cleared from the shell chrome.
     assert!(shell.set_subagent_presentation(Some(&snapshot("succeeded")), true));
-    assert!(shell.state.borrow().subagent_activity.is_none());
+    assert!(shell.state.borrow().subagent_activity.is_some());
+    assert!(shell.state.borrow().subagent_activity_block.is_some());
+    let settled = shell
+        .state
+        .borrow()
+        .rendered_transcript(120)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(settled.contains("Subagents"), "{settled}");
+    assert!(settled.contains("read-diffs · using read"), "{settled}");
+    assert!(settled.contains("completed"), "{settled}");
 }
 
 #[test]

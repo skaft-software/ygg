@@ -412,10 +412,11 @@ fn anthropic_pricing(model_id: &str) -> Option<Pricing> {
     Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
 }
 
-/// Return checked-in reference pricing for provider/model routes whose live
-/// inventory APIs do not publish rates. Unknown or mutable routes remain
-/// explicitly unpriced rather than borrowing another provider's prices.
-pub(crate) fn model_pricing(provider_id: &str, model_id: &str) -> Option<Pricing> {
+/// Return Ygg-owned pricing overrides for provider/model routes whose live
+/// inventory APIs do not publish rates. Special cases such as long-context
+/// tiers remain here; the public [`model_pricing`] wrapper falls back to the
+/// checked-in models.dev snapshot for other routes.
+fn legacy_model_pricing(provider_id: &str, model_id: &str) -> Option<Pricing> {
     let rates = match provider_id {
         "openai" => return openai_pricing(model_id),
         "anthropic" => return anthropic_pricing(model_id),
@@ -461,6 +462,17 @@ pub(crate) fn model_pricing(provider_id: &str, model_id: &str) -> Option<Pricing
         _ => return None,
     };
     Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
+}
+
+/// Return trusted pricing for a provider/model route.
+///
+/// Provider-specific overrides preserve Ygg's special cases (for example
+/// OpenAI long-context tiers). The checked-in models.dev snapshot fills in
+/// newly released and discovered routes, so discovery can provide trusted
+/// pricing without another hand-maintained model match arm.
+pub(crate) fn model_pricing(provider_id: &str, model_id: &str) -> Option<Pricing> {
+    legacy_model_pricing(provider_id, model_id)
+        .or_else(|| ygg_ai::model_metadata::model_pricing(provider_id, model_id))
 }
 
 /// Select Fireworks' wire protocol for a discovered model.
@@ -1259,7 +1271,9 @@ mod tests {
             .unwrap()
             .tiers
             .is_empty());
-        assert!(model_pricing(OPENROUTER.id, "deepseek/deepseek-v4-pro").is_none());
+        let openrouter = model_pricing(OPENROUTER.id, "deepseek/deepseek-v4-pro")
+            .expect("models.dev fallback pricing");
+        assert_eq!(openrouter.input, TokenRate(1_600_000));
     }
 
     #[test]

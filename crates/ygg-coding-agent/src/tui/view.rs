@@ -187,6 +187,13 @@ struct ToolPanel {
     /// sanitized segments; roles are resolved against the current theme only
     /// while rendering. The durable provider-visible `output` stays intact.
     extension_render_segments: Vec<ygg_agent::extension_process::ToolRenderSegment>,
+    /// Presentation-only delegated-worker event. It deliberately uses the
+    /// ordinary tool block lifecycle so its margin dot, scrollback stability,
+    /// and disclosure behavior match real tool calls without pretending that
+    /// `subagents` was a provider tool invocation.
+    subagent_activity: Option<SubagentActivityView>,
+    /// Whether Ctrl+O has expanded the delegated-worker roster.
+    subagent_activity_expanded: bool,
     /// Model family captured with the call for durable presentation
     /// provenance. Lifecycle chrome deliberately no longer consumes it:
     /// active, successful, and failed headers use muted, foreground, and
@@ -227,11 +234,40 @@ impl ToolPanel {
             is_error,
             failure_reason,
             extension_render_segments: Vec::new(),
+            subagent_activity: None,
+            subagent_activity_expanded: false,
             model_lab,
             cached_diff: RefCell::new(None),
             cached_metadata: RefCell::new(None),
             cached_disclosure_sensitive: RefCell::new(None),
         }
+    }
+
+    fn subagent_activity(view: &SubagentActivityView, expanded: bool) -> Self {
+        let mut panel = Self::new(
+            ToolCallId("subagents".into()),
+            "subagents".into(),
+            "{}".into(),
+            summarize_tool_with_workspace("subagents", &serde_json::json!({}), None),
+            subagent_activity_copy_text(view),
+            !subagent_activity_is_active(view),
+            subagent_activity_has_failure(view),
+            subagent_activity_failure_reason(view),
+            None,
+        );
+        panel.subagent_activity = Some(view.clone());
+        panel.subagent_activity_expanded = expanded;
+        panel
+    }
+
+    fn update_subagent_activity(&mut self, view: &SubagentActivityView, expanded: bool) {
+        self.subagent_activity = Some(view.clone());
+        self.subagent_activity_expanded = expanded;
+        self.finished = !subagent_activity_is_active(view);
+        self.is_error = subagent_activity_has_failure(view);
+        self.failure_reason = subagent_activity_failure_reason(view);
+        self.output = subagent_activity_copy_text(view);
+        self.cached_disclosure_sensitive.replace(None);
     }
 }
 
@@ -316,54 +352,76 @@ pub(crate) struct SubagentActivityView {
     pub(crate) include_cost_in_session_total: bool,
 }
 
-/// The activity strip is only shown while at least one child is still
-/// working; once every worker settles (or a spawn fails outright), the
-/// permanent record is the transcript, not the chrome.
-fn subagent_has_active_children(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> bool {
-    snapshot
-        .children
-        .iter()
-        .any(|child| matches!(child.state.as_str(), "pending" | "running"))
+fn subagent_activity_is_active(view: &SubagentActivityView) -> bool {
+    if !view.telemetry.is_empty() {
+        return view
+            .telemetry
+            .iter()
+            .any(|child| matches!(child.state.as_str(), "pending" | "running"));
+    }
+    view.activities.iter().any(|activity| {
+        matches!(
+            activity.state,
+            ygg_agent::ExtensionPresentationState::Loading
+                | ygg_agent::ExtensionPresentationState::Pending
+                | ygg_agent::ExtensionPresentationState::Active
+                | ygg_agent::ExtensionPresentationState::Running
+        )
+    })
 }
 
-fn subagent_status_label(snapshot: &ygg_agent::DelegationTelemetrySnapshot) -> Option<String> {
-    let active = snapshot
-        .children
-        .iter()
-        .filter(|child| matches!(child.state.as_str(), "pending" | "running"))
-        .count();
-    if active == 0 {
-        return None;
-    }
-    let failed = snapshot
-        .children
-        .iter()
-        .filter(|child| child.state == "failed" || child.failure_reason.is_some())
-        .count();
-    let profile = snapshot
-        .children
-        .iter()
-        .find_map(|child| child.profile.as_deref())
-        .unwrap_or("explore");
-    let mut chars = profile.chars();
-    let profile = format!(
-        "{}{}",
-        chars.next().unwrap_or('e').to_ascii_uppercase(),
-        chars.as_str()
-    );
-    let external_failure = snapshot.failure_reason.is_some();
-    if failed > 0 || external_failure {
-        Some(format!(
-            "• {} {profile} agents · {} failed (ctrl+o to expand)",
-            snapshot.children.len(),
-            failed.saturating_add(usize::from(external_failure))
-        ))
+fn subagent_activity_has_failure(view: &SubagentActivityView) -> bool {
+    view.failure_reason.is_some()
+        || view.telemetry.iter().any(|child| {
+            matches!(child.state.as_str(), "failed" | "cancelled" | "stopped")
+                || child.failure_reason.is_some()
+        })
+        || view.activities.iter().any(|activity| {
+            matches!(
+                activity.state,
+                ygg_agent::ExtensionPresentationState::Failed
+                    | ygg_agent::ExtensionPresentationState::Cancelled
+                    | ygg_agent::ExtensionPresentationState::Stopped
+                    | ygg_agent::ExtensionPresentationState::Unavailable
+            )
+        })
+}
+
+fn subagent_activity_failure_reason(view: &SubagentActivityView) -> Option<String> {
+    view.failure_reason.clone().or_else(|| {
+        view.telemetry
+            .iter()
+            .find_map(|child| child.failure_reason.clone())
+    })
+}
+
+/// Plain semantic text used by copy/width calculations for the presentation
+/// block. The renderer owns styling and compact row selection.
+pub(super) fn subagent_activity_copy_text(view: &SubagentActivityView) -> String {
+    let mut lines = vec!["Subagents".to_owned()];
+    if !view.telemetry.is_empty() {
+        lines.extend(view.telemetry.iter().map(|child| {
+            let state = if child.state.is_empty() {
+                "running"
+            } else {
+                child.state.as_str()
+            };
+            format!(
+                "{} · {state} · {} calls",
+                child.task_name, child.tool_use_count
+            )
+        }));
     } else {
-        Some(format!(
-            "• Running {active} {profile} agent{}… (ctrl+o to expand)",
-            if active == 1 { "" } else { "s" }
-        ))
+        lines.extend(
+            view.activities
+                .iter()
+                .map(|activity| format!("{} · {:?}", activity.summary, activity.state)),
+        );
     }
+    if let Some(reason) = view.failure_reason.as_deref() {
+        lines.push(format!("failed · {reason}"));
+    }
+    lines.join("\n")
 }
 
 #[derive(Default)]
@@ -437,11 +495,14 @@ pub(crate) struct ShellState {
     prompt_templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
     skill_commands: Arc<[(String, String)]>,
     extension_commands: Arc<[(String, String)]>,
-    /// Live, owner-scoped telemetry from the first-party subagent presentation.
-    /// This is transient chrome; authoritative usage is mirrored into the root
-    /// session ledger before the owning run settles.
+    /// Live state for the current root run. The corresponding presentation
+    /// block is retained in the transcript after settlement.
     pub(crate) subagent_activity: Option<SubagentActivityView>,
-    /// Whether the subagent activity strip is showing all children instead of
+    /// Transcript index of the current run's presentation-only subagent tool
+    /// block. It is reset at the next root run so settled history remains
+    /// immutable while a new delegation event gets its own row.
+    pub(crate) subagent_activity_block: Option<usize>,
+    /// Whether the subagent activity roster is showing all children instead of
     /// the latest two (ctrl+o toggle). Reset whenever the strip is cleared.
     pub(crate) subagent_activity_expanded: bool,
     slash_selection: usize,
@@ -617,6 +678,105 @@ impl ShellState {
         self.invalidate_transcript();
     }
 
+    fn insert_block(&mut self, index: usize, block: TranscriptBlock) {
+        let index = index.min(self.transcript.len());
+        let commit_id = self.next_transcript_commit_id.0;
+        self.next_transcript_commit_id.0 = commit_id
+            .checked_add(1)
+            .expect("transcript commit identity space exhausted");
+        self.transcript.insert(index, block);
+        self.transcript_commit_ids.insert(index, commit_id);
+        self.block_revisions.insert(index, 0);
+        if !self.follow_tail {
+            self.new_output_count = self.new_output_count.saturating_add(1);
+        }
+        for active in &mut self.active_event_blocks {
+            if *active >= index {
+                *active += 1;
+            }
+        }
+        self.active_text = self
+            .active_text
+            .map(|active| active + usize::from(active >= index));
+        self.active_reasoning = self
+            .active_reasoning
+            .map(|active| active + usize::from(active >= index));
+        self.subagent_activity_block = self
+            .subagent_activity_block
+            .map(|active| active + usize::from(active >= index));
+        for panel_index in self.tool_panels.values_mut() {
+            if *panel_index >= index {
+                *panel_index += 1;
+            }
+        }
+        if let Some(selection) = &mut self.transcript_selection {
+            selection.anchor.block += usize::from(selection.anchor.block >= index);
+            selection.focus.block += usize::from(selection.focus.block >= index);
+        }
+        if let Some(anchor) = &mut self.pending_selection_anchor {
+            anchor.block += usize::from(anchor.block >= index);
+        }
+        self.invalidate_transcript();
+    }
+
+    /// A transient empty thinking row is removed before the first event so the
+    /// new block is immediately followed by the model's replacement thinking
+    /// row, matching the tool-call presentation.
+    fn set_subagent_activity(&mut self, view: SubagentActivityView) {
+        self.subagent_activity = Some(view.clone());
+        let expanded = self.subagent_activity_expanded;
+        if let Some(index) = self.subagent_activity_block {
+            if let Some(TranscriptBlock::Tool(panel)) = self.transcript.get_mut(index) {
+                if panel.subagent_activity.is_some() {
+                    let was_active = !panel.finished;
+                    panel.update_subagent_activity(&view, expanded);
+                    let is_active = !panel.finished;
+                    if was_active && !is_active {
+                        self.unregister_active_event(index);
+                    } else if !was_active && is_active {
+                        self.register_active_event(index);
+                    }
+                    self.touch_block(index);
+                    return;
+                }
+            }
+            self.subagent_activity_block = None;
+        }
+
+        if let Some(index) = self.active_reasoning {
+            let empty = matches!(
+                self.transcript.get(index),
+                Some(TranscriptBlock::Reasoning(reasoning)) if reasoning.text.is_empty()
+            );
+            if empty {
+                self.remove_transient_activity_block(index);
+            }
+        }
+
+        let index = self.active_reasoning.unwrap_or(self.transcript.len());
+        let panel = ToolPanel::subagent_activity(&view, expanded);
+        let active = !panel.finished;
+        self.insert_block(index, TranscriptBlock::Tool(Box::new(panel)));
+        self.subagent_activity_block = Some(index);
+        if active {
+            self.register_active_event(index);
+            // Keep the model-status row below the delegated event while the
+            // child is alive. This is the same status the hidden spawn tool
+            // would otherwise reopen after its ToolFinished event.
+            self.open_reasoning_status();
+        }
+    }
+
+    fn reindex_subagent_activity_after_removal(&mut self, removed: usize) {
+        self.subagent_activity_block = self.subagent_activity_block.and_then(|index| {
+            if index == removed {
+                None
+            } else {
+                Some(index.saturating_sub(usize::from(index > removed)))
+            }
+        });
+    }
+
     pub(crate) fn jump_to_tail(&mut self) {
         self.scroll_from_bottom.set(0);
         self.follow_tail = true;
@@ -738,6 +898,7 @@ impl ShellState {
             return;
         }
         self.unregister_active_event(index);
+        self.reindex_subagent_activity_after_removal(index);
         self.transcript.remove(index);
         self.transcript_commit_ids.remove(index);
         self.block_revisions.remove(index);
@@ -957,6 +1118,7 @@ impl ShellState {
                 continue;
             }
             self.unregister_active_event(index);
+            self.reindex_subagent_activity_after_removal(index);
             self.transcript.remove(index);
             self.transcript_commit_ids.remove(index);
             self.block_revisions.remove(index);
@@ -1519,6 +1681,7 @@ impl InteractiveShell {
         // previous run's already-accounted worker costs into the new live
         // overlay while its first authoritative refresh is still pending.
         state.subagent_activity = None;
+        state.subagent_activity_block = None;
         state.subagent_activity_expanded = false;
         state.run_model = Some(state.model.clone());
         state.run_model_lab = state.model_lab;
@@ -1886,21 +2049,19 @@ impl InteractiveShell {
                 state.run_cost_available = true;
             }
             AgentEvent::DelegationUpdated { snapshot } => {
-                if subagent_has_active_children(snapshot) {
-                    state.subagent_activity = Some(SubagentActivityView {
-                        status_label: subagent_status_label(snapshot).unwrap_or_default(),
+                // Keep the last non-empty snapshot as a transcript event. The
+                // manager may publish an empty cleanup snapshot after settlement;
+                // dropping it here would make the visual event disappear just
+                // when the dot should settle green or red.
+                if !snapshot.children.is_empty() || snapshot.failure_reason.is_some() {
+                    state.set_subagent_activity(SubagentActivityView {
+                        status_label: "Subagents".into(),
                         activities: Vec::new(),
                         telemetry: snapshot.children.clone(),
                         failure_class: snapshot.failure_class.clone(),
                         failure_reason: snapshot.failure_reason.clone(),
                         include_cost_in_session_total: true,
                     });
-                } else {
-                    // Every worker reached a terminal state (or the spawn
-                    // itself failed): the permanent record is the transcript,
-                    // not a chrome strip, so the overlay goes away.
-                    state.subagent_activity = None;
-                    state.subagent_activity_expanded = false;
                 }
             }
             AgentEvent::RunFinished { .. } => {
@@ -1910,19 +2071,6 @@ impl InteractiveShell {
                     // emitted; from this boundary onward the footer must use
                     // the durable amount, not provisional child spend.
                     view.include_cost_in_session_total = false;
-                }
-                // Guard against a final snapshot never arriving: once the root
-                // run ends, no worker can still be active, so a strip that
-                // still claims one is stale.
-                if let Some(view) = state.subagent_activity.as_ref() {
-                    if !view
-                        .telemetry
-                        .iter()
-                        .any(|child| matches!(child.state.as_str(), "pending" | "running"))
-                    {
-                        state.subagent_activity = None;
-                        state.subagent_activity_expanded = false;
-                    }
                 }
             }
         }
@@ -2350,23 +2498,8 @@ impl InteractiveShell {
                 .filter(|activity| activity.kind == "subagent")
                 .cloned()
                 .collect::<Vec<_>>();
-            let active = activities.iter().any(|activity| {
-                matches!(
-                    activity.state,
-                    ygg_agent::ExtensionPresentationState::Loading
-                        | ygg_agent::ExtensionPresentationState::Pending
-                        | ygg_agent::ExtensionPresentationState::Active
-                        | ygg_agent::ExtensionPresentationState::Running
-                )
-            });
-            // Mirror the telemetry path: the strip only persists while at
-            // least one published activity is still in flight.
-            (!activities.is_empty() && active).then(|| SubagentActivityView {
-                status_label: snapshot
-                    .status
-                    .as_ref()
-                    .map(|status| status.label.clone())
-                    .unwrap_or_else(|| "Subagents".to_owned()),
+            (!activities.is_empty()).then_some(SubagentActivityView {
+                status_label: "Subagents".into(),
                 activities,
                 telemetry: Vec::new(),
                 failure_class: None,
@@ -2375,14 +2508,21 @@ impl InteractiveShell {
             })
         });
         let mut state = self.state.borrow_mut();
-        if state.subagent_activity == next {
-            return false;
+        if let Some(next) = next {
+            if state.subagent_activity.as_ref() == Some(&next)
+                && state.subagent_activity_block.is_some()
+            {
+                return false;
+            }
+            state.set_subagent_activity(next);
+            return true;
         }
-        if next.is_none() {
+        if snapshot.is_none() {
+            state.subagent_activity = None;
+            state.subagent_activity_block = None;
             state.subagent_activity_expanded = false;
         }
-        state.subagent_activity = next;
-        true
+        false
     }
 
     /// Replace the host-owned delegation telemetry for the active root run.
@@ -2394,25 +2534,34 @@ impl InteractiveShell {
         snapshot: Option<&ygg_agent::DelegationTelemetrySnapshot>,
         include_cost_in_session_total: bool,
     ) -> bool {
-        let next = snapshot
-            .filter(|snapshot| subagent_has_active_children(snapshot))
-            .map(|snapshot| SubagentActivityView {
-                status_label: subagent_status_label(snapshot).unwrap_or_default(),
-                activities: Vec::new(),
-                telemetry: snapshot.children.clone(),
-                failure_class: snapshot.failure_class.clone(),
-                failure_reason: snapshot.failure_reason.clone(),
-                include_cost_in_session_total,
-            });
+        let next = snapshot.and_then(|snapshot| {
+            (!snapshot.children.is_empty() || snapshot.failure_reason.is_some()).then_some(
+                SubagentActivityView {
+                    status_label: "Subagents".into(),
+                    activities: Vec::new(),
+                    telemetry: snapshot.children.clone(),
+                    failure_class: snapshot.failure_class.clone(),
+                    failure_reason: snapshot.failure_reason.clone(),
+                    include_cost_in_session_total,
+                },
+            )
+        });
         let mut state = self.state.borrow_mut();
-        if state.subagent_activity == next {
-            return false;
+        if let Some(next) = next {
+            if state.subagent_activity.as_ref() == Some(&next)
+                && state.subagent_activity_block.is_some()
+            {
+                return false;
+            }
+            state.set_subagent_activity(next);
+            return true;
         }
-        if next.is_none() {
+        if snapshot.is_none() {
+            state.subagent_activity = None;
+            state.subagent_activity_block = None;
             state.subagent_activity_expanded = false;
         }
-        state.subagent_activity = next;
-        true
+        false
     }
 
     /// behavior; literal paths are inserted as text. Directory completions omit
@@ -3111,6 +3260,15 @@ impl InteractiveShell {
         if activity_visible {
             let mut state = self.state.borrow_mut();
             state.subagent_activity_expanded = !state.subagent_activity_expanded;
+            let expanded = state.subagent_activity_expanded;
+            if let Some(index) = state.subagent_activity_block {
+                if let Some(TranscriptBlock::Tool(panel)) = state.transcript.get_mut(index) {
+                    if panel.subagent_activity.is_some() {
+                        panel.subagent_activity_expanded = expanded;
+                        state.touch_block(index);
+                    }
+                }
+            }
         } else {
             self.toggle_verbose_tools();
         }
@@ -3637,9 +3795,10 @@ impl InteractiveShell {
         state.run_cost_available = checkpoint_cost.is_some();
         state.run.clear();
         // Delegation telemetry belongs to the previously active root run. A
-        // session hydrate may reuse this shell, so clear the composer block
-        // before the replacement app can publish its own owner-fenced snapshot.
+        // session hydrate may reuse this shell, so clear the live pointer;
+        // hydrated history never contains an executable worker event.
         state.subagent_activity = None;
+        state.subagent_activity_block = None;
         state.subagent_activity_expanded = false;
         state.session_work_elapsed = Duration::ZERO;
         state.run_model = None;

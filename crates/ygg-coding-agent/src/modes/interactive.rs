@@ -3752,6 +3752,15 @@ async fn run_interactive_without_model(
     }
 }
 
+fn schedule_responses_prewarm(app: &App) {
+    let Ok(Some((client, model, request))) = app.agent.responses_prewarm_request() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _ = client.prewarm_responses(&model, request).await;
+    });
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
 pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
@@ -3805,6 +3814,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     update_status(&mut shell, &app);
     request_extension_ui(&mut shell, &mut app);
     shell.render();
+    schedule_responses_prewarm(&app);
 
     let mut pending_actions = VecDeque::new();
     let mut goal_deadline = recovered_goal_deadline(&app)?;
@@ -3860,6 +3870,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 }
                 app =
                     transition(app, &mut shell, &mut input, Reconfig::Thinking(reasoning)).await?;
+                schedule_responses_prewarm(&app);
                 shell.notice(format!("thinking changed to {}", level.label()));
                 shell.render();
             }
@@ -3877,9 +3888,13 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 )
                 .await?
                 {
-                    IdleCommandOutcome::Continue(next) => app = *next,
+                    IdleCommandOutcome::Continue(next) => {
+                        app = *next;
+                        schedule_responses_prewarm(&app);
+                    }
                     IdleCommandOutcome::Submit { app: next, prompt } => {
                         app = *next;
+                        schedule_responses_prewarm(&app);
                         startup_prompt = Some(prompt);
                     }
                     IdleCommandOutcome::Quit(next) => {

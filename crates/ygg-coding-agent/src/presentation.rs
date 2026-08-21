@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_failure_outcome_uses_canonical_route_without_provider_details() {
+    fn provider_failure_outcome_includes_safe_operational_details() {
         let now = Instant::now();
         let mut tracker = RunTracker::default();
         let id = tracker
@@ -1490,10 +1490,12 @@ mod tests {
             &finished(FinishReason::Failed(AgentError::Ai(AiError::Http(
                 ygg_ai::HttpError {
                     status: http::StatusCode::BAD_REQUEST,
-                    request_id: Some("secret-request-id".into()),
+                    request_id: Some("req-400".into()),
                     retry_after: None,
-                    provider_code: Some("secret-provider-code".into()),
-                    body_snippet: Some("secret provider body and prompt".into()),
+                    provider_code: Some("invalid_request".into()),
+                    body_snippet: Some(
+                        r#"{"error":{"message":"model does not support this request"}}"#.into(),
+                    ),
                     retryable: false,
                 },
             )))),
@@ -1502,12 +1504,10 @@ mod tests {
         let Some(RunOutcome::Failed { reason, .. }) = update.outcome else {
             panic!("expected failed outcome");
         };
-        assert_eq!(
-            reason,
-            "provider=custom-endpoint model=test-model phase=HTTP response"
-        );
+        assert!(reason.contains("status=400 (bad request)"));
+        assert!(reason.contains("code=invalid_request"));
+        assert!(reason.contains("request_id=req-400"));
         assert!(!reason.contains("secret"));
-        assert!(!reason.contains("400"));
     }
 
     #[test]

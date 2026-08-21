@@ -749,7 +749,10 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
             model.spec.cache.session_affinity_format,
             Some(ygg_ai::SessionAffinityFormat::Codex)
         );
-        assert_eq!(model.endpoint.transport, ygg_ai::EndpointTransport::Http);
+        assert_eq!(
+            model.endpoint.transport,
+            ygg_ai::EndpointTransport::WebSocketPreferred
+        );
     }
     let sol = catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
     assert_eq!(crate::compaction::context_window(&sol), 372_000);

@@ -16,9 +16,141 @@ use super::tool_render::{
 use super::transcript_cache::{RenderedTranscriptBlock, SurfaceGeometry};
 use super::{
     finish_transcript_block, fit_line, render_shell_output, render_user_prompt, wrap_hanging,
-    TranscriptBlock,
+    ToolPanel, TranscriptBlock,
 };
 use crate::tui::theme::{ThemeSurfaceChrome, YggTheme};
+
+fn extension_activity_state_label(state: ygg_agent::ExtensionPresentationState) -> &'static str {
+    match state {
+        ygg_agent::ExtensionPresentationState::Loading => "loading",
+        ygg_agent::ExtensionPresentationState::Pending => "pending",
+        ygg_agent::ExtensionPresentationState::Active => "active",
+        ygg_agent::ExtensionPresentationState::Running => "running",
+        ygg_agent::ExtensionPresentationState::Succeeded => "completed",
+        ygg_agent::ExtensionPresentationState::Failed => "failed",
+        ygg_agent::ExtensionPresentationState::Cancelled => "cancelled",
+        ygg_agent::ExtensionPresentationState::Degraded => "degraded",
+        ygg_agent::ExtensionPresentationState::Stopped => "stopped",
+        ygg_agent::ExtensionPresentationState::Unavailable => "unavailable",
+        ygg_agent::ExtensionPresentationState::Empty => "empty",
+    }
+}
+
+fn render_subagent_activity_panel(
+    panel: &ToolPanel,
+    theme: &YggTheme,
+    width: u16,
+    verbose_tools: bool,
+) -> Vec<String> {
+    let Some(view) = panel.subagent_activity.as_ref() else {
+        return Vec::new();
+    };
+    let label = theme.bold(&theme.fg("foreground", "Subagents"));
+    let mut lines = vec![label];
+    let limit = if panel.subagent_activity_expanded || verbose_tools {
+        5
+    } else {
+        2
+    };
+    let unicode = theme.unicode();
+
+    if !view.telemetry.is_empty() {
+        let children = view.telemetry.iter().rev().take(limit).collect::<Vec<_>>();
+        let task_width = children
+            .iter()
+            .map(|child| visible_width(&sanitize_for_terminal(&child.task_name)))
+            .max()
+            .unwrap_or_default();
+        for (index, child) in children.iter().rev().enumerate() {
+            let last = index + 1 == children.len();
+            let elbow = match (unicode, last) {
+                (true, true) => "└",
+                (true, false) => "├",
+                (false, true) => "`-",
+                (false, false) => "+-",
+            };
+            let task = sanitize_for_terminal(&child.task_name);
+            let task = format!("{task:<task_width$}");
+            let status = if child.state.is_empty() {
+                "running"
+            } else {
+                child.state.as_str()
+            };
+            let mut detail = status.to_owned();
+            if matches!(child.state.as_str(), "pending" | "running") {
+                if let Some(tool) = child.current_tool.as_deref() {
+                    detail.push_str(" · ");
+                    detail.push_str(&sanitize_for_terminal(tool));
+                }
+            }
+            let calls = child.tool_use_count;
+            detail.push_str(" · ");
+            detail.push_str(&format!(
+                "{calls} call{}",
+                if calls == 1 { "" } else { "s" }
+            ));
+            lines.push(fit_line(
+                &format!(
+                    "  {} {} {}",
+                    theme.fg("muted", elbow),
+                    theme.fg("foreground", &task),
+                    theme.fg("muted", &detail),
+                ),
+                width,
+            ));
+        }
+    } else {
+        let activities = view.activities.iter().rev().take(limit).collect::<Vec<_>>();
+        let summary_width = activities
+            .iter()
+            .map(|activity| visible_width(&sanitize_for_terminal(&activity.summary)))
+            .max()
+            .unwrap_or_default();
+        for (index, activity) in activities.iter().rev().enumerate() {
+            let last = index + 1 == activities.len();
+            let elbow = match (unicode, last) {
+                (true, true) => "└",
+                (true, false) => "├",
+                (false, true) => "`-",
+                (false, false) => "+-",
+            };
+            let summary = sanitize_for_terminal(&activity.summary);
+            let summary = format!("{summary:<summary_width$}");
+            let calls = activity.metrics.map_or(0, |metrics| metrics.tool_calls);
+            let detail = format!(
+                "{} · {calls} call{}",
+                extension_activity_state_label(activity.state),
+                if calls == 1 { "" } else { "s" }
+            );
+            lines.push(fit_line(
+                &format!(
+                    "  {} {} {}",
+                    theme.fg("muted", elbow),
+                    theme.fg("foreground", &summary),
+                    theme.fg("muted", &detail),
+                ),
+                width,
+            ));
+        }
+    }
+
+    if lines.len() == 1 {
+        if let Some(reason) = view.failure_reason.as_deref() {
+            lines.push(fit_line(
+                &format!(
+                    "  {} {}",
+                    theme.fg("muted", if unicode { "└" } else { "`-" }),
+                    theme.fg(
+                        "muted",
+                        &format!("failed · {}", sanitize_for_terminal(reason))
+                    ),
+                ),
+                width,
+            ));
+        }
+    }
+    finish_transcript_block(lines)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_block_planned(
@@ -70,6 +202,14 @@ pub(super) fn render_block_planned(
             verbose_tools,
             content_background,
         ),
+        TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
+            finish_transcript_block(render_subagent_activity_panel(
+                panel,
+                theme,
+                width,
+                verbose_tools,
+            ))
+        }
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
                 && panel.display.shell_command.is_some();

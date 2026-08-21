@@ -138,6 +138,9 @@ pub(super) fn materialize_deferred_session_history(state: &SharedState) -> Resul
     state.active_reasoning = state
         .active_reasoning
         .map(|index| index.saturating_add(prepended_blocks));
+    state.subagent_activity_block = state
+        .subagent_activity_block
+        .map(|index| index.saturating_add(prepended_blocks));
     for index in &mut state.active_event_blocks {
         *index = index.saturating_add(prepended_blocks);
     }

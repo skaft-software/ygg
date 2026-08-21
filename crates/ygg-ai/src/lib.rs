@@ -40,6 +40,7 @@ mod json_repair;
 pub mod model_metadata;
 pub mod pricing;
 pub mod responses;
+mod responses_ws;
 pub mod stream;
 mod transform;
 pub mod types;

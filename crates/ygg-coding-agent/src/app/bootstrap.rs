@@ -1441,7 +1441,9 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                 context_window,
                 max_output_tokens,
             },
-            pricing: openrouter_pricing(entry),
+            pricing: openrouter_pricing(entry).or_else(|| {
+                ygg_ai::model_metadata::model_pricing(crate::providers::OPENROUTER.id, api_name)
+            }),
             cache: crate::providers::cache_compatibility(
                 crate::providers::OPENROUTER.id,
                 api_name,
@@ -3332,9 +3334,10 @@ fn register_openai_codex(
         base_url: url::Url::parse(codex::BACKEND_BASE_URL)?,
         auth: Auth::dynamic(resolver),
         default_headers,
-        // AiClient currently implements HTTP/SSE only. Do not advertise a
-        // WebSocket preference until the transport actually honors it.
-        transport: ygg_ai::EndpointTransport::Http,
+        // Prefer the cached Responses WebSocket. AiClient retains the
+        // durable HTTP/SSE path as a conservative fallback for unavailable or
+        // provider-rejected sockets.
+        transport: ygg_ai::EndpointTransport::WebSocketPreferred,
         timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
     })?;
 
@@ -3347,7 +3350,12 @@ fn register_openai_codex(
         } else {
             ModelId(model.id.clone())
         };
-        let pricing = codex_pricing(&model.id);
+        let pricing = codex_pricing(&model.id).or_else(|| {
+            // Codex uses OpenAI's model identities; use the provider-scoped
+            // models.dev rate for newly added identities when no Codex-specific
+            // tier override exists.
+            ygg_ai::model_metadata::model_pricing("openai", &model.id)
+        });
         let supports_image_input = codex_supports_image_input(&model.id);
         catalog.register_model(ModelSpec {
             id: catalog_id,

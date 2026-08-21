@@ -1,9 +1,13 @@
 #![allow(missing_docs)]
 
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{oneshot, Mutex};
+use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
 use wiremock::matchers::{header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -327,6 +331,306 @@ fn text_request() -> Request {
         cache_retention: ygg_ai::CacheRetention::Short,
         session_id: None,
     }
+}
+#[derive(Clone, Copy)]
+enum WebSocketBehavior {
+    Complete,
+    CloseBeforeEvents,
+    RejectHandshake,
+    Stall,
+}
+
+struct TestResponsesServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    shutdown: Option<oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestResponsesServer {
+    async fn start(behavior: WebSocketBehavior, fallback_body: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown, mut shutdown_rx) = oneshot::channel();
+        let recorded_requests = Arc::clone(&requests);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        let requests = Arc::clone(&recorded_requests);
+                        let fallback_body = fallback_body.clone();
+                        tokio::spawn(async move {
+                            let _ = handle_test_responses_connection(
+                                stream,
+                                behavior,
+                                fallback_body,
+                                requests,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            requests,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    async fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().await.clone()
+    }
+}
+
+impl Drop for TestResponsesServer {
+    fn drop(&mut self) {
+        self.shutdown.take();
+        self.task.abort();
+    }
+}
+
+async fn handle_test_responses_connection(
+    mut stream: TcpStream,
+    behavior: WebSocketBehavior,
+    fallback_body: String,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut peek = [0_u8; 1024];
+    let count = stream.peek(&mut peek).await?;
+    let request_head = String::from_utf8_lossy(&peek[..count]).to_ascii_lowercase();
+    if !request_head.contains("upgrade: websocket") {
+        let mut request = [0_u8; 16 * 1024];
+        let _ = stream.read(&mut request).await?;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            fallback_body.len(), fallback_body
+        );
+        stream.write_all(response.as_bytes()).await?;
+        return Ok(());
+    }
+
+    if matches!(behavior, WebSocketBehavior::RejectHandshake) {
+        stream
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await?;
+        return Ok(());
+    }
+
+    let mut socket = accept_async(stream).await?;
+    loop {
+        let Some(Ok(WebSocketMessage::Text(text))) = socket.next().await else {
+            return Ok(());
+        };
+        let body: serde_json::Value = serde_json::from_str(text.as_ref())?;
+        requests.lock().await.push(body.clone());
+
+        match behavior {
+            WebSocketBehavior::CloseBeforeEvents => return Ok(()),
+            WebSocketBehavior::Stall => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(());
+            }
+            WebSocketBehavior::Complete | WebSocketBehavior::RejectHandshake => {}
+        }
+
+        let prewarm = body.get("generate") == Some(&serde_json::Value::Bool(false));
+        let id = if prewarm { "resp-prewarm" } else { "resp-turn" };
+        let mut events = vec![serde_json::json!({
+            "type": "response.created",
+            "response": {"id": id}
+        })];
+        if !prewarm {
+            events.extend([
+                serde_json::json!({
+                    "type": "response.content_part.added",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "part": {"type": "output_text"}
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.delta",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": "websocket"
+                }),
+                serde_json::json!({
+                    "type": "response.output_text.done",
+                    "output_index": 0,
+                    "content_index": 0
+                }),
+            ]);
+        }
+        events.push(serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": id,
+                "usage": {"input_tokens": 2, "output_tokens": if prewarm { 0 } else { 1 }, "total_tokens": if prewarm { 2 } else { 3 }}
+            }
+        }));
+        for event in events {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await?;
+        }
+        if !prewarm {
+            return Ok(());
+        }
+    }
+}
+
+fn websocket_test_model(base_url: &str) -> Model {
+    let mut model = make_test_model(base_url, Protocol::OpenAiResponses, false);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.transport = ygg_ai::EndpointTransport::WebSocketPreferred;
+    model.endpoint = Arc::new(endpoint);
+    model
+}
+
+fn responses_request(messages: Vec<Message>, session_id: Option<&str>) -> Request {
+    let mut request = text_request();
+    request.messages = messages;
+    request.session_id = session_id.map(str::to_owned);
+    request
+}
+
+fn user_message(text: &str) -> Message {
+    Message::User(UserMessage {
+        content: vec![UserPart::Text(text.to_owned())],
+    })
+}
+
+fn fallback_responses_body() -> String {
+    concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-http\"}}\n\n",
+        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"http\"}\n\n",
+        "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-http\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n"
+    )
+    .to_owned()
+}
+
+#[tokio::test]
+async fn responses_websocket_decodes_events_and_uses_continuation_suffix() {
+    let server =
+        TestResponsesServer::start(WebSocketBehavior::Complete, fallback_responses_body()).await;
+    let model = websocket_test_model(&server.base_url);
+    let client = AiClient::new();
+    let session_id = "session-ws";
+    client
+        .prewarm_responses(
+            &model,
+            responses_request(vec![user_message("first")], Some(session_id)),
+        )
+        .await
+        .unwrap();
+
+    let mut stream = client
+        .stream(
+            &model,
+            responses_request(
+                vec![user_message("first"), user_message("second")],
+                Some(session_id),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::TextDelta { delta, .. } if delta == "websocket"
+        )),
+        "events: {events:?}"
+    );
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["generate"], false);
+    assert_eq!(requests[1]["previous_response_id"], "resp-prewarm");
+    assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn responses_websocket_handshake_failure_falls_back_to_http_sse() {
+    let server = TestResponsesServer::start(
+        WebSocketBehavior::RejectHandshake,
+        fallback_responses_body(),
+    )
+    .await;
+    let model = websocket_test_model(&server.base_url);
+    let mut stream = AiClient::new()
+        .stream(
+            &model,
+            responses_request(vec![user_message("fallback")], Some("session-handshake")),
+        )
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
+            deltas.push(delta);
+        }
+    }
+    assert_eq!(deltas, vec!["http"]);
+}
+
+#[tokio::test]
+async fn responses_websocket_failure_before_output_falls_back_to_http_sse() {
+    let server = TestResponsesServer::start(
+        WebSocketBehavior::CloseBeforeEvents,
+        fallback_responses_body(),
+    )
+    .await;
+    let model = websocket_test_model(&server.base_url);
+    let mut stream = AiClient::new()
+        .stream(
+            &model,
+            responses_request(vec![user_message("fallback")], Some("session-close")),
+        )
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
+            deltas.push(delta);
+        }
+    }
+    assert_eq!(deltas, vec!["http"]);
+}
+
+#[tokio::test]
+async fn responses_websocket_idle_timeout_falls_back_to_http_sse() {
+    let server =
+        TestResponsesServer::start(WebSocketBehavior::Stall, fallback_responses_body()).await;
+    let model = websocket_test_model(&server.base_url);
+    let mut stream = AiClient::new()
+        .with_stream_timeouts(Duration::from_millis(10), Duration::from_millis(200))
+        .stream(
+            &model,
+            responses_request(vec![user_message("timeout")], Some("session-timeout")),
+        )
+        .await
+        .unwrap();
+    let mut deltas = Vec::new();
+    while let Some(event) = stream.next().await {
+        if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
+            deltas.push(delta);
+        }
+    }
+    assert_eq!(deltas, vec!["http"]);
 }
 
 #[tokio::test]
