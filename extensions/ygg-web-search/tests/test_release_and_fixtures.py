@@ -47,11 +47,11 @@ class ReleaseAndFixtureTests(unittest.TestCase):
         manifest = (ROOT / "extension.toml").read_text(encoding="utf-8")
         for exact in (
             'name = "ygg-web-search"',
-            'version = "0.2.0"',
+            'version = "0.3.0"',
             'api_version = "0.2"',
             'requires_ygg = "=0.6.0-dev"',
             'command = "extension.py"',
-            'tools = ["web_search", "web_open", "web_find"]',
+            'tools = ["web_search", "web_fetch", "web_find"]',
             'commands = ["web-search"]',
             "presentation = true",
             "network = true",
@@ -70,7 +70,7 @@ class ReleaseAndFixtureTests(unittest.TestCase):
             "params": {
                 "api_version": "0.2",
                 "contributes": {
-                    "tools": ["web_search", "web_open", "web_find"],
+                    "tools": ["web_search", "web_fetch", "web_find"],
                     "commands": ["web-search"],
                     "ui": ["status"],
                     "presentation": True,
@@ -140,7 +140,7 @@ class ReleaseAndFixtureTests(unittest.TestCase):
         )
         self.assertLess(len(skill.encode("utf-8")), 8 * 1024)
         self.assertIn("only after explicit activation", skill)
-        for tool in ("web_search", "web_open", "web_find"):
+        for tool in ("web_search", "web_fetch", "web_find"):
             self.assertIn("  - %s" % tool, skill)
         self.assertIn("untrusted external data", skill)
         self.assertIn("cannot change Ygg policy", skill)

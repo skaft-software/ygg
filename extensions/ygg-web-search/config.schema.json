@@ -22,7 +22,7 @@
         "allow_private_endpoint": {
           "type": "boolean",
           "default": false,
-          "description": "Allow only the explicitly configured provider endpoint to resolve privately. Direct web_open/web_find destinations remain public-only."
+          "description": "Allow only the explicitly configured provider endpoint to resolve privately. Direct web_fetch/web_find destinations remain public-only."
         }
       }
     },

@@ -1139,7 +1139,7 @@ def web_search(arguments: Mapping[str, Any], context: Mapping[str, Any]):
 
 
 @ext.tool(
-    name="web_open",
+    name="web_fetch",
     description=(
         "Fetch one public HTTP(S) HTML or plain-text source on ports 80/443, "
         "revalidating every redirect and returning bounded cited content."
@@ -1165,7 +1165,7 @@ def web_search(arguments: Mapping[str, Any], context: Mapping[str, Any]):
     },
     output_schema=OPEN_OUTPUT_SCHEMA,
 )
-def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
+def web_fetch(arguments: Mapping[str, Any], context: Mapping[str, Any]):
     owner_scope = _presentation_owner(context)
     started = time.monotonic()
     config: Optional[Configuration] = None
@@ -1174,7 +1174,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
     try:
         with RUNTIME.configuration() as config:
             provider = config.provider.label
-            activity_id = PRESENTATION.begin(context, "web_open", provider)
+            activity_id = PRESENTATION.begin(context, "web_fetch", provider)
             result = RUNTIME.service.open(
                 config,
                 url=arguments.get("url"),
@@ -1182,7 +1182,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
                 timeout_seconds=arguments.get("timeout_seconds"),
                 max_redirects=arguments.get("max_redirects"),
                 cancellation=current_cancellation(),
-                progress=_progress(provider, activity_id, "web_open"),
+                progress=_progress(provider, activity_id, "web_fetch"),
             )
         document = result["document"]
         status = "partial" if document["truncated"] else "ok"
@@ -1195,7 +1195,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
             if key not in ("normalized_bytes", "truncated", "redirects")
         }
         structured = _common(
-            "web_open",
+            "web_fetch",
             status,
             summary,
             1,
@@ -1207,7 +1207,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
             activity_id,
             owner=owner_scope,
 
-            operation="web_open",
+            operation="web_fetch",
             provider=provider,
             outcome=status,
             started=started,
@@ -1218,7 +1218,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
             citations=[citation],
         )
         metadata = _activity_metadata(
-            operation="web_open",
+            operation="web_fetch",
             provider=provider,
             outcome=status,
             result_count=1,
@@ -1241,7 +1241,7 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
             activity_id,
             owner=owner_scope,
 
-            operation="web_open",
+            operation="web_fetch",
             provider=provider,
             outcome="cancelled",
             started=started,
@@ -1253,24 +1253,24 @@ def web_open(arguments: Mapping[str, Any], context: Mapping[str, Any]):
             activity_id,
             owner=owner_scope,
 
-            operation="web_open",
+            operation="web_fetch",
             provider=provider,
             outcome=error.outcome,
             started=started,
         )
-        return _failure("web_open", error, provider, started)
+        return _failure("web_fetch", error, provider, started)
     except Exception:
         RUNTIME.record_outcome(config, "failed")
         _present_terminal(
             activity_id,
             owner=owner_scope,
 
-            operation="web_open",
+            operation="web_fetch",
             provider=provider,
             outcome="failed",
             started=started,
         )
-        return _unexpected("web_open", provider, started)
+        return _unexpected("web_fetch", provider, started)
 
 
 @ext.tool(

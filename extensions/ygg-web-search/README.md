@@ -121,11 +121,11 @@ The SearXNG instance must permit JSON search responses (`format=json`). Its
 endpoint is deliberately non-secret; credential-bearing URLs and unknown
 credential fields are rejected. A self-hosted endpoint on loopback or a private
 address requires `allow_private_endpoint: true`. That exception applies only to
-the configured provider hostname. Model-supplied `web_open` and `web_find`
+the configured provider hostname. Model-supplied `web_fetch` and `web_find`
 destinations and every redirect remain public-address-only.
 
 Optional `limits.allowed_domains` is an egress allowlist for search results,
-`web_open`, `web_find`, and redirects. A tool-supplied `domains` list can narrow
+`web_fetch`, `web_find`, and redirects. A tool-supplied `domains` list can narrow
 that configuration but cannot widen it.
 
 ## Tools and bounds
@@ -133,8 +133,8 @@ that configuration but cannot widen it.
 | Tool | Purpose | Hard bounds |
 | --- | --- | --- |
 | `web_search` | Query the selected Brave Search or SearXNG adapter | 512-byte query, 5 requested domains, 10 results, 20 seconds, 512 KiB provider response; Brave credentialed requests do not redirect |
-| `web_open` | Normalize one public HTML or plain-text URL | HTTP(S) ports 80/443, 20 seconds, 3 redirects, 512 KiB download, 128 KiB normalized content |
-| `web_find` | Find a literal pattern and return excerpts | 256-byte pattern, 20 matches, 512-byte excerpts, the same fetch bounds as `web_open` |
+| `web_fetch` | Normalize one public HTML or plain-text URL | HTTP(S) ports 80/443, 20 seconds, 3 redirects, 512 KiB download, 128 KiB normalized content |
+| `web_find` | Find a literal pattern and return excerpts | 256-byte pattern, 20 matches, 512-byte excerpts, the same fetch bounds as `web_fetch` |
 
 Defaults can be made smaller in configuration. Call arguments may select a
 smaller result, byte, redirect, or time limit but cannot exceed the hard limit.
@@ -230,7 +230,7 @@ Generic host reducers fence updates by process generation, retain a
 terminal snapshot across Serve reconnect, remove replacement-generation state,
 and render the same data without a search-specific frontend state machine.
 Source URLs are exposed only as host-validated references requiring an explicit
-user click; `web_open` is retrieval, not a browser tab.
+user click; `web_fetch` is retrieval, not a browser tab.
 
 ## Test
 

@@ -1,5 +1,5 @@
 name = "ygg-web-search"
-version = "0.2.0"
+version = "0.3.0"
 api_version = "0.2"
 requires_ygg = "=0.6.0-dev"
 description = "Selectable Brave Search or SearXNG web search with bounded public-page retrieval and stable citations"
@@ -16,7 +16,7 @@ process = false
 network = true
 
 [contributes]
-tools = ["web_search", "web_open", "web_find"]
+tools = ["web_search", "web_fetch", "web_find"]
 commands = ["web-search"]
 ui = ["status"]
 presentation = true

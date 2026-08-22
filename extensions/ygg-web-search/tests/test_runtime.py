@@ -167,7 +167,7 @@ def initialize():
         {
             "api_version": "0.2",
             "contributes": {
-                "tools": ["web_search", "web_open", "web_find"],
+                "tools": ["web_search", "web_fetch", "web_find"],
                 "commands": ["web-search"],
                 "ui": ["status"],
                 "presentation": True,
@@ -196,14 +196,14 @@ class RuntimeTests(unittest.TestCase):
             config = write_config(Path(temporary))
             module.RUNTIME = module.Runtime(config, StubService())
             search = module.web_search({"query": "fixture"}, OWNER_CONTEXT)
-            opened = module.web_open({"url": "https://example.com/source"}, OWNER_CONTEXT)
+            opened = module.web_fetch({"url": "https://example.com/source"}, OWNER_CONTEXT)
             found = module.web_find(
                 {"url": "https://example.com/source", "pattern": "bounded"}, OWNER_CONTEXT
             )
 
         for result, operation in (
             (search, "web_search"),
-            (opened, "web_open"),
+            (opened, "web_fetch"),
             (found, "web_find"),
         ):
             text = result["content"][0]["text"]
@@ -443,7 +443,7 @@ class RuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             {item["name"] for item in initialized["tools"]},
-            {"web_search", "web_open", "web_find"},
+            {"web_search", "web_fetch", "web_find"},
         )
         self.assertEqual(
             {item["name"] for item in initialized["commands"]},
