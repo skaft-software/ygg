@@ -1,0 +1,17 @@
+name = "lsp-client"
+version = "0.1.0"
+api_version = "0.2"
+description = "Read-only LSP code intelligence: definition, references, hover, and bounded diagnostics"
+
+[entrypoint]
+command = "extension.py"
+
+[capabilities]
+filesystem = "workspace"
+process = true
+network = false
+
+[contributes]
+tools = ["code_intelligence"]
+hooks = ["before_prompt"]
+notifications = true
