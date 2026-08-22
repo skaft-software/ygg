@@ -131,8 +131,8 @@ class RuntimeProtocolTests(unittest.TestCase):
                     },
                     "protocol": {
                         "version": "0.2",
-                        "required_features": ["content_parts"],
-                        "optional_features": ["lifecycle_events"],
+                        "required_features": ["request_cancellation", "content_parts"],
+                        "optional_features": ["request_progress", "lifecycle_events"],
                         "limits": {"max_concurrent_requests": 4},
                     },
                 },

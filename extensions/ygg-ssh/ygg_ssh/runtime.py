@@ -13,7 +13,12 @@ from .config import ConfigError, SshConfig, load_config
 from .session import DEFAULT_CONNECT_TIMEOUT_MS, SshSessions
 
 
-SUPPORTED_FEATURES = ("content_parts", "lifecycle_events")
+SUPPORTED_FEATURES = (
+    "request_cancellation",
+    "content_parts",
+    "request_progress",
+    "lifecycle_events",
+)
 
 
 def build_runtime(
