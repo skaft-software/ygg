@@ -869,7 +869,7 @@ requires_ygg = "=0.6.0-dev"
 `requires_ygg` is optional for an unpackaged local extension, but when present
 it is enforced during discovery. It is mandatory and must be the exact running
 Ygg version for every installed bundle. The first-party release catalog is
-intentionally small: `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`, `ygg-ssh`,
+intentionally small: `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`,
 `ygg-subagents`, and `ygg-web-search`. Install, inspect, update, and remove a
 published package with:
 

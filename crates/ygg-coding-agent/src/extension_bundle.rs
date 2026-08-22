@@ -862,7 +862,6 @@ mod tests {
                 "ygg-browse",
                 "ygg-hermes-memory",
                 "ygg-mcp",
-                "ygg-ssh",
                 "ygg-subagents",
                 "ygg-web-search",
             ]
