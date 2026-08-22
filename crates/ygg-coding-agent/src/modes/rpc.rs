@@ -1519,7 +1519,7 @@ impl EventTranslator {
                     }))?;
                 }
             }
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, result, .. } => {
                 let (name, _args, _) = self
                     .tools
                     .remove(&id.0)
@@ -1629,6 +1629,8 @@ impl EventTranslator {
                 }
             }
             AgentEvent::DelegationUpdated { .. } => {}
+            // Attempt boundaries are not part of the RPC protocol surface.
+            AgentEvent::TurnStarted => {}
             AgentEvent::RunFinished { reason, .. } => {
                 let outcome = HostRunOutcome::from_finish_reason(
                     &reason,

@@ -378,7 +378,7 @@ async fn run_prompt(
                         tools.insert(id.clone(), (name.clone(), args.clone()));
                     }
                     AgentEvent::ToolProgress { .. } => {}
-                    AgentEvent::ToolFinished { id, result } => {
+                    AgentEvent::ToolFinished { id, result, .. } => {
                         let (name, args) = tools
                             .remove(id)
                             .unwrap_or_else(|| ("tool".into(), serde_json::Value::Null));
@@ -474,7 +474,8 @@ async fn run_prompt(
                     }
                     AgentEvent::SteeringDelivered { .. }
                     | AgentEvent::FollowUpDelivered { .. }
-                    | AgentEvent::DelegationUpdated { .. } => {}
+                    | AgentEvent::DelegationUpdated { .. }
+                    | AgentEvent::TurnStarted => {}
                     AgentEvent::RunFinished { reason, .. } => {
                         let outcome = HostRunOutcome::from_finish_reason(
                             reason,

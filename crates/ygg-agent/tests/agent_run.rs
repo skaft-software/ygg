@@ -3315,7 +3315,14 @@ async fn dropping_run_does_not_replay_an_interrupted_tool() {
     )
     .await;
     let mut run = h.agent.prompt("start and then drop").await.unwrap();
-    let _ = run.next().await;
+    // Consume up to the committed assistant turn. Dropping earlier would
+    // suspend the generator at the advisory TurnStarted event, before the
+    // provider response (and therefore the durable tool call) exists.
+    while let Some(event) = run.next().await {
+        if matches!(event, AgentEvent::TurnFinished { .. }) {
+            break;
+        }
+    }
     drop(run);
     assert!(!h.workspace.join("drop-must-not-run.txt").exists());
     // Run::drop itself must close the durable tool-call boundary. Do not rely
@@ -4331,6 +4338,7 @@ async fn abort_before_completion_persists_cancellation_result() {
         AgentEvent::ToolFinished {
             id,
             result: Err(error),
+            ..
         } if id.0 == "call_p" && error.message.contains("cancelled by user")
     )));
     // One cancellation result persisted.
@@ -5027,6 +5035,7 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
             AgentEvent::ToolFinished {
                 id,
                 result: Err(error),
+                ..
             } => Some((id.0.as_str(), error.message.as_str())),
             _ => None,
         })
@@ -5034,7 +5043,11 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
     let succeeded = events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolFinished { id, result: Ok(_) } => Some(id.0.as_str()),
+            AgentEvent::ToolFinished {
+                id,
+                result: Ok(_),
+                ..
+            } => Some(id.0.as_str()),
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
@@ -5351,6 +5364,143 @@ async fn controlled_workspace_mutation_requires_and_consumes_exact_approval() {
     assert!(events
         .iter()
         .any(|event| matches!(event, AgentEvent::ToolFinished { result: Ok(_), .. })));
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+}
+
+// ── Speculative bash reconnaissance ────────────────────────────────────────
+
+/// Serves two sequential HTTP responses over a raw listener. The first
+/// response streams its SSE body in two parts separated by `tail_delay`, so
+/// the agent observes a completed tool call long before the provider turn
+/// finishes. The second response is written and closed in one shot.
+async fn stalled_tool_turn_server(
+    head: String,
+    tail: String,
+    tail_delay: Duration,
+    second: String,
+) -> String {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        for (index, body) in [(Some(head), Some(tail)), (None, Some(second))] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            if let Some(head) = index {
+                let tail = body.expect("first turn carries a tail");
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.flush().await.unwrap();
+                tokio::time::sleep(tail_delay).await;
+                socket.write_all(tail.as_bytes()).await.unwrap();
+            } else {
+                let body = body.expect("second turn carries a body");
+                socket.write_all(body.as_bytes()).await.unwrap();
+            }
+            socket.shutdown().await.unwrap();
+        }
+    });
+    uri
+}
+
+/// A shallow read-only bash call whose arguments finish streaming before the
+/// rest of the provider response must be executed speculatively during the
+/// stall: the tool observes the file before the test rewrites it. A serial
+/// fallback would only run the command after the stall and would observe the
+/// rewritten content instead.
+#[tokio::test]
+async fn shallow_recon_bash_speculates_while_the_provider_stream_is_open() {
+    let turn1_head = msg_start()
+        + &tool_block(
+            0,
+            "call_1",
+            "bash",
+            &serde_json::json!({"command": "cat probe.txt"}),
+        );
+    let uri = stalled_tool_turn_server(
+        turn1_head,
+        msg_end("tool_use"),
+        Duration::from_millis(900),
+        text_turn("done"),
+    )
+    .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    std::fs::write(workspace.join("probe.txt"), "before").unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let mut agent = build_agent(&uri, &workspace, &session_path, Some(8));
+
+    // Rewrite the probe file while the provider stall is still open. The
+    // speculative execution has already read (and returned) "before".
+    let rewrite = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(workspace.join("probe.txt"), "after").unwrap();
+    });
+
+    let mut run = agent.prompt("probe").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+    rewrite.await.unwrap();
+
+    let finished = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("ToolFinished for bash");
+    let output = finished.as_ref().expect("bash must succeed");
+    assert!(output.text.contains("before"), "{}", output.text);
+    assert!(!output.text.contains("after"), "{}", output.text);
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+}
+
+#[tokio::test]
+async fn non_recon_bash_still_executes_serially() {
+    let mut h = harness(
+        vec![
+            tool_turn(&[(
+                "call_1",
+                "bash",
+                serde_json::json!({"command": "echo speculative-serial-check"}),
+            )]),
+            text_turn("done"),
+        ],
+        Some(8),
+    )
+    .await;
+
+    let mut run = h.agent.prompt("run echo").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    let finished = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolFinished { result, .. } => Some(result),
+            _ => None,
+        })
+        .expect("ToolFinished for bash");
+    let output = finished.as_ref().expect("echo must succeed");
+    assert!(
+        output.text.contains("speculative-serial-check"),
+        "{}",
+        output.text
+    );
     assert!(matches!(
         assert_single_run_finished(&events),
         FinishReason::Completed

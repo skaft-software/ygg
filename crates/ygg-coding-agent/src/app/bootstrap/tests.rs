@@ -1378,6 +1378,21 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
             }),
         ),
     );
+    // One provider declares explicit per-token pricing.
+    let mut priced = provider(
+        "Metered Gateway",
+        "http://127.0.0.1:8500/v1/",
+        "metered-model",
+        Some(CustomAuthConfig::None),
+    );
+    priced.credential.models[0].pricing = Some(crate::auth::custom::CustomPricing {
+        input: 75,
+        output: 300,
+        ..Default::default()
+    });
+    registry
+        .providers
+        .insert("metered-gateway".into(), priced);
     registry.providers.insert(
         "invalid/provider".into(),
         provider(
@@ -1418,6 +1433,28 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
         home.endpoint.auth,
         Auth::BearerEnv { ref var } if var == "YGG_TEST_HOME_SERVER_KEY"
     ));
+
+    // Undeclared custom-model pricing defaults to trusted zero rates so
+    // cost-ceiling guardrails (such as subagent budgets) stay enforceable.
+    let default_pricing = home
+        .spec
+        .pricing
+        .as_ref()
+        .expect("custom models must carry trusted pricing");
+    assert_eq!(default_pricing.input, TokenRate(0));
+    assert_eq!(default_pricing.output, TokenRate(0));
+    assert_eq!(default_pricing.cache_read, TokenRate(0));
+    assert_eq!(default_pricing.cache_write_5m, TokenRate(0));
+
+    // A declared pricing block is honored verbatim.
+    let metered = catalog
+        .resolve(&ModelId("custom/metered-gateway/metered-model".into()))
+        .unwrap();
+    let declared = metered.spec.pricing.as_ref().expect("declared pricing");
+    assert_eq!(declared.input, TokenRate(75));
+    assert_eq!(declared.output, TokenRate(300));
+    assert_eq!(declared.cache_read, TokenRate(0));
+
     assert!(catalog
         .resolve(&ModelId("custom/invalid/provider/invalid-model".into()))
         .is_err());
@@ -1442,6 +1479,7 @@ fn custom_model_cache_is_scoped_to_endpoint_and_reuses_discovery() {
         reasoning_values: Vec::new(),
         reasoning_default: String::new(),
         reasoning_uses_system_message: true,
+        pricing: None,
     }];
     let mut first_headers = http::HeaderMap::new();
     first_headers.insert("x-organization", "tenant-one".parse().unwrap());

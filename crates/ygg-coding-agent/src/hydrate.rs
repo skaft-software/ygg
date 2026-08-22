@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ygg_agent::{Entry, EntryValue, Session};
+use ygg_agent::{Entry, EntryMetadata, EntryValue, Session};
 use ygg_ai::{AssistantPart, Message, ToolCallId, ToolResultPart, UserPart};
 
 use crate::tui::theme::ModelLab;
@@ -29,6 +29,11 @@ pub enum TranscriptItem {
         id: ToolCallId,
         text: String,
         is_error: bool,
+        /// Milliseconds between the tool's effect admission and the
+        /// finalization of its result. `None` for legacy entries, for
+        /// interrupted calls, and for results whose timing window was not
+        /// recorded.
+        duration_ms: Option<u64>,
     },
     CompactionMarker {
         summary: String,
@@ -84,12 +89,27 @@ fn media_marker(media: &ygg_ai::Media) -> String {
     }
 }
 
+/// Wall-time window, in milliseconds, recorded in the tool call's
+/// durable metadata.
+fn tool_result_duration_ms(metadata: Option<&EntryMetadata>) -> Option<u64> {
+    metadata.and_then(|metadata| {
+        match (
+            metadata.tool_started_unix_ms,
+            metadata.tool_finished_unix_ms,
+        ) {
+            (Some(started), Some(finished)) => Some(finished.saturating_sub(started)),
+            _ => None,
+        }
+    })
+}
+
 fn push_message(
     items: &mut Vec<TranscriptItem>,
     message: &Message,
     model_lab: Option<ModelLab>,
     prompt_color: Option<String>,
     display_text: Option<&str>,
+    metadata: Option<&EntryMetadata>,
 ) {
     match message {
         Message::User(user) => {
@@ -129,6 +149,7 @@ fn push_message(
                             id: result.tool_call_id.clone(),
                             text: tool_result_text(&result.content),
                             is_error: result.is_error,
+                            duration_ms: tool_result_duration_ms(metadata),
                         })
                     }
                     UserPart::Media(media) => text.push_str(&media_marker(media)),
@@ -327,7 +348,14 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     .metadata
                     .as_ref()
                     .and_then(|metadata| metadata.display_text.as_deref());
-                push_message(&mut items, message, prompt_lab, prompt_color, display_text);
+                push_message(
+                    &mut items,
+                    message,
+                    prompt_lab,
+                    prompt_color,
+                    display_text,
+                    entry.metadata.as_ref(),
+                );
                 // No process from a previous UI instance can still be running.
                 // Close an unpaired persisted call visibly instead of reviving
                 // it as an active spinner. Agent recovery will durably pair the
@@ -345,6 +373,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                                 id: call.id.clone(),
                                 text: "interrupted before a durable tool result was recorded; this call is not running and will be reconciled before the next prompt".into(),
                                 is_error: true,
+                                duration_ms: None,
                             });
                         }
                     }
@@ -595,6 +624,7 @@ mod tests {
                     id: ToolCallId("call-1".into()),
                     text: "ok".into(),
                     is_error: false,
+                    duration_ms: None,
                 },
                 TranscriptItem::User {
                     text: "after".into(),
@@ -621,6 +651,8 @@ mod tests {
                     run_outcome: None,
                     local_synthetic_assistant: false,
                     tool_output: None,
+                    tool_started_unix_ms: None,
+                    tool_finished_unix_ms: None,
                 }),
             )
             .unwrap();
@@ -642,6 +674,8 @@ mod tests {
                     run_outcome: None,
                     local_synthetic_assistant: false,
                     tool_output: None,
+                    tool_started_unix_ms: None,
+                    tool_finished_unix_ms: None,
                 }),
             )
             .unwrap();
@@ -854,7 +888,12 @@ mod tests {
         assert!(matches!(tail[0], TranscriptItem::ToolCall { .. }));
         assert!(matches!(
             &tail[1],
-            TranscriptItem::ToolResult { id, text, is_error: true }
+            TranscriptItem::ToolResult {
+                id,
+                text,
+                is_error: true,
+                ..
+            }
                 if id.0 == "interrupted-call"
                     && text.contains("not running")
                     && text.contains("reconciled")

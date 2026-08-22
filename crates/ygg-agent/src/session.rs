@@ -179,6 +179,15 @@ pub struct EntryMetadata {
     /// canonical provider-visible message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<crate::tool::ToolOutputDetails>,
+    /// Unix milliseconds just before the tool's effects were admitted
+    /// (`null` when the call never reached the effect gate). Together with
+    /// `tool_finished_unix_ms` this is the durable per-tool timing window
+    /// persisted beside the tool result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_started_unix_ms: Option<u64>,
+    /// Unix milliseconds when the tool call's outcome was finalized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_finished_unix_ms: Option<u64>,
     /// Marks a locally generated assistant boundary that intentionally has no
     /// authoritative provider sidecar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -247,6 +256,9 @@ impl EntryMetadata {
             .tool_output
             .and_then(|details| details.into_validated().ok())
             .filter(|details| !details.is_empty());
+        // The timing window is only meaningful beside a retained tool result.
+        self.tool_started_unix_ms = None;
+        self.tool_finished_unix_ms = None;
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
@@ -553,7 +565,7 @@ fn entry_ancestry_intervals(
     (entered, exited)
 }
 
-fn now_unix_millis() -> u64 {
+pub(crate) fn now_unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
@@ -2730,6 +2742,8 @@ mod tests {
                     display_text: Some("visible\ndraft".into()),
                     run_outcome: None,
                     tool_output: None,
+                    tool_started_unix_ms: None,
+                    tool_finished_unix_ms: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2744,6 +2758,8 @@ mod tests {
                     display_text: Some("bad\u{1b}".into()),
                     run_outcome: None,
                     tool_output: None,
+                    tool_started_unix_ms: None,
+                    tool_finished_unix_ms: None,
                     local_synthetic_assistant: false,
                 }),
             )
@@ -2760,6 +2776,8 @@ mod tests {
                 display_text: Some("visible\ndraft".into()),
                 run_outcome: None,
                 tool_output: None,
+                tool_started_unix_ms: None,
+                tool_finished_unix_ms: None,
                 local_synthetic_assistant: false,
             })
         );

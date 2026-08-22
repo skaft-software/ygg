@@ -369,6 +369,19 @@ If an endpoint cannot provide a useful `GET /v1/models`, set
 Protect the credential file with `chmod 600`. Use `--offline` to skip optional
 model discovery during startup; inference still reaches the selected endpoint.
 
+Custom models are treated as free for cost guardrails: each model gets trusted
+zero pricing by default, so subagents and other features that require trusted
+model pricing work out of the box on local and self-hosted servers. To track
+real spend instead, declare rates per model in microdollars per million tokens;
+omitted rates stay zero:
+
+```json
+{
+  "api_name": "metered-model",
+  "pricing": { "input": 75, "output": 300, "cache_read": 8, "cache_write_5m": 19 }
+}
+```
+
 ## What ships in the binary
 
 ### Three frontends

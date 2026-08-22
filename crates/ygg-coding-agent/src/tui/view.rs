@@ -182,6 +182,8 @@ struct ToolPanel {
     output: String,
     finished: bool,
     is_error: bool,
+    /// Wall time the call took, known once the outcome is final.
+    duration: Option<Duration>,
     failure_reason: Option<String>,
     /// Optional extension-owned semantic presentation. These are always plain,
     /// sanitized segments; roles are resolved against the current theme only
@@ -232,6 +234,7 @@ impl ToolPanel {
             output,
             finished,
             is_error,
+            duration: None,
             failure_reason,
             extension_render_segments: Vec::new(),
             subagent_activity: None,
@@ -547,6 +550,20 @@ pub(crate) struct ShellState {
     pub(crate) last_turn_generated_tokens: Option<u64>,
     /// Start of the visible model-generation portion of the current turn.
     pub(crate) turn_generation_started_at: Option<Instant>,
+    /// When the most recent provider request for the current turn was
+    /// opened (AgentEvent::TurnStarted). Anchors the first-token latency
+    /// measurement and is refreshed on every retry.
+    pub(crate) turn_requested_at: Option<Instant>,
+    /// First-token latency of the most recently completed provider
+    /// response: request opened until the first generated token.
+    pub(crate) last_turn_first_token: Option<Duration>,
+    /// Total provider time of the most recently completed provider
+    /// response: request opened until the response was fully generated.
+    pub(crate) last_turn_provider_elapsed: Option<Duration>,
+    /// (tool name, wall time) of recently completed tool calls, most
+    /// recent last. Session-scoped and bounded; powers the `/status`
+    /// tool wall-time line.
+    pub(crate) tool_durations: Vec<(String, Duration)>,
     /// Bytes streamed during the current provider attempt. This supports a
     /// cheap live token estimate without tokenizing the complete transcript on
     /// every frame.
@@ -789,6 +806,9 @@ impl ShellState {
         self.last_turn_generation_elapsed = None;
         self.last_turn_generated_tokens = None;
         self.turn_generation_started_at = None;
+        self.turn_requested_at = None;
+        self.last_turn_first_token = None;
+        self.last_turn_provider_elapsed = None;
         self.turn_streamed_output_bytes = 0;
         self.turn_output_tokens_before_generation = 0;
         self.run_cost_microdollars = 0;
@@ -1891,6 +1911,12 @@ impl InteractiveShell {
                     state.open_reasoning_status();
                 }
             }
+            AgentEvent::TurnStarted => {
+                // A new provider attempt for this model turn is beginning;
+                // the request is opened immediately after this event, so
+                // this moment anchors the attempt's first-token latency.
+                state.turn_requested_at = Some(Instant::now());
+            }
             AgentEvent::ToolStarted { id, name, args } => {
                 state.close_streaming_blocks();
                 state.event_dot_visible = true;
@@ -1962,7 +1988,7 @@ impl InteractiveShell {
                     }
                 }
             }
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, result, duration } => {
                 let estimated_result_tokens = match result {
                     Ok(output) => output.media().iter().fold(
                         crate::compaction::estimate_text_tokens(&output.text),
@@ -1974,8 +2000,11 @@ impl InteractiveShell {
                 }
                 .saturating_add(8);
                 let index = state.tool_panels.get(id).copied();
+                let mut completed_name = String::new();
                 if let Some(panel) = state.tool_output_mut(id) {
+                    completed_name = panel.name.clone();
                     panel.finished = true;
+                    panel.duration = Some(*duration);
                     panel.is_error = tool_result_is_failure(&panel.name, result);
                     panel.failure_reason = tool_failure_reason(&panel.name, result);
                     match result {
@@ -1989,6 +2018,13 @@ impl InteractiveShell {
                 if let Some(index) = index {
                     state.unregister_active_event(index);
                     state.touch_block(index);
+                }
+                if !completed_name.is_empty() {
+                    state.tool_durations.push((completed_name, *duration));
+                    if state.tool_durations.len() > 64 {
+                        let excess = state.tool_durations.len() - 64;
+                        state.tool_durations.drain(0..excess);
+                    }
                 }
                 if let Some((used, _)) = state.run_context_estimate.as_mut() {
                     *used = used.saturating_add(estimated_result_tokens);
@@ -2015,13 +2051,20 @@ impl InteractiveShell {
                 ..
             } => {
                 state.close_streaming_blocks();
+                let requested_at = state.turn_requested_at;
                 if let Some(started_at) = state.turn_generation_started_at.take() {
                     let elapsed = started_at.elapsed();
                     state.last_turn_tokens_per_second =
                         output_tokens_per_second(turn_usage.output_tokens, elapsed);
                     state.last_turn_generation_elapsed = Some(elapsed);
                     state.last_turn_generated_tokens = Some(turn_usage.output_tokens);
+                    state.last_turn_first_token = requested_at
+                        .map(|requested| started_at.saturating_duration_since(requested));
                 }
+                state.last_turn_provider_elapsed =
+                    requested_at.map(|requested| {
+                        Instant::now().saturating_duration_since(requested)
+                    });
                 // Provider usage is authoritative at this boundary. Prompt
                 // cache buckets all occupy context, while reasoning is already
                 // a subset of output, so canonical total_tokens is exactly the

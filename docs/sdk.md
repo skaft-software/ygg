@@ -111,7 +111,7 @@ Useful optional fields include:
 | `allow_external_paths` | Allows caller-supplied session/media paths outside the workspace. Model-controlled file tools remain workspace-only under the fixed Controlled policy. |
 | `context_files` | Enables or disables normal trusted workspace context files. |
 | `reasoning` | Ygg reasoning level accepted by the selected model. |
-| `max_turns` | Run turn limit; omission defaults to 40. |
+| `max_turns` | Run turn limit; omission runs without a turn ceiling, matching the interactive session default. |
 | `max_cost_microdollars` | Exact integer run-cost ceiling. |
 | `media` | Ordered typed inputs: `{"type":"image","path":"…"}` or `{"type":"audio","path":"…"}`. At most 12 items: eight images and four audio clips. |
 | `image_paths` | Legacy image-only input. It cannot be combined with `media`. |

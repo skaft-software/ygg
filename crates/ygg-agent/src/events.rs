@@ -166,6 +166,17 @@ pub enum AgentEvent {
         result: Result<CompactionInfo, String>,
     },
 
+    /// A new provider request for the current model turn is starting.
+    ///
+    /// Emitted when the agent opens the provider stream for a turn's first
+    /// attempt, and again once a retry's replacement stream is established.
+    /// The elapsed time from this event to the first
+    /// [`OutputDelta`](Self::OutputDelta) of the same attempt is that
+    /// attempt's first-token latency (TTFT).
+    ///
+    /// Advisory only: never persisted in the session.
+    TurnStarted,
+
     /// A tool call was emitted by the model and host-side admission begins now.
     /// A matching [`ToolFinished`](Self::ToolFinished) is emitted even when
     /// argument validation or the effect broker denies execution.
@@ -200,6 +211,8 @@ pub enum AgentEvent {
         /// The execution outcome. `Err` and a marked rich `Ok` output both
         /// become error tool results.
         result: Result<ToolOutput, ToolError>,
+        /// Wall time taken for the call.
+        duration: Duration,
     },
 
     /// A complete host-owned snapshot of delegated child activity.

@@ -2243,17 +2243,17 @@ fn resumed_session_restores_every_write_as_a_diff_panel() {
         .unwrap();
 
     let writes = [
-            (
-                "write-current",
-                "new.rs",
-                "ok\nnew.rs  created hash=x\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,1 @@\n+current format\n",
-            ),
-            (
-                "write-legacy",
-                "legacy.rs",
-                "ok\nlegacy.rs  created hash=y\n--- /dev/null\n+++ b/legacy.rs\n+legacy format\n",
-            ),
-        ];
+        (
+            "write-current",
+            "new.rs",
+            "ok\nnew.rs  created hash=x\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,1 @@\n+current format\n",
+        ),
+        (
+            "write-legacy",
+            "legacy.rs",
+            "ok\nlegacy.rs  created hash=y\n--- /dev/null\n+++ b/legacy.rs\n+legacy format\n",
+        ),
+    ];
     for (id, path, result) in writes {
         session
             .append(EntryValue::Message(Message::Assistant(AssistantMessage {
@@ -3083,7 +3083,10 @@ fn slash_popup_then_context_overlay_repaints_the_complete_native_viewport() {
 
         let visible = terminal.screen().contents();
         assert!(
-            visible.lines().next().is_some_and(|line| line.contains("Context ·")),
+            visible
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("Context ·")),
             "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
         );
         assert!(visible.contains(" input + "), "{visible}");
@@ -3163,6 +3166,7 @@ fn native_scrollback_keeps_finalized_tool_stable_while_streaming_scrolled_away()
             &AgentEvent::ToolFinished {
                 id: tool_id,
                 result: Ok(ToolOutput::new("tool completed")),
+                duration: Duration::from_millis(10),
             },
         );
         shell.render();
@@ -3231,8 +3235,7 @@ fn native_scrollback_keeps_finalized_tool_stable_while_streaming_scrolled_away()
                     .map(str::to_owned)
                     .collect::<Vec<_>>();
                 assert_eq!(
-                    viewed_history,
-                    historical_view,
+                    viewed_history, historical_view,
                     "historical tool surface changed during token {index} with synchronized_output={synchronized_output}"
                 );
             }
@@ -3303,10 +3306,10 @@ fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     let mut current_width = WIDTH;
 
     let mut response = String::from(
-            "# TABLE HEADING SENTINEL\n\n\
+        "# TABLE HEADING SENTINEL\n\n\
              | Marker | Boundary condition details | Regression scenario details | Expected behavior details |\n\
              |---|---|---|---|\n",
-        );
+    );
     for index in 0..12 {
         response.push_str(&format!(
                 "| ROW{index:02}SENTINEL | boundary condition {index} contains enough distinct words to wrap | streaming markdown reparses this row as tokens arrive | retain exactly one final physical copy in terminal history |\n"
@@ -4352,6 +4355,7 @@ fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
             result: Ok(ToolOutput::new(
                 "exit=1 duration=0.2s\nstderr: FAILED 76 passed",
             )),
+            duration: Duration::from_millis(200),
         },
     );
     let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 80).join("\n"));
@@ -4376,10 +4380,14 @@ fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
             result: Err(ToolError::new(
                 "error stale_file\nexpected hash=aaa actual=bbb\nThe file changed",
             )),
+            duration: Duration::from_millis(10),
         },
     );
     let plain = strip_terminal_sequences(&render_shell(&shell.state.borrow(), 120).join("\n"));
-    assert!(plain.contains("Edit  src/lib.rs"), "{plain:?}");
+    // The finished edit keeps its intent; wall time is reserved for bash.
+    assert!(plain.contains("Edit"), "{plain:?}");
+    assert!(plain.contains("src/lib.rs"), "{plain:?}");
+    assert!(!plain.contains("· 10 ms"), "{plain:?}");
     assert!(!plain.contains("The file changed"), "{plain:?}");
     assert!(!plain.contains("hash=aaa"), "{plain:?}");
     assert!(!plain.contains("actual=bbb"), "{plain:?}");
@@ -4412,6 +4420,7 @@ fn successful_media_reads_render_payload_free_capability_indicators() {
         &AgentEvent::ToolFinished {
             id: image_id,
             result: Ok(image_output),
+            duration: Duration::from_millis(10),
         },
     );
 
@@ -4436,7 +4445,14 @@ fn successful_media_reads_render_payload_free_capability_indicators() {
                 args: serde_json::json!({"path": path}),
             },
         );
-        shell.on_run_event(run_id, &AgentEvent::ToolFinished { id, result });
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::ToolFinished {
+                id,
+                result,
+                duration: Duration::from_millis(10),
+            },
+        );
     }
 
     let rendered = shell
@@ -4670,8 +4686,8 @@ fn fenced_diff_inside_markdown_does_not_hijack_the_whole_answer() {
     );
     assert!(!looks_like_diff(markdown));
     assert!(looks_like_diff(
-            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"
-        ));
+        "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new"
+    ));
     assert!(looks_like_diff(
         "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+fn main() {}"
     ));
@@ -4869,10 +4885,10 @@ fn collapsed_reasoning_uses_a_margin_dot_without_an_expanded_content_bullet() {
         "reasoning labels must align with tool labels: {tool_line:?} vs {reasoning_line:?}"
     );
     assert_eq!(
-            visual_column(reasoning_line, "Thinking"),
-            visual_column(disclosure_line, "└"),
-            "the disclosure elbow must descend from the first label character: {reasoning_line:?} vs {disclosure_line:?}"
-        );
+        visual_column(reasoning_line, "Thinking"),
+        visual_column(disclosure_line, "└"),
+        "the disclosure elbow must descend from the first label character: {reasoning_line:?} vs {disclosure_line:?}"
+    );
 }
 
 #[test]
@@ -5021,6 +5037,7 @@ fn reasoning_status_reopens_after_tools_for_the_next_model_turn() {
         &AgentEvent::ToolFinished {
             id,
             result: Ok(ygg_agent::ToolOutput::new("x".repeat(4_000))),
+            duration: Duration::from_millis(10),
         },
     );
     let state = shell.state.borrow();
@@ -5868,7 +5885,7 @@ fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
         TranscriptBlock::Assistant(Box::new(AssistantBlock::finalized("done".into())));
     assert_eq!(
         event_margin_marker(&finished_response, &theme, false, false),
-        Some(theme.settled_event_dot("success", "•"))
+        Some(theme.settled_event_dot("neutral", "•"))
     );
 
     let prompt = TranscriptBlock::User {
@@ -5972,7 +5989,7 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
 }
 
 #[test]
-fn streaming_response_dot_animates_and_settles_to_success() {
+fn streaming_response_dot_animates_then_settles_dim() {
     let mut shell = InteractiveShell::test_shell();
     let run_id = shell.begin_run("openai");
     shell.on_run_event(
@@ -6019,7 +6036,7 @@ fn streaming_response_dot_animates_and_settles_to_success() {
         let response = state.transcript.first().expect("finished response");
         assert_eq!(
             event_margin_marker(response, &state.theme, false, false),
-            Some(state.theme.settled_event_dot("success", "•"))
+            Some(state.theme.settled_event_dot("neutral", "•"))
         );
     }
 }
@@ -6322,6 +6339,7 @@ fn scripted_agent_events_map_to_distinct_transcript_and_tool_state() {
         AgentEvent::ToolFinished {
             id: id.clone(),
             result: Ok(ToolOutput::new("contents")),
+            duration: Duration::from_millis(10),
         },
         AgentEvent::TurnFinished {
             message: AssistantMessage {
@@ -6882,7 +6900,10 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
     // event, matching the composer chrome strip.
     assert!(block.contains("4 calls"), "{block}");
     assert!(block.contains("12.8k"), "{block}");
-    assert!(block.contains("↓220") || block.contains("out 220"), "{block}");
+    assert!(
+        block.contains("↓220") || block.contains("out 220"),
+        "{block}"
+    );
     assert!(block.contains("$0.007"), "{block}");
     assert!(
         block.contains("provider request failed: upstream unavailable")
@@ -6923,6 +6944,34 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
     });
     let transcript = shell.state.borrow().rendered_transcript(120).join("\n");
     assert!(!transcript.contains("Used subagent spawn"), "{transcript}");
+}
+
+#[test]
+fn extension_tools_render_label_and_argument_like_core_tools() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.on_agent_event(&ygg_agent::AgentEvent::ToolStarted {
+        id: ygg_ai::ToolCallId("ext-call".into()),
+        name: "web_search".into(),
+        args: serde_json::json!({"query": "rust tui transcript"}),
+    });
+    let transcript =
+        strip_terminal_sequences(&shell.state.borrow().rendered_transcript(120).join("\n"));
+    assert!(transcript.contains("Web search"), "{transcript}");
+    assert!(transcript.contains("rust tui transcript"), "{transcript}");
+    // The tool name must not be duplicated in the value column, and the
+    // legacy "Used" lead stays gone.
+    assert!(!transcript.contains("Used "), "{transcript}");
+    assert!(!transcript.contains("web search: rust tui"), "{transcript}");
+
+    shell.on_agent_event(&ygg_agent::AgentEvent::ToolStarted {
+        id: ygg_ai::ToolCallId("ssh-call".into()),
+        name: "ssh_exec".into(),
+        args: serde_json::json!({"argv": ["cargo", "test"]}),
+    });
+    let transcript =
+        strip_terminal_sequences(&shell.state.borrow().rendered_transcript(120).join("\n"));
+    assert!(transcript.contains("SSH"), "{transcript}");
+    assert!(!transcript.contains("Ssh"), "{transcript}");
 }
 
 #[test]
@@ -7379,6 +7428,7 @@ fn read_results_stay_hidden_in_collapsed_and_expanded_modes() {
             result: Ok(ToolOutput::new(
                 "READ RESULT SENTINEL\nfn private_implementation() {}",
             )),
+            duration: Duration::from_millis(10),
         },
     );
     let transcript = |shell: &InteractiveShell| {
@@ -7433,6 +7483,7 @@ fn tool_output_tail_expands_with_global_ctrl_o_and_copy_stays_safe() {
         &AgentEvent::ToolFinished {
             id: id.clone(),
             result: Ok(ToolOutput::new(secret.clone())),
+            duration: Duration::from_millis(10),
         },
     );
     let transcript = |shell: &InteractiveShell| {
@@ -7498,6 +7549,7 @@ fn search_output_and_edit_write_diffs_expand_with_global_ctrl_o() {
                     .collect::<Vec<_>>()
                     .join("\n"),
             )),
+            duration: Duration::from_millis(10),
         },
     );
 
@@ -7527,6 +7579,7 @@ fn search_output_and_edit_write_diffs_expand_with_global_ctrl_o() {
             &AgentEvent::ToolFinished {
                 id,
                 result: Ok(ToolOutput::new(diff)),
+                duration: Duration::from_millis(10),
             },
         );
     }
@@ -7681,6 +7734,7 @@ fn extension_tool_renderer_stays_internal_to_the_tool_record() {
         &AgentEvent::ToolFinished {
             id: id.clone(),
             result: Ok(ToolOutput::new("RAW EVIDENCE")),
+            duration: Duration::from_millis(10),
         },
     );
     shell.apply_extension_tool_renderer(

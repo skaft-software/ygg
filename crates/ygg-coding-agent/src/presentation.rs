@@ -815,7 +815,7 @@ impl RunTracker {
             }
             AgentEvent::ToolProgress { .. } => {}
             AgentEvent::DelegationUpdated { .. } => {}
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, result, .. } => {
                 run.pending_tools.remove(&id.0);
                 if let Some(tool) = run.tools.get(&id.0) {
                     if tool_result_is_failure(&tool.name, result) {
@@ -835,6 +835,10 @@ impl RunTracker {
                     run.transition(RunPhase::PreparingToolCall, now);
                 }
             }
+            // Provider attempts are not distinct presentation phases: the
+            // retry and compaction events surrounding each attempt already
+            // drive the phase machine, so no state changes here.
+            AgentEvent::TurnStarted => {}
             AgentEvent::RunFinished { reason, .. } => {
                 let elapsed = now.saturating_duration_since(run.started_at);
                 let terminal = match reason {
@@ -894,6 +898,10 @@ pub struct ToolDisplay {
     /// Presentation-only command string for the `bash` tool.
     pub shell_command: Option<String>,
     pub changed_path: Option<String>,
+    /// Salient argument shown after the tool's label in the transcript, the
+    /// way `Read` shows a path and `Bash` shows a command. `None` keeps the
+    /// legacy sentence summaries with their redundant lead stripped.
+    pub value: Option<String>,
 }
 
 impl ToolDisplay {
@@ -966,6 +974,7 @@ pub fn summarize_tool_with_workspace(
                 label: "search".to_owned(),
                 shell_command: None,
                 changed_path: None,
+                value: None,
             }
         }
         "edit" => path_tool(args, "updating", "updated", "updating", "edit", workspace),
@@ -983,20 +992,35 @@ pub fn summarize_tool_with_workspace(
             label: "delegation".to_owned(),
             shell_command: None,
             changed_path: None,
+            value: None,
         },
         other => {
             let readable = other.replace(['_', '-'], " ");
+            let detail = primary_arg_detail(args);
+            let (active, success, failure) = match detail.as_deref() {
+                Some(detail) => (
+                    format!("running {readable}: {detail}"),
+                    format!("finished {readable}: {detail}"),
+                    format!("{readable} failed: {detail}"),
+                ),
+                None => (
+                    format!("running {readable}"),
+                    format!("finished {readable}"),
+                    format!("{readable} failed"),
+                ),
+            };
             ToolDisplay {
-                active: format!("running {readable}"),
-                success: format!("finished {readable}"),
-                failure: format!("{readable} failed"),
-                compact_active: format!("running {readable}"),
-                compact_success: format!("finished {readable}"),
-                compact_failure: format!("{readable} failed"),
+                active: active.clone(),
+                success: success.clone(),
+                failure: failure.clone(),
+                compact_active: active,
+                compact_success: success,
+                compact_failure: failure,
                 plain_tag: "tool",
                 label: readable.clone(),
                 shell_command: None,
                 changed_path: None,
+                value: detail,
             }
         }
     }
@@ -1023,6 +1047,7 @@ fn path_tool(
         label: tag.to_owned(),
         shell_command: None,
         changed_path: (tag == "edit").then_some(path),
+        value: None,
     }
 }
 
@@ -1050,6 +1075,7 @@ fn summarize_read(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDis
         label: "read".to_owned(),
         shell_command: None,
         changed_path: None,
+        value: None,
     }
 }
 
@@ -1074,7 +1100,43 @@ fn summarize_bash(args: &serde_json::Value, workspace: Option<&Path>) -> ToolDis
         label: "bash".to_owned(),
         shell_command: Some(command),
         changed_path: None,
+        value: None,
     }
+}
+
+/// Pick the most informative top-level argument of an extension tool call so
+/// its transcript header can read `• Web search  <query>` the same way core
+/// tools read `• Read  <file>`. Well-known argument names win; otherwise the
+/// first string value is used. Long values collapse to one line and truncate.
+fn primary_arg_detail(args: &serde_json::Value) -> Option<String> {
+    const PREFERRED_KEYS: [&str; 12] = [
+        "command", "url", "path", "file", "query", "pattern", "target", "name", "task", "title",
+        "key", "message",
+    ];
+    const MAX_DETAIL_CHARS: usize = 72;
+
+    let object = args.as_object()?;
+    let mut candidate = PREFERRED_KEYS.iter().find_map(|key| {
+        object
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    });
+    if candidate.is_none() {
+        candidate = object
+            .values()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::trim)
+            .find(|value| !value.is_empty());
+    }
+    let candidate = candidate?;
+    let detail: String = candidate.split_whitespace().collect::<Vec<_>>().join(" ");
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return Some(detail);
+    }
+    let truncated: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
+    Some(format!("{truncated}…"))
 }
 
 /// Normalize a path only for presentation. Execution retains the raw model
@@ -1447,6 +1509,7 @@ mod tests {
             &AgentEvent::ToolFinished {
                 id: ToolCallId("call".into()),
                 result: Ok(ToolOutput::new("ok")),
+                duration: Duration::from_millis(10),
             },
             now,
         );
@@ -1529,6 +1592,7 @@ mod tests {
             &AgentEvent::ToolFinished {
                 id: ToolCallId("call".into()),
                 result: Ok(ToolOutput::new("exit=1 duration=0.1s")),
+                duration: Duration::from_millis(100),
             },
             now,
         );
@@ -1626,6 +1690,31 @@ mod tests {
         );
         assert_eq!(tests.active, "running cargo test --workspace");
         assert_eq!(tests.plain_tag, "bash");
+    }
+
+    #[test]
+    fn extension_tool_summaries_carry_a_salient_value() {
+        let search = summarize_tool("web_search", &serde_json::json!({"query": "rust tui"}));
+        assert_eq!(search.active, "running web search: rust tui");
+        assert_eq!(search.failure, "web search failed: rust tui");
+        assert_eq!(search.value.as_deref(), Some("rust tui"));
+
+        let browse = summarize_tool(
+            "browser_open_url",
+            &serde_json::json!({"url": "https://example.com"}),
+        );
+        assert_eq!(browse.value.as_deref(), Some("https://example.com"));
+        assert_eq!(browse.label, "browser open url");
+
+        // No recognizable argument keeps the legacy sentence summaries.
+        let bare = summarize_tool("custom_tool", &serde_json::json!({}));
+        assert_eq!(bare.active, "running custom tool");
+        assert!(bare.value.is_none());
+
+        let long = summarize_tool("mcp_note", &serde_json::json!({"text": "a ".repeat(60)}));
+        let value = long.value.expect("long detail");
+        assert!(value.chars().count() <= 73, "{value}");
+        assert!(value.ends_with('…'), "{value}");
     }
 
     #[test]

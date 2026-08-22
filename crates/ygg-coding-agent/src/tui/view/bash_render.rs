@@ -3,7 +3,7 @@
 use sexy_tui_rs::{visible_width, RichRenderer};
 
 use super::terminal_text::sanitize_for_terminal;
-use super::tool_render::tool_value_indent_width;
+use super::tool_render::{format_tool_duration, tool_value_indent_width};
 use super::{fit_line, subdued_text, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_LINES};
 use crate::tui::theme::YggTheme;
 
@@ -181,7 +181,7 @@ fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
         return None;
     }
     let output = final_bash_result(&panel.output);
-    if let Some(duration) = output
+    let parsed = output
         .lines()
         .next()
         .unwrap_or_default()
@@ -189,16 +189,21 @@ fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
         .find_map(|part| part.strip_prefix("duration="))
         .map(|value| value.trim_end_matches([',', ';']))
         .filter(|value| !value.is_empty())
-    {
-        return Some(
+        .map(|duration| {
             if duration.chars().last().is_some_and(char::is_alphabetic) {
                 duration.to_owned()
             } else {
                 format!("{duration}s")
-            },
-        );
+            }
+        });
+    if parsed.is_some() || !panel.finished {
+        return parsed;
     }
-    None
+    // The durable envelope is the preferred source, but some settled results
+    // (for example protocol errors) never carry a parseable duration token.
+    // Fall back to the host-measured wall time so every finished bash call
+    // renders its "Took" line exactly once.
+    panel.duration.map(format_tool_duration)
 }
 
 fn bash_content_gutter() -> usize {

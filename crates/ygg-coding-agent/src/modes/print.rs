@@ -283,6 +283,7 @@ mod tests {
             AgentEvent::ToolFinished {
                 id: ygg_ai::ToolCallId("failed-tool".into()),
                 result: Err(ygg_agent::ToolError::new("recoverable tool failure")),
+                duration: std::time::Duration::from_millis(10),
             },
             AgentEvent::RunFinished {
                 head: ygg_agent::EntryId("004".into()),

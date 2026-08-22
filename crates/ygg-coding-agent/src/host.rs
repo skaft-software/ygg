@@ -1024,7 +1024,7 @@ async fn run_request(
                     )
                     .await?;
             }
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, result, .. } => {
                 if result.as_ref().is_ok_and(|output| !output.is_error()) {
                     if let Some((name, args)) = active_tools.get(&id.0) {
                         if matches!(name.as_str(), "edit" | "write") {
@@ -1107,6 +1107,8 @@ async fn run_request(
                     )
                     .await?;
             }
+            // Attempt boundaries are not part of the host protocol surface.
+            AgentEvent::TurnStarted => {}
             AgentEvent::RunFinished { head, reason } => {
                 terminal_head = Some(head.0);
                 break HostRunOutcome::from_finish_reason(
@@ -1301,7 +1303,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         max_cost_microdollars: request.max_cost_microdollars,
         cost_warning_microdollars: None,
         show_turn_cost: false,
-        max_turns: request.max_turns.or(Some(40)),
+        max_turns: request.max_turns,
         show_reasoning_in_print: false,
         initial_prompt: None,
         prompt_template: None,

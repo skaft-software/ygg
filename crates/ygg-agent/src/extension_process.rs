@@ -4750,7 +4750,7 @@ impl ExtensionProcess {
                 );
                 lifecycle.tools.insert((owner, id.0.clone()), active);
             }
-            AgentEvent::ToolFinished { id, result } => {
+            AgentEvent::ToolFinished { id, result, .. } => {
                 let mut lifecycle = lock_std_mutex(&self.inner.lifecycle);
                 let owner = resource_owner.map(str::to_owned).or_else(|| {
                     let mut owners = lifecycle
@@ -11765,6 +11765,7 @@ command = "lifecycle-v02.py"
         process.on_event(&AgentEvent::ToolFinished {
             id: ygg_ai::ToolCallId("tool-call".into()),
             result: Ok(ToolOutput::new("natural completion during drain")),
+            duration: Duration::ZERO,
         });
         drop(admission);
         tokio::time::timeout(Duration::from_secs(3), reload)
@@ -11778,6 +11779,7 @@ command = "lifecycle-v02.py"
         process.on_event(&AgentEvent::ToolFinished {
             id: ygg_ai::ToolCallId("tool-call".into()),
             result: Ok(ToolOutput::new("duplicate late completion")),
+            duration: Duration::ZERO,
         });
         process
             .notify_lifecycle(&ExtensionLifecycleEvent::TurnSettled {

@@ -1,5 +1,7 @@
 //! Shared tool-output classification, alignment, and compact terminal rendering.
 
+use std::time::Duration;
+
 use sexy_tui_rs::{visible_width, DiffRenderOptions, RichRenderer, UnifiedDiff};
 
 use super::terminal_text::sanitize_for_terminal;
@@ -70,14 +72,34 @@ fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
 /// Minimum width reserved for the tool label before its value/output column.
 const TOOL_VALUE_MIN_WIDTH: usize = 6;
 
-pub(super) fn tool_display_label(name: &str) -> &'static str {
+pub(super) fn tool_display_label(name: &str) -> String {
     match name {
-        "read" => "Read",
-        "search" => "Explored",
-        "edit" => "Edit",
-        "write" => "Write",
-        "subagent_spawn" | "subagent_status" | "subagent_wait" | "subagent_stop" => "Delegated",
-        _ => "Used",
+        "read" => "Read".to_string(),
+        "search" => "Explored".to_string(),
+        "edit" => "Edit".to_string(),
+        "write" => "Write".to_string(),
+        _ if name.starts_with("subagent_") => "Delegated".to_string(),
+        _ if name.starts_with("browser_") => "Browse".to_string(),
+        _ if name.starts_with("ssh_") => "SSH".to_string(),
+        _ => {
+            let mut s = name.replace('_', " ");
+            if let Some(first) = s.get_mut(0..1) {
+                first.make_ascii_uppercase();
+            }
+            s
+        }
+    }
+}
+
+/// Compact wall-time for a completed tool call: "42 µs", "12 ms", or
+/// "1.42 s".
+pub(super) fn format_tool_duration(duration: Duration) -> String {
+    if duration.as_micros() < 1000 {
+        format!("{} µs", duration.as_micros())
+    } else if duration.as_millis() < 1000 {
+        format!("{} ms", duration.as_millis())
+    } else {
+        format!("{:.2} s", duration.as_secs_f64())
     }
 }
 

@@ -169,7 +169,7 @@ pub(super) fn event_margin_marker(
         }
         TranscriptBlock::Reasoning(_) => None,
         TranscriptBlock::Assistant(assistant) if !assistant.finished => Some(active_phase_dot()),
-        TranscriptBlock::Assistant(_) => Some(theme.settled_event_dot("success", event_dot)),
+        TranscriptBlock::Assistant(_) => Some(theme.settled_event_dot("neutral", event_dot)),
         TranscriptBlock::Tool(panel) if !panel.finished => Some(active_phase_dot()),
         TranscriptBlock::Tool(panel) => Some(if panel.is_error {
             theme.settled_event_dot("error", event_dot)

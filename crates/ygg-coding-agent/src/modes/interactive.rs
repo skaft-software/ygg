@@ -1407,7 +1407,7 @@ where
                         ));
                     }
                     shell.on_run_event(run_id, &event);
-                    if let AgentEvent::ToolFinished { id, result } = &event {
+                    if let AgentEvent::ToolFinished { id, result, .. } = &event {
                         if let Some((name, arguments)) = extension_tool_calls.remove(id) {
                             let (output, is_error) = match result {
                                 Ok(output) => (Some(output.text.clone()), output.is_error()),

@@ -216,6 +216,34 @@ pub struct CustomModel {
     /// `system` message instead of using OpenAI's `developer` role.
     #[serde(default)]
     pub reasoning_uses_system_message: bool,
+    /// Optional user-declared pricing. When absent, ygg treats the model as
+    /// free (zero rates), which still satisfies guardrails that require
+    /// trusted pricing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<CustomPricing>,
+}
+
+/// Explicit per-token pricing for one custom model.
+///
+/// Rates are microdollars per million tokens. Omitted fields default to zero,
+/// so `"pricing": {}` declares the model free. Custom endpoints are
+/// user-configured and therefore user-trusted: declaring any pricing
+/// (including the zero default ygg applies) enables cost guardrails such as
+/// subagent cost ceilings that require trusted model pricing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomPricing {
+    /// Rate for prompt input tokens.
+    #[serde(default)]
+    pub input: u64,
+    /// Rate for generated output tokens.
+    #[serde(default)]
+    pub output: u64,
+    /// Rate for cached input tokens that were read.
+    #[serde(default)]
+    pub cache_read: u64,
+    /// Rate for input tokens that caused a prompt-cache write.
+    #[serde(default)]
+    pub cache_write_5m: u64,
 }
 
 const fn default_auto_discover() -> bool {
@@ -250,6 +278,7 @@ impl Default for CustomModel {
             reasoning_values: Vec::new(),
             reasoning_default: String::new(),
             reasoning_uses_system_message: false,
+            pricing: None,
         }
     }
 }
@@ -644,6 +673,77 @@ mod tests {
         store.delete().unwrap();
         assert!(!path.exists());
         assert!(!cache_path.exists());
+    }
+
+    #[test]
+    fn model_pricing_round_trips_and_defaults_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        let store = CredentialStore::new(&path);
+        let mut provider = CustomProvider::from_credential(CustomCredential {
+            base_url: "http://localhost:1234/v1/".into(),
+            api_key: String::new(),
+            api_name: String::new(),
+            headers: Vec::new(),
+            models: vec![CustomModel {
+                api_name: "free-model".into(),
+                ..Default::default()
+            }],
+            auto_discover: false,
+        });
+        // Declared pricing serializes and deserializes verbatim.
+        provider.credential.models[0].pricing = Some(CustomPricing {
+            input: 10,
+            output: 20,
+            cache_read: 1,
+            cache_write_5m: 2,
+        });
+        store
+            .save_registry(&CustomRegistry::single("local", provider.clone()))
+            .unwrap();
+        let loaded = store.load_registry().unwrap().unwrap();
+        assert_eq!(
+            loaded.providers["local"].credential.models[0].pricing,
+            Some(CustomPricing {
+                input: 10,
+                output: 20,
+                cache_read: 1,
+                cache_write_5m: 2,
+            })
+        );
+
+        // Undeclared pricing stays absent in the file and after a reload.
+        provider.credential.models[0].pricing = None;
+        store
+            .save_registry(&CustomRegistry::single("local", provider))
+            .unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains("pricing"),
+            "undeclared pricing must not be serialized: {raw}"
+        );
+
+        // A pre-existing file without the pricing field loads as `None`.
+        let legacy = r#"{
+            "version": 1,
+            "providers": {
+                "legacy": {
+                    "label": "Legacy",
+                    "base_url": "http://localhost:1234/v1/",
+                    "auth": { "kind": "none" },
+                    "auto_discover": false,
+                    "models": [
+                        { "api_name": "old-model", "context_window": 8192 }
+                    ]
+                }
+            }
+        }"#;
+        write_private_fixture(&path, legacy);
+        let loaded = store.load_registry().unwrap().unwrap();
+        assert_eq!(
+            loaded.providers["legacy"].credential.models[0].pricing,
+            None
+        );
     }
 
     #[test]

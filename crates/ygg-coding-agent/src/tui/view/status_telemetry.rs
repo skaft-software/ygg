@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use ygg_ai::Usage;
 
 use super::terminal_text::sanitize_for_terminal;
+use super::tool_render::format_tool_duration;
 use super::{PriceDisplay, ShellState, YggTheme};
 
 /// Calculate a nonzero output-generation rate from a token count and measured
@@ -92,6 +93,44 @@ pub(super) fn status_telemetry(state: &ShellState, now: Instant) -> String {
         ));
     } else {
         lines.push("Throughput     unavailable".to_owned());
+    }
+    // First-token latency and total provider time for the most recent
+    // provider response, so latency comparisons (especially for local
+    // models) are visible without external tooling. `now` backs the live
+    // in-flight reading while an attempt is still open.
+    if let Some(first_token) = state.last_turn_first_token {
+        lines.push(format!("First token    {}", format_tool_duration(first_token)));
+    } else if active && state.turn_requested_at.is_some() {
+        lines.push("First token    awaiting first token".to_owned());
+    } else {
+        lines.push("First token    unavailable (no provider response)".to_owned());
+    }
+    if let Some(elapsed) = state.last_turn_provider_elapsed {
+        lines.push(format!(
+            "Provider time    {} (first token + generation)",
+            format_tool_duration(elapsed)
+        ));
+    } else if let Some(requested) = state.turn_requested_at {
+        if active {
+            lines.push(format!(
+                "Provider time    {:.2}s in flight",
+                now.saturating_duration_since(requested).as_secs_f64()
+            ));
+        } else {
+            lines.push("Provider time    unavailable".to_owned());
+        }
+    }
+    if !state.tool_durations.is_empty() {
+        let hidden = state.tool_durations.len().saturating_sub(8);
+        let prefix = if hidden > 0 { format!("{hidden} more · ") } else { String::new() };
+        let recent = state
+            .tool_durations
+            .iter()
+            .skip(state.tool_durations.len() - hidden)
+            .map(|(name, duration)| format!("{name} {}", format_tool_duration(*duration)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(format!("Recent tools   {prefix}{recent}"));
     }
     lines.join("\n")
 }

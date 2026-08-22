@@ -12,8 +12,8 @@
 mod store;
 
 pub use store::{
-    default_path, CredentialStore, CustomAuthConfig, CustomCredential, CustomModel, CustomProvider,
-    CustomRegistry,
+    default_path, CredentialStore, CustomAuthConfig, CustomCredential, CustomModel, CustomPricing,
+    CustomProvider, CustomRegistry,
 };
 
 /// Endpoint id used by the original single custom endpoint.

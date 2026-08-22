@@ -2217,6 +2217,7 @@ fn apple_foundation_model_defaults(api_name: &str) -> Option<crate::auth::custom
         reasoning_values,
         reasoning_default,
         reasoning_uses_system_message: true,
+        pricing: None,
     })
 }
 
@@ -2288,6 +2289,26 @@ fn default_apple_foundation_models_provider() -> crate::auth::custom::CustomProv
         api_key_env: None,
         cache: None,
         startup_timeout_secs: Some(CUSTOM_ENDPOINT_STARTUP_TIMEOUT.as_secs()),
+    }
+}
+
+/// Trusted pricing for a custom-provider model.
+///
+/// User-configured endpoints are treated as user-trusted: a declared
+/// `pricing` block is honored, and an undeclared one defaults to zero rates
+/// so local/self-hosted models count as free while still satisfying
+/// guardrails that require trusted model pricing (such as subagent cost
+/// ceilings).
+fn custom_model_pricing(model: &crate::auth::custom::CustomModel) -> Pricing {
+    let rates: crate::auth::custom::CustomPricing = model.pricing.unwrap_or_default();
+    Pricing {
+        input: TokenRate(rates.input),
+        output: TokenRate(rates.output),
+        cache_read: TokenRate(rates.cache_read),
+        cache_write_5m: TokenRate(rates.cache_write_5m),
+        cache_write_1h: None,
+        reasoning: None,
+        tiers: Vec::new(),
     }
 }
 
@@ -2552,7 +2573,7 @@ fn register_custom_openai_provider(
                 context_window: model.context_window,
                 max_output_tokens: model.max_output_tokens,
             },
-            pricing: None,
+            pricing: Some(custom_model_pricing(model)),
             cache: cache.clone(),
         })?;
     }
@@ -2715,6 +2736,7 @@ fn discover_models_blocking(
             // OpenAI's newer `developer` role. vLLM Qwen chat templates, in
             // particular, reject it while still accepting `system`.
             reasoning_uses_system_message: true,
+            pricing: None,
         });
     }
     apply_known_custom_model_defaults(cred, models)

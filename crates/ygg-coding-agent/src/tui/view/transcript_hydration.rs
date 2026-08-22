@@ -1,5 +1,7 @@
 //! Durable transcript-item projection into the interactive shell model.
 
+use std::time::Duration;
+
 use super::{
     bounded_append, sanitize_for_terminal, AssistantBlock, CompactionBlock, ShellState, ToolPanel,
     TranscriptBlock,
@@ -69,7 +71,12 @@ pub(super) fn append_hydrated_items(
                 ))));
                 state.tool_panels.insert(id, index);
             }
-            TranscriptItem::ToolResult { id, text, is_error } => {
+            TranscriptItem::ToolResult {
+                id,
+                text,
+                is_error,
+                duration_ms,
+            } => {
                 // Malformed provider output can reuse one call ID within the
                 // same assistant turn. The durable protocol cannot identify
                 // which duplicate a result belongs to, so conservatively close
@@ -92,10 +99,14 @@ pub(super) fn append_hydrated_items(
                         if let Some(TranscriptBlock::Tool(panel)) = state.transcript.get_mut(index)
                         {
                             apply_hydrated_tool_result(panel, &text, is_error);
+                            panel.duration =
+                                duration_ms.map(|millis| Duration::from_millis(millis));
                         }
                     }
                 } else if let Some(panel) = state.tool_output_mut(&id) {
                     apply_hydrated_tool_result(panel, &text, is_error);
+                    panel.duration =
+                        duration_ms.map(|millis| Duration::from_millis(millis));
                 } else {
                     let index = state.transcript.len();
                     let model_lab = state.model_lab;

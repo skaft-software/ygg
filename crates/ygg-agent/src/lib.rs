@@ -88,6 +88,7 @@ pub mod session;
 mod shell_safety;
 /// The generic skill substrate containing descriptors, load errors, trust levels, and the registry trait.
 pub mod skills;
+mod speculation;
 pub mod tool;
 pub mod tools;
 
