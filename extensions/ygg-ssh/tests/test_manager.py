@@ -60,6 +60,33 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaisesRegex(AdapterError, "normalized"):
                 harness.manager.read_file(CONTEXT, "../secret")
 
+    def test_list_lists_cwd_subdirs_and_reports_missing_paths(self):
+        with ManagerHarness() as harness:
+            (harness.remote / "docs").mkdir()
+            (harness.remote / "notes.txt").write_text("hello")
+            harness.connect()
+            root = harness.manager.list_dir(CONTEXT, "")
+            self.assertIn("docs/", root["entries"])
+            self.assertIn("notes.txt", root["entries"])
+            self.assertTrue(root["resolved_path"].endswith("remote"))
+            nested = harness.manager.list_dir(CONTEXT, "docs")
+            self.assertEqual(nested["entries"], [])
+            with self.assertRaisesRegex(AdapterError, "remote_not_found|does not exist"):
+                harness.manager.list_dir(CONTEXT, "missing-dir")
+            with self.assertRaisesRegex(AdapterError, "remote_not_found|does not exist"):
+                harness.manager.list_dir(CONTEXT, "notes.txt")
+
+    def test_context_contribution_reflects_connection_state(self):
+        with ManagerHarness(authority="read-only") as harness:
+            self.assertIsNone(harness.manager.context_contribution())
+            harness.connect()
+            contribution = harness.manager.context_contribution()
+            self.assertIsNotNone(contribution)
+            self.assertEqual(contribution["label"], "ygg-ssh")
+            self.assertEqual(contribution["placement"], "prompt_suffix")
+            self.assertIn("read-only", contribution["content"])
+            self.assertIn(str(harness.remote), contribution["content"])
+
     def test_read_only_denies_exec_and_write_without_approval(self):
         with ManagerHarness(authority="read-only") as harness:
             harness.connect()

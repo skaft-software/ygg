@@ -121,9 +121,16 @@ class RuntimeProtocolTests(unittest.TestCase):
                         "environment": ["SSH_AUTH_SOCK"],
                     },
                     "contributes": {
-                        "tools": ["ssh_status", "ssh_exec", "ssh_read", "ssh_write"],
+                        "tools": [
+                            "ssh_status",
+                            "ssh_exec",
+                            "ssh_read",
+                            "ssh_write",
+                            "ssh_list",
+                        ],
                         "commands": ["ssh"],
                         "ui": ["status"],
+                        "context": True,
                         "confirmations": True,
                         "presentation": True,
                     },
@@ -150,7 +157,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(initialized["id"], 1)
         self.assertEqual(
             sorted(tool["name"] for tool in initialized["result"]["tools"]),
-            ["ssh_exec", "ssh_read", "ssh_status", "ssh_write"],
+            ["ssh_exec", "ssh_list", "ssh_read", "ssh_status", "ssh_write"],
         )
         return initialized
 

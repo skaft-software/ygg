@@ -152,6 +152,21 @@ def build_runtime(
         "required": ["path"],
         "additionalProperties": False,
     }
+    list_parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "maxLength": 4096, "description": (
+                "Directory to list, relative to the configured remote cwd. "
+                "Omit or pass an empty string to list the configured remote cwd itself."
+            )},
+            "timeout_ms": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": config.limits.operation_timeout_ms,
+            },
+        },
+        "additionalProperties": False,
+    }
     write_parameters = {
         "type": "object",
         "properties": {
@@ -200,10 +215,16 @@ def build_runtime(
     @extension.tool(
         name="ssh_exec",
         description=(
-            "Run a bounded argv command in the selected configured remote cwd. V1 treats every "
-            "command as a mutation: it is disabled for read-only targets and requires a fresh "
-            "interactive approval. Host aliases, users, ports, jumps, cwd, and credentials are "
-            "not accepted as arguments."
+            "Run one argv command on the connected remote workspace. When an SSH session is "
+            "active, this is the primary way to inspect and operate that machine: prefer it "
+            "over local shell commands for anything on the remote host, and combine it with "
+            "ssh_list and ssh_read for discovery. Each call is a fresh one-shot command: "
+            "there is no persistent shell state, so use explicit paths or compound shell "
+            "expressions (for example sh -c) when state must carry within one call. The "
+            "command runs in the configured remote cwd; host aliases, users, ports, jumps, "
+            "cwd, and credentials are not accepted as arguments. V1 treats every command as "
+            "a mutation: it is disabled for read-only targets and requires a fresh "
+            "interactive approval per call."
         ),
         parameters=exec_parameters,
         output_schema=COMMON_OUTPUT_SCHEMA,
@@ -238,9 +259,12 @@ def build_runtime(
     @extension.tool(
         name="ssh_read",
         description=(
-            "Read bounded bytes from a normalized relative path below the selected configured "
-            "remote cwd. The lexical path check is not a remote filesystem sandbox; symlinks "
-            "remain controlled by the remote account."
+            "Read bounded bytes from a file on the connected remote workspace, relative to "
+            "the configured remote cwd. Use ssh_list first to discover the directory layout "
+            "instead of probing blind paths. A missing path fails with a structured "
+            "remote_not_found error rather than a generic failure. The lexical path check is "
+            "not a remote filesystem sandbox; symlinks remain controlled by the remote "
+            "account."
         ),
         parameters=read_parameters,
         output_schema=COMMON_OUTPUT_SCHEMA,
@@ -278,10 +302,57 @@ def build_runtime(
         return tool_result(text_content(text), structured_content=structured)
 
     @extension.tool(
+        name="ssh_list",
+        description=(
+            "List one directory on the connected remote workspace, relative to the configured "
+            "remote cwd. Omit the path to list the configured cwd itself. Directories in the "
+            "listing carry a trailing slash. Use this as the first discovery step on a "
+            "connected host instead of guessing paths; a missing path fails with a "
+            "structured remote_not_found error. Read-only: no approval is required."
+        ),
+        parameters=list_parameters,
+        output_schema=COMMON_OUTPUT_SCHEMA,
+    )
+    def ssh_list(arguments: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            data = manager.list_dir(
+                context,
+                arguments.get("path") or "",
+                timeout_ms=arguments.get("timeout_ms"),
+                cancellation=extension.cancellation,
+            )
+        except AdapterError as error:
+            return _error_result("list", error)
+        structured = {
+            "operation": "list",
+            "status": "ok",
+            "remote": True,
+            "summary": (
+                f"Listed {data['count']} remote entries under {data['path']} on alias "
+                f"{data['alias']}."
+            ),
+            "untrusted": True,
+            **data,
+        }
+        marker = " (truncated)" if data["truncated"] else ""
+        entries = "\n".join(data["entries"])
+        text = (
+            f"REMOTE · {data['alias']} · list · generation {data['connection_generation']}\n"
+            f"Bounded untrusted remote listing of {data['resolved_path']}{marker}; "
+            f"{data['count']} entries:\n"
+            "--- BEGIN UNTRUSTED REMOTE DATA ---\n"
+            f"{entries}\n"
+            "--- END UNTRUSTED REMOTE DATA ---"
+        )
+        return tool_result(text_content(text), structured_content=structured)
+
+    @extension.tool(
         name="ssh_write",
         description=(
-            "Atomically write bounded bytes to a normalized relative path below the selected "
-            "configured remote cwd. Requires a read-write target and fresh interactive approval."
+            "Atomically write bounded bytes into a file on the connected remote workspace, "
+            "relative to the configured remote cwd. For surgical edits of existing files, "
+            "prefer read-modify-write with ssh_read and ssh_write. Requires a read-write "
+            "target and fresh interactive approval."
         ),
         parameters=write_parameters,
         output_schema=COMMON_OUTPUT_SCHEMA,
@@ -333,6 +404,14 @@ def build_runtime(
         contribution = manager.status_contribution()
         contribution["surface"] = params.get("surface", "status")
         return contribution
+
+    @extension.context()
+    def collect_context(request: Mapping[str, Any], context: Mapping[str, Any]) -> list[dict[str, Any]]:
+        del context
+        contribution = manager.context_contribution()
+        if contribution is None:
+            return []
+        return [contribution]
 
     @extension.on_lifecycle("session/settled")
     def session_settled(event: Mapping[str, Any]) -> None:

@@ -43,7 +43,8 @@ The boundaries are deliberately narrow:
   for read-only targets and requires a fresh, default-deny interactive
   confirmation for each call. `ssh_write` has the same boundary. Headless or
   unavailable confirmation fails closed.
-- `ssh_read` is the only remote file operation available in read-only mode.
+- `ssh_read` and `ssh_list` are the only remote file operations available in
+  read-only mode.
   Paths are normalized relative lexical paths. This is not a remote filesystem
   sandbox: remote symlinks and the remote account's permissions still apply.
 - Agent forwarding, configured port forwarding, TTY allocation, local commands,
@@ -210,11 +211,21 @@ The model-callable tools intentionally have no target field:
 
 - `ssh_status {}` — bounded selected-session state and configured target IDs;
 - `ssh_read {path, offset?, max_bytes?, timeout_ms?}` — bounded read-only bytes;
+- `ssh_list {path?, timeout_ms?}` — bounded read-only directory listing
+  (relative subpath, or the configured cwd when omitted); a missing path fails
+  with a structured `remote_not_found` error, as does a missing `ssh_read`
+  path;
 - `ssh_exec {argv, timeout_ms?}` — bounded direct argv, always classified as a
   mutation and freshly approved; and
 - `ssh_write {path, data, encoding?, overwrite?, timeout_ms?}` — bounded
   UTF-8/base64 input, written through a temporary file and remote rename after
   fresh approval.
+
+When at least one connection is active, the extension also contributes one
+bounded prompt-context block (via API `0.2` `context/collect`) naming the live
+target, cwd, and authority so models operate on the remote workspace without
+re-deriving session state. The contribution is process-scoped and disappears
+when no connection is active.
 
 OpenSSH ultimately passes a remote command to the remote login shell. The
 adapter shell-quotes each argv item and its package-authored file scripts, but a

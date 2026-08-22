@@ -14,8 +14,9 @@ network = true
 environment = ["SSH_AUTH_SOCK"]
 
 [contributes]
-tools = ["ssh_status", "ssh_exec", "ssh_read", "ssh_write"]
+tools = ["ssh_status", "ssh_exec", "ssh_read", "ssh_write", "ssh_list"]
 commands = ["ssh"]
 ui = ["status"]
+context = true
 confirmations = true
 presentation = true

@@ -128,6 +128,17 @@ cd "$1"
 exec dd if="$2" bs=1 skip="$3" count="$4" 2>/dev/null
 '''
 
+# Directory listing. Exit 66 means the path is missing or not a directory;
+# the manager maps that to a structured remote_not_found error instead of a
+# generic failure so models can self-correct without blind re-probing.
+LIST_SCRIPT = r'''set -eu
+cd "$1"
+[ -d "$2" ] || exit 66
+cd "$2"
+pwd
+ls -Ap
+'''
+
 WRITE_SCRIPT = r'''set -eu
 cd "$1"
 path=./$2
@@ -318,6 +329,13 @@ class SshManager:
                 result.exit_status,
             )
             raise AdapterError("connection_lost", "OpenSSH connection was lost during a remote read")
+        if result.exit_status == 66:
+            self._finish_activity(activity, "failed", result.exit_status)
+            self._diagnose(connection, "read", "remote_not_found", result.duration_ms, result.exit_status)
+            raise AdapterError(
+                "remote_not_found",
+                f"remote path {safe_path!r} does not exist below the configured cwd",
+            )
         if result.exit_status != 0:
             self._finish_activity(activity, "failed", result.exit_status)
             self._diagnose(connection, "read", "remote_read_failed", result.duration_ms, result.exit_status)
@@ -336,6 +354,94 @@ class SshManager:
             "bytes": len(result.stdout),
             "encoding": encoded[0],
             "data": encoded[1],
+            "truncated": truncated,
+            "untrusted": True,
+        }
+
+    def list_dir(
+        self,
+        context: Mapping[str, Any],
+        path: str,
+        *,
+        timeout_ms: Optional[int] = None,
+        cancellation: Any = None,
+    ) -> dict[str, Any]:
+        """List one directory below the configured remote cwd (read class).
+
+        An omitted or empty path lists the configured remote cwd itself;
+        every other value must be a normalized relative subpath.
+        """
+        if path in (None, ""):
+            safe_path = "."
+        else:
+            safe_path = self._validate_relative_path(path)
+        limit = self.config.limits.max_file_bytes
+        timeout = self._validate_timeout(timeout_ms)
+        owner = OwnerFence.from_context(context)
+        connection = self._require_ready(owner, cancellation=cancellation)
+        remote_command = _remote_sh(
+            LIST_SCRIPT,
+            [connection.target.remote_cwd, safe_path],
+        )
+        activity = self._start_activity(connection, "read", "Remote directory listing")
+        try:
+            result = self.backend.run_remote(
+                connection.target.alias,
+                connection.master.control_path,
+                remote_command,
+                timeout_ms=timeout,
+                cancellation=cancellation,
+                capture_limit=limit,
+            )
+        except SshCancelled:
+            self._finish_activity(activity, "cancelled", None)
+            self._diagnose(connection, "list", "cancelled", None, None)
+            raise AdapterError("cancelled", "remote directory listing was cancelled") from None
+        except SshProcessError as error:
+            self._finish_activity(activity, "failed", None)
+            self._diagnose(connection, "list", error.code, None, None)
+            raise AdapterError(error.code, error.safe_summary) from error
+        if result.exit_status == 255 or result.exit_status < 0:
+            self._degrade_connection(connection, "connection_lost", "OpenSSH connection was lost")
+            self._finish_activity(activity, "failed", result.exit_status)
+            self._diagnose(
+                connection,
+                "list",
+                "connection_lost",
+                result.duration_ms,
+                result.exit_status,
+            )
+            raise AdapterError(
+                "connection_lost", "OpenSSH connection was lost during a remote listing"
+            )
+        if result.exit_status == 66:
+            self._finish_activity(activity, "failed", result.exit_status)
+            self._diagnose(connection, "list", "remote_not_found", result.duration_ms, result.exit_status)
+            raise AdapterError(
+                "remote_not_found",
+                f"remote path {safe_path!r} does not exist or is not a directory below the configured cwd",
+            )
+        if result.exit_status != 0:
+            self._finish_activity(activity, "failed", result.exit_status)
+            self._diagnose(connection, "list", "remote_list_failed", result.duration_ms, result.exit_status)
+            raise AdapterError("remote_list_failed", "the remote directory listing failed")
+        encoded = _encode_bytes(result.stdout)
+        lines = encoded[1].splitlines()
+        resolved_cwd = lines[0] if lines else ""
+        entries = [line for line in lines[1:] if line]
+        truncated = result.stdout_truncated or len(result.stdout) >= limit
+        self._finish_activity(activity, "succeeded", result.exit_status)
+        self._diagnose(connection, "list", "succeeded", result.duration_ms, result.exit_status)
+        return {
+            "ok": True,
+            "remote": True,
+            "alias": connection.target.alias,
+            "command_class": "read",
+            "connection_generation": connection.generation,
+            "path": safe_path,
+            "resolved_path": resolved_cwd,
+            "entries": entries,
+            "count": len(entries),
             "truncated": truncated,
             "untrusted": True,
         }
@@ -562,6 +668,51 @@ class SshManager:
             else "extension.ygg_ssh.idle"
         )
         return {"surface": "status", "text": text, "style_role": role, "priority": 30}
+
+    def context_contribution(self) -> Optional[dict[str, Any]]:
+        """Process-scoped prompt-context guidance for the connected workspace.
+
+        Returns None when no session is active so the model's context stays
+        clean. This is intentionally owner-free: context/collect is
+        process-scoped, so it describes the live connection without exposing
+        owner-fenced handles.
+        """
+        if self.configuration_error:
+            return None
+        with self._lock:
+            active = [
+                connection
+                for connection in self._connections.values()
+                if connection.state in {"ready", "connecting", "degraded"}
+            ]
+        if not active:
+            return None
+        lines = [
+            "Active remote workspace (ygg-ssh): a user-configured OpenSSH session is",
+            "connected. Treat the remote host as your working machine for this task:",
+            "",
+        ]
+        for connection in active:
+            authority = connection.target.authority
+            state = connection.state
+            lines.append(
+                f"- {connection.target.id} (alias {connection.target.alias}) · "
+                f"cwd {connection.target.remote_cwd} · authority {authority} · state {state}"
+            )
+        lines.extend(
+            [
+                "",
+                "Use the ssh_* tools for all work on this host: ssh_list to discover the",
+                "directory layout, ssh_read to read files, ssh_exec to run commands (when",
+                "the target is read-write), and ssh_write for file changes. Do not probe",
+                "local paths or re-derive the connection state with ssh_status every turn.",
+            ]
+        )
+        return {
+            "label": "ygg-ssh",
+            "content": "\n".join(lines),
+            "placement": "prompt_suffix",
+        }
 
     def presentation_snapshot(self, owner: Optional[OwnerFence] = None) -> dict[str, Any]:
         from .presentation import build_presentation
