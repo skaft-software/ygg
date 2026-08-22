@@ -1,7 +1,5 @@
 //! Shared tool-output classification, alignment, and compact terminal rendering.
 
-use std::time::Duration;
-
 use sexy_tui_rs::{visible_width, DiffRenderOptions, RichRenderer, UnifiedDiff};
 
 use super::terminal_text::sanitize_for_terminal;
@@ -88,18 +86,6 @@ pub(super) fn tool_display_label(name: &str) -> String {
             }
             s
         }
-    }
-}
-
-/// Compact wall-time for a completed tool call: "42 µs", "12 ms", or
-/// "1.42 s".
-pub(super) fn format_tool_duration(duration: Duration) -> String {
-    if duration.as_micros() < 1000 {
-        format!("{} µs", duration.as_micros())
-    } else if duration.as_millis() < 1000 {
-        format!("{} ms", duration.as_millis())
-    } else {
-        format!("{:.2} s", duration.as_secs_f64())
     }
 }
 

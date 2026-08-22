@@ -186,7 +186,6 @@ density = "comfortable" # compact, comfortable, or airy
 show_header = true
 show_footer = true
 show_status_line = true
-show_tool_duration = true
 show_reasoning = true
 show_panel_borders = true
 transcript_inset = 2
@@ -195,7 +194,6 @@ narrow_breakpoint = 72
 narrow_show_header = false
 narrow_show_footer = true
 narrow_show_status_line = true
-narrow_show_tool_duration = false
 narrow_show_reasoning = true
 narrow_show_panel_borders = false
 ```
@@ -271,7 +269,7 @@ and `compaction`. Every layout field alters the current renderer:
   default leaves it off to preserve Ygg's sparse default geometry.
 - `show_footer` retains identity in the footer when the header is hidden, while
   `show_status_line` independently controls telemetry and active-run status.
-- `show_panel_borders`, `show_reasoning`, and `show_tool_duration` control their
+- `show_panel_borders` and `show_reasoning` control their
   respective semantic surfaces.
 
 Each `narrow_show_*` value is resolved once from the physical terminal width,

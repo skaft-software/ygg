@@ -10,7 +10,7 @@ use super::surface_frame::decorate_surface;
 use super::surface_layout::{compile_surface_plan, surface_roles};
 use super::terminal_text::sanitize_for_terminal;
 use super::tool_render::{
-    format_tool_duration, render_compact_tool_output, render_diff_only, tool_diff,
+    render_compact_tool_output, render_diff_only, tool_diff,
     tool_display_label, tool_value_indent, tool_value_indent_width, without_redundant_tool_lead,
 };
 use super::transcript_cache::{RenderedTranscriptBlock, SurfaceGeometry};
@@ -187,7 +187,6 @@ pub(super) fn render_block_planned(
     verbose_tools: bool,
     active_dot_visible: bool,
 ) -> RenderedTranscriptBlock {
-    let layout = theme.layout_for_width(outer_width);
     let plan = compile_surface_plan(previous, block, theme, outer_width);
     let width = plan.geometry.content_width;
     let content_background = matches!(
@@ -265,33 +264,8 @@ pub(super) fn render_block_planned(
                     &panel.display.success
                 };
                 let tool = tool_display_label(&panel.name);
-                // The margin dot owns lifecycle colour. Tool text stays
-                // neutral so failures do not wash the whole event red. Bash
-                // keeps an optional wall-time suffix here because its compact
-                // output path owns the trailing "Took" line; every other tool
-                // renders without wall time so durations never appear twice
-                // or on tools whose cost is not interesting. The suffix is
-                // muted and does not shift the tool's value column: the gap
-                // shrinks to compensate.
-                let bash_tool = matches!(panel.name.as_str(), "bash" | "exec");
-                let (label, label_width) = match (
-                    layout.show_tool_duration && bash_tool,
-                    panel.duration,
-                ) {
-                    (true, Some(duration)) => {
-                        let suffix = format!(" · {}", format_tool_duration(duration));
-                        let label = format!(
-                            "{}{}",
-                            theme.bold(&theme.fg("foreground", &tool)),
-                            theme.fg("muted", &suffix)
-                        );
-                        (label, visible_width(&tool) + visible_width(&suffix))
-                    }
-                    _ => (
-                        theme.bold(&theme.fg("foreground", &tool)),
-                        visible_width(&tool),
-                    ),
-                };
+                let label = theme.bold(&theme.fg("foreground", &tool));
+                let label_width = visible_width(&tool);
                 let text = match panel.display.value.as_deref() {
                     Some(value) => sanitize_for_terminal(value),
                     None => {
@@ -299,12 +273,7 @@ pub(super) fn render_block_planned(
                     }
                 };
                 let text = theme.fg("muted", &text);
-                let duration_suffix =
-                    layout.show_tool_duration && bash_tool && panel.duration.is_some();
                 let gap = tool_value_indent_width(&tool).saturating_sub(label_width);
-                // A wall-time suffix can exceed the value indent; keep at
-                // least one separating space so the value never collides.
-                let gap = if duration_suffix { gap.max(1) } else { gap };
                 let label_prefix = format!("{label}{}", " ".repeat(gap));
                 let continuation = " ".repeat(visible_width(&label_prefix));
                 wrap_hanging(&text, &label_prefix, &continuation, width)
@@ -317,7 +286,6 @@ pub(super) fn render_block_planned(
                         theme,
                         width,
                         verbose_tools,
-                        layout.show_tool_duration,
                         &output_indent,
                     )),
                     "search" => lines.extend(render_compact_tool_output(

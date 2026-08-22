@@ -122,7 +122,7 @@ class RuntimeProtocolTests(unittest.TestCase):
         self.assertEqual(
             calls[0]["params"]["policy"],
             {
-                "tools": ["read", "search"],
+                "tools": ["read", "search", "edit", "write", "bash"],
                 "max_depth": 1,
                 "max_concurrent_children": 8,
                 "max_turns": None,
@@ -132,8 +132,14 @@ class RuntimeProtocolTests(unittest.TestCase):
                 "timeout_ms": None,
             },
         )
-        self.assertIn("Use only these exact requested tools: read, search", calls[0]["params"]["message"])
-        self.assertIn("Never use shell/process/bash, edit, write", calls[0]["params"]["message"])
+        self.assertIn(
+            "Use only these exact requested tools: read, search, edit, write, bash",
+            calls[0]["params"]["message"],
+        )
+        self.assertIn(
+            "File edits, file writes, and shell commands are permitted",
+            calls[0]["params"]["message"],
+        )
         presentation = self.running.writer.wait_for(
             lambda message: message.get("method") == "presentation/update"
             and message.get("params", {}).get("snapshot", {}).get("collection", {}).get("nodes")

@@ -6,21 +6,21 @@ Version `0.2.0` targets exactly Ygg `0.6.0-dev`.
 
 ## Safety model
 
-V1 is deliberately bounded, with a read-only default tool scope:
+V1 is deliberately bounded, with the parent's full standard tool scope as the default grant:
 
 - at most **eight active children** and thirty-two retained workers per parent owner;
 - depth one; a recursively admitted descendant is immediately interrupted when its host path/depth is observed;
 - four predefined profiles (`explore`, `review`, `test-analysis`, `research`);
 - inherited model only (`model: "inherit"`), because the API `0.2` service does not accept a model override;
-- requested tool scope is a non-empty duplicate-free subset of `read`, `search`, `edit`, `write`, and `bash`; `read, search` is the default and the recommended scope;
+- requested tool scope is a non-empty duplicate-free subset of `read`, `search`, `edit`, `write`, and `bash`; the default grant is the full five-tool scope, and `tools: [read, search]` narrows a worker to hard read-only for pure investigations;
 - wall-time, turn, and cost ceilings are optional per spawn: when omitted they inherit the parent session's ceilings (an unlimited parent remains unlimited); explicit values are bounded to 5 s–24 h, 1–256 turns, and 1–50,000,000 microdollars; returned output is 512–16,384 bytes;
 - fresh child contexts inherit the parent's model, context/output limits, and optional session token ceiling exactly; an unlimited parent remains unlimited and the model-facing spawn schema has no separate token-budget field;
 - strict owner derivation from `tool/call.context.resource_owner`; no tool schema accepts an owner;
 - retry-safe spawn keys, bounded output/error retention, cooperative cancellation, explicit stop, and continue (steer active / resume settled).
 
-`edit`, `write`, and `bash` may enter the child request through `tools` when
-explicitly granted, but the JSON Schema and runtime accept only that
-five-tool whitelist: network, browser, computer control, mailbox/team
+`edit`, `write`, and `bash` are part of the default grant; the `tools`
+argument narrows or restores any subset within the five-tool whitelist:
+network, browser, computer control, mailbox/team
 primitives, another agent primitive, and any other tool are rejected. The
 canonical child policy keeps repository content and task text as data, not
 policy, and never grants recursion or manager-generated commands.

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Live worker activity in the `/subagents` list: the host now exposes a
+  bounded rolling `recent_tools` array (last six tool calls with flattened
+  argument summaries, timing, and an error flag) on each `agent/list` record.
+  Picker rows lead with the latest action — e.g. `read
+  crates/ygg-agent/src/delegation.rs` or `* search pattern=spawn_agent` for a
+  call in flight, `!` prefixed after an error — so you can see what every
+  worker is doing without opening its transcript. The inspect detail gains a
+  "Recent tool activity" section and the headless narrow list shows the same
+  action per row.
+
+### Changed
+
+- Workers now inherit the parent's full standard tool scope (`read`, `search`,
+  `edit`, `write`, `bash`) by default; pass `tools: [read, search]` for a hard
+  read-only guarantee. The child prompt states the granted scope instead of a
+  blanket read-only ban, the `test-analysis` profile may run the checks it
+  proposes, and spawn schema/skill/README guidance were updated.
+- Terminal-gate rejections now carry cumulative session cost so per-worker cost
+  tracks token usage between accepted turns.
+
 ## 0.2.0
 
 ### Added

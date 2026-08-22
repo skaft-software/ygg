@@ -150,7 +150,7 @@ pub(super) fn event_margin_marker(
     collapsed_reasoning: bool,
 ) -> Option<String> {
     let event_dot = if theme.unicode() { "•" } else { "*" };
-    // Active response and tool dots pulse through tone rather than swapping
+    // Active tool and reasoning dots pulse through tone rather than swapping
     // differently sized glyphs. Their settled colour communicates the result.
     let active_phase_dot = || {
         if active_dot_visible {
@@ -164,12 +164,12 @@ pub(super) fn event_margin_marker(
             Some(if active_dot_visible {
                 theme.model_fg(reasoning.model_lab, event_dot)
             } else {
-                " ".to_owned()
+                theme.settled_event_dot("neutral", event_dot)
             })
         }
         TranscriptBlock::Reasoning(_) => None,
-        TranscriptBlock::Assistant(assistant) if !assistant.finished => Some(active_phase_dot()),
-        TranscriptBlock::Assistant(_) => Some(theme.settled_event_dot("neutral", event_dot)),
+        // Assistant dots stay solid light while streaming and after settling.
+        TranscriptBlock::Assistant(_) => Some(theme.fg("foreground", event_dot)),
         TranscriptBlock::Tool(panel) if !panel.finished => Some(active_phase_dot()),
         TranscriptBlock::Tool(panel) => Some(if panel.is_error {
             theme.settled_event_dot("error", event_dot)

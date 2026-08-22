@@ -53,7 +53,6 @@ pub struct ThemeLayout {
     pub show_header: bool,
     pub show_footer: bool,
     pub show_status_line: bool,
-    pub show_tool_duration: bool,
     pub show_reasoning: bool,
     pub show_panel_borders: bool,
     pub transcript_inset: u16,
@@ -62,7 +61,6 @@ pub struct ThemeLayout {
     pub narrow_show_header: bool,
     pub narrow_show_footer: bool,
     pub narrow_show_status_line: bool,
-    pub narrow_show_tool_duration: bool,
     pub narrow_show_reasoning: bool,
     pub narrow_show_panel_borders: bool,
 }
@@ -77,7 +75,6 @@ impl Default for ThemeLayout {
             show_header: false,
             show_footer: true,
             show_status_line: true,
-            show_tool_duration: true,
             show_reasoning: true,
             show_panel_borders: true,
             transcript_inset: 2,
@@ -86,7 +83,6 @@ impl Default for ThemeLayout {
             narrow_show_header: false,
             narrow_show_footer: true,
             narrow_show_status_line: true,
-            narrow_show_tool_duration: true,
             narrow_show_reasoning: true,
             narrow_show_panel_borders: false,
         }
@@ -100,7 +96,6 @@ pub struct ResolvedThemeLayout {
     pub show_header: bool,
     pub show_footer: bool,
     pub show_status_line: bool,
-    pub show_tool_duration: bool,
     pub show_reasoning: bool,
     pub show_panel_borders: bool,
     pub transcript_inset: u16,
@@ -127,11 +122,6 @@ impl ThemeLayout {
                 self.narrow_show_status_line
             } else {
                 self.show_status_line
-            },
-            show_tool_duration: if narrow {
-                self.narrow_show_tool_duration
-            } else {
-                self.show_tool_duration
             },
             show_reasoning: if narrow {
                 self.narrow_show_reasoning
@@ -749,7 +739,6 @@ fn parse_layout(value: Option<&Value>, source_name: &str) -> anyhow::Result<Them
             "show_header" => layout.show_header = boolean(value, source_name, key)?,
             "show_footer" => layout.show_footer = boolean(value, source_name, key)?,
             "show_status_line" => layout.show_status_line = boolean(value, source_name, key)?,
-            "show_tool_duration" => layout.show_tool_duration = boolean(value, source_name, key)?,
             "show_reasoning" => layout.show_reasoning = boolean(value, source_name, key)?,
             "show_panel_borders" => layout.show_panel_borders = boolean(value, source_name, key)?,
             "transcript_inset" => {
@@ -765,9 +754,6 @@ fn parse_layout(value: Option<&Value>, source_name: &str) -> anyhow::Result<Them
             "narrow_show_footer" => layout.narrow_show_footer = boolean(value, source_name, key)?,
             "narrow_show_status_line" => {
                 layout.narrow_show_status_line = boolean(value, source_name, key)?
-            }
-            "narrow_show_tool_duration" => {
-                layout.narrow_show_tool_duration = boolean(value, source_name, key)?
             }
             "narrow_show_reasoning" => {
                 layout.narrow_show_reasoning = boolean(value, source_name, key)?
@@ -918,15 +904,14 @@ mod tests {
     #[test]
     fn narrow_layout_is_deterministic() {
         let layout = ThemeLayout {
-            show_tool_duration: true,
-            narrow_show_tool_duration: false,
             narrow_breakpoint: 72,
             ..ThemeLayout::default()
         };
-        assert!(layout.resolve(120).show_tool_duration);
+        let wide = layout.resolve(120);
+        assert!(!wide.narrow);
         let narrow = layout.resolve(60);
         assert!(narrow.narrow);
-        assert!(!narrow.show_tool_duration);
+        assert!(narrow.show_status_line == layout.resolve(120).show_status_line);
     }
 
     #[test]

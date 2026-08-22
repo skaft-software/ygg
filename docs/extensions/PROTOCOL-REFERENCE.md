@@ -1394,7 +1394,11 @@ agent record contains `agent_id`, `agent_path`, `parent_id`, public
 `depth`, opaque `agent-session:*` resource reference, tagged `status`, effective
 `policy`, host-owned `created_at_ms`/`started_at_ms`/`completed_at_ms`,
 `deadline_at_ms`, `turn_count`, host-observed `tool_call_count`, structured
-`phase` and optional `tool_name`, cumulative disjoint `usage`, optional
+`phase` and optional `tool_name`, a bounded rolling `recent_tools` array of the
+last six tool calls (each with `name`, a flattened single-line `args` summary
+capped at 160 UTF-8 bytes, host `started_at_ms`, optional `finished_at_ms`, and
+an `error` flag) so owner-facing pickers can answer what a worker is doing
+without opening its transcript, cumulative disjoint `usage`, optional
 `cost_microdollars`, and principal/owner `provenance`. States are `pending`,
 `running`, `completed` (with host-byte-capped `output`), `interrupted`,
 `timed_out`, `failed` (with bounded `error`), and `shutdown`. Private delegation

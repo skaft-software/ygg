@@ -3,18 +3,9 @@
 use sexy_tui_rs::{visible_width, RichRenderer};
 
 use super::terminal_text::sanitize_for_terminal;
-use super::tool_render::{format_tool_duration, tool_value_indent_width};
+use super::tool_render::tool_value_indent_width;
 use super::{fit_line, subdued_text, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_LINES};
 use crate::tui::theme::YggTheme;
-
-fn tool_metadata(panel: &ToolPanel) -> Option<String> {
-    if let Some(ref cached) = *panel.cached_metadata.borrow() {
-        return cached.clone();
-    }
-    let result = compute_tool_metadata(panel);
-    *panel.cached_metadata.borrow_mut() = Some(result.clone());
-    result
-}
 
 /// Locate the final canonical `bash` result after any live progress bytes.
 /// The bash tool streams output while it runs, then emits a durable envelope
@@ -176,36 +167,6 @@ pub(super) fn bash_output_changes_when_expanded(panel: &ToolPanel) -> bool {
     compact_bash_output(panel, false) != compact_bash_output(panel, true)
 }
 
-fn compute_tool_metadata(panel: &ToolPanel) -> Option<String> {
-    if !matches!(panel.name.as_str(), "bash" | "exec") {
-        return None;
-    }
-    let output = final_bash_result(&panel.output);
-    let parsed = output
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .find_map(|part| part.strip_prefix("duration="))
-        .map(|value| value.trim_end_matches([',', ';']))
-        .filter(|value| !value.is_empty())
-        .map(|duration| {
-            if duration.chars().last().is_some_and(char::is_alphabetic) {
-                duration.to_owned()
-            } else {
-                format!("{duration}s")
-            }
-        });
-    if parsed.is_some() || !panel.finished {
-        return parsed;
-    }
-    // The durable envelope is the preferred source, but some settled results
-    // (for example protocol errors) never carry a parseable duration token.
-    // Fall back to the host-measured wall time so every finished bash call
-    // renders its "Took" line exactly once.
-    panel.duration.map(format_tool_duration)
-}
-
 fn bash_content_gutter() -> usize {
     let action = "Bash";
     visible_width(action) + 6usize.saturating_sub(visible_width(action)).max(2)
@@ -216,7 +177,6 @@ pub(super) fn render_compact_bash_output(
     theme: &YggTheme,
     width: u16,
     expanded: bool,
-    show_tool_duration: bool,
     output_indent: &str,
 ) -> Vec<String> {
     let compact = compact_bash_output(panel, expanded);
@@ -288,14 +248,6 @@ pub(super) fn render_compact_bash_output(
                 "(waiting for output)".to_owned()
             },
         );
-    }
-    if show_tool_duration {
-        if let Some(duration) = tool_metadata(panel) {
-            lines.push(fit_line(
-                &subdued_text(theme, &format!("{output_indent}Took {duration}")),
-                width,
-            ));
-        }
     }
     lines
 }

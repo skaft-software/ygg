@@ -64,10 +64,11 @@ SPAWN_SCHEMA: Dict[str, Any] = {
             "minItems": 1,
             "maxItems": len(CHILD_TOOLS),
             "uniqueItems": True,
-            "default": list(READ_ONLY_TOOLS),
+            "default": list(CHILD_TOOLS),
             "description": (
-                "Host-enforced tool whitelist for the child; defaults to read-only [read, search]. "
-                "edit, write, and bash grant bounded mutation scope in the shared workspace."
+                "Host-enforced tool whitelist for the child; defaults to the parent's full "
+                "standard scope [read, search, edit, write, bash]. Pass a subset such as "
+                "[read, search] to keep a worker read-only."
             ),
         },
         "timeout_seconds": {

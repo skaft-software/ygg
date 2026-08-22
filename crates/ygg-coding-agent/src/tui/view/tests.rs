@@ -4781,18 +4781,17 @@ fn collapsed_reasoning_status_has_a_blinking_event_dot() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     shell.begin_run("codex");
-    let render = |shell: &InteractiveShell| {
+    let raw = |shell: &InteractiveShell| {
         shell
             .state
             .borrow()
             .rendered_transcript(80)
             .iter()
-            .map(|line| strip_terminal_sequences(line))
             .find(|line| line.contains("Thinking"))
+            .cloned()
             .expect("reasoning status row")
     };
-
-    let before = render(&shell);
+    let before = strip_terminal_sequences(&raw(&shell));
     assert_eq!(before, "• Thinking");
     {
         let mut state = shell.state.borrow_mut();
@@ -4800,7 +4799,19 @@ fn collapsed_reasoning_status_has_a_blinking_event_dot() {
         assert_eq!(state.active_event_blocks, vec![0]);
         state.advance_event_dot_animation();
     }
-    assert_eq!(render(&shell), "  Thinking");
+    // The dot pulses into its dim slot: the glyph stays and only the tone
+    // changes.
+    let after_raw = raw(&shell);
+    assert_eq!(strip_terminal_sequences(&after_raw), "• Thinking");
+    {
+        let mut state = shell.state.borrow_mut();
+        state.advance_event_dot_animation();
+    }
+    let before_raw = raw(&shell);
+    assert_ne!(
+        before_raw, after_raw,
+        "collapsed reasoning dots should pulse through colour only"
+    );
 }
 
 #[test]
@@ -5873,19 +5884,20 @@ fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
 
     let streaming_response =
         TranscriptBlock::Assistant(Box::new(AssistantBlock::streaming("working")));
+    let streaming_visible = event_margin_marker(&streaming_response, &theme, true, false)
+        .expect("streaming assistant marker");
+    let streaming_quiet = event_margin_marker(&streaming_response, &theme, false, false)
+        .expect("quiet streaming assistant marker");
+    assert_eq!(streaming_visible, theme.fg("foreground", "•"));
     assert_eq!(
-        event_margin_marker(&streaming_response, &theme, true, false),
-        Some(theme.fg("foreground", "•"))
-    );
-    assert_eq!(
-        event_margin_marker(&streaming_response, &theme, false, false),
-        Some(theme.settled_event_dot("neutral", "•"))
+        streaming_quiet, streaming_visible,
+        "assistant dots stay solid light instead of pulsing into a dim slot"
     );
     let finished_response =
         TranscriptBlock::Assistant(Box::new(AssistantBlock::finalized("done".into())));
     assert_eq!(
         event_margin_marker(&finished_response, &theme, false, false),
-        Some(theme.settled_event_dot("neutral", "•"))
+        Some(theme.fg("foreground", "•"))
     );
 
     let prompt = TranscriptBlock::User {
@@ -5904,11 +5916,14 @@ fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
             .map(|marker| strip_terminal_sequences(&marker)),
         Some("•".into())
     );
+    let reasoning_slot = event_margin_marker(&reasoning, &theme, false, true)
+        .expect("quiet collapsed reasoning marker");
     assert_eq!(
-        event_margin_marker(&reasoning, &theme, false, true)
-            .map(|marker| strip_terminal_sequences(&marker)),
-        Some(" ".into())
+        strip_terminal_sequences(&reasoning_slot),
+        "•",
+        "quiet reasoning dots keep a dim slot instead of vanishing"
     );
+    assert_eq!(reasoning_slot, theme.settled_event_dot("neutral", "•"));
     let compaction = TranscriptBlock::Compaction(Box::new(CompactionBlock {
         label: "Context compacted".into(),
         summary: "summary".into(),
@@ -5989,7 +6004,7 @@ fn event_dot_animation_invalidates_active_tool_rows_in_lockstep() {
 }
 
 #[test]
-fn streaming_response_dot_animates_then_settles_dim() {
+fn streaming_response_dot_stays_solid_light_and_settles_solid() {
     let mut shell = InteractiveShell::test_shell();
     let run_id = shell.begin_run("openai");
     shell.on_run_event(
@@ -6017,16 +6032,16 @@ fn streaming_response_dot_animates_then_settles_dim() {
     );
     {
         let mut state = shell.state.borrow_mut();
-        assert!(event_dot_animating(&state));
+        // The assistant block is tracked, but its solid dot never pulses.
         assert_eq!(state.active_event_blocks, vec![0]);
+        assert!(!event_dot_animating(&state));
         state.advance_event_dot_animation();
     }
     let quiet = response_row();
     assert_eq!(
-        strip_terminal_sequences(&quiet),
-        strip_terminal_sequences(&visible)
+        quiet, visible,
+        "assistant dots should stay solid light while streaming"
     );
-    assert_ne!(quiet, visible, "response dot should pulse through colour");
 
     {
         let mut state = shell.state.borrow_mut();
@@ -6036,14 +6051,14 @@ fn streaming_response_dot_animates_then_settles_dim() {
         let response = state.transcript.first().expect("finished response");
         assert_eq!(
             event_margin_marker(response, &state.theme, false, false),
-            Some(state.theme.settled_event_dot("neutral", "•"))
+            Some(state.theme.fg("foreground", "•"))
         );
     }
 }
 
 #[test]
 fn event_dot_tracking_stays_bounded_in_long_sessions() {
-    let mut shell = InteractiveShell::test_shell();
+    let shell = InteractiveShell::test_shell();
     {
         let mut state = shell.state.borrow_mut();
         for index in 0..10_000 {
@@ -6051,20 +6066,31 @@ fn event_dot_tracking_stays_bounded_in_long_sessions() {
         }
     }
 
-    let run_id = shell.begin_run("openai");
-    shell.on_run_event(
-        run_id,
-        &AgentEvent::OutputDelta {
-            channel: OutputChannel::Text,
-            text: "streaming response".into(),
-        },
-    );
+    // A running tool drives the pulse; its block revision must move without
+    // touching any of the settled history above it.
+    let args = serde_json::json!({"path":"src/lib.rs"});
     let active_index = {
-        let state = shell.state.borrow();
-        assert_eq!(state.active_event_blocks.len(), 1);
-        state.active_event_blocks[0]
+        let mut state = shell.state.borrow_mut();
+        let index = state.transcript.len();
+        state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("edit".into()),
+            "edit".into(),
+            args.to_string(),
+            summarize_tool("edit", &args),
+            String::new(),
+            false,
+            false,
+            None,
+            None,
+        ))));
+        state.register_active_event(index);
+        assert!(event_dot_animating(&state));
+        index
     };
-    shell.state.borrow_mut().advance_event_dot_animation();
+    shell
+        .state
+        .borrow_mut()
+        .advance_event_dot_animation();
     {
         let state = shell.state.borrow();
         assert_eq!(state.block_revisions[active_index], 1);
@@ -6073,7 +6099,10 @@ fn event_dot_tracking_stays_bounded_in_long_sessions() {
             .all(|revision| *revision == 0));
     }
 
-    shell.interrupt_run(run_id);
+    shell
+        .state
+        .borrow_mut()
+        .unregister_active_event(active_index);
     assert!(shell.state.borrow().active_event_blocks.is_empty());
 }
 
@@ -6506,7 +6535,7 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
     );
 
     let details =
-        render_compact_bash_output(&panel, &theme, 80, false, false, &tool_value_indent("Bash"));
+        render_compact_bash_output(&panel, &theme, 80, false, &tool_value_indent("Bash"));
     assert!(
         details[0].contains("\x1b[38;2;"),
         "hidden-line metadata should use the muted metadata style: {details:?}"
@@ -8134,45 +8163,18 @@ fn layout_breakpoint_is_resolved_from_terminal_width_before_inset() {
                 narrow_breakpoint = 72
                 show_reasoning = true
                 narrow_show_reasoning = false
-                show_tool_duration = true
-                narrow_show_tool_duration = false
             "#,
     );
-    let renderer = theme.rich_renderer();
-    let reasoning = TranscriptBlock::Reasoning(Box::new(AssistantBlock::finalized_reasoning(
-        "visible at the breakpoint".into(),
-    )));
-    let at_breakpoint = render_block(None, &reasoning, &theme, &renderer, &renderer, 72, false);
-    let below_breakpoint = render_block(None, &reasoning, &theme, &renderer, &renderer, 71, false);
+    let at_breakpoint = theme.layout_for_width(72);
+    let below_breakpoint = theme.layout_for_width(71);
     assert!(
-        at_breakpoint.is_empty(),
-        "finished reasoning leaves no collapsed trace"
+        !at_breakpoint.narrow && at_breakpoint.show_reasoning,
+        "width == breakpoint stays on the wide layout"
     );
     assert!(
-        below_breakpoint.is_empty(),
-        "finished reasoning leaves no collapsed trace"
+        below_breakpoint.narrow && !below_breakpoint.show_reasoning,
+        "narrow fallbacks apply below the breakpoint before any inset"
     );
-
-    let args = serde_json::json!({"command": "cargo check"});
-    let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(
-        ToolCallId("duration-breakpoint".into()),
-        "bash".into(),
-        args.to_string(),
-        summarize_tool("bash", &args),
-        "exit=0 duration=0.2s".into(),
-        true,
-        false,
-        None,
-        None,
-    )));
-    let at_breakpoint = strip_terminal_sequences(
-        &render_block(None, &tool, &theme, &renderer, &renderer, 72, false).join("\n"),
-    );
-    let below_breakpoint = strip_terminal_sequences(
-        &render_block(None, &tool, &theme, &renderer, &renderer, 71, false).join("\n"),
-    );
-    assert!(at_breakpoint.contains("0.2s"), "{at_breakpoint:?}");
-    assert!(!below_breakpoint.contains("0.2s"), "{below_breakpoint:?}");
 }
 
 #[test]

@@ -6,6 +6,27 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Added
 
+- Delegated workers now expose a bounded rolling `recent_tools` activity ring
+  (last six tool calls with flattened argument summaries, host timestamps, and
+  an error flag) on every `agent/list` record, and the `/subagents` picker rows,
+  inspect detail, and headless list render the latest action live — so each
+  worker answers "what is it doing right now" without opening its transcript.
+- Terminal-gate rejections (`CandidateRejected`) now carry cumulative session
+  cost alongside run cost, so delegated-worker spend tracks token usage between
+  accepted turns instead of jumping at settlement.
+
+### Changed
+
+- Subagents now inherit the parent's full standard tool scope (`read`, `search`,
+  `edit`, `write`, `bash`) by default, matching Claude Code's Task workers;
+  pass `tools: [read, search]` to keep a worker read-only. Worker prompts,
+  profiles, the spawn schema, and skill guidance were updated accordingly.
+- The interactive composer's slash-command list refreshes when extension
+  contributions change, and an unknown slash command now names enabled
+  extensions that are not ready instead of failing with a bare error.
+
+### Added
+
 - Added checksum-verified, bounded, atomic executable-extension bundles for the
   small first-party release catalog and offline/local archives. `ygg extension
   install`, `list`, `update`, and `remove` now manage API `0.2` bundles without

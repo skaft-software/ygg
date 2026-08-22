@@ -232,6 +232,9 @@ pub enum AgentEvent {
         usage: Usage,
         /// Cost accrued during this run, including terminal-gate calls.
         run_cost_microdollars: u64,
+        /// Cumulative host-session cost when pricing is known, so owner
+        /// surfaces can track spend between accepted turns.
+        session_cost_microdollars: Option<u64>,
     },
 
     /// The model finished a turn. The assembled assistant message has already

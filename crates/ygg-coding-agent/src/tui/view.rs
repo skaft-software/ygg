@@ -204,8 +204,6 @@ struct ToolPanel {
     model_lab: Option<crate::tui::theme::ModelLab>,
     /// Lazily cached diff scan. `None` means not yet computed.
     cached_diff: RefCell<Option<Option<String>>>,
-    /// Lazily cached metadata string for completed bash results.
-    cached_metadata: RefCell<Option<Option<String>>>,
     /// Whether Ctrl+O can change this finalized tool's physical rows. The
     /// result is computed only after output becomes immutable.
     cached_disclosure_sensitive: RefCell<Option<bool>>,
@@ -241,7 +239,6 @@ impl ToolPanel {
             subagent_activity_expanded: false,
             model_lab,
             cached_diff: RefCell::new(None),
-            cached_metadata: RefCell::new(None),
             cached_disclosure_sensitive: RefCell::new(None),
         }
     }
@@ -1188,7 +1185,8 @@ impl ShellState {
         self.active_event_blocks
             .iter()
             .any(|index| match self.transcript.get(*index) {
-                Some(TranscriptBlock::Assistant(assistant)) => !assistant.finished,
+                // Assistant dots are solid light and never pulse; only tool,
+                // shell, and collapsed-reasoning blocks animate the dot.
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
                     !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
                 }
@@ -1206,7 +1204,6 @@ impl ShellState {
         for position in 0..self.active_event_blocks.len() {
             let index = self.active_event_blocks[position];
             let visible = match self.transcript.get(index) {
-                Some(TranscriptBlock::Assistant(assistant)) => !assistant.finished,
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
                     !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
                 }

@@ -67,6 +67,21 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("shared", detail["body"].lower())
         self.assertIn("no session ceiling", detail["body"])
 
+    def test_full_tool_scope_is_reported_as_granted_mutation(self):
+        worker = self.worker(
+            "running",
+            tools=("read", "search", "edit", "write", "bash"),
+        )
+        snapshot = build_snapshot(
+            [worker], selected_agent_id=worker.agent_id, now_ms=1_700_000_001_000
+        )
+        detail = snapshot["collection"]["detail"]
+        self.assertIn(
+            "granted mutation scope [read, search, edit, write, bash]", detail["body"]
+        )
+        self.assertIn("shared", detail["body"].lower())
+        self.assertIn("no session ceiling", detail["body"])
+
     def test_terminal_summary_controls_are_escaped_before_generic_presentation(self):
         worker = self.worker(
             "done",
@@ -167,6 +182,61 @@ class PresentationTests(unittest.TestCase):
         self.assertIn("Stop was not issued", stopped["text"])
         self.assertEqual(host.agents[result["worker"]["id"]].status["state"], "running")
         self.assertTrue(stopped["notifications"])
+
+    def test_recent_tool_activity_surfaces_in_rows_and_detail(self):
+        worker = self.worker(
+            "running",
+            recent_tools=[
+                {
+                    "name": "search",
+                    "args": "pattern=spawn_agent path=crates",
+                    "started_at_ms": 1_700_000_001_000,
+                    "finished_at_ms": 1_700_000_002_000,
+                    "error": False,
+                },
+                {
+                    "name": "read",
+                    "args": "path=crates/ygg-agent/src/delegation.rs",
+                    "started_at_ms": 1_700_000_003_000,
+                    "finished_at_ms": None,
+                    "error": False,
+                },
+            ],
+        )
+        snapshot = build_snapshot(
+            [worker], selected_agent_id=worker.agent_id, now_ms=1_700_000_004_000
+        )
+        node = snapshot["collection"]["nodes"][0]
+        # The in-progress read with its argument summary is the live focus.
+        self.assertIn("read path=crates/ygg-agent/src/delegation.rs", node["secondary"])
+        self.assertIn("* read", node["secondary"])
+        detail = snapshot["collection"]["detail"]["body"]
+        self.assertIn("Recent tool activity", detail)
+        self.assertIn("[ok] search pattern=spawn_agent path=crates", detail)
+        self.assertIn("[running] read path=crates/ygg-agent/src/delegation.rs", detail)
+        activity = snapshot["activities"][0]
+        self.assertIn("read path=crates/ygg-agent/src/delegation.rs", activity["summary"])
+
+    def test_error_tool_activity_is_marked_in_row_and_detail(self):
+        worker = self.worker(
+            "running",
+            recent_tools=[
+                {
+                    "name": "bash",
+                    "args": "command=make test",
+                    "started_at_ms": 1_700_000_001_000,
+                    "finished_at_ms": 1_700_000_002_500,
+                    "error": True,
+                }
+            ],
+        )
+        snapshot = build_snapshot(
+            [worker], selected_agent_id=worker.agent_id, now_ms=1_700_000_003_000
+        )
+        node = snapshot["collection"]["nodes"][0]
+        self.assertIn("! bash command=make test", node["secondary"])
+        detail = snapshot["collection"]["detail"]["body"]
+        self.assertIn("[error] bash command=make test", detail)
 
     def test_checked_in_presentation_fixtures_cover_live_tree_resync_and_inspection(self):
         live = json.loads(

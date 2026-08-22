@@ -23,8 +23,9 @@ MAX_WALL_SECONDS = 24 * 60 * 60
 MAX_COST_MICRODOLLARS = 50_000_000
 MAX_ERROR_BYTES = 4 * 1024
 MAX_LABEL_BYTES = 1_024
-# Workers are read-only by default; the parent may grant bounded mutation
-# tools (edit/write/bash) explicitly, matching full-tool worker usage.
+# Workers inherit the parent's full standard tool scope by default (matching
+# Claude Code's Task workers); a spawn may narrow the whitelist to read-only
+# or any subset via the `tools` argument.
 READ_ONLY_TOOLS = ("read", "search")
 CHILD_TOOLS = ("read", "search", "edit", "write", "bash")
 PROFILE_INSTRUCTIONS = {
@@ -38,10 +39,10 @@ PROFILE_INSTRUCTIONS = {
     ),
     "test-analysis": (
         "Inspect tests, fixtures, and failure evidence. Explain the smallest likely root cause and "
-        "the checks the parent should run; do not execute commands."
+        "the checks needed to prove it; run those checks when the task requires evidence."
     ),
     "research": (
-        "Perform a focused read-only investigation, compare the available evidence, and return a "
+        "Perform a focused investigation, compare the available evidence, and return a "
         "concise answer with uncertainty called out."
     ),
 }
@@ -194,7 +195,7 @@ class SpawnRequest:
                 code="unsupported_model",
             )
 
-        tools_value = arguments.get("tools", list(READ_ONLY_TOOLS))
+        tools_value = arguments.get("tools", list(CHILD_TOOLS))
         if not isinstance(tools_value, list) or not tools_value:
             raise SubagentError("tools must be a non-empty array")
         if len(tools_value) > len(CHILD_TOOLS):
@@ -390,6 +391,7 @@ class Worker:
     tokens_used: Optional[int] = None
     cost_microdollars: Optional[int] = None
     current_tool: Optional[str] = None
+    recent_tools: List[Dict[str, Any]] = field(default_factory=list)
     summary: Optional[str] = None
     last_error: Optional[str] = None
     artifacts: List[ArtifactReference] = field(default_factory=list)
@@ -451,6 +453,7 @@ class Worker:
             "export_reference": self.export_reference,
             "artifacts": [artifact.public() for artifact in self.artifacts],
             "current_tool": self.current_tool,
+            "recent_tools": list(self.recent_tools),
             "recovered_after_restart": self.recovered,
             "restart_count": self.restart_count,
             "delivery": self.delivery_state,
@@ -612,6 +615,33 @@ def first_nonnegative_int(*values: Any) -> Optional[int]:
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
     return None
+
+
+def parse_recent_tools(record: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Parse bounded host-observed tool activity from an agent/list record."""
+    raw = record.get("recent_tools")
+    if not isinstance(raw, list):
+        return []
+    results: List[Dict[str, Any]] = []
+    for item in raw[-6:]:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        args = item.get("args")
+        started_at_ms = item.get("started_at_ms")
+        finished_at_ms = item.get("finished_at_ms")
+        if not isinstance(name, str) or not name.strip() or len(name.encode("utf-8")) > 128:
+            continue
+        results.append(
+            {
+                "name": safe_label(name),
+                "args": safe_label(args) if isinstance(args, str) else "",
+                "started_at_ms": started_at_ms if isinstance(started_at_ms, int) else None,
+                "finished_at_ms": finished_at_ms if isinstance(finished_at_ms, int) else None,
+                "error": bool(item.get("error")),
+            }
+        )
+    return results
 
 
 def parse_artifacts(record: Mapping[str, Any], status: Mapping[str, Any]) -> List[ArtifactReference]:

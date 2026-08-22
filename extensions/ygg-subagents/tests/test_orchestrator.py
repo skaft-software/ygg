@@ -107,7 +107,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(worker["id"], "agent-1")
         self.assertEqual(worker["state"], "queued")
         self.assertEqual(worker["session"], fake_session_reference("agent-1"))
-        self.assertEqual(worker["tools"], ["read", "search"])
+        self.assertEqual(worker["tools"], ["read", "search", "edit", "write", "bash"])
         self.assertEqual(result["completion_delivery"], "host_owned_claim_ack_parent_turn")
         self.assertTrue(self.snapshots)
         self.assertEqual(self.snapshots[-1]["collection"]["nodes"][0]["id"], "worker:agent-1")
@@ -243,7 +243,7 @@ class OrchestrationTests(unittest.TestCase):
         self.assertEqual(worker["session"], fake_session_reference(agent_id))
         detail = self.snapshots[-1]["collection"]["detail"]
         self.assertIn("Host-observed final summary", detail["body"])
-        self.assertIn("Requested tool policy: read-only", detail["body"])
+        self.assertIn("Requested tool policy: granted mutation scope", detail["body"])
 
     def test_wall_timeout_interrupts_and_has_distinct_terminal_state(self):
         agent_id = self.spawn(timeout_seconds=5)["worker"]["id"]

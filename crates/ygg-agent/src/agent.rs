@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -14,21 +14,22 @@ use tokio::sync::mpsc;
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
-    OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest,
-    ResponsesInput, ResponsesOptions, ResponsesReplayItem, StopReason, StreamEvent, ToolCall,
-    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
-    PICODOLLARS_PER_MICRODOLLAR,
+    OutputModalities, PICODOLLARS_PER_MICRODOLLAR, Protocol, ReasoningConfig, ReasoningMode,
+    Request, ResponsesCompactRequest, ResponsesInput, ResponsesOptions, ResponsesReplayItem,
+    StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
+    UserMessage, UserPart,
 };
 
 use crate::compaction::{
-    build_handoff_message, build_turn_prefix_handoff_message, choose_first_kept_by_tokens,
-    finish_handoff, prepare_handoff, HandoffPreparation, DEFAULT_KEEP_RECENT_TOKENS,
-    SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
+    DEFAULT_KEEP_RECENT_TOKENS, HandoffPreparation, SUMMARIZATION_SYSTEM_PROMPT,
+    SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS, build_handoff_message,
+    build_turn_prefix_handoff_message, choose_first_kept_by_tokens, finish_handoff,
+    prepare_handoff,
 };
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
 use crate::delegation::{
-    enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
-    DelegationRuntimeSettings, DelegationTemplate,
+    DelegationBinding, DelegationConfig, DelegationError, DelegationRuntimeSettings,
+    DelegationTemplate, enable_root_delegation,
 };
 use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
 use crate::events::{
@@ -36,7 +37,7 @@ use crate::events::{
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
-use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
+use crate::extension_process::{EXTENSION_FEATURE_AGENT_SESSIONS, ExtensionProcess};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
@@ -45,9 +46,9 @@ use crate::session::{
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
-    CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
-    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress, ToolProgressSink,
-    PROGRESS_CHANNEL_CAPACITY,
+    CancellationToken, PROGRESS_CHANNEL_CAPACITY, ReplaySafety, Tool, ToolConcurrency, ToolContext,
+    ToolError, ToolOutput, ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind,
+    ToolProgress, ToolProgressSink,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -92,7 +93,9 @@ pub enum AgentError {
     },
     /// The next billable request's conservative token reservation would cross
     /// the configured session token ceiling.
-    #[error("session token limit would be exceeded: current {current} + reserved {reserved} tokens > limit {limit}")]
+    #[error(
+        "session token limit would be exceeded: current {current} + reserved {reserved} tokens > limit {limit}"
+    )]
     TokenLimit {
         /// Durable session token usage before the request.
         current: u64,
@@ -103,7 +106,9 @@ pub enum AgentError {
     },
     /// The next billable request's conservative reservation would cross the
     /// configured session spend ceiling.
-    #[error("session cost limit would be exceeded: current {current} µUSD + reserved {reserved} µUSD > limit {limit} µUSD")]
+    #[error(
+        "session cost limit would be exceeded: current {current} µUSD + reserved {reserved} µUSD > limit {limit} µUSD"
+    )]
     CostLimit {
         /// Durable session cost before the request.
         current: u64,
@@ -114,13 +119,17 @@ pub enum AgentError {
     },
     /// A spend ceiling was requested but the selected model has no trusted
     /// pricing from which the host can reserve the next request.
-    #[error("session cost limit cannot be enforced because model pricing is unavailable (limit {limit} µUSD)")]
+    #[error(
+        "session cost limit cannot be enforced because model pricing is unavailable (limit {limit} µUSD)"
+    )]
     CostUnavailable {
         /// Configured ceiling that cannot be enforced.
         limit: u64,
     },
     /// The request would exceed the model's context budget after compaction.
-    #[error("request context is too large: approximately {estimate} tokens exceeds the {budget}-token input budget")]
+    #[error(
+        "request context is too large: approximately {estimate} tokens exceeds the {budget}-token input budget"
+    )]
     ContextExceeded {
         /// Estimated request size.
         estimate: u64,
@@ -777,8 +786,7 @@ const REASONING_ANSWER_RESERVE: u64 = 1024;
 /// Bound actual tool executions emitted in one assistant turn. Every excess
 /// call still receives a compact error result so provider pairing remains valid.
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
-const FAILED_TURN_CONTEXT_MARKER: &str =
-    "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
+const FAILED_TURN_CONTEXT_MARKER: &str = "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
 const TOOL_TRUNCATION_MARKER: &str = "\n[tool output truncated]\n";
 /// Maximum retries for a transient provider failure. A replacement attempt is
 /// safe even after deltas were received: streamed output is provisional, the
@@ -1288,9 +1296,15 @@ fn parse_terminal_gate(response: &ygg_ai::Response) -> Option<TerminalGateDecisi
 
 fn continuation_instruction(stop_reason: &StopReason) -> &'static str {
     match stop_reason {
-        StopReason::MaxTokens => "The previous response was truncated at the token limit. Continue the task from the persisted state; do not claim completion until the work is finished and verified.",
-        StopReason::Other(reason) if reason == "tool_output_locked" => "The previous response emitted an internal locked-output placeholder instead of the intended structured call. Re-issue that tool call now using the provider's required tool-call format; do not print any control placeholder.",
-        _ => "The provider paused the turn. Continue the task from the persisted state and do not claim completion until the work is finished and verified.",
+        StopReason::MaxTokens => {
+            "The previous response was truncated at the token limit. Continue the task from the persisted state; do not claim completion until the work is finished and verified."
+        }
+        StopReason::Other(reason) if reason == "tool_output_locked" => {
+            "The previous response emitted an internal locked-output placeholder instead of the intended structured call. Re-issue that tool call now using the provider's required tool-call format; do not print any control placeholder."
+        }
+        _ => {
+            "The provider paused the turn. Continue the task from the persisted state and do not claim completion until the work is finished and verified."
+        }
     }
 }
 
@@ -3160,7 +3174,7 @@ impl<'a> CompactionContext<'a> {
                 None => {
                     return Err(AgentError::IncompleteResponse {
                         stop_reason: "compaction summary did not finish normally".to_owned(),
-                    })
+                    });
                 }
             };
             if self.abort.is_set() {
@@ -5098,6 +5112,9 @@ impl Agent {
                             let ev = AgentEvent::CandidateRejected {
                                 usage: run_usage,
                                 run_cost_microdollars: run_cost.microdollars,
+                                session_cost_microdollars: (session.total_cost_microdollars() > 0
+                                    || model.spec.pricing.is_some())
+                                .then(|| session.total_cost_microdollars()),
                             };
                             notify_observers(&observers, &ev);
                             yield ev;
@@ -5244,6 +5261,9 @@ impl Agent {
                                 let ev = AgentEvent::CandidateRejected {
                                     usage: run_usage,
                                     run_cost_microdollars: run_cost.microdollars,
+                                    session_cost_microdollars: (session.total_cost_microdollars() > 0
+                                        || model.spec.pricing.is_some())
+                                    .then(|| session.total_cost_microdollars()),
                                 };
                                 notify_observers(&observers, &ev);
                                 yield ev;
@@ -5258,6 +5278,9 @@ impl Agent {
                                 let ev = AgentEvent::CandidateRejected {
                                     usage: run_usage,
                                     run_cost_microdollars: run_cost.microdollars,
+                                    session_cost_microdollars: (session.total_cost_microdollars() > 0
+                                        || model.spec.pricing.is_some())
+                                    .then(|| session.total_cost_microdollars()),
                                 };
                                 notify_observers(&observers, &ev);
                                 yield ev;
@@ -5267,6 +5290,9 @@ impl Agent {
                                 let ev = AgentEvent::CandidateRejected {
                                     usage: run_usage,
                                     run_cost_microdollars: run_cost.microdollars,
+                                    session_cost_microdollars: (session.total_cost_microdollars() > 0
+                                        || model.spec.pricing.is_some())
+                                    .then(|| session.total_cost_microdollars()),
                                 };
                                 notify_observers(&observers, &ev);
                                 yield ev;
@@ -5847,6 +5873,7 @@ impl Agent {
                 AgentEvent::CandidateRejected {
                     usage: total,
                     run_cost_microdollars: cost,
+                    ..
                 } => {
                     text.truncate(committed_text_len);
                     media.truncate(committed_media_len);
@@ -5975,10 +6002,12 @@ mod tests {
             CancellationToken::default(),
         );
         let authoritative = serde_json::json!({ "command": "ls" });
-        assert!(speculative
-            .take_matched(&id, Some(&authoritative))
-            .await
-            .is_none());
+        assert!(
+            speculative
+                .take_matched(&id, Some(&authoritative))
+                .await
+                .is_none()
+        );
     }
     #[test]
     fn provisional_delivery_rolls_back_when_generic_tool_output_limiting_truncates_it() {
@@ -6192,8 +6221,7 @@ mod tests {
                     retry_after: None,
                     provider_code: Some("invalid_request".into()),
                     body_snippet: Some(
-                        r#"{"error":{"message":"model does not support this request"}}"#
-                            .into(),
+                        r#"{"error":{"message":"model does not support this request"}}"#.into(),
                     ),
                     retryable: false,
                 })),
@@ -6481,13 +6509,15 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
-                    "type": "reasoning",
-                    "id": "rs_large",
-                    "encrypted_content": "x".repeat(40_000),
-                    "unknown": {"phase": "analysis"}
-                }))
-                .unwrap()]),
+                ResponsesOutput::new(vec![
+                    ResponsesItem::new(serde_json::json!({
+                        "type": "reasoning",
+                        "id": "rs_large",
+                        "encrypted_content": "x".repeat(40_000),
+                        "unknown": {"phase": "analysis"}
+                    }))
+                    .unwrap(),
+                ]),
             )
             .unwrap();
 
@@ -6537,23 +6567,27 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
-                    "type": "message",
-                    "id": "old-output"
-                }))
-                .unwrap()]),
+                ResponsesOutput::new(vec![
+                    ResponsesItem::new(serde_json::json!({
+                        "type": "message",
+                        "id": "old-output"
+                    }))
+                    .unwrap(),
+                ]),
             )
             .unwrap();
         session
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
-                    "type": "compaction",
-                    "id": "small-checkpoint",
-                    "encrypted_content": "opaque"
-                }))
-                .unwrap()]),
+                ResponsesOutput::new(vec![
+                    ResponsesItem::new(serde_json::json!({
+                        "type": "compaction",
+                        "id": "small-checkpoint",
+                        "encrypted_content": "opaque"
+                    }))
+                    .unwrap(),
+                ]),
             )
             .unwrap();
 
@@ -6622,11 +6656,13 @@ mod tests {
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
-                    "type": "compaction",
-                    "encrypted_content": "small"
-                }))
-                .unwrap()]),
+                ResponsesOutput::new(vec![
+                    ResponsesItem::new(serde_json::json!({
+                        "type": "compaction",
+                        "encrypted_content": "small"
+                    }))
+                    .unwrap(),
+                ]),
             )
             .unwrap();
 

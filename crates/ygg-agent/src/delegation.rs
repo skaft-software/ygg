@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
-use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use ygg_ai::{AssistantPart, Cost, PICODOLLARS_PER_MICRODOLLAR, ToolDef, Usage};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
@@ -32,6 +32,10 @@ const ROOT_AGENT_ID: &str = "root";
 const ROOT_AGENT_PATH: &str = "/root";
 const COMMAND_CHANNEL_CAPACITY: usize = 32;
 const MAX_TELEMETRY_FAILURE_BYTES: usize = 4 * 1024;
+/// Rolling per-child tool-activity entries retained for owner inspection.
+const MAX_CHILD_TOOL_ACTIVITY: usize = 6;
+/// Bounded single-line summary of one child tool call's arguments.
+const MAX_TOOL_ARGS_SUMMARY_BYTES: usize = 160;
 const MAX_PROVENANCE_TEXT_BYTES: usize = 128 * 1024;
 const MAX_MAILBOX_MESSAGES: usize = 64;
 const MAX_MAILBOX_BYTES: usize = 1024 * 1024;
@@ -1080,6 +1084,27 @@ pub(crate) struct DelegatedUsageRecord {
     pub(crate) tool_call_count: u64,
 }
 
+/// Bounded host-observed record of one child tool call, retained for
+/// owner-scoped inspection in `agent/list`. Arguments are reduced to a
+/// bounded single-line summary; results are never captured here because
+/// completed tool results are already persisted in the child session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ChildToolActivity {
+    /// Tool name.
+    name: String,
+    /// Bounded single-line argument summary (`key=value` pairs).
+    args_summary: String,
+    /// Host capture time of the tool start in Unix milliseconds.
+    started_at_ms: u64,
+    /// Host capture time of the tool finish, when observed.
+    finished_at_ms: Option<u64>,
+    /// Whether the call finished as an error result.
+    error: bool,
+    /// Provider-assigned call ID used to match start/finish; never serialized.
+    #[serde(skip)]
+    call_id: String,
+}
+
 struct AgentRecord {
     identity: AgentIdentity,
     task_name: String,
@@ -1107,6 +1132,7 @@ struct AgentRecord {
     turn_count: u64,
     tool_call_count: u64,
     active_tools: BTreeMap<String, String>,
+    recent_tools: VecDeque<ChildToolActivity>,
     usage: Usage,
     cost: Option<Cost>,
     cost_microdollars: Option<u64>,
@@ -1875,6 +1901,7 @@ impl DelegationManager {
                     turn_count: 0,
                     tool_call_count: 0,
                     active_tools: BTreeMap::new(),
+                    recent_tools: VecDeque::new(),
                     usage: Usage::default(),
                     cost: (extension_policy.is_some()
                         && self.template.model.spec.pricing.is_some())
@@ -2322,7 +2349,9 @@ impl DelegationManager {
                 "The listed standard file and shell tools are installed for this task; collaboration tools are unavailable. Mutating tools remain subject to the inherited approval policy; host policy is authoritative."
             };
             (
-                format!("{base_system}\n\nThis is a host-enforced depth-one child session. {scope_note}"),
+                format!(
+                    "{base_system}\n\nThis is a host-enforced depth-one child session. {scope_note}"
+                ),
                 extensions,
                 policy.max_turns,
             )
@@ -2629,14 +2658,23 @@ impl DelegationManager {
                         acknowledged_follow_ups.add_usage(follow_up.usage());
                     }
                 }
-                Next::Event(Some(AgentEvent::ToolStarted { id, name, .. })) => {
-                    self.update_agent_tool_started(&identity.id, &id.0, name);
+                Next::Event(Some(AgentEvent::ToolStarted { id, name, args })) => {
+                    let args_summary = tool_args_summary(&args);
+                    self.update_agent_tool_started(&identity.id, &id.0, name, args_summary);
                 }
-                Next::Event(Some(AgentEvent::ToolFinished { id, .. })) => {
-                    self.update_agent_tool_finished(&identity.id, &id.0);
+                Next::Event(Some(AgentEvent::ToolFinished { id, result, .. })) => {
+                    let is_error = match &result {
+                        Err(_) => true,
+                        Ok(output) => output.is_error(),
+                    };
+                    self.update_agent_tool_finished(&identity.id, &id.0, is_error);
                 }
-                Next::Event(Some(AgentEvent::CandidateRejected { usage, .. })) => {
-                    self.update_agent_usage(&identity.id, usage, None, false);
+                Next::Event(Some(AgentEvent::CandidateRejected {
+                    usage,
+                    session_cost_microdollars,
+                    ..
+                })) => {
+                    self.update_agent_usage(&identity.id, usage, session_cost_microdollars, false);
                 }
                 Next::Event(Some(AgentEvent::TurnFinished {
                     message,
@@ -2705,7 +2743,13 @@ impl DelegationManager {
         }
     }
 
-    fn update_agent_tool_started(&self, id: &str, call_id: &str, name: String) {
+    fn update_agent_tool_started(
+        &self,
+        id: &str,
+        call_id: &str,
+        name: String,
+        args_summary: String,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -2714,13 +2758,24 @@ impl DelegationManager {
             return;
         };
         record.tool_call_count = record.tool_call_count.saturating_add(1);
-        record.active_tools.insert(call_id.to_owned(), name);
+        record.active_tools.insert(call_id.to_owned(), name.clone());
+        record.recent_tools.push_back(ChildToolActivity {
+            name,
+            args_summary,
+            started_at_ms: timestamp_ms() as u64,
+            finished_at_ms: None,
+            error: false,
+            call_id: call_id.to_owned(),
+        });
+        while record.recent_tools.len() > MAX_CHILD_TOOL_ACTIVITY {
+            record.recent_tools.pop_front();
+        }
         drop(state);
         self.changed.notify_waiters();
         self.publish_telemetry(None, None);
     }
 
-    fn update_agent_tool_finished(&self, id: &str, call_id: &str) {
+    fn update_agent_tool_finished(&self, id: &str, call_id: &str, is_error: bool) {
         let mut state = self
             .state
             .lock()
@@ -2729,6 +2784,15 @@ impl DelegationManager {
             return;
         };
         record.active_tools.remove(call_id);
+        if let Some(entry) = record
+            .recent_tools
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.call_id == call_id && entry.finished_at_ms.is_none())
+        {
+            entry.finished_at_ms = Some(timestamp_ms() as u64);
+            entry.error = is_error;
+        }
         drop(state);
         self.changed.notify_waiters();
         self.publish_telemetry(None, None);
@@ -4471,6 +4535,19 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "tool_call_count": record.tool_call_count,
         "phase": phase,
         "tool_name": record.active_tools.values().next_back(),
+        "recent_tools": record
+            .recent_tools
+            .iter()
+            .map(|activity| {
+                json!({
+                    "name": activity.name,
+                    "args": activity.args_summary,
+                    "started_at_ms": activity.started_at_ms,
+                    "finished_at_ms": activity.finished_at_ms,
+                    "error": activity.error,
+                })
+            })
+            .collect::<Vec<_>>(),
         "usage": record.usage,
         "cost_microdollars": record.cost_microdollars,
         "deadline_at_ms": record.deadline_at_ms,
@@ -4596,6 +4673,50 @@ fn bounded_text(text: &str) -> String {
     bounded_text_to(text, MAX_PROVENANCE_TEXT_BYTES)
 }
 
+/// Reduce parsed tool arguments to a bounded single-line summary of
+/// `key=value` scalar pairs, collapsing whitespace so the value renders on
+/// one picker row. Non-scalar arguments are summarized as their type.
+fn tool_args_summary(args: &serde_json::Value) -> String {
+    let flatten = |value: &str| {
+        let mut collapsed = String::with_capacity(value.len());
+        let mut previous_was_space = true;
+        for character in value.chars() {
+            if character.is_whitespace() {
+                if !previous_was_space {
+                    collapsed.push(' ');
+                    previous_was_space = true;
+                }
+            } else {
+                collapsed.push(character);
+                previous_was_space = false;
+            }
+        }
+        collapsed.trim_end().to_owned()
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(object) = args.as_object() {
+        for (key, value) in object {
+            let rendered = match value {
+                serde_json::Value::String(text) => flatten(text),
+                serde_json::Value::Number(number) => number.to_string(),
+                serde_json::Value::Bool(flag) => flag.to_string(),
+                serde_json::Value::Null => continue,
+                _ => flatten(&value.to_string()),
+            };
+            parts.push(format!("{key}={rendered}"));
+            if parts.join(" ").len() > MAX_TOOL_ARGS_SUMMARY_BYTES {
+                parts.pop();
+                break;
+            }
+        }
+    }
+    let mut summary = parts.join(" ");
+    if summary.len() > MAX_TOOL_ARGS_SUMMARY_BYTES {
+        summary = bounded_text_to(&summary, MAX_TOOL_ARGS_SUMMARY_BYTES);
+    }
+    summary.replace('\n', " ")
+}
+
 fn timestamp_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4649,14 +4770,18 @@ mod tests {
         assert!(reference.starts_with("agent-session:"));
         assert_eq!(reference.len(), "agent-session:".len() + 64);
         assert!(!reference.contains("review"));
-        assert!(delegated_session_reference(Path::new(
-            "/private/sessions/.delegation/not-a-team/0001-review.jsonl"
-        ))
-        .is_none());
-        assert!(delegated_session_reference(Path::new(
-            "/private/sessions/.delegation/team-safe/../outside.jsonl"
-        ))
-        .is_none());
+        assert!(
+            delegated_session_reference(Path::new(
+                "/private/sessions/.delegation/not-a-team/0001-review.jsonl"
+            ))
+            .is_none()
+        );
+        assert!(
+            delegated_session_reference(Path::new(
+                "/private/sessions/.delegation/team-safe/../outside.jsonl"
+            ))
+            .is_none()
+        );
     }
 
     fn test_extension_policy() -> ExtensionAgentSessionPolicy {
@@ -4847,7 +4972,12 @@ mod tests {
         assert_eq!(child.tool_use_count, 0);
         assert_eq!(child.task_name, "explore");
 
-        manager.update_agent_tool_started(&agent_id, "tool-1", "read".into());
+        manager.update_agent_tool_started(
+            &agent_id,
+            "tool-1",
+            "read".into(),
+            "path=src/lib.rs".to_owned(),
+        );
         let using_tool = telemetry.recv().await.expect("tool-start snapshot");
         let child = using_tool
             .children
@@ -4985,6 +5115,7 @@ mod tests {
                     turn_count: 0,
                     tool_call_count: 0,
                     active_tools: BTreeMap::new(),
+                    recent_tools: VecDeque::new(),
                     usage: Usage::default(),
                     cost: None,
                     cost_microdollars: None,
@@ -5051,8 +5182,11 @@ mod tests {
         assert!(execution.task_delivered);
         match execution.outcome {
             WorkerOutcome::Failed(error) => {
-                assert!(error
-                    .contains("delegated run could not start after the task was durably accepted"))
+                assert!(
+                    error.contains(
+                        "delegated run could not start after the task was durably accepted"
+                    )
+                )
             }
             _ => panic!("expected startup failure"),
         }
@@ -5125,10 +5259,12 @@ mod tests {
                             if text == "task persisted through the original descriptor"
                     )
         )));
-        assert!(Session::open_read_only(&session_path)
-            .unwrap()
-            .entries()
-            .is_empty());
+        assert!(
+            Session::open_read_only(&session_path)
+                .unwrap()
+                .entries()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -5220,10 +5356,12 @@ mod tests {
             std::fs::read(&outside).unwrap(),
             b"outside must not be opened\n"
         );
-        assert!(std::fs::symlink_metadata(&session_path)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&session_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let state = manager.state.lock().unwrap();
         let record = &state.records[&child_id];
         assert_eq!(record.queued_follow_ups.messages, 1);
@@ -5389,6 +5527,7 @@ mod tests {
                 turn_count: 0,
                 tool_call_count: 0,
                 active_tools: BTreeMap::new(),
+                recent_tools: VecDeque::new(),
                 usage: Usage::default(),
                 cost: None,
                 cost_microdollars: None,
@@ -5458,16 +5597,20 @@ mod tests {
             child.registered_tool_names(),
             vec!["read".to_owned(), "search".to_owned()]
         );
-        assert!(child
-            .registered_tool_names()
-            .iter()
-            .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str())));
-        assert!(manager
-            .template
-            .extensions
-            .tool_definitions()
-            .iter()
-            .any(|tool| tool.name == "write"));
+        assert!(
+            child
+                .registered_tool_names()
+                .iter()
+                .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str()))
+        );
+        assert!(
+            manager
+                .template
+                .extensions
+                .tool_definitions()
+                .iter()
+                .any(|tool| tool.name == "write")
+        );
     }
 
     #[test]
@@ -5621,7 +5764,7 @@ mod tests {
                 &record.session_path,
             ));
             record.turn_count = 2;
-            record.tool_call_count = 3;
+            record.tool_call_count = 1;
             record.active_tools.insert("call-3".into(), "search".into());
             record.usage = Usage {
                 input_tokens: 10,
@@ -5631,6 +5774,26 @@ mod tests {
             };
             record.cost_microdollars = Some(7);
         }
+        // Exercise the real capture path outside the state lock: one finished
+        // call with flattened arguments and one still in flight.
+        manager.update_agent_tool_started(
+            first_id,
+            "call-9",
+            "read".to_owned(),
+            tool_args_summary(&json!({
+                "path": "crates/ygg-agent/src/delegation.rs",
+                "limit": 120,
+                "options": {"nested": true},
+                "note": "line one\nline two"
+            })),
+        );
+        manager.update_agent_tool_finished(first_id, "call-9", false);
+        manager.update_agent_tool_started(
+            first_id,
+            "call-10",
+            "search".to_owned(),
+            tool_args_summary(&json!({"pattern": "spawn_agent"})),
+        );
         let listed = service.list("root-owner").unwrap();
         let record = listed["agents"]
             .as_array()
@@ -5644,6 +5807,19 @@ mod tests {
         assert_eq!(record["tool_call_count"], 3);
         assert_eq!(record["phase"], "using_tool");
         assert_eq!(record["tool_name"], "search");
+        let recent = record["recent_tools"].as_array().unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0]["name"], "read");
+        assert_eq!(
+            recent[0]["args"],
+            "limit=120 note=line one line two options={\"nested\":true} path=crates/ygg-agent/src/delegation.rs"
+        );
+        assert!(recent[0]["started_at_ms"].as_u64().is_some());
+        assert!(recent[0]["finished_at_ms"].as_u64().is_some());
+        assert_eq!(recent[0]["error"], false);
+        assert_eq!(recent[1]["name"], "search");
+        assert_eq!(recent[1]["args"], "pattern=spawn_agent");
+        assert!(recent[1]["finished_at_ms"].is_null());
         assert_eq!(record["usage"]["total_tokens"], 15);
         assert_eq!(record["cost_microdollars"], 7);
         assert_eq!(record["profile"], "review");
@@ -5658,24 +5834,30 @@ mod tests {
             .open_session_reference("extension-policy", reference)
             .unwrap()
             .unwrap();
-        assert!(inspection
-            .append(crate::EntryValue::Config {
-                model: None,
-                reasoning: None,
-                reasoning_mode: None,
-            })
-            .is_err());
-        assert!(binding
-            .open_session_reference("another-extension", reference)
-            .unwrap()
-            .is_none());
-        assert!(binding
-            .open_session_reference(
-                "extension-policy",
-                &format!("agent-session:{}", "0".repeat(64)),
-            )
-            .unwrap()
-            .is_none());
+        assert!(
+            inspection
+                .append(crate::EntryValue::Config {
+                    model: None,
+                    reasoning: None,
+                    reasoning_mode: None,
+                })
+                .is_err()
+        );
+        assert!(
+            binding
+                .open_session_reference("another-extension", reference)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            binding
+                .open_session_reference(
+                    "extension-policy",
+                    &format!("agent-session:{}", "0".repeat(64)),
+                )
+                .unwrap()
+                .is_none()
+        );
 
         let journal =
             std::fs::read_to_string(manager.team_directory.join("provenance.jsonl")).unwrap();
@@ -5690,9 +5872,11 @@ mod tests {
         assert_eq!(persisted["extension_profile"], "review");
         assert_eq!(persisted["extension_idempotency_key"], "first-key");
         assert_eq!(persisted["extension_fingerprint"], "f".repeat(64));
-        assert!(persisted["session_reference"]
-            .as_str()
-            .is_some_and(|reference| reference.starts_with("agent-session:")));
+        assert!(
+            persisted["session_reference"]
+                .as_str()
+                .is_some_and(|reference| reference.starts_with("agent-session:"))
+        );
         assert!(persisted.get("task").is_none());
         assert!(persisted.get("session").is_none());
         assert!(!journal.contains("first bounded task"));
@@ -5853,6 +6037,32 @@ mod tests {
         assert!(output.ends_with("...[truncated]"));
     }
 
+    #[test]
+    fn tool_args_summary_is_flat_bounded_and_single_line() {
+        let summary = tool_args_summary(&json!({
+            "path": "src/main.rs",
+            "line": 42,
+            "all": true,
+            "missing": null,
+            "options": {"deep": [1, 2]},
+        }));
+        // serde_json maps sort keys, so the summary is deterministic.
+        assert_eq!(
+            summary,
+            "all=true line=42 options={\"deep\":[1,2]} path=src/main.rs"
+        );
+        let collapsed = tool_args_summary(&json!({"command": "make\ntest\n  here"}));
+        assert_eq!(collapsed, "command=make test here");
+        let oversized = tool_args_summary(&json!({ "blob": "x".repeat(4_000) }));
+        assert!(oversized.len() <= MAX_TOOL_ARGS_SUMMARY_BYTES + "\n...[truncated]".len());
+        assert_eq!(tool_args_summary(&serde_json::Value::Null), "");
+        assert_eq!(
+            tool_args_summary(&json!([1, 2, 3])),
+            "",
+            "non-object arguments summarize to nothing"
+        );
+    }
+
     #[tokio::test]
     async fn extension_services_are_idempotent_and_isolated_by_principal_and_owner() {
         let directory = tempfile::tempdir().unwrap();
@@ -5889,23 +6099,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cached["agent_id"], "agent-1");
-        assert!(service_a
-            .spawn(
-                "root-owner",
-                test_extension_spawn("research", None, None, "different", "spawn-1"),
-            )
-            .unwrap_err()
-            .contains("different input"));
+        assert!(
+            service_a
+                .spawn(
+                    "root-owner",
+                    test_extension_spawn("research", None, None, "different", "spawn-1"),
+                )
+                .unwrap_err()
+                .contains("different input")
+        );
 
-        assert!(service_b
-            .send_message("root-owner", &identity.id, "cross-principal".into())
-            .await
-            .unwrap_err()
-            .contains("no child sessions"));
-        assert!(service_a
-            .list("different-owner")
-            .unwrap_err()
-            .contains("not an active"));
+        assert!(
+            service_b
+                .send_message("root-owner", &identity.id, "cross-principal".into())
+                .await
+                .unwrap_err()
+                .contains("no child sessions")
+        );
+        assert!(
+            service_a
+                .list("different-owner")
+                .unwrap_err()
+                .contains("not an active")
+        );
 
         service_a
             .send_message("root-owner", &identity.id, "owned".into())
@@ -5914,9 +6130,11 @@ mod tests {
         let command = commands.recv().await.unwrap();
         assert!(matches!(command.kind, WorkerCommandKind::Message(_)));
         service_a.shutdown_owned();
-        assert!(manager.state.lock().unwrap().records[&identity.id]
-            .shutdown
-            .is_cancelled());
+        assert!(
+            manager.state.lock().unwrap().records[&identity.id]
+                .shutdown
+                .is_cancelled()
+        );
     }
 
     #[tokio::test]
@@ -6008,9 +6226,11 @@ mod tests {
         }
 
         assert_eq!(mailbox.len(), MAX_MAILBOX_MESSAGES);
-        assert!(mailbox
-            .iter()
-            .any(|message| message.message == "durable" && !message.evictable));
+        assert!(
+            mailbox
+                .iter()
+                .any(|message| message.message == "durable" && !message.evictable)
+        );
         assert_eq!(
             mailbox.back().unwrap().message,
             (MAX_MAILBOX_MESSAGES - 1).to_string()
@@ -6445,11 +6665,15 @@ mod tests {
         );
 
         let mut queued_tasks = VecDeque::new();
-        assert!(!manager.drain_interrupted_commands("agent-1", &mut command_rx, &mut queued_tasks,));
+        assert!(
+            !manager.drain_interrupted_commands("agent-1", &mut command_rx, &mut queued_tasks,)
+        );
         assert_eq!(queued_tasks.len(), MAX_QUEUED_FOLLOW_UPS);
-        assert!(queued_tasks
-            .iter()
-            .all(|task| matches!(task, QueuedTask::FollowUp(_))));
+        assert!(
+            queued_tasks
+                .iter()
+                .all(|task| matches!(task, QueuedTask::FollowUp(_)))
+        );
         assert_eq!(
             manager.state.lock().unwrap().records["agent-1"]
                 .queued_follow_ups
@@ -6756,6 +6980,7 @@ mod tests {
                     turn_count: 0,
                     tool_call_count: 0,
                     active_tools: BTreeMap::new(),
+                    recent_tools: VecDeque::new(),
                     usage: Usage::default(),
                     cost: None,
                     cost_microdollars: None,

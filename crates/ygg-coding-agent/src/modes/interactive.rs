@@ -12,38 +12,39 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
-    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
-    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
+    AgentCompactionMode, AgentError, AgentEvent, EntryId, GoalDecision, GoalStatus, GoalTurnSource,
+    Run, RunControl, Session, analyze_session_cache_stats,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
-    build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
+    Bootstrap, build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive,
 };
 use crate::app::{
-    apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
-    thinking_to_reasoning_with_subagents, App, Reconfig,
+    App, Reconfig, apply_reconfig, level_from_reasoning, reasoning_label,
+    supported_levels_with_subagents, thinking_to_reasoning_with_subagents,
 };
 use crate::commands::{self, Command};
 use crate::compaction::{
-    attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
+    CompactionOutcome, attempt_compaction, context_window, estimate_next_request_tokens,
 };
 use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::{HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::RunId;
-use crate::prompts::{render_and_record, RenderedPrompt};
+use crate::prompts::{RenderedPrompt, render_and_record};
 use crate::resources::{compose_instructions, expand_skill_command};
 use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
-    confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
-    optional_model_picker, read_only_document, read_only_document_live, session_picker,
-    subagent_picker, theme_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
+    SubagentPickerSnapshot, confirmation_picker, extension_confirmation_picker,
+    extension_input_picker, extension_picker, optional_model_picker, read_only_document,
+    read_only_document_live, session_picker, subagent_picker, theme_picker, thinking_picker,
+    tool_input_picker,
 };
 use crate::tui::theme::{
-    available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
-    load_theme_for_background, TerminalBackground,
+    TerminalBackground, available_themes, background_from_terminal_rgb,
+    load_named_theme_for_background, load_theme, load_theme_for_background,
 };
 use crate::tui::view::InteractiveShell;
 
@@ -1224,6 +1225,25 @@ where
                     InputAction::Command(_) => {
                         let command = commands::parse(&shell.drain_editor());
                         let was_quit = matches!(command, Command::Quit);
+                        // The live subagents view only reads extension
+                        // presentation state, so it is safe to open while the
+                        // run keeps going. Run events buffer until the panel
+                        // closes and are applied immediately afterwards.
+                        if matches!(&command, Command::Unknown(text)
+                            if is_live_subagents_command(text, executable_extensions))
+                        {
+                            match active_subagents_view(shell, input, executable_extensions).await {
+                                Ok(()) => {
+                                    shell.render();
+                                    continue;
+                                }
+                                Err(error) => {
+                                    shell.error(format!("extension command failed: {error}"));
+                                    shell.render();
+                                    continue;
+                                }
+                            }
+                        }
                         handle_active_command(
                             shell,
                             command,
@@ -1578,6 +1598,10 @@ fn apply_extension_background(
         shell.notice(message);
         changed = true;
     }
+    // Extension contributions can arrive (or change) after the initial
+    // handshake; keep the composer's slash-command list in step so commands
+    // like /subagents are enterable as soon as their owning process is ready.
+    shell.set_extension_commands(Arc::from(executable_extensions.command_suggestions()));
     changed
 }
 
@@ -2149,8 +2173,7 @@ fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
     }
 
     let context = session.context()?;
-    let header =
-        "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n";
+    let header = "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n";
     let omitted_marker = "\n\n[older transcript entries omitted]";
     let recent_start = context.len().saturating_sub(MAX_MESSAGES);
     let mut blocks = Vec::new();
@@ -2381,6 +2404,73 @@ fn refresh_subagent_snapshot<'a, 'extensions>(
             },
         }
     })
+}
+
+/// Whether an unknown-command text is the bare `/subagents` live view owned
+/// by the ygg-subagents extension. Only that view is safe to open mid-run:
+/// it reads extension presentation state and never touches the running
+/// agent session.
+fn is_live_subagents_command(
+    text: &str,
+    extensions: &crate::extensions::ExecutableExtensions,
+) -> bool {
+    let Some(name) = text.strip_prefix('/') else {
+        return false;
+    };
+    name.trim() == "subagents"
+        && extensions.command_owner("subagents").as_deref() == Some("ygg-subagents")
+}
+
+/// Live `/subagents` view while a run is active. Mirrors the idle
+/// `subagents_view` picker, but selection opens the extension-provided
+/// detail snapshot instead of the session transcript, which needs the idle
+/// owner of `App`.
+async fn active_subagents_view<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    extensions: &mut crate::extensions::ExecutableExtensions,
+) -> anyhow::Result<()>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    loop {
+        if subagent_view_entries(extensions).is_none_or(|(_, entries)| entries.is_empty()) {
+            for notice in extensions.drain_events() {
+                shell.notice(notice);
+            }
+            shell.notice("No subagents for this session.");
+            return Ok(());
+        }
+        let notices = extensions.drain_events();
+        let (title, entries) = subagent_view_entries(extensions)
+            .expect("entries checked non-empty above");
+        let initial = subagent_picker_snapshot(&title, &entries, notices);
+        let selected_id = {
+            let mut refresh = SubagentRefreshContext {
+                extensions,
+                last_error: None,
+            };
+            subagent_picker(shell, input, initial, 0, &mut refresh, refresh_subagent_snapshot)
+                .await?
+        };
+        let Some(selected_id) = selected_id else {
+            return Ok(());
+        };
+        for notice in extensions.drain_events() {
+            shell.notice(notice);
+        }
+        // Open the latest snapshot detail for the selection. The live
+        // transcript drill-in stays idle-only because it revalidates against
+        // the durable session through `App`.
+        if let Some((_, entries)) = subagent_view_entries(extensions) {
+            if let Some(entry) = entries.iter().find(|entry| entry.node_id == selected_id) {
+                read_only_document(shell, input, entry.label.clone(), entry.fallback_detail.clone())
+                    .await?;
+            } else {
+                shell.notice("subagent state changed; select it again to view");
+            }
+        }
+    }
 }
 
 async fn subagents_view(
@@ -3420,7 +3510,34 @@ async fn run_idle_command(
                                 prompt: rendered.text,
                             });
                         }
-                        Ok(None) => shell.error(format!("unknown command: {text}")),
+                        Ok(None) => {
+                            // A slash command that no running extension
+                            // contributes may still belong to an extension
+                            // that is starting, degraded, or parked. Say so
+                            // instead of a bare unknown.
+                            let not_ready: Vec<String> = app
+                                .executable_extensions
+                                .summaries()
+                                .into_iter()
+                                .filter(|summary| {
+                                    summary.enabled
+                                        && (!summary.running
+                                            || summary.health.as_ref().is_some_and(|health| {
+                                                health.state
+                                                    != ygg_agent::ExtensionHealthState::Ready
+                                            }))
+                                })
+                                .map(|summary| summary.name)
+                                .collect();
+                            if text.starts_with('/') && !not_ready.is_empty() {
+                                shell.error(format!(
+                                    "unknown command: {text} (extensions not ready: {} — see /extensions status)",
+                                    not_ready.join(", ")
+                                ));
+                            } else {
+                                shell.error(format!("unknown command: {text}"));
+                            }
+                        }
                         Err(error) => shell.error(error.to_string()),
                     }
                 }
@@ -4385,9 +4502,11 @@ mod tests {
                 "Disable ygg-web-search"
             ]
         );
-        assert!(descriptions[0]
-            .as_deref()
-            .is_some_and(|description| description.contains("API key")));
+        assert!(
+            descriptions[0]
+                .as_deref()
+                .is_some_and(|description| description.contains("API key"))
+        );
 
         let (items, _) = web_search_menu_entries(false);
         assert_eq!(items, ["Brave Search (recommended)", "SearXNG"]);
@@ -4716,9 +4835,11 @@ mod tests {
             let mut quit_requested = false;
             handle_active_command(&mut shell, command, &mut queue, &mut quit_requested);
 
-            assert!(shell
-                .debug_snapshot()
-                .contains("theme commands are available at the next idle boundary"));
+            assert!(
+                shell
+                    .debug_snapshot()
+                    .contains("theme commands are available at the next idle boundary")
+            );
             assert!(queue.is_empty());
             assert!(!quit_requested);
         }
@@ -4732,9 +4853,11 @@ mod tests {
             let mut quit_requested = false;
             handle_active_command(&mut shell, command, &mut queue, &mut quit_requested);
 
-            assert!(shell
-                .debug_snapshot()
-                .contains("cost and cache reports are available at the next idle boundary"));
+            assert!(
+                shell
+                    .debug_snapshot()
+                    .contains("cost and cache reports are available at the next idle boundary")
+            );
             assert!(queue.is_empty());
             assert!(!quit_requested);
         }
@@ -5096,5 +5219,66 @@ mod tests {
                     ygg_ai::UserPart::Text(text) if text.starts_with("steer ")
                 ))
         )));
+    }
+
+    #[tokio::test]
+    async fn active_run_subagents_without_extension_owner_stays_an_unknown_command() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let (_server, _workspace, mut agent) = scripted_agent().await;
+        let mut shell = InteractiveShell::test_shell();
+        let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        for character in "/subagents".chars() {
+            sender
+                .send(Ok(Event::Key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))))
+                .await
+                .unwrap();
+        }
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        // Keep the sender alive so the receiver remains pending rather than
+        // signalling an input close that would abort the real run.
+        let _sender = sender;
+        let mut input = ReceiverStream::new(receiver);
+        let mut ticker = tokio::time::interval(Duration::from_millis(1));
+        let mut pending = VecDeque::new();
+        let mut quit = false;
+        let mut executable_extensions = crate::extensions::ExecutableExtensions::default();
+        let run_id = shell.begin_run("test");
+        let mut run = agent.prompt("initial").await.unwrap();
+        shell.set_awaiting_provider(run_id);
+        let control = run.control();
+        let ended = drive_active_run(
+            &mut run,
+            &control,
+            &mut shell,
+            &mut input,
+            &mut ticker,
+            &mut pending,
+            &mut quit,
+            None,
+            None,
+            &mut executable_extensions,
+            &mut false,
+        )
+        .await
+        .unwrap();
+        drop(run);
+
+        assert_eq!(ended, HostRunOutcome::Completed);
+        assert_eq!(
+            shell.debug_error().as_deref(),
+            Some("unknown command: /subagents"),
+            "without a ygg-subagents owner the command must not open the live view"
+        );
     }
 }

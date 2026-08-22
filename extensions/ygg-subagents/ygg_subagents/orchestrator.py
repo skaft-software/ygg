@@ -27,6 +27,7 @@ from .model import (
     depth_from_record,
     host_state,
     parse_artifacts,
+    parse_recent_tools,
     parse_target,
     safe_label,
     sanitize_document,
@@ -1118,6 +1119,7 @@ class Orchestrator:
         if cost is not None:
             worker.cost_microdollars = cost
         worker.artifacts = parse_artifacts(record, status)
+        worker.recent_tools = parse_recent_tools(record)
         delivery = record.get("delivery_state", status.get("delivery_state"))
         if delivery in {"pending", "claimed", "acked", "host_managed"}:
             worker.delivery_state = str(delivery)

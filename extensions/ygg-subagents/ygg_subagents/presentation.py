@@ -124,9 +124,22 @@ def worker_references(worker: Worker) -> List[Dict[str, Any]]:
     return references
 
 
+def latest_action(worker: Worker) -> Optional[str]:
+    """Bounded single-line description of the worker's most recent tool call."""
+    if not worker.recent_tools:
+        return None
+    entry = worker.recent_tools[-1]
+    args = entry.get("args") or ""
+    action = "%s %s" % (entry["name"], args) if args else str(entry["name"])
+    if entry.get("finished_at_ms") is None:
+        return "* %s" % action
+    if entry.get("error"):
+        return "! %s" % action
+    return action
+
+
 def worker_secondary(worker: Worker, now_ms: int) -> str:
     state = STATE_LABEL.get(worker.state, safe_label(worker.state))
-    phase = safe_label(worker.current_tool or worker.phase or state)
     if worker.max_turns is None:
         turns = "%s turns, no ceiling" % (
             worker.turn_count if worker.turn_count is not None else "?"
@@ -155,12 +168,19 @@ def worker_secondary(worker: Worker, now_ms: int) -> str:
         worker.tool_call_count,
         "" if worker.tool_call_count == 1 else "s",
     )
+    # The latest host-observed tool call (with its bounded argument summary)
+    # replaces the bare phase token so the picker row answers "what is it
+    # doing" without opening the transcript.
+    action = latest_action(worker)
+    focus = action if action is not None else safe_label(
+        worker.current_tool or worker.phase or state
+    )
     return bounded_text(
         "%s · %s · %s · %s/%s · %s · %s · %s · %s%s"
         % (
             state,
             duration_label(worker.elapsed_ms(now_ms)),
-            phase,
+            focus,
             worker.profile,
             worker.effective_model,
             tool_calls,
@@ -247,6 +267,18 @@ def detail_body(worker: Worker, now_ms: int) -> str:
         lines.append("Artifacts:")
         for artifact in worker.artifacts:
             lines.append("- %s" % safe_label(artifact.label or artifact.identifier))
+    if worker.recent_tools:
+        lines.append("Recent tool activity (host-observed, latest last):")
+        for entry in worker.recent_tools:
+            args = entry.get("args") or ""
+            action = "%s %s" % (entry["name"], args) if args else str(entry["name"])
+            if entry.get("finished_at_ms") is None:
+                marker = "running"
+            elif entry.get("error"):
+                marker = "error"
+            else:
+                marker = "ok"
+            lines.append("- [%s] %s" % (marker, action))
     if worker.summary is not None:
         lines.extend(["", "Host-observed final summary (unsafe controls escaped):", worker.summary])
     if worker.last_error is not None:
@@ -308,7 +340,9 @@ def build_snapshot(
             node["parent_id"] = parent_node_id
         nodes.append(node)
 
-        phase = safe_label(worker.current_tool or worker.phase or worker.state)
+        phase = latest_action(worker) or safe_label(
+            worker.current_tool or worker.phase or worker.state
+        )
         metrics: Dict[str, Any] = {
             "tool_calls": worker.tool_call_count,
             "input_tokens": worker.input_tokens or 0,
@@ -383,13 +417,15 @@ def narrow_list(workers: Sequence[Worker], now_ms: int) -> str:
         return "\n".join(lines)
     for index, worker in enumerate(ordered):
         branch = "└─" if index == len(ordered) - 1 else "├─"
+        action = latest_action(worker) or ""
         lines.append(
-            "%s %-20s %-10s %s  %s"
+            "%s %-20s %-10s %s  %s  %s"
             % (
                 branch,
                 bounded_text(worker.name, 20),
                 STATE_LABEL.get(worker.state, worker.state),
                 duration_label(worker.elapsed_ms(now_ms)),
+                bounded_text(action, 80) if action else "-",
                 worker.agent_id,
             )
         )
