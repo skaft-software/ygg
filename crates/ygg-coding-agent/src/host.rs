@@ -2186,11 +2186,9 @@ mod tests {
     #[test]
     fn outbound_serialization_never_crosses_its_bound() {
         let oversized = serde_json::json!({"text": "x".repeat(MAX_FRAME_BYTES)});
-        assert!(
-            serialize_bounded(&oversized, MAX_FRAME_BYTES - 1)
-                .unwrap()
-                .is_none()
-        );
+        assert!(serialize_bounded(&oversized, MAX_FRAME_BYTES - 1)
+            .unwrap()
+            .is_none());
 
         let bounded = serialize_bounded(&serde_json::json!({"ok": true}), 128)
             .unwrap()
@@ -2231,11 +2229,9 @@ mod tests {
         let mut request = base_request(root.path().to_path_buf());
         request.resume_session = Some(outside);
         let error = session_selection(&sessions, &request).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("must stay inside the configured session directory")
-        );
+        assert!(error
+            .to_string()
+            .contains("must stay inside the configured session directory"));
 
         let directory = sessions.join("not-a-file.jsonl");
         std::fs::create_dir(&directory).unwrap();
@@ -2286,11 +2282,9 @@ mod tests {
 
         request.image_paths = vec![outside_image];
         let error = load_user_input(&request, "inspect".into(), &model).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("outside the configured workspace")
-        );
+        assert!(error
+            .to_string()
+            .contains("outside the configured workspace"));
     }
 
     #[test]
@@ -2341,11 +2335,9 @@ mod tests {
             ModalitySet::none().with(Modality::Image),
         );
         let error = load_user_input(&request, "listen".into(), &image_only).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not support native WAV audio input")
-        );
+        assert!(error
+            .to_string()
+            .contains("does not support native WAV audio input"));
 
         let advertised_on_unsupported_protocol = model_with_inputs(
             Protocol::OpenAiResponses,

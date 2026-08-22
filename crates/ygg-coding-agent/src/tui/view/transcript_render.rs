@@ -10,8 +10,8 @@ use super::surface_frame::decorate_surface;
 use super::surface_layout::{compile_surface_plan, surface_roles};
 use super::terminal_text::sanitize_for_terminal;
 use super::tool_render::{
-    render_compact_tool_output, render_diff_only, tool_diff,
-    tool_display_label, tool_value_indent, tool_value_indent_width, without_redundant_tool_lead,
+    render_compact_tool_output, render_diff_only, tool_diff, tool_display_label, tool_value_indent,
+    tool_value_indent_width, without_redundant_tool_lead,
 };
 use super::transcript_cache::{RenderedTranscriptBlock, SurfaceGeometry};
 use super::{
@@ -36,26 +36,19 @@ fn extension_activity_state_label(state: ygg_agent::ExtensionPresentationState) 
     }
 }
 
-fn render_subagent_activity_panel(
-    panel: &ToolPanel,
-    theme: &YggTheme,
-    width: u16,
-    verbose_tools: bool,
-) -> Vec<String> {
+fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
     let Some(view) = panel.subagent_activity.as_ref() else {
         return Vec::new();
     };
     let label = theme.bold(&theme.fg("foreground", "Subagents"));
     let mut lines = vec![label];
-    let limit = if panel.subagent_activity_expanded || verbose_tools {
-        5
-    } else {
-        2
-    };
+    // The host caps concurrent children at eight with depth one, so the full
+    // roster always fits; hiding rows behind a recency window leaves running
+    // workers invisible.
     let unicode = theme.unicode();
 
     if !view.telemetry.is_empty() {
-        let children = view.telemetry.iter().rev().take(limit).collect::<Vec<_>>();
+        let children = &view.telemetry[..];
         let task_width = children
             .iter()
             .map(|child| visible_width(&sanitize_for_terminal(&child.task_name)))
@@ -124,7 +117,7 @@ fn render_subagent_activity_panel(
             ));
         }
     } else {
-        let activities = view.activities.iter().rev().take(limit).collect::<Vec<_>>();
+        let activities = &view.activities[..];
         let summary_width = activities
             .iter()
             .map(|activity| visible_width(&sanitize_for_terminal(&activity.summary)))
@@ -226,12 +219,7 @@ pub(super) fn render_block_planned(
             content_background,
         ),
         TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
-            finish_transcript_block(render_subagent_activity_panel(
-                panel,
-                theme,
-                width,
-                verbose_tools,
-            ))
+            finish_transcript_block(render_subagent_activity_panel(panel, theme, width))
         }
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")

@@ -101,16 +101,11 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
         width,
     )];
     let unicode = state.theme.unicode();
-    // Collapsed: the two most recent children. Expanded: the five most
-    // recent, so a large team cannot push the whole frame past the viewport
-    // (the full roster stays one /subagents away).
-    let limit = if state.subagent_activity_expanded {
-        5
-    } else {
-        2
-    };
+    // The host caps concurrent children at eight with depth one, so the full
+    // roster always fits; hiding rows behind a recency window leaves running
+    // workers invisible.
     if !view.telemetry.is_empty() {
-        let children = view.telemetry.iter().rev().take(limit).collect::<Vec<_>>();
+        let children = &view.telemetry[..];
         for (index, child) in children.iter().rev().enumerate() {
             let last = index + 1 == children.len();
             let branch = match (unicode, last) {
@@ -228,7 +223,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             width,
         ));
     } else {
-        let activities = view.activities.iter().rev().take(limit).collect::<Vec<_>>();
+        let activities = &view.activities[..];
         for (index, activity) in activities.iter().rev().enumerate() {
             let last = index + 1 == activities.len();
             let branch = match (unicode, last) {
@@ -338,7 +333,10 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
         Vec::new()
     };
     let subagent_limit = rows.saturating_sub(header.len() + error.len() + composer.len() + 1);
-    subagents.truncate(subagent_limit.min(8));
+    // The roster is bounded by the host's eight-concurrent-children cap, but
+    // each child renders several rows, so only the viewport bounds how much
+    // of the strip shows.
+    subagents.truncate(subagent_limit);
     if state.panel.is_some() {
         // The focused picker must retain at least its filter row and cursor,
         // even when a tiny terminal also has a wrapped error message.

@@ -12,39 +12,38 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
-    AgentCompactionMode, AgentError, AgentEvent, EntryId, GoalDecision, GoalStatus, GoalTurnSource,
-    Run, RunControl, Session, analyze_session_cache_stats,
+    analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
+    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
-    Bootstrap, build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive,
+    build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
 };
 use crate::app::{
-    App, Reconfig, apply_reconfig, level_from_reasoning, reasoning_label,
-    supported_levels_with_subagents, thinking_to_reasoning_with_subagents,
+    apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
+    thinking_to_reasoning_with_subagents, App, Reconfig,
 };
 use crate::commands::{self, Command};
 use crate::compaction::{
-    CompactionOutcome, attempt_compaction, context_window, estimate_next_request_tokens,
+    attempt_compaction, context_window, estimate_next_request_tokens, CompactionOutcome,
 };
 use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::{HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::RunId;
-use crate::prompts::{RenderedPrompt, render_and_record};
+use crate::prompts::{render_and_record, RenderedPrompt};
 use crate::resources::{compose_instructions, expand_skill_command};
 use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
-    SubagentPickerSnapshot, confirmation_picker, extension_confirmation_picker,
-    extension_input_picker, extension_picker, optional_model_picker, read_only_document,
-    read_only_document_live, session_picker, subagent_picker, theme_picker, thinking_picker,
-    tool_input_picker,
+    confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
+    optional_model_picker, read_only_document, read_only_document_live, session_picker,
+    subagent_picker, theme_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
 };
 use crate::tui::theme::{
-    TerminalBackground, available_themes, background_from_terminal_rgb,
-    load_named_theme_for_background, load_theme, load_theme_for_background,
+    available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
+    load_theme_for_background, TerminalBackground,
 };
 use crate::tui::view::InteractiveShell;
 
@@ -2442,16 +2441,23 @@ where
             return Ok(());
         }
         let notices = extensions.drain_events();
-        let (title, entries) = subagent_view_entries(extensions)
-            .expect("entries checked non-empty above");
+        let (title, entries) =
+            subagent_view_entries(extensions).expect("entries checked non-empty above");
         let initial = subagent_picker_snapshot(&title, &entries, notices);
         let selected_id = {
             let mut refresh = SubagentRefreshContext {
                 extensions,
                 last_error: None,
             };
-            subagent_picker(shell, input, initial, 0, &mut refresh, refresh_subagent_snapshot)
-                .await?
+            subagent_picker(
+                shell,
+                input,
+                initial,
+                0,
+                &mut refresh,
+                refresh_subagent_snapshot,
+            )
+            .await?
         };
         let Some(selected_id) = selected_id else {
             return Ok(());
@@ -2464,8 +2470,13 @@ where
         // the durable session through `App`.
         if let Some((_, entries)) = subagent_view_entries(extensions) {
             if let Some(entry) = entries.iter().find(|entry| entry.node_id == selected_id) {
-                read_only_document(shell, input, entry.label.clone(), entry.fallback_detail.clone())
-                    .await?;
+                read_only_document(
+                    shell,
+                    input,
+                    entry.label.clone(),
+                    entry.fallback_detail.clone(),
+                )
+                .await?;
             } else {
                 shell.notice("subagent state changed; select it again to view");
             }
@@ -4502,11 +4513,9 @@ mod tests {
                 "Disable ygg-web-search"
             ]
         );
-        assert!(
-            descriptions[0]
-                .as_deref()
-                .is_some_and(|description| description.contains("API key"))
-        );
+        assert!(descriptions[0]
+            .as_deref()
+            .is_some_and(|description| description.contains("API key")));
 
         let (items, _) = web_search_menu_entries(false);
         assert_eq!(items, ["Brave Search (recommended)", "SearXNG"]);
@@ -4835,11 +4844,9 @@ mod tests {
             let mut quit_requested = false;
             handle_active_command(&mut shell, command, &mut queue, &mut quit_requested);
 
-            assert!(
-                shell
-                    .debug_snapshot()
-                    .contains("theme commands are available at the next idle boundary")
-            );
+            assert!(shell
+                .debug_snapshot()
+                .contains("theme commands are available at the next idle boundary"));
             assert!(queue.is_empty());
             assert!(!quit_requested);
         }
@@ -4853,11 +4860,9 @@ mod tests {
             let mut quit_requested = false;
             handle_active_command(&mut shell, command, &mut queue, &mut quit_requested);
 
-            assert!(
-                shell
-                    .debug_snapshot()
-                    .contains("cost and cache reports are available at the next idle boundary")
-            );
+            assert!(shell
+                .debug_snapshot()
+                .contains("cost and cache reports are available at the next idle boundary"));
             assert!(queue.is_empty());
             assert!(!quit_requested);
         }

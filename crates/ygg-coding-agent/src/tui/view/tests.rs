@@ -6087,10 +6087,7 @@ fn event_dot_tracking_stays_bounded_in_long_sessions() {
         assert!(event_dot_animating(&state));
         index
     };
-    shell
-        .state
-        .borrow_mut()
-        .advance_event_dot_animation();
+    shell.state.borrow_mut().advance_event_dot_animation();
     {
         let state = shell.state.borrow();
         assert_eq!(state.block_revisions[active_index], 1);
@@ -6534,8 +6531,7 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
         None,
     );
 
-    let details =
-        render_compact_bash_output(&panel, &theme, 80, false, &tool_value_indent("Bash"));
+    let details = render_compact_bash_output(&panel, &theme, 80, false, &tool_value_indent("Bash"));
     assert!(
         details[0].contains("\x1b[38;2;"),
         "hidden-line metadata should use the muted metadata style: {details:?}"
@@ -7191,10 +7187,11 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(collapsed.contains("Audit release surface"), "{collapsed}");
-    assert!(!collapsed.contains("Read release history"), "{collapsed}");
+    assert!(collapsed.contains("Read release history"), "{collapsed}");
+    assert!(collapsed.contains("Scan changelog"), "{collapsed}");
 
-    // ctrl+o toggles the transcript roster between the two most recent children
-    // and the five most recent.
+    // Every child renders regardless of expansion; ctrl+o remains reserved
+    // for verbose tool disclosure when no subagent activity is visible.
     shell.expand_focused_tool();
     assert!(shell.state.borrow().subagent_activity_expanded);
     assert!(shell.state.borrow().subagent_activity.is_some());

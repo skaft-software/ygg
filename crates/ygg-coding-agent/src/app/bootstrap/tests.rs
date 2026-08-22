@@ -1390,9 +1390,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
         output: 300,
         ..Default::default()
     });
-    registry
-        .providers
-        .insert("metered-gateway".into(), priced);
+    registry.providers.insert("metered-gateway".into(), priced);
     registry.providers.insert(
         "invalid/provider".into(),
         provider(

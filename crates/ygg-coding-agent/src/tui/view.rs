@@ -1985,7 +1985,11 @@ impl InteractiveShell {
                     }
                 }
             }
-            AgentEvent::ToolFinished { id, result, duration } => {
+            AgentEvent::ToolFinished {
+                id,
+                result,
+                duration,
+            } => {
                 let estimated_result_tokens = match result {
                     Ok(output) => output.media().iter().fold(
                         crate::compaction::estimate_text_tokens(&output.text),
@@ -2058,10 +2062,8 @@ impl InteractiveShell {
                     state.last_turn_first_token = requested_at
                         .map(|requested| started_at.saturating_duration_since(requested));
                 }
-                state.last_turn_provider_elapsed =
-                    requested_at.map(|requested| {
-                        Instant::now().saturating_duration_since(requested)
-                    });
+                state.last_turn_provider_elapsed = requested_at
+                    .map(|requested| Instant::now().saturating_duration_since(requested));
                 // Provider usage is authoritative at this boundary. Prompt
                 // cache buckets all occupy context, while reasoning is already
                 // a subset of output, so canonical total_tokens is exactly the
