@@ -1,8 +1,14 @@
-"""Strict, bounded configuration for the authenticated OpenSSH adapter."""
+"""Strict, bounded configuration for the ygg-ssh portal registry.
+
+The registry only maps stable target identifiers to OpenSSH aliases that the
+user already configured and authenticated in their own ``~/.ssh/config``.
+It deliberately holds no limits, authority levels, or project trust chains:
+the agent operates the remote host through its normal shell tool, and the
+remote account's own OpenSSH-enforced permissions are the boundary.
+"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -12,57 +18,38 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Optional, Union
 
 
-MAX_CONFIG_BYTES = 256 * 1024
-MAX_TRUSTED_PROJECTS = 8
+MAX_CONFIG_BYTES = 64 * 1024
 MAX_TARGETS = 32
 MAX_TARGET_ID_BYTES = 32
 MAX_ALIAS_BYTES = 128
 MAX_LABEL_BYTES = 96
 MAX_REMOTE_PATH_BYTES = 4096
-_TARGET_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+TARGET_ID_PATTERN = r"[a-z][a-z0-9-]{0,31}"
+_TARGET_ID = re.compile(rf"^{TARGET_ID_PATTERN}$")
 # A deliberately conservative OpenSSH destination alias. User, port, ProxyJump,
 # and identity selection remain in the user's OpenSSH configuration and cannot
-# be introduced through model or tool arguments.
+# be introduced through model or command arguments.
 _SSH_ALIAS = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-_HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ConfigError(ValueError):
-    """Configuration failed a bounded schema or trust check."""
-
-
-@dataclass(frozen=True)
-class Limits:
-    max_sessions: int = 8
-    connect_timeout_ms: int = 10_000
-    operation_timeout_ms: int = 30_000
-    max_output_bytes: int = 128 * 1024
-    max_file_bytes: int = 128 * 1024
-    max_command_args: int = 64
-    max_command_bytes: int = 32 * 1024
-    max_activities: int = 64
-    health_interval_ms: int = 2_000
-    shutdown_timeout_ms: int = 1_500
-    termination_grace_ms: int = 250
+    """Configuration failed a bounded schema or file-trust check."""
 
 
 @dataclass(frozen=True)
 class Target:
-    """One explicit OpenSSH alias and fixed remote working directory."""
+    """One explicit OpenSSH alias with an optional working-directory hint."""
 
     id: str
     alias: str
     label: str
-    remote_cwd: str
-    authority: str = "read-only"
+    cwd: Optional[str] = None
     enabled: bool = True
-    scope: str = "user"
 
 
 @dataclass(frozen=True)
 class SshConfig:
     targets: tuple[Target, ...]
-    limits: Limits = Limits()
     source: Optional[Path] = None
 
     @classmethod
@@ -72,21 +59,11 @@ class SshConfig:
     def target(self, target_id: str) -> Optional[Target]:
         return next((target for target in self.targets if target.id == target_id), None)
 
+    def enabled_targets(self) -> tuple[Target, ...]:
+        return tuple(target for target in self.targets if target.enabled)
 
-_LIMIT_FIELDS: dict[str, tuple[str, int, int]] = {
-    "maxSessions": ("max_sessions", 1, 16),
-    "connectTimeoutMs": ("connect_timeout_ms", 100, 30_000),
-    "operationTimeoutMs": ("operation_timeout_ms", 100, 120_000),
-    "maxOutputBytes": ("max_output_bytes", 1024, 128 * 1024),
-    "maxFileBytes": ("max_file_bytes", 1024, 128 * 1024),
-    "maxCommandArgs": ("max_command_args", 1, 128),
-    "maxCommandBytes": ("max_command_bytes", 256, 64 * 1024),
-    "maxActivities": ("max_activities", 1, 128),
-    "healthIntervalMs": ("health_interval_ms", 250, 60_000),
-    "shutdownTimeoutMs": ("shutdown_timeout_ms", 100, 5_000),
-    "terminationGraceMs": ("termination_grace_ms", 25, 2_000),
-}
-_TARGET_FIELDS = {"alias", "label", "remoteCwd", "authority", "enabled"}
+
+_TARGET_FIELDS = {"alias", "label", "cwd", "enabled"}
 
 
 def default_config_path() -> Path:
@@ -95,18 +72,8 @@ def default_config_path() -> Path:
     return Path.home() / ".ygg" / "ssh.json"
 
 
-def load_config(
-    path: Optional[Union[os.PathLike[str], str]] = None,
-    *,
-    workspace: Optional[Union[os.PathLike[str], str]] = None,
-) -> SshConfig:
-    """Load a user file and explicitly digest-pinned project files.
-
-    Missing default configuration is valid and inert. An explicit path must
-    exist. Project configuration is considered only when the user file names an
-    absolute file below the active workspace's ``.ygg`` directory and pins the
-    exact bytes.
-    """
+def load_config(path: Optional[Union[os.PathLike[str], str]] = None) -> SshConfig:
+    """Load the user registry. A missing default file is valid and inert."""
 
     explicit = path is not None
     config_path = Path(path) if path is not None else default_config_path()
@@ -116,53 +83,11 @@ def load_config(
         return SshConfig.empty(config_path)
 
     root, _root_bytes, canonical_path = _read_json_file(config_path)
-    _require_keys(root, {"version", "limits", "targets", "trustedProjects"}, "config")
-    _require_version(root)
-    limits = _parse_limits(root.get("limits", {}))
-    if limits.max_file_bytes > limits.max_output_bytes:
-        raise ConfigError("maxFileBytes cannot exceed maxOutputBytes")
-    targets = _parse_targets(root.get("targets", {}), scope="user")
-
-    workspace_path = Path(workspace).resolve() if workspace is not None else None
-    projects = root.get("trustedProjects", [])
-    if not isinstance(projects, list):
-        raise ConfigError("trustedProjects must be an array")
-    if len(projects) > MAX_TRUSTED_PROJECTS:
-        raise ConfigError(f"trustedProjects exceeds the {MAX_TRUSTED_PROJECTS}-file limit")
-    if projects and workspace_path is None:
-        raise ConfigError("trusted project configuration requires an active workspace")
-
-    seen_ids = {target.id for target in targets}
-    seen_aliases = {target.alias.casefold() for target in targets}
-    for index, descriptor in enumerate(projects):
-        project_path, expected_digest = _trusted_project_descriptor(descriptor, index)
-        assert workspace_path is not None
-        project_root = (workspace_path / ".ygg").resolve(strict=False)
-        try:
-            canonical_project = project_path.resolve(strict=True)
-        except OSError as error:
-            raise ConfigError("cannot resolve trusted project SSH configuration") from error
-        try:
-            canonical_project.relative_to(project_root)
-        except ValueError as error:
-            raise ConfigError("a trusted project SSH configuration is outside workspace/.ygg") from error
-        project, project_bytes, _project_file = _read_json_file(project_path)
-        if hashlib.sha256(project_bytes).hexdigest() != expected_digest:
-            raise ConfigError("a trusted project SSH configuration digest does not match")
-        _require_keys(project, {"version", "targets"}, "trusted project config")
-        _require_version(project)
-        project_targets = _parse_targets(project.get("targets", {}), scope="project")
-        if seen_ids.intersection(target.id for target in project_targets):
-            raise ConfigError("target identifiers must be unique across user and project config")
-        if seen_aliases.intersection(target.alias.casefold() for target in project_targets):
-            raise ConfigError("OpenSSH aliases must be unique across user and project config")
-        targets.extend(project_targets)
-        seen_ids.update(target.id for target in project_targets)
-        seen_aliases.update(target.alias.casefold() for target in project_targets)
-
-    if len(targets) > MAX_TARGETS:
-        raise ConfigError("configured SSH targets exceed the bounded target limit")
-    return SshConfig(targets=tuple(targets), limits=limits, source=canonical_path)
+    _require_keys(root, {"version", "targets"}, "config")
+    if root.get("version") != 1:
+        raise ConfigError("SSH configuration version must be 1")
+    targets = _parse_targets(root.get("targets", {}))
+    return SshConfig(targets=tuple(targets), source=canonical_path)
 
 
 def _read_json_file(path: Path) -> tuple[dict[str, Any], bytes, Path]:
@@ -205,23 +130,7 @@ def _read_json_file(path: Path) -> tuple[dict[str, Any], bytes, Path]:
     return value, data, path.resolve(strict=True)
 
 
-def _require_version(value: Mapping[str, Any]) -> None:
-    if value.get("version") != 1:
-        raise ConfigError("SSH configuration version must be 1")
-
-
-def _parse_limits(value: Any) -> Limits:
-    if not isinstance(value, dict):
-        raise ConfigError("limits must be an object")
-    _require_keys(value, set(_LIMIT_FIELDS), "limits")
-    parsed = Limits().__dict__.copy()
-    for public_name, item in value.items():
-        internal_name, minimum, maximum = _LIMIT_FIELDS[public_name]
-        parsed[internal_name] = _bounded_integer(item, public_name, minimum, maximum)
-    return Limits(**parsed)
-
-
-def _parse_targets(value: Any, *, scope: str) -> list[Target]:
+def _parse_targets(value: Any) -> list[Target]:
     if not isinstance(value, dict):
         raise ConfigError("targets must be an object")
     if len(value) > MAX_TARGETS:
@@ -248,63 +157,26 @@ def _parse_targets(value: Any, *, scope: str) -> list[Target]:
         label = _bounded_text(
             descriptor.get("label", alias), f"target {target_id} label", MAX_LABEL_BYTES
         )
-        remote_cwd = _bounded_text(
-            descriptor.get("remoteCwd"),
-            f"target {target_id} remoteCwd",
-            MAX_REMOTE_PATH_BYTES,
-        )
-        remote_path = PurePosixPath(remote_cwd)
-        if (
-            not remote_path.is_absolute()
-            or str(remote_path) != remote_cwd
-            or any(part in {"", ".", ".."} for part in remote_path.parts[1:])
-        ):
-            raise ConfigError(f"target {target_id} remoteCwd must be a normalized absolute POSIX path")
-        authority = descriptor.get("authority", "read-only")
-        if authority not in {"read-only", "read-write"}:
-            raise ConfigError(f"target {target_id} authority must be read-only or read-write")
+        cwd = descriptor.get("cwd")
+        if cwd is not None:
+            cwd = _bounded_text(cwd, f"target {target_id} cwd", MAX_REMOTE_PATH_BYTES)
+            remote_path = PurePosixPath(cwd)
+            if (
+                not remote_path.is_absolute()
+                or str(remote_path) != cwd
+                or any(part in {"", ".", ".."} for part in remote_path.parts[1:])
+            ):
+                raise ConfigError(f"target {target_id} cwd must be a normalized absolute POSIX path")
         enabled = descriptor.get("enabled", True)
         if not isinstance(enabled, bool):
             raise ConfigError(f"target {target_id} enabled must be a boolean")
-        parsed.append(
-            Target(
-                id=target_id,
-                alias=alias,
-                label=label,
-                remote_cwd=remote_cwd,
-                authority=authority,
-                enabled=enabled,
-                scope=scope,
-            )
-        )
+        parsed.append(Target(id=target_id, alias=alias, label=label, cwd=cwd, enabled=enabled))
     return parsed
-
-
-def _trusted_project_descriptor(value: Any, index: int) -> tuple[Path, str]:
-    if not isinstance(value, dict):
-        raise ConfigError(f"trustedProjects[{index}] must be an object")
-    _require_keys(value, {"path", "sha256"}, f"trustedProjects[{index}]")
-    path_value = _bounded_text(value.get("path"), "trusted project path", MAX_REMOTE_PATH_BYTES)
-    project_path = Path(path_value)
-    if not project_path.is_absolute():
-        raise ConfigError("trusted project configuration paths must be absolute")
-    digest = value.get("sha256")
-    if not isinstance(digest, str) or not _HEX_DIGEST.fullmatch(digest):
-        raise ConfigError("trusted project sha256 must be 64 lowercase hexadecimal characters")
-    return project_path, digest
 
 
 def _require_keys(value: Mapping[str, Any], allowed: set[str], label: str) -> None:
     if set(value) - allowed:
         raise ConfigError(f"{label} contains unknown fields")
-
-
-def _bounded_integer(value: Any, label: str, minimum: int, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ConfigError(f"{label} must be an integer")
-    if not minimum <= value <= maximum:
-        raise ConfigError(f"{label} must be between {minimum} and {maximum}")
-    return value
 
 
 def _bounded_text(value: Any, label: str, maximum: int) -> str:

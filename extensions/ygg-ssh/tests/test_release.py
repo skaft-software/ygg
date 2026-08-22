@@ -22,19 +22,23 @@ REPOSITORY = ROOT.parents[1]
 
 
 class ReleaseSmokeTests(unittest.TestCase):
-    def test_manifest_is_api_02_exact_ygg_release_metadata(self):
+    def test_manifest_is_api_02_portal_metadata(self):
         self.assertIsNotNone(tomllib)
         manifest = tomllib.loads((ROOT / "extension.toml").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "ygg-ssh")
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"], "0.2.0")
         self.assertEqual(manifest["api_version"], "0.2")
         self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-ssh")
         self.assertEqual(manifest["capabilities"]["environment"], ["SSH_AUTH_SOCK"])
         self.assertTrue(manifest["capabilities"]["network"])
         self.assertTrue(manifest["capabilities"]["process"])
-        self.assertTrue(manifest["contributes"]["presentation"])
-        self.assertTrue(manifest["contributes"]["confirmations"])
+        contributes = manifest["contributes"]
+        self.assertNotIn("tools", contributes)
+        self.assertNotIn("confirmations", contributes)
+        self.assertNotIn("presentation", contributes)
+        self.assertIn("ssh", contributes["commands"])
+        self.assertTrue(contributes["context"])
         self.assertFalse((ROOT / "package.toml").exists())
 
     def test_entrypoint_vendored_sdk_and_release_files_are_self_contained(self):
@@ -44,9 +48,12 @@ class ReleaseSmokeTests(unittest.TestCase):
             "vendor/ygg_extension/extension.py",
             "vendor/ygg_extension/protocol.py",
             "ygg_ssh/runtime.py",
+            "ygg_ssh/session.py",
+            "ygg_ssh/config.py",
+            "fixtures/fake_ssh",
+            "skills/ssh-remote-work/SKILL.md",
             "config.schema.json",
             "config.example.json",
-            "fixtures/fake_ssh.py",
             "README.md",
             "CHANGELOG.md",
             "LICENSE",
@@ -136,10 +143,12 @@ class ReleaseSmokeTests(unittest.TestCase):
                 for marker in forbidden:
                     self.assertNotIn(marker, data, path)
 
-    def test_all_json_fixtures_parse(self):
-        for path in [ROOT / "config.schema.json", ROOT / "config.example.json", *(ROOT / "fixtures").rglob("*.json")]:
+    def test_all_json_fixtures_parse_and_example_is_disabled(self):
+        for path in [ROOT / "config.schema.json", ROOT / "config.example.json"]:
             with self.subTest(path=path):
                 json.loads(path.read_text(encoding="utf-8"))
+        example = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
+        self.assertFalse(example["targets"]["example"]["enabled"])
 
 
 if __name__ == "__main__":

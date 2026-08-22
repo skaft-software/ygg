@@ -1,125 +1,126 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import tempfile
 import unittest
 
-from ygg_ssh.config import ConfigError, default_config_path, load_config
+from ygg_ssh.config import ConfigError, SshConfig, load_config
 
 from .helpers import config_document, write_json
 
 
 class ConfigTests(unittest.TestCase):
-    def test_missing_default_is_inert_and_explicit_missing_fails(self):
-        self.assertEqual(default_config_path().name, "ssh.json")
-        with self.assertRaisesRegex(ConfigError, "does not exist"):
-            load_config("/definitely/missing/ygg-ssh.json")
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
 
-    def test_explicit_alias_remote_cwd_and_read_only_default(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = root / "remote"
-            remote.mkdir()
-            document = config_document(remote)
-            del document["targets"]["fixture"]["authority"]
-            config = load_config(write_json(root / "ssh.json", document))
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_explicit_missing_file_is_an_error_and_empty_config_is_inert(self):
+        with self.assertRaises(ConfigError):
+            load_config(self.root / "absent.json")
+        empty = SshConfig.empty(self.root / "absent.json")
+        self.assertEqual(empty.targets, ())
+        self.assertEqual(empty.enabled_targets(), ())
+
+    def test_valid_document_parses_targets(self):
+        path = write_json(self.root / "ssh.json", config_document())
+        config = load_config(path)
+        self.assertEqual(len(config.targets), 1)
         target = config.targets[0]
+        self.assertEqual(target.id, "fixture")
         self.assertEqual(target.alias, "fixture-alias")
-        self.assertEqual(target.authority, "read-only")
-        self.assertEqual(target.remote_cwd, str(remote))
+        self.assertEqual(target.cwd, "/srv/fixture")
+        self.assertTrue(target.enabled)
+        self.assertEqual(config.enabled_targets(), config.targets)
 
-    def test_rejects_model_style_destinations_credentials_and_unknown_fields(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            remote = root / "remote"
-            remote.mkdir()
-            for field, value in (
-                ("alias", "user@example.com"),
-                ("alias", "-oProxyCommand=bad"),
-                ("identityFile", "/tmp/key"),
-                ("port", 22),
-                ("proxyJump", "jump"),
-            ):
-                document = config_document(remote)
-                document["targets"]["fixture"][field] = value
-                if field != "alias":
-                    document["targets"]["fixture"]["alias"] = "fixture"
-                path = write_json(root / f"{field}.json", document)
-                with self.subTest(field=field), self.assertRaises(ConfigError):
+    def test_explicit_missing_path_is_an_error(self):
+        with self.assertRaises(ConfigError):
+            load_config(self.root / "absent.json")
+
+    def test_unknown_root_and_target_fields_are_rejected(self):
+        document = config_document()
+        document["limits"] = {}
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+        document = config_document()
+        document["targets"]["fixture"]["authority"] = "read-only"
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_wrong_version_is_rejected(self):
+        document = config_document()
+        document["version"] = 2
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_invalid_target_identifiers_are_rejected(self):
+        document = config_document()
+        document["targets"] = {"Bad_Id": {"alias": "ok-alias"}}
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_unsafe_alias_is_rejected(self):
+        document = config_document()
+        document["targets"]["fixture"]["alias"] = "-ProxyCommand evil"
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_duplicate_aliases_are_rejected(self):
+        document = config_document()
+        document["targets"]["other"] = {"alias": "FIXTURE-ALIAS"}
+        path = write_json(self.root / "ssh.json", document)
+        with self.assertRaises(ConfigError):
+            load_config(path)
+
+    def test_relative_or_traversing_cwd_is_rejected(self):
+        for bad in ("srv/fixture", "/srv/../etc", "/srv//fixture", "/srv/fixture/.."):
+            document = config_document()
+            document["targets"]["fixture"]["cwd"] = bad
+            path = write_json(self.root / "ssh.json", document)
+            with self.subTest(cwd=bad):
+                with self.assertRaises(ConfigError):
                     load_config(path)
 
-    def test_rejects_duplicate_keys_controls_traversal_and_unsafe_permissions(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            duplicate = root / "duplicate.json"
-            duplicate.write_text('{"version":1,"version":1,"targets":{}}', encoding="utf-8")
-            duplicate.chmod(0o600)
-            with self.assertRaisesRegex(ConfigError, "duplicate"):
-                load_config(duplicate)
+    def test_symlinked_config_is_rejected(self):
+        real = write_json(self.root / "real.json", config_document())
+        link = self.root / "link.json"
+        link.symlink_to(real)
+        with self.assertRaises(ConfigError):
+            load_config(link)
 
-            document = config_document(root)
-            document["targets"]["fixture"]["remoteCwd"] = "/srv/../secret"
-            with self.assertRaisesRegex(ConfigError, "normalized"):
-                load_config(write_json(root / "traversal.json", document))
+    def test_group_writable_config_is_rejected(self):
+        path = write_json(self.root / "ssh.json", config_document())
+        path.chmod(0o660)
+        with self.assertRaises(ConfigError):
+            load_config(path)
 
-            unsafe = write_json(root / "unsafe.json", config_document(root))
-            unsafe.chmod(0o666)
-            with self.assertRaisesRegex(ConfigError, "writable"):
-                load_config(unsafe)
+    def test_duplicate_json_keys_are_rejected(self):
+        path = self.root / "ssh.json"
+        path.write_text('{"version": 1, "version": 1, "targets": {}}\n', encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaises(ConfigError):
+            load_config(path)
 
-    def test_digest_pinned_project_config_is_merged_and_edit_fails_closed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory) / "workspace"
-            project_dir = workspace / ".ygg"
-            project_dir.mkdir(parents=True)
-            project = write_json(
-                project_dir / "ssh-project.json",
-                {
-                    "version": 1,
-                    "targets": {
-                        "project": {
-                            "alias": "project-alias",
-                            "remoteCwd": "/srv/project",
-                            "authority": "read-only",
-                        }
-                    },
-                },
-            )
-            digest = hashlib.sha256(project.read_bytes()).hexdigest()
-            user = write_json(
-                Path(directory) / "user.json",
-                {
-                    "version": 1,
-                    "targets": {},
-                    "trustedProjects": [{"path": str(project), "sha256": digest}],
-                },
-            )
-            config = load_config(user, workspace=workspace)
-            self.assertEqual(config.targets[0].scope, "project")
-            project.write_text(project.read_text(encoding="utf-8") + "\n", encoding="utf-8")
-            with self.assertRaisesRegex(ConfigError, "digest"):
-                load_config(user, workspace=workspace)
+    def test_oversized_config_is_rejected(self):
+        path = self.root / "ssh.json"
+        path.write_text('{"version": 1, "targets": {}, "pad": "' + "x" * 70_000 + '"}\n', encoding="utf-8")
+        path.chmod(0o600)
+        with self.assertRaises(ConfigError):
+            load_config(path)
 
-    def test_limits_are_capped_and_file_cannot_exceed_output(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            document = config_document(root)
-            document["limits"]["maxSessions"] = 17
-            with self.assertRaisesRegex(ConfigError, "between"):
-                load_config(write_json(root / "large.json", document))
-            document = config_document(root)
-            document["limits"]["maxOutputBytes"] = 1024
-            document["limits"]["maxFileBytes"] = 2048
-            with self.assertRaisesRegex(ConfigError, "cannot exceed"):
-                load_config(write_json(root / "mismatch.json", document))
-
-    def test_schema_and_example_are_valid_json_and_example_is_disabled(self):
-        root = Path(__file__).resolve().parents[1]
-        json.loads((root / "config.schema.json").read_text(encoding="utf-8"))
-        example = json.loads((root / "config.example.json").read_text(encoding="utf-8"))
-        self.assertFalse(example["targets"]["example-read-only"]["enabled"])
+    def test_disabled_targets_are_filtered(self):
+        document = config_document(enabled=False)
+        path = write_json(self.root / "ssh.json", document)
+        config = load_config(path)
+        self.assertEqual(config.enabled_targets(), ())
 
 
 if __name__ == "__main__":

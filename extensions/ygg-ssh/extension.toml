@@ -1,8 +1,8 @@
 name = "ygg-ssh"
-version = "0.1.0"
+version = "0.2.0"
 api_version = "0.2"
 requires_ygg = "=0.6.0-dev"
-description = "Owner-fenced adapter for explicit authenticated OpenSSH aliases"
+description = "Verified SSH portal guidance for explicit authenticated OpenSSH aliases"
 
 [entrypoint]
 command = "ygg-ssh"
@@ -14,9 +14,6 @@ network = true
 environment = ["SSH_AUTH_SOCK"]
 
 [contributes]
-tools = ["ssh_status", "ssh_exec", "ssh_read", "ssh_write", "ssh_list"]
 commands = ["ssh"]
 ui = ["status"]
 context = true
-confirmations = true
-presentation = true

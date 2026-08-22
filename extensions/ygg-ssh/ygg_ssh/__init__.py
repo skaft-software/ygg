@@ -1,15 +1,13 @@
-"""Authenticated OpenSSH adapter for Ygg."""
+"""Authenticated OpenSSH portal for Ygg."""
 
-from .config import ConfigError, Limits, SshConfig, Target, load_config
-from .manager import AdapterError, OwnerFence, SshManager
+from .config import ConfigError, SshConfig, Target, load_config
+from .session import ProbeResult, SshSessions
 
 __all__ = [
-    "AdapterError",
     "ConfigError",
-    "Limits",
-    "OwnerFence",
+    "ProbeResult",
     "SshConfig",
-    "SshManager",
+    "SshSessions",
     "Target",
     "load_config",
 ]

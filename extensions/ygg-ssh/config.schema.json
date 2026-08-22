@@ -7,48 +7,18 @@
   "required": ["version", "targets"],
   "properties": {
     "version": {"const": 1},
-    "limits": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "maxSessions": {"type": "integer", "minimum": 1, "maximum": 16},
-        "connectTimeoutMs": {"type": "integer", "minimum": 100, "maximum": 30000},
-        "operationTimeoutMs": {"type": "integer", "minimum": 100, "maximum": 120000},
-        "maxOutputBytes": {"type": "integer", "minimum": 1024, "maximum": 131072},
-        "maxFileBytes": {"type": "integer", "minimum": 1024, "maximum": 131072},
-        "maxCommandArgs": {"type": "integer", "minimum": 1, "maximum": 128},
-        "maxCommandBytes": {"type": "integer", "minimum": 256, "maximum": 65536},
-        "maxActivities": {"type": "integer", "minimum": 1, "maximum": 128},
-        "healthIntervalMs": {"type": "integer", "minimum": 250, "maximum": 60000},
-        "shutdownTimeoutMs": {"type": "integer", "minimum": 100, "maximum": 5000},
-        "terminationGraceMs": {"type": "integer", "minimum": 25, "maximum": 2000}
-      }
-    },
     "targets": {
       "type": "object",
       "maxProperties": 32,
       "propertyNames": {"pattern": "^[a-z][a-z0-9-]{0,31}$"},
       "additionalProperties": {"$ref": "#/$defs/target"}
-    },
-    "trustedProjects": {
-      "type": "array",
-      "maxItems": 8,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["path", "sha256"],
-        "properties": {
-          "path": {"type": "string", "minLength": 1, "maxLength": 4096},
-          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-        }
-      }
     }
   },
   "$defs": {
     "target": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["alias", "remoteCwd"],
+      "required": ["alias"],
       "properties": {
         "alias": {
           "type": "string",
@@ -57,8 +27,13 @@
           "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
         },
         "label": {"type": "string", "minLength": 1, "maxLength": 96},
-        "remoteCwd": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/"},
-        "authority": {"enum": ["read-only", "read-write"], "default": "read-only"},
+        "cwd": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/",
+          "description": "Optional absolute POSIX working-directory hint surfaced to the model."
+        },
         "enabled": {"type": "boolean", "default": true}
       }
     }
