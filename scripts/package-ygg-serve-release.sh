@@ -48,6 +48,11 @@ if ! git -C "$repository_directory" diff-index --quiet HEAD --; then
     printf 'release source has tracked changes; package an immutable clean commit\n' >&2
     exit 1
 fi
+untracked_files=$(git -C "$repository_directory" ls-files --others --exclude-standard)
+if [[ -n "$untracked_files" ]]; then
+    printf 'release source has untracked files; package an immutable clean commit\n' >&2
+    exit 1
+fi
 binary="$repository_directory/target/$target/release/ygg"
 package_version=${version#v}
 artifact_name="ygg-serve-${package_version}-${target}"
@@ -85,7 +90,7 @@ args = ["serve"]
 sha256 = "$binary_sha256"
 
 [capabilities]
-network = "loopback"
+network = "loopback+explicit-n0-relay"
 process = true
 filesystem = "workspace"
 EOF

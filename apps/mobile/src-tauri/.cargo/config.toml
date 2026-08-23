@@ -1,0 +1,4 @@
+# Keep lockfile updates on releases compatible with the shell's Rust 1.86 MSRV
+# unless a dependency requires an explicit reviewed pin.
+[resolver]
+incompatible-rust-versions = "fallback"

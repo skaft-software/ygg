@@ -1,0 +1,4 @@
+# Keep repository lockfile updates on releases compatible with Ygg's Rust 1.86 MSRV
+# unless a dependency requires an explicit reviewed pin.
+[resolver]
+incompatible-rust-versions = "fallback"

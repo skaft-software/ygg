@@ -9,6 +9,10 @@ import type {
   CommandAck,
   CommandDiscovery,
   CommandSuggestion,
+  CompanionCatalog,
+  CompanionDevice,
+  CompanionDevicePlatform,
+  CompanionPairingInvitation,
   ContextStatus,
   ContextTotals,
   ContextUsage,
@@ -216,6 +220,173 @@ export class UnsupportedWireCommandError extends Error {
     super(`${commandType}: ${message}`);
     this.name = "UnsupportedWireCommandError";
   }
+}
+
+const companionIdentifierPattern = /^[A-Za-z0-9_.:-]{1,128}$/u;
+
+function companionIdentifier(value: unknown, path: string): string {
+  const decoded = string(value, path);
+  if (!companionIdentifierPattern.test(decoded)) {
+    throw new WireContractError(path, "must be a bounded companion identifier");
+  }
+  return decoded;
+}
+
+function companionText(value: unknown, path: string, maximum: number): string {
+  const decoded = boundedString(value, path, maximum);
+  if (
+    [...decoded].some((character) => {
+      const codePoint = character.codePointAt(0);
+      return (
+        codePoint !== undefined &&
+        (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f))
+      );
+    })
+  ) {
+    throw new WireContractError(path, "must not contain control characters");
+  }
+  return decoded;
+}
+
+function companionPlatform(
+  value: unknown,
+  path: string,
+): CompanionDevicePlatform {
+  return enumeration(value, path, ["ios", "android", "macos", "other"] as const);
+}
+
+function optionalTimestamp(value: unknown, path: string): number | undefined {
+  return value === undefined ? undefined : number(value, path);
+}
+
+export function projectCompanionDevice(value: unknown): CompanionDevice {
+  const wire = object(value, "companionDevice", [
+    "id",
+    "name",
+    "platform",
+    "pairedAtMs",
+    "lastSeenAtMs",
+    "revokedAtMs",
+    "connected",
+  ]);
+  const revokedAtMs = optionalTimestamp(
+    wire.revokedAtMs,
+    "companionDevice.revokedAtMs",
+  );
+  const connected = boolean(wire.connected, "companionDevice.connected");
+  if (revokedAtMs !== undefined && connected) {
+    throw new WireContractError(
+      "companionDevice.connected",
+      "must be false after revocation",
+    );
+  }
+  return {
+    id: companionIdentifier(wire.id, "companionDevice.id"),
+    name: companionText(wire.name, "companionDevice.name", 128),
+    platform: companionPlatform(wire.platform, "companionDevice.platform"),
+    pairedAtMs: number(wire.pairedAtMs, "companionDevice.pairedAtMs"),
+    lastSeenAtMs: optionalTimestamp(
+      wire.lastSeenAtMs,
+      "companionDevice.lastSeenAtMs",
+    ),
+    revokedAtMs,
+    connected,
+  };
+}
+
+export function projectCompanionDevices(value: unknown): CompanionDevice[] {
+  const devices = array(value, "companionDevices");
+  if (devices.length > 128) {
+    throw new WireContractError("companionDevices", "must contain at most 128 devices");
+  }
+  return devices.map(projectCompanionDevice);
+}
+
+export function projectCompanionCatalog(value: unknown): CompanionCatalog {
+  const wire = object(value, "companionCatalog", [
+    "revision",
+    "devices",
+    "pending",
+    "invitationExpiresAtMs",
+  ]);
+  const pending = array(wire.pending, "companionCatalog.pending");
+  if (pending.length > 3) {
+    throw new WireContractError(
+      "companionCatalog.pending",
+      "must contain at most 3 requests",
+    );
+  }
+  return {
+    revision: number(wire.revision, "companionCatalog.revision"),
+    devices: projectCompanionDevices(wire.devices),
+    pending: pending.map((value, index) => {
+      const path = `companionCatalog.pending[${index}]`;
+      const request = object(value, path, [
+        "requestId",
+        "device",
+        "state",
+        "phrase",
+        "expiresAtMs",
+      ]);
+      const device = object(request.device, `${path}.device`, [
+        "name",
+        "platform",
+        "appVersion",
+      ]);
+      return {
+        requestId: companionIdentifier(request.requestId, `${path}.requestId`),
+        device: {
+          name: companionText(device.name, `${path}.device.name`, 128),
+          platform: companionPlatform(
+            device.platform,
+            `${path}.device.platform`,
+          ),
+          appVersion: companionText(
+            device.appVersion,
+            `${path}.device.appVersion`,
+            64,
+          ),
+        },
+        state: enumeration(request.state, `${path}.state`, [
+          "pending",
+          "approved",
+        ] as const),
+        phrase: companionText(request.phrase, `${path}.phrase`, 128),
+        expiresAtMs: number(request.expiresAtMs, `${path}.expiresAtMs`),
+      };
+    }),
+    invitationExpiresAtMs: optionalTimestamp(
+      wire.invitationExpiresAtMs,
+      "companionCatalog.invitationExpiresAtMs",
+    ),
+  };
+}
+
+export function projectCompanionPairingInvitation(
+  value: unknown,
+): CompanionPairingInvitation {
+  const wire = object(value, "companionPairingInvitation", [
+    "ticket",
+    "expiresAtMs",
+  ]);
+  const ticket = boundedString(
+    wire.ticket,
+    "companionPairingInvitation.ticket",
+    4_096,
+  );
+  if (!ticket.startsWith("ygg://pair/v1/")) {
+    throw new WireContractError(
+      "companionPairingInvitation.ticket",
+      "must use the supported pairing scheme",
+    );
+  }
+  return {
+    ticket,
+    expiresAtMs: number(
+      wire.expiresAtMs,
+      "companionPairingInvitation.expiresAtMs",
+    ),
+  };
 }
 
 const liveStates = [
@@ -4154,10 +4325,14 @@ export function projectHostBootstrap(value: unknown): HostBootstrapProjection {
         "hostBootstrap.capabilities.lanClients",
       ),
       terminal,
-      // These describe UI paths that require more than a host capability bit.
-      // Keep pairing disabled until an authenticated pairing lifecycle exists.
+      // Device administration is mounted only for the authenticated loopback
+      // owner, and the backend advertises connectedDevices only while the
+      // explicitly enabled companion runtime is healthy.
       attachmentIngest: attachments && attachmentPolicy !== undefined,
-      pairDevices: false,
+      pairDevices: boolean(
+        capabilities.connectedDevices,
+        "hostBootstrap.capabilities.connectedDevices",
+      ),
       sessionMetadata,
       sessionBranches,
       conversationBranching,

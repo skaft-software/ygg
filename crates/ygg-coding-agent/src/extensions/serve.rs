@@ -35,8 +35,9 @@ use ygg_serve_backend::{
     AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind, ArtifactRef,
     AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
     AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery, CommandSuggestion,
-    CommandSuggestionKind, CompletedCompaction, CompletionReview, ContextCategory,
-    ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
+    CommandSuggestionKind, CompanionConfig, CompanionControl, CompanionRelay, CompanionRuntime,
+    CompletedCompaction, CompletionReview, ContextCategory, ContextCategoryTotal,
+    ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
     ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, ExtensionPresentation, FileChange, FileEntryId,
@@ -257,7 +258,13 @@ pub async fn run(
     port: u16,
     no_open: bool,
     web_root: Option<PathBuf>,
+    companion: bool,
+    companion_relay: Option<String>,
 ) -> anyhow::Result<()> {
+    match (companion, companion_relay.as_deref()) {
+        (false, None) | (true, Some("n0")) => {}
+        _ => anyhow::bail!("companion mode requires both --companion and --companion-relay n0"),
+    }
     let _host_lock = ServeHostLock::acquire(&config)?;
     let terminal =
         config
@@ -269,6 +276,18 @@ pub async fn run(
             });
     let host = Arc::new(YggHost::new(config)?);
     let goal_store_root = host.serve_state_dir.join("goals");
+    let companion_control = if companion {
+        Some(
+            CompanionControl::open(CompanionConfig {
+                serve_state_dir: host.serve_state_dir.clone(),
+                host_id: host.descriptor.id.to_string(),
+                relay: CompanionRelay::N0,
+            })
+            .context("cannot initialize companion identity and registry")?,
+        )
+    } else {
+        None
+    };
     let supervisor = Arc::new(SessionSupervisor::new(
         Arc::clone(&host),
         SupervisorConfig {
@@ -276,18 +295,42 @@ pub async fn run(
             ..SupervisorConfig::default()
         },
     ));
-    let server = LoopbackServer::start(
-        Arc::clone(&supervisor),
-        LoopbackConfig {
-            port,
-            web_root: web_root.clone(),
-            terminal,
-            goal_store_root,
-        },
-    )
-    .await?;
+    let loopback_config = LoopbackConfig {
+        port,
+        web_root: web_root.clone(),
+        terminal,
+        goal_store_root,
+    };
+    let server = match companion_control.as_ref() {
+        Some(control) => {
+            LoopbackServer::start_with_companion(
+                Arc::clone(&supervisor),
+                loopback_config,
+                control.clone(),
+            )
+            .await?
+        }
+        None => LoopbackServer::start(Arc::clone(&supervisor), loopback_config).await?,
+    };
+    let companion_runtime = if let Some(control) = companion_control {
+        match CompanionRuntime::start(control, &server).await {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                let _ = server.shutdown().await;
+                return Err(anyhow::Error::new(error).context("cannot start companion networking"));
+            }
+        }
+    } else {
+        None
+    };
     let pull_request_refresh = tokio::spawn(run_pull_request_catalog_refresh(host, supervisor));
     let clean_url = server.url();
+    if let Some(runtime) = companion_runtime.as_ref() {
+        crate::output::stdout_line(format!(
+            "Companion endpoint: {} (n0 relay opt-in)",
+            runtime.endpoint_id()
+        ));
+    }
     if let Some(root) = web_root {
         crate::output::stdout_line(format!("Web app: {}", root.display()));
     } else {
@@ -309,8 +352,14 @@ pub async fn run(
     let interrupted = tokio::signal::ctrl_c().await;
     pull_request_refresh.abort();
     let _ = pull_request_refresh.await;
+    let companion_shutdown = match companion_runtime {
+        Some(runtime) => runtime.shutdown().await.map_err(anyhow::Error::new),
+        None => Ok(()),
+    };
+    let loopback_shutdown = server.shutdown().await.map_err(anyhow::Error::new);
     interrupted?;
-    server.shutdown().await?;
+    companion_shutdown?;
+    loopback_shutdown?;
     Ok(())
 }
 
@@ -8156,7 +8205,7 @@ async fn project_agent_event(
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }
-        AgentEvent::ToolFinished { id, result } => {
+        AgentEvent::ToolFinished { id, result, .. } => {
             let tool_item_id = projection.tool_items.get(&id.0).cloned();
             let projected = projection.tool_calls.get(&id.0).cloned();
             if let (Some(item_id), Some(mut tool)) = (tool_item_id.clone(), projected) {
@@ -8235,6 +8284,7 @@ async fn project_agent_event(
             // presentation snapshots; native telemetry is TUI-local run chrome.
         }
         AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionFinished { .. } => {}
+        AgentEvent::TurnStarted => {}
     }
     Ok(None)
 }
@@ -11120,6 +11170,11 @@ fn load_or_create_host_id(config: &Config) -> anyhow::Result<HostId> {
     if let Some(id) = read_existing()? {
         return Ok(id);
     }
+    if CompanionControl::has_persisted_state(&state_dir)
+        .context("cannot inspect persisted companion state")?
+    {
+        anyhow::bail!("ygg serve host identity is missing while persisted companion state exists");
+    }
 
     let mut random = [0u8; 32];
     getrandom::fill(&mut random)?;
@@ -11136,6 +11191,7 @@ fn load_or_create_host_id(config: &Config) -> anyhow::Result<HostId> {
             file.write_all(id.as_str().as_bytes())?;
             file.write_all(b"\n")?;
             file.sync_all()?;
+            std::fs::File::open(&state_dir)?.sync_all()?;
             Ok(id)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => read_existing()?
@@ -11446,6 +11502,31 @@ mod tests {
         config.session_dir = directory.join("sessions");
         config.workspace_trusted = trusted;
         config
+    }
+
+    #[test]
+    fn missing_host_identity_is_not_replaced_after_companion_state_is_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = serve_test_config(directory.path());
+        let original = load_or_create_host_id(&config).unwrap();
+        let state_dir = secure_serve_state_dir(&config.session_dir).unwrap();
+        drop(
+            CompanionControl::open(CompanionConfig {
+                serve_state_dir: state_dir.clone(),
+                host_id: original.to_string(),
+                relay: CompanionRelay::N0,
+            })
+            .unwrap(),
+        );
+        let identity_path = state_dir.join("serve-host-id");
+        std::fs::remove_file(&identity_path).unwrap();
+
+        let error = load_or_create_host_id(&config).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("host identity is missing while persisted companion state exists"));
+        assert!(!identity_path.exists());
     }
 
     const REMOVED_MODEL_ID: &str = "removed-provider/retired-model";

@@ -25,13 +25,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
       - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - run: cargo audit
       - run: cargo audit --file extensions/ygg-serve/Cargo.lock
+      - run: cargo audit --file extensions/ygg-companion-protocol/Cargo.lock
+      - run: cargo audit --file apps/mobile/src-tauri/Cargo.lock
       - run: cargo deny check
       - run: cargo deny --manifest-path extensions/ygg-serve/Cargo.toml check
+      - run: cargo deny --manifest-path extensions/ygg-companion-protocol/Cargo.toml check
+      - run: cargo deny --manifest-path apps/mobile/src-tauri/Cargo.toml --target aarch64-apple-ios check
+      - run: cargo deny --manifest-path apps/mobile/src-tauri/Cargo.toml --target aarch64-linux-android check
 
   quality:
     runs-on: ubuntu-24.04
@@ -39,6 +46,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
         with:
+          toolchain: 1.86.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - name: Test binary release tooling
@@ -49,7 +57,8 @@ jobs:
             scripts/package-ygg-extension-release.sh \
             scripts/package-ygg-release.sh \
             scripts/package-ygg-serve-release.sh \
-            scripts/test-binary-installer.sh
+            scripts/test-binary-installer.sh \
+            scripts/test-ygg-serve-release-packaging.sh
           python3 -m py_compile scripts/provider-acceptance.py
           version="v$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
           while IFS= read -r extension; do
@@ -63,6 +72,7 @@ jobs:
               "$RUNNER_TEMP/extension-bundles-repeat/$extension-${version#v}.tar.gz"
           done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
           scripts/test-binary-installer.sh
+          scripts/test-ygg-serve-release-packaging.sh
           scripts/build-ygg-image.sh --context "$RUNNER_TEMP/ygg-container-context"
           test "$(cat "$RUNNER_TEMP/ygg-container-context/.ygg-container-source")" = "$(git rev-parse HEAD)"
           test ! -e "$RUNNER_TEMP/ygg-container-context/.git"
@@ -72,11 +82,14 @@ jobs:
       - run: cargo fmt --manifest-path extensions/ygg-serve/Cargo.toml -- --check
       - run: cargo clippy --manifest-path extensions/ygg-serve/Cargo.toml --all-targets --locked -- -D warnings
       - run: cargo test --manifest-path extensions/ygg-serve/Cargo.toml --locked
+      - run: cargo fmt --manifest-path extensions/ygg-companion-protocol/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path extensions/ygg-companion-protocol/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path extensions/ygg-companion-protocol/Cargo.toml --locked
       # Cargo 1.90 stabilized packaging interdependent workspace crates. Keep
       # compilation and tests on the 1.86 MSRV above; use 1.90 only to assemble
       # the publishable crates together. The serve feature depends on the
       # publish-excluded optional extension.
-      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      - uses: dtolnay/rust-toolchain@06e5a564a0556e338780f5aecf2e7dcc9b267f07
         with:
           toolchain: 1.90.0
       - run: cargo +1.90.0 package --workspace --exclude ygg-coding-agent --locked --no-verify
@@ -103,6 +116,37 @@ jobs:
             fi
           done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
 
+  mobile-quality:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
+          components: rustfmt, clippy
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: apps/mobile/.node-version
+          cache: npm
+          cache-dependency-path: apps/mobile/package-lock.json
+      - run: npm ci
+        working-directory: apps/mobile
+      - run: npm audit --audit-level=high
+        working-directory: apps/mobile
+      - run: npm run tauri -- --version
+        working-directory: apps/mobile
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+        with:
+          workspaces: apps/mobile/src-tauri -> target
+      - run: cargo fmt --manifest-path apps/mobile/src-tauri/Cargo.toml -- --check
+      - name: Validate Android keyring Rust 1.86 patch
+        run: |
+          rustfmt --edition 2024 --check apps/mobile/src-tauri/vendor/android-native-keyring-store/src/by_store/vault.rs
+          cp -R apps/mobile/src-tauri/vendor/android-native-keyring-store "$RUNNER_TEMP/android-native-keyring-store"
+          cargo check --manifest-path "$RUNNER_TEMP/android-native-keyring-store/Cargo.toml"
+      - run: cargo clippy --manifest-path apps/mobile/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - run: cargo test --manifest-path apps/mobile/src-tauri/Cargo.toml --lib --locked
+
   test:
     strategy:
       fail-fast: false
@@ -112,6 +156,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - run: cargo test --workspace --all-targets --all-features --locked
       - run: cargo check --workspace --all-targets --no-default-features --locked
@@ -121,6 +167,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - run: cargo check --workspace --all-targets --all-features --locked
 
@@ -132,6 +180,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
@@ -158,6 +208,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+        with:
+          toolchain: 1.86.0
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
       - run: cargo install --debug --locked --path crates/ygg-coding-agent --bins --features serve --root "$RUNNER_TEMP/ygg-install"
       - run: "$RUNNER_TEMP/ygg-install/bin/ygg --version"

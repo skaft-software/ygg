@@ -40,8 +40,7 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
-# Keep the audited lopdf 0.42.0 parser compatible with the Rust 1.86 MSRV.
-# Upstream 0.42.0 declares 1.85 but uses let-chain syntax stabilized later;
-# this local patch only rewrites that syntax and does not change parser logic.
+# Keep the audited lopdf 0.42.0 parser compatible with Rust 1.86 and Iroh's
+# pinned prerelease crypto graph; see the vendored patch note for both deltas.
 [patch.crates-io]
 lopdf = { path = "extensions/ygg-serve/vendor/lopdf" }

@@ -74,9 +74,11 @@ async fn run() -> anyhow::Result<()> {
         no_open,
         port,
         web_root,
+        companion,
+        companion_relay,
     }) = top_level_command.clone()
     {
-        return extension_package::run_serve(no_open, port, web_root);
+        return extension_package::run_serve(no_open, port, web_root, companion, companion_relay);
     }
 
     let cwd = std::env::current_dir()?;
@@ -99,9 +101,12 @@ async fn run() -> anyhow::Result<()> {
         no_open,
         port,
         web_root,
+        companion,
+        companion_relay,
     }) = top_level_command
     {
-        return extensions::serve::run(config, port, no_open, web_root).await;
+        return extensions::serve::run(config, port, no_open, web_root, companion, companion_relay)
+            .await;
     }
     let mode = config.mode.clone();
     let initial_prompt = config.initial_prompt.clone();

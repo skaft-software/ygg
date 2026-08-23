@@ -1,0 +1,65 @@
+[package]
+name = "ygg-mobile"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT"
+description = "Experimental native companion for one authoritative Ygg Serve host."
+publish = false
+
+# Keep the experimental native shell independently buildable and out of the
+# shipping root workspace.
+[workspace]
+
+[lib]
+name = "ygg_mobile_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "tokio", "ws"] }
+futures-util = "0.3"
+getrandom = "0.3"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "server", "service", "tokio"] }
+iroh = "=0.95.1"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tauri = { version = "=2.11.5", features = [] }
+tauri-plugin-keyring-store = { version = "=0.2.0", default-features = false }
+thiserror = "1"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-io-timeout = "1.2.1"
+tower = { version = "0.5", features = ["util"] }
+ygg-companion-protocol = { version = "=0.1.0", path = "../../../extensions/ygg-companion-protocol" }
+zeroize = "1"
+
+# Iroh 0.95.1's prerelease cryptography graph must remain on this mutually
+# compatible set for Rust 1.86; newer release candidates changed constraints.
+crypto-common = "=0.2.0-rc.4"
+der = "=0.8.0-rc.9"
+ed25519 = "=3.0.0-rc.0"
+pkcs8 = "=0.11.0-rc.7"
+spki = "=0.8.0-rc.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+# android-native-keyring-store reads this process-global context before opening
+# Android Keystore/SharedPreferences. Initialize this exact shared instance from
+# Tauri's native activity before the first credential operation.
+ndk-context = "=0.1.1"
+
+[patch.crates-io]
+android-native-keyring-store = { path = "vendor/android-native-keyring-store" }
+tauri-plugin-keyring-store = { path = "vendor/tauri-plugin-keyring-store" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.29"
+
+[lints.rust]
+missing_docs = "warn"

@@ -163,6 +163,7 @@ fn handshake_resynchronization_shutdown_and_eof() {
     assert_eq!(hello["data"]["features"]["typed_media_input"], true);
     assert_eq!(hello["data"]["features"]["typed_audio_input"], true);
     assert_eq!(hello["data"]["features"]["prompt_display_text"], true);
+    assert_eq!(hello["data"]["features"]["inline_pricing"], true);
     assert_eq!(hello["data"]["features"]["in_band_abort"], false);
 
     host.send_raw(b"{not-json}");
@@ -257,6 +258,68 @@ fn rejects_duplicate_fields_and_unterminated_eof_frames() {
         "incomplete protocol frame at EOF"
     );
     assert!(host.wait().success());
+}
+
+#[test]
+fn rejects_malformed_inline_pricing_at_the_protocol_boundary() {
+    let (_root, home, workspace) = fixture();
+    let mut host = HostProcess::spawn(&home, &workspace);
+
+    let request = json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": "bad-pricing",
+        "command": "run",
+        "run_id": "run-bad-pricing",
+        "workspace": workspace,
+        "model": "local-test",
+        "base_url": "https://example.com/v1",
+        "provider_mode": "openai-compatible",
+        "inline_pricing": {
+            "input": 1,
+            "output": 2,
+            "cache_read": 1,
+            "cache_write_5m": 1,
+            "tiers": [{
+                "min_input_tokens": 1000,
+                "surprise_rate": 3
+            }]
+        },
+        "prompt": "test"
+    });
+    host.send(&request);
+    let rejected = host.recv();
+    assert_envelope(&rejected, "invalid", 1, "protocol_error");
+    assert!(rejected["data"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("surprise_rate")));
+
+    host.send(&json!({
+        "protocol_version": PROTOCOL_VERSION,
+        "request_id": "bad-tier-order",
+        "command": "run",
+        "run_id": "run-bad-tier-order",
+        "workspace": workspace,
+        "model": "local-test",
+        "base_url": "https://example.com/v1",
+        "provider_mode": "openai-compatible",
+        "inline_pricing": {
+            "input": 1,
+            "output": 2,
+            "cache_read": 1,
+            "cache_write_5m": 1,
+            "tiers": [
+                {"min_input_tokens": 1000},
+                {"min_input_tokens": 1000}
+            ]
+        },
+        "prompt": "test"
+    }));
+    let rejected = host.recv();
+    assert_envelope(&rejected, "bad-tier-order", 1, "final_result");
+    assert_eq!(rejected["data"]["status"], "error");
+    assert!(rejected["data"]["error"]
+        .as_str()
+        .is_some_and(|error| error.contains("Invalid pricing configuration")));
 }
 
 #[derive(Debug)]
@@ -357,6 +420,15 @@ fn run_request(
         "provider_mode": "openai-compatible",
         "context_window_tokens": 8192,
         "max_output_tokens": 1024,
+        "inline_pricing": {
+            "input": 150000,
+            "output": 600000,
+            "cache_read": 75000,
+            "cache_write_5m": 150000,
+            "cache_write_1h": null,
+            "reasoning": null,
+            "tiers": []
+        },
         "prompt": "Reply with the fixture marker.",
         "system_prompt": "This is a deterministic protocol test.",
         "tools": [],

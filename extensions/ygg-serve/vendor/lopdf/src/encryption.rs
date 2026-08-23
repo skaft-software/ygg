@@ -853,7 +853,7 @@ mod tests {
     use crate::creator::tests::create_document;
     use crate::encryption::{Aes128CryptFilter, Aes256CryptFilter, CryptFilter};
     use crate::{EncryptionState, EncryptionVersion, Permissions};
-    use rand::RngExt as _;
+    use rand::Rng as _;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

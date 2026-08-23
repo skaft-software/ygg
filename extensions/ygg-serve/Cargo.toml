@@ -21,16 +21,23 @@ bytes = "1"
 futures-util = "0.3"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 getrandom = "0.3"
+http-body-util = "0.1"
+iroh = "=0.95.1"
 libc = "0.2"
 lopdf = { version = "=0.42.0", default-features = false }
 portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-ygg-agent = { version = "=0.6.0-dev", path = "../../crates/ygg-agent" }
 sha2 = "0.10"
 thiserror = "1"
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# Iroh's broad `time` range otherwise resolves to releases requiring Rust 1.88.
+time = "=0.3.45"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower = { version = "0.5", features = ["util"] }
+ygg-agent = { version = "=0.6.0-dev", path = "../../crates/ygg-agent" }
+ygg-companion-protocol = { version = "=0.1.0", path = "../ygg-companion-protocol" }
+zeroize = "1"
 
 [dev-dependencies]
 tempfile = "3"
@@ -39,7 +46,7 @@ tokio-tungstenite = "0.29"
 [lints.rust]
 missing_docs = "warn"
 
-# Keep the audited lopdf 0.42.0 parser compatible with the Rust 1.86 MSRV;
-# see the vendored patch's source note for the one syntax-only change.
+# Keep the audited lopdf 0.42.0 parser compatible with Rust 1.86 and Iroh's
+# pinned prerelease crypto graph; see the vendored patch note for both deltas.
 [patch.crates-io]
 lopdf = { path = "vendor/lopdf" }

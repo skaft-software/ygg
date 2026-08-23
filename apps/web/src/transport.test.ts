@@ -14,6 +14,9 @@ class FakeWebSocket {
   static instances: FakeWebSocket[] = [];
 
   readonly url: string;
+  closeCode: number | undefined;
+  closeReason: string | undefined;
+  closeCalls = 0;
   private listeners = new Map<
     string,
     Set<EventListenerOrEventListenerObject>
@@ -30,13 +33,15 @@ class FakeWebSocket {
   ): void {
     if (!callback) return;
     const listeners =
-      this.listeners.get(type) ??
-      new Set<EventListenerOrEventListenerObject>();
+      this.listeners.get(type) ?? new Set<EventListenerOrEventListenerObject>();
     listeners.add(callback);
     this.listeners.set(type, listeners);
   }
 
-  close(): void {
+  close(code?: number, reason?: string): void {
+    this.closeCalls += 1;
+    this.closeCode = code;
+    this.closeReason = reason;
     this.emit("close", new Event("close"));
   }
 
@@ -68,10 +73,7 @@ function deferred<T>() {
 describe("HTTP Ygg transport", () => {
   beforeEach(() => {
     FakeWebSocket.instances = [];
-    vi.stubGlobal(
-      "WebSocket",
-      FakeWebSocket as unknown as typeof WebSocket,
-    );
+    vi.stubGlobal("WebSocket", FakeWebSocket as unknown as typeof WebSocket);
   });
 
   afterEach(() => {
@@ -97,6 +99,80 @@ describe("HTTP Ygg transport", () => {
 
     expect(transportModeFromSearch("?transport=Fixture")).toBe("live");
     expect(transportModeFromSearch("?transport=fixture-preview")).toBe("live");
+  });
+
+  it("bounds and length-checks companion administration responses", async () => {
+    const catalog = JSON.stringify({ revision: 1, devices: [], pending: [] });
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        new Response(catalog, {
+          status: 200,
+          headers: { "Content-Length": String(catalog.length + 1) },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(null, {
+          status: 204,
+          headers: { "Content-Length": "1" },
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const transport = new HttpTransport("device-browser");
+
+    await expect(transport.getCompanionCatalog()).rejects.toThrow(
+      "invalid response",
+    );
+    await expect(transport.closeCompanionPairing()).rejects.toThrow(
+      "invalid response",
+    );
+  });
+
+  it("applies one aggregate deadline to companion administration headers and body", async () => {
+    vi.useFakeTimers();
+    let bodyCancelled = false;
+    const hangingBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{"));
+      },
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(new Response(hangingBody, { status: 200 })),
+      ),
+    );
+    const transport = new HttpTransport("device-browser");
+    try {
+      const request = transport.getCompanionCatalog();
+      const rejection = expect(request).rejects.toThrow(
+        "The companion host did not respond in time.",
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await rejection;
+      expect(bodyCancelled).toBe(true);
+    } finally {
+      transport.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("requires exact companion administration status codes", async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      new HttpTransport("device-browser").revokeCompanionDevice("device-one"),
+    ).rejects.toThrow("Device revocation failed with 200");
   });
 
   it("supports persistent goal reads and lifecycle mutations", async () => {
@@ -170,9 +246,7 @@ describe("HTTP Ygg transport", () => {
         "session-demo",
         "resource-handle",
       ),
-    ).toBe(
-      "/api/v1/sessions/session-demo/resources/resource-handle",
-    );
+    ).toBe("/api/v1/sessions/session-demo/resources/resource-handle");
   });
 
   it("uses the typed repository, document, trusted-file, and transcript routes", async () => {
@@ -304,9 +378,9 @@ describe("HTTP Ygg transport", () => {
     await expect(
       transport.ingestDocument("session/one", upload),
     ).resolves.toEqual(document);
-    await expect(
-      transport.listDocuments("session/one"),
-    ).resolves.toEqual([document]);
+    await expect(transport.listDocuments("session/one")).resolves.toEqual([
+      document,
+    ]);
     await expect(
       transport.getTrustedFiles("project/one"),
     ).resolves.toMatchObject({ files: [entry] });
@@ -321,12 +395,12 @@ describe("HTTP Ygg transport", () => {
         "file/22222222222222222222222222222222",
       ),
     ).resolves.toMatchObject({ entry, text: "# Release plan\n" });
-    await expect(
-      transport.getCommandDiscovery("session/one"),
-    ).resolves.toEqual({ commands: commandDiscovery.commands, skills: [] });
-    await expect(
-      transport.searchTranscripts(searchRequest),
-    ).resolves.toEqual(transcriptResult);
+    await expect(transport.getCommandDiscovery("session/one")).resolves.toEqual(
+      { commands: commandDiscovery.commands, skills: [] },
+    );
+    await expect(transport.searchTranscripts(searchRequest)).resolves.toEqual(
+      transcriptResult,
+    );
 
     expect(fetchMock.mock.calls[0]).toEqual([
       "/api/v1/projects/project%2Fone/context",
@@ -609,13 +683,13 @@ describe("HTTP Ygg transport", () => {
       attachments: [],
     });
 
-    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject(
-      {
-        hostId: "host-demo",
-        deviceId: expect.stringMatching(/^browser-[A-Za-z0-9-]+$/),
-        commandId: "command-live",
-      },
-    );
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)),
+    ).toMatchObject({
+      hostId: "host-demo",
+      deviceId: expect.stringMatching(/^browser-[A-Za-z0-9-]+$/),
+      commandId: "command-live",
+    });
     transport.close();
   });
 
@@ -696,15 +770,15 @@ describe("HTTP Ygg transport", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(
       fetchMock.mock.calls[2]?.[1]?.body,
     );
-    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toMatchObject(
-      {
-        hostId: "host-demo",
-        deviceId: "device-browser",
-        commandId: "command-submit",
-        issuedAtMs: 1_721_000_000_050,
-        expectedActorGeneration: 3,
-      },
-    );
+    expect(
+      JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body)),
+    ).toMatchObject({
+      hostId: "host-demo",
+      deviceId: "device-browser",
+      commandId: "command-submit",
+      issuedAtMs: 1_721_000_000_050,
+      expectedActorGeneration: 3,
+    });
     transport.close();
   });
 
@@ -737,7 +811,9 @@ describe("HTTP Ygg transport", () => {
       "fetch",
       vi
         .fn<typeof fetch>()
-        .mockImplementation(() => Promise.resolve(jsonResponse(hostBootstrapGolden))),
+        .mockImplementation(() =>
+          Promise.resolve(jsonResponse(hostBootstrapGolden)),
+        ),
     );
     const transport = new HttpTransport("device-browser");
     const received: unknown[] = [];
@@ -781,9 +857,11 @@ describe("HTTP Ygg transport", () => {
     const olderReplay = deferred<Response>();
     const newerReplay = deferred<Response>();
     let replayCall = 0;
-    const fetchMock = vi.fn<typeof fetch>((input) => {
+    const replaySignals: AbortSignal[] = [];
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
       if (String(input).includes("/replay?")) {
         replayCall += 1;
+        replaySignals.push(init?.signal as AbortSignal);
         return replayCall === 1 ? olderReplay.promise : newerReplay.promise;
       }
       return Promise.resolve(jsonResponse(hostBootstrapGolden));
@@ -799,6 +877,7 @@ describe("HTTP Ygg transport", () => {
     await vi.waitFor(() => expect(replayCall).toBe(1));
 
     await transport.connect();
+    expect(replaySignals[0]?.aborted).toBe(true);
     const currentSocket = FakeWebSocket.instances[1]!;
     currentSocket.emit("open", new Event("open"));
     await vi.waitFor(() => expect(replayCall).toBe(2));
@@ -848,12 +927,149 @@ describe("HTTP Ygg transport", () => {
     transport.close();
   });
 
+  it("closes a socket whose live-event replay buffer reaches its bound", async () => {
+    const replay = deferred<Response>();
+    let replayRequested = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        if (String(input).includes("/replay?")) {
+          replayRequested = true;
+          return replay.promise;
+        }
+        return Promise.resolve(jsonResponse(hostBootstrapGolden));
+      }),
+    );
+    const transport = new HttpTransport("device-browser");
+    const received: unknown[] = [];
+    transport.subscribe((event) => received.push(event));
+    await transport.connect();
+    const socket = FakeWebSocket.instances[0]!;
+    socket.emit("open", new Event("open"));
+    await vi.waitFor(() => expect(replayRequested).toBe(true));
+
+    const message = JSON.stringify({
+      protocol: 1,
+      hostSequence: 12,
+      event: eventEnvelopeGolden,
+    });
+    for (let index = 0; index <= 2_048; index += 1) {
+      socket.emit("message", new MessageEvent("message", { data: message }));
+    }
+
+    expect(socket.closeCode).toBe(1009);
+    expect(socket.closeReason).toBe("Ygg replay buffer exceeds its limit");
+
+    replay.resolve(
+      jsonResponse({
+        type: "events",
+        after: { actorGeneration: 3, sequence: 42 },
+        through: { actorGeneration: 3, sequence: 42 },
+        events: [],
+      }),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(received).toEqual([]);
+    transport.close();
+  });
+
+  it("bounds recovery response bytes before parsing", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        if (String(input).includes("/replay?")) {
+          return Promise.resolve(
+            new Response("{}", {
+              status: 200,
+              headers: { "Content-Length": String(8 * 1024 * 1024 + 1) },
+            }),
+          );
+        }
+        return Promise.resolve(jsonResponse(hostBootstrapGolden));
+      }),
+    );
+    const transport = new HttpTransport("device-browser");
+    await transport.connect();
+    const socket = FakeWebSocket.instances[0]!;
+
+    socket.emit("open", new Event("open"));
+
+    await vi.waitFor(() => expect(socket.closeCalls).toBeGreaterThan(0));
+    transport.close();
+  });
+
+  it("rejects replay responses whose event count exceeds the browser bound", async () => {
+    const replay = {
+      type: "events",
+      after: { actorGeneration: 3, sequence: 42 },
+      through: { actorGeneration: 3, sequence: 42 },
+      events: Array.from({ length: 2_049 }, () => eventEnvelopeGolden),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) =>
+        Promise.resolve(
+          String(input).includes("/replay?")
+            ? jsonResponse(replay)
+            : jsonResponse(hostBootstrapGolden),
+        ),
+      ),
+    );
+    const transport = new HttpTransport("device-browser");
+    await transport.connect();
+    const socket = FakeWebSocket.instances[0]!;
+
+    socket.emit("open", new Event("open"));
+
+    await vi.waitFor(() => expect(socket.closeCalls).toBeGreaterThan(0));
+    transport.close();
+  });
+
+  it("applies one aggregate deadline to recovery headers and body", async () => {
+    vi.useFakeTimers();
+    let bodyCancelled = false;
+    const hangingBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{"));
+      },
+      cancel() {
+        bodyCancelled = true;
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>((input) => {
+        if (String(input).includes("/replay?")) {
+          return Promise.resolve(new Response(hangingBody, { status: 200 }));
+        }
+        return Promise.resolve(jsonResponse(hostBootstrapGolden));
+      }),
+    );
+    const transport = new HttpTransport("device-browser");
+    try {
+      await transport.connect();
+      const socket = FakeWebSocket.instances[0]!;
+      socket.emit("open", new Event("open"));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(bodyCancelled).toBe(true);
+      expect(socket.closeCalls).toBeGreaterThan(0);
+    } finally {
+      transport.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("decodes the nested host WebSocket envelope before publishing", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn<typeof fetch>().mockResolvedValue(
-        jsonResponse(hostBootstrapGolden),
-      ),
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse(hostBootstrapGolden)),
     );
     const transport = new HttpTransport("device-browser");
     const received: unknown[] = [];
@@ -890,9 +1106,9 @@ describe("HTTP Ygg transport", () => {
   it("publishes cross-client catalog summaries from the host stream", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn<typeof fetch>().mockResolvedValue(
-        jsonResponse(hostBootstrapGolden),
-      ),
+      vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(jsonResponse(hostBootstrapGolden)),
     );
     const transport = new HttpTransport("device-browser");
     const received: unknown[] = [];
@@ -1262,9 +1478,7 @@ describe("HTTP Ygg transport", () => {
       )
       .mockResolvedValueOnce(
         jsonResponse({
-          days: [
-            { date: "2025-01-02", tokens: 260, request_count: 3 },
-          ],
+          days: [{ date: "2025-01-02", tokens: 260, request_count: 3 }],
           current_streak: 1,
           longest_streak: 4,
         }),

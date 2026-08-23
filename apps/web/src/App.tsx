@@ -107,7 +107,8 @@ const statusLabel: Record<SessionStatus, string> = {
 };
 
 const transportMode = transportModeFromSearch(window.location.search);
-const store = new YggStore(createTransport(transportMode));
+const transport = createTransport(transportMode);
+const store = new YggStore(transport);
 const activityPaneStorageKey = "ygg.ui.activity-width";
 const inspectorPaneStorageKey = "ygg.ui.inspector-width";
 const terminalPaneStorageKey = "ygg.ui.terminal-width";
@@ -1845,12 +1846,11 @@ const getCommandDiscovery = useCallback(
           ) : (
             <DevicesView
               hostName={state.bootstrap.host.name}
-              devices={state.bootstrap.devices}
-              lanAvailable={
+              companionAvailable={
                 state.bootstrap.capabilities.connectedDevices &&
-                state.bootstrap.capabilities.lanClients &&
                 state.bootstrap.capabilities.pairDevices
               }
+              transport={transport}
             />
           )}
         </div>

@@ -19,8 +19,8 @@ use ygg_agent::{
 use ygg_ai::{
     AssistantMessage, AssistantPart, AudioFormat, Auth, CacheRetention, Capabilities, Endpoint,
     EndpointId, Media, Message, Modality, ModalitySet, ModelLimits, ModelSpec,
-    OpenAiChatReasoningMode, Protocol, ReasoningCapability, ReasoningControl, ReasoningEffort,
-    UserMessage, UserPart,
+    OpenAiChatReasoningMode, Pricing, PricingTier, Protocol, ReasoningCapability, ReasoningControl,
+    ReasoningEffort, TokenRate, UserMessage, UserPart,
 };
 
 use crate::app::bootstrap::{self, LaunchSelection, SessionSelection};
@@ -123,6 +123,8 @@ struct RunRequest {
     #[serde(default)]
     max_cost_microdollars: Option<u64>,
     #[serde(default)]
+    inline_pricing: Option<InlinePricing>,
+    #[serde(default)]
     history: Vec<SeedMessage>,
     #[serde(default)]
     media: Vec<MediaInput>,
@@ -138,6 +140,65 @@ struct RunRequest {
     enabled_extensions: Vec<String>,
     #[serde(default)]
     trusted_extensions: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlinePricing {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write_5m: u64,
+    #[serde(default)]
+    cache_write_1h: Option<u64>,
+    #[serde(default)]
+    reasoning: Option<u64>,
+    #[serde(default)]
+    tiers: Vec<InlinePricingTier>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InlinePricingTier {
+    min_input_tokens: u64,
+    #[serde(default)]
+    input: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
+    #[serde(default)]
+    cache_read: Option<u64>,
+    #[serde(default)]
+    cache_write_5m: Option<u64>,
+    #[serde(default)]
+    cache_write_1h: Option<u64>,
+    #[serde(default)]
+    reasoning: Option<u64>,
+}
+
+impl InlinePricing {
+    fn into_pricing(self) -> Pricing {
+        Pricing {
+            input: TokenRate(self.input),
+            output: TokenRate(self.output),
+            cache_read: TokenRate(self.cache_read),
+            cache_write_5m: TokenRate(self.cache_write_5m),
+            cache_write_1h: self.cache_write_1h.map(TokenRate),
+            reasoning: self.reasoning.map(TokenRate),
+            tiers: self
+                .tiers
+                .into_iter()
+                .map(|tier| PricingTier {
+                    min_input_tokens: tier.min_input_tokens,
+                    input: tier.input.map(TokenRate),
+                    output: tier.output.map(TokenRate),
+                    cache_read: tier.cache_read.map(TokenRate),
+                    cache_write_5m: tier.cache_write_5m.map(TokenRate),
+                    cache_write_1h: tier.cache_write_1h.map(TokenRate),
+                    reasoning: tier.reasoning.map(TokenRate),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -516,6 +577,7 @@ fn known_request_field(command: &str, field: &str) -> bool {
                 | "offline"
                 | "max_turns"
                 | "max_cost_microdollars"
+                | "inline_pricing"
                 | "history"
                 | "media"
                 | "image_paths"
@@ -708,6 +770,7 @@ async fn emit_hello(emitter: &mut Emitter<'_>) -> anyhow::Result<()> {
                     "typed_audio_input": true,
                     "prompt_display_text": true,
                     "inline_models": true,
+                    "inline_pricing": true,
                     "tools": true,
                     "skills": true,
                     "extensions": true,
@@ -752,6 +815,7 @@ async fn emit_models(emitter: &mut Emitter<'_>, offline: bool) -> anyhow::Result
             offline: true,
             max_turns: Some(1),
             max_cost_microdollars: None,
+            inline_pricing: None,
             history: Vec::new(),
             media: Vec::new(),
             image_paths: Vec::new(),
@@ -1415,7 +1479,10 @@ fn register_inline_model(
             context_window,
             max_output_tokens,
         },
-        pricing: None,
+        pricing: request
+            .inline_pricing
+            .clone()
+            .map(InlinePricing::into_pricing),
         cache: ygg_ai::CacheCompatibility::default(),
     })?;
     Ok(model_id)
@@ -1567,6 +1634,8 @@ fn validate_run_request(request: &RunRequest) -> anyhow::Result<()> {
         parse_inline_base_url(base_url)?;
         inline_protocol(request.provider_mode.as_deref())?;
         build_inline_headers(&request.custom_headers)?;
+    } else if request.inline_pricing.is_some() {
+        anyhow::bail!("inline_pricing requires a non-empty inline base_url");
     }
     if request.history.len() > MAX_HISTORY_MESSAGES {
         anyhow::bail!("history exceeds the {MAX_HISTORY_MESSAGES}-message limit");
@@ -2048,6 +2117,7 @@ mod tests {
             offline: true,
             max_turns: None,
             max_cost_microdollars: None,
+            inline_pricing: None,
             history: Vec::new(),
             media: Vec::new(),
             image_paths: Vec::new(),
@@ -2197,7 +2267,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_routes_reject_unsafe_urls_modes_and_headers() {
+    fn inline_routes_reject_unsafe_urls_modes_headers_and_unbound_pricing() {
         for url in [
             "file:///tmp/provider",
             "https://user@example.com/v1",
@@ -2218,6 +2288,51 @@ mod tests {
         assert!(build_inline_headers(&headers).is_ok());
         headers.insert("x-extra".to_owned(), "x".repeat(MAX_CUSTOM_HEADER_BYTES));
         assert!(build_inline_headers(&headers).is_err());
+
+        let mut request = base_request(PathBuf::from("."));
+        request.inline_pricing = Some(InlinePricing {
+            input: 1,
+            output: 2,
+            cache_read: 1,
+            cache_write_5m: 1,
+            cache_write_1h: None,
+            reasoning: None,
+            tiers: Vec::new(),
+        });
+        assert!(validate_run_request(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a non-empty inline base_url"));
+    }
+
+    #[test]
+    fn inline_pricing_populates_the_registered_model() {
+        let mut catalog = ygg_ai::ModelCatalog::default();
+        let mut request = base_request(PathBuf::from("."));
+        request.base_url = Some("https://example.com/v1".into());
+        let pricing = InlinePricing {
+            input: 150_000,
+            output: 600_000,
+            cache_read: 75_000,
+            cache_write_5m: 150_000,
+            cache_write_1h: Some(300_000),
+            reasoning: Some(600_000),
+            tiers: vec![InlinePricingTier {
+                min_input_tokens: 128_000,
+                input: Some(300_000),
+                output: None,
+                cache_read: None,
+                cache_write_5m: None,
+                cache_write_1h: None,
+                reasoning: None,
+            }],
+        };
+        let expected = pricing.clone().into_pricing();
+        request.inline_pricing = Some(pricing);
+
+        let model_id = register_inline_model(&mut catalog, &request).unwrap();
+        let model = catalog.resolve(&model_id).unwrap();
+        assert_eq!(model.spec.pricing.as_ref(), Some(&expected));
     }
 
     #[test]

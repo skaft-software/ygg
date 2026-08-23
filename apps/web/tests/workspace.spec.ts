@@ -1399,7 +1399,7 @@ test("opens connected devices only when the host advertises them", async ({
   await expect(
     page.getByRole("heading", { name: "Connected devices" }),
   ).toBeVisible();
-  await expect(page.getByText("Secure local network")).toBeVisible();
+  await expect(page.getByText("Worldwide companion")).toBeVisible();
 });
 
 test("honors reduced motion for live status animation", async ({

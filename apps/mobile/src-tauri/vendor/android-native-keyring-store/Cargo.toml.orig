@@ -1,0 +1,39 @@
+[package]
+authors = ["André Puel <andrepuel@gmail.com>", "Dan Brotsky <dev@brotsky.com>"]
+description = "Android CredentialStore for keyring-core"
+homepage = "https://github.com/open-source-cooperative/android-native-keyring-store"
+keywords = ["password", "secret", "credential", "android", "keystore"]
+license = "MIT OR Apache-2.0"
+name = "android-native-keyring-store"
+repository = "https://github.com/open-source-cooperative/android-native-keyring-store.git"
+version = "1.0.0"
+rust-version = "1.86"
+edition = "2024"
+readme = "README.md"
+exclude = ["keyring-tester"]
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[features]
+legacy = []
+compile-tests = ["android_log-sys"]
+android-log = ["android_log-sys", "tracing-subscriber/env-filter"]
+
+[dependencies]
+android_log-sys = { version = "0.3", optional = true }
+base64 = "0.22"
+jni = "0.21"
+keyring-core = "1"
+log = "0.4"
+ndk-context = "0.1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
+
+[package.metadata.docs.rs]
+targets = ["aarch64-linux-android"]
+features = ["legacy"]

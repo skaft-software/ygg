@@ -1,0 +1,24 @@
+[default]
+description = "Default permissions for the plugin"
+permissions = [
+  "allow-get-passwords",
+  "allow-set-passwords",
+  "allow-delete-passwords",
+  "allow-password-exists",
+  "allow-export-passwords-plain",
+  "allow-import-passwords-plain",
+  "allow-export-passwords-encrypted",
+  "allow-import-passwords-encrypted",
+  "allow-ping",
+  "allow-initialize",
+  "allow-destroy",
+  "allow-save",
+  "allow-create-client",
+  "allow-load-client",
+  "allow-get-store-record",
+  "allow-save-store-record",
+  "allow-remove-store-record",
+  "allow-save-secret",
+  "allow-remove-secret",
+  "allow-execute-procedure",
+]

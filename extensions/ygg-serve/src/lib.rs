@@ -10,6 +10,7 @@ mod actor;
 mod attachment;
 mod bounds;
 mod command;
+mod companion;
 mod document_ingest;
 mod document_store;
 mod embedded_web;
@@ -53,6 +54,10 @@ pub use command::{
     AckDisposition, AttachmentRef, CommandAck, HostAckDisposition, HostCommand, HostCommandAck,
     HostCommandEnvelope, PermanentDeleteConfirmation, PromptInput, RequestAnswer, SessionCommand,
     SessionCommandEnvelope, SlashCommandInvocation,
+};
+pub use companion::{
+    CompanionConfig, CompanionControl, CompanionControlError, CompanionError, CompanionRelay,
+    CompanionRuntime,
 };
 pub use document_ingest::{
     ingest_document, DocumentIngestError, DocumentMediaType, DocumentProvenance,

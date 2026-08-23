@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Pair Ygg Companion</title>
+    <link rel="stylesheet" href="/_native/onboarding.css" />
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">Y</div>
+      <h1>Connect to your Ygg host</h1>
+      <p class="intro">Your agents and credentials stay on your computer. This app securely controls that one host.</p>
+
+      <section id="import-panel" aria-labelledby="import-title">
+        <h2 id="import-title">Import invitation</h2>
+        <label for="device-name">Device name</label>
+        <input id="device-name" maxlength="128" autocomplete="name" placeholder="My phone" />
+        <label for="ticket">Pairing invitation</label>
+        <textarea id="ticket" maxlength="4096" rows="5" spellcheck="false" autocomplete="off" placeholder="ygg://pair/v1/…"></textarea>
+        <button id="pair" type="button">Request approval</button>
+      </section>
+
+      <section id="status-panel" aria-live="polite" aria-atomic="true">
+        <h2>Status</h2>
+        <p id="status">Preparing protected device identity…</p>
+        <div id="phrase-panel" hidden>
+          <span>Compare on both devices</span>
+          <strong id="phrase"></strong>
+          <small id="expiry"></small>
+        </div>
+        <button id="cancel" class="secondary" type="button" hidden>Cancel request</button>
+        <button id="remove" class="secondary danger" type="button" hidden>Remove local access</button>
+      </section>
+
+      <aside>
+        <strong>Relay privacy</strong>
+        <p>Worldwide access uses n0 relays. Relay operators can observe network addresses, timing, and traffic volume, but Iroh encrypts application content end to end.</p>
+      </aside>
+    </main>
+    <script src="/_native/onboarding.js"></script>
+  </body>
+</html>

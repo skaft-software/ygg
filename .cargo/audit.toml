@@ -1,0 +1,23 @@
+[advisories]
+ignore = [
+  # time 0.3.45 is the newest release compatible with Ygg's Rust 1.86 MSRV.
+  # The resolved graph enables only time's default/alloc/std features, not its
+  # parsing feature, so no affected RFC 2822 parsing entry point is compiled.
+  # Remove when Iroh can use time >=0.3.47 without raising Ygg's MSRV.
+  "RUSTSEC-2026-0009",
+  # Iroh 0.95.1 is the last release compatible with Ygg's Rust 1.86 MSRV.
+  # Its hickory dependency does not enable the DNSSEC features required to
+  # reach this NSEC3 validator path.
+  "RUSTSEC-2026-0118",
+  # Ygg passes Iroh only the fixed N0 relay map. Hickory encodes bounded,
+  # internally constructed hostname queries; untrusted DNS record sets cannot
+  # reach the affected message-encoding path. Remove with the Iroh upgrade.
+  "RUSTSEC-2026-0119",
+  # Tauri 2.11.5 resolves through plist 1.8 to quick-xml 0.38.4 at the
+  # Rust 1.86 MSRV. In this shell plist parses only repository/app-owned build
+  # inputs and the app bundle's own metadata; no remote or host payload is XML.
+  # Remove both exceptions when a Rust-1.86-compatible Tauri/plist graph admits
+  # quick-xml >=0.41.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]

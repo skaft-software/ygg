@@ -66,7 +66,7 @@ Request:
 Response:
 
 ```json
-{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.6.0-dev","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
+{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.6.0-dev","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"inline_pricing":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
 ```
 
 Consumers must reject a protocol mismatch, unknown request ID, run/session ID
@@ -113,6 +113,7 @@ Useful optional fields include:
 | `reasoning` | Ygg reasoning level accepted by the selected model. |
 | `max_turns` | Run turn limit; omission runs without a turn ceiling, matching the interactive session default. |
 | `max_cost_microdollars` | Exact integer run-cost ceiling. |
+| `inline_pricing` | Complete pricing for an inline `base_url`, using integer microdollars per 1,000,000 tokens. It is validated and bound to the route-specific model before cost enforcement. |
 | `media` | Ordered typed inputs: `{"type":"image","path":"…"}` or `{"type":"audio","path":"…"}`. At most 12 items: eight images and four audio clips. |
 | `image_paths` | Legacy image-only input. It cannot be combined with `media`. |
 | `prompt_paths`, `skill_paths` | Explicit resource roots. |
@@ -141,7 +142,7 @@ Example with two visual references around one audio reference:
 An application can define one route without modifying global Ygg configuration:
 
 ```json
-{"protocol_version":1,"request_id":"req-local","command":"run","run_id":"run-local","workspace":"/srv/workspace","model":"local-model","provider":"local","base_url":"http://127.0.0.1:1234/v1","api_key":"application-owned-secret","custom_headers":{"x-tenant":"example"},"provider_mode":"openai-compatible","context_window_tokens":32768,"max_output_tokens":4096,"input_modalities":["image"],"supports_reasoning":false,"prompt":"Reply with OK","tools":[]}
+{"protocol_version":1,"request_id":"req-local","command":"run","run_id":"run-local","workspace":"/srv/workspace","model":"local-model","provider":"local","base_url":"http://127.0.0.1:1234/v1","api_key":"application-owned-secret","custom_headers":{"x-tenant":"example"},"provider_mode":"openai-compatible","context_window_tokens":32768,"max_output_tokens":4096,"input_modalities":["image"],"supports_reasoning":false,"inline_pricing":{"input":150000,"output":600000,"cache_read":75000,"cache_write_5m":150000,"cache_write_1h":null,"reasoning":null,"tiers":[]},"max_cost_microdollars":25000,"prompt":"Reply with OK","tools":[]}
 ```
 
 Supported `provider_mode` values are:
@@ -161,6 +162,22 @@ query, or fragment. Route/model IDs are SHA-256-derived and isolated from the
 built-in catalog. Custom headers are capped at 64 entries and 64 KiB total;
 hop-by-hop and routing headers are rejected. Anthropic keys use `x-api-key`;
 other inline modes use Bearer authentication.
+
+`inline_pricing` is accepted only with a non-empty inline `base_url`. It must
+supply `input`, `output`, `cache_read`, and `cache_write_5m`; optional
+`cache_write_1h` and `reasoning` rates may be `null`. `tiers` is an ordered array
+of unique `min_input_tokens` thresholds with optional overrides for all six
+rates. Every rate is a non-negative JSON integer representing microdollars per
+1,000,000 tokens. Unknown or malformed nested fields are rejected by strict JSON
+deserialization, and duplicate or invalid tier thresholds fail before provider
+I/O. The caller owns the accuracy of these route-specific rates; Ygg does not
+infer them from the inline model name.
+
+A cost ceiling requires pricing on the actual resolved model. Built-in catalog
+models already carry it where known. Inline callers must send trusted
+`inline_pricing`; omitting it leaves the route unpriced and therefore unsuitable
+for a hard ceiling. Consumers should fail closed rather than run unattended work
+against an unpriced model.
 
 Without `base_url`, `model` is resolved through Ygg's normal catalog and
 credential resolvers. If Ygg has no Codex credential on first use, it can copy a

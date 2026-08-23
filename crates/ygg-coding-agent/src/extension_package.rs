@@ -22,6 +22,7 @@ pub(super) const PACKAGE_ID: &str = "ygg-serve";
 const PACKAGE_MANIFEST: &str = "package.toml";
 const INSTALL_RECORD: &str = "install.json";
 const ENTRYPOINT: &str = "bin/ygg-serve-runtime";
+const SERVE_NETWORK_CAPABILITY: &str = "loopback+explicit-n0-relay";
 const RELEASE_REPOSITORY: &str = "https://github.com/skaft-software/ygg";
 pub(super) const MAX_CHECKSUM_BYTES: usize = 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
@@ -231,7 +232,17 @@ fn print_bundle_installed(
 }
 
 #[allow(dead_code)]
-pub fn run_serve(no_open: bool, port: u16, web_root: Option<PathBuf>) -> anyhow::Result<()> {
+pub fn run_serve(
+    no_open: bool,
+    port: u16,
+    web_root: Option<PathBuf>,
+    companion: bool,
+    companion_relay: Option<String>,
+) -> anyhow::Result<()> {
+    match (companion, companion_relay.as_deref()) {
+        (false, None) | (true, Some("n0")) => {}
+        _ => anyhow::bail!("companion mode requires both --companion and --companion-relay n0"),
+    }
     let root = extensions_root()?;
     let manifest = load_installed(&root).with_context(|| {
         format!("Ygg Serve is not installed; run 'ygg extension install {PACKAGE_ID}'")
@@ -253,6 +264,12 @@ pub fn run_serve(no_open: bool, port: u16, web_root: Option<PathBuf>) -> anyhow:
     command.arg("--port").arg(port.to_string());
     if let Some(web_root) = web_root {
         command.arg("--web-root").arg(web_root);
+    }
+    if companion {
+        command.arg("--companion");
+    }
+    if let Some(relay) = companion_relay {
+        command.arg("--companion-relay").arg(relay);
     }
     command
         .env("YGG_EXTENSION_PACKAGE_DIR", &package_dir)
@@ -930,12 +947,12 @@ fn validate_manifest(manifest: &PackageManifest) -> anyhow::Result<()> {
         anyhow::bail!("package entrypoint must be {ENTRYPOINT} with the single argument 'serve'");
     }
     validate_sha256(&manifest.entrypoint.sha256)?;
-    if manifest.capabilities.network != "loopback"
+    if manifest.capabilities.network != SERVE_NETWORK_CAPABILITY
         || !manifest.capabilities.process
         || manifest.capabilities.filesystem != "workspace"
     {
         anyhow::bail!(
-            "Ygg Serve must declare network='loopback', process=true, and filesystem='workspace'"
+            "Ygg Serve must declare network='{SERVE_NETWORK_CAPABILITY}', process=true, and filesystem='workspace'"
         );
     }
     Ok(())
@@ -1350,7 +1367,7 @@ mod tests {
              args = [\"serve\"]\n\
              sha256 = \"{digest}\"\n\n\
              [capabilities]\n\
-             network = \"loopback\"\n\
+             network = \"{SERVE_NETWORK_CAPABILITY}\"\n\
              process = true\n\
              filesystem = \"workspace\"\n",
             env!("CARGO_PKG_VERSION"),
@@ -1559,6 +1576,13 @@ mod tests {
             "requires_ygg = \">=0.1.0\"",
         );
         let manifest: PackageManifest = toml::from_str(&incompatible).unwrap();
+        assert!(validate_manifest(&manifest).is_err());
+
+        let undeclared_wan = package_manifest(b"runtime").replace(
+            &format!("network = \"{SERVE_NETWORK_CAPABILITY}\""),
+            "network = \"loopback\"",
+        );
+        let manifest: PackageManifest = toml::from_str(&undeclared_wan).unwrap();
         assert!(validate_manifest(&manifest).is_err());
     }
 

@@ -275,7 +275,7 @@ version = "0.10"
 version = "8.0"
 
 [dependencies.rand]
-version = "0.10"
+version = "0.9"
 
 [dependencies.rangemap]
 version = "1.5"

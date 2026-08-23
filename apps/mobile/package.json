@@ -1,0 +1,15 @@
+{
+  "name": "@skaft/ygg-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "sync:web": "npm --prefix ../web run build && npm --prefix ../web run bundle:sync",
+    "bundle:check": "npm --prefix ../web run bundle:check",
+    "tauri": "tauri",
+    "dev": "npm run sync:web && tauri dev",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.1"
+  }
+}

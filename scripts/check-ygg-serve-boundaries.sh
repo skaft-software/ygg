@@ -1,12 +1,12 @@
 #!/bin/sh
 set -eu
 
-# Forward-enforcement checkpoint after the shipped Serve source, canonical release
-# tooling, and then-current main were reconciled. Their independent histories
-# include unrelated core/TUI work, so auditing from the earlier stacked-branch
+# Forward-enforcement checkpoint at the companion branch base, after the shipped
+# Serve source and then-current main were reconciled. Their independent histories
+# include unrelated core/TUI work, so auditing from an earlier stacked-branch
 # checkpoint would turn this gate into a blanket core allowlist. A caller may
 # still pass an older ancestor to audit a wider range explicitly.
-default_base_ref=63f73d655c4fe27faeae4579f379726b093ef827
+default_base_ref=060909aff73033dc7ef4e1e75a3091fe23239a90
 base_ref=${1:-$default_base_ref}
 
 if ! git rev-parse --verify "${base_ref}^{commit}" >/dev/null 2>&1; then
@@ -32,17 +32,23 @@ violations=""
 for changed_file in $changed_files; do
   case "$changed_file" in
     apps/web/* \
+      | apps/mobile/* \
       | extensions/ygg-serve/* \
+      | extensions/ygg-companion-protocol/* \
       | docs/experimental/ygg-serve/* \
       | docs/design/config-diagnostics.md \
       | docs/design/serve-lifecycle-safety.md \
       | SECURITY.md \
       | scripts/check-ygg-serve-boundaries.sh \
       | scripts/package-ygg-serve-release.sh \
+      | scripts/test-ygg-serve-release-packaging.sh \
       | scripts/smoke-ygg-serve-installed.sh \
       | .github/workflows/ci.yml \
       | .github/workflows/release-serve.yml \
+      | .cargo/audit.toml \
+      | .cargo/config.toml \
       | .gitattributes \
+      | docs/extensions.md \
       | deny.toml \
       | Cargo.toml \
       | Cargo.lock \
@@ -51,6 +57,7 @@ for changed_file in $changed_files; do
     crates/ygg-coding-agent/Cargo.toml \
       | crates/ygg-coding-agent/src/cli.rs \
       | crates/ygg-coding-agent/src/extension_package.rs \
+      | crates/ygg-coding-agent/src/lib.rs \
       | crates/ygg-coding-agent/src/main.rs \
       | crates/ygg-coding-agent/src/commands.rs \
       | crates/ygg-coding-agent/src/extensions.rs \

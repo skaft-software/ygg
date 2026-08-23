@@ -5,7 +5,7 @@ use crate::encryption::Permissions;
 use crate::{Document, Error, Object};
 use aes::cipher::{BlockDecryptMut as _, BlockEncryptMut as _, KeyInit as _, KeyIvInit as _};
 use md5::{Digest as _, Md5};
-use rand::RngExt as _;
+use rand::Rng as _;
 use sha2::{Sha256, Sha384, Sha512};
 
 type Aes128CbcEnc = cbc::Encryptor<aes::Aes128>;
@@ -1204,7 +1204,7 @@ mod tests {
     use crate::Permissions;
     use crate::creator::tests::create_document;
     use crate::encryption::PasswordAlgorithm;
-    use rand::RngExt as _;
+    use rand::Rng as _;
 
     #[test]
     fn authenticate_password_r2() {

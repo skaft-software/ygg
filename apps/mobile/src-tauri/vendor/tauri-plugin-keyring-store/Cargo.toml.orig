@@ -1,0 +1,75 @@
+[package]
+name = "tauri-plugin-keyring-store"
+version = "0.2.0"
+authors = ["s00d"]
+description = "Stronghold-inspired secrets and crypto helpers backed by the OS credential store (keyring-core)."
+edition = "2021"
+rust-version = "1.77.2"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/s00d/tauri-plugin-keyring-store"
+documentation = "https://docs.rs/tauri-plugin-keyring-store"
+keywords = ["tauri", "tauri-plugin", "keyring", "credential", "secrets"]
+categories = ["authentication", "api-bindings"]
+exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
+links = "tauri-plugin-keyring-store"
+
+[package.metadata.docs.rs]
+all-features = true
+# Do not set `rustc-args = ["--cfg", "docsrs"]`: that applies to all dependencies and breaks
+# serde_derive + serde on nightly (see serde-rs/serde#2994). docs.rs passes `--cfg docsrs` to
+# rustdoc for the crate being documented; use `cfg(doc)` in Cargo.toml / code for Linux stubs.
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+default = ["crypto"]
+# SLIP10 / BIP39 / Ed25519 procedures via `iota-crypto` only. Encrypted backup (Argon2 + ChaCha) is always built.
+crypto = ["dep:iota-crypto"]
+
+[dependencies]
+# Transitive 0.14.7 breaks docs.rs: `#![cfg_attr(docsrs, feature(doc_auto_cfg))]` removed in rustc 1.92+.
+generic-array = "0.14.9"
+tauri = { version = "2.11.2" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+log = "0.4"
+# Keep this store compatible with Iroh 0.95.1's prerelease crypto graph.
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+keyring-core = "1"
+iota-crypto = { version = "0.23", optional = true, default-features = false, features = [
+  "bip39",
+  "bip39-en",
+  "slip10",
+  "ed25519",
+  "random",
+]}
+argon2 = { version = "0.5", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.10" }
+getrandom = { version = "0.4" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["protected"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1"
+
+# Linux D-Bus backend is omitted when documenting (`cfg(doc)`), e.g. docs.rs without host GLib.
+[target.'cfg(all(target_os = "linux", not(doc)))'.dependencies]
+dbus-secret-service-keyring-store = { version = "1", default-features = false, features = [
+  "crypto-rust",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = "=1.0.0"
+
+[build-dependencies]
+tauri-plugin = { version = "2.6.2", features = ["build"] }
+
+[dev-dependencies]
+rand = "0.10"

@@ -1,5 +1,30 @@
-import { Bell, BellOff, Type } from "lucide-react";
+import { Bell, BellOff, ShieldCheck, Type } from "lucide-react";
 import { useEffect, useState } from "react";
+
+function readNativeSettingsUrl(): string | null {
+  const value = document
+    .querySelector<HTMLMetaElement>('meta[name="ygg-native-settings-url"]')
+    ?.content.trim();
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    if (
+      url.protocol !== "http:" ||
+      url.hostname !== "127.0.0.1" ||
+      !url.port ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !/^\/_native\/settings\/start\/[0-9a-f]{64}$/.test(url.pathname)
+    ) {
+      return null;
+    }
+    return url.href;
+  } catch {
+    return null;
+  }
+}
 
 interface SettingsViewProps {
   notificationsSupported: boolean;
@@ -75,6 +100,7 @@ export function SettingsView({
   const [notificationMessage, setNotificationMessage] = useState<string | null>(
     null,
   );
+  const [nativeSettingsUrl] = useState(readNativeSettingsUrl);
 
   useEffect(() => {
     const stack =
@@ -214,6 +240,35 @@ export function SettingsView({
           ) : null}
         </div>
       </section>
+
+      {nativeSettingsUrl ? (
+        <section
+          className="settings-section"
+          aria-labelledby="companion-settings-title"
+        >
+          <div className="settings-section-heading">
+            <ShieldCheck aria-hidden="true" />
+            <div>
+              <h2 id="companion-settings-title">Companion access</h2>
+              <p>
+                Open the app-owned settings origin to remove this device's
+                protected endpoint identity and pinned host.
+              </p>
+            </div>
+          </div>
+          <div className="settings-rows">
+            <a className="settings-toggle-row" href={nativeSettingsUrl}>
+              <span>
+                <strong>Open native companion settings</strong>
+                <small>
+                  Host-provided web content cannot remove active access.
+                </small>
+              </span>
+              <ShieldCheck aria-hidden="true" />
+            </a>
+          </div>
+        </section>
+      ) : null}
     </main>
   );
 }

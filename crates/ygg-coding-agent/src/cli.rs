@@ -47,6 +47,17 @@ pub enum TopLevelCommand {
         /// Directory containing a development graphical shell.
         #[arg(long, value_name = "DIR")]
         web_root: Option<PathBuf>,
+        /// Explicitly enable the authenticated native companion transport.
+        #[arg(long, requires = "companion_relay")]
+        companion: bool,
+        /// Explicit WAN relay provider for companion mode.
+        #[arg(
+            long,
+            value_name = "PROVIDER",
+            value_parser = ["n0"],
+            requires = "companion"
+        )]
+        companion_relay: Option<String>,
     },
 }
 
@@ -2387,7 +2398,33 @@ mod tests {
                 no_open: true,
                 port: 0,
                 web_root: Some(_),
+                companion: false,
+                companion_relay: None,
             })
+        ));
+    }
+
+    #[test]
+    fn serve_companion_requires_an_explicit_known_relay() {
+        assert!(Cli::try_parse_from(["ygg", "serve", "--companion"]).is_err());
+        assert!(Cli::try_parse_from(["ygg", "serve", "--companion-relay", "n0"]).is_err());
+        assert!(Cli::try_parse_from([
+            "ygg",
+            "serve",
+            "--companion",
+            "--companion-relay",
+            "unknown",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from(["ygg", "serve", "--companion", "--companion-relay", "n0"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Serve {
+                companion: true,
+                companion_relay: Some(ref relay),
+                ..
+            }) if relay == "n0"
         ));
     }
 

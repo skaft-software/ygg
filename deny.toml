@@ -16,6 +16,40 @@ yanked = "deny"
 # migrates its default-syntax dump off bincode 1, or replace `default-syntaxes`
 # with a Ygg-built trusted SyntaxSet if upstream does not migrate.
 ignore = [
+  # time 0.3.45 is the newest release compatible with Ygg's Rust 1.86 MSRV.
+  # This graph enables only default/alloc/std; the vulnerable RFC 2822 parser
+  # and every affected parsing entry point are absent. Remove when Iroh can use
+  # time >=0.3.47 without raising Ygg's MSRV.
+  "RUSTSEC-2026-0009",
+  # Iroh 0.95.1 is the last release compatible with Ygg's Rust 1.86 MSRV.
+  # Its hickory graph does not enable either DNSSEC feature required to reach
+  # this NSEC3 validator bug. Remove this exception when Iroh can move to the
+  # fixed hickory line without an unplanned MSRV increase.
+  "RUSTSEC-2026-0118",
+  # Ygg supplies Iroh only the fixed N0 relay map. Hickory encodes internally
+  # constructed, bounded hostname lookups here; no untrusted DNS record set
+  # reaches the vulnerable message-encoding path. Track with the Iroh upgrade.
+  "RUSTSEC-2026-0119",
+  # Linux-only transitive compile-time macro dependency through Iroh's network
+  # interface discovery. The advisory reports maintenance status, not a known
+  # vulnerability; replace when netlink-packet-core moves off `paste`.
+  "RUSTSEC-2024-0436",
+  # Tauri 2.11.5 resolves through plist 1.8 to quick-xml 0.38.4 at the
+  # Rust 1.86 MSRV. The shell exposes no XML boundary: plist reads only
+  # repository/app-owned build inputs and the app bundle's own metadata.
+  # Remove when the compatible Tauri/plist graph admits quick-xml >=0.41.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+  # Tauri's urlpattern dependency still uses the unmaintained rust-unic family.
+  # These are maintenance notices, not known vulnerabilities, and native code
+  # separately enforces exact loopback scheme/host/port/path navigation. Remove
+  # this group when a Rust-1.86-compatible Tauri release replaces urlpattern's
+  # rust-unic dependency.
+  "RUSTSEC-2025-0075",
+  "RUSTSEC-2025-0080",
+  "RUSTSEC-2025-0081",
+  "RUSTSEC-2025-0098",
+  "RUSTSEC-2025-0100",
   # Indirectly pulled by lopdf 0.42.0 for PDF font parsing. This is an
   # unmaintained warning, not a known vulnerability; no newer lopdf release
   # removes the dependency yet. Reassess on every lopdf upgrade or when

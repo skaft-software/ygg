@@ -27,8 +27,9 @@ const MAX_SUCCESS_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// timeout. Without this, a dead route can consume the full endpoint timeout on
 /// every retry before the UI receives an error.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum silence allowed between SSE body chunks.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Maximum silence allowed between SSE body chunks. Tool-call parsers may
+/// buffer a complete large argument object before emitting the next chunk.
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Absolute deadline for one generation request.
 const DEFAULT_STREAM_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// Compression level used by the ChatGPT Codex SSE endpoint and the official

@@ -4,6 +4,10 @@ import type {
   ClientCommand,
   CommandAck,
   CommandDiscovery,
+  CompanionCatalog,
+  CompanionDevice,
+  CompanionPairingDecision,
+  CompanionPairingInvitation,
   DocumentReference,
   GoalMutation,
   GoalState,
@@ -48,6 +52,9 @@ import {
   projectHostStreamEvent,
   projectDocumentReference,
   projectCommandDiscovery,
+  projectCompanionCatalog,
+  projectCompanionDevices,
+  projectCompanionPairingInvitation,
   projectReplayResponse,
   projectSessionSnapshot,
   projectTranscriptSearchResult,
@@ -118,6 +125,18 @@ export interface YggTransport {
   subscribe(listener: EventListener): () => void;
   subscribeConnection?(listener: ConnectionListener): () => void;
   close(): void;
+}
+
+export interface CompanionAdminTransport {
+  getCompanionDevices(): Promise<CompanionDevice[]>;
+  getCompanionCatalog(): Promise<CompanionCatalog>;
+  openCompanionPairing(): Promise<CompanionPairingInvitation>;
+  closeCompanionPairing(): Promise<void>;
+  decideCompanionPairing(
+    requestId: string,
+    decision: CompanionPairingDecision,
+  ): Promise<void>;
+  revokeCompanionDevice(deviceId: string): Promise<void>;
 }
 
 export type TerminalConnectionState =
@@ -487,7 +506,7 @@ function decodeGoalResponse(response: Response, value: unknown): GoalResponse {
   return { goal, revision };
 }
 
-export class FixtureTransport implements YggTransport {
+export class FixtureTransport implements YggTransport, CompanionAdminTransport {
   private bootstrap = clone(fixtureBootstrap);
   private sessions = clone(fixtureSessions);
   private listeners = new Set<EventListener>();
@@ -499,6 +518,30 @@ export class FixtureTransport implements YggTransport {
   private projectFiles = new Map<string, Map<string, FixtureProjectFile>>();
   private goals = new Map<string, GoalState>();
   private goalRevisions = new Map<string, number>();
+
+  private companionCatalog: CompanionCatalog = {
+    revision: 1,
+    devices: [
+      {
+        id: "device-phone",
+        name: "Achu’s iPhone",
+        platform: "ios",
+        pairedAtMs: Date.now() - 7 * 86_400_000,
+        lastSeenAtMs: Date.now(),
+        connected: true,
+      },
+      {
+        id: "device-linux",
+        name: "temper",
+        platform: "other",
+        pairedAtMs: Date.now() - 30 * 86_400_000,
+        lastSeenAtMs: Date.now() - 86_400_000,
+        connected: false,
+      },
+    ],
+    pending: [],
+  };
+  private companionInvitation: CompanionPairingInvitation | null = null;
 
   async getProjectCatalog(): Promise<ProjectCatalog> {
     return {
@@ -668,6 +711,72 @@ export class FixtureTransport implements YggTransport {
       currentStreak: 3,
       longestStreak: 12,
     };
+  }
+
+  async getCompanionDevices(): Promise<CompanionDevice[]> {
+    return clone(this.companionCatalog.devices);
+  }
+
+  async getCompanionCatalog(): Promise<CompanionCatalog> {
+    return clone(this.companionCatalog);
+  }
+
+  async openCompanionPairing(): Promise<CompanionPairingInvitation> {
+    const now = Date.now();
+    if (
+      !this.companionInvitation ||
+      this.companionInvitation.expiresAtMs <= now
+    ) {
+      this.companionInvitation = {
+        ticket: `ygg://pair/v1/${crypto.randomUUID().replaceAll("-", "")}`,
+        expiresAtMs: now + 120_000,
+      };
+    }
+    this.companionCatalog.invitationExpiresAtMs =
+      this.companionInvitation.expiresAtMs;
+    return clone(this.companionInvitation);
+  }
+
+  async closeCompanionPairing(): Promise<void> {
+    this.companionInvitation = null;
+    delete this.companionCatalog.invitationExpiresAtMs;
+    this.companionCatalog.pending = [];
+  }
+
+  async decideCompanionPairing(
+    requestId: string,
+    decision: CompanionPairingDecision,
+  ): Promise<void> {
+    const pending = this.companionCatalog.pending.find(
+      (request) => request.requestId === requestId,
+    );
+    if (!pending)
+      throw new Error("The pairing request is no longer available.");
+    this.companionCatalog.pending = this.companionCatalog.pending.filter(
+      (request) => request.requestId !== requestId,
+    );
+    if (decision === "approve") {
+      this.companionCatalog.devices.push({
+        id: `device-fixture-${this.companionCatalog.revision + 1}`,
+        name: pending.device.name,
+        platform: pending.device.platform,
+        pairedAtMs: Date.now(),
+        connected: true,
+      });
+      this.companionCatalog.revision += 1;
+    }
+  }
+
+  async revokeCompanionDevice(deviceId: string): Promise<void> {
+    const device = this.companionCatalog.devices.find(
+      (candidate) => candidate.id === deviceId,
+    );
+    if (!device) throw new Error("The companion device was not found.");
+    if (device.revokedAtMs === undefined) {
+      device.revokedAtMs = Date.now();
+      device.connected = false;
+      this.companionCatalog.revision += 1;
+    }
   }
 
   async connect(
@@ -2107,11 +2216,309 @@ export class FixtureTransport implements YggTransport {
   }
 }
 
-export class HttpTransport implements YggTransport {
+const companionRequestTimeoutMs = 10_000;
+const recoveryRequestTimeoutMs = 10_000;
+const companionCatalogResponseBytes = 300 * 1024;
+const companionInvitationResponseBytes = 8 * 1024;
+const companionErrorResponseBytes = 8 * 1024;
+const maximumHostEventBytes = 1024 * 1024;
+const maximumReplayBufferedEvents = 2_048;
+const maximumReplayBufferedBytes = 8 * 1024 * 1024;
+const maximumReplayResponseBytes = 8 * 1024 * 1024;
+const maximumCatalogRefreshResponseBytes = 12 * 1024 * 1024;
+
+async function companionRequest<T>(
+  request: (init: RequestInit) => Promise<Response>,
+  consume: (response: Response, signal: AbortSignal) => Promise<T>,
+  init?: RequestInit,
+): Promise<T> {
+  const controller = new AbortController();
+  const deadline = Date.now() + companionRequestTimeoutMs;
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    companionRequestTimeoutMs,
+  );
+  try {
+    const response = await request({
+      ...init,
+      credentials: "same-origin",
+      signal: controller.signal,
+    });
+    const result = await consume(response, controller.signal);
+    if (controller.signal.aborted || Date.now() >= deadline) {
+      throw new Error("The companion host did not respond in time.");
+    }
+    return result;
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error("The companion host did not respond in time.", {
+        cause: error,
+      });
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+  }
+}
+
+interface BoundedBodyOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number | null;
+  hostLabel?: string;
+}
+
+async function boundedBody(
+  response: Response,
+  maximumBytes: number,
+  options: BoundedBodyOptions = {},
+): Promise<Uint8Array> {
+  const hostLabel = options.hostLabel ?? "companion host";
+  const declaredLength = response.headers.get("content-length");
+  let declaredBytes: number | null = null;
+  if (declaredLength !== null) {
+    const parsedLength = Number(declaredLength);
+    if (
+      !/^\d+$/u.test(declaredLength) ||
+      !Number.isSafeInteger(parsedLength) ||
+      parsedLength > maximumBytes
+    ) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new Error(`The ${hostLabel} returned an oversized response.`);
+    }
+    declaredBytes = parsedLength;
+  }
+  if (!response.body) {
+    if (declaredBytes !== null && declaredBytes !== 0) {
+      throw new Error(`The ${hostLabel} returned an invalid response.`);
+    }
+    return new Uint8Array();
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let timedOut = false;
+  let cancelled = false;
+  const timeoutMs =
+    options.timeoutMs === undefined
+      ? companionRequestTimeoutMs
+      : options.timeoutMs;
+  const timeout =
+    timeoutMs === null
+      ? undefined
+      : window.setTimeout(() => {
+          timedOut = true;
+          void reader.cancel().catch(() => undefined);
+        }, timeoutMs);
+  const cancel = () => {
+    cancelled = true;
+    void reader.cancel().catch(() => undefined);
+  };
+  options.signal?.addEventListener("abort", cancel, { once: true });
+  if (options.signal?.aborted) cancel();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maximumBytes) {
+        void reader.cancel().catch(() => undefined);
+        throw new Error(`The ${hostLabel} returned an oversized response.`);
+      }
+      chunks.push(value);
+    }
+    if (timedOut) {
+      throw new Error(`The ${hostLabel} did not respond in time.`);
+    }
+    if (cancelled) {
+      throw new Error(`The ${hostLabel} request was cancelled.`);
+    }
+    if (declaredBytes !== null && total !== declaredBytes) {
+      throw new Error(`The ${hostLabel} returned an invalid response.`);
+    }
+  } catch (error) {
+    void reader.cancel().catch(() => undefined);
+    if (timedOut) {
+      throw new Error(`The ${hostLabel} did not respond in time.`, {
+        cause: error,
+      });
+    }
+    if (cancelled) {
+      throw new Error(`The ${hostLabel} request was cancelled.`, {
+        cause: error,
+      });
+    }
+    if (error instanceof Error) throw error;
+    throw new Error(`The ${hostLabel} returned an invalid response.`, {
+      cause: error,
+    });
+  } finally {
+    if (timeout !== undefined) window.clearTimeout(timeout);
+    options.signal?.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function decodeBoundedJson(bytes: Uint8Array, hostLabel: string): unknown {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`The ${hostLabel} returned an invalid response.`);
+  }
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new Error(`The ${hostLabel} returned an invalid response.`);
+  }
+}
+
+async function boundedJson(
+  response: Response,
+  maximumBytes: number,
+  options: BoundedBodyOptions = {},
+): Promise<unknown> {
+  return decodeBoundedJson(
+    await boundedBody(response, maximumBytes, options),
+    "companion host",
+  );
+}
+
+async function recoveryJson(
+  request: (init: RequestInit) => Promise<Response>,
+  maximumBytes: number,
+  attemptSignal: AbortSignal,
+  failure: string,
+): Promise<{ value: unknown; byteLength: number }> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const deadline = Date.now() + recoveryRequestTimeoutMs;
+  const cancel = () => controller.abort();
+  attemptSignal.addEventListener("abort", cancel, { once: true });
+  if (attemptSignal.aborted) cancel();
+  const timeout = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, recoveryRequestTimeoutMs);
+  try {
+    const response = await request({
+      headers: { Accept: "application/json" },
+      credentials: "same-origin",
+      signal: controller.signal,
+    });
+    if (response.status !== 200) {
+      await boundedBody(response, companionErrorResponseBytes, {
+        signal: controller.signal,
+        timeoutMs: null,
+        hostLabel: "host",
+      });
+      throw new Error(`${failure} with ${response.status}`);
+    }
+    const bytes = await boundedBody(response, maximumBytes, {
+      signal: controller.signal,
+      timeoutMs: null,
+      hostLabel: "host",
+    });
+    if (timedOut || Date.now() >= deadline) {
+      throw new Error("The host did not respond in time.");
+    }
+    const value = decodeBoundedJson(bytes, "host");
+    if (timedOut || Date.now() >= deadline) {
+      throw new Error("The host did not respond in time.");
+    }
+    return { value, byteLength: bytes.byteLength };
+  } catch (error) {
+    if (attemptSignal.aborted) {
+      throw new Error("The recovery attempt was superseded.", { cause: error });
+    }
+    if (timedOut) {
+      throw new Error("The host did not respond in time.", { cause: error });
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    attemptSignal.removeEventListener("abort", cancel);
+  }
+}
+
+function replayEventBounds(value: unknown): {
+  count: number;
+  encodedBytes: number;
+} {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (value as { type?: unknown }).type !== "events" ||
+    !Array.isArray((value as { events?: unknown }).events)
+  ) {
+    return { count: 0, encodedBytes: 0 };
+  }
+  const events = (value as { events: unknown[] }).events;
+  let encodedBytes = 0;
+  for (const event of events) {
+    const encoded = JSON.stringify(event);
+    if (encoded === undefined) {
+      throw new Error("The host returned an invalid replay response.");
+    }
+    const eventBytes = new TextEncoder().encode(encoded).byteLength;
+    if (eventBytes > maximumHostEventBytes) {
+      throw new Error("The host returned an oversized replay event.");
+    }
+    encodedBytes += eventBytes;
+    if (encodedBytes > maximumReplayBufferedBytes) {
+      throw new Error("The host returned an oversized replay response.");
+    }
+  }
+  return { count: events.length, encodedBytes };
+}
+
+async function requireEmptyCompanionResponse(
+  response: Response,
+  options: BoundedBodyOptions = {},
+): Promise<void> {
+  const body = await boundedBody(
+    response,
+    companionErrorResponseBytes,
+    options,
+  );
+  if (body.byteLength !== 0) {
+    throw new Error("The companion host returned an invalid response.");
+  }
+}
+
+async function requireCompanionStatus(
+  response: Response,
+  expectedStatus: number,
+  failure: string,
+  options: BoundedBodyOptions = {},
+): Promise<void> {
+  if (response.status === expectedStatus) return;
+  await boundedBody(response, companionErrorResponseBytes, options);
+  throw new Error(`${failure} with ${response.status}.`);
+}
+
+function companionIdentifierPath(value: string, label: string): string {
+  if (!validDeviceId.test(value)) {
+    throw new Error(`The ${label} is invalid.`);
+  }
+  return encodeURIComponent(value);
+}
+
+export class HttpTransport implements YggTransport, CompanionAdminTransport {
   private listeners = new Set<EventListener>();
   private connectionListeners = new Set<ConnectionListener>();
   private connectionState: TransportConnectionState = "connecting";
   private socket: WebSocket | null = null;
+  private socketRecoveryController: AbortController | null = null;
   private reconnectTimer: number | null = null;
   private reconnectAttempt = 0;
   private closedByClient = false;
@@ -2204,6 +2611,152 @@ export class HttpTransport implements YggTransport {
       throw new Error(`Usage activity failed with ${response.status}`);
     }
     return projectUsageActivity(await response.json());
+  }
+
+  async getCompanionDevices(): Promise<CompanionDevice[]> {
+    return companionRequest(
+      (init) => fetch("/api/v1/companion/devices", init),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          200,
+          "Connected devices failed",
+          options,
+        );
+        return projectCompanionDevices(
+          await boundedJson(
+            response,
+            companionCatalogResponseBytes,
+            options,
+          ),
+        );
+      },
+      { headers: { Accept: "application/json" } },
+    );
+  }
+
+  async getCompanionCatalog(): Promise<CompanionCatalog> {
+    return companionRequest(
+      (init) => fetch("/api/v1/companion/pairing/state", init),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          200,
+          "Companion status failed",
+          options,
+        );
+        return projectCompanionCatalog(
+          await boundedJson(
+            response,
+            companionCatalogResponseBytes,
+            options,
+          ),
+        );
+      },
+      { headers: { Accept: "application/json" } },
+    );
+  }
+
+  async openCompanionPairing(): Promise<CompanionPairingInvitation> {
+    return companionRequest(
+      (init) => fetch("/api/v1/companion/pairing/open", init),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          200,
+          "Opening companion pairing failed",
+          options,
+        );
+        return projectCompanionPairingInvitation(
+          await boundedJson(
+            response,
+            companionInvitationResponseBytes,
+            options,
+          ),
+        );
+      },
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: "{}",
+      },
+    );
+  }
+
+  async closeCompanionPairing(): Promise<void> {
+    return companionRequest(
+      (init) => fetch("/api/v1/companion/pairing", init),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          204,
+          "Closing companion pairing failed",
+          options,
+        );
+        await requireEmptyCompanionResponse(response, options);
+      },
+      { method: "DELETE" },
+    );
+  }
+
+  async decideCompanionPairing(
+    requestId: string,
+    decision: CompanionPairingDecision,
+  ): Promise<void> {
+    const requestPath = companionIdentifierPath(
+      requestId,
+      "pairing request ID",
+    );
+    return companionRequest(
+      (init) =>
+        fetch(
+          `/api/v1/companion/pairing/requests/${requestPath}/decision`,
+          init,
+        ),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          204,
+          "Pairing decision failed",
+          options,
+        );
+        await requireEmptyCompanionResponse(response, options);
+      },
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ decision }),
+      },
+    );
+  }
+
+  async revokeCompanionDevice(deviceId: string): Promise<void> {
+    const devicePath = companionIdentifierPath(deviceId, "device ID");
+    return companionRequest(
+      (init) => fetch(`/api/v1/companion/devices/${devicePath}`, init),
+      async (response, signal) => {
+        const options = { signal, timeoutMs: null };
+        await requireCompanionStatus(
+          response,
+          204,
+          "Device revocation failed",
+          options,
+        );
+        await requireEmptyCompanionResponse(response, options);
+      },
+      { method: "DELETE" },
+    );
   }
 
   async connect(
@@ -2712,6 +3265,8 @@ export class HttpTransport implements YggTransport {
       window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.socketRecoveryController?.abort();
+    this.socketRecoveryController = null;
     this.socket?.close();
     this.socket = null;
     this.replacementBarrierBySession.clear();
@@ -2727,6 +3282,9 @@ export class HttpTransport implements YggTransport {
     }
 
     const generation = ++this.socketGeneration;
+    this.socketRecoveryController?.abort();
+    const recoveryController = new AbortController();
+    this.socketRecoveryController = recoveryController;
     const previous = this.socket;
     this.socket = null;
     previous?.close();
@@ -2742,7 +3300,17 @@ export class HttpTransport implements YggTransport {
       hostSequence: number;
       event: HostEvent;
     }> = [];
+    let bufferedEventBytes = 0;
+    let streamInvalid = false;
     const isCurrent = () => this.isCurrentSocket(socket, generation);
+    const invalidateSocket = (code?: number, reason?: string) => {
+      streamInvalid = true;
+      replaying = false;
+      bufferedEvents.length = 0;
+      bufferedEventBytes = 0;
+      recoveryController.abort();
+      socket.close(code, reason);
+    };
 
     socket.addEventListener("open", () => {
       if (!isCurrent()) {
@@ -2755,15 +3323,16 @@ export class HttpTransport implements YggTransport {
       this.setConnectionState("connected");
       replaying = true;
       void Promise.all([
-        this.replayAll(socket, generation),
-        this.refreshCatalog(socket, generation),
+        this.replayAll(socket, generation, recoveryController.signal),
+        this.refreshCatalog(socket, generation, recoveryController.signal),
       ]).then(
         () => {
-          if (!isCurrent()) return;
+          if (!isCurrent() || streamInvalid) return;
           replaying = false;
           const buffered = bufferedEvents
             .splice(0)
             .sort((left, right) => left.hostSequence - right.hostSequence);
+          bufferedEventBytes = 0;
           for (const projection of buffered) {
             if (this.rememberEvent(projection.event)) {
               this.dispatch(projection.event);
@@ -2771,33 +3340,57 @@ export class HttpTransport implements YggTransport {
           }
         },
         () => {
-          if (isCurrent()) socket.close();
+          if (isCurrent()) invalidateSocket();
         },
       );
     });
 
     socket.addEventListener("message", (message) => {
-      if (!isCurrent()) return;
+      if (!isCurrent() || streamInvalid) return;
       try {
-        const projection = projectHostStreamEvent(
-          JSON.parse(String(message.data)),
-          { models: this.models },
-        );
+        if (typeof message.data !== "string") {
+          throw new Error("host events must be text");
+        }
+        if (message.data.length > maximumHostEventBytes) {
+          invalidateSocket(1009, "Ygg event exceeds its size limit");
+          return;
+        }
+        const eventBytes = new TextEncoder().encode(message.data).byteLength;
+        if (eventBytes > maximumHostEventBytes) {
+          invalidateSocket(1009, "Ygg event exceeds its size limit");
+          return;
+        }
+        const projection = projectHostStreamEvent(JSON.parse(message.data), {
+          models: this.models,
+        });
         if (replaying) {
+          if (
+            bufferedEvents.length >= maximumReplayBufferedEvents ||
+            bufferedEventBytes + eventBytes > maximumReplayBufferedBytes
+          ) {
+            invalidateSocket(1009, "Ygg replay buffer exceeds its limit");
+            return;
+          }
           bufferedEvents.push(projection);
+          bufferedEventBytes += eventBytes;
         } else if (this.rememberEvent(projection.event)) {
           this.dispatch(projection.event);
         }
       } catch {
-        socket.close(1002, "Invalid ygg event");
+        invalidateSocket(1002, "Invalid ygg event");
       }
     });
 
     socket.addEventListener("close", () => {
+      recoveryController.abort();
+      if (this.socketRecoveryController === recoveryController) {
+        this.socketRecoveryController = null;
+      }
       if (!isCurrent()) return;
       this.socket = null;
       replaying = false;
       bufferedEvents.length = 0;
+      bufferedEventBytes = 0;
       if (this.closedByClient) return;
       this.setConnectionState("reconnecting");
       const delay = Math.min(5_000, 250 * 2 ** this.reconnectAttempt);
@@ -2931,26 +3524,29 @@ export class HttpTransport implements YggTransport {
   private async refreshCatalog(
     socket: WebSocket,
     generation: number,
+    signal: AbortSignal,
   ): Promise<void> {
     const anchor =
       this.catalogAnchorSessionId ?? this.cursorBySession.keys().next().value;
-    const request: RequestInit = {
-      headers: { Accept: "application/json" },
-      credentials: "same-origin",
-    };
-    const response = anchor
-      ? await fetch(
-          `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(anchor)}`,
-          request,
-        )
-      : await fetch("/api/v1/bootstrap?inventoryOnly=true", request);
-    if (!this.isCurrentSocket(socket, generation)) return;
-    if (!response.ok) {
-      throw new Error(`Catalog refresh failed with ${response.status}`);
-    }
-    const { bootstrap } = projectHostBootstrap(await response.json());
+    const request = anchor
+      ? (init: RequestInit) =>
+          fetch(
+            `/api/v1/bootstrap?selectedSessionId=${encodeURIComponent(anchor)}`,
+            init,
+          )
+      : (init: RequestInit) =>
+          fetch("/api/v1/bootstrap?inventoryOnly=true", init);
+    const { value } = await recoveryJson(
+      request,
+      maximumCatalogRefreshResponseBytes,
+      signal,
+      "Catalog refresh failed",
+    );
+    if (!this.isCurrentSocket(socket, generation) || signal.aborted) return;
+    const { bootstrap } = projectHostBootstrap(value);
     if (
       !this.isCurrentSocket(socket, generation) ||
+      signal.aborted ||
       bootstrap.catalogRevision <= this.catalogRevision
     ) {
       return;
@@ -2978,56 +3574,70 @@ export class HttpTransport implements YggTransport {
   private async replayAll(
     socket: WebSocket,
     generation: number,
+    signal: AbortSignal,
   ): Promise<void> {
     const cursors = [...this.cursorBySession.entries()];
-    await Promise.all(
-      cursors.map(async ([sessionId, cursor]) => {
-        const query = new URLSearchParams({
-          actorGeneration: String(cursor.actorGeneration),
-          sequence: String(cursor.sequence),
+    let responseBytes = 0;
+    let eventCount = 0;
+    let eventBytes = 0;
+    for (const [sessionId, cursor] of cursors) {
+      if (!this.isCurrentSocket(socket, generation) || signal.aborted) return;
+      const query = new URLSearchParams({
+        actorGeneration: String(cursor.actorGeneration),
+        sequence: String(cursor.sequence),
+      });
+      const response = await recoveryJson(
+        (init) =>
+          fetch(
+            `/api/v1/sessions/${encodeURIComponent(sessionId)}/replay?${query}`,
+            init,
+          ),
+        maximumReplayResponseBytes - responseBytes,
+        signal,
+        "Replay failed",
+      );
+      if (!this.isCurrentSocket(socket, generation) || signal.aborted) return;
+      responseBytes += response.byteLength;
+      const bounds = replayEventBounds(response.value);
+      if (
+        bounds.count > maximumReplayBufferedEvents - eventCount ||
+        bounds.encodedBytes > maximumReplayBufferedBytes - eventBytes
+      ) {
+        throw new Error("The host returned an oversized replay response.");
+      }
+      eventCount += bounds.count;
+      eventBytes += bounds.encodedBytes;
+
+      const replay = projectReplayResponse(response.value, {
+        summary: this.summaries.get(sessionId),
+        models: this.models,
+      });
+      if (!this.isCurrentSocket(socket, generation) || signal.aborted) return;
+      if (replay.type === "gap") {
+        this.rememberSnapshot(replay.snapshot);
+        this.dispatch({
+          type: "session.snapshot",
+          sessionId: replay.snapshot.sessionId,
+          actorGeneration: replay.snapshot.actorGeneration,
+          sequence: replay.snapshot.sequence,
+          snapshot: replay.snapshot,
         });
-        const response = await fetch(
-          `/api/v1/sessions/${encodeURIComponent(sessionId)}/replay?${query}`,
-          {
-            headers: { Accept: "application/json" },
-            credentials: "same-origin",
-          },
-        );
-        if (!this.isCurrentSocket(socket, generation)) return;
-        if (!response.ok) {
-          throw new Error(`Replay failed with ${response.status}`);
-        }
-        const replay = projectReplayResponse(await response.json(), {
-          summary: this.summaries.get(sessionId),
-          models: this.models,
+        continue;
+      }
+      for (const event of replay.events) {
+        if (this.rememberEvent(event)) this.dispatch(event);
+      }
+      if (
+        replay.events.length === 0 &&
+        !this.replacementBarrierBySession.has(sessionId)
+      ) {
+        this.actorGenerationBySession[sessionId] = replay.actorGeneration;
+        this.cursorBySession.set(sessionId, {
+          actorGeneration: replay.actorGeneration,
+          sequence: replay.sequence,
         });
-        if (!this.isCurrentSocket(socket, generation)) return;
-        if (replay.type === "gap") {
-          this.rememberSnapshot(replay.snapshot);
-          this.dispatch({
-            type: "session.snapshot",
-            sessionId: replay.snapshot.sessionId,
-            actorGeneration: replay.snapshot.actorGeneration,
-            sequence: replay.snapshot.sequence,
-            snapshot: replay.snapshot,
-          });
-          return;
-        }
-        for (const event of replay.events) {
-          if (this.rememberEvent(event)) this.dispatch(event);
-        }
-        if (
-          replay.events.length === 0 &&
-          !this.replacementBarrierBySession.has(sessionId)
-        ) {
-          this.actorGenerationBySession[sessionId] = replay.actorGeneration;
-          this.cursorBySession.set(sessionId, {
-            actorGeneration: replay.actorGeneration,
-            sequence: replay.sequence,
-          });
-        }
-      }),
-    );
+      }
+    }
   }
 }
 
@@ -3077,7 +3687,7 @@ export function resolveClientDeviceId(): string | undefined {
 
 export function createTransport(
   mode = transportModeFromSearch(window.location.search),
-): YggTransport {
+): YggTransport & CompanionAdminTransport {
   // Vite folds import.meta.env.DEV to false for production builds. That makes
   // FixtureTransport and its fixture-data imports unreachable and removable
   // from the production dependency graph.

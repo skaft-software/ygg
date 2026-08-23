@@ -1389,6 +1389,44 @@ export interface CommandAck {
   catalogChanged?: boolean;
 }
 
+export type CompanionDevicePlatform = "ios" | "android" | "macos" | "other";
+
+export interface CompanionDevice {
+  id: string;
+  name: string;
+  platform: CompanionDevicePlatform;
+  pairedAtMs: number;
+  lastSeenAtMs?: number;
+  revokedAtMs?: number;
+  connected: boolean;
+}
+
+export interface PendingCompanionPairing {
+  requestId: string;
+  device: {
+    name: string;
+    platform: CompanionDevicePlatform;
+    appVersion: string;
+  };
+  state: "pending" | "approved";
+  phrase: string;
+  expiresAtMs: number;
+}
+
+export interface CompanionCatalog {
+  revision: number;
+  devices: CompanionDevice[];
+  pending: PendingCompanionPairing[];
+  invitationExpiresAtMs?: number;
+}
+
+export interface CompanionPairingInvitation {
+  ticket: string;
+  expiresAtMs: number;
+}
+
+export type CompanionPairingDecision = "approve" | "deny";
+
 export interface ConnectedDevice {
   id: string;
   name: string;

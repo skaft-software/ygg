@@ -1,6 +1,7 @@
 //! Loopback-only HTTP and WebSocket transport for first-party graphical clients.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Component, Path as FilePath, PathBuf};
 use std::sync::{
@@ -9,10 +10,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
+use axum::body::{to_bytes, Body};
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path, Query, RawQuery, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, RawQuery, Request, State};
 use axum::http::header::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
     COOKIE, ETAG, HOST, LOCATION, ORIGIN, RANGE, REFERRER_POLICY, SET_COOKIE, TRANSFER_ENCODING,
@@ -23,11 +24,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
-use tokio::sync::{oneshot, Semaphore};
+use tokio::sync::{broadcast, oneshot, watch, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::embedded_web::WebBundle;
@@ -40,7 +41,10 @@ use crate::{
     MAX_COMMAND_BYTES, MAX_DOCUMENT_FILE_BYTES, MAX_PROJECT_FILE_PATH_BYTES,
     MAX_PROJECT_FILE_WRITE_BYTES, MAX_PTY_INPUT_BYTES, PROTOCOL_VERSION,
 };
+use crate::{CompanionControl, CompanionControlError};
+use ygg_companion_protocol::{PairingDecisionRequest, PairingInvitation};
 
+const MAX_PATH_BYTES: usize = 8 * 1024;
 const MAX_QUERY_BYTES: usize = 4 * 1024;
 const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 8 * 1024;
 // JSON may escape every input byte, while the decoded PTY input remains
@@ -50,6 +54,10 @@ const RATE_LIMIT_REQUESTS: usize = 240;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(10);
 const MAX_CONCURRENT_ATTACHMENT_UPLOADS: usize = 4;
 const MAX_CONCURRENT_SESSION_EXPORTS: usize = 1;
+const MAX_COMPANION_ADMIN_REQUEST_BYTES: usize = 1024;
+const COMPANION_ADMIN_BODY_TIMEOUT: Duration = Duration::from_secs(5);
+const WEBSOCKET_CLOSE_GRACE: Duration = Duration::from_secs(1);
+const WEBSOCKET_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // JSON escapes can expand each accepted UTF-8 byte to six bytes.
 const MAX_PROJECT_FILE_WRITE_REQUEST_BYTES: usize =
     MAX_PROJECT_FILE_WRITE_BYTES * 6 + MAX_PROJECT_FILE_PATH_BYTES * 6 + 1024;
@@ -89,6 +97,142 @@ pub enum TransportError {
     /// The loopback server task ended unexpectedly.
     #[error("loopback server task failed")]
     Task(#[from] tokio::task::JoinError),
+    /// An upgraded WebSocket did not stop within the shutdown bound.
+    #[error("loopback WebSocket shutdown timed out")]
+    WebSocketShutdown,
+}
+
+/// Authenticated application surface shared with the companion QUIC adapter.
+#[derive(Clone)]
+pub(crate) struct CompanionApplication {
+    pub(crate) router: Router,
+    pub(crate) subscribe_events:
+        Arc<dyn Fn() -> broadcast::Receiver<crate::HostStreamEvent> + Send + Sync>,
+}
+
+/// Principal established by a transport boundary before application dispatch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TransportPrincipal {
+    LoopbackOwner,
+    Paired { device_id: DeviceId },
+}
+
+struct UpgradeTracker {
+    state: StdMutex<UpgradeTrackerState>,
+    shutdown: watch::Sender<bool>,
+    idle: Notify,
+}
+
+#[derive(Default)]
+struct UpgradeTrackerState {
+    closed: bool,
+    active: usize,
+}
+
+struct UpgradeLease {
+    tracker: Arc<UpgradeTracker>,
+    shutdown: watch::Receiver<bool>,
+}
+
+impl UpgradeTracker {
+    fn new() -> Arc<Self> {
+        let (shutdown, _) = watch::channel(false);
+        Arc::new(Self {
+            state: StdMutex::new(UpgradeTrackerState::default()),
+            shutdown,
+            idle: Notify::new(),
+        })
+    }
+
+    fn register(self: &Arc<Self>) -> Option<UpgradeLease> {
+        let mut state = self.state.lock().expect("upgrade tracker poisoned");
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(UpgradeLease {
+            tracker: self.clone(),
+            shutdown: self.shutdown.subscribe(),
+        })
+    }
+
+    fn close(&self) {
+        let should_signal = {
+            let mut state = self.state.lock().expect("upgrade tracker poisoned");
+            if state.closed {
+                false
+            } else {
+                state.closed = true;
+                true
+            }
+        };
+        if should_signal {
+            self.shutdown.send_replace(true);
+        }
+    }
+
+    async fn wait_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.state.lock().expect("upgrade tracker poisoned").active == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl UpgradeLease {
+    async fn run<F>(mut self, operation: F)
+    where
+        F: Future<Output = ()>,
+    {
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = upgrade_shutdown(&mut self.shutdown) => {}
+            _ = &mut operation => {}
+        }
+    }
+
+    async fn run_with_shutdown_grace<F>(mut self, operation: F, grace: Duration)
+    where
+        F: Future<Output = ()>,
+    {
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            _ = upgrade_shutdown(&mut self.shutdown) => {
+                let _ = tokio::time::timeout(grace, &mut operation).await;
+            }
+            _ = &mut operation => {}
+        }
+    }
+}
+
+impl Drop for UpgradeLease {
+    fn drop(&mut self) {
+        let idle = {
+            let mut state = self.tracker.state.lock().expect("upgrade tracker poisoned");
+            debug_assert!(state.active > 0);
+            state.active -= 1;
+            state.active == 0
+        };
+        if idle {
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
+async fn upgrade_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 /// Running loopback server.
@@ -96,6 +240,8 @@ pub struct LoopbackServer {
     address: SocketAddr,
     launch_token: String,
     terminal: Option<PtyManager>,
+    companion_application: CompanionApplication,
+    upgrades: Arc<UpgradeTracker>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -109,6 +255,23 @@ impl LoopbackServer {
     pub async fn start<H: HostService>(
         supervisor: Arc<SessionSupervisor<H>>,
         config: LoopbackConfig,
+    ) -> Result<Self, TransportError> {
+        Self::start_inner(supervisor, config, None).await
+    }
+
+    /// Starts loopback with owner-only companion administration enabled.
+    pub async fn start_with_companion<H: HostService>(
+        supervisor: Arc<SessionSupervisor<H>>,
+        config: LoopbackConfig,
+        companion: CompanionControl,
+    ) -> Result<Self, TransportError> {
+        Self::start_inner(supervisor, config, Some(companion)).await
+    }
+
+    async fn start_inner<H: HostService>(
+        supervisor: Arc<SessionSupervisor<H>>,
+        config: LoopbackConfig,
+        companion: Option<CompanionControl>,
     ) -> Result<Self, TransportError> {
         let web_bundle = match config.web_root.as_deref() {
             Some(root) => WebBundle::from_root(root)?,
@@ -129,6 +292,7 @@ impl LoopbackServer {
             cookie_name: format!("ygg_{}", random_hex(12)?),
             cookie_value: random_hex(32)?,
         };
+        let upgrades = UpgradeTracker::new();
 
         let state = Arc::new(TransportState {
             supervisor,
@@ -140,7 +304,14 @@ impl LoopbackServer {
             terminal: terminal.clone(),
             goal_store,
             web_bundle,
+            companion,
+            upgrades: upgrades.clone(),
         });
+        let event_state = Arc::clone(&state);
+        let companion_application = CompanionApplication {
+            router: build_application_router(Arc::clone(&state)),
+            subscribe_events: Arc::new(move || event_state.supervisor.subscribe_events()),
+        };
         let router = build_router(state);
         let (shutdown, shutdown_receiver) = oneshot::channel();
         let task = tokio::spawn(async move {
@@ -154,9 +325,15 @@ impl LoopbackServer {
             address,
             launch_token,
             terminal,
+            companion_application,
+            upgrades,
             shutdown: Some(shutdown),
             task: Some(task),
         })
+    }
+
+    pub(crate) fn companion_application(&self) -> CompanionApplication {
+        self.companion_application.clone()
     }
 
     /// Exact bound loopback address.
@@ -177,19 +354,26 @@ impl LoopbackServer {
 
     /// Waits until the listener exits.
     pub async fn wait(mut self) -> Result<(), TransportError> {
-        let result = self.await_task().await;
+        let task_result = self.await_task().await;
         self.shutdown.take();
         self.stop_terminal();
-        result
+        self.upgrades.close();
+        let upgrade_result = self.await_upgrades().await;
+        task_result?;
+        upgrade_result
     }
 
     /// Requests graceful shutdown and waits for completion.
     pub async fn shutdown(mut self) -> Result<(), TransportError> {
         self.stop_terminal();
+        self.upgrades.close();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.await_task().await
+        let task_result = self.await_task().await;
+        let upgrade_result = self.await_upgrades().await;
+        task_result?;
+        upgrade_result
     }
 
     async fn await_task(&mut self) -> Result<(), TransportError> {
@@ -203,6 +387,12 @@ impl LoopbackServer {
         }
     }
 
+    async fn await_upgrades(&self) -> Result<(), TransportError> {
+        tokio::time::timeout(WEBSOCKET_SHUTDOWN_TIMEOUT, self.upgrades.wait_idle())
+            .await
+            .map_err(|_| TransportError::WebSocketShutdown)
+    }
+
     fn stop_terminal(&mut self) {
         if let Some(terminal) = self.terminal.take() {
             terminal.shutdown();
@@ -213,6 +403,7 @@ impl LoopbackServer {
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
         self.stop_terminal();
+        self.upgrades.close();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -229,6 +420,8 @@ struct TransportState<H: HostService> {
     terminal: Option<PtyManager>,
     goal_store: GoalStore,
     web_bundle: WebBundle,
+    companion: Option<CompanionControl>,
+    upgrades: Arc<UpgradeTracker>,
 }
 
 struct TransportAuth {
@@ -304,24 +497,53 @@ impl AllowedAuthorities {
 
 #[derive(Default)]
 struct RateLimiter {
-    accepted: StdMutex<VecDeque<Instant>>,
+    accepted: StdMutex<RateLimitState>,
+}
+
+#[derive(Default)]
+struct RateLimitState {
+    owner: VecDeque<Instant>,
+    companions: BTreeMap<DeviceId, VecDeque<Instant>>,
+    unattributed: VecDeque<Instant>,
 }
 
 impl RateLimiter {
-    fn admit(&self) -> bool {
+    fn admit(&self, principal: Option<&Extension<TransportPrincipal>>) -> bool {
         let now = Instant::now();
         let mut accepted = self.accepted.lock().expect("rate limiter poisoned");
-        while accepted
-            .front()
-            .is_some_and(|instant| now.duration_since(*instant) >= RATE_LIMIT_WINDOW)
-        {
-            accepted.pop_front();
-        }
+        let accepted = match principal {
+            Some(Extension(TransportPrincipal::LoopbackOwner)) => &mut accepted.owner,
+            Some(Extension(TransportPrincipal::Paired { device_id })) => {
+                accepted.companions.retain(|_, requests| {
+                    expire_rate_limit_requests(requests, now);
+                    !requests.is_empty()
+                });
+                accepted.companions.entry(device_id.clone()).or_default()
+            }
+            None => &mut accepted.unattributed,
+        };
+        expire_rate_limit_requests(accepted, now);
         if accepted.len() >= RATE_LIMIT_REQUESTS {
             return false;
         }
         accepted.push_back(now);
         true
+    }
+
+    fn admit_remote_read(&self, principal: Option<&Extension<TransportPrincipal>>) -> bool {
+        match principal {
+            Some(Extension(TransportPrincipal::LoopbackOwner)) => true,
+            Some(Extension(TransportPrincipal::Paired { .. })) | None => self.admit(principal),
+        }
+    }
+}
+
+fn expire_rate_limit_requests(accepted: &mut VecDeque<Instant>, now: Instant) {
+    while accepted
+        .front()
+        .is_some_and(|instant| now.duration_since(*instant) >= RATE_LIMIT_WINDOW)
+    {
+        accepted.pop_front();
     }
 }
 
@@ -492,6 +714,11 @@ fn default_file_search_limit() -> usize {
 }
 
 fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
+    build_application_router(Arc::clone(&state))
+        .layer(middleware::from_fn_with_state(state, secure_request::<H>))
+}
+
+fn build_application_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
     Router::new()
         .route("/", get(index::<H>))
         .route("/__ygg/launch/{token}", get(exchange_launch_token::<H>))
@@ -576,23 +803,272 @@ fn build_router<H: HostService>(state: Arc<TransportState<H>>) -> Router {
         )
         .route("/api/v1/events", any(events_socket::<H>))
         .route("/api/v1/terminal", any(terminal_socket::<H>))
+        .route("/api/v1/companion/devices", get(companion_devices::<H>))
+        .route(
+            "/api/v1/companion/pairing/open",
+            post(companion_pairing_open::<H>),
+        )
+        .route(
+            "/api/v1/companion/pairing/state",
+            get(companion_pairing_state::<H>),
+        )
+        .route(
+            "/api/v1/companion/pairing/requests/{request_id}/decision",
+            post(companion_pairing_decision::<H>)
+                .layer(DefaultBodyLimit::max(MAX_COMPANION_ADMIN_REQUEST_BYTES)),
+        )
+        .route(
+            "/api/v1/companion/pairing",
+            axum::routing::delete(companion_pairing_close::<H>),
+        )
+        .route(
+            "/api/v1/companion/devices/{device_id}",
+            axum::routing::delete(companion_device_revoke::<H>),
+        )
         .route("/{*asset}", get(static_asset::<H>))
         .fallback(not_found)
-        .layer(middleware::from_fn_with_state(
-            Arc::clone(&state),
-            secure_request::<H>,
-        ))
         .with_state(state)
+}
+
+fn owner_companion<H: HostService>(
+    state: &TransportState<H>,
+    principal: Option<Extension<TransportPrincipal>>,
+) -> Result<CompanionControl, Box<Response>> {
+    if !matches!(
+        principal,
+        Some(Extension(TransportPrincipal::LoopbackOwner))
+    ) {
+        return Err(Box::new(authentication_required()));
+    }
+    state.companion.clone().ok_or_else(|| {
+        Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "Companion mode is not enabled on this host.",
+            ),
+        ))
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyCompanionAdminRequest {}
+
+async fn companion_admin_body(request: Request, maximum: usize) -> Result<Bytes, Response> {
+    if request.uri().query().is_some() {
+        return Err(invalid_request());
+    }
+    let expected = declared_content_length(request.headers()).map_err(|()| invalid_request())?;
+    if maximum == 0 && request.headers().contains_key(TRANSFER_ENCODING) {
+        return Err(invalid_request());
+    }
+    if expected.is_some_and(|length| length > maximum) {
+        return Err(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            SanitizedError::public(
+                crate::ErrorCode::PayloadTooLarge,
+                "The companion administration request is too large.",
+            ),
+        ));
+    }
+    let body = match tokio::time::timeout(
+        COMPANION_ADMIN_BODY_TIMEOUT,
+        to_bytes(request.into_body(), maximum),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return Err(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                SanitizedError::public(
+                    crate::ErrorCode::PayloadTooLarge,
+                    "The companion administration request is too large.",
+                ),
+            ));
+        }
+        Err(_) => {
+            return Err(error_response(
+                StatusCode::REQUEST_TIMEOUT,
+                SanitizedError::public(
+                    crate::ErrorCode::Unavailable,
+                    "The companion administration request body timed out.",
+                )
+                .with_retryable(true),
+            ));
+        }
+    };
+    if expected.is_some_and(|length| length != body.len()) {
+        return Err(invalid_request());
+    }
+    Ok(body)
+}
+
+async fn companion_devices<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    if let Err(response) = companion_admin_body(request, 0).await {
+        return response;
+    }
+    Json(control.catalog().devices).into_response()
+}
+
+async fn companion_pairing_state<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    if let Err(response) = companion_admin_body(request, 0).await {
+        return response;
+    }
+    Json(control.catalog()).into_response()
+}
+
+async fn companion_pairing_open<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    let body = match companion_admin_body(request, MAX_COMPANION_ADMIN_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if serde_json::from_slice::<EmptyCompanionAdminRequest>(&body).is_err() {
+        return invalid_request();
+    }
+    match control.open_pairing() {
+        Ok(invitation) => Json::<PairingInvitation>(invitation).into_response(),
+        Err(error) => companion_control_error_response(error),
+    }
+}
+
+async fn companion_pairing_decision<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    Path(request_id): Path<String>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    let body = match companion_admin_body(request, MAX_COMPANION_ADMIN_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
+    if request_id.is_empty() || request_id.len() > 128 {
+        return invalid_request();
+    }
+    let payload = match serde_json::from_slice::<PairingDecisionRequest>(&body) {
+        Ok(payload) => payload,
+        Err(_) => return invalid_request(),
+    };
+    match control.decide_pairing(&request_id, payload.decision) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => companion_control_error_response(error),
+    }
+}
+
+async fn companion_pairing_close<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    if let Err(response) = companion_admin_body(request, 0).await {
+        return response;
+    }
+    control.close_pairing();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn companion_device_revoke<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+    Path(device_id): Path<String>,
+    request: Request,
+) -> Response {
+    let control = match owner_companion(state.as_ref(), principal) {
+        Ok(control) => control,
+        Err(response) => return *response,
+    };
+    if let Err(response) = companion_admin_body(request, 0).await {
+        return response;
+    }
+    if DeviceId::new(device_id.clone()).is_err() {
+        return invalid_request();
+    }
+    match control.revoke_device(&device_id) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => companion_control_error_response(error),
+    }
+}
+
+fn companion_control_error_response(error: CompanionControlError) -> Response {
+    match error {
+        CompanionControlError::Unavailable => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "Companion networking is unavailable.",
+            )
+            .with_retryable(true),
+        ),
+        CompanionControlError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            SanitizedError::public(
+                crate::ErrorCode::NotFound,
+                "The companion record was not found.",
+            ),
+        ),
+        CompanionControlError::Capacity => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            SanitizedError::public(
+                crate::ErrorCode::Unavailable,
+                "Companion pairing is at capacity.",
+            ),
+        ),
+        CompanionControlError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            SanitizedError::public(
+                crate::ErrorCode::InvalidCommand,
+                "The pairing state changed before this request completed.",
+            ),
+        ),
+        CompanionControlError::Storage => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            SanitizedError::internal(),
+        ),
+    }
 }
 
 async fn ingest_document<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
     query: Result<Query<DocumentUploadQuery>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.document_ingest_supported() {
@@ -675,9 +1151,10 @@ async fn ingest_document<H: HostService>(
 
 async fn list_documents<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -692,10 +1169,11 @@ async fn list_documents<H: HostService>(
 
 async fn list_trusted_files<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     query: Result<Query<TrustedFileListQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.trusted_project_files_supported() {
@@ -730,9 +1208,10 @@ async fn list_trusted_files<H: HostService>(
 
 async fn repository_context<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.repository_context_supported() {
@@ -750,10 +1229,11 @@ async fn repository_context<H: HostService>(
 
 async fn search_trusted_files<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     query: Result<Query<TrustedFileSearchQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let project_id = match ProjectId::new(raw_project_id) {
@@ -776,9 +1256,10 @@ async fn search_trusted_files<H: HostService>(
 
 async fn read_trusted_file<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path((raw_project_id, raw_entry_id)): Path<(String, String)>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let project_id = match ProjectId::new(raw_project_id) {
@@ -801,10 +1282,11 @@ async fn read_trusted_file<H: HostService>(
 
 async fn project_file_tree<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     query: Result<Query<ProjectFileTreeQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.project_file_browser_supported() {
@@ -830,10 +1312,11 @@ async fn project_file_tree<H: HostService>(
 
 async fn read_project_file<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     query: Result<Query<ProjectFileReadQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.project_file_browser_supported() {
@@ -859,10 +1342,11 @@ async fn read_project_file<H: HostService>(
 
 async fn search_project_files<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     query: Result<Query<ProjectFileSearchQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.project_file_browser_supported() {
@@ -888,10 +1372,11 @@ async fn search_project_files<H: HostService>(
 
 async fn write_project_file<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_project_id): Path<String>,
     payload: Result<Json<ProjectFileWriteRequest>, JsonRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.project_file_write_supported() {
@@ -923,11 +1408,12 @@ async fn write_project_file<H: HostService>(
 
 async fn ingest_attachment<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     query: Result<Query<AttachmentUploadQuery>, axum::extract::rejection::QueryRejection>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let Query(query) = match query {
@@ -991,9 +1477,10 @@ async fn ingest_attachment<H: HostService>(
 
 async fn attachment_content<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(handle): Path<String>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     match state.supervisor.attachment_content(&handle).await {
@@ -1035,9 +1522,10 @@ async fn attachment_content<H: HostService>(
 
 async fn resource_content<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path((raw_session_id, handle)): Path<(String, String)>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -1132,13 +1620,14 @@ async fn resource_content<H: HostService>(
 
 async fn session_export<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
     if query.is_some() {
         return invalid_request();
     }
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -1321,9 +1810,10 @@ async fn not_found() -> Response {
 
 async fn bootstrap<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     query: Result<Query<BootstrapQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let Query(query) = match query {
@@ -1352,13 +1842,30 @@ async fn bootstrap<H: HostService>(
         }
     };
     match result {
-        Ok(bootstrap) => Json(bootstrap).into_response(),
+        Ok(mut bootstrap) => {
+            match principal.map(|Extension(principal)| principal) {
+                Some(TransportPrincipal::LoopbackOwner) => {
+                    bootstrap.capabilities.connected_devices = state
+                        .companion
+                        .as_ref()
+                        .is_some_and(CompanionControl::is_healthy);
+                }
+                Some(TransportPrincipal::Paired { .. }) | None => {
+                    bootstrap.capabilities.terminal = false;
+                    bootstrap.capabilities.connected_devices = false;
+                }
+            }
+            Json(bootstrap).into_response()
+        }
         Err(error) => supervisor_error_response(error),
     }
 }
 
-async fn project_catalog<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
-    if !state.rate_limiter.admit() {
+async fn project_catalog<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+) -> Response {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     match state.supervisor.project_catalog().await {
@@ -1369,9 +1876,10 @@ async fn project_catalog<H: HostService>(State(state): State<Arc<TransportState<
 
 async fn usage_stats<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     query: Result<Query<UsageStatsQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let Query(query) = match query {
@@ -1384,8 +1892,11 @@ async fn usage_stats<H: HostService>(
     }
 }
 
-async fn usage_lifetime<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
-    if !state.rate_limiter.admit() {
+async fn usage_lifetime<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+) -> Response {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     match state.supervisor.usage_lifetime().await {
@@ -1394,8 +1905,11 @@ async fn usage_lifetime<H: HostService>(State(state): State<Arc<TransportState<H
     }
 }
 
-async fn usage_activity<H: HostService>(State(state): State<Arc<TransportState<H>>>) -> Response {
-    if !state.rate_limiter.admit() {
+async fn usage_activity<H: HostService>(
+    State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
+) -> Response {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     match state.supervisor.usage_activity().await {
@@ -1406,8 +1920,12 @@ async fn usage_activity<H: HostService>(State(state): State<Arc<TransportState<H
 
 async fn session_snapshot<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
 ) -> Response {
+    if !state.rate_limiter.admit_remote_read(principal.as_ref()) {
+        return rate_limited();
+    }
     let session_id = match SessionId::new(raw_session_id) {
         Ok(id) => id,
         Err(_) => return invalid_request(),
@@ -1420,9 +1938,10 @@ async fn session_snapshot<H: HostService>(
 
 async fn command_discovery<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -1446,9 +1965,10 @@ fn goal_response(goal: Option<GoalState>, revision: u64) -> Response {
 
 async fn session_goal<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -1467,10 +1987,11 @@ async fn session_goal<H: HostService>(
 
 async fn update_goal<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
     payload: Result<Json<GoalRequest>, JsonRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let session_id = match SessionId::new(raw_session_id) {
@@ -1545,9 +2066,13 @@ async fn update_goal<H: HostService>(
 
 async fn session_replay<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     Path(raw_session_id): Path<String>,
     query: Result<Query<ReplayQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response {
+    if !state.rate_limiter.admit_remote_read(principal.as_ref()) {
+        return rate_limited();
+    }
     let session_id = match SessionId::new(raw_session_id) {
         Ok(id) => id,
         Err(_) => return invalid_request(),
@@ -1577,9 +2102,10 @@ async fn session_replay<H: HostService>(
 
 async fn host_command<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     payload: Result<Json<HostCommandEnvelope>, JsonRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let Json(envelope) = match payload {
@@ -1594,9 +2120,10 @@ async fn host_command<H: HostService>(
 
 async fn session_command<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     payload: Result<Json<SessionCommandEnvelope>, JsonRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let Json(envelope) = match payload {
@@ -1611,9 +2138,10 @@ async fn session_command<H: HostService>(
 
 async fn transcript_search<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     payload: Result<Json<crate::TranscriptSearchRequest>, JsonRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     if !state.supervisor.transcript_search_supported() {
@@ -1631,9 +2159,10 @@ async fn transcript_search<H: HostService>(
 
 async fn events_socket<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let upgrade = match upgrade {
@@ -1641,10 +2170,13 @@ async fn events_socket<H: HostService>(
         Err(_) => return invalid_request(),
     };
     let events = state.supervisor.subscribe_events();
+    let Some(upgrade_task) = state.upgrades.register() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     upgrade
         .max_message_size(MAX_WEBSOCKET_MESSAGE_BYTES)
         .max_frame_size(MAX_WEBSOCKET_MESSAGE_BYTES)
-        .on_upgrade(move |socket| stream_events(socket, events))
+        .on_upgrade(move |socket| upgrade_task.run(stream_events(socket, events)))
 }
 
 async fn stream_events(
@@ -1701,9 +2233,10 @@ async fn stream_events(
 
 async fn terminal_socket<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
+    principal: Option<Extension<TransportPrincipal>>,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
-    if !state.rate_limiter.admit() {
+    if !state.rate_limiter.admit(principal.as_ref()) {
         return rate_limited();
     }
     let upgrade = match upgrade {
@@ -1713,10 +2246,16 @@ async fn terminal_socket<H: HostService>(
     let Some(terminal) = state.terminal.clone() else {
         return not_found().await;
     };
+    let Some(upgrade_task) = state.upgrades.register() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     upgrade
         .max_message_size(MAX_TERMINAL_WEBSOCKET_MESSAGE_BYTES)
         .max_frame_size(MAX_TERMINAL_WEBSOCKET_MESSAGE_BYTES)
-        .on_upgrade(move |socket| stream_terminal(socket, terminal))
+        .on_upgrade(move |socket| {
+            upgrade_task
+                .run_with_shutdown_grace(stream_terminal(socket, terminal), WEBSOCKET_CLOSE_GRACE)
+        })
 }
 
 async fn stream_terminal(socket: WebSocket, terminal: PtyManager) {
@@ -1965,6 +2504,22 @@ fn terminal_error_message(error: &PtyError) -> &'static str {
     }
 }
 
+fn declared_content_length(headers: &HeaderMap) -> Result<Option<usize>, ()> {
+    let mut values = headers.get_all(CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return Err(());
+    }
+    let value = std::str::from_utf8(bytes).map_err(|_| ())?;
+    value.parse::<usize>().map(Some).map_err(|_| ())
+}
+
 async fn secure_request<H: HostService>(
     State(state): State<Arc<TransportState<H>>>,
     request: Request,
@@ -2009,27 +2564,25 @@ async fn secure_request<H: HostService>(
             .ok()
             .is_some_and(|value| matches!(value, "same-origin" | "same-site" | "none")),
     };
+    let path_allowed = request.uri().path().len() <= MAX_PATH_BYTES;
     let query_allowed = request
         .uri()
         .query()
-        .is_none_or(|query| session_export || query.len() <= MAX_QUERY_BYTES);
+        .is_none_or(|query| query.len() <= MAX_QUERY_BYTES);
+    let content_length = declared_content_length(headers);
+    let valid_content_length = content_length.as_ref().ok().copied().flatten();
+    let bodyless_request_has_body = request.method() != Method::POST
+        && (headers.contains_key(TRANSFER_ENCODING)
+            || valid_content_length.is_some_and(|length| length != 0));
     let export_has_query = session_export && request.uri().query().is_some();
     let export_has_body = session_export
         && (headers.contains_key(TRANSFER_ENCODING)
-            || headers
-                .get(CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length != 0));
+            || valid_content_length.is_some_and(|length| length != 0));
     let resource_has_forbidden_shape = resource_request
         && (request.uri().query().is_some()
             || headers.contains_key(RANGE)
             || headers.contains_key(TRANSFER_ENCODING)
-            || headers
-                .get(CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length != 0));
+            || valid_content_length.is_some_and(|length| length != 0));
     let content_length_limit = if attachment_upload {
         state
             .supervisor
@@ -2043,14 +2596,8 @@ async fn secure_request<H: HostService>(
     } else {
         MAX_COMMAND_BYTES
     };
-    let content_length_allowed = match headers.get(CONTENT_LENGTH) {
-        None => true,
-        Some(value) => value
-            .to_str()
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .is_some_and(|length| length <= content_length_limit),
-    };
+    let content_length_allowed =
+        valid_content_length.is_none_or(|length| length <= content_length_limit);
     let mutation_has_json = request.method() != Method::POST
         || headers
             .get(CONTENT_TYPE)
@@ -2095,9 +2642,14 @@ async fn secure_request<H: HostService>(
             )
         } else if !api_authenticated {
             authentication_required()
-        } else if export_has_query || export_has_body || resource_has_forbidden_shape {
+        } else if content_length.is_err()
+            || bodyless_request_has_body
+            || export_has_query
+            || export_has_body
+            || resource_has_forbidden_shape
+        {
             invalid_request()
-        } else if !query_allowed || !content_length_allowed {
+        } else if !path_allowed || !query_allowed || !content_length_allowed {
             error_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 SanitizedError::public(
@@ -2114,6 +2666,10 @@ async fn secure_request<H: HostService>(
                 ),
             )
         } else {
+            let mut request = request;
+            request
+                .extensions_mut()
+                .insert(TransportPrincipal::LoopbackOwner);
             next.run(request).await
         };
     apply_security_headers(response.headers_mut());
@@ -3161,6 +3717,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn events_socket(address: SocketAddr, cookie: &str) -> TerminalSocket {
+        let mut request = format!("ws://{address}/api/v1/events")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "origin",
+            format!("http://{address}")
+                .parse::<TungsteniteHeaderValue>()
+                .unwrap(),
+        );
+        request
+            .headers_mut()
+            .insert("cookie", cookie.parse::<TungsteniteHeaderValue>().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    #[cfg(unix)]
     async fn next_terminal_message(socket: &mut TerminalSocket) -> serde_json::Value {
         loop {
             let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
@@ -3293,6 +3866,83 @@ mod tests {
     }
 
     #[test]
+    fn content_length_is_unique_ascii_decimal() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(declared_content_length(&headers), Ok(None));
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("42"));
+        assert_eq!(declared_content_length(&headers), Ok(Some(42)));
+
+        for invalid in ["", "+1", "-1", " 1", "1 ", "1, 1", "1a"] {
+            let value = HeaderValue::from_bytes(invalid.as_bytes()).unwrap();
+            headers.insert(CONTENT_LENGTH, value);
+            assert_eq!(declared_content_length(&headers), Err(()), "{invalid:?}");
+        }
+
+        headers.remove(CONTENT_LENGTH);
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        headers.append(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert_eq!(declared_content_length(&headers), Err(()));
+
+        headers.remove(CONTENT_LENGTH);
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&format!("{}0", usize::MAX)).unwrap(),
+        );
+        assert_eq!(declared_content_length(&headers), Err(()));
+    }
+
+    #[tokio::test]
+    async fn companion_admin_bodies_enforce_declared_length_and_bodyless_framing() {
+        let mut exact = Request::new(Body::from("{}"));
+        exact
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("2"));
+        assert_eq!(
+            companion_admin_body(exact, MAX_COMPANION_ADMIN_REQUEST_BYTES)
+                .await
+                .unwrap(),
+            "{}"
+        );
+
+        let mut mismatch = Request::new(Body::from("{}"));
+        mismatch
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("1"));
+        assert_eq!(
+            companion_admin_body(mismatch, MAX_COMPANION_ADMIN_REQUEST_BYTES)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let mut oversized = Request::new(Body::empty());
+        oversized
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("1025"));
+        assert_eq!(
+            companion_admin_body(oversized, MAX_COMPANION_ADMIN_REQUEST_BYTES)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+
+        let mut transfer_encoded = Request::new(Body::empty());
+        transfer_encoded
+            .headers_mut()
+            .insert(TRANSFER_ENCODING, HeaderValue::from_static("chunked"));
+        assert_eq!(
+            companion_admin_body(transfer_encoded, 0)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[test]
     fn static_asset_allowlist_excludes_dotfiles_and_source_maps() {
         assert!(safe_relative_path(FilePath::new("assets/app.js")));
         assert!(safe_relative_path(FilePath::new(
@@ -3344,6 +3994,83 @@ mod tests {
         assert!(!safe_relative_path(FilePath::new("assets/.secret")));
         assert!(bundle.asset("assets/app.js.map").is_none());
         assert!(bundle.asset("private.txt").is_none());
+    }
+
+    #[test]
+    fn companion_rate_limits_are_isolated_by_device_and_from_the_owner() {
+        let limiter = RateLimiter::default();
+        let companion = Extension(TransportPrincipal::Paired {
+            device_id: DeviceId::new("device-rate-limit").unwrap(),
+        });
+        let other_companion = Extension(TransportPrincipal::Paired {
+            device_id: DeviceId::new("device-other-rate-limit").unwrap(),
+        });
+        let owner = Extension(TransportPrincipal::LoopbackOwner);
+
+        for _ in 0..RATE_LIMIT_REQUESTS {
+            assert!(limiter.admit(Some(&companion)));
+        }
+        assert!(!limiter.admit(Some(&companion)));
+        for _ in 0..RATE_LIMIT_REQUESTS {
+            assert!(limiter.admit(Some(&other_companion)));
+        }
+        assert!(!limiter.admit(Some(&other_companion)));
+        for _ in 0..RATE_LIMIT_REQUESTS {
+            assert!(limiter.admit(Some(&owner)));
+        }
+        assert!(!limiter.admit(Some(&owner)));
+
+        assert!(!limiter.admit_remote_read(Some(&companion)));
+        for _ in 0..(RATE_LIMIT_REQUESTS * 2) {
+            assert!(limiter.admit_remote_read(Some(&owner)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_websocket_stops_with_the_server() {
+        let host = Arc::new(MockHost::new());
+        let supervisor = Arc::new(SessionSupervisor::new(
+            Arc::clone(&host),
+            SupervisorConfig::default(),
+        ));
+        let server = LoopbackServer::start(
+            supervisor,
+            LoopbackConfig {
+                port: 0,
+                web_root: None,
+                terminal: None,
+                goal_store_root: host._goal_root.path().join("goals"),
+            },
+        )
+        .await
+        .unwrap();
+        let address = server.address();
+        let exchanged = request(address, exchange_request(address, &server.launch_token)).await;
+        let cookie = response_header(&exchanged, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let mut socket = events_socket(address, &cookie).await;
+
+        let shutdown = tokio::spawn(async move { server.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(TungsteniteMessage::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(_)) => {}
+                }
+            }
+        })
+        .await
+        .expect("event WebSocket remained open after server shutdown");
+        tokio::time::timeout(Duration::from_secs(3), shutdown)
+            .await
+            .expect("server shutdown timed out")
+            .unwrap()
+            .unwrap();
     }
 
     #[cfg(unix)]
@@ -4081,6 +4808,15 @@ mod tests {
         )
         .await;
         assert!(oversized.starts_with("HTTP/1.1 413"));
+
+        let body_on_get = request(
+            address,
+            format!(
+                "GET /api/v1/projects HTTP/1.1\r\nHost: {address}\r\nCookie: {cookie}\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx"
+            ),
+        )
+        .await;
+        assert!(body_on_get.starts_with("HTTP/1.1 400"));
 
         let allowed = request(address, get_request(address, "/")).await;
         assert!(allowed.starts_with("HTTP/1.1 200"));

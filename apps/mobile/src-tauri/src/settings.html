@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en" data-return-url="{{APP_ORIGIN}}/">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>Ygg Companion Settings</title>
+    <link rel="stylesheet" href="/_native/settings.css" />
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">Y</div>
+      <p class="eyebrow">Native companion</p>
+      <h1>Companion settings</h1>
+      <p class="intro">These controls are isolated from the host-provided web interface.</p>
+
+      <section aria-labelledby="access-title">
+        <h2 id="access-title">This device</h2>
+        <p id="status" role="status" aria-live="polite">Loading protected companion state…</p>
+        <button id="remove" class="danger" type="button">Remove local companion access</button>
+        <p class="detail">This deletes the endpoint identity and pinned host profile from this device. It does not revoke the retained device record on the host; revoke that record from the host's owner-only Connected Devices screen.</p>
+      </section>
+
+      <button id="back" class="secondary" type="button">Back to Ygg</button>
+    </main>
+    <script src="/_native/settings.js"></script>
+  </body>
+</html>
