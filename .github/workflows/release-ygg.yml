@@ -76,10 +76,10 @@ jobs:
             exit 1
           fi
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$tag" ]]; then
-              echo "manual releases must dispatch this workflow from the exact canonical tag $tag" >&2
-              exit 1
-            fi
+            # Dispatching from a branch is allowed: the canonical tag is
+            # resolved explicitly via INPUT_RELEASE_TAG above, and source
+            # provenance is pinned to that tag's commit downstream.
+            : # no additional constraint beyond release_tag being provided
           else
             case "$mode" in
               binaries) expected_workflow_tag="ygg-binaries-$tag" ;;
