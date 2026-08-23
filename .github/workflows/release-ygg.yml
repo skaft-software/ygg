@@ -424,7 +424,8 @@ jobs:
           grep -F "release_source_commit=\"$SOURCE_COMMIT\"" release-assets/install-ygg.sh
           grep -F "release_workflow_commit=\"$WORKFLOW_COMMIT\"" release-assets/install-ygg.sh
           release-assets/install-ygg.sh --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
-          test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
+          ls -la release-assets/
+test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
