@@ -7,7 +7,9 @@
     "bundle:check": "npm --prefix ../web run bundle:check",
     "tauri": "tauri",
     "dev": "npm run sync:web && tauri dev",
-    "build": "tauri build"
+    "build": "tauri build",
+    "ios:build": "npm run sync:web && tauri ios build --debug",
+    "ios:open": "open src-tauri/gen/apple/ygg-mobile.xcodeproj"
   },
   "devDependencies": {
     "@tauri-apps/cli": "2.11.1"

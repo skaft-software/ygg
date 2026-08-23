@@ -15,7 +15,21 @@ publish = false
 name = "ygg_mobile_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+# `generate_context!` decides whether to embed the web bundle from this flag:
+# without `custom-protocol` it compiles in "dev" mode, and a dev build combined
+# with an injected `devUrl` embeds an *empty* asset map, leaving
+# `AssetBundle::verified` with no SHA256SUMS to load. The Tauri CLI only enables
+# this feature for release builds, but this app has no dev server at all: its
+# frontend is a prebuilt static bundle verified byte-for-byte against
+# SHA256SUMS, so embedding is the only mode that can ever work. Keeping it in
+# `default` means every build path -- CLI or Xcode, debug or release -- embeds
+# real assets.
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
+serde_json = "1"
 tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
@@ -56,6 +70,14 @@ ndk-context = "=0.1.1"
 [patch.crates-io]
 android-native-keyring-store = { path = "vendor/android-native-keyring-store" }
 tauri-plugin-keyring-store = { path = "vendor/tauri-plugin-keyring-store" }
+# swift-rs 1.0.7 cross-compiles the Tauri Swift package with `-Xswiftc -sdk/
+# -target` overrides that Xcode 27's SwiftPM re-orders after its own host
+# flags, so `tauri ios build` fails compiling the package against the macOS
+# SDK ("could not build module 'AppKit'"). Upstream main (1.0.8) switches to
+# `swift build --triple`, resolves the new Products/<Config>-<platform>
+# output layout, and re-globalizes @_cdecl symbols (needs `rustup component
+# add llvm-tools`). Drop this pin once 1.0.8+ is published to crates.io.
+swift-rs = { git = "https://github.com/Brendonovich/swift-rs", rev = "fd82965ee1a55b2777122a9ac42a581c613327ac" }
 
 [dev-dependencies]
 tempfile = "3"

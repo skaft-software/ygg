@@ -9,10 +9,7 @@
   },
   "app": {
     "withGlobalTauri": false,
-    "windows": [],
-    "security": {
-      "csp": "default-src 'self'; base-uri 'none'; connect-src 'self'; font-src 'self' data:; form-action 'none'; frame-ancestors 'none'; img-src 'self' data: blob:; object-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
-    }
+    "windows": []
   },
   "bundle": {
     "active": true,

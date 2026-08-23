@@ -83,29 +83,57 @@ impl AssetBundle {
     where
         F: FnMut(&str) -> Option<Vec<u8>>,
     {
-        let sums = load("SHA256SUMS").ok_or(ProxyError::InvalidBundle)?;
-        let expected_bundle = load("bundle.sha256").ok_or(ProxyError::InvalidBundle)?;
+        // Each rejection names itself. On iOS this is the only way to tell a
+        // missing embedded key from a digest mismatch without a device round
+        // trip, because the process has no readable stdout/stderr.
+        fn reject(reason: &str) -> ProxyError {
+            crate::diagnostic(&format!("bundle rejected: {reason}"));
+            ProxyError::InvalidBundle
+        }
+
+        let sums = load("SHA256SUMS").ok_or_else(|| {
+            reject(
+                "SHA256SUMS key absent: the binary has no embedded web bundle. This is what a \
+                 dev-mode build produces (`tauri ios dev`, or any build without the \
+                 `custom-protocol` feature). Use `npm run ios:build`.",
+            )
+        })?;
+        let expected_bundle =
+            load("bundle.sha256").ok_or_else(|| reject("bundle.sha256 key absent"))?;
         if sums.len() > 64 * 1024 || expected_bundle.len() > 128 {
-            return Err(ProxyError::InvalidBundle);
+            return Err(reject("checksum file exceeds its size bound"));
         }
         let expected = parse_sums(&sums)?;
         if expected.is_empty() || expected.len() > 256 {
-            return Err(ProxyError::InvalidBundle);
+            return Err(reject("manifest entry count out of range"));
         }
         let mut assets = HashMap::with_capacity(expected.len());
         let mut aggregate = 0usize;
         for (path, digest) in expected {
-            let bytes = load(&path).ok_or(ProxyError::InvalidBundle)?;
+            let bytes = load(&path).ok_or_else(|| reject(&format!("asset key absent: {path}")))?;
             if bytes.len() > MAX_ASSET_BYTES {
-                return Err(ProxyError::InvalidBundle);
+                return Err(reject(&format!(
+                    "asset exceeds per-file bound: {path} ({} bytes)",
+                    bytes.len()
+                )));
             }
             aggregate = aggregate
                 .checked_add(bytes.len())
-                .ok_or(ProxyError::InvalidBundle)?;
-            if aggregate > MAX_ASSET_AGGREGATE_BYTES || hex_sha256(&bytes) != digest {
-                return Err(ProxyError::InvalidBundle);
+                .ok_or_else(|| reject("aggregate size overflow"))?;
+            if aggregate > MAX_ASSET_AGGREGATE_BYTES {
+                return Err(reject(&format!(
+                    "aggregate exceeds bound at {path} ({aggregate} bytes)"
+                )));
             }
-            let content_type = asset_content_type(&path).ok_or(ProxyError::InvalidBundle)?;
+            let actual = hex_sha256(&bytes);
+            if actual != digest {
+                return Err(reject(&format!(
+                    "digest mismatch: {path} ({} bytes) expected {digest} got {actual}",
+                    bytes.len()
+                )));
+            }
+            let content_type = asset_content_type(&path)
+                .ok_or_else(|| reject(&format!("unsupported content type: {path}")))?;
             assets.insert(
                 format!("/{path}"),
                 Asset {
@@ -115,14 +143,20 @@ impl AssetBundle {
             );
         }
         let expected_bundle = std::str::from_utf8(&expected_bundle)
-            .map_err(|_| ProxyError::InvalidBundle)?
+            .map_err(|_| reject("bundle.sha256 is not UTF-8"))?
             .trim();
-        if !valid_digest(expected_bundle) || hex_sha256(&sums) != expected_bundle {
-            return Err(ProxyError::InvalidBundle);
+        if !valid_digest(expected_bundle) {
+            return Err(reject("bundle.sha256 is not a valid digest"));
+        }
+        let actual_bundle = hex_sha256(&sums);
+        if actual_bundle != expected_bundle {
+            return Err(reject(&format!(
+                "manifest digest mismatch: expected {expected_bundle} got {actual_bundle}"
+            )));
         }
         let index = assets
             .get("/index.html")
-            .ok_or(ProxyError::InvalidBundle)?
+            .ok_or_else(|| reject("manifest has no index.html entry"))?
             .bytes
             .clone();
         Ok(Self {
@@ -1077,12 +1111,41 @@ fn authorize_auth(
             return Err(plain(StatusCode::FORBIDDEN, "Origin rejected"));
         }
     }
-    if let Some(site) = headers.get("sec-fetch-site") {
-        if site.as_bytes() != b"same-origin" {
-            return Err(plain(StatusCode::FORBIDDEN, "Request context rejected"));
-        }
+    if !fetch_site_allowed(headers) {
+        return Err(plain(StatusCode::FORBIDDEN, "Request context rejected"));
     }
     Ok(())
+}
+
+/// Whether the request's Fetch Metadata context is acceptable.
+///
+/// WebKit attaches `Sec-Fetch-*` metadata to every request it makes.
+/// Requests associated with a document carry that document's origin
+/// relationship (`same-origin`, `cross-site`, ...), but a top-level
+/// document navigation has no associated origin, so WebKit stamps it
+/// `Sec-Fetch-Site: none`. That includes the redirect the webview
+/// follows after the one-use launch-token URL: without accepting it,
+/// the app can never open its own UI on a real device. `none` is
+/// therefore accepted, but only when the request identifies itself as
+/// a document navigation (`Sec-Fetch-Mode: navigate`, or a WebKit that
+/// ships the site value without the mode value). Drive-by requests
+/// from a foreign page still arrive as `cross-site` (or `same-site`)
+/// and are rejected.
+fn fetch_site_allowed(headers: &HeaderMap) -> bool {
+    let Some(site) = headers.get("sec-fetch-site") else {
+        // Pre-metadata WebKit sends nothing: there is nothing to act
+        // on, and the host, cookie, and origin gates above still
+        // apply.
+        return true;
+    };
+    if site.as_bytes() == b"same-origin" {
+        return true;
+    }
+    site.as_bytes() == b"none"
+        && headers
+            .get("sec-fetch-mode")
+            .map(|mode| mode.as_bytes() == b"navigate")
+            .unwrap_or(true)
 }
 
 fn auth_cookie_matches(headers: &HeaderMap, auth: &LocalAuth) -> bool {
@@ -1730,6 +1793,101 @@ mod tests {
         assert_eq!(response_status(&websocket), Some(401));
 
         fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn webkit_top_level_navigations_pass_the_context_check() {
+        let host_endpoint = Endpoint::empty_builder(RelayMode::Disabled)
+            .alpns(vec![ygg_companion_protocol::COMPANION_ALPN.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let fixture = TestProxy::start_paired(&host_endpoint).await;
+        let (_, app_cookie) = authenticate(&fixture).await;
+        let app_address = fixture.handle.address();
+        let app_host = format!("127.0.0.1:{}", app_address.port());
+
+        // WebKit stamps the redirect it follows after the 303 with
+        // `Sec-Fetch-Site: none` (a top-level navigation has no
+        // associated origin). Requiring `same-origin` here is what
+        // turned every real-device app open into a black screen.
+        let navigated = raw_exchange(
+            app_address,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: {app_host}\r\nCookie: {app_cookie}\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&navigated), Some(200));
+
+        // A drive-by from a foreign page still arrives `cross-site`
+        // and is still rejected.
+        let cross_site = raw_exchange(
+            app_address,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: {app_host}\r\nCookie: {app_cookie}\r\nSec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&cross_site), Some(403));
+        assert!(std::str::from_utf8(&cross_site)
+            .unwrap()
+            .contains("Request context rejected"));
+
+        // The `none` exception is navigation-only: a non-navigate
+        // request cannot claim an unassociated context.
+        let none_without_navigation = raw_exchange(
+            app_address,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: {app_host}\r\nCookie: {app_cookie}\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: cors\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&none_without_navigation), Some(403));
+
+        // The settings origin runs the same gate on a second
+        // loopback port, through its own launch-token flow.
+        let index = raw_exchange(
+            app_address,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: {app_host}\r\nCookie: {app_cookie}\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        let index = std::str::from_utf8(&index).unwrap();
+        let settings_url = index
+            .split_once("<meta name=\"ygg-native-settings-url\" content=\"")
+            .and_then(|(_, rest)| rest.split_once("\">"))
+            .map(|(url, _)| url)
+            .unwrap();
+        let settings_address = fixture.handle.settings_address();
+        let settings_host = format!("127.0.0.1:{}", settings_address.port());
+        let settings_origin = format!("http://{settings_host}");
+        let settings_path = settings_url.strip_prefix(&settings_origin).unwrap();
+
+        let settings_launched = raw_exchange(
+            settings_address,
+            &format!("GET {settings_path} HTTP/1.1\r\nHost: {settings_host}\r\nConnection: close\r\n\r\n"),
+        )
+        .await;
+        assert_eq!(response_status(&settings_launched), Some(303));
+        let settings_cookie = response_header(&settings_launched, "set-cookie")
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let settings_navigated = raw_exchange(
+            settings_address,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: {settings_host}\r\nCookie: {settings_cookie}\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nSec-Fetch-Dest: document\r\nConnection: close\r\n\r\n"
+            ),
+        )
+        .await;
+        assert_eq!(response_status(&settings_navigated), Some(200));
+
+        fixture.shutdown().await;
+        host_endpoint.close().await;
     }
 
     #[tokio::test]
