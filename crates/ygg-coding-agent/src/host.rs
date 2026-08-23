@@ -1410,6 +1410,7 @@ fn register_inline_model(
             responses_lite: false,
             agent_delegation: None,
             structured_output: true,
+            deferred_tool_loading: false,
         },
         limits: ModelLimits {
             context_window,
@@ -2075,6 +2076,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 32_768,

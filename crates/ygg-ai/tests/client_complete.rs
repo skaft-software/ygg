@@ -27,6 +27,7 @@ fn make_test_model(base_url_str: &str, protocol: Protocol) -> Model {
             responses_lite: false,
             agent_delegation: None,
             structured_output: false,
+            deferred_tool_loading: false,
         },
         limits: ModelLimits {
             context_window: 10000,

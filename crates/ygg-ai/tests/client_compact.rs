@@ -32,6 +32,7 @@ fn model(base_url: &str, protocol: Protocol) -> Model {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 100_000,

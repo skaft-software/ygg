@@ -760,6 +760,7 @@ mod tests {
                         tool_call_id: ToolCallId("edit".into()),
                         content: vec![ToolResultPart::Text("done".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 }),
             ],
@@ -800,6 +801,7 @@ mod tests {
                     tool_call_id: ToolCallId("call".into()),
                     content: vec![ToolResultPart::Text("x".repeat(2_100))],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             }),
         ];
@@ -826,6 +828,7 @@ mod tests {
                         tool_call_id: ToolCallId("call".into()),
                         content: vec![ToolResultPart::Media(audio("tool recording"))],
                         is_error: false,
+                        added_tool_names: None,
                     }),
                 ],
             }),

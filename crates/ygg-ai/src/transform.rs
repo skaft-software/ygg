@@ -135,6 +135,7 @@ fn normalize_pending_user_part(part: &UserPart) -> UserPart {
             tool_call_id: normalize_id(&result.tool_call_id),
             content: result.content.clone(),
             is_error: result.is_error,
+            added_tool_names: result.added_tool_names.clone(),
         }),
     }
 }
@@ -225,6 +226,7 @@ fn transform_user_part(part: &UserPart, target: &Model) -> UserPart {
                 .map(|part| transform_tool_result_part(part, target))
                 .collect(),
             is_error: result.is_error,
+            added_tool_names: result.added_tool_names.clone(),
         }),
     }
 }
@@ -268,6 +270,7 @@ fn transform_user_part_owned(part: UserPart, target: &Model) -> UserPart {
                 .map(|part| transform_tool_result_part_owned(part, target))
                 .collect(),
             is_error: result.is_error,
+            added_tool_names: result.added_tool_names,
         }),
     }
 }
@@ -514,6 +517,7 @@ fn push_synthetic_results(
                 tool_call_id,
                 content: vec![ToolResultPart::Text(MISSING_TOOL_RESULT.to_string())],
                 is_error: true,
+                added_tool_names: None,
             })
         })
         .collect();
@@ -553,6 +557,7 @@ mod tests {
                     responses_lite: false,
                     agent_delegation: None,
                     structured_output: false,
+                    deferred_tool_loading: false,
                 },
                 limits: ModelLimits {
                     context_window: 16_384,
@@ -668,6 +673,7 @@ mod tests {
                     tool_call_id: ToolCallId("call_1".to_string()),
                     content: vec![ToolResultPart::Media(image)],
                     is_error: false,
+                    added_tool_names: None,
                 }),
             ],
         })];
@@ -714,6 +720,7 @@ mod tests {
                         tool_call_id: ToolCallId("call_1".into()),
                         content: vec![ToolResultPart::Media(tool_audio)],
                         is_error: false,
+                        added_tool_names: None,
                     }),
                 ],
             }),
@@ -802,6 +809,7 @@ mod tests {
                         tool_call_id: ToolCallId(invalid_id.to_string()),
                         content: vec![ToolResultPart::Text("done".to_string())],
                         is_error: false,
+                        added_tool_names: None,
                     }),
                 ],
             }),
@@ -881,6 +889,7 @@ mod tests {
                     tool_call_id: ToolCallId("call_1".to_string()),
                     content: vec![ToolResultPart::Text("ok".to_string())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             }),
         ];

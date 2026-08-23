@@ -331,6 +331,27 @@ struct ChatChunkFunction {
 
 // --- Core Codec Implementations ---
 
+/// Collect tool names that were announced mid-conversation via a tool
+/// result's `added_tool_names` (pi's deferred-tools pattern). Announced
+/// schemas are excluded from the static request tool set from the
+/// announcement onward; providers with native deferred loading consume the
+/// same names as load points.
+fn deferred_tool_names(messages: &[crate::types::Message]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    for message in messages {
+        if let crate::types::Message::User(user) = message {
+            for part in &user.content {
+                if let crate::types::UserPart::ToolResult(result) = part {
+                    if let Some(added) = &result.added_tool_names {
+                        names.extend(added.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
 fn provider_effort(value: &str) -> Option<ReasoningEffort> {
     match value.trim().to_ascii_lowercase().as_str() {
         "minimal" | "min" => Some(ReasoningEffort::Minimal),
@@ -667,11 +688,25 @@ pub(crate) fn build_request(
     }
 
     // 4. Map tools and tool_choice
-    let tools_opt = if req.tools.is_empty() || !model.spec.capabilities.tools {
+    // Tools announced mid-conversation via `added_tool_names` are loaded
+    // dynamically: their schemas are excluded from the static request set
+    // from the announcement onward. Mirrors pi's deferred-tools handling for
+    // OpenAI Chat providers.
+    let deferred_tool_names = if model.spec.capabilities.deferred_tool_loading {
+        deferred_tool_names(&req.messages)
+    } else {
+        Default::default()
+    };
+    let active_tools: Vec<&crate::types::ToolDef> = req
+        .tools
+        .iter()
+        .filter(|tool| !deferred_tool_names.contains(&tool.name))
+        .collect();
+    let tools_opt = if active_tools.is_empty() || !model.spec.capabilities.tools {
         None
     } else {
         Some(
-            req.tools
+            active_tools
                 .iter()
                 .enumerate()
                 .map(|(index, t)| ChatTool {
@@ -681,7 +716,7 @@ pub(crate) fn build_request(
                         description: t.description.clone(),
                         parameters: t.parameters.clone(),
                     },
-                    cache_control: (index + 1 == req.tools.len()
+                    cache_control: (index + 1 == active_tools.len()
                         && model.spec.cache.supports_cache_control_on_tools)
                         .then_some(cache_marker)
                         .flatten(),
@@ -2378,6 +2413,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: structured,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 10000,
@@ -2640,6 +2676,130 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn deferred_tool_loading_excludes_announced_schemas() {
+        let mut model = make_test_model(false, false, false, true, false, false);
+        Arc::make_mut(&mut model.spec)
+            .capabilities
+            .deferred_tool_loading = true;
+
+        let make_tool = |name: &str| crate::types::ToolDef {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let request = Request {
+            system: None,
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantPart::ToolCall(ToolCall {
+                        id: ToolCallId("call-1".into()),
+                        name: "read".into(),
+                        arguments_json: "{}".to_string(),
+                    })],
+                    model: ModelId("test-model".into()),
+                    protocol: Protocol::OpenAiChat,
+                }),
+                Message::User(UserMessage {
+                    content: vec![
+                        UserPart::ToolResult(crate::types::ToolResult {
+                            tool_call_id: ToolCallId("call-1".into()),
+                            content: vec![ToolResultPart::Text("connected".into())],
+                            is_error: false,
+                            added_tool_names: Some(vec!["browser_click".into()]),
+                        }),
+                    ],
+                }),
+            ],
+            tools: vec![make_tool("read"), make_tool("bash"), make_tool("browser_click")],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &request).unwrap().body).unwrap();
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"bash"));
+        assert!(!names.contains(&"browser_click"));
+    }
+
+    #[test]
+    fn deferred_tool_loading_disabled_keeps_all_schemas() {
+        let mut model = make_test_model(false, false, false, true, false, false);
+        Arc::make_mut(&mut model.spec)
+            .capabilities
+            .deferred_tool_loading = false;
+
+        let make_tool = |name: &str| crate::types::ToolDef {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        };
+        let request = Request {
+            system: None,
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantPart::ToolCall(ToolCall {
+                        id: ToolCallId("call-1".into()),
+                        name: "read".into(),
+                        arguments_json: "{}".to_string(),
+                    })],
+                    model: ModelId("test-model".into()),
+                    protocol: Protocol::OpenAiChat,
+                }),
+                Message::User(UserMessage {
+                    content: vec![
+                        UserPart::ToolResult(crate::types::ToolResult {
+                            tool_call_id: ToolCallId("call-1".into()),
+                            content: vec![ToolResultPart::Text("connected".into())],
+                            is_error: false,
+                            added_tool_names: Some(vec!["browser_click".into()]),
+                        }),
+                    ],
+                }),
+            ],
+            tools: vec![make_tool("read"), make_tool("bash"), make_tool("browser_click")],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: None,
+        };
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &request).unwrap().body).unwrap();
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 3);
     }
 
     #[test]

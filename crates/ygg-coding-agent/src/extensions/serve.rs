@@ -14271,6 +14271,7 @@ mod tests {
                     tool_call_id: ToolCallId(call_id.to_owned()),
                     content: vec![ToolResultPart::Text(output.to_owned())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -14728,6 +14729,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-write-replaced".into()),
                     content: vec![ToolResultPart::Text(replaced_output.clone())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -16318,6 +16320,7 @@ mod tests {
                         "exit=0 duration=0.05s\n{output_canary}"
                     ))],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -16392,6 +16395,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-semantic-replay".into()),
                     content: vec![ToolResultPart::Text(raw_result.into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();

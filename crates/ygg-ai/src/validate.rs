@@ -754,6 +754,7 @@ mod tests {
             responses_lite: false,
             agent_delegation: None,
             structured_output: structured,
+            deferred_tool_loading: false,
         }
     }
 
@@ -773,6 +774,7 @@ mod tests {
                     tool_call_id: ToolCallId("orphan".to_string()),
                     content: vec![],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })],
             tools: vec![],
@@ -1033,6 +1035,7 @@ mod matrix_tests {
             responses_lite: false,
             agent_delegation: None,
             structured_output: structured,
+            deferred_tool_loading: false,
         }
     }
 
@@ -1563,6 +1566,7 @@ mod matrix_tests {
                 None,
             ))],
             is_error: false,
+            added_tool_names: None,
         })])];
         // Provide a preceding assistant tool call so pairing passes and we reach the media check.
         req.messages.insert(
@@ -1640,6 +1644,7 @@ mod matrix_tests {
             tool_call_id: ToolCallId("nope".into()),
             content: vec![ToolResultPart::Text("r".into())],
             is_error: false,
+            added_tool_names: None,
         })])];
         assert!(matches!(
             run(

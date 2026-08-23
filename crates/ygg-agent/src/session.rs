@@ -2677,6 +2677,7 @@ mod tests {
                 tool_call_id: ToolCallId(call_id.to_string()),
                 content: vec![ygg_ai::ToolResultPart::Text(text.to_string())],
                 is_error: false,
+                added_tool_names: None,
             })],
         }))
     }
@@ -2807,6 +2808,7 @@ mod tests {
                         tool_call_id: ToolCallId("call-structured".into()),
                         content: vec![ygg_ai::ToolResultPart::Text("Found one source.".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })),
                 Some(EntryMetadata {
@@ -2862,6 +2864,7 @@ mod tests {
                         tool_call_id: ToolCallId("call-null".into()),
                         content: vec![ygg_ai::ToolResultPart::Text("No value.".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })),
                 Some(EntryMetadata {
@@ -4156,6 +4159,7 @@ mod tests {
                     tool_call_id: ToolCallId("call_1".into()),
                     content: vec![],
                     is_error: false,
+                    added_tool_names: None,
                 }),
                 UserPart::Media(ygg_ai::Media::image_bytes(
                     bytes::Bytes::from_static(b"first"),

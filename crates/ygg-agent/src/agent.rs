@@ -1641,6 +1641,7 @@ fn lower_tool_result(
     result: &Result<ToolOutput, ToolError>,
     model: &Model,
     text_limit: usize,
+    added_tool_names: Vec<String>,
 ) -> (
     UserMessage,
     Vec<ToolOutputMediaKind>,
@@ -1719,6 +1720,7 @@ fn lower_tool_result(
         tool_call_id: call_id,
         content: result_parts,
         is_error: effective_is_error,
+        added_tool_names: (!added_tool_names.is_empty()).then_some(added_tool_names),
     }));
     content.extend(adjacent_media.into_iter().map(UserPart::Media));
     (
@@ -1744,6 +1746,7 @@ fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError
                 tool_call_id: call.id,
                 content: vec![ToolResultPart::Text(text)],
                 is_error: true,
+                added_tool_names: None,
             })],
         })))?;
     }
@@ -4200,8 +4203,13 @@ impl Agent {
                     ))),
                 }
             };
-            let (message, _, _, _, details) =
-                lower_tool_result(call.id, &result, &self.model, sandbox.max_output_bytes);
+            let (message, _, _, _, details) = lower_tool_result(
+                call.id,
+                &result,
+                &self.model,
+                sandbox.max_output_bytes,
+                Vec::new(),
+            );
             self.session.append_with_metadata(
                 EntryValue::Message(Message::User(message)),
                 details.map(|tool_output| EntryMetadata {
@@ -4350,6 +4358,10 @@ impl Agent {
             }
             let mut registered_tools = tool_map.keys().cloned().collect::<Vec<_>>();
             registered_tools.sort();
+            // Tool names already visible to the provider either as static
+            // schemas or via an earlier `added_tool_names` announcement.
+            let mut announced_tools: std::collections::HashSet<String> =
+                registered_tools.iter().cloned().collect();
 
             let mut pending_steer: Vec<UserInput> = Vec::new();
             let mut followups: VecDeque<UserInput> = VecDeque::new();
@@ -4463,6 +4475,7 @@ impl Agent {
                     }
                     registered_tools = tool_map.keys().cloned().collect();
                     registered_tools.sort();
+                    announced_tools.extend(registered_tools.iter().cloned());
                 }
                 let request_tool_defs = tool_defs.clone();
 
@@ -5649,11 +5662,24 @@ impl Agent {
                     // A large early result must never starve later successful
                     // calls in the same model turn. Structured media is lowered
                     // only when the active model/protocol can replay it safely.
+                    // Announce tools that appeared as a consequence of this
+                    // execution (extension/MCP registrations). Later requests
+                    // exclude announced schemas under deferred tool loading.
+                    let (_, snapshot_tools) = extension_host.tool_snapshot();
+                    let newly_added: Vec<String> = snapshot_tools
+                        .iter()
+                        .map(|tool| tool.definition().name)
+                        .filter(|name| !announced_tools.contains(name))
+                        .collect();
+                    if !newly_added.is_empty() {
+                        announced_tools.extend(newly_added.iter().cloned());
+                    }
                     let (message, accepted_media, text, is_error, details) = lower_tool_result(
                         call.id.clone(),
                         &result,
                         &model,
                         sandbox.max_output_bytes,
+                        newly_added,
                     );
                     terminal_action_receipts.push(TerminalActionReceipt {
                         tool: call.name.clone(),
@@ -6026,7 +6052,7 @@ mod tests {
             .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
             .unwrap();
         let (_, _, persisted_text, _, _) =
-            lower_tool_result(ygg_ai::ToolCallId("delivery".into()), &result, &model, 32);
+            lower_tool_result(ygg_ai::ToolCallId("delivery".into()), &result, &model, 32, Vec::new());
         assert_ne!(persisted_text, result.as_ref().unwrap().text);
         assert!(persisted_text.len() <= 32);
 
@@ -6327,7 +6353,7 @@ mod tests {
             "image/png".parse().unwrap(),
         )));
         let (message, accepted, _, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
         assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
         assert!(!is_error);
         assert_eq!(message.content.len(), 1);
@@ -6362,6 +6388,7 @@ mod tests {
                 &result,
                 &model,
                 text_limit,
+                        Vec::new(),
             );
 
             assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
@@ -6406,7 +6433,7 @@ mod tests {
             )
             .unwrap());
         let (message, _, _, is_error, details) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
 
         assert!(!is_error);
         let details = details.expect("durable details");
@@ -6440,7 +6467,7 @@ mod tests {
                 format,
             )));
             let (message, accepted, _, is_error, _) =
-                lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+                lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
             assert_eq!(accepted, vec![ToolOutputMediaKind::Audio]);
             assert!(!is_error);
             assert!(matches!(message.content[0], UserPart::ToolResult(_)));
@@ -6462,7 +6489,7 @@ mod tests {
             ygg_ai::AudioFormat::Wav,
         )));
         let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096);
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096, Vec::new());
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("protocol cannot replay audio"));
@@ -6477,7 +6504,7 @@ mod tests {
             ygg_ai::AudioFormat::Aac,
         )));
         let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096);
+            lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096, Vec::new());
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("accepts WAV or MP3"));
@@ -6931,6 +6958,7 @@ mod tests {
                         tool_call_id: ygg_ai::ToolCallId(index.into()),
                         content: vec![ToolResultPart::Text(text.into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();
