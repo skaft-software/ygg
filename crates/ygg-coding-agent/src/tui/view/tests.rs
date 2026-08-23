@@ -2276,6 +2276,7 @@ fn resumed_session_restores_every_write_as_a_diff_panel() {
                     tool_call_id: ToolCallId(id.into()),
                     content: vec![ToolResultPart::Text(result.into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -2324,6 +2325,7 @@ fn duplicate_hydrated_tool_call_ids_never_leave_a_running_card() {
                 tool_call_id: ToolCallId("duplicate".into()),
                 content: vec![ToolResultPart::Text("durable result".into())],
                 is_error: false,
+                added_tool_names: None,
             })],
         })))
         .unwrap();

@@ -994,6 +994,8 @@ fn register_openai_compatible_models(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: protocol != Protocol::OpenAiChat,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window,
@@ -1062,6 +1064,8 @@ fn register_anthropic_compatible_models(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window,
@@ -1155,6 +1159,8 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
             responses_lite: false,
             agent_delegation: None,
             structured_output: false,
+
+            deferred_tool_loading: false,
         },
         limits: ModelLimits {
             context_window,
@@ -1222,6 +1228,8 @@ fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Re
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window,
@@ -1436,6 +1444,8 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window,
@@ -1546,6 +1556,8 @@ fn register_static_models(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: model.protocol != Protocol::OpenAiChat,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: model.context_window,
@@ -2568,6 +2580,8 @@ fn register_custom_openai_provider(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: model.structured_output,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: model.context_window,
@@ -3406,6 +3420,8 @@ fn register_openai_codex(
                 responses_lite: model.responses_lite,
                 agent_delegation: model.agent_delegation,
                 structured_output: false,
+
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: model.context_window,

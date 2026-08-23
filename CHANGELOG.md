@@ -6,6 +6,14 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Added
 
+- Deferred tool-schema loading, ported from Pi's deferred-tools design:
+  tool results can now carry `added_tool_names` — the set of tools that became
+  available as a consequence of that execution (for example an extension or
+  MCP server registering tools on first use). Models advertising the new
+  `deferred_tool_loading` capability stop re-sending announced schemas in the
+  static request tool set; providers without the capability are unaffected.
+  This is the load-bearing prerequisite for lazily registered extension and
+  MCP tool schemas.
 - Delegated workers now expose a bounded rolling `recent_tools` activity ring
   (last six tool calls with flattened argument summaries, host timestamps, and
   an error flag) on every `agent/list` record, and the `/subagents` picker rows,

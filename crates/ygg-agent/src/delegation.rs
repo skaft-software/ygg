@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
-use ygg_ai::{AssistantPart, Cost, PICODOLLARS_PER_MICRODOLLAR, ToolDef, Usage};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
+use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
@@ -416,8 +416,7 @@ impl ExtensionAgentSessionPolicy {
             return Err(format!(
                 "extension child max_cost_microdollars must be null or between 1 and {}",
                 MAX_EXTENSION_COST_MICRODOLLARS
-            ))
-            .into();
+            ));
         }
         if !(512..=16 * 1024).contains(&self.max_output_bytes) {
             return Err("extension child max_output_bytes must be between 512 and 16384".into());
@@ -4770,18 +4769,14 @@ mod tests {
         assert!(reference.starts_with("agent-session:"));
         assert_eq!(reference.len(), "agent-session:".len() + 64);
         assert!(!reference.contains("review"));
-        assert!(
-            delegated_session_reference(Path::new(
-                "/private/sessions/.delegation/not-a-team/0001-review.jsonl"
-            ))
-            .is_none()
-        );
-        assert!(
-            delegated_session_reference(Path::new(
-                "/private/sessions/.delegation/team-safe/../outside.jsonl"
-            ))
-            .is_none()
-        );
+        assert!(delegated_session_reference(Path::new(
+            "/private/sessions/.delegation/not-a-team/0001-review.jsonl"
+        ))
+        .is_none());
+        assert!(delegated_session_reference(Path::new(
+            "/private/sessions/.delegation/team-safe/../outside.jsonl"
+        ))
+        .is_none());
     }
 
     fn test_extension_policy() -> ExtensionAgentSessionPolicy {
@@ -5182,11 +5177,8 @@ mod tests {
         assert!(execution.task_delivered);
         match execution.outcome {
             WorkerOutcome::Failed(error) => {
-                assert!(
-                    error.contains(
-                        "delegated run could not start after the task was durably accepted"
-                    )
-                )
+                assert!(error
+                    .contains("delegated run could not start after the task was durably accepted"))
             }
             _ => panic!("expected startup failure"),
         }
@@ -5259,12 +5251,10 @@ mod tests {
                             if text == "task persisted through the original descriptor"
                     )
         )));
-        assert!(
-            Session::open_read_only(&session_path)
-                .unwrap()
-                .entries()
-                .is_empty()
-        );
+        assert!(Session::open_read_only(&session_path)
+            .unwrap()
+            .entries()
+            .is_empty());
     }
 
     #[cfg(unix)]
@@ -5356,12 +5346,10 @@ mod tests {
             std::fs::read(&outside).unwrap(),
             b"outside must not be opened\n"
         );
-        assert!(
-            std::fs::symlink_metadata(&session_path)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
+        assert!(std::fs::symlink_metadata(&session_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         let state = manager.state.lock().unwrap();
         let record = &state.records[&child_id];
         assert_eq!(record.queued_follow_ups.messages, 1);
@@ -5597,20 +5585,16 @@ mod tests {
             child.registered_tool_names(),
             vec!["read".to_owned(), "search".to_owned()]
         );
-        assert!(
-            child
-                .registered_tool_names()
-                .iter()
-                .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str()))
-        );
-        assert!(
-            manager
-                .template
-                .extensions
-                .tool_definitions()
-                .iter()
-                .any(|tool| tool.name == "write")
-        );
+        assert!(child
+            .registered_tool_names()
+            .iter()
+            .all(|name| !COLLABORATION_TOOL_NAMES.contains(&name.as_str())));
+        assert!(manager
+            .template
+            .extensions
+            .tool_definitions()
+            .iter()
+            .any(|tool| tool.name == "write"));
     }
 
     #[test]
@@ -5834,30 +5818,24 @@ mod tests {
             .open_session_reference("extension-policy", reference)
             .unwrap()
             .unwrap();
-        assert!(
-            inspection
-                .append(crate::EntryValue::Config {
-                    model: None,
-                    reasoning: None,
-                    reasoning_mode: None,
-                })
-                .is_err()
-        );
-        assert!(
-            binding
-                .open_session_reference("another-extension", reference)
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            binding
-                .open_session_reference(
-                    "extension-policy",
-                    &format!("agent-session:{}", "0".repeat(64)),
-                )
-                .unwrap()
-                .is_none()
-        );
+        assert!(inspection
+            .append(crate::EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            })
+            .is_err());
+        assert!(binding
+            .open_session_reference("another-extension", reference)
+            .unwrap()
+            .is_none());
+        assert!(binding
+            .open_session_reference(
+                "extension-policy",
+                &format!("agent-session:{}", "0".repeat(64)),
+            )
+            .unwrap()
+            .is_none());
 
         let journal =
             std::fs::read_to_string(manager.team_directory.join("provenance.jsonl")).unwrap();
@@ -5872,11 +5850,9 @@ mod tests {
         assert_eq!(persisted["extension_profile"], "review");
         assert_eq!(persisted["extension_idempotency_key"], "first-key");
         assert_eq!(persisted["extension_fingerprint"], "f".repeat(64));
-        assert!(
-            persisted["session_reference"]
-                .as_str()
-                .is_some_and(|reference| reference.starts_with("agent-session:"))
-        );
+        assert!(persisted["session_reference"]
+            .as_str()
+            .is_some_and(|reference| reference.starts_with("agent-session:")));
         assert!(persisted.get("task").is_none());
         assert!(persisted.get("session").is_none());
         assert!(!journal.contains("first bounded task"));
@@ -6099,29 +6075,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(cached["agent_id"], "agent-1");
-        assert!(
-            service_a
-                .spawn(
-                    "root-owner",
-                    test_extension_spawn("research", None, None, "different", "spawn-1"),
-                )
-                .unwrap_err()
-                .contains("different input")
-        );
+        assert!(service_a
+            .spawn(
+                "root-owner",
+                test_extension_spawn("research", None, None, "different", "spawn-1"),
+            )
+            .unwrap_err()
+            .contains("different input"));
 
-        assert!(
-            service_b
-                .send_message("root-owner", &identity.id, "cross-principal".into())
-                .await
-                .unwrap_err()
-                .contains("no child sessions")
-        );
-        assert!(
-            service_a
-                .list("different-owner")
-                .unwrap_err()
-                .contains("not an active")
-        );
+        assert!(service_b
+            .send_message("root-owner", &identity.id, "cross-principal".into())
+            .await
+            .unwrap_err()
+            .contains("no child sessions"));
+        assert!(service_a
+            .list("different-owner")
+            .unwrap_err()
+            .contains("not an active"));
 
         service_a
             .send_message("root-owner", &identity.id, "owned".into())
@@ -6130,11 +6100,9 @@ mod tests {
         let command = commands.recv().await.unwrap();
         assert!(matches!(command.kind, WorkerCommandKind::Message(_)));
         service_a.shutdown_owned();
-        assert!(
-            manager.state.lock().unwrap().records[&identity.id]
-                .shutdown
-                .is_cancelled()
-        );
+        assert!(manager.state.lock().unwrap().records[&identity.id]
+            .shutdown
+            .is_cancelled());
     }
 
     #[tokio::test]
@@ -6226,11 +6194,9 @@ mod tests {
         }
 
         assert_eq!(mailbox.len(), MAX_MAILBOX_MESSAGES);
-        assert!(
-            mailbox
-                .iter()
-                .any(|message| message.message == "durable" && !message.evictable)
-        );
+        assert!(mailbox
+            .iter()
+            .any(|message| message.message == "durable" && !message.evictable));
         assert_eq!(
             mailbox.back().unwrap().message,
             (MAX_MAILBOX_MESSAGES - 1).to_string()
@@ -6665,15 +6631,11 @@ mod tests {
         );
 
         let mut queued_tasks = VecDeque::new();
-        assert!(
-            !manager.drain_interrupted_commands("agent-1", &mut command_rx, &mut queued_tasks,)
-        );
+        assert!(!manager.drain_interrupted_commands("agent-1", &mut command_rx, &mut queued_tasks,));
         assert_eq!(queued_tasks.len(), MAX_QUEUED_FOLLOW_UPS);
-        assert!(
-            queued_tasks
-                .iter()
-                .all(|task| matches!(task, QueuedTask::FollowUp(_)))
-        );
+        assert!(queued_tasks
+            .iter()
+            .all(|task| matches!(task, QueuedTask::FollowUp(_))));
         assert_eq!(
             manager.state.lock().unwrap().records["agent-1"]
                 .queued_follow_ups

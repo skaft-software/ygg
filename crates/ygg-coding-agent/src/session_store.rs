@@ -2858,6 +2858,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-1".into()),
                     content: vec![ToolResultPart::Text("y".repeat(2 * 1024 * 1024))],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();

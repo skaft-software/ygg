@@ -586,6 +586,7 @@ pub(crate) mod tests {
                         tool_call_id: ToolCallId(format!("call-{index}")),
                         content: vec![ToolResultPart::Text("ok".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();
@@ -728,6 +729,7 @@ pub(crate) mod tests {
                         tool_call_id: ToolCallId(format!("call-{index}")),
                         content: vec![ToolResultPart::Text("ok".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();

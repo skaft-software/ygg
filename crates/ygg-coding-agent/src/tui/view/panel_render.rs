@@ -74,13 +74,6 @@ pub(super) fn document_visual_row_count_styled(text: &str, width: u16, styled: b
     document_visual_lines_styled(text, width, styled).len()
 }
 
-#[cfg(test)]
-pub mod panel_render_test_hook {
-    pub fn document_lines(text: &str, width: u16, styled: bool) -> Vec<String> {
-        super::document_visual_lines_styled(text, width, styled)
-    }
-}
-
 fn is_confirmation_panel(action: &super::PanelAction) -> bool {
     matches!(action, super::PanelAction::ExtensionConfirmation)
 }
@@ -462,5 +455,12 @@ pub(super) fn render_panel_with_limit(
             lines.truncate(max_rows);
             lines
         }
+    }
+}
+
+#[cfg(test)]
+pub mod panel_render_test_hook {
+    pub fn document_lines(text: &str, width: u16, styled: bool) -> Vec<String> {
+        super::document_visual_lines_styled(text, width, styled)
     }
 }

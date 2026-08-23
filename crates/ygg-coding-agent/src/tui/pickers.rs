@@ -960,6 +960,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ygg_ai::ModelLimits {
                 context_window: 131072,
@@ -1003,6 +1004,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ygg_ai::ModelLimits {
                 context_window: 128000,

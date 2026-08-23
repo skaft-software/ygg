@@ -684,6 +684,7 @@ async fn stream_http(
 /// Decode a cached Responses WebSocket using the same protocol builder as the
 /// ordinary SSE path. The wire event shape is JSON rather than `data:` framed
 /// SSE, so each message is wrapped in the codec's private event view.
+#[allow(clippy::too_many_arguments)]
 fn responses_websocket_stream(
     model: Model,
     mut events: mpsc::Receiver<Result<serde_json::Value, AiError>>,

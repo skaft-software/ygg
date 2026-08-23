@@ -1710,6 +1710,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 200000,
@@ -1893,6 +1894,7 @@ mod tests {
                     tool_call_id: crate::types::ToolCallId("call_raw|item_exact".to_owned()),
                     content: vec![crate::types::ToolResultPart::Text("ok".to_owned())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             }),
         ];

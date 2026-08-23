@@ -8043,6 +8043,7 @@ async fn project_agent_event(
     response_text: &mut String,
 ) -> Result<Option<HostRunOutcome>, ServiceError> {
     match agent_event {
+        AgentEvent::TurnStarted => {}
         AgentEvent::OutputDelta { channel, text } => {
             let text = bounded_text(&text, MAX_ITEM_TEXT_BYTES);
             let turn_id = projection.turn_id(run_id)?;
@@ -8156,7 +8157,11 @@ async fn project_agent_event(
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }
-        AgentEvent::ToolFinished { id, result } => {
+        AgentEvent::ToolFinished {
+            id,
+            result,
+            duration: _,
+        } => {
             let tool_item_id = projection.tool_items.get(&id.0).cloned();
             let projected = projection.tool_calls.get(&id.0).cloned();
             if let (Some(item_id), Some(mut tool)) = (tool_item_id.clone(), projected) {
@@ -14271,6 +14276,7 @@ mod tests {
                     tool_call_id: ToolCallId(call_id.to_owned()),
                     content: vec![ToolResultPart::Text(output.to_owned())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -14728,6 +14734,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-write-replaced".into()),
                     content: vec![ToolResultPart::Text(replaced_output.clone())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -16318,6 +16325,7 @@ mod tests {
                         "exit=0 duration=0.05s\n{output_canary}"
                     ))],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -16392,6 +16400,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-semantic-replay".into()),
                     content: vec![ToolResultPart::Text(raw_result.into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
