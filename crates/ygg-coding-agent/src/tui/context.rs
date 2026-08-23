@@ -472,7 +472,7 @@ mod tests {
         let named = report
             .render(
                 &crate::tui::theme::test_bundled_theme_with(
-                    "bone-machine",
+                    "clawed",
                     crate::tui::terminal::TerminalCapabilities::test(
                         true,
                         true,

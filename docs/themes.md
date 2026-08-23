@@ -11,7 +11,7 @@ Theme files are discovered in these locations:
 3. Explicit theme directories, in command-line order
 
 Later locations win when names collide. The resource inspector reports each
-override and ignores project themes in untrusted workspaces. The eleven themes
+override and ignores project themes in untrusted workspaces. The three themes
 shipped in the binary are the lowest-precedence fallback, so any of them can be
 replaced locally by a file with the same name.
 
@@ -22,27 +22,33 @@ repeatable explicit roots with `--theme-dir <directory>`.
 
 ## Bundled theme pack
 
-The pack intentionally demonstrates different design philosophies without
-painting over the user's terminal background:
+The pack recreates the look and feel of three familiar coding-agent
+workbenches, so switching to Ygg feels like sitting at a bench you already
+know. Each is a faithful visual clone — exact palette values, prompt markers,
+frame shapes, and spacing — expressed entirely as theme data:
 
-- `bone-machine` — dense brutalist slabs, heavy tabs, and mechanical state cuts
-- `circuit-garden` — airy rounded seed/canopy cards with vine-like rails
-- `field-notes` — ASCII notebook margins explicitly marked `Q`, `OBS`, and `CMD`
-- `kawaii-pink` — default-like focus dressed in adaptive candy pink, blush ribbons, hearts, and sparkles
-- `oxide-console` — industrial instrument panels, buses, alarms, and registers
-- `paper-ledger` — measured 84-column rules, label columns, and margin notes
-- `signal-noir` — sparse prose interrupted by red signal and trace bands
-- `synthwave-relay` — centered `TX`/`RX` broadcast cards and auxiliary channels
-- `tidepool` — alternating left/right islands joined by current and tidemark rails
-- `violet-hour` — chapters, pull quotes, marginalia, footnotes, and a final `FINIS`
-- `zen-mono` — strict unframed 68-column text floating in negative space
+- `clawed` — a warm terracotta workspace in the style of Claude Code: rounded
+  `╭─╮` frames, a plain `>` prompt, `⏺` record-button tool dots, `⎿` bracket
+  result rails, `✻` thinking sparks, and comfortable spacing. Dark terminals
+  get the signature `#d97757` accent.
+- `pie` — pi's airy tomorrow-night bench: a `❯` prompt, rounded blue-bordered
+  composer, full-width filled user cards (`#343541` on dark), state-tinted
+  tool bands, and generous breathing room.
+- `kodex` — codex's quiet monochrome: a `›` prompt, cyan-only accent
+  (`#00cdcd` dark / `#005f87` light), a subtle shaded user band, dim
+  secondary text, a rule-less shaded composer rectangle, and compact spacing.
 
-Each bundled theme opts into adaptive color balancing. Ygg keeps its design
-hue while moving RGB foregrounds toward a contrast-safe luminance for the
-detected light, dark, or unknown terminal profile. Detection first honors
-`YGG_COLOR_SCHEME` and `COLORFGBG`; in the interactive TUI, when those are
-absent, Ygg sends a short OSC 11 background query after entering raw mode and
-uses the response when the terminal provides one.
+The clones pin their palettes with hand-authored `[variants.dark]` and
+`[variants.light]` tables instead of adaptive balancing (`adaptive = false`),
+so the exact reference colors survive on both profiles. Base `[colors]`
+accents are conservative values that stay readable when the terminal
+background is unknown. All three set `model.use_lab_color = false`: only
+Ygg's compiled-in default theme colors prompts and accents per model family;
+a pack theme keeps its own fixed identity regardless of the active model.
+Terminal-profile detection first honors `YGG_COLOR_SCHEME` and `COLORFGBG`;
+in the interactive TUI, when those are absent, Ygg sends a short OSC 11
+background query after entering raw mode and uses the response when the
+terminal provides one.
 
 Every pack theme also retains the terminal's own default canvas: none sets a
 global background fill. Cards and bands may use a bounded, low-luminance
@@ -55,14 +61,19 @@ markers carry the strongest hue. RGB accents are quantized through the active
 ANSI 256 or ANSI 16 palette, and plain mode removes styling and selects an
 explicit `[glyphs_ascii]` set without changing the visible text.
 
-User prompts are the deliberate exception to a completely unpainted canvas:
-each persisted, model-bound prompt paints its complete inner semantic row with
-the model colour, including theme padding and trailing cells. The theme's
-transcript inset and structural border remain outside that rectangle. Ygg stores
-the exact `#RRGGBB` value with the session entry, so changing the model or theme
-cannot recolour old prompts. Only output capability changes the wire encoding:
-truecolor uses the stored RGB exactly, ANSI 256/16 quantize it, and plain/no-color
-terminals retain the same row geometry without escapes.
+User prompts are the deliberate exception to a completely unpainted canvas —
+but only under model-adaptive theming. When the active theme keeps
+`model.use_lab_color` enabled (the compiled-in default does, and custom themes
+inherit it unless they opt out), each persisted, model-bound prompt paints its
+complete inner semantic row with the model colour, including theme padding and
+trailing cells. The theme's transcript inset and structural border remain
+outside that rectangle. Ygg stores the exact `#RRGGBB` value with the session
+entry, so changing the model or theme cannot recolour old prompts. Only output
+capability changes the wire encoding: truecolor uses the stored RGB exactly,
+ANSI 256/16 quantize it, and plain/no-color terminals retain the same row
+geometry without escapes. Themes that set `model.use_lab_color = false` — all
+three bundled pack themes do — suppress the provenance paint entirely and
+render user prompts through their own `[surfaces.user]` recipe instead.
 
 ## Runtime reload and scrolling ownership
 
@@ -100,6 +111,13 @@ tool_title = "accent"
 diff_added_bg = "#388064"
 diff_removed_bg = "#cf5b55"
 prompt_card_bg = "#164a4d"
+
+# Optional composer chrome. "boxed" (default): full-width top/bottom rules.
+# "framed": a cornered box coloured by composer_border. "shaded": no rules —
+# a rectangle filled with composer_bg (skipped when it resolves to default).
+composer = "framed"
+composer_border = "accent"
+composer_bg = "default"
 
 [model]
 use_lab_color = false
@@ -263,8 +281,12 @@ and `compaction`. Every layout field alters the current renderer:
 - `transcript_inset` moves and reflows transcript content without breaking
   mouse-selection coordinates.
 - `composer_padding` controls compact prompt padding and aligns the
-  footer/status sentence. The boxed prompt frames with full-width top and
-  bottom rules; its content rows carry no side borders.
+  footer/status sentence. The default boxed prompt frames with full-width top
+  and bottom rules; its content rows carry no side borders. The `[colors]`
+  token `composer` selects alternative chrome: `framed` draws a cornered box
+  coloured by the `composer_border` token, and `shaded` drops the rules
+  entirely and paints the prompt rows with the `composer_bg` token (rows stay
+  unpainted when it resolves to `default`, such as on unknown backgrounds).
 - `show_header` moves model identity into the pinned header band. The compiled
   default leaves it off to preserve Ygg's sparse default geometry.
 - `show_footer` retains identity in the footer when the header is hidden, while

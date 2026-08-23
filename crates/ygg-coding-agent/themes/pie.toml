@@ -1,0 +1,358 @@
+# "Pie" — rounded blue-bordered boxes over a tomorrow-night kitchen counter.
+# User messages and tool runs arrive as filled cards; irrational by design.
+[metadata]
+name = "Pie"
+description = "An airy kitchen of rounded blue boxes, aqua accents, and filled message cards over a tomorrow-night counter. Irrationally comfortable."
+author = "Ygg theme pack"
+version = "1"
+terminal = "light-dark"
+adaptive = false
+
+[colors]
+accent = "#4e7d79"
+muted = "#737373"
+error = "#9a5757"
+warning = "#8f7a26"
+success = "#557a55"
+info = "#6a7fa0"
+border = "#6d7fa0"
+border_focused = "#4e9eb0"
+tool_title = "foreground"
+md_heading = "accent"
+md_link = "info"
+md_code = "accent"
+md_quote_border = "muted"
+md_list_bullet = "accent"
+pie_user_bg = "default"
+pie_tool_bg = "default"
+pie_note_bg = "default"
+composer = "framed"
+composer_border = "border"
+
+[model]
+use_lab_color = false
+
+[roles.tool_title]
+foreground = "tool_title"
+bold = true
+
+[roles.heading]
+foreground = "md_heading"
+bold = true
+
+[roles.emphasis]
+foreground = "accent"
+italic = true
+
+[roles.strong]
+foreground = "accent"
+bold = true
+
+[roles.link]
+foreground = "md_link"
+underline = true
+
+[roles.inline_code]
+foreground = "md_code"
+
+[roles.quote]
+foreground = "muted"
+italic = true
+
+[roles.notification]
+foreground = "info"
+italic = true
+
+[roles.confirmation]
+foreground = "accent"
+bold = true
+
+[roles."extension.sparkle"]
+foreground = "accent"
+italic = true
+
+[roles."extension.status"]
+foreground = "info"
+italic = true
+
+[roles."extension.header"]
+foreground = "accent"
+bold = true
+
+[roles."surface.user"]
+foreground = "foreground"
+background = "pie_user_bg"
+
+[roles."surface.user.border"]
+foreground = "border"
+
+[roles."surface.user.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.assistant"]
+foreground = "foreground"
+
+[roles."surface.assistant.border"]
+foreground = "border"
+
+[roles."surface.assistant.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.reasoning"]
+foreground = "muted"
+italic = true
+
+[roles."surface.reasoning.border"]
+foreground = "border"
+
+[roles."surface.reasoning.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.tool"]
+foreground = "foreground"
+background = "pie_tool_bg"
+
+[roles."surface.tool.border"]
+foreground = "border"
+
+[roles."surface.tool.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.shell"]
+foreground = "foreground"
+background = "pie_tool_bg"
+
+[roles."surface.shell.border"]
+foreground = "border"
+
+[roles."surface.shell.label"]
+foreground = "accent"
+italic = true
+
+[roles."surface.notice"]
+foreground = "foreground"
+background = "pie_note_bg"
+
+[roles."surface.notice.border"]
+foreground = "warning"
+
+[roles."surface.notice.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.outcome"]
+foreground = "muted"
+
+[roles."surface.outcome.border"]
+foreground = "accent"
+
+[roles."surface.outcome.label"]
+foreground = "accent"
+bold = true
+
+[roles."surface.compaction"]
+foreground = "muted"
+italic = true
+
+[roles."surface.compaction.border"]
+foreground = "border"
+
+[roles."surface.compaction.label"]
+foreground = "info"
+italic = true
+
+[glyphs]
+top_left = "╭"
+top_right = "╮"
+bottom_left = "╰"
+bottom_right = "╯"
+horizontal = "─"
+vertical = "│"
+rail = "│"
+prompt = "❯"
+shell = "$"
+success = "✓"
+warning = "△"
+note = "◆"
+error = "×"
+interrupt = "■"
+pending = "·"
+collapsed = "▸"
+expanded = "▾"
+separator = " · "
+ellipsis = "…"
+bullet = "•"
+reasoning = "≈"
+wordmark = "π pie"
+
+[glyphs_ascii]
+top_left = "+"
+top_right = "+"
+bottom_left = "+"
+bottom_right = "+"
+horizontal = "-"
+vertical = "|"
+rail = "|"
+prompt = ">"
+shell = "$"
+success = "+"
+warning = "!"
+note = "*"
+error = "x"
+interrupt = "#"
+pending = "."
+collapsed = ">"
+expanded = "v"
+separator = " - "
+ellipsis = "..."
+bullet = "*"
+reasoning = "~"
+wordmark = "pie"
+
+[surfaces.user]
+chrome = "band"
+heading = "none"
+padding = 1
+width = "full"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.assistant]
+chrome = "plain"
+heading = "none"
+padding = 0
+width = "content"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.reasoning]
+chrome = "rail"
+heading = "none"
+padding = 1
+width = "content"
+align = "left"
+max_width = 92
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.tool]
+chrome = "band"
+heading = "none"
+padding = 1
+width = "full"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.shell]
+chrome = "band"
+heading = "none"
+padding = 1
+width = "full"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.notice]
+chrome = "band"
+heading = "none"
+padding = 1
+width = "full"
+align = "left"
+max_width = 92
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[surfaces.outcome]
+chrome = "rule"
+heading = "overline"
+label = "baked"
+padding = 0
+width = "content"
+align = "left"
+max_width = 80
+narrow_chrome = "plain"
+narrow_heading = "inline"
+narrow_label = "baked"
+narrow_padding = 0
+
+[surfaces.compaction]
+chrome = "rail"
+heading = "none"
+padding = 1
+width = "content"
+align = "left"
+max_width = 92
+narrow_chrome = "plain"
+narrow_heading = "none"
+narrow_padding = 0
+
+[layout]
+density = "airy"
+show_header = true
+show_footer = true
+show_status_line = true
+show_reasoning = true
+show_panel_borders = true
+transcript_inset = 1
+composer_padding = 1
+narrow_breakpoint = 72
+narrow_show_header = false
+narrow_show_footer = true
+narrow_show_status_line = true
+narrow_show_reasoning = true
+narrow_show_panel_borders = false
+
+[variants.dark.colors]
+accent = "#8abeb7"
+muted = "#808080"
+error = "#cc6666"
+warning = "#ffff00"
+success = "#b5bd68"
+info = "#81a2be"
+border = "#5f87ff"
+border_focused = "#00d7ff"
+tool_title = "#d4d4d4"
+md_heading = "#f0c674"
+md_link = "#81a2be"
+md_code = "#8abeb7"
+md_quote_border = "#808080"
+md_list_bullet = "#8abeb7"
+pie_user_bg = "#343541"
+pie_tool_bg = "#282832"
+pie_note_bg = "#2d2838"
+
+[variants.light.colors]
+accent = "#4a6f6c"
+muted = "#6c6c6c"
+error = "#aa5555"
+warning = "#9a7326"
+success = "#588458"
+info = "#547da7"
+border = "#547da7"
+border_focused = "#5a8080"
+tool_title = "#1f2328"
+md_heading = "#9a7326"
+md_link = "#547da7"
+md_code = "#5a8080"
+md_quote_border = "#6c6c6c"
+md_list_bullet = "#5a8080"
+pie_user_bg = "#e8e8e8"
+pie_tool_bg = "#e8e8f0"
+pie_note_bg = "#ede7f6"

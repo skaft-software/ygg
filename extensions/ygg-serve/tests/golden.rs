@@ -121,13 +121,13 @@ fn snapshot() -> SessionSnapshot {
 
 fn theme() -> ThemeOption {
     ThemeOption {
-        id: ThemeId::new("tidepool").unwrap(),
+        id: ThemeId::new("clawed").unwrap(),
         theme: ThemeDto {
-            name: "Tidepool".into(),
+            name: "Clawed".into(),
             source: ThemeSourceClass::Bundled,
             revision: 3,
             scheme: ColorScheme::Dark,
-            density: ThemeDensity::Airy,
+            density: ThemeDensity::Comfortable,
             motion: ThemeMotion::Full,
             typography: ThemeTypography {
                 body_family: "system-sans".into(),
@@ -139,9 +139,9 @@ fn theme() -> ThemeOption {
                 (
                     "accent".into(),
                     ThemeColor::Rgb {
-                        red: 22,
-                        green: 143,
-                        blue: 145,
+                        red: 217,
+                        green: 119,
+                        blue: 87,
                     },
                 ),
                 ("canvas".into(), ThemeColor::Default),
@@ -211,7 +211,7 @@ fn bootstrap() -> HostBootstrap {
         authority_profiles: vec![AuthorityProfile::ReadOnly, AuthorityProfile::Workspace],
         authority_ceiling: AuthorityProfile::Workspace,
         themes: vec![theme()],
-        selected_theme_id: ThemeId::new("tidepool").unwrap(),
+        selected_theme_id: ThemeId::new("clawed").unwrap(),
         projects: vec![ProjectSummary {
             id: ProjectId::new("project-ygg").unwrap(),
             name: "ygg".into(),

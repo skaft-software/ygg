@@ -65,6 +65,43 @@ fn horiz(state: &super::view::ShellState) -> &str {
 // Unified composer frame
 // ---------------------------------------------------------------------------
 
+/// Composer chrome selected by the theme's open `composer` token.
+/// `boxed` (default): full-width top/bottom rules, no corners.
+/// `framed`: a cornered box (Claude Code / pi style) coloured by
+/// `composer_border` (token reference; falls back to the model accent).
+/// `shaded`: no rules at all — a rectangle painted with `composer_bg`
+/// (codex style). Unresolvable backgrounds degrade to plain rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ComposerChrome {
+    Boxed,
+    Framed,
+    Shaded,
+}
+
+fn composer_chrome(theme: &super::theme::YggTheme) -> ComposerChrome {
+    match theme
+        .resolve::<String>("composer")
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("framed") => ComposerChrome::Framed,
+        Some("shaded") => ComposerChrome::Shaded,
+        _ => ComposerChrome::Boxed,
+    }
+}
+
+/// Width available to composer content rows for the active chrome. Framed
+/// chrome spends two border columns and one space of padding per side;
+/// shaded chrome keeps one painted margin column per side.
+fn composer_inner_width(theme: &super::theme::YggTheme, width: u16) -> u16 {
+    match composer_chrome(theme) {
+        ComposerChrome::Boxed => width,
+        ComposerChrome::Framed => width.saturating_sub(4),
+        ComposerChrome::Shaded => width.saturating_sub(2),
+    }
+    .max(1)
+}
+
 /// Render the entire composer: a top rule, full-width content rows, and a
 /// bottom rule. The rules are plain horizontal lines with no corners, and
 /// content rows carry no side borders, so text selected from the prompt
@@ -83,6 +120,8 @@ fn render_composer_box(
 
     let theme = &state.theme;
     let h = horiz(state);
+    let chrome = composer_chrome(theme);
+    let inner_width = usize::from(composer_inner_width(theme, width));
 
     // The rules identify the selected/executing model without pretending
     // to measure progress. Idle chrome stays quiet; focus and work use the
@@ -101,19 +140,71 @@ fn render_composer_box(
     let focused =
         state.panel.is_none() && (!state.editor.is_empty() || state.tool_input_prompt.is_some());
     let compacting = state.run_label == "compacting";
-    let border_rgb = if focused || run_active || compacting {
+    let border_rgb = if chrome == ComposerChrome::Framed {
+        // Framed chrome keeps the theme's fixed border colour; the frame is
+        // part of the theme's identity, not a model/activity indicator.
+        theme
+            .role_rgb("composer_border")
+            .unwrap_or(if focused || run_active || compacting {
+                accent
+            } else {
+                idle_border
+            })
+    } else if focused || run_active || compacting {
         accent
     } else {
         idle_border
     };
+    let shaded_bg = (chrome == ComposerChrome::Shaded)
+        .then(|| theme.role_rgb("composer_bg"))
+        .flatten();
     // Plain full-width rules, with no corner glyphs, so nothing in the
     // composer row carries a border character into copied text.
     let render_rule = || -> String { theme.rgb_fg(border_rgb, &h.repeat(w)) };
+    let frame_rule = |left: &str, right: &str| -> String {
+        theme.rgb_fg(
+            border_rgb,
+            &format!("{left}{}{right}", h.repeat(w.saturating_sub(2))),
+        )
+    };
+    // Wrap one full-width content row in the active chrome.
+    let finish_row = |row: String| -> String {
+        match chrome {
+            ComposerChrome::Boxed => row,
+            ComposerChrome::Framed => {
+                let vertical = theme.rgb_fg(border_rgb, theme.glyph("vertical"));
+                format!("{vertical} {row} {vertical}")
+            }
+            ComposerChrome::Shaded => {
+                let padded = format!(" {row} ");
+                match shaded_bg {
+                    Some(bg) => theme.paint_row_background(bg, &padded),
+                    None => padded,
+                }
+            }
+        }
+    };
+    let blank_shaded_row = || -> String {
+        let padded = " ".repeat(w);
+        match shaded_bg {
+            Some(bg) => theme.paint_row_background(bg, &padded),
+            None => padded,
+        }
+    };
 
     let mut lines = Vec::with_capacity(content_rows + 2);
 
-    // ---- top rule ----
-    lines.push(render_rule());
+    // ---- top edge ----
+    match chrome {
+        ComposerChrome::Boxed => lines.push(render_rule()),
+        ComposerChrome::Framed => {
+            lines.push(frame_rule(
+                theme.glyph("top_left"),
+                theme.glyph("top_right"),
+            ));
+        }
+        ComposerChrome::Shaded => lines.push(blank_shaded_row()),
+    }
 
     // ---- content rows ----
     let marker = theme.bold(&theme.model_fg(
@@ -128,14 +219,17 @@ fn render_composer_box(
     // layout, positions the terminal cursor there, and the backend requests a
     // steady block shape. Inserting a beam glyph here would shift the text.
     let cursor_marker = composer_cursor_marker(state);
-    // Rows span the full width between the rules; nothing else frames the
-    // prompt, so selected text copies without border characters.
+    // Rows span the full inner width; boxed chrome frames with rules only, so
+    // selected text copies without border characters.
     let render_row = |content: &str| -> String {
         let content_width = visible_width(content);
-        if content_width > w {
-            fit_line(content, width)
+        if content_width > inner_width {
+            fit_line(content, inner_width as u16)
         } else {
-            format!("{content}{}", " ".repeat(w.saturating_sub(content_width)))
+            format!(
+                "{content}{}",
+                " ".repeat(inner_width.saturating_sub(content_width))
+            )
         }
     };
 
@@ -148,14 +242,17 @@ fn render_composer_box(
     if editor.is_empty() {
         for i in 0..content_rows {
             if i == 0 {
-                lines.push(render_row(&format!("{marker} {cursor_marker}")));
+                lines.push(finish_row(render_row(&format!("{marker} {cursor_marker}"))));
             } else {
-                lines.push(render_row(""));
+                lines.push(finish_row(render_row("")));
             }
         }
     } else {
-        let layout =
-            state.cached_editor_layout((w as u16).max(2), Some(&editor), Some(editor_cursor));
+        let layout = state.cached_editor_layout(
+            (inner_width as u16).max(2),
+            Some(&editor),
+            Some(editor_cursor),
+        );
         let total_lines = layout.lines.len();
         let overflow = total_lines.saturating_sub(content_rows);
         let visible_rows = if overflow > 0 {
@@ -218,11 +315,18 @@ fn render_composer_box(
             rendered.push(render_row(""));
         }
 
-        lines.append(&mut rendered);
+        lines.extend(rendered.into_iter().map(&finish_row));
     }
 
-    // ---- bottom rule ----
-    lines.push(render_rule());
+    // ---- bottom edge ----
+    match chrome {
+        ComposerChrome::Boxed => lines.push(render_rule()),
+        ComposerChrome::Framed => lines.push(frame_rule(
+            theme.glyph("bottom_left"),
+            theme.glyph("bottom_right"),
+        )),
+        ComposerChrome::Shaded => lines.push(blank_shaded_row()),
+    }
 
     lines
 }
@@ -784,9 +888,10 @@ pub fn render_composer_surface(
         let padding = layout.composer_padding.min(width.saturating_sub(3));
         width.saturating_sub(padding.saturating_add(2)).max(1)
     } else {
-        // The boxed composer frames with top and bottom rules only, so its
-        // content spans the full terminal width.
-        width.max(1)
+        // Boxed chrome frames with top and bottom rules only, so its content
+        // spans the full terminal width; framed and shaded chrome reserve
+        // side columns.
+        composer_inner_width(&state.theme, width)
     };
     let visual_lines = if editor.is_empty() {
         1

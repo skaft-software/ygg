@@ -3862,7 +3862,7 @@ fn switching_back_to_default_clears_named_theme_attributes() {
         crate::tui::terminal::ColorDepth::TrueColor,
     );
     let violet = crate::tui::theme::test_bundled_theme_with(
-        "violet-hour",
+        "pie",
         capabilities,
         crate::tui::theme::TerminalBackground::Unknown,
     );
@@ -4198,7 +4198,7 @@ fn renderer_covers_idle_and_every_active_run_phase() {
 fn named_theme_keeps_active_work_out_of_the_footer() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-        "bone-machine",
+        "clawed",
         crate::tui::terminal::TerminalCapabilities::test(
             true,
             true,
@@ -7897,6 +7897,70 @@ fn active_model_switch_keeps_run_identity_and_clears_stale_idle_telemetry() {
 }
 
 #[test]
+fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
+    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
+    use crate::tui::theme::TerminalBackground;
+
+    let composer_lines = |name: &str| -> Vec<String> {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(60, 12);
+        shell.set_theme(crate::tui::theme::test_bundled_theme_with(
+            name,
+            TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
+            TerminalBackground::Dark,
+        ));
+        let lines = render_shell(&shell.state.borrow(), 60);
+        lines
+    };
+
+    // clawed and pie: a cornered frame in the theme's border colour.
+    for name in ["clawed", "pie"] {
+        let lines = composer_lines(name);
+        let plain = lines
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        let top = plain
+            .iter()
+            .position(|line| line.starts_with('╭') && line.ends_with('╮'))
+            .unwrap_or_else(|| panic!("{name} composer lost its top corners: {plain:?}"));
+        assert!(
+            plain[top + 1..]
+                .iter()
+                .any(|line| line.starts_with('╰') && line.ends_with('╯')),
+            "{name} composer lost its bottom corners"
+        );
+        assert!(
+            plain[top + 1].starts_with('│') && plain[top + 1].ends_with('│'),
+            "{name} composer content rows lost their side borders: {:?}",
+            plain[top + 1]
+        );
+    }
+
+    // kodex: no rules at all — a shaded rectangle painted with composer_bg.
+    let lines = composer_lines("kodex");
+    let plain = lines
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert!(
+        !plain
+            .iter()
+            .any(|line| line.contains('─') || line.contains('╭') || line.contains('│')),
+        "kodex composer must not draw rules or frames: {plain:?}"
+    );
+    // #323232 fill on the prompt row and its padding rows.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("\x1b[48;2;50;50;50m"))
+            .count(),
+        3,
+        "kodex composer should paint exactly three shaded rows"
+    );
+}
+
+#[test]
 fn transcript_and_composer_have_exactly_one_breathing_row() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 5);
@@ -8624,19 +8688,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
     assert!(narrow.iter().all(|line| !line.chars().all(|ch| ch == '─')));
 }
 
-const BUNDLED_THEME_NAMES: [&str; 11] = [
-    "bone-machine",
-    "circuit-garden",
-    "field-notes",
-    "kawaii-pink",
-    "oxide-console",
-    "paper-ledger",
-    "signal-noir",
-    "synthwave-relay",
-    "tidepool",
-    "violet-hour",
-    "zen-mono",
-];
+const BUNDLED_THEME_NAMES: [&str; 3] = ["clawed", "kodex", "pie"];
 
 fn populate_theme_fixture(shell: &mut InteractiveShell) {
     shell.set_identity("local", "qwen3.6-27b", "high");
@@ -8764,7 +8816,7 @@ fn ansi_background_is_open_at_end(line: &str) -> bool {
 }
 
 #[test]
-fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() {
+fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
@@ -8782,8 +8834,8 @@ fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() 
         populate_theme_fixture(&mut shell);
         let transcript = shell.state.borrow().rendered_transcript(96).join("\n");
         assert!(
-            transcript.contains("\x1b[48;2;255;112;24m"),
-            "{name} changed the immutable prompt provenance background"
+            !transcript.contains("\x1b[48;2;255;112;24m"),
+            "{name} leaked the default theme's model-adaptive provenance paint"
         );
         assert!(
             !transcript.contains("\x1b[38;2;255;112;24m"),
@@ -8854,9 +8906,9 @@ fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() 
             eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
         }
     }
-    assert_eq!(wide.len(), 11);
-    assert_eq!(ascii.len(), 11);
-    assert_eq!(narrow.len(), 11);
+    assert_eq!(wide.len(), 3);
+    assert_eq!(ascii.len(), 3);
+    assert_eq!(narrow.len(), 3);
 }
 
 #[test]

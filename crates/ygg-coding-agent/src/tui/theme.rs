@@ -503,7 +503,21 @@ impl YggTheme {
     /// runs produced by the rich renderer. Theme data remains typed; only the
     /// renderer creates these reset/reopen sequences.
     pub(crate) fn apply_semantic_role_layered(&self, role: &str, text: &str) -> String {
-        let wrapped_empty = self.inner.apply_style(self.semantic_style(role), "");
+        self.apply_style_layered(self.semantic_style(role), text)
+    }
+
+    /// Paint a full row with a background colour while preserving inner ANSI
+    /// runs (the shaded composer rectangle). No-colour terminals get the text
+    /// back unchanged.
+    pub(crate) fn paint_row_background(&self, rgb: (u8, u8, u8), text: &str) -> String {
+        self.apply_style_layered(
+            TextStyle::plain().background(Color::Rgb(rgb.0, rgb.1, rgb.2)),
+            text,
+        )
+    }
+
+    fn apply_style_layered(&self, style: TextStyle, text: &str) -> String {
+        let wrapped_empty = self.inner.apply_style(style, "");
         let Some(opening) = wrapped_empty.strip_suffix("\x1b[0m") else {
             return text.to_owned();
         };
@@ -597,6 +611,14 @@ impl YggTheme {
             .unwrap_or_else(|| DEFAULT_ACCENT.to_owned());
         let color = parse_hex_color(&balance_foreground(&source, self.background))?;
         Some((color.red, color.green, color.blue))
+    }
+
+    /// Whether this theme opts into model-adaptive lab coloring. The default
+    /// theme sets `model.use_lab_color = true`; bundled pack themes disable it
+    /// so their fixed palettes stay untouched. Custom themes that omit the key
+    /// keep the historical adaptive behaviour.
+    pub(crate) fn uses_model_lab_color(&self) -> bool {
+        self.resolve::<bool>("model.use_lab_color").unwrap_or(true)
     }
 
     /// Render `text` in the accent colour of a specific model family.
@@ -2222,8 +2244,8 @@ mod tests {
     }
 
     #[test]
-    fn eleven_bundled_themes_load_for_every_terminal_profile() {
-        assert_eq!(theme_pack::THEMES.len(), 11);
+    fn three_bundled_themes_load_for_every_terminal_profile() {
+        assert_eq!(theme_pack::THEMES.len(), 3);
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let black = Rgb {
             red: 0,
@@ -2292,34 +2314,30 @@ mod tests {
     }
 
     #[test]
-    fn kawaii_pink_preserves_default_layout_and_adapts_its_surfaces() {
+    fn pie_keeps_exact_clone_surfaces_and_defaults_on_unknown_terminals() {
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
-        let dark =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Dark).unwrap();
-        let light =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Light).unwrap();
+        let dark = load_bundled_theme_for("pie", capabilities, TerminalBackground::Dark).unwrap();
+        let light = load_bundled_theme_for("pie", capabilities, TerminalBackground::Light).unwrap();
         let unknown =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Unknown)
-                .unwrap();
+            load_bundled_theme_for("pie", capabilities, TerminalBackground::Unknown).unwrap();
 
-        assert_eq!(dark.layout(), &ThemeLayout::default());
-        assert_eq!(light.layout(), &ThemeLayout::default());
-        for theme in [&dark, &light, &unknown] {
-            let accent = required_rgb_token(theme, "accent");
-            assert!(
-                accent.red > accent.green && accent.blue > accent.green,
-                "pink accent lost its hue: {accent:?}"
-            );
-        }
-        for token in ["kawaii_blush_bg", "kawaii_lilac_bg", "kawaii_note_bg"] {
-            assert!(relative_luminance(required_rgb_token(&dark, token)) < 0.05);
-            assert!(relative_luminance(required_rgb_token(&light, token)) > 0.90);
+        assert_eq!(dark.layout(), light.layout());
+        assert_eq!(format!("{:?}", dark.layout().density), "Airy");
+        assert_eq!(dark.layout().transcript_inset, 1);
+        for token in ["pie_user_bg", "pie_tool_bg", "pie_note_bg"] {
+            assert!(relative_luminance(required_rgb_token(&dark, token)) < 0.06);
+            assert!(relative_luminance(required_rgb_token(&light, token)) > 0.80);
             assert_eq!(
                 unknown.resolve::<String>(token).as_deref(),
                 Some("default"),
                 "unknown terminals should keep {token} on their default canvas"
             );
         }
+        // Exact clone palette: pi's dark user-message background.
+        assert_eq!(
+            dark.resolve::<String>("pie_user_bg").as_deref(),
+            Some("#343541")
+        );
     }
 
     #[test]
@@ -2347,22 +2365,22 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(signatures.len(), 11);
+        assert_eq!(signatures.len(), 3);
         assert_eq!(
             themes
                 .iter()
                 .map(|theme| theme.glyph("wordmark"))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            11
+            3
         );
-        assert!(
+        assert_eq!(
             themes
                 .iter()
                 .map(|theme| theme.glyph("prompt"))
                 .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                >= 8
+                .len(),
+            3
         );
         assert!(
             themes
@@ -2370,7 +2388,7 @@ mod tests {
                 .map(|theme| theme.glyph("top_left"))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
-                >= 5
+                >= 2
         );
         assert_eq!(
             themes
@@ -2380,7 +2398,7 @@ mod tests {
                 .len(),
             3
         );
-        assert_eq!(bundled_theme_summaries().len(), 11);
+        assert_eq!(bundled_theme_summaries().len(), 3);
     }
 
     #[test]
@@ -2481,22 +2499,20 @@ mod tests {
     fn semantic_roles_and_glyphs_degrade_without_losing_text() {
         let truecolor = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let theme =
-            load_bundled_theme_for("bone-machine", truecolor, TerminalBackground::Unknown).unwrap();
+            load_bundled_theme_for("clawed", truecolor, TerminalBackground::Unknown).unwrap();
         let confirmation = theme.apply_semantic_role("confirmation", "continue?");
         assert!(confirmation.contains("continue?"));
         assert!(confirmation.contains("\x1b[1m"));
-        assert!(confirmation.contains("\x1b[7m"));
-        assert_eq!(theme.glyph("prompt"), "»");
+        assert_eq!(theme.glyph("prompt"), ">");
 
         let plain = TerminalCapabilities::test(false, false, ColorDepth::None);
-        let theme =
-            load_bundled_theme_for("bone-machine", plain, TerminalBackground::Unknown).unwrap();
+        let theme = load_bundled_theme_for("clawed", plain, TerminalBackground::Unknown).unwrap();
         assert_eq!(
             theme.apply_semantic_role("confirmation", "continue?"),
             "continue?"
         );
         assert_eq!(theme.glyph("prompt"), ">");
-        assert_eq!(theme.glyph("horizontal"), "=");
+        assert_eq!(theme.glyph("top_left"), "+");
     }
 
     #[test]

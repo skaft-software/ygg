@@ -38,16 +38,9 @@ const rgb = (hex: string) => {
 };
 
 const themeCatalog: ThemeOption[] = [
-  ["bone-machine", "Bone Machine", "#a93434", "compact"],
-  ["circuit-garden", "Circuit Garden", "#00a87a", "airy"],
-  ["field-notes", "Field Notes", "#6e7e35", "comfortable"],
-  ["oxide-console", "Oxide Console", "#b45f32", "compact"],
-  ["paper-ledger", "Paper Ledger", "#7d5c3b", "airy"],
-  ["signal-noir", "Signal Noir", "#b52c3a", "comfortable"],
-  ["synthwave-relay", "Synthwave Relay", "#d238b4", "compact"],
-  ["tidepool", "Tidepool", "#168f91", "airy"],
-  ["violet-hour", "Violet Hour", "#7650a5", "airy"],
-  ["zen-mono", "Zen Mono", "#717171", "airy"],
+  ["clawed", "Clawed", "#d97757", "comfortable"],
+  ["kodex", "Kodex", "#00cdcd", "compact"],
+  ["pie", "Pie", "#8abeb7", "airy"],
 ].map(([id, name, accent, density], index) => ({
   id,
   theme: {
@@ -298,7 +291,7 @@ export const fixtureBootstrap: HostBootstrap = {
   authorityProfiles: ["readOnly", "workspace"],
   authorityCeiling: "workspace",
   themes: themeCatalog,
-  selectedThemeId: "tidepool",
+  selectedThemeId: "clawed",
   devices: devicesCatalog,
   capabilities: {
     attachments: true,

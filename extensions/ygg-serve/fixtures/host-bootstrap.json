@@ -56,13 +56,13 @@
   "authorityCeiling": "workspace",
   "themes": [
     {
-      "id": "tidepool",
+      "id": "clawed",
       "theme": {
-        "name": "Tidepool",
+        "name": "Clawed",
         "source": "bundled",
         "revision": 3,
         "scheme": "dark",
-        "density": "airy",
+        "density": "comfortable",
         "motion": "full",
         "typography": {
           "bodyFamily": "system-sans",
@@ -73,9 +73,9 @@
         "colors": {
           "accent": {
             "kind": "rgb",
-            "red": 22,
-            "green": 143,
-            "blue": 145
+            "red": 217,
+            "green": 119,
+            "blue": 87
           },
           "canvas": {
             "kind": "default"
@@ -95,7 +95,7 @@
       }
     }
   ],
-  "selectedThemeId": "tidepool",
+  "selectedThemeId": "clawed",
   "projects": [
     {
       "id": "project-ygg",
