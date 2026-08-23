@@ -2703,17 +2703,19 @@ mod tests {
                     protocol: Protocol::OpenAiChat,
                 }),
                 Message::User(UserMessage {
-                    content: vec![
-                        UserPart::ToolResult(crate::types::ToolResult {
-                            tool_call_id: ToolCallId("call-1".into()),
-                            content: vec![ToolResultPart::Text("connected".into())],
-                            is_error: false,
-                            added_tool_names: Some(vec!["browser_click".into()]),
-                        }),
-                    ],
+                    content: vec![UserPart::ToolResult(crate::types::ToolResult {
+                        tool_call_id: ToolCallId("call-1".into()),
+                        content: vec![ToolResultPart::Text("connected".into())],
+                        is_error: false,
+                        added_tool_names: Some(vec!["browser_click".into()]),
+                    })],
                 }),
             ],
-            tools: vec![make_tool("read"), make_tool("bash"), make_tool("browser_click")],
+            tools: vec![
+                make_tool("read"),
+                make_tool("bash"),
+                make_tool("browser_click"),
+            ],
             tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
             temperature: None,
@@ -2766,17 +2768,19 @@ mod tests {
                     protocol: Protocol::OpenAiChat,
                 }),
                 Message::User(UserMessage {
-                    content: vec![
-                        UserPart::ToolResult(crate::types::ToolResult {
-                            tool_call_id: ToolCallId("call-1".into()),
-                            content: vec![ToolResultPart::Text("connected".into())],
-                            is_error: false,
-                            added_tool_names: Some(vec!["browser_click".into()]),
-                        }),
-                    ],
+                    content: vec![UserPart::ToolResult(crate::types::ToolResult {
+                        tool_call_id: ToolCallId("call-1".into()),
+                        content: vec![ToolResultPart::Text("connected".into())],
+                        is_error: false,
+                        added_tool_names: Some(vec!["browser_click".into()]),
+                    })],
                 }),
             ],
-            tools: vec![make_tool("read"), make_tool("bash"), make_tool("browser_click")],
+            tools: vec![
+                make_tool("read"),
+                make_tool("bash"),
+                make_tool("browser_click"),
+            ],
             tool_choice: ToolChoice::Auto,
             max_output_tokens: None,
             temperature: None,

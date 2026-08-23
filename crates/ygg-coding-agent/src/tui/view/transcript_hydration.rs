@@ -99,13 +99,12 @@ pub(super) fn append_hydrated_items(
                         if let Some(TranscriptBlock::Tool(panel)) = state.transcript.get_mut(index)
                         {
                             apply_hydrated_tool_result(panel, &text, is_error);
-                            panel.duration =
-                                duration_ms.map(|millis| Duration::from_millis(millis));
+                            panel.duration = duration_ms.map(Duration::from_millis);
                         }
                     }
                 } else if let Some(panel) = state.tool_output_mut(&id) {
                     apply_hydrated_tool_result(panel, &text, is_error);
-                    panel.duration = duration_ms.map(|millis| Duration::from_millis(millis));
+                    panel.duration = duration_ms.map(Duration::from_millis);
                 } else {
                     let index = state.transcript.len();
                     let model_lab = state.model_lab;

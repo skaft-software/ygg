@@ -8043,6 +8043,7 @@ async fn project_agent_event(
     response_text: &mut String,
 ) -> Result<Option<HostRunOutcome>, ServiceError> {
     match agent_event {
+        AgentEvent::TurnStarted => {}
         AgentEvent::OutputDelta { channel, text } => {
             let text = bounded_text(&text, MAX_ITEM_TEXT_BYTES);
             let turn_id = projection.turn_id(run_id)?;
@@ -8156,7 +8157,11 @@ async fn project_agent_event(
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }
-        AgentEvent::ToolFinished { id, result } => {
+        AgentEvent::ToolFinished {
+            id,
+            result,
+            duration: _,
+        } => {
             let tool_item_id = projection.tool_items.get(&id.0).cloned();
             let projected = projection.tool_calls.get(&id.0).cloned();
             if let (Some(item_id), Some(mut tool)) = (tool_item_id.clone(), projected) {

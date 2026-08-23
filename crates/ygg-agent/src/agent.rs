@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -14,22 +14,21 @@ use tokio::sync::mpsc;
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
-    OutputModalities, PICODOLLARS_PER_MICRODOLLAR, Protocol, ReasoningConfig, ReasoningMode,
-    Request, ResponsesCompactRequest, ResponsesInput, ResponsesOptions, ResponsesReplayItem,
-    StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
-    UserMessage, UserPart,
+    OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest,
+    ResponsesInput, ResponsesOptions, ResponsesReplayItem, StopReason, StreamEvent, ToolCall,
+    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
-    DEFAULT_KEEP_RECENT_TOKENS, HandoffPreparation, SUMMARIZATION_SYSTEM_PROMPT,
-    SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS, build_handoff_message,
-    build_turn_prefix_handoff_message, choose_first_kept_by_tokens, finish_handoff,
-    prepare_handoff,
+    build_handoff_message, build_turn_prefix_handoff_message, choose_first_kept_by_tokens,
+    finish_handoff, prepare_handoff, HandoffPreparation, DEFAULT_KEEP_RECENT_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
 use crate::delegation::{
-    DelegationBinding, DelegationConfig, DelegationError, DelegationRuntimeSettings,
-    DelegationTemplate, enable_root_delegation,
+    enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
+    DelegationRuntimeSettings, DelegationTemplate,
 };
 use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
 use crate::events::{
@@ -37,7 +36,7 @@ use crate::events::{
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
-use crate::extension_process::{EXTENSION_FEATURE_AGENT_SESSIONS, ExtensionProcess};
+use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
@@ -46,9 +45,9 @@ use crate::session::{
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
-    CancellationToken, PROGRESS_CHANNEL_CAPACITY, ReplaySafety, Tool, ToolConcurrency, ToolContext,
-    ToolError, ToolOutput, ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind,
-    ToolProgress, ToolProgressSink,
+    CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress, ToolProgressSink,
+    PROGRESS_CHANNEL_CAPACITY,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -6028,12 +6027,10 @@ mod tests {
             CancellationToken::default(),
         );
         let authoritative = serde_json::json!({ "command": "ls" });
-        assert!(
-            speculative
-                .take_matched(&id, Some(&authoritative))
-                .await
-                .is_none()
-        );
+        assert!(speculative
+            .take_matched(&id, Some(&authoritative))
+            .await
+            .is_none());
     }
     #[test]
     fn provisional_delivery_rolls_back_when_generic_tool_output_limiting_truncates_it() {
@@ -6051,8 +6048,13 @@ mod tests {
             .unwrap()
             .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
             .unwrap();
-        let (_, _, persisted_text, _, _) =
-            lower_tool_result(ygg_ai::ToolCallId("delivery".into()), &result, &model, 32, Vec::new());
+        let (_, _, persisted_text, _, _) = lower_tool_result(
+            ygg_ai::ToolCallId("delivery".into()),
+            &result,
+            &model,
+            32,
+            Vec::new(),
+        );
         assert_ne!(persisted_text, result.as_ref().unwrap().text);
         assert!(persisted_text.len() <= 32);
 
@@ -6352,8 +6354,13 @@ mod tests {
             bytes::Bytes::from_static(b"png"),
             "image/png".parse().unwrap(),
         )));
-        let (message, accepted, _, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
+        let (message, accepted, _, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &result,
+            &model,
+            4096,
+            Vec::new(),
+        );
         assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
         assert!(!is_error);
         assert_eq!(message.content.len(), 1);
@@ -6388,7 +6395,7 @@ mod tests {
                 &result,
                 &model,
                 text_limit,
-                        Vec::new(),
+                Vec::new(),
             );
 
             assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
@@ -6432,8 +6439,13 @@ mod tests {
                 Some(serde_json::json!({"cache": "miss"})),
             )
             .unwrap());
-        let (message, _, _, is_error, details) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
+        let (message, _, _, is_error, details) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &result,
+            &model,
+            4096,
+            Vec::new(),
+        );
 
         assert!(!is_error);
         let details = details.expect("durable details");
@@ -6466,8 +6478,13 @@ mod tests {
                 bytes::Bytes::from_static(b"audio"),
                 format,
             )));
-            let (message, accepted, _, is_error, _) =
-                lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096, Vec::new());
+            let (message, accepted, _, is_error, _) = lower_tool_result(
+                ygg_ai::ToolCallId("call".into()),
+                &result,
+                &model,
+                4096,
+                Vec::new(),
+            );
             assert_eq!(accepted, vec![ToolOutputMediaKind::Audio]);
             assert!(!is_error);
             assert!(matches!(message.content[0], UserPart::ToolResult(_)));
@@ -6488,8 +6505,13 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Wav,
         )));
-        let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096, Vec::new());
+        let (message, accepted, text, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &audio,
+            &responses,
+            4096,
+            Vec::new(),
+        );
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("protocol cannot replay audio"));
@@ -6503,8 +6525,13 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Aac,
         )));
-        let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096, Vec::new());
+        let (message, accepted, text, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &aac,
+            &chat,
+            4096,
+            Vec::new(),
+        );
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("accepts WAV or MP3"));
@@ -6536,15 +6563,13 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "reasoning",
-                        "id": "rs_large",
-                        "encrypted_content": "x".repeat(40_000),
-                        "unknown": {"phase": "analysis"}
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_large",
+                    "encrypted_content": "x".repeat(40_000),
+                    "unknown": {"phase": "analysis"}
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
@@ -6594,27 +6619,23 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "message",
-                        "id": "old-output"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "message",
+                    "id": "old-output"
+                }))
+                .unwrap()]),
             )
             .unwrap();
         session
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "compaction",
-                        "id": "small-checkpoint",
-                        "encrypted_content": "opaque"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "id": "small-checkpoint",
+                    "encrypted_content": "opaque"
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
@@ -6683,13 +6704,11 @@ mod tests {
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "compaction",
-                        "encrypted_content": "small"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "small"
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
