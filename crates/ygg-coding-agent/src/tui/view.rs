@@ -49,6 +49,8 @@ use self::input_overlays::render_slash_suggestions;
 use self::native_scrollback::{render_shell, render_shell_at, render_shell_update};
 use self::panel_render::filtered_indices;
 #[cfg(test)]
+pub(crate) use self::panel_render::panel_render_test_hook;
+#[cfg(test)]
 use self::panel_render::render_panel;
 use self::reasoning_render::collapsed_reasoning_lines;
 #[cfg(test)]
@@ -60,7 +62,7 @@ use self::renderer_runtime::{render_loop, RenderCommand, SharedState};
 use self::shell_chrome::responsive_identity;
 use self::shell_chrome::shell_chrome;
 use self::status_telemetry::{
-    output_tokens_per_second, status_telemetry, styled_status_text,
+    output_tokens_per_second, status_telemetry, styled_extension_output, styled_status_text,
     usage_cache_hit_rate_basis_points,
 };
 #[cfg(test)]
@@ -70,6 +72,7 @@ use self::terminal_text::sanitize_extension_tool_render_segments;
 pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
+pub(crate) use self::tool_render::tool_display_label;
 use self::transcript_cache::TranscriptCache;
 use self::transcript_history::{
     materialize_deferred_session_history, DeferredSessionHistory, NextTranscriptCommitId,
@@ -301,9 +304,12 @@ pub(crate) enum Panel {
         action: PanelAction,
     },
     /// Scrollable, read-only document used for delegated worker transcripts.
+    /// `styled` marks text that was already sanitized at the producing
+    /// boundary and carries trusted theme ANSI; rendering must preserve it.
     ReadOnlyDocument {
         title: String,
         text: String,
+        styled: bool,
         /// Visual rows retained below the current viewport tail.
         scroll_from_bottom: usize,
     },
@@ -3288,6 +3294,17 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Text(sanitize_for_terminal(&text)));
     }
 
+    /// Extension slash-command output, framed with heading chrome. The body
+    /// is sanitized; only trusted theme styling added here survives.
+    pub fn show_extension_output(&mut self, command: &str, text: String) {
+        let mut state = self.state.borrow_mut();
+        state.overlay = Some(ShellOverlay::Text(styled_extension_output(
+            &state.theme,
+            command,
+            &text,
+        )));
+    }
+
     pub fn show_context_report(&mut self, report: crate::tui::context::ContextReport) {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
     }
@@ -3427,15 +3444,30 @@ impl InteractiveShell {
 
     /// Replace the body of a read-only document without changing its title or
     /// scroll anchor. A reader browsing upward stays at that logical offset;
-    /// a reader at the tail follows newly appended transcript rows.
+    /// a reader at the tail follows newly appended transcript rows. The text
+    /// is sanitized; styled documents must use
+    /// [`Self::update_read_only_document_styled`] instead.
+    #[cfg(test)]
     pub fn update_read_only_document(&mut self, text: String) {
+        self.update_read_only_document_inner(crate::tui::view::sanitize_for_terminal(&text));
+    }
+
+    /// Styled variant of [`Self::update_read_only_document`]: the text was
+    /// already sanitized at the producing boundary and carries trusted theme
+    /// ANSI, which must survive refreshes verbatim.
+    pub fn update_read_only_document_styled(&mut self, text: String) {
+        self.update_read_only_document_inner(text);
+    }
+
+    fn update_read_only_document_inner(&mut self, new_text: String) {
         let mut state = self.state.borrow_mut();
-        let (old_text, old_scroll) = match state.panel.as_ref() {
+        let (old_text, old_scroll, styled) = match state.panel.as_ref() {
             Some(Panel::ReadOnlyDocument {
                 text: current_text,
                 scroll_from_bottom,
+                styled,
                 ..
-            }) => (current_text.clone(), *scroll_from_bottom),
+            }) => (current_text.clone(), *scroll_from_bottom, *styled),
             _ => return,
         };
         let panel_rows = self::panel_render::render_panel_with_limit(
@@ -3446,11 +3478,12 @@ impl InteractiveShell {
         .len();
         let viewport_rows =
             self::panel_render::document_body_rows(&state, state.size.0, panel_rows);
-        let old_max = self::panel_render::document_visual_row_count(&old_text, state.size.0)
-            .saturating_sub(viewport_rows);
-        let new_text = crate::tui::view::sanitize_for_terminal(&text);
-        let new_max = self::panel_render::document_visual_row_count(&new_text, state.size.0)
-            .saturating_sub(viewport_rows);
+        let old_max =
+            self::panel_render::document_visual_row_count_styled(&old_text, state.size.0, styled)
+                .saturating_sub(viewport_rows);
+        let new_max =
+            self::panel_render::document_visual_row_count_styled(&new_text, state.size.0, styled)
+                .saturating_sub(viewport_rows);
         let old_top = old_max.saturating_sub(old_scroll.min(old_max));
         let new_scroll = if old_scroll == 0 {
             0
@@ -3581,12 +3614,14 @@ impl InteractiveShell {
             }
             Panel::ReadOnlyDocument {
                 text,
+                styled,
                 scroll_from_bottom,
                 ..
             } => {
                 use crossterm::event::{Event, KeyCode};
                 let viewport_rows = document_page_step;
-                let visual_rows = self::panel_render::document_visual_row_count(text, size.0);
+                let visual_rows =
+                    self::panel_render::document_visual_row_count_styled(text, size.0, *styled);
                 let maximum = visual_rows.saturating_sub(viewport_rows);
                 *scroll_from_bottom = (*scroll_from_bottom).min(maximum);
                 match event {

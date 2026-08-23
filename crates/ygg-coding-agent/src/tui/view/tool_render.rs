@@ -70,7 +70,7 @@ fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
 /// Minimum width reserved for the tool label before its value/output column.
 const TOOL_VALUE_MIN_WIDTH: usize = 6;
 
-pub(super) fn tool_display_label(name: &str) -> String {
+pub(crate) fn tool_display_label(name: &str) -> String {
     match name {
         "read" => "Read".to_string(),
         "search" => "Explored".to_string(),

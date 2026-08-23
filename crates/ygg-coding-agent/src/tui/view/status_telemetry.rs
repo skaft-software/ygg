@@ -169,3 +169,77 @@ mod tests {
         assert!(!plain.contains('\x1b'));
     }
 }
+
+/// Chrome for extension slash-command output. The body is sanitized here, then
+/// framed with a heading rule and light per-line styling so long extension
+/// reports stay scannable: `label:` prefixes read as headings, `-` bullets get
+/// a quiet marker, and `·` separators stay dim.
+pub(super) fn styled_extension_output(theme: &YggTheme, command: &str, text: &str) -> String {
+    let safe = sanitize_for_terminal(text);
+    let rule_width = 28;
+    let rule = theme.fg("muted", &theme.glyph("horizontal").repeat(rule_width));
+    let heading = format!(
+        "{} {}",
+        theme.settled_event_dot("neutral", if theme.unicode() { "•" } else { "*" }),
+        theme.bold(&theme.fg("foreground", &format!("/{command}")))
+    );
+    let mut lines = vec![rule.clone(), heading, rule.clone()];
+    for line in safe.lines() {
+        let styled_line = if let Some((label, rest)) = line.split_once(':') {
+            if !label.is_empty()
+                && label.len() <= 32
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '_')
+                && !rest.contains(':')
+            {
+                format!("{}{}{}", theme.fg("model_accent", label), ":", rest)
+            } else {
+                line.to_owned()
+            }
+        } else if let Some(rest) = line.strip_prefix("- ") {
+            format!("{} {}", theme.fg("muted", "-"), rest)
+        } else {
+            line.to_owned()
+        };
+        lines.push(styled_line);
+    }
+    lines.push(rule);
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod extension_output_tests {
+    use super::*;
+
+    #[test]
+    fn styled_extension_output_frames_and_labels_the_body() {
+        let theme = crate::tui::theme::test_theme();
+        let styled = styled_extension_output(
+            &theme,
+            "web-search",
+            "provider: brave\n- result one\nplain line\nsome:thing: odd",
+        );
+        let plain = sanitize_for_terminal(&styled);
+        assert!(plain.contains("/web-search"));
+        assert!(plain.contains("provider: brave"));
+        assert!(plain.contains("- result one"));
+        // Styling must survive as trusted ANSI in the overlay text.
+        assert!(styled.contains('\x1b'));
+        // The body itself was sanitized; nothing raw leaks through.
+        assert!(!styled.contains("\u{7}"));
+    }
+
+    #[test]
+    fn styled_extension_output_is_plain_when_color_depth_is_none() {
+        let theme =
+            crate::tui::theme::test_theme_with(crate::tui::terminal::TerminalCapabilities::test(
+                true,
+                true,
+                crate::tui::terminal::ColorDepth::None,
+            ));
+        let styled = styled_extension_output(&theme, "extensions", "no extensions configured");
+        assert!(!styled.contains('\x1b'), "{styled:?}");
+        assert!(styled.contains("/extensions"));
+    }
+}

@@ -38,9 +38,10 @@ use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
-    optional_model_picker, read_only_document, read_only_document_live, session_picker,
+    optional_model_picker, read_only_document, read_only_document_live_styled, session_picker,
     subagent_picker, theme_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
 };
+use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
     available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
     load_theme_for_background, TerminalBackground,
@@ -2158,79 +2159,141 @@ async fn thinking_configuration_picker(
     Ok(Some((ReasoningMode::Standard, level)))
 }
 
-fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
+fn delegated_session_text(session: &Session, theme: &YggTheme) -> anyhow::Result<String> {
+    use crate::tui::view::sanitize_for_terminal;
+    use ygg_ai::{AssistantMessage, Message, UserPart};
+
     const MAX_MESSAGES: usize = 64;
     const MAX_BLOCK_BYTES: usize = 16 * 1024;
     const MAX_TOTAL_BYTES: usize = 128 * 1024;
 
-    fn bounded(value: &str, limit: usize) -> &str {
+    fn bounded(value: &str, limit: usize) -> String {
         let mut end = value.len().min(limit);
         while end > 0 && !value.is_char_boundary(end) {
             end -= 1;
         }
-        &value[..end]
+        value[..end].to_owned()
     }
 
+    // One sanitized line of a compact argument preview for a tool call row.
+    fn tool_argument_preview(call: &ygg_ai::ToolCall) -> String {
+        let raw = sanitize_for_terminal(&call.arguments_json);
+        let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        bounded(&flat, 96)
+    }
+
+    let dot = if theme.unicode() { "•" } else { "*" };
+    let indent_dot = format!("  {} ", theme.fg("muted", "│"));
     let context = session.context()?;
-    let header = "Delegated worker transcript · read-only\nMutation remains owner-bound to agent_sessions.\n";
-    let omitted_marker = "\n\n[older transcript entries omitted]";
+
+    // Styled header chrome; the panel title carries the worker label.
+    let header = format!(
+        "{} {}\n{}",
+        theme.settled_event_dot("neutral", dot),
+        theme.bold(&theme.fg("foreground", "Delegated worker transcript")),
+        theme.dim("read-only · mutation remains owner-bound to agent_sessions"),
+    );
+    let omitted_marker = format!("\n\n{}", theme.dim("[older transcript entries omitted]"));
     let recent_start = context.len().saturating_sub(MAX_MESSAGES);
     let mut blocks = Vec::new();
     for message in context.iter().skip(recent_start) {
-        let mut block = String::new();
+        let mut rows: Vec<String> = Vec::new();
+        let mut block_bytes = 0usize;
+        let push_row = |rows: &mut Vec<String>, block_bytes: &mut usize, row: String| {
+            if *block_bytes >= MAX_BLOCK_BYTES {
+                return;
+            }
+            *block_bytes += row.len() + 1;
+            rows.push(row);
+        };
         match message {
-            ygg_ai::Message::User(user) => {
-                let mut texts = user.content.iter().filter_map(|part| match part {
-                    ygg_ai::UserPart::Text(text) => Some(text.as_str()),
+            Message::User(user) => {
+                let texts = user.content.iter().filter_map(|part| match part {
+                    UserPart::Text(text) => Some(text.as_str()),
                     _ => None,
                 });
-                if let Some(first) = texts.next() {
-                    block.push_str("\nParent / tool\n");
-                    block.push_str(bounded(first, MAX_BLOCK_BYTES));
-                    for text in texts {
-                        if block.len() >= MAX_BLOCK_BYTES {
+                for (index, text) in texts.enumerate() {
+                    if block_bytes >= MAX_BLOCK_BYTES {
+                        break;
+                    }
+                    if index == 0 {
+                        let label = theme.bold(&theme.fg("foreground", "Parent request"));
+                        push_row(
+                            &mut rows,
+                            &mut block_bytes,
+                            format!(
+                                "\n{} {} {}",
+                                theme.settled_event_dot("success", dot),
+                                label,
+                                theme.dim("· from parent")
+                            ),
+                        );
+                    }
+                    for line in sanitize_for_terminal(text).lines() {
+                        if block_bytes >= MAX_BLOCK_BYTES {
                             break;
                         }
-                        block.push('\n');
-                        block.push_str(bounded(text, MAX_BLOCK_BYTES.saturating_sub(block.len())));
+                        push_row(
+                            &mut rows,
+                            &mut block_bytes,
+                            format!("{indent_dot}{}", theme.fg("muted", line)),
+                        );
                     }
                 }
             }
-            ygg_ai::Message::Assistant(assistant) => {
-                for part in &assistant.content {
+            Message::Assistant(AssistantMessage { content, .. }) => {
+                for part in content {
+                    if block_bytes >= MAX_BLOCK_BYTES {
+                        break;
+                    }
                     match part {
                         ygg_ai::AssistantPart::Text(text) => {
-                            if block.is_empty() {
-                                block.push_str("\nWorker\n");
+                            if rows.is_empty() {
+                                let label = theme.bold(&theme.fg("foreground", "Worker"));
+                                push_row(
+                                    &mut rows,
+                                    &mut block_bytes,
+                                    format!("\n{} {}", theme.fg("foreground", dot), label),
+                                );
                             }
-                            block.push_str(bounded(
-                                text,
-                                MAX_BLOCK_BYTES.saturating_sub(block.len()),
-                            ));
+                            for line in sanitize_for_terminal(text).lines() {
+                                if block_bytes >= MAX_BLOCK_BYTES {
+                                    break;
+                                }
+                                push_row(
+                                    &mut rows,
+                                    &mut block_bytes,
+                                    format!("{indent_dot}{}", line),
+                                );
+                            }
                         }
                         ygg_ai::AssistantPart::ToolCall(call) => {
-                            if block.is_empty() {
-                                block.push_str("\nWorker\n");
-                            }
-                            if block.len() < MAX_BLOCK_BYTES {
-                                block.push_str("\n[tool: ");
-                                block.push_str(bounded(
-                                    &call.name,
-                                    MAX_BLOCK_BYTES.saturating_sub(block.len() + 2),
-                                ));
-                                block.push(']');
-                            }
+                            let label = crate::tui::view::tool_display_label(&call.name);
+                            let label = theme.bold(&theme.fg("foreground", &label));
+                            let preview = tool_argument_preview(call);
+                            let detail = if preview.is_empty() {
+                                String::new()
+                            } else {
+                                theme.dim(&format!(" {preview}"))
+                            };
+                            push_row(
+                                &mut rows,
+                                &mut block_bytes,
+                                format!(
+                                    "\n{} {}{}",
+                                    theme.settled_event_dot("neutral", dot),
+                                    label,
+                                    detail
+                                ),
+                            );
                         }
                         ygg_ai::AssistantPart::Reasoning(_) | ygg_ai::AssistantPart::Media(_) => {}
-                    }
-                    if block.len() >= MAX_BLOCK_BYTES {
-                        break;
                     }
                 }
             }
         }
-        if !block.is_empty() {
-            blocks.push(bounded(&block, MAX_BLOCK_BYTES).to_owned());
+        if !rows.is_empty() {
+            blocks.push(rows.join("\n"));
         }
     }
 
@@ -2259,14 +2322,14 @@ fn delegated_session_text(session: &Session) -> anyhow::Result<String> {
     let mut output = String::with_capacity(
         header.len() + selected_bytes + usize::from(omitted) * omitted_marker.len(),
     );
-    output.push_str(header);
+    output.push_str(&header);
     for block in &blocks[selected_start..] {
         output.push_str(block);
     }
     if omitted {
-        output.insert_str(header.len(), omitted_marker);
+        output.insert_str(header.len(), &omitted_marker);
     }
-    debug_assert!(output.len() <= MAX_TOTAL_BYTES);
+    debug_assert!(output.len() <= MAX_TOTAL_BYTES + 4096);
     Ok(output)
 }
 
@@ -2589,6 +2652,7 @@ async fn subagents_view(
         });
         let node_id = entry.node_id.clone();
         let fallback_detail = entry.fallback_detail.clone();
+        let theme = shell.theme();
         let initial_text = if let (Some(principal), Some(reference)) =
             (principal.as_deref(), reference.as_deref())
         {
@@ -2596,7 +2660,7 @@ async fn subagents_view(
                 .agent
                 .open_delegated_session_reference(principal, reference)
             {
-                Ok(Some(session)) => delegated_session_text(&session)?,
+                Ok(Some(session)) => delegated_session_text(&session, &shell.theme())?,
                 Ok(None) => format!(
                     "{}\n\nThe delegated transcript is no longer available for this parent session.",
                     fallback_detail
@@ -2625,7 +2689,7 @@ async fn subagents_view(
                     .agent
                     .open_delegated_session_reference(principal, reference)
                 {
-                    Ok(Some(session)) => delegated_session_text(&session).map(Some),
+                    Ok(Some(session)) => delegated_session_text(&session, &theme).map(Some),
                     Ok(None) => Ok(Some(format!(
                         "{}\n\nThe delegated transcript is no longer available for this parent session.",
                         current_fallback
@@ -2640,7 +2704,7 @@ async fn subagents_view(
             };
             std::future::ready(result)
         };
-        read_only_document_live(
+        read_only_document_live_styled(
             shell,
             input,
             format!("{} · read-only transcript", entry.label),
@@ -3253,7 +3317,7 @@ async fn run_idle_command(
                     .agent
                     .open_delegated_session_reference(&principal, &reference)
                 {
-                    Ok(Some(session)) => match delegated_session_text(&session) {
+                    Ok(Some(session)) => match delegated_session_text(&session, &shell.theme()) {
                         Ok(text) => shell.show_overlay_text(text),
                         Err(error) => {
                             shell.error(format!("failed to inspect delegated session: {error}"))
@@ -3506,7 +3570,7 @@ async fn run_idle_command(
                     if visible.trim().is_empty() {
                         shell.notice(format!("/{extension_name} completed"));
                     } else {
-                        shell.show_overlay_text(visible);
+                        shell.show_extension_output(&extension_name, visible);
                     }
                 }
                 Ok(None) => {
@@ -4502,6 +4566,10 @@ mod tests {
     use super::*;
     use ygg_agent::EntryValue;
 
+    fn test_theme() -> crate::tui::theme::YggTheme {
+        crate::tui::theme::test_theme()
+    }
+
     #[test]
     fn web_search_menu_recommends_brave_and_keeps_searxng_and_disable() {
         let (items, descriptions) = web_search_menu_entries(true);
@@ -4533,8 +4601,11 @@ mod tests {
                 },
             )))
             .unwrap();
-        let text = delegated_session_text(&session).unwrap();
-        assert!(text.contains("Delegated worker transcript · read-only"));
+        let text = delegated_session_text(&session, &test_theme()).unwrap();
+        // The styled header must still read correctly after ANSI stripping.
+        let plain = crate::tui::view::sanitize_for_terminal(&text);
+        assert!(plain.contains("Delegated worker transcript"));
+        assert!(plain.contains("read-only · mutation remains owner-bound"));
         assert!(text.contains("Inspect the worker result."));
         assert!(!text.contains(private_path.to_str().unwrap()));
         assert!(text.len() <= 128 * 1024);
@@ -4564,7 +4635,7 @@ mod tests {
                 .unwrap();
         }
 
-        let text = delegated_session_text(&session).unwrap();
+        let text = delegated_session_text(&session, &test_theme()).unwrap();
         assert!(text.contains("NEWEST-FINAL-WORKER-RESULT"), "{text}");
         assert!(!text.contains("block-00-older-worker-output"));
         assert!(text.contains("[older transcript entries omitted]"));

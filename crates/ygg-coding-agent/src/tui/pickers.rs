@@ -449,6 +449,7 @@ where
     shell.open_panel(Panel::ReadOnlyDocument {
         title: title.into(),
         text: crate::tui::view::sanitize_for_terminal(&text),
+        styled: false,
         scroll_from_bottom: 0,
     });
     shell.render();
@@ -491,9 +492,9 @@ where
     }
 }
 
-/// Show a live bounded read-only document. Refreshes replace the body without
-/// moving a reader who has scrolled upward; the tail follows new rows.
-pub async fn read_only_document_live<S, F, Fut>(
+/// Styled variant of [`read_only_document`]: the producer sanitizes its
+/// content once and applies trusted theme ANSI, which rendering preserves.
+pub async fn read_only_document_live_styled<S, F, Fut>(
     shell: &mut InteractiveShell,
     input: &mut S,
     title: impl Into<String>,
@@ -507,7 +508,8 @@ where
 {
     shell.open_panel(Panel::ReadOnlyDocument {
         title: title.into(),
-        text: crate::tui::view::sanitize_for_terminal(&text),
+        text,
+        styled: true,
         scroll_from_bottom: 0,
     });
     shell.render();
@@ -550,7 +552,7 @@ where
             }
             _ = refresh_tick.tick() => {
                 if let Ok(Some(text)) = refresh().await {
-                    shell.update_read_only_document(text);
+                    shell.update_read_only_document_styled(text);
                     shell.render();
                 }
             }

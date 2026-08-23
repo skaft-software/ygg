@@ -8511,6 +8511,7 @@ fn read_only_document_panel_scrolls_and_returns_to_its_owner() {
             .map(|line| format!("transcript line {line:02}"))
             .collect::<Vec<_>>()
             .join("\n"),
+        styled: false,
         scroll_from_bottom: 0,
     });
 
@@ -8573,6 +8574,7 @@ fn read_only_document_home_reaches_top_with_wrapped_error_and_header_chrome() {
             .map(|line| format!("document row {line:02}"))
             .collect::<Vec<_>>()
             .join("\n"),
+        styled: false,
         scroll_from_bottom: 0,
     });
 
@@ -8855,4 +8857,30 @@ fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() 
     assert_eq!(wide.len(), 11);
     assert_eq!(ascii.len(), 11);
     assert_eq!(narrow.len(), 11);
+}
+
+#[test]
+fn styled_read_only_document_preserves_trusted_ansi_and_sanitizes_plain_documents() {
+    let shell = InteractiveShell::test_shell();
+    let theme = crate::tui::theme::test_theme();
+    let styled_text = format!(
+        "{} {}",
+        theme.bold(&theme.fg("foreground", "Worker")),
+        "\x1b[31mraw-esc\x1b[0m"
+    );
+    // Styled documents keep theme styling but the producer had already
+    // sanitized content; rendering must not re-sanitize away the bold.
+    let lines = crate::tui::view::panel_render_test_hook::document_lines(&styled_text, 80, true);
+    assert!(
+        lines.iter().any(|line| line.contains("\x1b[1m")),
+        "styled document lost its trusted ANSI: {lines:?}"
+    );
+    // Plain documents still sanitize embedded escapes.
+    let lines =
+        crate::tui::view::panel_render_test_hook::document_lines("before \x1b[31mafter", 80, false);
+    assert!(
+        lines.iter().all(|line| !line.contains("\x1b")),
+        "plain document kept a raw escape: {lines:?}"
+    );
+    let _ = shell;
 }

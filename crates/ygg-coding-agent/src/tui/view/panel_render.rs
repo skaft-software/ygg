@@ -42,12 +42,18 @@ fn panel_cell(text: &str) -> String {
     super::sanitize_for_terminal(text).replace('\n', " ")
 }
 
-fn document_visual_lines(text: &str, width: u16) -> Vec<String> {
+/// `styled` text was already sanitized at its producing boundary and carries
+/// trusted theme ANSI that must survive wrapping.
+pub(super) fn document_visual_lines_styled(text: &str, width: u16, styled: bool) -> Vec<String> {
     let inset = usize::from(width >= 5) * 2;
     let available = usize::from(width)
         .saturating_sub(inset.saturating_mul(2))
         .max(1);
-    let text = super::sanitize_for_terminal(text);
+    let text = if styled {
+        text.to_owned()
+    } else {
+        super::sanitize_for_terminal(text)
+    };
     let mut lines = Vec::new();
     for source in text.split('\n') {
         let wrapped = wrap_text_with_ansi(source, available);
@@ -64,8 +70,15 @@ fn document_visual_lines(text: &str, width: u16) -> Vec<String> {
     lines
 }
 
-pub(super) fn document_visual_row_count(text: &str, width: u16) -> usize {
-    document_visual_lines(text, width).len()
+pub(super) fn document_visual_row_count_styled(text: &str, width: u16, styled: bool) -> usize {
+    document_visual_lines_styled(text, width, styled).len()
+}
+
+#[cfg(test)]
+pub mod panel_render_test_hook {
+    pub fn document_lines(text: &str, width: u16, styled: bool) -> Vec<String> {
+        super::document_visual_lines_styled(text, width, styled)
+    }
 }
 
 fn is_confirmation_panel(action: &super::PanelAction) -> bool {
@@ -286,11 +299,12 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             let chrome_rows = if confirmation { 1 } else { 2 };
             (body + chrome_rows + border_rows).min(max_panel)
         }
-        Panel::ReadOnlyDocument { text, .. } => {
+        Panel::ReadOnlyDocument { text, styled, .. } => {
             let border_rows = usize::from(
                 state.theme.layout_for_width(width).show_panel_borders && max_panel >= 5,
             ) * 2;
-            (document_visual_row_count(text, width) + 2 + border_rows).min(max_panel)
+            (document_visual_row_count_styled(text, width, *styled) + 2 + border_rows)
+                .min(max_panel)
         }
     }
 }
@@ -407,12 +421,13 @@ pub(super) fn render_panel_with_limit(
         Panel::ReadOnlyDocument {
             title,
             text,
+            styled,
             scroll_from_bottom,
         } => {
             let show_borders =
                 state.theme.layout_for_width(width).show_panel_borders && max_rows >= 5;
             let body_rows = document_body_rows(state, width, max_rows);
-            let visual = document_visual_lines(text, width);
+            let visual = document_visual_lines_styled(text, width, *styled);
             let maximum = visual.len().saturating_sub(body_rows);
             let scroll = (*scroll_from_bottom).min(maximum);
             let end = visual.len().saturating_sub(scroll);
