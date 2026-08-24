@@ -441,14 +441,12 @@ impl<'a> TUI<'a> {
         } else {
             self.inline_commit_cursor
         };
-        let lazy_update = (self
-            .capabilities
-            .plain
+        let lazy_update = (self.capabilities.plain
             || (self.inline_scrollback
                 && self.capabilities.cursor_addressing
                 && self.capabilities.line_clearing))
-        .then(|| self.root_render_update(width, render_commit_cursor))
-        .flatten();
+            .then(|| self.root_render_update(width, render_commit_cursor))
+            .flatten();
         let previous_len = self.previous_frame.len();
         // A prefix beyond the retained frame cannot be validated. Fall back to
         // the component's full renderer rather than pairing its replacement

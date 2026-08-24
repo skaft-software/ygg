@@ -848,7 +848,10 @@ mod tests {
             min_effort: ReasoningEffort::Minimal,
             max_effort: ReasoningEffort::High,
         }));
-        assert_eq!(supported_levels_with_subagents(&model, false), vec![ThinkingLevel::On]);
+        assert_eq!(
+            supported_levels_with_subagents(&model, false),
+            vec![ThinkingLevel::On]
+        );
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::Off, &model).unwrap(),
             ReasoningConfig::On
@@ -881,6 +884,9 @@ mod tests {
             thinking_to_reasoning(ThinkingLevel::High, &model).unwrap(),
             ReasoningConfig::Off
         );
-        assert_eq!(supported_levels_with_subagents(&model, false), vec![ThinkingLevel::Off]);
+        assert_eq!(
+            supported_levels_with_subagents(&model, false),
+            vec![ThinkingLevel::Off]
+        );
     }
 }

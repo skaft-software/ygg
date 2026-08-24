@@ -1026,5 +1026,4 @@ mod tests {
             "Apple Foundation Models · Qwen3.6 27B"
         );
     }
-
 }

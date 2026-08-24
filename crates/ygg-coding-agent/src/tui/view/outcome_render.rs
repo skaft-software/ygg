@@ -165,7 +165,8 @@ mod tests {
                     prompt: "choose an implementation".into(),
                 },
                 "needs input",
-            ),        ];
+            ),
+        ];
         for (outcome, expected) in outcomes {
             let rendered = outcome_line(&outcome, None, &theme);
             assert!(rendered.contains(expected), "{rendered:?}");

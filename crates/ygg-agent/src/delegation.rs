@@ -1889,8 +1889,7 @@ impl DelegationManager {
             }) {
                 Ok(encoded) => encoded,
                 Err(error) => {
-                    let message =
-                        format!("could not persist delegation provenance: {error}");
+                    let message = format!("could not persist delegation provenance: {error}");
                     let error = io::Error::other(error);
                     self.fail_persistence_locked(&mut state, &error);
                     drop(state);
@@ -3452,8 +3451,7 @@ impl DelegationManager {
                 let encoded = match encoded {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        let message =
-                            format!("could not persist message provenance: {error}");
+                        let message = format!("could not persist message provenance: {error}");
                         self.fail_persistence_locked(&mut state, &error);
                         return Err(message);
                     }
@@ -3494,7 +3492,9 @@ impl DelegationManager {
                         return Err("delegation team is shutting down".into());
                     };
                     if let Some(permit) = command_permit {
-                        record.reserved_messages.add(directed_message_bytes(&candidate));
+                        record
+                            .reserved_messages
+                            .add(directed_message_bytes(&candidate));
                         permit.send(WorkerCommand::message(candidate));
                     } else {
                         record.pending_messages.push_back(candidate);
@@ -3525,8 +3525,15 @@ impl DelegationManager {
                 .journal_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let (target_id, target_path, running_now, follow_up, encoded_message,
-                 encoded_status, command_permit) = {
+            let (
+                target_id,
+                target_path,
+                running_now,
+                follow_up,
+                encoded_message,
+                encoded_status,
+                command_permit,
+            ) = {
                 let mut state = self
                     .state
                     .lock()
@@ -3577,8 +3584,7 @@ impl DelegationManager {
                 let encoded_message = match encoded_message {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        let message =
-                            format!("could not persist follow-up provenance: {error}");
+                        let message = format!("could not persist follow-up provenance: {error}");
                         self.fail_persistence_locked(&mut state, &error);
                         return Err(message);
                     }
@@ -3603,8 +3609,15 @@ impl DelegationManager {
                         return Err(message);
                     }
                 };
-                (target_id, target_path, running_now, follow_up, encoded_message,
-                 encoded_status, command_permit)
+                (
+                    target_id,
+                    target_path,
+                    running_now,
+                    follow_up,
+                    encoded_message,
+                    encoded_status,
+                    command_permit,
+                )
             };
             if let Err(error) = self.journal.append_encoded(&encoded_message) {
                 let message = format!("could not persist follow-up provenance: {error}");
@@ -3617,9 +3630,8 @@ impl DelegationManager {
             }
             if let Some(encoded) = &encoded_status {
                 if let Err(error) = self.journal.append_encoded(encoded) {
-                    let message = format!(
-                        "could not persist pending follow-up status provenance: {error}"
-                    );
+                    let message =
+                        format!("could not persist pending follow-up status provenance: {error}");
                     let mut state = self
                         .state
                         .lock()
@@ -3878,8 +3890,7 @@ impl DelegationManager {
                 let encoded = match encoded {
                     Ok(encoded) => encoded,
                     Err(error) => {
-                        let message =
-                            format!("could not persist interrupt provenance: {error}");
+                        let message = format!("could not persist interrupt provenance: {error}");
                         self.fail_persistence_locked(&mut state, &error);
                         return Err(message);
                     }
@@ -3889,8 +3900,7 @@ impl DelegationManager {
             if requested {
                 if let Some(encoded) = encoded {
                     if let Err(error) = self.journal.append_encoded(&encoded) {
-                        let message =
-                            format!("could not persist interrupt provenance: {error}");
+                        let message = format!("could not persist interrupt provenance: {error}");
                         let mut state = self
                             .state
                             .lock()

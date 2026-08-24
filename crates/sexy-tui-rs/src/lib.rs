@@ -53,8 +53,8 @@ pub use terminal_colors::{
 pub use theme::capability::CapabilityTier;
 pub use theme::Theme;
 pub use tui::{
-    CommitCursor, CommitPosition, Component, FrameUpdate, PinnedFrame, InputListener, TUI,
-    CURSOR_MARKER,
+    CommitCursor, CommitPosition, Component, FrameUpdate, InputListener, PinnedFrame,
+    CURSOR_MARKER, TUI,
 };
 pub use utils::{
     apply_background_to_line, extract_ansi_code, extract_segments, is_punctuation_char,

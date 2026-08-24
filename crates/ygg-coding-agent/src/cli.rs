@@ -2005,10 +2005,9 @@ mod tests {
             "max_cost_microdollars = 100\ncost_warning_microdollars = 25\n[compaction]\nenabled = false\ncompact_model = 'cheap'",
         )
         .unwrap();
-        let project: ConfigLayer = toml::from_str(
-            "cost_warning_microdollars = 40\n[compaction]\nkeep_recent_tokens = 2",
-        )
-        .unwrap();
+        let project: ConfigLayer =
+            toml::from_str("cost_warning_microdollars = 40\n[compaction]\nkeep_recent_tokens = 2")
+                .unwrap();
         let mut merged = global;
         merged.merge(project);
         assert_eq!(merged.max_cost_microdollars, Some(100));

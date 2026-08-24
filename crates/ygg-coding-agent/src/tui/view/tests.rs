@@ -9,10 +9,10 @@ use super::transcript_commit::{
     transcript_commit_cursor, transcript_commit_position, FINAL_COMMIT_SEGMENT,
 };
 use super::*;
-use sexy_tui_rs::CURSOR_MARKER;
 use crate::commands;
 use crate::presentation::RunPhase;
 use crate::tui::theme::ThemeSurfaceHeading;
+use sexy_tui_rs::CURSOR_MARKER;
 
 struct EmulatedTerminal {
     size: Arc<Mutex<(u16, u16)>>,

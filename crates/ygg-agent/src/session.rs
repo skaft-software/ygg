@@ -1284,14 +1284,12 @@ impl Session {
         // together inside one call, so locking and error semantics are
         // unchanged; outside a multi-threaded runtime (tests, sync callers)
         // it runs inline exactly as before.
-        if tokio::runtime::Handle::try_current()
-            .is_ok_and(|handle| {
-                matches!(
-                    handle.runtime_flavor(),
-                    tokio::runtime::RuntimeFlavor::MultiThread
-                )
-            })
-        {
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        }) {
             tokio::task::block_in_place(|| critical_section(self, bytes))
         } else {
             critical_section(self, bytes)

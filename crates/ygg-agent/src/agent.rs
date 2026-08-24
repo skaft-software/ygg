@@ -2693,8 +2693,9 @@ fn settle_tool_progress(
         if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
             if let Ok(mut opt) = reply_tx_mutex.lock() {
                 if let Some(reply_tx) = opt.take() {
-                    let _ =
-                        reply_tx.send(Err("session event discarded because cancellation won".to_string()));
+                    let _ = reply_tx.send(Err(
+                        "session event discarded because cancellation won".to_string()
+                    ));
                 }
             }
         }
