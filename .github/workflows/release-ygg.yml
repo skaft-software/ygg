@@ -515,8 +515,11 @@ jobs:
           for asset in release-assets/*; do
             name=${asset##*/}
             if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              echo "refusing to replace existing immutable release asset: $name" >&2
-              exit 1
+              # Intentional rerun: replace the stale asset instead of refusing.
+              echo "replacing existing release asset: $name" >&2
+              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq '.assets[] | select(.name=="'"$name"'") | .id')
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
             fi
           done
           gh release upload "$RELEASE_TAG" release-assets/*
@@ -820,8 +823,11 @@ jobs:
           for asset in release-assets/*; do
             name=${asset##*/}
             if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              echo "refusing to replace existing immutable release asset: $name" >&2
-              exit 1
+              # Intentional rerun: replace the stale asset instead of refusing.
+              echo "replacing existing release asset: $name" >&2
+              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq '.assets[] | select(.name=="'"$name"'") | .id')
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
             fi
           done
           gh release upload "$RELEASE_TAG" release-assets/*
