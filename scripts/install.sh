@@ -2,7 +2,7 @@
 set -eu
 
 repository="skaft-software/ygg"
-version="0.6.0-dev"
+version="0.6.0"
 tag="v$version"
 release_source_commit="__YGG_RELEASE_SOURCE_COMMIT__"
 release_base="https://github.com/$repository/releases/download/$tag"
