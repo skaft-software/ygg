@@ -507,8 +507,10 @@ work goes through its `subagent_*` tools and owner-bound `/subagents` browser;
 the root agent never receives a parallel native collaboration surface. Without
 the extension, Ultra is clamped to the highest ordinary safe effort.
 
-Extension workers are read/search-only, depth-one, and bounded to two active
-children with sixteen retained records. Each worker has an isolated durable
+Extension workers inherit the parent's full standard tool scope (`read`,
+`search`, `edit`, `write`, and `bash`) by default and can be narrowed per spawn
+to a hard read-only pair, stay depth-one, and run under a bound of eight active
+children with thirty-two retained records. Each worker has an isolated durable
 session, inherited policy limits, host-owned cancellation and cost/token
 ceilings, and an owner-authorized read-only transcript. While a root run is
 active, the TUI keeps an owner-scoped `Subagents` block directly above the

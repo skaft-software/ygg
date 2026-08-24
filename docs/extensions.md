@@ -507,8 +507,10 @@ label; `fingerprint`, when present, is a lowercase SHA-256 digest retained only
 for recovery. `policy` is mandatory and contains `tools`,
 `max_depth`, `max_concurrent_children`, `max_turns`, optional/null `max_tokens`,
 `max_cost_microdollars`, `max_output_bytes`, and `timeout_ms`. The current
-bounded service accepts only a non-empty subset of `read`/`search`, depth one,
-and at most two active children (sixteen retained); it freezes a detached tool
+bounded service accepts a non-empty subset of `read`, `search`, `edit`,
+`write`, and `bash` — the parent's full standard scope by default, narrowable
+per spawn — enforces depth one, and allows at most eight active children
+(thirty-two retained); it freezes a detached tool
 snapshot, applies lower parent turn/cost ceilings, inherits the parent's resolved
 model context/output limits, and treats null `max_tokens` as exact inheritance of
 the parent's optional cumulative session ceiling (including no ceiling). A

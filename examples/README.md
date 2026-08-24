@@ -22,6 +22,9 @@ extension into a project.
   status tool, status-line contribution, and tool renderer.
 - [`extensions/local-model-workflow/`](extensions/local-model-workflow/) —
   deterministic prompt/context shaping for smaller local context windows.
+- [`extensions/lsp-client/`](extensions/lsp-client/) — read-only LSP code
+  intelligence (`definition`, `references`, `hover`, diagnostics) via one
+  `code_intelligence` tool with bounded, typed unavailable states.
 
 Copy an example into the matching `.ygg/` directory in a project. Executable
 extensions must also be explicitly enabled and independently trusted. They run
