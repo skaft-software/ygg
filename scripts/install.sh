@@ -255,9 +255,9 @@ manifest_path, bundle_path, cosign_path = sys.argv[1:4]
 identity, repository, source_commit, archive_name = sys.argv[4:8]
 expected_names = {
     "install-ygg.sh",
-    "ygg-0.6.0-dev-aarch64-apple-darwin.tar.gz",
-    "ygg-0.6.0-dev-x86_64-apple-darwin.tar.gz",
-    "ygg-0.6.0-dev-x86_64-unknown-linux-gnu.tar.gz",
+    "ygg-0.6.0-aarch64-apple-darwin.tar.gz",
+    "ygg-0.6.0-x86_64-apple-darwin.tar.gz",
+    "ygg-0.6.0-x86_64-unknown-linux-gnu.tar.gz",
 }
 line_pattern = re.compile(r"^([0-9A-Fa-f]{64})  (?:\./)?([A-Za-z0-9_.-]+)$")
 
