@@ -1050,6 +1050,12 @@ pub(crate) struct DelegationManager {
     journal: ProvenanceJournal,
     template: DelegationTemplate,
     state: Mutex<ManagerState>,
+    /// Serializes each provenance-journaled operation's
+    /// decide → append → commit window so that journal record order always
+    /// matches state mutation order, while the state lock itself is released
+    /// across the journal's durable `sync_data`. Lock order:
+    /// permits (RwLock) → journal_order → state.
+    journal_order: Mutex<()>,
     permits: RwLock<Arc<Semaphore>>,
     changed: Notify,
     telemetry: Mutex<DelegationTelemetryState>,
@@ -1339,11 +1345,15 @@ impl ProvenanceJournal {
 
     fn append(&self, event: &ProvenanceEvent<'_>) -> io::Result<()> {
         let encoded = serde_json::to_vec(event).map_err(io::Error::other)?;
+        self.append_encoded(&encoded)
+    }
+
+    fn append_encoded(&self, encoded: &[u8]) -> io::Result<()> {
         let mut file = self
             .file
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        file.write_all(&encoded)?;
+        file.write_all(encoded)?;
         file.write_all(b"\n")?;
         file.sync_data()
     }
@@ -1520,6 +1530,7 @@ impl DelegationManager {
                     root_active: true,
                     root_resource_owner: None,
                 }),
+                journal_order: Mutex::new(()),
                 permits: RwLock::new(Arc::new(Semaphore::new(child_slots))),
                 changed: Notify::new(),
                 telemetry: Mutex::new(DelegationTelemetryState {
@@ -1611,6 +1622,13 @@ impl DelegationManager {
                 return Err("invalid root delegation identity".into());
             }
             let child_slots = self.config.limits.max_concurrent_agents - 1;
+            // Serialize the reset against journaled operations'
+            // decide → append → commit windows so it cannot interleave with
+            // their commit phases. Lock order: journal_order → permits → state.
+            let _journal_order = self
+                .journal_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut permits = self
                 .permits
                 .write()
@@ -1641,6 +1659,13 @@ impl DelegationManager {
             return Ok(());
         }
 
+        // Serialize the reset against journaled operations'
+        // decide → append → commit windows so it cannot interleave with
+        // their commit phases.
+        let _journal_order = self
+            .journal_order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut state = self
             .state
             .lock()
@@ -1773,6 +1798,13 @@ impl DelegationManager {
             .map(|timeout_ms| created_at_ms.saturating_add(timeout_ms));
 
         let (identity, session, command_rx, shutdown, task_name) = {
+            // The journal_order guard spans decide → append → commit so that
+            // journal record order matches state mutation order, while the
+            // state lock is dropped across the journal's durable `sync_data`.
+            let _journal_order = self
+                .journal_order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut state = self
                 .state
                 .lock()
@@ -1822,7 +1854,7 @@ impl DelegationManager {
                 delegated_session_reference(&session_path)
                     .expect("generated extension child path has a delegated session reference")
             });
-            if let Err(error) = self.journal.append(&ProvenanceEvent::AgentSpawned {
+            let encoded = match serde_json::to_vec(&ProvenanceEvent::AgentSpawned {
                 timestamp_ms: u128::from(created_at_ms),
                 agent_id: &identity.id,
                 agent_path: &identity.path,
@@ -1855,8 +1887,42 @@ impl DelegationManager {
                     .then_some(session_path.as_path()),
                 session_reference: extension_session_reference.as_deref(),
             }) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let message =
+                        format!("could not persist delegation provenance: {error}");
+                    let error = io::Error::other(error);
+                    self.fail_persistence_locked(&mut state, &error);
+                    drop(state);
+                    drop(command_tx);
+                    drop(session);
+                    let _ = self.remove_team_file_if_exists(&session_path);
+                    return Err(message);
+                }
+            };
+            drop(state);
+            // Durable provenance sync runs without the state lock held.
+            if let Err(error) = self.journal.append_encoded(&encoded) {
                 let message = format!("could not persist delegation provenance: {error}");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 self.fail_persistence_locked(&mut state, &error);
+                drop(state);
+                drop(command_tx);
+                drop(session);
+                let _ = self.remove_team_file_if_exists(&session_path);
+                return Err(message);
+            }
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.persistence_error.is_some() || !state.root_active || state.shutting_down {
+                // The team was invalidated mid-operation; discard the prepared
+                // worker instead of resurrecting state after its provenance.
+                let message = "delegation team is shutting down".to_owned();
                 drop(state);
                 drop(command_tx);
                 drop(session);
@@ -2851,46 +2917,95 @@ impl DelegationManager {
     }
 
     fn set_status(&self, id: &str, status: DelegatedAgentStatus, notify_parent: bool) -> bool {
-        let mut state = self
-            .state
+        // The journal_order guard makes this operation's decide → append →
+        // commit window mutually exclusive with every other provenance-
+        // journaled operation, so journal record order always matches state
+        // mutation order. The state lock is dropped across the journal's
+        // durable `sync_data` so unrelated state operations are not stalled
+        // by disk latency.
+        let _journal_order = self
+            .journal_order
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if state.persistence_error.is_some() || !state.records.contains_key(id) {
-            return false;
-        }
-        let record = state.records.get(id).expect("checked child exists");
-        if matches!(&status, DelegatedAgentStatus::Shutdown) && !record.status.is_running() {
-            return true;
-        }
-        if record.interrupt_requested
-            && matches!(
-                status,
-                DelegatedAgentStatus::Pending | DelegatedAgentStatus::Running
-            )
         {
-            return true;
-        }
-        if record.status == status {
-            if matches!(status, DelegatedAgentStatus::Interrupted) {
-                state
-                    .records
-                    .get_mut(id)
-                    .expect("checked child exists")
-                    .interrupt_requested = false;
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.persistence_error.is_some() || !state.records.contains_key(id) {
+                return false;
             }
-            return true;
+            let record = state.records.get(id).expect("checked child exists");
+            if matches!(&status, DelegatedAgentStatus::Shutdown) && !record.status.is_running() {
+                return true;
+            }
+            if record.interrupt_requested
+                && matches!(
+                    status,
+                    DelegatedAgentStatus::Pending | DelegatedAgentStatus::Running
+                )
+            {
+                return true;
+            }
+            if record.status == status {
+                if matches!(status, DelegatedAgentStatus::Interrupted) {
+                    state
+                        .records
+                        .get_mut(id)
+                        .expect("checked child exists")
+                        .interrupt_requested = false;
+                }
+                return true;
+            }
         }
         let transition_ms = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
-        if let Err(error) = self.journal.append(&ProvenanceEvent::AgentStatus {
-            timestamp_ms: u128::from(transition_ms),
-            agent_id: id,
-            status: &status,
-        }) {
+        let encoded = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Re-check under the journal_order guard: a concurrent owning-run
+            // reset or persistence failure may have invalidated this record
+            // after the fast-path pass above.
+            if state.persistence_error.is_some() || !state.records.contains_key(id) {
+                return false;
+            }
+            serde_json::to_vec(&ProvenanceEvent::AgentStatus {
+                timestamp_ms: u128::from(transition_ms),
+                agent_id: id,
+                status: &status,
+            })
+            .map_err(io::Error::other)
+        };
+        let encoded = match encoded {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.fail_persistence_locked(&mut state, &error);
+                return false;
+            }
+        };
+        if let Err(error) = self.journal.append_encoded(&encoded) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.fail_persistence_locked(&mut state, &error);
             return false;
         }
         let notification = {
-            let record = state.records.get_mut(id).expect("checked child exists");
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(record) = state.records.get_mut(id) else {
+                // An owning-run reset removed the record mid-operation; it
+                // already owns its journal record and must not be resurrected.
+                return true;
+            };
             record.status = status;
             if matches!(record.status, DelegatedAgentStatus::Running)
                 && record.started_at_ms.is_none()
@@ -2924,9 +3039,12 @@ impl DelegationManager {
             })
         };
         if let Some((parent_id, message)) = notification {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             push_mailbox_locked(&mut state, &parent_id, message);
         }
-        drop(state);
         self.changed.notify_waiters();
         self.publish_telemetry(None, None);
         true
@@ -3253,107 +3371,135 @@ impl DelegationManager {
             message,
         };
         let (target_id, delivery) = {
-            let mut state = self
-                .state
+            // The journal_order guard spans decide → append → commit so that
+            // journal record order matches state mutation order, while the
+            // state lock is dropped across the journal's durable `sync_data`.
+            let _journal_order = self
+                .journal_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.ensure_owner_active_locked(&state, owner)?;
-            let target_id = Self::resolve_id_locked(&state, target)
-                .ok_or_else(|| format!("unknown delegation target: {target}"))?;
+            let (target_id, delivery, encoded, command_permit) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_owner_active_locked(&state, owner)?;
+                let target_id = Self::resolve_id_locked(&state, target)
+                    .ok_or_else(|| format!("unknown delegation target: {target}"))?;
 
-            let mut command_permit = None;
-            let delivery = if target_id == ROOT_AGENT_ID {
-                let mailbox_message = MailboxMessage {
-                    kind: "message",
-                    from: candidate.from.clone(),
-                    task_name: None,
-                    message: candidate.message.clone(),
-                    evictable: false,
-                    continued: false,
-                    leased: false,
-                };
-                if !mailbox_can_accept_after_evicting_automatic(
-                    &state.root_mailbox,
-                    &mailbox_message,
-                ) {
-                    return Err("root delegation mailbox is full".into());
-                }
-                "queued"
-            } else {
-                let record = state
-                    .records
-                    .get(&target_id)
-                    .expect("resolved child exists");
-                if matches!(record.status, DelegatedAgentStatus::Shutdown)
-                    || record.shutdown.is_cancelled()
-                {
-                    return Err(format!("target is shut down: {}", record.identity.path));
-                }
-                if record.interrupt_requested {
-                    return Err(format!(
-                        "target is being interrupted: {}",
-                        record.identity.path
-                    ));
-                }
-                if !record_can_accept_pending_message(record, &candidate) {
-                    return Err(format!(
-                        "target pending-message queue is full: {}",
-                        record.identity.path
-                    ));
-                }
-                if matches!(record.status, DelegatedAgentStatus::Running) {
-                    command_permit = Some(
-                        record
-                            .command_tx
-                            .clone()
-                            .try_reserve_owned()
-                            .map_err(command_queue_error)?,
-                    );
-                    "steering"
-                } else {
-                    "queued"
-                }
-            };
-
-            if let Err(error) = self.journal.append(&ProvenanceEvent::Message {
-                timestamp_ms: timestamp_ms(),
-                from: &owner.id,
-                to: &target_id,
-                kind: "message",
-                message: &candidate.message,
-            }) {
-                let message = format!("could not persist message provenance: {error}");
-                self.fail_persistence_locked(&mut state, &error);
-                return Err(message);
-            }
-            if target_id == ROOT_AGENT_ID {
-                push_mailbox_bounded(
-                    &mut state.root_mailbox,
-                    MailboxMessage {
+                let mut command_permit = None;
+                let delivery = if target_id == ROOT_AGENT_ID {
+                    let mailbox_message = MailboxMessage {
                         kind: "message",
-                        from: candidate.from,
+                        from: candidate.from.clone(),
                         task_name: None,
-                        message: candidate.message,
+                        message: candidate.message.clone(),
                         evictable: false,
                         continued: false,
                         leased: false,
-                    },
-                );
-            } else if let Some(permit) = command_permit {
-                state
-                    .records
-                    .get_mut(&target_id)
-                    .expect("resolved child exists")
-                    .reserved_messages
-                    .add(directed_message_bytes(&candidate));
-                permit.send(WorkerCommand::message(candidate));
-            } else {
-                state
-                    .records
-                    .get_mut(&target_id)
-                    .expect("resolved child exists")
-                    .pending_messages
-                    .push_back(candidate);
+                    };
+                    if !mailbox_can_accept_after_evicting_automatic(
+                        &state.root_mailbox,
+                        &mailbox_message,
+                    ) {
+                        return Err("root delegation mailbox is full".into());
+                    }
+                    "queued"
+                } else {
+                    let record = state
+                        .records
+                        .get(&target_id)
+                        .expect("resolved child exists");
+                    if matches!(record.status, DelegatedAgentStatus::Shutdown)
+                        || record.shutdown.is_cancelled()
+                    {
+                        return Err(format!("target is shut down: {}", record.identity.path));
+                    }
+                    if record.interrupt_requested {
+                        return Err(format!(
+                            "target is being interrupted: {}",
+                            record.identity.path
+                        ));
+                    }
+                    if !record_can_accept_pending_message(record, &candidate) {
+                        return Err(format!(
+                            "target pending-message queue is full: {}",
+                            record.identity.path
+                        ));
+                    }
+                    if matches!(record.status, DelegatedAgentStatus::Running) {
+                        command_permit = Some(
+                            record
+                                .command_tx
+                                .clone()
+                                .try_reserve_owned()
+                                .map_err(command_queue_error)?,
+                        );
+                        "steering"
+                    } else {
+                        "queued"
+                    }
+                };
+
+                let encoded = serde_json::to_vec(&ProvenanceEvent::Message {
+                    timestamp_ms: timestamp_ms(),
+                    from: &owner.id,
+                    to: &target_id,
+                    kind: "message",
+                    message: &candidate.message,
+                })
+                .map_err(io::Error::other);
+                let encoded = match encoded {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let message =
+                            format!("could not persist message provenance: {error}");
+                        self.fail_persistence_locked(&mut state, &error);
+                        return Err(message);
+                    }
+                };
+                (target_id, delivery, encoded, command_permit)
+            };
+            if let Err(error) = self.journal.append_encoded(&encoded) {
+                let message = format!("could not persist message provenance: {error}");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.fail_persistence_locked(&mut state, &error);
+                return Err(message);
+            }
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if target_id == ROOT_AGENT_ID {
+                    push_mailbox_bounded(
+                        &mut state.root_mailbox,
+                        MailboxMessage {
+                            kind: "message",
+                            from: candidate.from,
+                            task_name: None,
+                            message: candidate.message,
+                            evictable: false,
+                            continued: false,
+                            leased: false,
+                        },
+                    );
+                } else {
+                    let Some(record) = state.records.get_mut(&target_id) else {
+                        // An owning-run reset removed the record mid-operation;
+                        // do not resurrect it after its provenance record.
+                        return Err("delegation team is shutting down".into());
+                    };
+                    if let Some(permit) = command_permit {
+                        record.reserved_messages.add(directed_message_bytes(&candidate));
+                        permit.send(WorkerCommand::message(candidate));
+                    } else {
+                        record.pending_messages.push_back(candidate);
+                    }
+                }
             }
             (target_id, delivery)
         };
@@ -3372,102 +3518,153 @@ impl DelegationManager {
             message: request.message,
         };
         let (target_id, target_path, running_now) = {
-            let mut state = self
-                .state
+            // The journal_order guard spans decide → append → commit so that
+            // journal record order matches state mutation order, while the
+            // state lock is dropped across the journal's durable syncs.
+            let _journal_order = self
+                .journal_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.ensure_owner_active_locked(&state, owner)?;
-            let target_id = Self::resolve_id_locked(&state, &request.target)
-                .ok_or_else(|| format!("unknown delegation target: {}", request.target))?;
-            if target_id == ROOT_AGENT_ID {
-                return Err("followup_task cannot target the root agent".into());
-            }
-            let record = state
-                .records
-                .get(&target_id)
-                .expect("resolved child exists");
-            if matches!(record.status, DelegatedAgentStatus::Shutdown)
-                || record.shutdown.is_cancelled()
-            {
-                return Err(format!("target is shut down: {}", record.identity.path));
-            }
-            if record.interrupt_requested {
-                return Err(format!(
-                    "target is being interrupted: {}",
-                    record.identity.path
-                ));
-            }
-            if !record_can_accept_follow_up(record, &follow_up) {
-                return Err(format!(
-                    "target follow-up queue is full: {}",
-                    record.identity.path
-                ));
-            }
-            let running_now = record.status.is_running();
-            let target_path = record.identity.path.clone();
-            let command_permit = record
-                .command_tx
-                .clone()
-                .try_reserve_owned()
-                .map_err(command_queue_error)?;
-
-            if let Err(error) = self.journal.append(&ProvenanceEvent::Message {
-                timestamp_ms: timestamp_ms(),
-                from: &owner.id,
-                to: &target_id,
-                kind: "follow_up",
-                message: &follow_up.message,
-            }) {
-                let message = format!("could not persist follow-up provenance: {error}");
-                self.fail_persistence_locked(&mut state, &error);
-                return Err(message);
-            }
-            if !running_now {
-                if let Err(error) = self.journal.append(&ProvenanceEvent::AgentStatus {
-                    timestamp_ms: timestamp_ms(),
-                    agent_id: &target_id,
-                    status: &DelegatedAgentStatus::Pending,
-                }) {
-                    let message =
-                        format!("could not persist pending follow-up status provenance: {error}");
-                    self.fail_persistence_locked(&mut state, &error);
-                    return Err(message);
+            let (target_id, target_path, running_now, follow_up, encoded_message,
+                 encoded_status, command_permit) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_owner_active_locked(&state, owner)?;
+                let target_id = Self::resolve_id_locked(&state, &request.target)
+                    .ok_or_else(|| format!("unknown delegation target: {}", request.target))?;
+                if target_id == ROOT_AGENT_ID {
+                    return Err("followup_task cannot target the root agent".into());
                 }
                 let record = state
                     .records
-                    .get_mut(&target_id)
+                    .get(&target_id)
                     .expect("resolved child exists");
-                record.status = DelegatedAgentStatus::Pending;
-                // A resumed worker is no longer terminal; drop the stale
-                // completion timestamp so elapsed-time consumers do not see
-                // a frozen first-run interval.
-                record.completed_at_ms = None;
-                // A follow-up to a settled worker starts a new run. If the
-                // original wall budget already elapsed while the worker was
-                // idle, the spawn-frozen deadline would start an instantly
-                // expired run; re-anchor it from the requested timeout so
-                // the resumed run owns a fresh budget.
-                if let (Some(deadline), Some(timeout)) = (
-                    record.deadline_at_ms,
-                    record
-                        .extension_policy
-                        .as_ref()
-                        .and_then(|policy| policy.timeout_ms),
-                ) {
-                    let now = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
-                    if deadline <= now {
-                        record.deadline_at_ms = Some(now.saturating_add(timeout));
+                if matches!(record.status, DelegatedAgentStatus::Shutdown)
+                    || record.shutdown.is_cancelled()
+                {
+                    return Err(format!("target is shut down: {}", record.identity.path));
+                }
+                if record.interrupt_requested {
+                    return Err(format!(
+                        "target is being interrupted: {}",
+                        record.identity.path
+                    ));
+                }
+                if !record_can_accept_follow_up(record, &follow_up) {
+                    return Err(format!(
+                        "target follow-up queue is full: {}",
+                        record.identity.path
+                    ));
+                }
+                let running_now = record.status.is_running();
+                let target_path = record.identity.path.clone();
+                let command_permit = record
+                    .command_tx
+                    .clone()
+                    .try_reserve_owned()
+                    .map_err(command_queue_error)?;
+
+                let encoded_message = serde_json::to_vec(&ProvenanceEvent::Message {
+                    timestamp_ms: timestamp_ms(),
+                    from: &owner.id,
+                    to: &target_id,
+                    kind: "follow_up",
+                    message: &follow_up.message,
+                })
+                .map_err(io::Error::other);
+                let encoded_message = match encoded_message {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let message =
+                            format!("could not persist follow-up provenance: {error}");
+                        self.fail_persistence_locked(&mut state, &error);
+                        return Err(message);
                     }
+                };
+                let encoded_status = (!running_now)
+                    .then(|| {
+                        serde_json::to_vec(&ProvenanceEvent::AgentStatus {
+                            timestamp_ms: timestamp_ms(),
+                            agent_id: &target_id,
+                            status: &DelegatedAgentStatus::Pending,
+                        })
+                        .map_err(io::Error::other)
+                    })
+                    .transpose();
+                let encoded_status = match encoded_status {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let message = format!(
+                            "could not persist pending follow-up status provenance: {error}"
+                        );
+                        self.fail_persistence_locked(&mut state, &error);
+                        return Err(message);
+                    }
+                };
+                (target_id, target_path, running_now, follow_up, encoded_message,
+                 encoded_status, command_permit)
+            };
+            if let Err(error) = self.journal.append_encoded(&encoded_message) {
+                let message = format!("could not persist follow-up provenance: {error}");
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.fail_persistence_locked(&mut state, &error);
+                return Err(message);
+            }
+            if let Some(encoded) = &encoded_status {
+                if let Err(error) = self.journal.append_encoded(encoded) {
+                    let message = format!(
+                        "could not persist pending follow-up status provenance: {error}"
+                    );
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    self.fail_persistence_locked(&mut state, &error);
+                    return Err(message);
                 }
             }
-            let usage = follow_up.usage();
-            state
-                .records
-                .get_mut(&target_id)
-                .expect("resolved child exists")
-                .queued_follow_ups
-                .add_usage(usage);
-            command_permit.send(WorkerCommand::follow_up(follow_up));
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !running_now {
+                    if let Some(record) = state.records.get_mut(&target_id) {
+                        record.status = DelegatedAgentStatus::Pending;
+                        // A resumed worker is no longer terminal; drop the stale
+                        // completion timestamp so elapsed-time consumers do not see
+                        // a frozen first-run interval.
+                        record.completed_at_ms = None;
+                        // A follow-up to a settled worker starts a new run. If the
+                        // original wall budget already elapsed while the worker was
+                        // idle, the spawn-frozen deadline would start an instantly
+                        // expired run; re-anchor it from the requested timeout so
+                        // the resumed run owns a fresh budget.
+                        if let (Some(deadline), Some(timeout)) = (
+                            record.deadline_at_ms,
+                            record
+                                .extension_policy
+                                .as_ref()
+                                .and_then(|policy| policy.timeout_ms),
+                        ) {
+                            let now = u64::try_from(timestamp_ms()).unwrap_or(u64::MAX);
+                            if deadline <= now {
+                                record.deadline_at_ms = Some(now.saturating_add(timeout));
+                            }
+                        }
+                    }
+                }
+                if let Some(record) = state.records.get_mut(&target_id) {
+                    let usage = follow_up.usage();
+                    record.queued_follow_ups.add_usage(usage);
+                }
+                command_permit.send(WorkerCommand::follow_up(follow_up));
+            }
             (target_id, target_path, running_now)
         };
         self.changed.notify_waiters();
@@ -3638,42 +3835,77 @@ impl DelegationManager {
 
     async fn interrupt(&self, owner: &AgentIdentity, target: &str) -> Result<Value, String> {
         let (target_id, path, status, requested) = {
-            let mut state = self
-                .state
+            // The journal_order guard spans decide → append → commit so that
+            // journal record order matches state mutation order, while the
+            // state lock is dropped across the journal's durable `sync_data`.
+            let _journal_order = self
+                .journal_order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.ensure_owner_active_locked(&state, owner)?;
-            let target_id = Self::resolve_id_locked(&state, target)
-                .ok_or_else(|| format!("unknown delegation target: {target}"))?;
-            if target_id == ROOT_AGENT_ID {
-                return Err("interrupt_agent cannot target the root agent".into());
-            }
-            let record = state
-                .records
-                .get(&target_id)
-                .expect("resolved child exists");
-            if !is_descendant_path(&record.identity.path, &owner.path) && owner.id != ROOT_AGENT_ID
-            {
-                return Err("an agent may only interrupt its descendants".into());
-            }
-            let path = record.identity.path.clone();
-            let status = record.status.clone();
-            let requested = status.is_running() && !record.interrupt_requested;
-            if requested {
-                if let Err(error) = self.journal.append(&ProvenanceEvent::InterruptRequested {
-                    timestamp_ms: timestamp_ms(),
-                    from: &owner.id,
-                    to: &target_id,
-                }) {
-                    let message = format!("could not persist interrupt provenance: {error}");
-                    self.fail_persistence_locked(&mut state, &error);
-                    return Err(message);
+            let (target_id, path, status, requested, encoded) = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.ensure_owner_active_locked(&state, owner)?;
+                let target_id = Self::resolve_id_locked(&state, target)
+                    .ok_or_else(|| format!("unknown delegation target: {target}"))?;
+                if target_id == ROOT_AGENT_ID {
+                    return Err("interrupt_agent cannot target the root agent".into());
                 }
-                state
+                let record = state
                     .records
-                    .get_mut(&target_id)
-                    .expect("resolved child exists")
-                    .interrupt_requested = true;
+                    .get(&target_id)
+                    .expect("resolved child exists");
+                if !is_descendant_path(&record.identity.path, &owner.path)
+                    && owner.id != ROOT_AGENT_ID
+                {
+                    return Err("an agent may only interrupt its descendants".into());
+                }
+                let path = record.identity.path.clone();
+                let status = record.status.clone();
+                let requested = status.is_running() && !record.interrupt_requested;
+                let encoded = requested
+                    .then(|| {
+                        serde_json::to_vec(&ProvenanceEvent::InterruptRequested {
+                            timestamp_ms: timestamp_ms(),
+                            from: &owner.id,
+                            to: &target_id,
+                        })
+                        .map_err(io::Error::other)
+                    })
+                    .transpose();
+                let encoded = match encoded {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        let message =
+                            format!("could not persist interrupt provenance: {error}");
+                        self.fail_persistence_locked(&mut state, &error);
+                        return Err(message);
+                    }
+                };
+                (target_id, path, status, requested, encoded)
+            };
+            if requested {
+                if let Some(encoded) = encoded {
+                    if let Err(error) = self.journal.append_encoded(&encoded) {
+                        let message =
+                            format!("could not persist interrupt provenance: {error}");
+                        let mut state = self
+                            .state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        self.fail_persistence_locked(&mut state, &error);
+                        return Err(message);
+                    }
+                }
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(record) = state.records.get_mut(&target_id) {
+                    record.interrupt_requested = true;
+                }
             }
             (target_id, path, status, requested)
         };
@@ -4865,6 +5097,7 @@ mod tests {
                 root_resource_owner: None,
             }),
             permits: RwLock::new(Arc::new(Semaphore::new(3))),
+            journal_order: Mutex::new(()),
             changed: Notify::new(),
             telemetry: Mutex::new(DelegationTelemetryState {
                 revision: 0,
@@ -4930,6 +5163,7 @@ mod tests {
                 root_resource_owner: None,
             }),
             permits: RwLock::new(Arc::new(Semaphore::new(3))),
+            journal_order: Mutex::new(()),
             changed: Notify::new(),
             telemetry: Mutex::new(DelegationTelemetryState {
                 revision: 0,
