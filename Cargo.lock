@@ -3070,7 +3070,6 @@ dependencies = [
  "pretty_assertions",
  "reqwest",
  "rustix 1.1.4",
- "schemars",
  "semver",
  "serde",
  "serde_json",
