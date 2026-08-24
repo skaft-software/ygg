@@ -482,7 +482,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
-          WORKFLOW_TAG: ${{ github.ref_name }}
+          WORKFLOW_TAG: ygg-binaries-${{ needs.resolve.outputs.tag }}
           WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
         run: |
           set -euo pipefail
