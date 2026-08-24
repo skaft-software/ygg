@@ -258,7 +258,10 @@ fn provider_error_from_success_body(body: &[u8]) -> Option<ProviderError> {
 /// uniformly accept request `Content-Encoding`, while the Codex SSE endpoint
 /// explicitly supports zstd. Compression failure is only an optimization miss:
 /// preserve the valid uncompressed request instead of failing the model turn.
-fn prepare_request_body(
+///
+/// The zstd work runs on the blocking thread pool so multi-hundred-KB request
+/// bodies never stall the async runtime worker.
+async fn prepare_request_body(
     endpoint_id: &crate::types::EndpointId,
     protocol: Protocol,
     headers: &mut http::HeaderMap,
@@ -268,15 +271,22 @@ fn prepare_request_body(
         return body;
     }
 
-    match zstd::bulk::compress(&body, CODEX_REQUEST_ZSTD_LEVEL) {
-        Ok(compressed) => {
+    let owned = body.clone();
+    match tokio::task::spawn_blocking(move || {
+        zstd::bulk::compress(owned.as_ref(), CODEX_REQUEST_ZSTD_LEVEL)
+    })
+    .await
+    {
+        Ok(Ok(compressed)) => {
             headers.insert(
                 http::header::CONTENT_ENCODING,
                 http::HeaderValue::from_static("zstd"),
             );
             bytes::Bytes::from(compressed)
         }
-        Err(_) => body,
+        // Compression failure (or a panicked worker) is only an optimization
+        // miss: send the valid uncompressed body.
+        _ => body,
     }
 }
 
@@ -353,7 +363,8 @@ async fn stream_http(
         model.spec.protocol,
         &mut headers,
         parts.body.clone(),
-    );
+    )
+    .await;
 
     // 3. Send the HTTP request
     let builder = http
@@ -1316,8 +1327,8 @@ impl AiClient {
 mod tests {
     use super::*;
 
-    #[test]
-    fn codex_responses_body_is_zstd_compressed_and_other_routes_are_untouched() {
+    #[tokio::test]
+    async fn codex_responses_body_is_zstd_compressed_and_other_routes_are_untouched() {
         let original = bytes::Bytes::from(vec![b'a'; 128 * 1024]);
         let mut headers = http::HeaderMap::new();
         let compressed = prepare_request_body(
@@ -1325,7 +1336,8 @@ mod tests {
             Protocol::OpenAiResponses,
             &mut headers,
             original.clone(),
-        );
+        )
+        .await;
         assert_eq!(headers[http::header::CONTENT_ENCODING], "zstd");
         assert!(compressed.len() < original.len() / 10);
         assert_eq!(
@@ -1339,7 +1351,8 @@ mod tests {
             Protocol::OpenAiResponses,
             &mut generic_headers,
             original.clone(),
-        );
+        )
+        .await;
         assert_eq!(generic, original);
         assert!(generic_headers
             .get(http::header::CONTENT_ENCODING)

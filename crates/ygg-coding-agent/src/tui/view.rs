@@ -3111,18 +3111,29 @@ impl InteractiveShell {
 
     /// Best-effort OSC 52 clipboard transport. The semantic fallback is
     /// retained separately in `copy_buffer`, so redirected output loses no data.
+    ///
+    /// `pbcopy`'s stdin write plus child wait block the caller, and this runs
+    /// from the interactive event loop, so the process handoff happens on a
+    /// detached thread. A detached thread (rather than `tokio::spawn`) keeps
+    /// this method callable from the synchronous view API and its runtime-less
+    /// unit tests. Errors stay ignored: `copy_buffer` remains authoritative.
     fn set_clipboard(text: &str) {
         #[cfg(target_os = "macos")]
         {
-            if let Ok(mut child) = std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                let _ = child.wait();
-            }
+            let text = text.to_owned();
+            let _ = std::thread::Builder::new()
+                .name("clipboard-pbcopy".to_owned())
+                .spawn(move || {
+                    if let Ok(mut child) = std::process::Command::new("pbcopy")
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        let _ = child.wait();
+                    }
+                });
         }
 
         if !std::io::stdout().is_terminal() {
