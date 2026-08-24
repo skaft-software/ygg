@@ -14,6 +14,7 @@
 
       <section id="import-panel" aria-labelledby="import-title">
         <h2 id="import-title">Import invitation</h2>
+        <button id="scan" type="button">Scan pairing code</button>
         <label for="device-name">Device name</label>
         <input id="device-name" maxlength="128" autocomplete="name" placeholder="My phone" />
         <label for="ticket">Pairing invitation</label>
@@ -38,6 +39,16 @@
         <p>Worldwide access uses n0 relays. Relay operators can observe network addresses, timing, and traffic volume, but Iroh encrypts application content end to end.</p>
       </aside>
     </main>
+
+    <div id="scan-overlay" hidden>
+      <video id="scan-video" playsinline muted></video>
+      <div class="scan-bar">
+        <p id="scan-status">Point the camera at the pairing code.</p>
+        <button id="scan-close" class="secondary" type="button">Close</button>
+      </div>
+    </div>
+
+    <script src="/_native/jsqr.js"></script>
     <script src="/_native/onboarding.js"></script>
   </body>
 </html>

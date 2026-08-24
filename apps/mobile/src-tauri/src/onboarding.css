@@ -28,4 +28,35 @@ button.danger { color: #ffb5b5; }
 #phrase { display: block; margin: 8px 0; color: #cbff65; font-size: clamp(19px, 6vw, 27px); letter-spacing: 0.03em; }
 aside { font-size: 13px; }
 aside p { margin-bottom: 0; }
+
+#scan-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  background: #04070b;
+}
+
+#scan-video {
+  flex: 1;
+  width: 100%;
+  min-height: 0;
+  object-fit: cover;
+  background: #000;
+}
+
+.scan-bar {
+  padding: 14px 16px max(18px, env(safe-area-inset-bottom));
+  border-top: 1px solid #2a3340;
+  background: rgba(8, 11, 16, 0.94);
+}
+
+#scan-status {
+  margin: 0 0 12px;
+  font-size: 14px;
+}
+
+#scan-close { margin-top: 0; }
+
 [hidden] { display: none !important; }

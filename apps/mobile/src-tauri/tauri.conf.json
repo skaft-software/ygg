@@ -15,7 +15,8 @@
     "active": true,
     "targets": "all",
     "iOS": {
-      "minimumSystemVersion": "15.0"
+      "minimumSystemVersion": "15.0",
+      "template": "templates/ios-project.yml"
     },
     "android": {
       "minSdkVersion": 26

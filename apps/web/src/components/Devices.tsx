@@ -14,6 +14,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -25,6 +26,8 @@ import type {
   PendingCompanionPairing,
 } from "../protocol";
 import type { CompanionAdminTransport } from "../transport";
+import { pairingQrModules } from "../pairing-qr";
+import { PairingQrCode } from "./PairingQrCode";
 
 const catalogPollMs = 2_000;
 
@@ -146,6 +149,11 @@ export function DevicesView({
   const [now, setNow] = useState(0);
   const pairButtonRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLElement>(null);
+
+  const pairingQr = useMemo(
+    () => (invitation ? pairingQrModules(invitation.ticket) : null),
+    [invitation],
+  );
 
   const refresh = useCallback(async () => {
     const next = await transport.getCompanionCatalog();
@@ -463,11 +471,26 @@ export function DevicesView({
               </button>
             </header>
             <h2 id="pairing-title">Pair a native Ygg companion</h2>
-            <p>
-              Paste this one-time ticket into the Ygg mobile app. After its
-              authenticated request arrives, compare the phrase shown on both
-              surfaces before approving.
-            </p>
+            {pairingQr ? (
+              <>
+                <p>
+                  Scan this code with the Ygg companion app, or copy the
+                  ticket below and paste it into the app on your phone. After
+                  its authenticated request arrives, compare the phrase shown
+                  on both surfaces before approving.
+                </p>
+                <div className="pairing-qr">
+                  <PairingQrCode modules={pairingQr} />
+                </div>
+              </>
+            ) : (
+              <p>
+                This ticket is too long for a QR code, so copy the ticket
+                below and paste it into the Ygg companion app. After its
+                authenticated request arrives, compare the phrase shown on
+                both surfaces before approving.
+              </p>
+            )}
             <label className="pairing-ticket">
               <span>One-time pairing ticket</span>
               <textarea value={invitation.ticket} readOnly rows={4} />

@@ -52,6 +52,7 @@ const LOCAL_WRITE_TIMEOUT: Duration = Duration::from_secs(20);
 const ONBOARDING_HTML: &[u8] = include_bytes!("onboarding.html");
 const ONBOARDING_CSS: &[u8] = include_bytes!("onboarding.css");
 const ONBOARDING_JS: &[u8] = include_bytes!("onboarding.js");
+const ONBOARDING_JSQR: &[u8] = include_bytes!("../vendor/jsqr.js");
 const SETTINGS_HTML: &str = include_str!("settings.html");
 const SETTINGS_CSS: &[u8] = include_bytes!("settings.css");
 const SETTINGS_JS: &[u8] = include_bytes!("settings.js");
@@ -909,6 +910,12 @@ async fn serve_asset(state: ProxyState, uri: &Uri) -> Response<Body> {
     if uri.path() == "/_native/onboarding.js" {
         return native_asset(ONBOARDING_JS, "text/javascript; charset=utf-8", false);
     }
+    // The QR decoder is an onboarding asset: it must be reachable before
+    // the device is paired, because the phone needs it to decode the very
+    // ticket that pairs the device.
+    if uri.path() == "/_native/jsqr.js" {
+        return native_asset(ONBOARDING_JSQR, "text/javascript; charset=utf-8", false);
+    }
     let Some(profile) = state.core.paired_profile().await else {
         return if valid_spa_path(uri.path()) {
             native_asset(ONBOARDING_HTML, "text/html; charset=utf-8", false)
@@ -1620,6 +1627,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vendored_jsqr_matches_the_pinned_npm_build() {
+        // jsQR is vendored from the npm package (see the header in
+        // vendor/jsqr.js and the license in vendor/jsqr-LICENSE). The
+        // pinned digest keeps the copy auditable: any change — even a
+        // whitespace-only re-sync — must update this value on purpose.
+        assert_eq!(
+            hex_sha256(ONBOARDING_JSQR),
+            "1401538a234b0cd8c74fcc85622cb6250a4153f5da2563196941b32d928f762f"
+        );
+        // The browser UMD wrapper must remain intact: it is what attaches
+        // the decoder to `window.jsQR` for the onboarding page.
+        let source = std::str::from_utf8(ONBOARDING_JSQR)
+            .expect("vendored jsQR is ASCII/UTF-8");
+        assert!(source.contains("webpackUniversalModuleDefinition"));
+    }
+
     #[tokio::test]
     async fn native_request_bodies_match_declared_content_length() {
         let mut exact = Request::new(Body::from("body"));
@@ -1780,7 +1804,13 @@ mod tests {
         )
         .into_bytes();
         request.extend_from_slice(&oversized_body);
-        let oversized_body_response = raw_exchange_bytes(address, &request).await;
+        let oversized_body_response =
+            raw_exchange_bytes(
+                address,
+                &request,
+                MAX_HTTP1_BUFFER_BYTES + MAX_NATIVE_BODY_BYTES,
+            )
+            .await;
         assert_eq!(response_status(&oversized_body_response), Some(413));
 
         let websocket = raw_exchange(
@@ -1791,6 +1821,65 @@ mod tests {
         )
         .await;
         assert_eq!(response_status(&websocket), Some(401));
+
+        fixture.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn jsqr_is_served_before_pairing_and_behind_the_auth_gate() {
+        let fixture = TestProxy::start().await;
+        let (_, app_cookie) = authenticate(&fixture).await;
+        let app_address = fixture.handle.address();
+        let app_host = format!("127.0.0.1:{}", app_address.port());
+
+        // The vendored decoder is a pinned, hash-verified asset, so it may
+        // legitimately exceed the small-response bound that applies to
+        // dynamically generated responses. Its exact contents are pinned by
+        // the SHA-256 check in vendored_jsqr_matches_the_pinned_npm_build.
+        let jsqr_bound = ONBOARDING_JSQR.len() + 16 * 1024;
+
+        // Unpaired: the scanner must load so the phone can decode the
+        // very ticket it is about to pair with.
+        let unpaired = raw_exchange_bytes(
+            app_address,
+            format!(
+                "GET /_native/jsqr.js HTTP/1.1\r\nHost: {app_host}\r\nCookie: {app_cookie}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+            jsqr_bound,
+        )
+        .await;
+        assert_eq!(response_status(&unpaired), Some(200));
+        let (head, body) = std::str::from_utf8(&unpaired)
+            .unwrap()
+            .split_once("\r\n\r\n")
+            .unwrap();
+        assert!(head.contains("text/javascript"));
+        assert_eq!(body, std::str::from_utf8(ONBOARDING_JSQR).unwrap());
+
+        // The authentication gate still applies: a foreign host and a
+        // missing session are both rejected.
+        let foreign_host = raw_exchange_bytes(
+            app_address,
+            format!(
+                "GET /_native/jsqr.js HTTP/1.1\r\nHost: attacker.example\r\nCookie: {app_cookie}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+            jsqr_bound,
+        )
+        .await;
+        assert_eq!(response_status(&foreign_host), Some(404));
+
+        let unauthenticated = raw_exchange_bytes(
+            app_address,
+            format!(
+                "GET /_native/jsqr.js HTTP/1.1\r\nHost: {app_host}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+            jsqr_bound,
+        )
+        .await;
+        assert_eq!(response_status(&unauthenticated), Some(401));
 
         fixture.shutdown().await;
     }
@@ -2307,10 +2396,23 @@ mod tests {
     }
 
     async fn raw_exchange(address: SocketAddr, request: &str) -> Vec<u8> {
-        raw_exchange_bytes(address, request.as_bytes()).await
+        raw_exchange_bytes(
+            address,
+            request.as_bytes(),
+            MAX_HTTP1_BUFFER_BYTES + MAX_NATIVE_BODY_BYTES,
+        )
+        .await
     }
 
-    async fn raw_exchange_bytes(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    /// Read one full HTTP/1 response off the raw socket, asserting the
+    /// proxy never transmits more than `max_response_bytes`. The bound for
+    /// dynamically generated responses is the small buffer pair above; a
+    /// pinned, hash-verified asset may declare its own larger bound.
+    async fn raw_exchange_bytes(
+        address: SocketAddr,
+        request: &[u8],
+        max_response_bytes: usize,
+    ) -> Vec<u8> {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream.write_all(request).await.unwrap();
         let mut response = Vec::new();
@@ -2324,7 +2426,7 @@ mod tests {
                 break;
             }
             response.extend_from_slice(&buffer[..read]);
-            assert!(response.len() <= MAX_HTTP1_BUFFER_BYTES + MAX_NATIVE_BODY_BYTES);
+            assert!(response.len() <= max_response_bytes);
         }
         response
     }

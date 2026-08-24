@@ -9,6 +9,11 @@ const importPanel = byId("import-panel");
 const pairButton = byId("pair");
 const cancelButton = byId("cancel");
 const removeButton = byId("remove");
+const scanButton = byId("scan");
+const scanOverlay = byId("scan-overlay");
+const scanVideo = byId("scan-video");
+const scanStatus = byId("scan-status");
+const scanCloseButton = byId("scan-close");
 let pollTimer = 0;
 
 async function nativeRequest(path, method = "GET", body) {
@@ -29,6 +34,7 @@ function render(state) {
   const pending = state.phase === "pending";
   const paired = state.phase === "paired";
   importPanel.hidden = pending || paired || state.phase === "restartRequired";
+  if (importPanel.hidden) stopScanner();
   cancelButton.hidden = !pending;
   removeButton.hidden = !["revoked", "restartRequired"].includes(state.phase);
   phrasePanel.hidden = !pending || !state.phrase;
@@ -55,6 +61,131 @@ function schedulePoll() {
     }
   }, 1500);
 }
+
+// ---------------------------------------------------------------------------
+// Pairing-code scanner
+//
+// The companion app ships jsQR (served from /_native/jsqr.js) so the
+// phone can decode the host's QR code completely offline. A decoded value
+// is only accepted into the ticket field when it has the ticket scheme, so
+// an unrelated code in the room cannot be confused with an invitation.
+// ---------------------------------------------------------------------------
+
+let scanStream = null;
+let scanTimer = 0;
+let scanningFrame = false;
+const scanCanvas = document.createElement("canvas");
+const scanContext = scanCanvas.getContext("2d", { willReadFrequently: true });
+
+const SCAN_PROMPT = "Point the camera at the pairing code.";
+
+function isPairingTicket(value) {
+  return (
+    typeof value === "string" &&
+    value.startsWith("ygg://pair/v1/") &&
+    value.length > "ygg://pair/v1/".length &&
+    value.length <= 4096
+  );
+}
+
+function setScanStatus(message) {
+  scanStatus.textContent = message;
+}
+
+function stopScanner() {
+  if (scanTimer) {
+    window.clearInterval(scanTimer);
+    scanTimer = 0;
+  }
+  scanningFrame = false;
+  if (scanStream) {
+    for (const track of scanStream.getTracks()) track.stop();
+    scanStream = null;
+  }
+  scanVideo.srcObject = null;
+  if (!scanOverlay.hidden) {
+    scanOverlay.hidden = true;
+    setScanStatus(SCAN_PROMPT);
+  }
+}
+
+function handleDecodedTicket(ticket) {
+  stopScanner();
+  byId("ticket").value = ticket;
+  statusText.textContent = "Pairing code recognized. Add a device name, then request approval.";
+  byId("device-name").focus();
+}
+
+async function scanFrame() {
+  if (scanningFrame || scanOverlay.hidden || !scanStream) return;
+  if (!scanVideo.videoWidth || !scanVideo.videoHeight) {
+    return; // The camera is still producing its first frames.
+  }
+  scanningFrame = true;
+  try {
+    const width = scanVideo.videoWidth;
+    const height = scanVideo.videoHeight;
+    scanCanvas.width = width;
+    scanCanvas.height = height;
+    scanContext.drawImage(scanVideo, 0, 0, width, height);
+    const rgba = scanContext.getImageData(0, 0, width, height).data;
+    const decoded = window.jsQR(rgba, width, height, { inversionAttempts: "dontInvert" });
+    if (decoded && isPairingTicket(decoded.data)) {
+      handleDecodedTicket(decoded.data);
+    }
+  } finally {
+    scanningFrame = false;
+  }
+}
+
+async function startScanner() {
+  if (scanStream) return;
+  if (typeof window.jsQR !== "function") {
+    scanOverlay.hidden = false;
+    setScanStatus("The built-in code reader is unavailable. Paste the ticket instead.");
+    return;
+  }
+  try {
+    scanStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+  } catch (error) {
+    scanStream = null;
+    const denied = error && (error.name === "NotAllowedError" || error.name === "PermissionDeniedError");
+    scanOverlay.hidden = false;
+    setScanStatus(
+      denied
+        ? "Camera access was denied. Allow the camera in Settings → Ygg, or paste the ticket below."
+        : "The camera is unavailable right now. Paste the ticket instead.",
+    );
+    return;
+  }
+  scanVideo.srcObject = scanStream;
+  try {
+    await scanVideo.play();
+  } catch {
+    // Autoplay can be rejected before the overlay is visible; the frames
+    // still flow through the stream, which is all the decoder needs.
+  }
+  scanOverlay.hidden = false;
+  setScanStatus(SCAN_PROMPT);
+  scanTimer = window.setInterval(scanFrame, 300);
+}
+
+scanButton.addEventListener("click", () => {
+  if (scanStream) {
+    stopScanner();
+    scanButton.focus();
+  } else {
+    void startScanner();
+  }
+});
+
+scanCloseButton.addEventListener("click", () => {
+  stopScanner();
+  scanButton.focus();
+});
 
 pairButton.addEventListener("click", async () => {
   const ticket = byId("ticket").value.trim();

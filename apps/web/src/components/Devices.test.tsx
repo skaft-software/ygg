@@ -254,6 +254,42 @@ describe("connected devices", () => {
     expect(trigger).toHaveFocus();
   });
 
+  it("shows the pairing ticket as a QR code the companion can scan", async () => {
+    render(
+      <DevicesView
+        hostName="Desk host"
+        companionAvailable
+        transport={mockTransport()}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Pair a device" }));
+    expect(
+      await screen.findByRole("img", { name: "Pairing code" }),
+    ).toBeVisible();
+  });
+
+  it("keeps the manual ticket path when the ticket overflows a QR code", async () => {
+    render(
+      <DevicesView
+        hostName="Desk host"
+        companionAvailable
+        transport={mockTransport({
+          openCompanionPairing: vi.fn(async () => ({
+            // Lowercase forces byte-mode encoding; 2332 total bytes is one
+            // past the 2331-byte byte-mode capacity of QR version 40/M.
+            ticket: `ygg://pair/v1/${"a".repeat(2318)}`,
+            expiresAtMs: Date.now() + 120_000,
+          })),
+        })}
+      />,
+    );
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Pair a device" }));
+    expect(await screen.findByText(/too long for a QR code/)).toBeVisible();
+    expect(screen.queryByRole("img", { name: "Pairing code" })).toBeNull();
+  });
+
   it("rejects malformed companion catalogs before UI state is updated", () => {
     expect(() =>
       projectCompanionCatalog({

@@ -8096,6 +8096,17 @@ kbd {
   font-size: var(--font-meta);
 }
 
+.pairing-qr {
+  display: grid;
+  justify-items: center;
+  margin-top: 16px;
+}
+
+.qr-code {
+  width: 232px;
+  height: 232px;
+}
+
 .pairing-ticket textarea {
   width: 100%;
   min-height: 92px;
