@@ -379,7 +379,11 @@ MAX_TAR_BYTES = 160 * 1024 * 1024
 MAX_ENTRIES = 4096
 MAX_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_EXPANDED_BYTES = 128 * 1024 * 1024
-MAX_PADDING_BYTES = tarfile.RECORDSIZE
+# A tar stream is zero-padded to a 10240-byte record boundary, and some
+# producers emit one additional 512-byte block after the last record. Allow
+# up to a record plus one block of zero padding; anything non-zero, or more
+# padding than that, means appended or concatenated data.
+MAX_PADDING_BYTES = tarfile.RECORDSIZE + tarfile.BLOCKSIZE
 WINDOWS_FORBIDDEN = set('<>:"\\|?*')
 WINDOWS_DEVICES = {
     "CON", "PRN", "AUX", "NUL",
