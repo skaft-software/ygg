@@ -572,7 +572,11 @@ test("runs the authenticated production host lifecycle end to end", async ({
       const publicSnapshot = JSON.stringify(snapshot);
       expect(publicSnapshot).toContain(expected);
       expect(publicSnapshot).not.toContain("status 429");
-      expect(publicSnapshot).not.toContain(ERROR_DIAGNOSTIC);
+      // Provider diagnostics may surface the provider message, but every
+      // secret-bearing span inside it must be redacted at the boundary.
+      expect(publicSnapshot).toContain(
+        `detail=${ERROR_DIAGNOSTIC}: [REDACTED]`,
+      );
       expect(publicSnapshot).not.toContain(LIVE_PROVIDER_TOKEN);
       expect(publicSnapshot).not.toContain(FAILED_TURN_CONTEXT_MARKER);
       const visibleText = await page.locator("body").innerText();
