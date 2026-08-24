@@ -1232,7 +1232,16 @@ where
                         if matches!(&command, Command::Unknown(text)
                             if is_live_subagents_command(text, executable_extensions))
                         {
-                            match active_subagents_view(shell, input, executable_extensions).await {
+                            match active_subagents_view(
+                                shell,
+                                input,
+                                executable_extensions,
+                                |principal: &str, reference: &str| {
+                                    run.open_delegated_session_reference(principal, reference)
+                                },
+                            )
+                            .await
+                            {
                                 Ok(()) => {
                                     shell.render();
                                     continue;
@@ -2159,8 +2168,14 @@ async fn thinking_configuration_picker(
     Ok(Some((ReasoningMode::Standard, level)))
 }
 
-fn delegated_session_text(session: &Session, theme: &YggTheme) -> anyhow::Result<String> {
-    use crate::tui::view::sanitize_for_terminal;
+fn delegated_session_text(
+    session: &Session,
+    theme: &YggTheme,
+    width: u16,
+) -> anyhow::Result<String> {
+    use crate::tui::view::{
+        assistant_markdown_document_lines, sanitize_for_terminal, user_prompt_document_lines,
+    };
     use ygg_ai::{AssistantMessage, Message, UserPart};
 
     const MAX_MESSAGES: usize = 64;
@@ -2182,8 +2197,8 @@ fn delegated_session_text(session: &Session, theme: &YggTheme) -> anyhow::Result
         bounded(&flat, 96)
     }
 
+    let rich_renderer = theme.rich_renderer();
     let dot = if theme.unicode() { "•" } else { "*" };
-    let indent_dot = format!("  {} ", theme.fg("muted", "│"));
     let context = session.context()?;
 
     // Styled header chrome; the panel title carries the worker label.
@@ -2228,16 +2243,15 @@ fn delegated_session_text(session: &Session, theme: &YggTheme) -> anyhow::Result
                                 theme.dim("· from parent")
                             ),
                         );
+                    } else {
+                        push_row(&mut rows, &mut block_bytes, String::new());
                     }
-                    for line in sanitize_for_terminal(text).lines() {
+                    // Rendered identically to the main transcript's user block.
+                    for line in user_prompt_document_lines(text, &rich_renderer, theme, width) {
                         if block_bytes >= MAX_BLOCK_BYTES {
                             break;
                         }
-                        push_row(
-                            &mut rows,
-                            &mut block_bytes,
-                            format!("{indent_dot}{}", theme.fg("muted", line)),
-                        );
+                        push_row(&mut rows, &mut block_bytes, line);
                     }
                 }
             }
@@ -2248,23 +2262,21 @@ fn delegated_session_text(session: &Session, theme: &YggTheme) -> anyhow::Result
                     }
                     match part {
                         ygg_ai::AssistantPart::Text(text) => {
-                            if rows.is_empty() {
-                                let label = theme.bold(&theme.fg("foreground", "Worker"));
-                                push_row(
-                                    &mut rows,
-                                    &mut block_bytes,
-                                    format!("\n{} {}", theme.fg("foreground", dot), label),
-                                );
+                            if !rows.is_empty() {
+                                push_row(&mut rows, &mut block_bytes, String::new());
                             }
-                            for line in sanitize_for_terminal(text).lines() {
+                            // Rendered identically to the main transcript's
+                            // settled assistant markdown block.
+                            for line in assistant_markdown_document_lines(
+                                text,
+                                &rich_renderer,
+                                theme,
+                                width,
+                            ) {
                                 if block_bytes >= MAX_BLOCK_BYTES {
                                     break;
                                 }
-                                push_row(
-                                    &mut rows,
-                                    &mut block_bytes,
-                                    format!("{indent_dot}{}", line),
-                                );
+                                push_row(&mut rows, &mut block_bytes, line);
                             }
                         }
                         ygg_ai::AssistantPart::ToolCall(call) => {
@@ -2484,16 +2496,18 @@ fn is_live_subagents_command(
 }
 
 /// Live `/subagents` view while a run is active. Mirrors the idle
-/// `subagents_view` picker, but selection opens the extension-provided
-/// detail snapshot instead of the session transcript, which needs the idle
-/// owner of `App`.
-async fn active_subagents_view<S>(
+/// `subagents_view` picker: selection opens the same theme-styled read-only
+/// worker transcript through the active run's delegation binding, so every
+/// subagent with a durable child session is viewable mid-run too.
+async fn active_subagents_view<S, F>(
     shell: &mut InteractiveShell,
     input: &mut S,
     extensions: &mut crate::extensions::ExecutableExtensions,
+    open_delegated: F,
 ) -> anyhow::Result<()>
 where
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+    F: Fn(&str, &str) -> Result<Option<Session>, ygg_agent::AgentError>,
 {
     loop {
         if subagent_view_entries(extensions).is_none_or(|(_, entries)| entries.is_empty()) {
@@ -2528,16 +2542,63 @@ where
         for notice in extensions.drain_events() {
             shell.notice(notice);
         }
-        // Open the latest snapshot detail for the selection. The live
-        // transcript drill-in stays idle-only because it revalidates against
-        // the durable session through `App`.
+        // Open the same theme-styled transcript as the idle view, resolved
+        // through the active run's delegation binding. The read-only session
+        // file never touches the running agent state.
         if let Some((_, entries)) = subagent_view_entries(extensions) {
             if let Some(entry) = entries.iter().find(|entry| entry.node_id == selected_id) {
-                read_only_document(
+                let reference = entry.session_reference.clone();
+                let principal = reference.as_deref().and_then(|reference| {
+                    extensions.presentation_session_reference_principal(reference)
+                });
+                let node_id = entry.node_id.clone();
+                let fallback_detail = entry.fallback_detail.clone();
+                let label = entry.label.clone();
+                let theme = shell.theme();
+                let width = shell.width();
+                let open_text = |fallback: &str| -> String {
+                    match (principal.as_deref(), reference.as_deref()) {
+                        (Some(principal), Some(reference)) => {
+                            match open_delegated(principal, reference) {
+                                Ok(Some(session)) => {
+                                    delegated_session_text(&session, &theme, width)
+                                        .unwrap_or_else(|error| {
+                                            format!(
+                                                "{fallback}\n\nFailed to render the delegated transcript: {error}"
+                                            )
+                                        })
+                                }
+                                Ok(None) => format!(
+                                    "{fallback}\n\nThe delegated transcript is not available yet."
+                                ),
+                                Err(error) => format!(
+                                    "{fallback}\n\nFailed to open the delegated transcript: {error}"
+                                ),
+                            }
+                        }
+                        _ => fallback.to_owned(),
+                    }
+                };
+                let initial_text = open_text(&fallback_detail);
+                let refresh = || {
+                    let current_fallback = subagent_view_entries(extensions)
+                        .and_then(|(_, entries)| {
+                            entries
+                                .into_iter()
+                                .find(|candidate| candidate.node_id == node_id)
+                        })
+                        .map(|candidate| candidate.fallback_detail)
+                        .unwrap_or_else(|| fallback_detail.clone());
+                    let result: anyhow::Result<Option<String>> =
+                        Ok(Some(open_text(&current_fallback)));
+                    std::future::ready(result)
+                };
+                read_only_document_live_styled(
                     shell,
                     input,
-                    entry.label.clone(),
-                    entry.fallback_detail.clone(),
+                    format!("{label} · read-only transcript"),
+                    initial_text,
+                    refresh,
                 )
                 .await?;
             } else {
@@ -2653,6 +2714,7 @@ async fn subagents_view(
         let node_id = entry.node_id.clone();
         let fallback_detail = entry.fallback_detail.clone();
         let theme = shell.theme();
+        let width = shell.width();
         let initial_text = if let (Some(principal), Some(reference)) =
             (principal.as_deref(), reference.as_deref())
         {
@@ -2660,7 +2722,7 @@ async fn subagents_view(
                 .agent
                 .open_delegated_session_reference(principal, reference)
             {
-                Ok(Some(session)) => delegated_session_text(&session, &shell.theme())?,
+                Ok(Some(session)) => delegated_session_text(&session, &shell.theme(), width)?,
                 Ok(None) => format!(
                     "{}\n\nThe delegated transcript is no longer available for this parent session.",
                     fallback_detail
@@ -2689,7 +2751,9 @@ async fn subagents_view(
                     .agent
                     .open_delegated_session_reference(principal, reference)
                 {
-                    Ok(Some(session)) => delegated_session_text(&session, &theme).map(Some),
+                    Ok(Some(session)) => {
+                        delegated_session_text(&session, &theme, width).map(Some)
+                    }
                     Ok(None) => Ok(Some(format!(
                         "{}\n\nThe delegated transcript is no longer available for this parent session.",
                         current_fallback
@@ -3317,12 +3381,14 @@ async fn run_idle_command(
                     .agent
                     .open_delegated_session_reference(&principal, &reference)
                 {
-                    Ok(Some(session)) => match delegated_session_text(&session, &shell.theme()) {
-                        Ok(text) => shell.show_overlay_text(text),
-                        Err(error) => {
-                            shell.error(format!("failed to inspect delegated session: {error}"))
+                    Ok(Some(session)) => {
+                        match delegated_session_text(&session, &shell.theme(), shell.width()) {
+                            Ok(text) => shell.show_overlay_text(text),
+                            Err(error) => {
+                                shell.error(format!("failed to inspect delegated session: {error}"))
+                            }
                         }
-                    },
+                    }
                     Ok(None) => shell
                         .error("delegated session reference is unavailable for this parent".into()),
                     Err(error) => {
@@ -4601,7 +4667,7 @@ mod tests {
                 },
             )))
             .unwrap();
-        let text = delegated_session_text(&session, &test_theme()).unwrap();
+        let text = delegated_session_text(&session, &test_theme(), 80).unwrap();
         // The styled header must still read correctly after ANSI stripping.
         let plain = crate::tui::view::sanitize_for_terminal(&text);
         assert!(plain.contains("Delegated worker transcript"));
@@ -4635,11 +4701,39 @@ mod tests {
                 .unwrap();
         }
 
-        let text = delegated_session_text(&session, &test_theme()).unwrap();
+        let text = delegated_session_text(&session, &test_theme(), 80).unwrap();
         assert!(text.contains("NEWEST-FINAL-WORKER-RESULT"), "{text}");
         assert!(!text.contains("block-00-older-worker-output"));
         assert!(text.contains("[older transcript entries omitted]"));
         assert!(text.len() <= 128 * 1024, "{}", text.len());
+    }
+
+    #[test]
+    fn delegated_session_renders_markdown_like_the_main_transcript() {
+        // The worker transcript must flow through the exact same rich
+        // markdown renderer as the main conversation: headings, bold, and
+        // inline code keep their theme styling instead of being flattened to
+        // raw text.
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("child.jsonl")).unwrap();
+        let markdown = "# Heading One\n\nplain **bold** and `code` tail";
+        session
+            .append(EntryValue::Message(ygg_ai::Message::Assistant(
+                ygg_ai::AssistantMessage {
+                    content: vec![ygg_ai::AssistantPart::Text(markdown.into())],
+                    model: ygg_ai::ModelId("worker-test".into()),
+                    protocol: ygg_ai::Protocol::OpenAiChat,
+                },
+            )))
+            .unwrap();
+        let text = delegated_session_text(&session, &test_theme(), 80).unwrap();
+
+        let theme = test_theme();
+        let renderer = theme.rich_renderer();
+        let expected =
+            crate::tui::view::assistant_markdown_document_lines(markdown, &renderer, &theme, 80)
+                .join("\n");
+        assert!(text.contains(&expected), "styled block not found in {text}");
     }
 
     #[test]

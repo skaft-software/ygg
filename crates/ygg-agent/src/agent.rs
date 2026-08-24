@@ -605,6 +605,24 @@ pub struct Run<'a> {
 }
 
 impl Run<'_> {
+    /// Open an extension-negotiated child session by its opaque presentation
+    /// reference while this run is active.
+    ///
+    /// Mirrors [`Agent::open_delegated_session_reference`] so live UI (for
+    /// example the mid-run `/subagents` transcript drill-in) can read a worker
+    /// transcript read-only without owning the root session. The delegation
+    /// manager state lock is only taken to resolve the reference to a path.
+    pub fn open_delegated_session_reference(
+        &self,
+        extension_principal: &str,
+        reference: &str,
+    ) -> Result<Option<Session>, AgentError> {
+        let Some(binding) = self.delegation.as_ref() else {
+            return Ok(None);
+        };
+        binding.open_session_reference(extension_principal, reference)
+    }
+
     /// Returns a clonable handle for sending control messages while the run's
     /// event stream is being consumed.
     pub fn control(&self) -> RunControl {
