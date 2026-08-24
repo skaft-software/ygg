@@ -1304,7 +1304,6 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         compaction: CompactionPolicy::default(),
         max_cost_microdollars: request.max_cost_microdollars,
         cost_warning_microdollars: None,
-        show_turn_cost: false,
         max_turns: request.max_turns,
         show_reasoning_in_print: false,
         initial_prompt: None,
@@ -1410,6 +1409,7 @@ fn register_inline_model(
             responses_lite: false,
             agent_delegation: None,
             structured_output: true,
+            deferred_tool_loading: false,
         },
         limits: ModelLimits {
             context_window,
@@ -2075,6 +2075,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 32_768,

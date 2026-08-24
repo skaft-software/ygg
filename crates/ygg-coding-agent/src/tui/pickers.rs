@@ -11,7 +11,7 @@ use ygg_ai::{ModelCatalog, ModelId};
 
 use crate::config::ThinkingLevel;
 use crate::presentation::{format_token_rate_value, ModelDisplayMetadata};
-use crate::session_store::{SessionMeta, SessionStore};
+use crate::session_store::SessionMeta;
 use crate::tui::view::{InteractiveShell, Panel, PanelAction, PanelResult};
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
@@ -560,15 +560,6 @@ where
     }
 }
 
-#[allow(dead_code)]
-pub fn session_items(store: &SessionStore) -> Vec<String> {
-    store
-        .list()
-        .into_iter()
-        .map(|session| session.title)
-        .collect()
-}
-
 /// Ask the user to select a stored session from a precomputed snapshot.
 /// Callers discover and summarize sessions off the raw-terminal input task.
 pub async fn session_picker(
@@ -960,6 +951,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ygg_ai::ModelLimits {
                 context_window: 131072,
@@ -1003,6 +995,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ygg_ai::ModelLimits {
                 context_window: 128000,
@@ -1034,22 +1027,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_items_map_ids_and_titles() {
-        let directory = tempfile::tempdir().unwrap();
-        let workspace = tempfile::tempdir().unwrap();
-        let store = SessionStore::new(directory.path(), workspace.path());
-        std::fs::create_dir_all(store.dir()).unwrap();
-        let mut session = ygg_agent::Session::create(store.dir().join("one.jsonl")).unwrap();
-        session
-            .append(ygg_agent::EntryValue::Message(ygg_ai::Message::User(
-                ygg_ai::UserMessage {
-                    content: vec![ygg_ai::UserPart::Text("mapped title".into())],
-                },
-            )))
-            .unwrap();
-        let items = session_items(&store);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0], "mapped title");
-    }
 }

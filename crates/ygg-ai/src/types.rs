@@ -174,6 +174,11 @@ pub struct Capabilities {
     pub agent_delegation: Option<AgentDelegation>,
     /// Whether the model supports structured outputs (JSON schema / mode).
     pub structured_output: bool,
+    /// Whether the provider loads tool schemas dynamically after a
+    /// `added_tool_names` announcement on a tool result. When false, every
+    /// registered tool's schema is sent with every request.
+    #[serde(default)]
+    pub deferred_tool_loading: bool,
 }
 
 /// Compact set over a small closed modality universe.
@@ -677,6 +682,13 @@ pub struct ToolResult {
     pub content: Vec<ToolResultPart>,
     /// Whether the tool execution resulted in a terminal error.
     pub is_error: bool,
+    /// Names from the registry that became available as a consequence of this
+    /// tool execution (for example an extension or MCP server that registers
+    /// additional tools on first use). Providers capable of deferred tool
+    /// loading treat these names as load points: once announced, those tool
+    /// schemas are excluded from the static request schema set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_tool_names: Option<Vec<String>>,
 }
 
 /// Part of a tool result.
@@ -1241,6 +1253,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 128000,

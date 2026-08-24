@@ -7,11 +7,11 @@
 <h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>A tiny and fast coding agent written fully in Rust.</strong>
+  <strong>The local-first coding agent.</strong><br>Provider agnostic. Language agnostic. Written fully in Rust.
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.5.0"><img alt="Release: 0.5.0" src="https://img.shields.io/badge/release-0.5.0-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.0"><img alt="Release: 0.6.0" src="https://img.shields.io/badge/release-0.6.0-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -32,9 +32,13 @@
 
 ---
 
-ygg is a local-first coding agent written in Rust. It combines a provider-independent inference layer, durable branchable sessions, explicit tools, image and audio input, configurable compaction, model-advertised Ultra reasoning with bounded task delegation, and a customizable terminal interface.
+ygg is a local-first coding agent written in Rust. Everything important happens on your machine: model traffic goes directly from you to the endpoint you choose, sessions are local inspectable JSONL, and a supervised extension runtime lets you teach ygg new tricks without giving up control.
 
-It supports local OpenAI-compatible servers alongside OpenAI, Anthropic, OpenRouter, and other hosted providers. There is no hosted ygg control plane: model traffic goes directly from your machine to the endpoint you select, and sessions remain local, inspectable JSONL.
+**Provider agnostic.** Local OpenAI-compatible servers (llama.cpp, vLLM, LM Studio, Ollama-style endpoints) sit beside OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, and more as equal citizens — same tools, same session model, same terminal.
+
+**Language agnostic.** The extension API is line-delimited JSON-RPC over stdio, so an extension can be written in any language; the official Python SDK is a convenience, not a requirement. Prompt templates are Pi-compatible, skills follow the open Agent Skills spec (`SKILL.md`), and packaged tool catalogs can port adapters written for other agents.
+
+**Supervised extensions.** First-party bundles ship separately, install checksum-verified and inert, and stay disabled until you explicitly enable **and** trust them. Bounded subagent delegation runs up to eight concurrent workers with live telemetry, mutation grants you opt into, and continue/resume across sessions.
 
 > **Apple Foundation Models:** On macOS 27, run `fm serve` from Terminal.app, then configure its OpenAI-compatible endpoint as a custom provider. See the [ygg documentation](https://skaft.org/ygg/docs/) for the current setup.
 
@@ -45,6 +49,8 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 | Principle | What it means in ygg |
 | --- | --- |
 | **Local models first** | First-class custom endpoints, offline startup, cold-start-aware timeouts, model discovery, endpoint-reported reasoning controls, and token metrics. |
+| **Provider agnostic** | One conversation model across OpenAI Chat, OpenAI Responses, and Anthropic Messages; hosted and local endpoints are configured identically and swapped with a flag. |
+| **Language agnostic extensions** | The extension runtime speaks JSON-RPC over stdio — any language works. Pi-compatible prompt templates and Agent-Skills-spec skills port existing agent plugins to ygg. |
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
@@ -54,14 +60,9 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 ## Install
 
 ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.5.0`
+[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.0`
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
 silicon. Linux musl is not supported by this release.
-
-> **Version note:** This README tracks the current `0.6.0-dev` checkout. The
-> interactive extension-management and subagent-browser sections below are
-> unreleased and are not present in the published `v0.5.0` binaries; use the
-> checkout installation to dogfood them.
 
 ### Installer
 
@@ -71,7 +72,7 @@ architecture, verifies the matching release archive, and installs `ygg` and
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.5.0/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.0/install-ygg.sh | sh
 ```
 
 No Rust toolchain is needed for the default installation. Restart the shell,
@@ -87,7 +88,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.5.0/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.0/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -98,7 +99,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.5.0 \
+  --tag v0.6.0 \
   --bins \
   ygg-coding-agent
 ```
@@ -125,12 +126,12 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.5.0 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.0 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
 
-Starting with v0.5.0, Ygg updates through the channel that installed it and
+Starting with v0.5.0 and later, Ygg updates through the channel that installed it and
 never replaces itself in process: the installer or Cargo swaps the installed
 files, and you restart Ygg to pick up the new version.
 
@@ -506,8 +507,10 @@ work goes through its `subagent_*` tools and owner-bound `/subagents` browser;
 the root agent never receives a parallel native collaboration surface. Without
 the extension, Ultra is clamped to the highest ordinary safe effort.
 
-Extension workers are read/search-only, depth-one, and bounded to two active
-children with sixteen retained records. Each worker has an isolated durable
+Extension workers inherit the parent's full standard tool scope (`read`,
+`search`, `edit`, `write`, and `bash`) by default and can be narrowed per spawn
+to a hard read-only pair, stay depth-one, and run under a bound of eight active
+children with thirty-two retained records. Each worker has an isolated durable
 session, inherited policy limits, host-owned cancellation and cost/token
 ceilings, and an owner-authorized read-only transcript. While a root run is
 active, the TUI keeps an owner-scoped `Subagents` block directly above the
@@ -916,7 +919,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.5.0.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.0.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |

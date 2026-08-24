@@ -4,10 +4,8 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use sexy_tui_rs::theme::{capability::CapabilityTier, Theme as SexyTheme};
-use sexy_tui_rs::widgets::SelectListTheme;
 use sexy_tui_rs::{
     CapabilityOverrides, CodeOverflow, Color, RenderOptions, RichRenderer, SupportLevel, TextRole,
     TextStyle, UnorderedListMarker,
@@ -321,17 +319,6 @@ fn default_surfaces() -> BTreeMap<String, ThemeSurface> {
     .collect()
 }
 
-#[allow(dead_code)]
-fn valid_runtime_role_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 96
-        && !name.starts_with('.')
-        && !name.ends_with('.')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
 fn semantic_text_role(name: &str) -> Option<(TextRole, &'static str)> {
     Some(match name {
         "text" | "foreground" => (TextRole::Text, "foreground"),
@@ -469,17 +456,11 @@ impl YggTheme {
             .unwrap_or_else(|| unicode_glyph(name))
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used only with the `serve` extension feature
     pub fn semantic_role_names(&self) -> impl Iterator<Item = &str> {
         self.semantic_styles.keys().map(String::as_str)
     }
 
-    #[allow(dead_code)]
-    pub fn has_semantic_role(&self, role: &str) -> bool {
-        self.semantic_styles.contains_key(role)
-    }
-
-    #[allow(dead_code)]
     pub fn semantic_style(&self, role: &str) -> TextStyle {
         self.semantic_styles
             .get(role)
@@ -494,7 +475,6 @@ impl YggTheme {
     /// Render a built-in or extension-defined semantic role. Extensions use
     /// stable role names and never need access to Ygg's private application
     /// state or raw terminal escape sequences.
-    #[allow(dead_code)]
     pub fn apply_semantic_role(&self, role: &str, text: &str) -> String {
         self.inner.apply_style(self.semantic_style(role), text)
     }
@@ -539,27 +519,9 @@ impl YggTheme {
         layered
     }
 
-    #[allow(dead_code)]
-    pub fn override_semantic_style(
-        &mut self,
-        role: impl Into<String>,
-        style: TextStyle,
-    ) -> anyhow::Result<()> {
-        let role = role.into();
-        if !valid_runtime_role_name(&role) {
-            anyhow::bail!("invalid semantic role {role:?}");
-        }
-        if let Some((text_role, _)) = semantic_text_role(&role) {
-            self.inner.override_style(text_role, style);
-        }
-        self.semantic_styles.insert(role, style);
-        Ok(())
-    }
-
     /// Reload the active file or bundled theme while preserving this terminal
     /// capability/background profile. Runtime model styling is reapplied by
     /// the shell when it swaps the returned theme in.
-    #[allow(dead_code)]
     pub fn reload(&self) -> anyhow::Result<Self> {
         match &self.source {
             ThemeSource::CompiledDefault => {
@@ -1523,18 +1485,6 @@ pub(crate) fn test_bundled_theme_with(
 }
 
 #[cfg(test)]
-fn foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.fg(token, text))
-}
-
-#[cfg(test)]
-fn bold_foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.bold(&theme.fg(token, text)))
-}
-
-#[cfg(test)]
 fn project_theme_dir(config: &Config) -> PathBuf {
     config.workspace.join(".ygg").join("themes")
 }
@@ -2083,54 +2033,6 @@ pub(crate) fn apply_model_lab(theme: &mut YggTheme, lab: ModelLab) {
     apply_model_lab_for(theme, lab, background);
 }
 
-/// Build sexy-tui's select-list closures from the current model theme.
-#[cfg(test)]
-pub fn select_list_theme(theme: &YggTheme) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: foreground(theme, "model_accent"),
-        selected_text: bold_foreground(theme, "model_accent"),
-        description: foreground(theme, "muted"),
-        scroll_info: foreground(theme, "muted"),
-        no_match: foreground(theme, "error"),
-    }
-}
-
-#[allow(dead_code)]
-fn shared_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        theme
-            .lock()
-            .expect("picker theme mutex poisoned")
-            .fg(token, text)
-    })
-}
-
-#[allow(dead_code)]
-fn shared_bold_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        let theme = theme.lock().expect("picker theme mutex poisoned");
-        theme.bold(&theme.fg(token, text))
-    })
-}
-
-/// A picker theme whose model accent can change as selection moves.
-#[allow(dead_code)]
-pub fn dynamic_select_list_theme(theme: Arc<Mutex<YggTheme>>) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: shared_foreground(theme.clone(), "model_accent"),
-        selected_text: shared_bold_foreground(theme.clone(), "model_accent"),
-        description: shared_foreground(theme.clone(), "muted"),
-        scroll_info: shared_foreground(theme.clone(), "muted"),
-        no_match: shared_foreground(theme, "error"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2159,7 +2061,6 @@ mod tests {
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,
             cost_warning_microdollars: None,
-            show_turn_cost: false,
             max_turns: Some(40),
             show_reasoning_in_print: false,
             initial_prompt: None,
@@ -2188,13 +2089,6 @@ mod tests {
             (right, left)
         };
         (relative_luminance(light) + 0.05) / (relative_luminance(dark) + 0.05)
-    }
-
-    #[test]
-    fn select_list_theme_builds_and_preserves_text() {
-        let theme = select_list_theme(&test_theme());
-        assert!((theme.selected_text)("x").contains('x'));
-        assert!((theme.no_match)("x").contains('x'));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 use serde::Serialize;
 
+use crate::error::AiError;
+use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{CacheCompatibility, CacheRetention, Request};
 
 /// Wire cache-control marker shared by Anthropic and compatible endpoints.
@@ -166,6 +168,34 @@ pub(crate) fn normalize_tool_call_id_owned(id: String) -> String {
     normalize_invalid_tool_call_id(&id)
 }
 
+/// Records `ev` on the response builder and appends it to the canonical event
+/// list. Every streaming codec funnels provider events through this so builder
+/// invariants are enforced exactly once.
+pub(crate) fn emit_event(
+    events: &mut Vec<StreamEvent>,
+    builder: &mut ResponseBuilder,
+    ev: StreamEvent,
+) -> Result<(), AiError> {
+    builder.on_event(&ev)?;
+    events.push(ev);
+    Ok(())
+}
+
+/// Canonical index for a provider-side key, allocating a fresh slot on first
+/// sight. Callers that re-key after closing a segment must not rely on this
+/// `.len()`-based allocation; see [`ResponseBuilder::next_canonical_index`].
+pub(crate) fn get_canonical_index(builder: &mut ResponseBuilder, key: &str) -> usize {
+    if let Some(&idx) = builder.provider_to_canonical_indices.get(key) {
+        idx
+    } else {
+        let idx = builder.provider_to_canonical_indices.len();
+        builder
+            .provider_to_canonical_indices
+            .insert(key.to_string(), idx);
+        idx
+    }
+}
+
 fn normalize_invalid_tool_call_id(id: &str) -> String {
     let is_valid_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'-';
 
@@ -310,6 +340,7 @@ pub(crate) mod harness {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 200_000,

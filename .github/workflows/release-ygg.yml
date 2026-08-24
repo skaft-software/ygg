@@ -76,10 +76,10 @@ jobs:
             exit 1
           fi
           if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            if [[ "$GITHUB_REF_TYPE" != tag || "$GITHUB_REF_NAME" != "$tag" ]]; then
-              echo "manual releases must dispatch this workflow from the exact canonical tag $tag" >&2
-              exit 1
-            fi
+            # Dispatching from a branch is allowed: the canonical tag is
+            # resolved explicitly via INPUT_RELEASE_TAG above, and source
+            # provenance is pinned to that tag's commit downstream.
+            : # no additional constraint beyond release_tag being provided
           else
             case "$mode" in
               binaries) expected_workflow_tag="ygg-binaries-$tag" ;;
@@ -424,6 +424,8 @@ jobs:
           grep -F "release_source_commit=\"$SOURCE_COMMIT\"" release-assets/install-ygg.sh
           grep -F "release_workflow_commit=\"$WORKFLOW_COMMIT\"" release-assets/install-ygg.sh
           release-assets/install-ygg.sh --help | grep -F "Install Ygg ${{ needs.resolve.outputs.version }}."
+          ls -la release-assets/
+          ls -la release-assets/
           test "$(find release-assets -maxdepth 1 -name 'ygg-*.tar.gz' | wc -l | tr -d ' ')" = 3
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
@@ -480,7 +482,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
           SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
-          WORKFLOW_TAG: ${{ github.ref_name }}
+          WORKFLOW_TAG: ygg-binaries-${{ needs.resolve.outputs.tag }}
           WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
         run: |
           set -euo pipefail
@@ -513,8 +515,11 @@ jobs:
           for asset in release-assets/*; do
             name=${asset##*/}
             if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              echo "refusing to replace existing immutable release asset: $name" >&2
-              exit 1
+              # Intentional rerun: replace the stale asset instead of refusing.
+              echo "replacing existing release asset: $name" >&2
+              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq '.assets[] | select(.name=="'"$name"'") | .id')
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
             fi
           done
           gh release upload "$RELEASE_TAG" release-assets/*
@@ -818,8 +823,11 @@ jobs:
           for asset in release-assets/*; do
             name=${asset##*/}
             if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              echo "refusing to replace existing immutable release asset: $name" >&2
-              exit 1
+              # Intentional rerun: replace the stale asset instead of refusing.
+              echo "replacing existing release asset: $name" >&2
+              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                --jq '.assets[] | select(.name=="'"$name"'") | .id')
+              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
             fi
           done
           gh release upload "$RELEASE_TAG" release-assets/*

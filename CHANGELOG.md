@@ -2,10 +2,35 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## Unreleased
+## 0.6.1 — Unreleased
+
+### Changed
+
+- Removed dead public API surface across the workspace and removed the dead
+  Pi-port TUI surface in `sexy-tui-rs`.
+- Flattened the internal tool trait stack: `Tool` became the object-safe
+  `ErasedTool` form and `TypedTool` was removed.
+- Retired the `show_turn_cost` flag.
+- Hoisted protocol helpers that were duplicated across crates into `ygg-ai`.
+- Fixed concurrency bottlenecks so `Session::persist` and `DelegationManager`
+  journal writes no longer block under load.
+- Removed roughly 19 GB of accumulated workspace junk from the repository tree.
+- Fixed documentation drift: subagent worker tool-scope and limit wording in
+  `README.md`, `docs/extensions.md`, and `docs/design/ygg-agent.md`, plus the
+  supported-fixes target in `SECURITY.md`.
+
+## 0.6.0 — 2026-08-23
 
 ### Added
 
+- Deferred tool-schema loading, ported from Pi's deferred-tools design:
+  tool results can now carry `added_tool_names` — the set of tools that became
+  available as a consequence of that execution (for example an extension or
+  MCP server registering tools on first use). Models advertising the new
+  `deferred_tool_loading` capability stop re-sending announced schemas in the
+  static request tool set; providers without the capability are unaffected.
+  This is the load-bearing prerequisite for lazily registered extension and
+  MCP tool schemas.
 - Delegated workers now expose a bounded rolling `recent_tools` activity ring
   (last six tool calls with flattened argument summaries, host timestamps, and
   an error flag) on every `agent/list` record, and the `/subagents` picker rows,
@@ -14,18 +39,6 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Terminal-gate rejections (`CandidateRejected`) now carry cumulative session
   cost alongside run cost, so delegated-worker spend tracks token usage between
   accepted turns instead of jumping at settlement.
-
-### Changed
-
-- Subagents now inherit the parent's full standard tool scope (`read`, `search`,
-  `edit`, `write`, `bash`) by default, matching Claude Code's Task workers;
-  pass `tools: [read, search]` to keep a worker read-only. Worker prompts,
-  profiles, the spawn schema, and skill guidance were updated accordingly.
-- The interactive composer's slash-command list refreshes when extension
-  contributions change, and an unknown slash command now names enabled
-  extensions that are not ready instead of failing with a bare error.
-
-### Added
 
 - Added checksum-verified, bounded, atomic executable-extension bundles for the
   small first-party release catalog and offline/local archives. `ygg extension
@@ -57,6 +70,13 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
+- Subagents now inherit the parent's full standard tool scope (`read`, `search`,
+  `edit`, `write`, `bash`) by default, matching Claude Code's Task workers;
+  pass `tools: [read, search]` to keep a worker read-only. Worker prompts,
+  profiles, the spawn schema, and skill guidance were updated accordingly.
+- The interactive composer's slash-command list refreshes when extension
+  contributions change, and an unknown slash command now names enabled
+  extensions that are not ready instead of failing with a bare error.
 - Kept the target-specific Ygg Serve `package.toml` application archive distinct
   from generic executable-extension `extension.toml` bundles.
 - Removed ambient executable-extension header/status/footer and presentation

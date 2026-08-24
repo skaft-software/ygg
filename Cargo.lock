@@ -1974,7 +1974,6 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "serde",
- "serde_json",
  "syntect",
  "tempfile",
  "toml",
@@ -3055,7 +3054,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "ygg-agent"
-version = "0.6.0-dev"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3070,7 +3069,6 @@ dependencies = [
  "pretty_assertions",
  "reqwest",
  "rustix 1.1.4",
- "schemars",
  "semver",
  "serde",
  "serde_json",
@@ -3090,7 +3088,7 @@ dependencies = [
 
 [[package]]
 name = "ygg-ai"
-version = "0.6.0-dev"
+version = "0.6.0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3114,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "ygg-coding-agent"
-version = "0.6.0-dev"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",

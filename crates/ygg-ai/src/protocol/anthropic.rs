@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
-use crate::protocol::{cache_control, Base64Bytes, CacheControl, HttpRequestParts};
+use crate::protocol::{
+    cache_control, emit_event, get_canonical_index, Base64Bytes, CacheControl, HttpRequestParts,
+};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
     AssistantPart, ImageSource, Media, Message, Protocol, ReasoningConfig, ReasoningState,
@@ -727,16 +729,6 @@ fn push_synthetic_tool_results(
 // Anthropic Messages is always streamed (design §12.3); there is no
 // non-streaming decode path, so this codec deliberately exposes none.
 
-fn emit_event(
-    events: &mut Vec<StreamEvent>,
-    builder: &mut ResponseBuilder,
-    ev: StreamEvent,
-) -> Result<(), AiError> {
-    builder.on_event(&ev)?;
-    events.push(ev);
-    Ok(())
-}
-
 /// Decodes a streaming SSE event from Anthropic, emitting StreamEvents.
 pub(crate) fn decode_stream_event(
     _model: &crate::catalog::Model,
@@ -989,18 +981,6 @@ pub(crate) fn decode_stream_event(
 
 // --- Helpers ---
 
-fn get_canonical_index(builder: &mut ResponseBuilder, key: &str) -> usize {
-    if let Some(&idx) = builder.provider_to_canonical_indices.get(key) {
-        idx
-    } else {
-        let idx = builder.provider_to_canonical_indices.len();
-        builder
-            .provider_to_canonical_indices
-            .insert(key.to_string(), idx);
-        idx
-    }
-}
-
 fn map_stop_reason(reason: &str) -> StopReason {
     match reason {
         "end_turn" => StopReason::EndTurn,
@@ -1112,6 +1092,7 @@ mod tests {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 200000,

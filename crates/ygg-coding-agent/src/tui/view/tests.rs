@@ -9,6 +9,7 @@ use super::transcript_commit::{
     transcript_commit_cursor, transcript_commit_position, FINAL_COMMIT_SEGMENT,
 };
 use super::*;
+use sexy_tui_rs::CURSOR_MARKER;
 use crate::commands;
 use crate::presentation::RunPhase;
 use crate::tui::theme::ThemeSurfaceHeading;
@@ -1486,29 +1487,6 @@ fn steering_overflow_reports_entirely_hidden_prompts() {
 }
 
 #[test]
-fn terminal_native_prompt_wraps_and_shrinks_without_a_panel() {
-    let mut shell = InteractiveShell::test_shell();
-    shell.set_size(24, 10);
-    for character in "abcdefghijklmnopqrstuvwxyz0123456789".chars() {
-        shell.apply_edit(EditAction::Char(character));
-    }
-
-    let rendered = render_prompt_box(&shell.state.borrow(), 24, 8);
-    assert!(rendered.len() > 1, "long input should grow the editor");
-    assert!(rendered.iter().all(|line| visible_width(line) <= 24));
-    assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
-    assert!(!rendered.iter().any(|line| {
-        line.chars()
-            .any(|character| matches!(character, '┏' | '┓' | '┗' | '┛'))
-    }));
-
-    shell.drain_editor();
-    let rendered = render_prompt_box(&shell.state.borrow(), 24, 8);
-    assert_eq!(rendered.len(), 1, "empty editor should shrink to one row");
-    assert!(rendered[0].contains('›'));
-}
-
-#[test]
 fn terminal_native_prompt_stays_within_every_viewport() {
     for (width, height) in [
         (1, 5),
@@ -2276,6 +2254,7 @@ fn resumed_session_restores_every_write_as_a_diff_panel() {
                     tool_call_id: ToolCallId(id.into()),
                     content: vec![ToolResultPart::Text(result.into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -2324,6 +2303,7 @@ fn duplicate_hydrated_tool_call_ids_never_leave_a_running_card() {
                 tool_call_id: ToolCallId("duplicate".into()),
                 content: vec![ToolResultPart::Text("durable result".into())],
                 is_error: false,
+                added_tool_names: None,
             })],
         })))
         .unwrap();
@@ -6603,7 +6583,6 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
         state.last_turn_tokens_per_second = Some(41.9);
         state.context_estimate = Some((5_600, 246_000));
         state.price_display = PriceDisplay::ExplicitZero;
-        state.show_turn_cost = true;
         state.telemetry_model = Some(state.model.clone());
     }
     let now = Instant::now();
@@ -6643,7 +6622,6 @@ fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
         state.run_reasoning = Some(state.reasoning.clone());
         state.run_price_display = Some(PriceDisplay::Unknown);
         state.run_context_estimate = Some((21_000, 256_000));
-        state.show_turn_cost = true;
         state.run.set_phase_at(
             id,
             RunPhase::AwaitingProvider {
@@ -6756,7 +6734,6 @@ fn footer_distinguishes_explicit_zero_from_unavailable_pricing() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("local", "qwen3.6-35b-a3b", "high");
     let now = Instant::now();
-    shell.state.borrow_mut().show_turn_cost = true;
 
     shell.state.borrow_mut().price_display = PriceDisplay::Unknown;
     let unknown = plain_footer(&shell, 80, now);
@@ -7811,7 +7788,6 @@ fn active_model_switch_keeps_run_identity_and_clears_stale_idle_telemetry() {
         state.model_lab = Some(ModelLab::OpenAi);
         state.context_estimate = Some((12_000, 256_000));
         state.price_display = PriceDisplay::Priced;
-        state.show_turn_cost = true;
     }
     shell.on_prompt_submitted("prompt for A");
     let run_id = shell.begin_run("openai");

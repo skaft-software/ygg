@@ -42,13 +42,6 @@ pub fn composer_content_rows(terminal_rows: u16, visual_lines: usize) -> usize {
     visual_lines.max(1).min(max_rows)
 }
 
-/// When the editor has more lines than visible, this many rows are hidden
-/// and we show an overflow indicator.
-#[allow(dead_code)]
-pub fn composer_overflow_count(editor_lines: usize, visible_rows: usize) -> usize {
-    editor_lines.saturating_sub(visible_rows)
-}
-
 // ---------------------------------------------------------------------------
 // Bordered composer box
 // ---------------------------------------------------------------------------
@@ -1025,11 +1018,5 @@ mod tests {
         ] {
             assert_eq!(format_microdollars(microdollars), expected);
         }
-    }
-
-    #[test]
-    fn overflow_count() {
-        assert_eq!(composer_overflow_count(5, 3), 2);
-        assert_eq!(composer_overflow_count(3, 5), 0);
     }
 }

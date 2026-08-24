@@ -586,6 +586,7 @@ pub(crate) mod tests {
                         tool_call_id: ToolCallId(format!("call-{index}")),
                         content: vec![ToolResultPart::Text("ok".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();
@@ -634,7 +635,6 @@ pub(crate) mod tests {
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,
             cost_warning_microdollars: None,
-            show_turn_cost: false,
             max_turns: Some(40),
             show_reasoning_in_print: false,
             initial_prompt: None,
@@ -728,6 +728,7 @@ pub(crate) mod tests {
                         tool_call_id: ToolCallId(format!("call-{index}")),
                         content: vec![ToolResultPart::Text("ok".into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();

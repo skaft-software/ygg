@@ -341,17 +341,6 @@ pub fn level_from_reasoning(
     }
 }
 
-/// Levels the model can offer through the legacy model-only API. `xhigh` and
-/// `max` appear only when the model advertises them via `max_effort`; Ultra is
-/// intentionally omitted without the product's subagent observation boundary.
-#[allow(dead_code)]
-pub fn supported_levels(model: &Model) -> Vec<ThinkingLevel> {
-    supported_levels_for_model(model)
-        .into_iter()
-        .filter(|level| *level != ThinkingLevel::Ultra)
-        .collect()
-}
-
 fn supported_levels_for_model(model: &Model) -> Vec<ThinkingLevel> {
     let Some(capability) = &model.spec.capabilities.reasoning else {
         return vec![ThinkingLevel::Off];
@@ -598,7 +587,7 @@ mod tests {
             spec: Arc::new(spec),
             endpoint: base.endpoint,
         };
-        assert!(!supported_levels(&model).contains(&ThinkingLevel::Ultra));
+        assert!(!supported_levels_with_subagents(&model, false).contains(&ThinkingLevel::Ultra));
         assert!(supported_levels_with_subagents(&model, true).contains(&ThinkingLevel::Ultra));
 
         let (reasoning, mode, diagnostic) = normalize_reasoning_selection_for_model_with_subagents(
@@ -737,16 +726,16 @@ mod tests {
     #[test]
     fn supported_levels_gate_on_ceiling() {
         let high = effort_model(ReasoningEffort::High);
-        assert!(!supported_levels(&high).contains(&ThinkingLevel::Xhigh));
-        assert!(!supported_levels(&high).contains(&ThinkingLevel::Max));
+        assert!(!supported_levels_with_subagents(&high, false).contains(&ThinkingLevel::Xhigh));
+        assert!(!supported_levels_with_subagents(&high, false).contains(&ThinkingLevel::Max));
 
         let xhigh = effort_model(ReasoningEffort::Xhigh);
-        assert!(supported_levels(&xhigh).contains(&ThinkingLevel::Xhigh));
-        assert!(!supported_levels(&xhigh).contains(&ThinkingLevel::Max));
+        assert!(supported_levels_with_subagents(&xhigh, false).contains(&ThinkingLevel::Xhigh));
+        assert!(!supported_levels_with_subagents(&xhigh, false).contains(&ThinkingLevel::Max));
 
         let max = effort_model(ReasoningEffort::Max);
-        assert!(supported_levels(&max).contains(&ThinkingLevel::Xhigh));
-        assert!(supported_levels(&max).contains(&ThinkingLevel::Max));
+        assert!(supported_levels_with_subagents(&max, false).contains(&ThinkingLevel::Xhigh));
+        assert!(supported_levels_with_subagents(&max, false).contains(&ThinkingLevel::Max));
     }
 
     #[test]
@@ -757,7 +746,7 @@ mod tests {
         model.spec = Arc::new(spec);
 
         assert_eq!(
-            supported_levels(&model),
+            supported_levels_with_subagents(&model, false),
             vec![
                 ThinkingLevel::Off,
                 ThinkingLevel::Medium,
@@ -812,7 +801,7 @@ mod tests {
             max_effort: ReasoningEffort::High,
         }));
         assert_eq!(
-            supported_levels(&toggle),
+            supported_levels_with_subagents(&toggle, false),
             vec![ThinkingLevel::Off, ThinkingLevel::On]
         );
         assert_eq!(
@@ -839,7 +828,7 @@ mod tests {
             max_effort: ReasoningEffort::High,
         }));
         assert_eq!(
-            supported_levels(&levels),
+            supported_levels_with_subagents(&levels, false),
             vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::High]
         );
         assert_eq!(
@@ -859,7 +848,7 @@ mod tests {
             min_effort: ReasoningEffort::Minimal,
             max_effort: ReasoningEffort::High,
         }));
-        assert_eq!(supported_levels(&model), vec![ThinkingLevel::On]);
+        assert_eq!(supported_levels_with_subagents(&model, false), vec![ThinkingLevel::On]);
         assert_eq!(
             thinking_to_reasoning(ThinkingLevel::Off, &model).unwrap(),
             ReasoningConfig::On
@@ -892,6 +881,6 @@ mod tests {
             thinking_to_reasoning(ThinkingLevel::High, &model).unwrap(),
             ReasoningConfig::Off
         );
-        assert_eq!(supported_levels(&model), vec![ThinkingLevel::Off]);
+        assert_eq!(supported_levels_with_subagents(&model, false), vec![ThinkingLevel::Off]);
     }
 }

@@ -601,6 +601,7 @@ mod tests {
                             tool_call_id: ToolCallId("call-1".into()),
                             content: vec![ToolResultPart::Text("ok".into())],
                             is_error: false,
+                            added_tool_names: None,
                         }),
                         UserPart::Text("after".into()),
                     ],
@@ -781,6 +782,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-1".into()),
                     content: vec![ToolResultPart::Text("contents".into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -843,6 +845,7 @@ mod tests {
                     tool_call_id: ToolCallId("call-responses".into()),
                     content: vec![ToolResultPart::Text("contents".into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -923,6 +926,7 @@ mod tests {
                     tool_call_id: ToolCallId("reused".into()),
                     content: vec![ToolResultPart::Text("durable".into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();
@@ -967,6 +971,7 @@ mod tests {
                     tool_call_id: ToolCallId("duplicate".into()),
                     content: vec![ToolResultPart::Text("one durable result".into())],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();

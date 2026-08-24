@@ -643,6 +643,7 @@ fn scripted_model(uri: &str) -> Model {
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: false,
+                deferred_tool_loading: false,
             },
             limits: ModelLimits {
                 context_window: 200_000,
@@ -5044,9 +5045,7 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
         .iter()
         .filter_map(|event| match event {
             AgentEvent::ToolFinished {
-                id,
-                result: Ok(_),
-                ..
+                id, result: Ok(_), ..
             } => Some(id.0.as_str()),
             _ => None,
         })

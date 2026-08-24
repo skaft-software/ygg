@@ -72,6 +72,7 @@ fn make_model(
             responses_lite: false,
             agent_delegation: None,
             structured_output: true,
+            deferred_tool_loading: false,
         },
         limits: ModelLimits {
             context_window: 10000,
@@ -116,6 +117,7 @@ fn test_cross_protocol_canonical_immutability() {
         tool_call_id: ToolCallId("call_1".to_string()),
         content: vec![ToolResultPart::Text("done".to_string())],
         is_error: false,
+        added_tool_names: None,
     };
 
     let assistant_reasoning = AssistantPart::Reasoning(ReasoningPart {

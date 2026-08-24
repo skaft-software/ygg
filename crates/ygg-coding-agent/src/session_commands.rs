@@ -1214,6 +1214,7 @@ mod tests {
                         "Authorization: Bearer {result_secret}"
                     ))],
                     is_error: false,
+                    added_tool_names: None,
                 })],
             })))
             .unwrap();

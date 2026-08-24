@@ -152,6 +152,7 @@ fn convert_utc_offset(bytes: &mut [u8]) {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct DateTime(String);
 
 impl Object {

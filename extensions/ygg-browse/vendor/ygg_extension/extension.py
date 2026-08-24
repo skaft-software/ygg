@@ -1281,16 +1281,16 @@ class Extension:
         tools: Sequence[str],
         max_depth: int,
         max_concurrent_children: int,
-        max_turns: int,
+        max_turns: Optional[int] = None,
         max_tokens: Optional[int] = None,
-        max_cost_microdollars: int,
+        max_cost_microdollars: Optional[int] = None,
         max_output_bytes: int,
-        timeout_ms: int,
+        timeout_ms: Optional[int] = None,
         profile: Optional[str] = None,
         fingerprint: Optional[str] = None,
         parent_request_id: Any = _MISSING,
     ) -> dict[str, Any]:
-        """Create a host-bounded read-only child owned by the active request."""
+        """Create a host-bounded child owned by the active request; omitted ceilings inherit the parent session's limits."""
 
         if not isinstance(task_name, str) or not task_name.strip():
             raise ValueError("agent task_name must be non-empty")
@@ -1319,19 +1319,20 @@ class Extension:
             isinstance(tools, (str, bytes, bytearray))
             or not isinstance(tools, Sequence)
             or not tools
-            or len(tools) > 2
+            or len(tools) > 5
             or any(not isinstance(tool, str) for tool in tools)
             or len(set(tools)) != len(tools)
-            or any(tool not in {"read", "search"} for tool in tools)
+            or any(
+                tool not in {"read", "search", "edit", "write", "bash"} for tool in tools
+            )
         ):
-            raise ValueError("agent tools must be a duplicate-free subset of read and search")
+            raise ValueError(
+                "agent tools must be a duplicate-free subset of read, search, edit, write, and bash"
+            )
         integer_limits = {
             "max_depth": (max_depth, 1, 1),
-            "max_concurrent_children": (max_concurrent_children, 1, 2),
-            "max_turns": (max_turns, 1, 12),
-            "max_cost_microdollars": (max_cost_microdollars, 1, 500_000),
+            "max_concurrent_children": (max_concurrent_children, 1, 8),
             "max_output_bytes": (max_output_bytes, 512, 16 * 1024),
-            "timeout_ms": (timeout_ms, 5_000, 15 * 60 * 1_000),
         }
         for name, (value, minimum, maximum) in integer_limits.items():
             if (
@@ -1341,6 +1342,22 @@ class Extension:
             ):
                 raise ValueError(
                     f"agent {name} must be an integer between {minimum} and {maximum}"
+                )
+        optional_limits = {
+            "max_turns": (max_turns, 1, 256),
+            "max_cost_microdollars": (max_cost_microdollars, 1, 50_000_000),
+            "timeout_ms": (timeout_ms, 5_000, 24 * 60 * 60 * 1_000),
+        }
+        for name, (value, minimum, maximum) in optional_limits.items():
+            if value is None:
+                continue
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or not minimum <= value <= maximum
+            ):
+                raise ValueError(
+                    f"agent {name} must be null or an integer between {minimum} and {maximum}"
                 )
         if max_tokens is not None and (
             not isinstance(max_tokens, int)

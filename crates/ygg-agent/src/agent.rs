@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -14,22 +14,21 @@ use tokio::sync::mpsc;
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
-    OutputModalities, PICODOLLARS_PER_MICRODOLLAR, Protocol, ReasoningConfig, ReasoningMode,
-    Request, ResponsesCompactRequest, ResponsesInput, ResponsesOptions, ResponsesReplayItem,
-    StopReason, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
-    UserMessage, UserPart,
+    OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest,
+    ResponsesInput, ResponsesOptions, ResponsesReplayItem, StopReason, StreamEvent, ToolCall,
+    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
-    DEFAULT_KEEP_RECENT_TOKENS, HandoffPreparation, SUMMARIZATION_SYSTEM_PROMPT,
-    SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS, build_handoff_message,
-    build_turn_prefix_handoff_message, choose_first_kept_by_tokens, finish_handoff,
-    prepare_handoff,
+    build_handoff_message, build_turn_prefix_handoff_message, choose_first_kept_by_tokens,
+    finish_handoff, prepare_handoff, HandoffPreparation, DEFAULT_KEEP_RECENT_TOKENS,
+    SUMMARIZATION_SYSTEM_PROMPT, SUMMARY_OUTPUT_TOKENS, TURN_PREFIX_OUTPUT_TOKENS,
 };
 use crate::context::{ContextBreakdown, ContextSnapshot, ContextTracker};
 use crate::delegation::{
-    DelegationBinding, DelegationConfig, DelegationError, DelegationRuntimeSettings,
-    DelegationTemplate, enable_root_delegation,
+    enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
+    DelegationRuntimeSettings, DelegationTemplate,
 };
 use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
 use crate::events::{
@@ -37,7 +36,7 @@ use crate::events::{
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
-use crate::extension_process::{EXTENSION_FEATURE_AGENT_SESSIONS, ExtensionProcess};
+use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
@@ -46,9 +45,9 @@ use crate::session::{
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
-    CancellationToken, PROGRESS_CHANNEL_CAPACITY, ReplaySafety, Tool, ToolConcurrency, ToolContext,
-    ToolError, ToolOutput, ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind,
-    ToolProgress, ToolProgressSink,
+    CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress, ToolProgressSink,
+    PROGRESS_CHANNEL_CAPACITY,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -1641,6 +1640,7 @@ fn lower_tool_result(
     result: &Result<ToolOutput, ToolError>,
     model: &Model,
     text_limit: usize,
+    added_tool_names: Vec<String>,
 ) -> (
     UserMessage,
     Vec<ToolOutputMediaKind>,
@@ -1719,6 +1719,7 @@ fn lower_tool_result(
         tool_call_id: call_id,
         content: result_parts,
         is_error: effective_is_error,
+        added_tool_names: (!added_tool_names.is_empty()).then_some(added_tool_names),
     }));
     content.extend(adjacent_media.into_iter().map(UserPart::Media));
     (
@@ -1744,6 +1745,7 @@ fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError
                 tool_call_id: call.id,
                 content: vec![ToolResultPart::Text(text)],
                 is_error: true,
+                added_tool_names: None,
             })],
         })))?;
     }
@@ -2614,6 +2616,147 @@ fn observe_context_tracker(
     Ok(breakdown)
 }
 
+/// Which queue a batch of control inputs came from; only the announced event
+/// differs between steering and follow-up delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlDeliveryKind {
+    Steering,
+    FollowUp,
+}
+
+impl ControlDeliveryKind {
+    fn delivered_event(self, messages: Vec<String>) -> AgentEvent {
+        match self {
+            Self::Steering => AgentEvent::SteeringDelivered { messages },
+            Self::FollowUp => AgentEvent::FollowUpDelivered { messages },
+        }
+    }
+}
+
+/// Outcome of appending one queued control-input batch (steering or
+/// follow-up) to the session.
+enum ControlDelivery {
+    /// Every input was appended; announce them with this event when present.
+    Completed { event: Option<AgentEvent> },
+    /// Persistence failed. Any prefix that did reach the session is announced
+    /// by `event`; the run must then end with `finish`.
+    Interrupted {
+        event: Option<AgentEvent>,
+        finish: FinishReason,
+    },
+}
+
+/// Snapshot of everything `observe_context_tracker` needs to re-observe the
+/// tracker after control inputs change the session.
+struct ContextObservation<'a> {
+    tracker: &'a ContextTracker,
+    model: &'a Model,
+    system: &'a str,
+    tools: &'a [ToolDef],
+}
+
+impl ContextObservation<'_> {
+    fn observe(&self, session: &Session) -> Result<ContextBreakdown, SessionError> {
+        observe_context_tracker(self.tracker, session, self.model, self.system, self.tools)
+    }
+}
+
+/// Result of applying one drained tool-progress item to the run.
+enum ProgressSettlement {
+    /// Cancellation took precedence before the item was accepted; semantic
+    /// state was discarded and the caller must stop accepting progress.
+    Cancelled,
+    /// Consumed internally as a durable session event (persisted, or its
+    /// reply resolved with the persistence error).
+    Settled,
+    /// Pure progress; surface it to observers as a `ToolProgress` event.
+    Emit(ToolProgress),
+}
+
+/// Apply one drained tool-progress item.
+///
+/// When `cancelled` won, any queued session event is rejected through its
+/// reply channel without touching the session. Otherwise a session event is
+/// appended durably and acknowledged; every other progress flavor is returned
+/// for the caller to emit.
+fn settle_tool_progress(
+    p: ToolProgress,
+    cancelled: bool,
+    session: &mut Session,
+) -> ProgressSettlement {
+    if cancelled {
+        // The biased select deliberately gives cancellation
+        // precedence. Events already accepted in the loop
+        // remain durable, but a queued semantic event must
+        // not take effect after the tool was reported as
+        // cancelled (notably, it must not activate a skill).
+        if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
+            if let Ok(mut opt) = reply_tx_mutex.lock() {
+                if let Some(reply_tx) = opt.take() {
+                    let _ =
+                        reply_tx.send(Err("session event discarded because cancellation won".to_string()));
+                }
+            }
+        }
+        return ProgressSettlement::Cancelled;
+    }
+    if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
+        let res = session.append(*event);
+        if let Ok(mut opt) = reply_tx_mutex.lock() {
+            if let Some(reply_tx) = opt.take() {
+                let _ = reply_tx.send(res.map_err(|e| e.to_string()));
+            }
+        }
+        ProgressSettlement::Settled
+    } else {
+        ProgressSettlement::Emit(p)
+    }
+}
+
+/// Append a batch of already-queued control inputs as durable user messages
+/// and report what was delivered.
+///
+/// Each summary is recorded for the terminal gate before its append is
+/// attempted, mirroring the original inline blocks. On append failure the
+/// context tracker is still observed (its error ignored) so observers see the
+/// partial delivery before the run ends.
+fn deliver_control_inputs(
+    queued: Vec<UserInput>,
+    kind: ControlDeliveryKind,
+    session: &mut Session,
+    metadata: &EntryMetadata,
+    terminal_gate_requests: &mut Vec<String>,
+    observation: &ContextObservation<'_>,
+) -> ControlDelivery {
+    let mut delivered = Vec::with_capacity(queued.len());
+    for input in queued {
+        let summary = input.text_summary();
+        terminal_gate_requests.push(summary.clone());
+        if let Err(e) = session.append_with_metadata(user_message(input), Some(metadata.clone())) {
+            let event = (!delivered.is_empty())
+                .then(|| kind.delivered_event(std::mem::take(&mut delivered)));
+            let _ = observation.observe(session);
+            return ControlDelivery::Interrupted {
+                event,
+                finish: FinishReason::Failed(e.into()),
+            };
+        }
+        delivered.push(summary);
+    }
+    if !delivered.is_empty() {
+        if let Err(error) = observation.observe(session) {
+            return ControlDelivery::Interrupted {
+                event: None,
+                finish: FinishReason::Failed(error.into()),
+            };
+        }
+        return ControlDelivery::Completed {
+            event: Some(kind.delivered_event(delivered)),
+        };
+    }
+    ControlDelivery::Completed { event: None }
+}
+
 fn worst_case_request_cost(model: &Model, input_tokens: u64, output_tokens: u64) -> Option<u64> {
     let pricing = model.spec.pricing.as_ref()?;
     let mut input_rate = pricing
@@ -2804,49 +2947,6 @@ impl PreparedTurn {
 }
 
 impl<'a> CompactionContext<'a> {
-    #[allow(clippy::too_many_arguments)] // Mirrors the borrowed request-run state held by the context.
-    fn new(
-        client: &'a AiClient,
-        model: &'a Model,
-        compaction_model: &'a Model,
-        session: &'a mut Session,
-        usage: &'a mut Usage,
-        run_cost: &'a mut CostAccumulator,
-        cache_retention: CacheRetention,
-        reasoning: &'a ReasoningConfig,
-        reasoning_mode: ReasoningMode,
-        session_id: &'a str,
-        max_session_tokens: Option<u64>,
-        max_session_cost_microdollars: Option<u64>,
-        abort: &'a AbortFlag,
-        mode: AgentCompactionMode,
-        threshold_fraction: f64,
-        keep_recent_tokens: u64,
-        events: &'a mpsc::UnboundedSender<AgentEvent>,
-        context: &'a ContextTracker,
-    ) -> Self {
-        Self {
-            client,
-            model,
-            compaction_model,
-            session,
-            usage,
-            run_cost,
-            cache_retention,
-            reasoning,
-            reasoning_mode,
-            session_id,
-            max_session_tokens,
-            max_session_cost_microdollars,
-            abort,
-            mode,
-            threshold_fraction,
-            keep_recent_tokens,
-            events,
-            context,
-        }
-    }
-
     async fn call(
         &mut self,
         system: &str,
@@ -4200,8 +4300,13 @@ impl Agent {
                     ))),
                 }
             };
-            let (message, _, _, _, details) =
-                lower_tool_result(call.id, &result, &self.model, sandbox.max_output_bytes);
+            let (message, _, _, _, details) = lower_tool_result(
+                call.id,
+                &result,
+                &self.model,
+                sandbox.max_output_bytes,
+                Vec::new(),
+            );
             self.session.append_with_metadata(
                 EntryValue::Message(Message::User(message)),
                 details.map(|tool_output| EntryMetadata {
@@ -4350,6 +4455,10 @@ impl Agent {
             }
             let mut registered_tools = tool_map.keys().cloned().collect::<Vec<_>>();
             registered_tools.sort();
+            // Tool names already visible to the provider either as static
+            // schemas or via an earlier `added_tool_names` announcement.
+            let mut announced_tools: std::collections::HashSet<String> =
+                registered_tools.iter().cloned().collect();
 
             let mut pending_steer: Vec<UserInput> = Vec::new();
             let mut followups: VecDeque<UserInput> = VecDeque::new();
@@ -4393,47 +4502,33 @@ impl Agent {
                         QueueDeliveryMode::All => std::mem::take(&mut pending_steer),
                         QueueDeliveryMode::OneAtATime => vec![pending_steer.remove(0)],
                     };
-                    let mut delivered = Vec::with_capacity(queued.len());
-                    for input in queued {
-                        let summary = input.text_summary();
-                        terminal_gate_requests.push(summary.clone());
-                        if let Err(e) = session.append_with_metadata(
-                            user_message(input),
-                            Some(control_prompt_metadata.clone()),
-                        ) {
-                            if !delivered.is_empty() {
-                                let _ = observe_context_tracker(
-                                    &stream_context,
-                                    session,
-                                    &model,
-                                    &system,
-                                    &tool_defs,
-                                );
-                                let ev = AgentEvent::SteeringDelivered {
-                                    messages: delivered,
-                                };
+                    let observation = ContextObservation {
+                        tracker: &stream_context,
+                        model: &model,
+                        system: &system,
+                        tools: &tool_defs,
+                    };
+                    match deliver_control_inputs(
+                        queued,
+                        ControlDeliveryKind::Steering,
+                        session,
+                        &control_prompt_metadata,
+                        &mut terminal_gate_requests,
+                        &observation,
+                    ) {
+                        ControlDelivery::Completed { event } => {
+                            if let Some(ev) = event {
                                 notify_observers(&observers, &ev);
                                 yield ev;
                             }
-                            break 'run FinishReason::Failed(e.into());
                         }
-                        delivered.push(summary);
-                    }
-                    if !delivered.is_empty() {
-                        if let Err(error) = observe_context_tracker(
-                            &stream_context,
-                            session,
-                            &model,
-                            &system,
-                            &tool_defs,
-                        ) {
-                            break 'run FinishReason::Failed(error.into());
+                        ControlDelivery::Interrupted { event, finish } => {
+                            if let Some(ev) = event {
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                            }
+                            break 'run finish;
                         }
-                        let ev = AgentEvent::SteeringDelivered {
-                            messages: delivered,
-                        };
-                        notify_observers(&observers, &ev);
-                        yield ev;
                     }
                 }
 
@@ -4463,6 +4558,7 @@ impl Agent {
                     }
                     registered_tools = tool_map.keys().cloned().collect();
                     registered_tools.sort();
+                    announced_tools.extend(registered_tools.iter().cloned());
                 }
                 let request_tool_defs = tool_defs.clone();
 
@@ -4472,26 +4568,26 @@ impl Agent {
                 let (compaction_event_tx, mut compaction_event_rx) =
                     mpsc::unbounded_channel::<AgentEvent>();
                 let capacity = {
-                    let mut compaction = CompactionContext::new(
-                        &client,
-                        &model,
-                        &compaction_model,
+                    let mut compaction = CompactionContext {
+                        client: &client,
+                        model: &model,
+                        compaction_model: &compaction_model,
                         session,
-                        &mut run_usage,
-                        &mut run_cost,
+                        usage: &mut run_usage,
+                        run_cost: &mut run_cost,
                         cache_retention,
-                        &reasoning,
+                        reasoning: &reasoning,
                         reasoning_mode,
-                        &session_id,
+                        session_id: &session_id,
                         max_session_tokens,
                         max_session_cost_microdollars,
-                        &abort,
-                        auto_compaction_mode,
-                        compaction_threshold_fraction,
-                        compaction_keep_recent_tokens,
-                        &compaction_event_tx,
-                        &stream_context,
-                    );
+                        abort: &abort,
+                        mode: auto_compaction_mode,
+                        threshold_fraction: compaction_threshold_fraction,
+                        keep_recent_tokens: compaction_keep_recent_tokens,
+                        events: &compaction_event_tx,
+                        context: &stream_context,
+                    };
                     let operation = compaction
                         .ensure_capacity(&system, &request_tool_defs, max_output_tokens);
                     tokio::pin!(operation);
@@ -4638,26 +4734,26 @@ impl Agent {
                     Err(error) if context_retries < MAX_PROVIDER_RETRIES && looks_like_context_error(&error) => {
                         context_retries += 1;
                         let compacted = {
-                            let mut compaction = CompactionContext::new(
-                                &client,
-                                &model,
-                                &compaction_model,
+                            let mut compaction = CompactionContext {
+                                client: &client,
+                                model: &model,
+                                compaction_model: &compaction_model,
                                 session,
-                                &mut run_usage,
-                                &mut run_cost,
+                                usage: &mut run_usage,
+                                run_cost: &mut run_cost,
                                 cache_retention,
-                                &reasoning,
+                                reasoning: &reasoning,
                                 reasoning_mode,
-                                &session_id,
+                                session_id: &session_id,
                                 max_session_tokens,
                                 max_session_cost_microdollars,
-                                &abort,
-                                auto_compaction_mode,
-                                compaction_threshold_fraction,
-                                compaction_keep_recent_tokens,
-                                &compaction_event_tx,
-                                &stream_context,
-                            );
+                                abort: &abort,
+                                mode: auto_compaction_mode,
+                                threshold_fraction: compaction_threshold_fraction,
+                                keep_recent_tokens: compaction_keep_recent_tokens,
+                                events: &compaction_event_tx,
+                                context: &stream_context,
+                            };
                             let operation = compaction.force_one_boundary(
                                 &system,
                                 &request_tool_defs,
@@ -4790,26 +4886,26 @@ impl Agent {
                                 stream_context.provider_retry();
                                 context_retries += 1;
                                 let compacted = {
-                                    let mut compaction = CompactionContext::new(
-                                        &client,
-                                        &model,
-                                        &compaction_model,
+                                    let mut compaction = CompactionContext {
+                                        client: &client,
+                                        model: &model,
+                                        compaction_model: &compaction_model,
                                         session,
-                                        &mut run_usage,
-                                        &mut run_cost,
+                                        usage: &mut run_usage,
+                                        run_cost: &mut run_cost,
                                         cache_retention,
-                                        &reasoning,
+                                        reasoning: &reasoning,
                                         reasoning_mode,
-                                        &session_id,
+                                        session_id: &session_id,
                                         max_session_tokens,
                                         max_session_cost_microdollars,
-                                        &abort,
-                                        auto_compaction_mode,
-                                        compaction_threshold_fraction,
-                                        compaction_keep_recent_tokens,
-                                        &compaction_event_tx,
-                                        &stream_context,
-                                    );
+                                        abort: &abort,
+                                        mode: auto_compaction_mode,
+                                        threshold_fraction: compaction_threshold_fraction,
+                                        keep_recent_tokens: compaction_keep_recent_tokens,
+                                        events: &compaction_event_tx,
+                                        context: &stream_context,
+                                    };
                                     let operation = compaction.force_one_boundary(
                                         &system,
                                         &request_tool_defs,
@@ -5175,47 +5271,33 @@ impl Agent {
                                 vec![followups.pop_front().expect("follow-up queue is non-empty")]
                             }
                         };
-                        let mut delivered = Vec::with_capacity(queued.len());
-                        for input in queued {
-                            let summary = input.text_summary();
-                            terminal_gate_requests.push(summary.clone());
-                            if let Err(e) = session.append_with_metadata(
-                                user_message(input),
-                                Some(control_prompt_metadata.clone()),
-                            ) {
-                                if !delivered.is_empty() {
-                                    let _ = observe_context_tracker(
-                                        &stream_context,
-                                        session,
-                                        &model,
-                                        &system,
-                                        &tool_defs,
-                                    );
-                                    let ev = AgentEvent::FollowUpDelivered {
-                                        messages: delivered,
-                                    };
+                        let observation = ContextObservation {
+                            tracker: &stream_context,
+                            model: &model,
+                            system: &system,
+                            tools: &tool_defs,
+                        };
+                        match deliver_control_inputs(
+                            queued,
+                            ControlDeliveryKind::FollowUp,
+                            session,
+                            &control_prompt_metadata,
+                            &mut terminal_gate_requests,
+                            &observation,
+                        ) {
+                            ControlDelivery::Completed { event } => {
+                                if let Some(ev) = event {
                                     notify_observers(&observers, &ev);
                                     yield ev;
                                 }
-                                break 'run FinishReason::Failed(e.into());
                             }
-                            delivered.push(summary);
-                        }
-                        if !delivered.is_empty() {
-                            if let Err(error) = observe_context_tracker(
-                                &stream_context,
-                                session,
-                                &model,
-                                &system,
-                                &tool_defs,
-                            ) {
-                                break 'run FinishReason::Failed(error.into());
+                            ControlDelivery::Interrupted { event, finish } => {
+                                if let Some(ev) = event {
+                                    notify_observers(&observers, &ev);
+                                    yield ev;
+                                }
+                                break 'run finish;
                             }
-                            let ev = AgentEvent::FollowUpDelivered {
-                                messages: delivered,
-                            };
-                            notify_observers(&observers, &ev);
-                            yield ev;
                         }
                         continue;
                     }
@@ -5543,32 +5625,17 @@ impl Agent {
                                                 // trigger cancellation during the same select poll,
                                                 // after the biased abort branch was already checked.
                                                 // Recheck before accepting semantic state.
-                                                if abort.is_set() {
-                                                    if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
-                                                        if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                                            if let Some(reply_tx) = opt.take() {
-                                                                let _ = reply_tx.send(Err(
-                                                                    "session event discarded because cancellation won".to_string()
-                                                                ));
-                                                            }
-                                                        }
+                                                match settle_tool_progress(p, abort.is_set(), session) {
+                                                    ProgressSettlement::Cancelled => break None,
+                                                    ProgressSettlement::Settled => {}
+                                                    ProgressSettlement::Emit(p) => {
+                                                        let ev = AgentEvent::ToolProgress {
+                                                            id: call.id.clone(),
+                                                            progress: p,
+                                                        };
+                                                        notify_observers(&observers, &ev);
+                                                        yield ev;
                                                     }
-                                                    break None;
-                                                }
-                                                if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
-                                                    let res = session.append(*event);
-                                                    if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                                        if let Some(reply_tx) = opt.take() {
-                                                            let _ = reply_tx.send(res.map_err(|e| e.to_string()));
-                                                        }
-                                                    }
-                                                } else {
-                                                    let ev = AgentEvent::ToolProgress {
-                                                        id: call.id.clone(),
-                                                        progress: p,
-                                                    };
-                                                    notify_observers(&observers, &ev);
-                                                    yield ev;
                                                 }
                                             }
                                         },
@@ -5649,11 +5716,24 @@ impl Agent {
                     // A large early result must never starve later successful
                     // calls in the same model turn. Structured media is lowered
                     // only when the active model/protocol can replay it safely.
+                    // Announce tools that appeared as a consequence of this
+                    // execution (extension/MCP registrations). Later requests
+                    // exclude announced schemas under deferred tool loading.
+                    let (_, snapshot_tools) = extension_host.tool_snapshot();
+                    let newly_added: Vec<String> = snapshot_tools
+                        .iter()
+                        .map(|tool| tool.definition().name)
+                        .filter(|name| !announced_tools.contains(name))
+                        .collect();
+                    if !newly_added.is_empty() {
+                        announced_tools.extend(newly_added.iter().cloned());
+                    }
                     let (message, accepted_media, text, is_error, details) = lower_tool_result(
                         call.id.clone(),
                         &result,
                         &model,
                         sandbox.max_output_bytes,
+                        newly_added,
                     );
                     terminal_action_receipts.push(TerminalActionReceipt {
                         tool: call.name.clone(),
@@ -5679,38 +5759,17 @@ impl Agent {
 
                     // ── Drain accepted progress before ToolFinished ───────
                     while let Ok(p) = progress_rx.try_recv() {
-                        if cancellation_won {
-                            // The biased select deliberately gives cancellation
-                            // precedence. Events already accepted in the loop
-                            // remain durable, but a queued semantic event must
-                            // not take effect after the tool was reported as
-                            // cancelled (notably, it must not activate a skill).
-                            if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
-                                if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                    if let Some(reply_tx) = opt.take() {
-                                        let _ = reply_tx.send(Err(
-                                            "session event discarded because cancellation won"
-                                                .to_string(),
-                                        ));
-                                    }
-                                }
+                        match settle_tool_progress(p, cancellation_won, session) {
+                            ProgressSettlement::Cancelled => continue,
+                            ProgressSettlement::Settled => {}
+                            ProgressSettlement::Emit(p) => {
+                                let ev = AgentEvent::ToolProgress {
+                                    id: call.id.clone(),
+                                    progress: p,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
                             }
-                            continue;
-                        }
-                        if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
-                            let res = session.append(*event);
-                            if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                if let Some(reply_tx) = opt.take() {
-                                    let _ = reply_tx.send(res.map_err(|e| e.to_string()));
-                                }
-                            }
-                        } else {
-                            let ev = AgentEvent::ToolProgress {
-                                id: call.id.clone(),
-                                progress: p,
-                            };
-                            notify_observers(&observers, &ev);
-                            yield ev;
                         }
                     }
                     // Report dropped progress if any.
@@ -6002,12 +6061,10 @@ mod tests {
             CancellationToken::default(),
         );
         let authoritative = serde_json::json!({ "command": "ls" });
-        assert!(
-            speculative
-                .take_matched(&id, Some(&authoritative))
-                .await
-                .is_none()
-        );
+        assert!(speculative
+            .take_matched(&id, Some(&authoritative))
+            .await
+            .is_none());
     }
     #[test]
     fn provisional_delivery_rolls_back_when_generic_tool_output_limiting_truncates_it() {
@@ -6025,8 +6082,13 @@ mod tests {
             .unwrap()
             .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
             .unwrap();
-        let (_, _, persisted_text, _, _) =
-            lower_tool_result(ygg_ai::ToolCallId("delivery".into()), &result, &model, 32);
+        let (_, _, persisted_text, _, _) = lower_tool_result(
+            ygg_ai::ToolCallId("delivery".into()),
+            &result,
+            &model,
+            32,
+            Vec::new(),
+        );
         assert_ne!(persisted_text, result.as_ref().unwrap().text);
         assert!(persisted_text.len() <= 32);
 
@@ -6326,8 +6388,13 @@ mod tests {
             bytes::Bytes::from_static(b"png"),
             "image/png".parse().unwrap(),
         )));
-        let (message, accepted, _, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+        let (message, accepted, _, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &result,
+            &model,
+            4096,
+            Vec::new(),
+        );
         assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
         assert!(!is_error);
         assert_eq!(message.content.len(), 1);
@@ -6362,6 +6429,7 @@ mod tests {
                 &result,
                 &model,
                 text_limit,
+                Vec::new(),
             );
 
             assert_eq!(accepted, vec![ToolOutputMediaKind::Image]);
@@ -6405,8 +6473,13 @@ mod tests {
                 Some(serde_json::json!({"cache": "miss"})),
             )
             .unwrap());
-        let (message, _, _, is_error, details) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+        let (message, _, _, is_error, details) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &result,
+            &model,
+            4096,
+            Vec::new(),
+        );
 
         assert!(!is_error);
         let details = details.expect("durable details");
@@ -6439,8 +6512,13 @@ mod tests {
                 bytes::Bytes::from_static(b"audio"),
                 format,
             )));
-            let (message, accepted, _, is_error, _) =
-                lower_tool_result(ygg_ai::ToolCallId("call".into()), &result, &model, 4096);
+            let (message, accepted, _, is_error, _) = lower_tool_result(
+                ygg_ai::ToolCallId("call".into()),
+                &result,
+                &model,
+                4096,
+                Vec::new(),
+            );
             assert_eq!(accepted, vec![ToolOutputMediaKind::Audio]);
             assert!(!is_error);
             assert!(matches!(message.content[0], UserPart::ToolResult(_)));
@@ -6461,8 +6539,13 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Wav,
         )));
-        let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &audio, &responses, 4096);
+        let (message, accepted, text, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &audio,
+            &responses,
+            4096,
+            Vec::new(),
+        );
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("protocol cannot replay audio"));
@@ -6476,8 +6559,13 @@ mod tests {
             bytes::Bytes::from_static(b"audio"),
             ygg_ai::AudioFormat::Aac,
         )));
-        let (message, accepted, text, is_error, _) =
-            lower_tool_result(ygg_ai::ToolCallId("call".into()), &aac, &chat, 4096);
+        let (message, accepted, text, is_error, _) = lower_tool_result(
+            ygg_ai::ToolCallId("call".into()),
+            &aac,
+            &chat,
+            4096,
+            Vec::new(),
+        );
         assert!(accepted.is_empty());
         assert!(is_error);
         assert!(text.contains("accepts WAV or MP3"));
@@ -6509,15 +6597,13 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "reasoning",
-                        "id": "rs_large",
-                        "encrypted_content": "x".repeat(40_000),
-                        "unknown": {"phase": "analysis"}
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "reasoning",
+                    "id": "rs_large",
+                    "encrypted_content": "x".repeat(40_000),
+                    "unknown": {"phase": "analysis"}
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
@@ -6567,27 +6653,23 @@ mod tests {
                 assistant,
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "message",
-                        "id": "old-output"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "message",
+                    "id": "old-output"
+                }))
+                .unwrap()]),
             )
             .unwrap();
         session
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "compaction",
-                        "id": "small-checkpoint",
-                        "encrypted_content": "opaque"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "id": "small-checkpoint",
+                    "encrypted_content": "opaque"
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
@@ -6656,13 +6738,11 @@ mod tests {
             .append_responses_compaction(
                 model.endpoint.id.clone(),
                 model.spec.id.clone(),
-                ResponsesOutput::new(vec![
-                    ResponsesItem::new(serde_json::json!({
-                        "type": "compaction",
-                        "encrypted_content": "small"
-                    }))
-                    .unwrap(),
-                ]),
+                ResponsesOutput::new(vec![ResponsesItem::new(serde_json::json!({
+                    "type": "compaction",
+                    "encrypted_content": "small"
+                }))
+                .unwrap()]),
             )
             .unwrap();
 
@@ -6931,6 +7011,7 @@ mod tests {
                         tool_call_id: ygg_ai::ToolCallId(index.into()),
                         content: vec![ToolResultPart::Text(text.into())],
                         is_error: false,
+                        added_tool_names: None,
                     })],
                 })))
                 .unwrap();
