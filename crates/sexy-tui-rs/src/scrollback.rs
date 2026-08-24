@@ -1,7 +1,7 @@
 //! Terminal-owned scrollback reset and replay policy.
 
 use crate::terminal::Terminal;
-use crate::terminal_image::delete_all_kitty_images;
+use crate::tui::delete_all_kitty_images;
 
 /// Destructively replace the terminal's screen and saved lines, then replay the
 /// application-owned rows. The caller brackets this operation in synchronized

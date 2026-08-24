@@ -1974,7 +1974,6 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "serde",
- "serde_json",
  "syntect",
  "tempfile",
  "toml",

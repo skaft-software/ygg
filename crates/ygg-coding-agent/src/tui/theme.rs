@@ -4,10 +4,8 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use sexy_tui_rs::theme::{capability::CapabilityTier, Theme as SexyTheme};
-use sexy_tui_rs::widgets::SelectListTheme;
 use sexy_tui_rs::{
     CapabilityOverrides, CodeOverflow, Color, RenderOptions, RichRenderer, SupportLevel, TextRole,
     TextStyle, UnorderedListMarker,
@@ -1501,18 +1499,6 @@ pub(crate) fn test_bundled_theme_with(
 }
 
 #[cfg(test)]
-fn foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.fg(token, text))
-}
-
-#[cfg(test)]
-fn bold_foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.bold(&theme.fg(token, text)))
-}
-
-#[cfg(test)]
 fn project_theme_dir(config: &Config) -> PathBuf {
     config.workspace.join(".ygg").join("themes")
 }
@@ -2061,54 +2047,6 @@ pub(crate) fn apply_model_lab(theme: &mut YggTheme, lab: ModelLab) {
     apply_model_lab_for(theme, lab, background);
 }
 
-/// Build sexy-tui's select-list closures from the current model theme.
-#[cfg(test)]
-pub fn select_list_theme(theme: &YggTheme) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: foreground(theme, "model_accent"),
-        selected_text: bold_foreground(theme, "model_accent"),
-        description: foreground(theme, "muted"),
-        scroll_info: foreground(theme, "muted"),
-        no_match: foreground(theme, "error"),
-    }
-}
-
-#[allow(dead_code)]
-fn shared_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        theme
-            .lock()
-            .expect("picker theme mutex poisoned")
-            .fg(token, text)
-    })
-}
-
-#[allow(dead_code)]
-fn shared_bold_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        let theme = theme.lock().expect("picker theme mutex poisoned");
-        theme.bold(&theme.fg(token, text))
-    })
-}
-
-/// A picker theme whose model accent can change as selection moves.
-#[allow(dead_code)]
-pub fn dynamic_select_list_theme(theme: Arc<Mutex<YggTheme>>) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: shared_foreground(theme.clone(), "model_accent"),
-        selected_text: shared_bold_foreground(theme.clone(), "model_accent"),
-        description: shared_foreground(theme.clone(), "muted"),
-        scroll_info: shared_foreground(theme.clone(), "muted"),
-        no_match: shared_foreground(theme, "error"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2166,13 +2104,6 @@ mod tests {
             (right, left)
         };
         (relative_luminance(light) + 0.05) / (relative_luminance(dark) + 0.05)
-    }
-
-    #[test]
-    fn select_list_theme_builds_and_preserves_text() {
-        let theme = select_list_theme(&test_theme());
-        assert!((theme.selected_text)("x").contains('x'));
-        assert!((theme.no_match)("x").contains('x'));
     }
 
     #[test]
