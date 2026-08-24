@@ -2947,7 +2947,7 @@ impl PreparedTurn {
     }
 }
 
-impl<'a> CompactionContext<'a> {
+impl CompactionContext<'_> {
     async fn call(
         &mut self,
         system: &str,
