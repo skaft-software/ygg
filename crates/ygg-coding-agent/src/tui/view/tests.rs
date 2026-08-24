@@ -12,6 +12,7 @@ use super::*;
 use crate::commands;
 use crate::presentation::RunPhase;
 use crate::tui::theme::ThemeSurfaceHeading;
+use sexy_tui_rs::CURSOR_MARKER;
 
 struct EmulatedTerminal {
     size: Arc<Mutex<(u16, u16)>>,
@@ -1483,29 +1484,6 @@ fn steering_overflow_reports_entirely_hidden_prompts() {
     assert!(joined.contains("└ prompt 1"), "{rendered:?}");
     assert!(joined.contains("└ prompt 2"), "{rendered:?}");
     assert!(joined.contains("3 more queued"), "{rendered:?}");
-}
-
-#[test]
-fn terminal_native_prompt_wraps_and_shrinks_without_a_panel() {
-    let mut shell = InteractiveShell::test_shell();
-    shell.set_size(24, 10);
-    for character in "abcdefghijklmnopqrstuvwxyz0123456789".chars() {
-        shell.apply_edit(EditAction::Char(character));
-    }
-
-    let rendered = render_prompt_box(&shell.state.borrow(), 24, 8);
-    assert!(rendered.len() > 1, "long input should grow the editor");
-    assert!(rendered.iter().all(|line| visible_width(line) <= 24));
-    assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
-    assert!(!rendered.iter().any(|line| {
-        line.chars()
-            .any(|character| matches!(character, '┏' | '┓' | '┗' | '┛'))
-    }));
-
-    shell.drain_editor();
-    let rendered = render_prompt_box(&shell.state.borrow(), 24, 8);
-    assert_eq!(rendered.len(), 1, "empty editor should shrink to one row");
-    assert!(rendered[0].contains('›'));
 }
 
 #[test]
@@ -3864,7 +3842,7 @@ fn switching_back_to_default_clears_named_theme_attributes() {
         crate::tui::terminal::ColorDepth::TrueColor,
     );
     let violet = crate::tui::theme::test_bundled_theme_with(
-        "violet-hour",
+        "pie",
         capabilities,
         crate::tui::theme::TerminalBackground::Unknown,
     );
@@ -4200,7 +4178,7 @@ fn renderer_covers_idle_and_every_active_run_phase() {
 fn named_theme_keeps_active_work_out_of_the_footer() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-        "bone-machine",
+        "clawed",
         crate::tui::terminal::TerminalCapabilities::test(
             true,
             true,
@@ -6605,7 +6583,6 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
         state.last_turn_tokens_per_second = Some(41.9);
         state.context_estimate = Some((5_600, 246_000));
         state.price_display = PriceDisplay::ExplicitZero;
-        state.show_turn_cost = true;
         state.telemetry_model = Some(state.model.clone());
     }
     let now = Instant::now();
@@ -6645,7 +6622,6 @@ fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
         state.run_reasoning = Some(state.reasoning.clone());
         state.run_price_display = Some(PriceDisplay::Unknown);
         state.run_context_estimate = Some((21_000, 256_000));
-        state.show_turn_cost = true;
         state.run.set_phase_at(
             id,
             RunPhase::AwaitingProvider {
@@ -6758,7 +6734,6 @@ fn footer_distinguishes_explicit_zero_from_unavailable_pricing() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("local", "qwen3.6-35b-a3b", "high");
     let now = Instant::now();
-    shell.state.borrow_mut().show_turn_cost = true;
 
     shell.state.borrow_mut().price_display = PriceDisplay::Unknown;
     let unknown = plain_footer(&shell, 80, now);
@@ -7813,7 +7788,6 @@ fn active_model_switch_keeps_run_identity_and_clears_stale_idle_telemetry() {
         state.model_lab = Some(ModelLab::OpenAi);
         state.context_estimate = Some((12_000, 256_000));
         state.price_display = PriceDisplay::Priced;
-        state.show_turn_cost = true;
     }
     shell.on_prompt_submitted("prompt for A");
     let run_id = shell.begin_run("openai");
@@ -7895,6 +7869,70 @@ fn active_model_switch_keeps_run_identity_and_clears_stale_idle_telemetry() {
                 )),
             ),
         ]
+    );
+}
+
+#[test]
+fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
+    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
+    use crate::tui::theme::TerminalBackground;
+
+    let composer_lines = |name: &str| -> Vec<String> {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(60, 12);
+        shell.set_theme(crate::tui::theme::test_bundled_theme_with(
+            name,
+            TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
+            TerminalBackground::Dark,
+        ));
+        let lines = render_shell(&shell.state.borrow(), 60);
+        lines
+    };
+
+    // clawed and pie: a cornered frame in the theme's border colour.
+    for name in ["clawed", "pie"] {
+        let lines = composer_lines(name);
+        let plain = lines
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        let top = plain
+            .iter()
+            .position(|line| line.starts_with('╭') && line.ends_with('╮'))
+            .unwrap_or_else(|| panic!("{name} composer lost its top corners: {plain:?}"));
+        assert!(
+            plain[top + 1..]
+                .iter()
+                .any(|line| line.starts_with('╰') && line.ends_with('╯')),
+            "{name} composer lost its bottom corners"
+        );
+        assert!(
+            plain[top + 1].starts_with('│') && plain[top + 1].ends_with('│'),
+            "{name} composer content rows lost their side borders: {:?}",
+            plain[top + 1]
+        );
+    }
+
+    // kodex: no rules at all — a shaded rectangle painted with composer_bg.
+    let lines = composer_lines("kodex");
+    let plain = lines
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert!(
+        !plain
+            .iter()
+            .any(|line| line.contains('─') || line.contains('╭') || line.contains('│')),
+        "kodex composer must not draw rules or frames: {plain:?}"
+    );
+    // #323232 fill on the prompt row and its padding rows.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.contains("\x1b[48;2;50;50;50m"))
+            .count(),
+        3,
+        "kodex composer should paint exactly three shaded rows"
     );
 }
 
@@ -8626,19 +8664,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
     assert!(narrow.iter().all(|line| !line.chars().all(|ch| ch == '─')));
 }
 
-const BUNDLED_THEME_NAMES: [&str; 11] = [
-    "bone-machine",
-    "circuit-garden",
-    "field-notes",
-    "kawaii-pink",
-    "oxide-console",
-    "paper-ledger",
-    "signal-noir",
-    "synthwave-relay",
-    "tidepool",
-    "violet-hour",
-    "zen-mono",
-];
+const BUNDLED_THEME_NAMES: [&str; 3] = ["clawed", "kodex", "pie"];
 
 fn populate_theme_fixture(shell: &mut InteractiveShell) {
     shell.set_identity("local", "qwen3.6-27b", "high");
@@ -8766,7 +8792,7 @@ fn ansi_background_is_open_at_end(line: &str) -> bool {
 }
 
 #[test]
-fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() {
+fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
@@ -8784,8 +8810,8 @@ fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() 
         populate_theme_fixture(&mut shell);
         let transcript = shell.state.borrow().rendered_transcript(96).join("\n");
         assert!(
-            transcript.contains("\x1b[48;2;255;112;24m"),
-            "{name} changed the immutable prompt provenance background"
+            !transcript.contains("\x1b[48;2;255;112;24m"),
+            "{name} leaked the default theme's model-adaptive provenance paint"
         );
         assert!(
             !transcript.contains("\x1b[38;2;255;112;24m"),
@@ -8856,9 +8882,9 @@ fn bundled_theme_pack_has_eleven_color_independent_wide_and_narrow_identities() 
             eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
         }
     }
-    assert_eq!(wide.len(), 11);
-    assert_eq!(ascii.len(), 11);
-    assert_eq!(narrow.len(), 11);
+    assert_eq!(wide.len(), 3);
+    assert_eq!(ascii.len(), 3);
+    assert_eq!(narrow.len(), 3);
 }
 
 #[test]

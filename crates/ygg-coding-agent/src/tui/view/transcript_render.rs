@@ -202,7 +202,9 @@ pub(super) fn render_block_planned(
         } => render_user_prompt(
             text,
             model_lab,
-            prompt_color.as_deref(),
+            prompt_color
+                .as_deref()
+                .filter(|_| theme.uses_model_lab_color()),
             rich_renderer,
             theme,
             width,
@@ -368,7 +370,9 @@ pub(super) fn render_block_planned(
         };
     }
     let prompt_color = match block {
-        TranscriptBlock::User { prompt_color, .. } => prompt_color.as_deref(),
+        TranscriptBlock::User { prompt_color, .. } => prompt_color
+            .as_deref()
+            .filter(|_| theme.uses_model_lab_color()),
         _ => None,
     };
     let lines = decorate_surface(

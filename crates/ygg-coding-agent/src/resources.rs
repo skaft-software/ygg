@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Config;
-#[cfg(test)]
-use crate::resource_resolver::{ResourceKind, ResourceResolver, ResourceSnapshot, ResourceTrust};
 
 /// Stable identity applied before the dynamic environment and tool contract.
 pub const BASE_PERSONA: &str = "You are Ygg, an expert coding assistant.";
@@ -1218,58 +1216,6 @@ impl FileSystemSkillRegistry {
         })
     }
 
-    /// Parse the legacy shared-resolver snapshot retained for embedders and migration tests.
-    #[cfg(test)]
-    pub fn from_snapshot(
-        _workspace_root: PathBuf,
-        _additional_paths: Vec<PathBuf>,
-        workspace_trusted: bool,
-        snapshot: &ResourceSnapshot,
-    ) -> Self {
-        debug_assert_eq!(snapshot.kind, ResourceKind::Skill);
-        let mut diagnostics = snapshot
-            .diagnostics()
-            .iter()
-            .map(|diagnostic| skill_diagnostic(&diagnostic.path, &diagnostic.message))
-            .collect::<Vec<_>>();
-        let mut candidates = Vec::new();
-        for resource in snapshot.resources() {
-            let trust = match resource.trust {
-                ResourceTrust::User => SkillTrust::UserInstalled,
-                ResourceTrust::TrustedWorkspace => SkillTrust::Workspace,
-                ResourceTrust::Explicit => SkillTrust::ExplicitExternal,
-            };
-            candidates.push(SkillCandidate {
-                entrypoint: resource.path.clone(),
-                root: resource
-                    .path
-                    .parent()
-                    .unwrap_or(&resource.root)
-                    .to_path_buf(),
-                policy: SkillRootPolicy {
-                    trust,
-                    direct_markdown: false,
-                    legacy_ygg: resource
-                        .path
-                        .components()
-                        .any(|component| component.as_os_str() == ".ygg"),
-                },
-            });
-        }
-        match Self::from_candidates(
-            candidates,
-            std::mem::take(&mut diagnostics),
-            workspace_trusted,
-        ) {
-            Ok(registry) => registry,
-            Err(error) => Self {
-                descriptors: Arc::from([]),
-                diagnostics: Arc::from([skill_diagnostic("<snapshot>", error.to_string())]),
-                workspace_trusted,
-            },
-        }
-    }
-
     #[cfg(test)]
     fn new_with_user_skills_dir(
         workspace_root: PathBuf,
@@ -1532,7 +1478,6 @@ mod tests {
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,
             cost_warning_microdollars: None,
-            show_turn_cost: false,
             max_turns: Some(40),
             show_reasoning_in_print: false,
             initial_prompt: None,
@@ -2061,65 +2006,6 @@ Environment:
                 .trim(),
             "User instructions."
         );
-    }
-
-    #[test]
-    fn shared_resolver_skill_snapshot_accepts_standard_name_only_frontmatter() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let global = temp.path().join("global/.ygg");
-        let skill = global.join("skills/focused-review");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&skill).unwrap();
-        std::fs::write(
-            skill.join("SKILL.md"),
-            "---\nname: focused-review\ndescription: Review only relevant code.\n---\nStay focused.",
-        )
-        .unwrap();
-        let resolver = ResourceResolver::with_global_ygg_dir(workspace.clone(), true, global);
-        let snapshot = resolver.discover(ResourceKind::Skill, &[]);
-        let registry = FileSystemSkillRegistry::from_snapshot(workspace, vec![], true, &snapshot);
-        let loaded = registry.load(&"focused-review".to_owned()).unwrap();
-        assert_eq!(loaded.descriptor.name, "focused-review");
-        assert_eq!(loaded.descriptor.id, "focused-review");
-        assert_eq!(loaded.instructions.trim(), "Stay focused.");
-    }
-
-    #[test]
-    fn malformed_and_mismatched_skills_remain_inspectable_diagnostics() {
-        let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
-        let global = temp.path().join("global/.ygg");
-        let malformed = global.join("skills/malformed");
-        let mismatched = global.join("skills/wrong-directory");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&malformed).unwrap();
-        std::fs::create_dir_all(&mismatched).unwrap();
-        std::fs::write(
-            malformed.join("SKILL.md"),
-            "---\nname: Missing description\n---\nbody",
-        )
-        .unwrap();
-        std::fs::write(
-            mismatched.join("SKILL.md"),
-            "---\nid: declared-id\nname: Declared\ndescription: mismatch\n---\nbody",
-        )
-        .unwrap();
-
-        let resolver = ResourceResolver::with_global_ygg_dir(workspace.clone(), true, global);
-        let snapshot = resolver.discover(ResourceKind::Skill, &[]);
-        let registry = FileSystemSkillRegistry::from_snapshot(workspace, vec![], true, &snapshot);
-        let diagnostics = registry.diagnostics();
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.path.ends_with("malformed/SKILL.md")
-                && diagnostic.message.contains("description is required")
-        }));
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.path.ends_with("wrong-directory/SKILL.md")
-                && diagnostic.message.contains("does not match directory name")
-        }));
-        assert_eq!(registry.descriptors().len(), 1);
-        assert_eq!(registry.descriptors()[0].id, "declared-id");
     }
 
     #[test]

@@ -6639,12 +6639,37 @@ async fn spawn_connection(
     #[cfg(unix)]
     command.process_group(0);
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| ExtensionRuntimeError::Spawn {
-            extension: descriptor.manifest.name.clone(),
-            message: error.to_string(),
-        })?;
+    // Linux can transiently reject exec with ETXTBSY ("Text file busy") when a
+    // freshly written entrypoint is launched while another host thread still
+    // holds a write descriptor on it (a known race between concurrent fd close
+    // and posix_spawn's vfork window in multithreaded processes). A short,
+    // bounded retry keeps extension starts reliable without masking other spawn
+    // failures.
+    let mut child = {
+        const MAX_TEXT_FILE_BUSY_RETRIES: usize = 4;
+        let mut attempt = 0;
+        loop {
+            match command.spawn() {
+                Ok(child) => break child,
+                Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    attempt += 1;
+                    if attempt > MAX_TEXT_FILE_BUSY_RETRIES {
+                        return Err(ExtensionRuntimeError::Spawn {
+                            extension: descriptor.manifest.name.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                    tokio::time::sleep(Duration::from_millis(10 * attempt as u64)).await;
+                }
+                Err(error) => {
+                    return Err(ExtensionRuntimeError::Spawn {
+                        extension: descriptor.manifest.name.clone(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+    };
     let process_group_id = extension_process_group_id(&child);
     let process_group = ProcessGroupGuard::extension(process_group_id);
     let termination = process_group.termination_handle();

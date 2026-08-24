@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Ygg is pre-1.0 software. Security fixes are made on the latest `0.5.0` release; older snapshots are not supported.
+Ygg is pre-1.0 software. Security fixes are made on the latest `0.6.x` release; older snapshots are not supported.
 
 ## Boundary and defaults
 

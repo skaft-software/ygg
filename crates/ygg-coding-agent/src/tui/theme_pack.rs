@@ -8,48 +8,16 @@ pub(crate) struct BundledTheme {
 
 pub(crate) const THEMES: &[BundledTheme] = &[
     BundledTheme {
-        id: "bone-machine",
-        source: include_str!("../../themes/bone-machine.toml"),
+        id: "clawed",
+        source: include_str!("../../themes/clawed.toml"),
     },
     BundledTheme {
-        id: "circuit-garden",
-        source: include_str!("../../themes/circuit-garden.toml"),
+        id: "kodex",
+        source: include_str!("../../themes/kodex.toml"),
     },
     BundledTheme {
-        id: "field-notes",
-        source: include_str!("../../themes/field-notes.toml"),
-    },
-    BundledTheme {
-        id: "kawaii-pink",
-        source: include_str!("../../themes/kawaii-pink.toml"),
-    },
-    BundledTheme {
-        id: "oxide-console",
-        source: include_str!("../../themes/oxide-console.toml"),
-    },
-    BundledTheme {
-        id: "paper-ledger",
-        source: include_str!("../../themes/paper-ledger.toml"),
-    },
-    BundledTheme {
-        id: "signal-noir",
-        source: include_str!("../../themes/signal-noir.toml"),
-    },
-    BundledTheme {
-        id: "synthwave-relay",
-        source: include_str!("../../themes/synthwave-relay.toml"),
-    },
-    BundledTheme {
-        id: "tidepool",
-        source: include_str!("../../themes/tidepool.toml"),
-    },
-    BundledTheme {
-        id: "violet-hour",
-        source: include_str!("../../themes/violet-hour.toml"),
-    },
-    BundledTheme {
-        id: "zen-mono",
-        source: include_str!("../../themes/zen-mono.toml"),
+        id: "pie",
+        source: include_str!("../../themes/pie.toml"),
     },
 ];
 
@@ -65,12 +33,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pack_has_eleven_unique_stable_ids() {
+    fn pack_has_three_unique_stable_ids() {
         let mut ids = THEMES.iter().map(|theme| theme.id).collect::<Vec<_>>();
-        assert_eq!(ids.len(), 11);
+        assert_eq!(ids.len(), 3);
         ids.sort_unstable();
         ids.dedup();
-        assert_eq!(ids.len(), 11);
-        assert!(find("KAWAII-PINK").is_some());
+        assert_eq!(ids.len(), 3);
+        assert!(find("CLAWED").is_some());
     }
 }

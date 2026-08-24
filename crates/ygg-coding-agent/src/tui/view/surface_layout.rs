@@ -178,13 +178,14 @@ pub(super) fn compile_surface_plan<'a>(
         || chrome == ThemeSurfaceChrome::Rule
         || heading != ThemeSurfaceHeading::None;
     let has_bottom_row = chrome == ThemeSurfaceChrome::Card;
-    let highlighted_user = matches!(
-        block,
-        TranscriptBlock::User {
-            prompt_color: Some(_),
-            ..
-        }
-    );
+    let highlighted_user = theme.uses_model_lab_color()
+        && matches!(
+            block,
+            TranscriptBlock::User {
+                prompt_color: Some(_),
+                ..
+            }
+        );
     // A highlighted prompt gets one painted row above and below its content,
     // matching the breathing room in the active composer. User cards already
     // carried that interior padding, including on no-colour terminals.

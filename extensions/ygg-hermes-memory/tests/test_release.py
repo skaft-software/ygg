@@ -29,7 +29,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-hermes-memory")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.0-dev")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.0")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-hermes-memory")
         self.assertTrue(manifest["capabilities"]["network"])
         self.assertTrue(manifest["capabilities"]["process"])
@@ -171,7 +171,7 @@ class ReleaseSmokeTests(unittest.TestCase):
                 str(REPOSITORY / "scripts" / "package-ygg-extension-release.sh"),
                 "ygg-hermes-memory",
                 str(first),
-                "v0.6.0-dev",
+                "v0.6.0",
                 str(source),
             ]
             completed = subprocess.run(

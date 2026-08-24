@@ -67,10 +67,15 @@ can message peers, steer active work, queue messages for an idle worker, receive
 follow-up runs, wait without lost notifications, and spawn within the remaining
 depth and concurrency bounds.
 
-The default team limit is four concurrent agents including the root, depth two,
-and sixteen total agents including the root during each owning run. Host
+The default team limit is ten concurrent agents including the root, depth two,
+and thirty-two total agents during each owning run. Host
 validation permits 2–32 concurrent agents, depth 1–8, and at most 256 total,
-with total capacity never below concurrent capacity. A semaphore and ancestry
+with total capacity never below concurrent capacity. The first-party
+`ygg-subagents` service that the coding product actually uses is stricter: its
+children sit exactly one level below the root and are bounded to eight active
+children per parent with thirty-two retained records per resource owner, and a
+worker inherits the parent's full standard tool scope (`read`, `search`,
+`edit`, `write`, `bash`) unless the spawn narrows it. A semaphore and ancestry
 checks enforce those limits independently of model behavior; an idle worker is
 reserved as `Pending` before a follow-up is published so concurrent follow-ups
 cannot start overlapping runs. Each worker command channel is capped at 32;

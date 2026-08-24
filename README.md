@@ -54,7 +54,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, eleven bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
+| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, three bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
 | **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
@@ -507,8 +507,10 @@ work goes through its `subagent_*` tools and owner-bound `/subagents` browser;
 the root agent never receives a parallel native collaboration surface. Without
 the extension, Ultra is clamped to the highest ordinary safe effort.
 
-Extension workers are read/search-only, depth-one, and bounded to two active
-children with sixteen retained records. Each worker has an isolated durable
+Extension workers inherit the parent's full standard tool scope (`read`,
+`search`, `edit`, `write`, and `bash`) by default and can be narrowed per spawn
+to a hard read-only pair, stay depth-one, and run under a bound of eight active
+children with thirty-two retained records. Each worker has an isolated durable
 session, inherited policy limits, host-owned cancellation and cost/token
 ceilings, and an owner-authorized read-only transcript. While a root run is
 active, the TUI keeps an owner-scoped `Subagents` block directly above the
@@ -583,7 +585,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
 - Exact theme replacement: switching back to default does not retain attributes from the previous theme.
-- Eleven bundled themes: `bone-machine`, `circuit-garden`, `field-notes`, `kawaii-pink`, `oxide-console`, `paper-ledger`, `signal-noir`, `synthwave-relay`, `tidepool`, `violet-hour`, and `zen-mono`.
+- Three bundled themes cloning familiar coding-agent benches: `clawed` (Claude Code's terracotta and rounded frames), `pie` (pi's airy tomorrow-night cards), and `kodex` (codex's compact cyan monochrome).
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -600,7 +602,7 @@ and sent to the provider only when required to continue the tool protocol; live
 progress is neither persisted nor sent to the model.
 
 ```sh
-ygg --theme kawaii-pink
+ygg --theme clawed
 ygg --color auto
 ygg --mouse app
 ```

@@ -49,7 +49,7 @@ fn outcome_line(outcome: &RunOutcome, tokens_per_second: Option<f64>, theme: &Yg
                 &format!("failed{separator}{}", format_duration(*elapsed))
             )
         ),
-        RunOutcome::Interrupted { elapsed } | RunOutcome::Cancelled { elapsed } => format!(
+        RunOutcome::Interrupted { elapsed } => format!(
             "{} {}",
             theme.fg("warning", theme.glyph("interrupt")),
             subdued_text(
@@ -165,12 +165,6 @@ mod tests {
                     prompt: "choose an implementation".into(),
                 },
                 "needs input",
-            ),
-            (
-                RunOutcome::Cancelled {
-                    elapsed: Duration::from_secs(1),
-                },
-                "interrupted · 1.0s",
             ),
         ];
         for (outcome, expected) in outcomes {

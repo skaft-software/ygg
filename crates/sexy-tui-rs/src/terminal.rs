@@ -2,7 +2,7 @@
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -11,9 +11,42 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::execute;
 use crossterm::terminal::{self, ClearType};
 
-use crate::keys::{is_kitty_protocol_active, set_kitty_protocol_active};
 use crate::terminal_colors::is_osc11_background_color_response;
-use crate::terminal_image::get_capabilities;
+
+/// Whether Kitty progressive keyboard enhancement was negotiated. Pi keeps
+/// this as process-global state because escape-sequence decoding is string-only.
+static KITTY_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+fn set_kitty_protocol_active(active: bool) {
+    KITTY_PROTOCOL_ACTIVE.store(active, Ordering::Release);
+}
+
+fn is_kitty_protocol_active() -> bool {
+    KITTY_PROTOCOL_ACTIVE.load(Ordering::Acquire)
+}
+
+static CACHED_CAPABILITIES: Mutex<Option<crate::capabilities::TerminalCapabilities>> =
+    Mutex::new(None);
+
+/// Recover from a poisoned mutex. If the lock is poisoned, return the inner
+/// value anyway (a panic in one holder shouldn't break the whole TUI).
+fn lock_or_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Detect terminal capabilities without writing probe sequences.
+fn detect_capabilities() -> crate::capabilities::TerminalCapabilities {
+    crate::capabilities::TerminalCapabilities::detect()
+}
+
+/// Get cached capabilities, detecting them on first use.
+fn get_capabilities() -> crate::capabilities::TerminalCapabilities {
+    let mut guard = lock_or_recover(&CACHED_CAPABILITIES);
+    if guard.is_none() {
+        *guard = Some(detect_capabilities());
+    }
+    guard.unwrap()
+}
 
 /// Poll interval for the input loop shutdown check.
 const POLL_TIMEOUT_MS: u64 = 50;
@@ -339,8 +372,6 @@ impl Terminal for ProcessTerminal {
         // Enable bracketed paste
         execute!(self.stdout, crossterm::style::Print("\x1b[?2004h")).ok();
 
-        // Preserve ordinary terminal text while making modified controls and
-        // layout-resolved alternate key text unambiguous.
         self.enable_keyboard_enhancements();
 
         enum ProcessEvent {
@@ -492,7 +523,7 @@ impl Terminal for ProcessTerminal {
     }
 
     fn capabilities(&self) -> crate::capabilities::TerminalCapabilities {
-        crate::terminal_image::get_capabilities()
+        get_capabilities()
     }
 }
 

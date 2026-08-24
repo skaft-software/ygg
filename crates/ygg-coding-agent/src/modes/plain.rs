@@ -163,9 +163,6 @@ fn outcome_text(outcome: &RunOutcome) -> String {
             format!("[interrupted] {}", format_duration(*elapsed))
         }
         RunOutcome::NeedsInput { prompt } => format!("[needs input] {prompt}"),
-        RunOutcome::Cancelled { elapsed } => {
-            format!("[cancelled] {}", format_duration(*elapsed))
-        }
     }
 }
 

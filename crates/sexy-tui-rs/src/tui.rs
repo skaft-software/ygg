@@ -1,23 +1,25 @@
 //! Retained component tree with line-differential terminal rendering.
-use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::rc::Rc;
 
 use crate::scrollback::reset_and_replay;
 use crate::terminal::{key_to_string, Terminal, TerminalInput};
-use crate::terminal_image::{delete_all_kitty_images, is_image_line};
 use crate::utils::visible_width;
 
 /// Zero-width APC escape sequence used as a cursor position marker.
 /// Pi's zero-cell APC cursor marker.
 pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 
-struct OverlayEntry {
-    handle: Rc<RefCell<OverlayHandle>>,
-    component: Box<dyn Component>,
-    options: OverlayOptions,
-    focus_order: usize,
+/// Whether a rendered row carries a Kitty graphics placement.
+pub(crate) fn is_image_line(line: &str) -> bool {
+    line.contains("\x1b_G")
 }
+
+/// Kitty graphics protocol escape that deletes every placed image. Destructive
+/// inline replays must emit it before rebuilding rows they may have erased.
+pub(crate) fn delete_all_kitty_images() -> String {
+    "\x1b_Ga=d\x1b\\".to_string()
+}
+
 /// Global input listener. Returning `Some` consumes the input event.
 pub type InputListener<'a> = Box<dyn FnMut(&str) -> Option<String> + 'a>;
 
@@ -195,256 +197,6 @@ pub trait Component {
     fn invalidate(&mut self);
 }
 
-/// Components that can receive focus and display a hardware cursor for IME.
-pub trait Focusable {
-    fn set_focused(&mut self, focused: bool);
-    fn is_focused(&self) -> bool;
-}
-
-// =============================================================================
-// Container
-// =============================================================================
-
-/// Container that groups child components vertically.
-pub struct Container {
-    children: Vec<Box<dyn Component>>,
-    focused_child: Option<usize>,
-}
-
-impl Container {
-    pub fn new() -> Self {
-        Container {
-            children: Vec::new(),
-            focused_child: None,
-        }
-    }
-
-    pub fn add_child(&mut self, child: Box<dyn Component>) {
-        self.children.push(child);
-    }
-
-    pub fn remove_child(&mut self, child_idx: usize) {
-        if child_idx < self.children.len() {
-            self.children.remove(child_idx);
-            if self.focused_child == Some(child_idx) {
-                self.focused_child = None;
-            }
-        }
-    }
-
-    pub fn set_focus(&mut self, idx: Option<usize>) {
-        self.focused_child = idx;
-    }
-
-    pub fn focused_child_mut(&mut self) -> Option<&mut Box<dyn Component>> {
-        self.focused_child.and_then(|i| self.children.get_mut(i))
-    }
-
-    fn render_update(&self, width: u16, cursor: Option<CommitCursor>) -> Option<FrameUpdate> {
-        (self.children.len() == 1)
-            .then(|| self.children[0].render_update_with_cursor(width, cursor))
-            .flatten()
-    }
-}
-
-impl Component for Container {
-    fn render(&self, width: u16) -> Vec<String> {
-        let mut lines = Vec::new();
-        for child in &self.children {
-            lines.extend(child.render(width));
-        }
-        lines
-    }
-
-    fn handle_input(&mut self, data: &str) {
-        if let Some(idx) = self.focused_child {
-            if let Some(child) = self.children.get_mut(idx) {
-                child.handle_input(data);
-            }
-        }
-    }
-
-    fn handle_paste(&mut self, data: &str) {
-        if let Some(idx) = self.focused_child {
-            if let Some(child) = self.children.get_mut(idx) {
-                child.handle_paste(data);
-            }
-        }
-    }
-
-    fn wants_key_release(&self) -> bool {
-        if let Some(idx) = self.focused_child {
-            self.children
-                .get(idx)
-                .is_some_and(|c| c.wants_key_release())
-        } else {
-            false
-        }
-    }
-
-    fn invalidate(&mut self) {
-        for child in &mut self.children {
-            child.invalidate();
-        }
-    }
-}
-
-impl Default for Container {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// =============================================================================
-// Overlay Support
-// =============================================================================
-
-/// Anchor position for overlays.
-#[derive(Debug, Clone, Copy)]
-pub enum OverlayAnchor {
-    Center,
-    TopLeft,
-    TopCenter,
-    TopRight,
-    LeftCenter,
-    RightCenter,
-    BottomLeft,
-    BottomCenter,
-    BottomRight,
-}
-
-/// Margin values for overlays.
-#[derive(Debug, Clone, Copy)]
-pub struct OverlayMargin {
-    pub top: u16,
-    pub right: u16,
-    pub bottom: u16,
-    pub left: u16,
-}
-
-impl OverlayMargin {
-    pub fn all(value: u16) -> Self {
-        OverlayMargin {
-            top: value,
-            right: value,
-            bottom: value,
-            left: value,
-        }
-    }
-}
-
-/// Options for focusing/unfocusing an overlay.
-pub struct OverlayUnfocusOptions {
-    pub target: Option<Box<dyn Component>>,
-}
-
-/// Absolute cells or a percentage of the terminal dimension.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SizeValue {
-    Cells(u16),
-    Percent(f64),
-}
-
-impl From<u16> for SizeValue {
-    fn from(value: u16) -> Self {
-        Self::Cells(value)
-    }
-}
-
-impl SizeValue {
-    pub const fn cells(value: u16) -> Self {
-        Self::Cells(value)
-    }
-    pub const fn percent(value: f64) -> Self {
-        Self::Percent(value)
-    }
-
-    fn resolve_size(self, total: usize) -> usize {
-        match self {
-            Self::Cells(value) => usize::from(value),
-            Self::Percent(value) => ((total as f64) * value / 100.0).floor().max(0.0) as usize,
-        }
-    }
-
-    fn resolve_position(self, available: usize, extent: usize, margin: usize) -> usize {
-        match self {
-            Self::Cells(value) => usize::from(value),
-            Self::Percent(value) => {
-                margin
-                    + ((available.saturating_sub(extent) as f64) * value / 100.0)
-                        .floor()
-                        .max(0.0) as usize
-            }
-        }
-    }
-}
-
-/// Options for creating an overlay.
-#[derive(Debug, Clone, Copy)]
-pub struct OverlayOptions {
-    pub width: Option<SizeValue>,
-    pub min_width: Option<u16>,
-    pub max_height: Option<SizeValue>,
-    pub anchor: OverlayAnchor,
-    pub offset_x: i16,
-    pub offset_y: i16,
-    pub row: Option<SizeValue>,
-    pub col: Option<SizeValue>,
-    pub margin: Option<OverlayMargin>,
-    pub non_capturing: bool,
-}
-
-impl Default for OverlayOptions {
-    fn default() -> Self {
-        OverlayOptions {
-            width: None,
-            min_width: None,
-            max_height: None,
-            anchor: OverlayAnchor::Center,
-            offset_x: 0,
-            offset_y: 0,
-            row: None,
-            col: None,
-            margin: None,
-            non_capturing: false,
-        }
-    }
-}
-
-/// Handle to an active overlay.
-#[derive(Clone)]
-pub struct OverlayHandle {
-    pub id: usize,
-    hidden: bool,
-    focused: bool,
-}
-
-impl OverlayHandle {
-    pub fn hide(&mut self) {
-        self.hidden = true;
-    }
-
-    pub fn show(&mut self) {
-        self.hidden = false;
-    }
-
-    pub fn is_hidden(&self) -> bool {
-        self.hidden
-    }
-
-    pub fn focus(&mut self) {
-        self.focused = true;
-    }
-
-    pub fn unfocus(&mut self, _options: Option<OverlayUnfocusOptions>) {
-        self.focused = false;
-    }
-
-    pub fn is_focused(&self) -> bool {
-        self.focused
-    }
-}
-
 // =============================================================================
 // TUI — Main Interface
 // =============================================================================
@@ -452,9 +204,7 @@ impl OverlayHandle {
 /// Main TUI instance managing the render loop.
 pub struct TUI<'a> {
     terminal: Box<dyn Terminal + 'a>,
-    root: Container,
-    overlays: Vec<OverlayEntry>,
-    next_overlay_id: usize,
+    children: Vec<Box<dyn Component>>,
     previous_frame: Vec<String>,
     /// Terminal dimensions used for `previous_frame`. A resize invalidates all
     /// cursor-relative differential-rendering assumptions.
@@ -507,9 +257,7 @@ impl<'a> TUI<'a> {
         let capabilities = terminal.capabilities();
         TUI {
             terminal,
-            root: Container::new(),
-            overlays: Vec::new(),
-            next_overlay_id: 0,
+            children: Vec::new(),
             previous_frame: Vec::new(),
             previous_size: None,
             first_render: true,
@@ -547,53 +295,22 @@ impl<'a> TUI<'a> {
         self.terminal.write(&format!("\x1b]2;{clean}\x07"));
     }
 
-    /// Add a component to the root container.
+    /// Add a component. Input and paste are delivered to the most recently
+    /// added child, matching the single active-component usage of the shell.
     pub fn add_child(&mut self, child: Box<dyn Component>) {
-        self.root.add_child(child);
+        self.children.push(child);
     }
 
-    /// Remove a component from the root container.
+    /// Remove a component by index.
     pub fn remove_child(&mut self, idx: usize) {
-        self.root.remove_child(idx);
+        if idx < self.children.len() {
+            self.children.remove(idx);
+        }
     }
 
-    /// Set focus to a specific child.
-    pub fn set_focus(&mut self, idx: Option<usize>) {
-        self.root.set_focus(idx);
-    }
-
-    /// Show an overlay on top of the current content.
-    pub fn show_overlay(
-        &mut self,
-        component: Box<dyn Component>,
-        options: OverlayOptions,
-    ) -> Rc<RefCell<OverlayHandle>> {
-        let id = self.next_overlay_id;
-        self.next_overlay_id += 1;
-        let handle = Rc::new(RefCell::new(OverlayHandle {
-            id,
-            hidden: false,
-            focused: !options.non_capturing,
-        }));
-        self.overlays.push(OverlayEntry {
-            handle: handle.clone(),
-            component,
-            options,
-            focus_order: id,
-        });
-        handle
-    }
-
-    /// Hide the topmost overlay.
-    pub fn hide_overlay(&mut self) {
-        self.overlays.pop();
-    }
-
-    /// Check if any visible overlay is active.
-    pub fn has_overlay(&self) -> bool {
-        self.overlays
-            .iter()
-            .any(|entry| !entry.handle.borrow().hidden)
+    /// The child that currently receives input and paste events.
+    fn active_child_mut(&mut self) -> Option<&mut Box<dyn Component>> {
+        self.children.last_mut()
     }
 
     /// Add an input listener for global key handling.
@@ -668,16 +385,8 @@ impl<'a> TUI<'a> {
             }
         }
 
-        // Route to focused overlay or root
-        let focused_overlay = self.overlays.iter().rposition(|entry| {
-            let handle = entry.handle.borrow();
-            handle.focused && !handle.hidden
-        });
-
-        if let Some(index) = focused_overlay {
-            self.overlays[index].component.handle_input(data);
-        } else {
-            self.root.handle_input(data);
+        if let Some(child) = self.active_child_mut() {
+            child.handle_input(data);
         }
 
         self.request_render();
@@ -702,14 +411,8 @@ impl<'a> TUI<'a> {
                         return;
                     }
                 }
-                let focused_overlay = self.overlays.iter().rposition(|entry| {
-                    let handle = entry.handle.borrow();
-                    handle.focused && !handle.hidden
-                });
-                if let Some(index) = focused_overlay {
-                    self.overlays[index].component.handle_paste(&text);
-                } else {
-                    self.root.handle_paste(&text);
+                if let Some(child) = self.active_child_mut() {
+                    child.handle_paste(&text);
                 }
                 self.request_render();
             }
@@ -738,15 +441,11 @@ impl<'a> TUI<'a> {
         } else {
             self.inline_commit_cursor
         };
-        let lazy_update = (self
-            .overlays
-            .iter()
-            .all(|entry| entry.handle.borrow().hidden)
-            && (self.capabilities.plain
-                || (self.inline_scrollback
-                    && self.capabilities.cursor_addressing
-                    && self.capabilities.line_clearing)))
-            .then(|| self.root.render_update(width, render_commit_cursor))
+        let lazy_update = (self.capabilities.plain
+            || (self.inline_scrollback
+                && self.capabilities.cursor_addressing
+                && self.capabilities.line_clearing))
+            .then(|| self.root_render_update(width, render_commit_cursor))
             .flatten();
         let previous_len = self.previous_frame.len();
         // A prefix beyond the retained frame cannot be validated. Fall back to
@@ -835,18 +534,14 @@ impl<'a> TUI<'a> {
             reused
         } else {
             let mut rendered = Vec::new();
-            // Render root container. Plain/log mode is escape-free and does not
-            // right-pad every row with terminal-width spaces. Inline scrollback
-            // also skips padding: every repaint erases before writing, and padded
-            // rows would put trailing spaces into native text selection.
-            for line in self.root.render(width) {
+            // Render the children in order. Plain/log mode is escape-free and
+            // does not right-pad every row with terminal-width spaces. Inline
+            // scrollback also skips padding: every repaint erases before
+            // writing, and padded rows would put trailing spaces into native
+            // text selection.
+            for line in self.root_render(width) {
                 rendered.push(self.prepare_line(line, width));
             }
-
-            // Pi overlays are screen-relative rectangles composited into root
-            // rows. They never replace an entire row merely because an overlay
-            // produced content for it.
-            rendered = self.composite_overlays(rendered, width, height);
 
             // Extract the typed cursor marker before frame comparison. It is a
             // trusted library control token, never accepted from semantic text.
@@ -1682,148 +1377,18 @@ impl<'a> TUI<'a> {
         }
     }
 
-    fn resolve_overlay_layout(
-        options: OverlayOptions,
-        overlay_height: usize,
-        terminal_width: usize,
-        terminal_height: usize,
-    ) -> (usize, usize, usize, Option<usize>) {
-        let margin = options.margin.unwrap_or_else(|| OverlayMargin::all(0));
-        let available_width = terminal_width
-            .saturating_sub(usize::from(margin.left) + usize::from(margin.right))
-            .max(1);
-        let available_height = terminal_height
-            .saturating_sub(usize::from(margin.top) + usize::from(margin.bottom))
-            .max(1);
-        let mut width = options
-            .width
-            .map(|value| value.resolve_size(terminal_width))
-            .unwrap_or(80.min(available_width));
-        if let Some(minimum) = options.min_width {
-            width = width.max(usize::from(minimum));
-        }
-        width = width.clamp(1, available_width);
-        let max_height = options
-            .max_height
-            .map(|value| value.resolve_size(terminal_height))
-            .map(|value| value.clamp(1, available_height));
-        let height = max_height.map_or(overlay_height, |maximum| overlay_height.min(maximum));
-        let top = usize::from(margin.top);
-        let left = usize::from(margin.left);
-        let anchored_row = match options.anchor {
-            OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => top,
-            OverlayAnchor::BottomLeft
-            | OverlayAnchor::BottomCenter
-            | OverlayAnchor::BottomRight => top + available_height.saturating_sub(height),
-            _ => top + available_height.saturating_sub(height) / 2,
-        };
-        let anchored_col = match options.anchor {
-            OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => left,
-            OverlayAnchor::TopRight | OverlayAnchor::RightCenter | OverlayAnchor::BottomRight => {
-                left + available_width.saturating_sub(width)
-            }
-            _ => left + available_width.saturating_sub(width) / 2,
-        };
-        let row = options
-            .row
-            .map(|value| value.resolve_position(available_height, height, top))
-            .unwrap_or(anchored_row) as i64
-            + i64::from(options.offset_y);
-        let col = options
-            .col
-            .map(|value| value.resolve_position(available_width, width, left))
-            .unwrap_or(anchored_col) as i64
-            + i64::from(options.offset_x);
-        let maximum_row = terminal_height
-            .saturating_sub(usize::from(margin.bottom) + height)
-            .max(top);
-        let maximum_col = terminal_width
-            .saturating_sub(usize::from(margin.right) + width)
-            .max(left);
-        (
-            width,
-            row.clamp(top as i64, maximum_row as i64) as usize,
-            col.clamp(left as i64, maximum_col as i64) as usize,
-            max_height,
-        )
+    fn root_render_update(&self, width: u16, cursor: Option<CommitCursor>) -> Option<FrameUpdate> {
+        // Lazy updates require exactly one child: a multi-child frame has no
+        // single stable prefix to reuse.
+        (self.children.len() == 1)
+            .then(|| self.children[0].render_update_with_cursor(width, cursor))
+            .flatten()
     }
 
-    fn composite_overlays(&self, mut lines: Vec<String>, width: u16, height: u16) -> Vec<String> {
-        use crate::utils::{extract_segments, slice_with_width};
-        let terminal_width = usize::from(width);
-        let terminal_height = usize::from(height);
-        if self.overlays.is_empty() || terminal_width == 0 || terminal_height == 0 {
-            return lines;
-        }
-        let mut order: Vec<usize> = (0..self.overlays.len()).collect();
-        order.sort_by_key(|index| self.overlays[*index].focus_order);
-        let mut rendered = Vec::new();
-        let mut minimum_lines = lines.len();
-        for index in order {
-            let entry = &self.overlays[index];
-            if entry.handle.borrow().hidden {
-                continue;
-            }
-            let (overlay_width, _, _, max_height) =
-                Self::resolve_overlay_layout(entry.options, 0, terminal_width, terminal_height);
-            let mut overlay_lines = entry.component.render(overlay_width as u16);
-            if let Some(maximum) = max_height {
-                overlay_lines.truncate(maximum);
-            }
-            let (_, row, col, _) = Self::resolve_overlay_layout(
-                entry.options,
-                overlay_lines.len(),
-                terminal_width,
-                terminal_height,
-            );
-            minimum_lines = minimum_lines.max(row + overlay_lines.len());
-            rendered.push((overlay_lines, row, col, overlay_width));
-        }
-        let working_height = lines.len().max(terminal_height).max(minimum_lines);
-        lines.resize(working_height, String::new());
-        let viewport_start = working_height.saturating_sub(terminal_height);
-        for (overlay_lines, row, col, overlay_width) in rendered {
-            for (offset, overlay_line) in overlay_lines.into_iter().enumerate() {
-                let index = viewport_start + row + offset;
-                if index >= lines.len() || is_image_line(&lines[index]) {
-                    continue;
-                }
-                let after_start = col + overlay_width;
-                let base = extract_segments(
-                    &lines[index],
-                    col,
-                    after_start,
-                    terminal_width.saturating_sub(after_start),
-                    true,
-                );
-                let overlay = slice_with_width(&overlay_line, 0, overlay_width, true);
-                let before_padding = col.saturating_sub(base.before_width);
-                let overlay_padding = overlay_width.saturating_sub(overlay.width);
-                let actual_before = col.max(base.before_width);
-                let actual_overlay = overlay_width.max(overlay.width);
-                let after_target = terminal_width.saturating_sub(actual_before + actual_overlay);
-                let after_padding = after_target.saturating_sub(base.after_width);
-                let reset = if self.capabilities.plain {
-                    ""
-                } else {
-                    "\x1b[0m\x1b]8;;\x07"
-                };
-                let mut composite = format!(
-                    "{}{}{}{}{}{}{}{}",
-                    base.before,
-                    " ".repeat(before_padding),
-                    reset,
-                    overlay.text,
-                    " ".repeat(overlay_padding),
-                    reset,
-                    base.after,
-                    " ".repeat(after_padding)
-                );
-                if visible_width(&composite) > terminal_width {
-                    composite = crate::utils::slice_by_column(&composite, 0, terminal_width, true);
-                }
-                lines[index] = composite;
-            }
+    fn root_render(&self, width: u16) -> Vec<String> {
+        let mut lines = Vec::new();
+        for child in &self.children {
+            lines.extend(child.render(width));
         }
         lines
     }
@@ -1940,7 +1505,8 @@ fn extract_cursor_position_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     struct RecordingTerminal {
         size: Rc<Cell<(u16, u16)>>,
@@ -3774,84 +3340,5 @@ mod tests {
             "\x1b[3;1H\x1b[0m\x1b]8;;\x1b\\",
             "shutdown must leave the caller below the complete inline frame"
         );
-    }
-
-    struct StaticOverlay {
-        lines: Vec<String>,
-        requested_width: Rc<Cell<u16>>,
-    }
-
-    impl Component for StaticOverlay {
-        fn render(&self, width: u16) -> Vec<String> {
-            self.requested_width.set(width);
-            self.lines.clone()
-        }
-        fn invalidate(&mut self) {}
-    }
-
-    #[test]
-    fn pi_overlay_layout_composites_rectangles_without_replacing_root_rows() {
-        let size = Rc::new(Cell::new((16, 3)));
-        let (terminal, ..) =
-            recording_terminal(size, crate::capabilities::TerminalCapabilities::plain());
-        let requested_width = Rc::new(Cell::new(0));
-        let mut tui = TUI::new(Box::new(terminal));
-        tui.show_overlay(
-            Box::new(StaticOverlay {
-                lines: vec!["XY".into()],
-                requested_width: requested_width.clone(),
-            }),
-            OverlayOptions {
-                width: Some(4.into()),
-                row: Some(1.into()),
-                col: Some(4.into()),
-                ..OverlayOptions::default()
-            },
-        );
-        let frame = tui.composite_overlays(vec!["0123456789abcdef".into(); 3], 16, 3);
-        assert_eq!(requested_width.get(), 4);
-        assert_eq!(frame[0], "0123456789abcdef");
-        assert_eq!(frame[1], "0123XY  89abcdef");
-        assert_eq!(frame[2], "0123456789abcdef");
-
-        let (overlay_width, row, col, _) = TUI::resolve_overlay_layout(
-            OverlayOptions {
-                width: Some(SizeValue::percent(50.0)),
-                row: Some(SizeValue::percent(100.0)),
-                col: Some(SizeValue::percent(50.0)),
-                ..OverlayOptions::default()
-            },
-            1,
-            16,
-            3,
-        );
-        assert_eq!((overlay_width, row, col), (8, 2, 4));
-    }
-
-    #[test]
-    fn pi_overlay_anchor_margin_offset_and_max_height_are_applied() {
-        let size = Rc::new(Cell::new((16, 6)));
-        let (terminal, ..) =
-            recording_terminal(size, crate::capabilities::TerminalCapabilities::plain());
-        let mut tui = TUI::new(Box::new(terminal));
-        tui.show_overlay(
-            Box::new(StaticOverlay {
-                lines: vec!["A".into(), "B".into(), "C".into()],
-                requested_width: Rc::new(Cell::new(0)),
-            }),
-            OverlayOptions {
-                width: Some(4.into()),
-                max_height: Some(2.into()),
-                anchor: OverlayAnchor::BottomRight,
-                offset_x: -1,
-                margin: Some(OverlayMargin::all(1)),
-                ..OverlayOptions::default()
-            },
-        );
-        let frame = tui.composite_overlays(Vec::new(), 16, 6);
-        assert_eq!(frame.len(), 6);
-        assert_eq!(&frame[3][10..11], "A");
-        assert_eq!(&frame[4][10..11], "B");
-        assert!(!frame.iter().any(|line| line.contains('C')));
     }
 }

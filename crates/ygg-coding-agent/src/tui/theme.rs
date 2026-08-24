@@ -4,10 +4,8 @@ use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
 use sexy_tui_rs::theme::{capability::CapabilityTier, Theme as SexyTheme};
-use sexy_tui_rs::widgets::SelectListTheme;
 use sexy_tui_rs::{
     CapabilityOverrides, CodeOverflow, Color, RenderOptions, RichRenderer, SupportLevel, TextRole,
     TextStyle, UnorderedListMarker,
@@ -321,17 +319,6 @@ fn default_surfaces() -> BTreeMap<String, ThemeSurface> {
     .collect()
 }
 
-#[allow(dead_code)]
-fn valid_runtime_role_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 96
-        && !name.starts_with('.')
-        && !name.ends_with('.')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
 fn semantic_text_role(name: &str) -> Option<(TextRole, &'static str)> {
     Some(match name {
         "text" | "foreground" => (TextRole::Text, "foreground"),
@@ -469,17 +456,11 @@ impl YggTheme {
             .unwrap_or_else(|| unicode_glyph(name))
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used only with the `serve` extension feature
     pub fn semantic_role_names(&self) -> impl Iterator<Item = &str> {
         self.semantic_styles.keys().map(String::as_str)
     }
 
-    #[allow(dead_code)]
-    pub fn has_semantic_role(&self, role: &str) -> bool {
-        self.semantic_styles.contains_key(role)
-    }
-
-    #[allow(dead_code)]
     pub fn semantic_style(&self, role: &str) -> TextStyle {
         self.semantic_styles
             .get(role)
@@ -494,7 +475,6 @@ impl YggTheme {
     /// Render a built-in or extension-defined semantic role. Extensions use
     /// stable role names and never need access to Ygg's private application
     /// state or raw terminal escape sequences.
-    #[allow(dead_code)]
     pub fn apply_semantic_role(&self, role: &str, text: &str) -> String {
         self.inner.apply_style(self.semantic_style(role), text)
     }
@@ -503,7 +483,21 @@ impl YggTheme {
     /// runs produced by the rich renderer. Theme data remains typed; only the
     /// renderer creates these reset/reopen sequences.
     pub(crate) fn apply_semantic_role_layered(&self, role: &str, text: &str) -> String {
-        let wrapped_empty = self.inner.apply_style(self.semantic_style(role), "");
+        self.apply_style_layered(self.semantic_style(role), text)
+    }
+
+    /// Paint a full row with a background colour while preserving inner ANSI
+    /// runs (the shaded composer rectangle). No-colour terminals get the text
+    /// back unchanged.
+    pub(crate) fn paint_row_background(&self, rgb: (u8, u8, u8), text: &str) -> String {
+        self.apply_style_layered(
+            TextStyle::plain().background(Color::Rgb(rgb.0, rgb.1, rgb.2)),
+            text,
+        )
+    }
+
+    fn apply_style_layered(&self, style: TextStyle, text: &str) -> String {
+        let wrapped_empty = self.inner.apply_style(style, "");
         let Some(opening) = wrapped_empty.strip_suffix("\x1b[0m") else {
             return text.to_owned();
         };
@@ -525,27 +519,9 @@ impl YggTheme {
         layered
     }
 
-    #[allow(dead_code)]
-    pub fn override_semantic_style(
-        &mut self,
-        role: impl Into<String>,
-        style: TextStyle,
-    ) -> anyhow::Result<()> {
-        let role = role.into();
-        if !valid_runtime_role_name(&role) {
-            anyhow::bail!("invalid semantic role {role:?}");
-        }
-        if let Some((text_role, _)) = semantic_text_role(&role) {
-            self.inner.override_style(text_role, style);
-        }
-        self.semantic_styles.insert(role, style);
-        Ok(())
-    }
-
     /// Reload the active file or bundled theme while preserving this terminal
     /// capability/background profile. Runtime model styling is reapplied by
     /// the shell when it swaps the returned theme in.
-    #[allow(dead_code)]
     pub fn reload(&self) -> anyhow::Result<Self> {
         match &self.source {
             ThemeSource::CompiledDefault => {
@@ -597,6 +573,14 @@ impl YggTheme {
             .unwrap_or_else(|| DEFAULT_ACCENT.to_owned());
         let color = parse_hex_color(&balance_foreground(&source, self.background))?;
         Some((color.red, color.green, color.blue))
+    }
+
+    /// Whether this theme opts into model-adaptive lab coloring. The default
+    /// theme sets `model.use_lab_color = true`; bundled pack themes disable it
+    /// so their fixed palettes stay untouched. Custom themes that omit the key
+    /// keep the historical adaptive behaviour.
+    pub(crate) fn uses_model_lab_color(&self) -> bool {
+        self.resolve::<bool>("model.use_lab_color").unwrap_or(true)
     }
 
     /// Render `text` in the accent colour of a specific model family.
@@ -1501,18 +1485,6 @@ pub(crate) fn test_bundled_theme_with(
 }
 
 #[cfg(test)]
-fn foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.fg(token, text))
-}
-
-#[cfg(test)]
-fn bold_foreground(theme: &YggTheme, token: &'static str) -> Box<dyn Fn(&str) -> String> {
-    let theme = theme.clone();
-    Box::new(move |text| theme.bold(&theme.fg(token, text)))
-}
-
-#[cfg(test)]
 fn project_theme_dir(config: &Config) -> PathBuf {
     config.workspace.join(".ygg").join("themes")
 }
@@ -2061,54 +2033,6 @@ pub(crate) fn apply_model_lab(theme: &mut YggTheme, lab: ModelLab) {
     apply_model_lab_for(theme, lab, background);
 }
 
-/// Build sexy-tui's select-list closures from the current model theme.
-#[cfg(test)]
-pub fn select_list_theme(theme: &YggTheme) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: foreground(theme, "model_accent"),
-        selected_text: bold_foreground(theme, "model_accent"),
-        description: foreground(theme, "muted"),
-        scroll_info: foreground(theme, "muted"),
-        no_match: foreground(theme, "error"),
-    }
-}
-
-#[allow(dead_code)]
-fn shared_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        theme
-            .lock()
-            .expect("picker theme mutex poisoned")
-            .fg(token, text)
-    })
-}
-
-#[allow(dead_code)]
-fn shared_bold_foreground(
-    theme: Arc<Mutex<YggTheme>>,
-    token: &'static str,
-) -> Box<dyn Fn(&str) -> String> {
-    Box::new(move |text| {
-        let theme = theme.lock().expect("picker theme mutex poisoned");
-        theme.bold(&theme.fg(token, text))
-    })
-}
-
-/// A picker theme whose model accent can change as selection moves.
-#[allow(dead_code)]
-pub fn dynamic_select_list_theme(theme: Arc<Mutex<YggTheme>>) -> SelectListTheme {
-    SelectListTheme {
-        selected_prefix: shared_foreground(theme.clone(), "model_accent"),
-        selected_text: shared_bold_foreground(theme.clone(), "model_accent"),
-        description: shared_foreground(theme.clone(), "muted"),
-        scroll_info: shared_foreground(theme.clone(), "muted"),
-        no_match: shared_foreground(theme, "error"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2137,7 +2061,6 @@ mod tests {
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,
             cost_warning_microdollars: None,
-            show_turn_cost: false,
             max_turns: Some(40),
             show_reasoning_in_print: false,
             initial_prompt: None,
@@ -2166,13 +2089,6 @@ mod tests {
             (right, left)
         };
         (relative_luminance(light) + 0.05) / (relative_luminance(dark) + 0.05)
-    }
-
-    #[test]
-    fn select_list_theme_builds_and_preserves_text() {
-        let theme = select_list_theme(&test_theme());
-        assert!((theme.selected_text)("x").contains('x'));
-        assert!((theme.no_match)("x").contains('x'));
     }
 
     #[test]
@@ -2222,8 +2138,8 @@ mod tests {
     }
 
     #[test]
-    fn eleven_bundled_themes_load_for_every_terminal_profile() {
-        assert_eq!(theme_pack::THEMES.len(), 11);
+    fn three_bundled_themes_load_for_every_terminal_profile() {
+        assert_eq!(theme_pack::THEMES.len(), 3);
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let black = Rgb {
             red: 0,
@@ -2292,34 +2208,30 @@ mod tests {
     }
 
     #[test]
-    fn kawaii_pink_preserves_default_layout_and_adapts_its_surfaces() {
+    fn pie_keeps_exact_clone_surfaces_and_defaults_on_unknown_terminals() {
         let capabilities = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
-        let dark =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Dark).unwrap();
-        let light =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Light).unwrap();
+        let dark = load_bundled_theme_for("pie", capabilities, TerminalBackground::Dark).unwrap();
+        let light = load_bundled_theme_for("pie", capabilities, TerminalBackground::Light).unwrap();
         let unknown =
-            load_bundled_theme_for("kawaii-pink", capabilities, TerminalBackground::Unknown)
-                .unwrap();
+            load_bundled_theme_for("pie", capabilities, TerminalBackground::Unknown).unwrap();
 
-        assert_eq!(dark.layout(), &ThemeLayout::default());
-        assert_eq!(light.layout(), &ThemeLayout::default());
-        for theme in [&dark, &light, &unknown] {
-            let accent = required_rgb_token(theme, "accent");
-            assert!(
-                accent.red > accent.green && accent.blue > accent.green,
-                "pink accent lost its hue: {accent:?}"
-            );
-        }
-        for token in ["kawaii_blush_bg", "kawaii_lilac_bg", "kawaii_note_bg"] {
-            assert!(relative_luminance(required_rgb_token(&dark, token)) < 0.05);
-            assert!(relative_luminance(required_rgb_token(&light, token)) > 0.90);
+        assert_eq!(dark.layout(), light.layout());
+        assert_eq!(format!("{:?}", dark.layout().density), "Airy");
+        assert_eq!(dark.layout().transcript_inset, 1);
+        for token in ["pie_user_bg", "pie_tool_bg", "pie_note_bg"] {
+            assert!(relative_luminance(required_rgb_token(&dark, token)) < 0.06);
+            assert!(relative_luminance(required_rgb_token(&light, token)) > 0.80);
             assert_eq!(
                 unknown.resolve::<String>(token).as_deref(),
                 Some("default"),
                 "unknown terminals should keep {token} on their default canvas"
             );
         }
+        // Exact clone palette: pi's dark user-message background.
+        assert_eq!(
+            dark.resolve::<String>("pie_user_bg").as_deref(),
+            Some("#343541")
+        );
     }
 
     #[test]
@@ -2347,22 +2259,22 @@ mod tests {
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(signatures.len(), 11);
+        assert_eq!(signatures.len(), 3);
         assert_eq!(
             themes
                 .iter()
                 .map(|theme| theme.glyph("wordmark"))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            11
+            3
         );
-        assert!(
+        assert_eq!(
             themes
                 .iter()
                 .map(|theme| theme.glyph("prompt"))
                 .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                >= 8
+                .len(),
+            3
         );
         assert!(
             themes
@@ -2370,7 +2282,7 @@ mod tests {
                 .map(|theme| theme.glyph("top_left"))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len()
-                >= 5
+                >= 2
         );
         assert_eq!(
             themes
@@ -2380,7 +2292,7 @@ mod tests {
                 .len(),
             3
         );
-        assert_eq!(bundled_theme_summaries().len(), 11);
+        assert_eq!(bundled_theme_summaries().len(), 3);
     }
 
     #[test]
@@ -2481,22 +2393,20 @@ mod tests {
     fn semantic_roles_and_glyphs_degrade_without_losing_text() {
         let truecolor = TerminalCapabilities::test(true, true, ColorDepth::TrueColor);
         let theme =
-            load_bundled_theme_for("bone-machine", truecolor, TerminalBackground::Unknown).unwrap();
+            load_bundled_theme_for("clawed", truecolor, TerminalBackground::Unknown).unwrap();
         let confirmation = theme.apply_semantic_role("confirmation", "continue?");
         assert!(confirmation.contains("continue?"));
         assert!(confirmation.contains("\x1b[1m"));
-        assert!(confirmation.contains("\x1b[7m"));
-        assert_eq!(theme.glyph("prompt"), "»");
+        assert_eq!(theme.glyph("prompt"), ">");
 
         let plain = TerminalCapabilities::test(false, false, ColorDepth::None);
-        let theme =
-            load_bundled_theme_for("bone-machine", plain, TerminalBackground::Unknown).unwrap();
+        let theme = load_bundled_theme_for("clawed", plain, TerminalBackground::Unknown).unwrap();
         assert_eq!(
             theme.apply_semantic_role("confirmation", "continue?"),
             "continue?"
         );
         assert_eq!(theme.glyph("prompt"), ">");
-        assert_eq!(theme.glyph("horizontal"), "=");
+        assert_eq!(theme.glyph("top_left"), "+");
     }
 
     #[test]

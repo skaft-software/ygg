@@ -1227,44 +1227,73 @@ impl Session {
     /// listing can still open active sessions, while a second writer fails
     /// before it can reuse stale entry IDs.
     fn persist(&mut self, bytes: &[u8]) -> Result<(), SessionError> {
-        self.file.lock_exclusive()?;
-        let result = (|| {
-            if self.file.metadata()?.len() != self.persisted_len {
-                return Err(SessionError::ConcurrentModification);
-            }
-            let byte_count = u64::try_from(bytes.len()).map_err(|_| {
-                SessionError::Limit("record write length does not fit u64".to_owned())
-            })?;
-            let new_len = self
-                .persisted_len
-                .checked_add(byte_count)
-                .ok_or_else(|| SessionError::Limit("session file length overflow".to_owned()))?;
-            if new_len > MAX_SESSION_FILE_BYTES {
-                return Err(SessionError::Limit(format!(
-                    "write would grow session to {new_len} bytes (limit {MAX_SESSION_FILE_BYTES})"
-                )));
-            }
-            let added_records = bytes.iter().filter(|byte| **byte == b'\n').count();
-            let new_records = self
-                .persisted_records
-                .checked_add(added_records)
-                .ok_or_else(|| SessionError::Limit("session record count overflow".to_owned()))?;
-            if new_records > MAX_SESSION_RECORDS {
-                return Err(SessionError::Limit(format!(
-                    "write would grow session past {MAX_SESSION_RECORDS} records"
-                )));
-            }
-            self.file.seek(std::io::SeekFrom::End(0))?;
-            self.file.write_all(bytes)?;
-            self.file.sync_data()?;
-            self.persisted_len = new_len;
-            self.persisted_records = new_records;
+        // The flock acquisition, staleness check, append, and sync_data form
+        // one critical section that must run as a single unit on one thread so
+        // the advisory lock is never held across an await point.
+        fn critical_section(session: &mut Session, bytes: &[u8]) -> Result<(), SessionError> {
+            session.file.lock_exclusive()?;
+            let result = (|| {
+                if session.file.metadata()?.len() != session.persisted_len {
+                    return Err(SessionError::ConcurrentModification);
+                }
+                let byte_count = u64::try_from(bytes.len()).map_err(|_| {
+                    SessionError::Limit("record write length does not fit u64".to_owned())
+                })?;
+                let new_len = session
+                    .persisted_len
+                    .checked_add(byte_count)
+                    .ok_or_else(|| {
+                        SessionError::Limit("session file length overflow".to_owned())
+                    })?;
+                if new_len > MAX_SESSION_FILE_BYTES {
+                    return Err(SessionError::Limit(format!(
+                        "write would grow session to {new_len} bytes (limit {MAX_SESSION_FILE_BYTES})"
+                    )));
+                }
+                let added_records = bytes.iter().filter(|byte| **byte == b'\n').count();
+                let new_records = session
+                    .persisted_records
+                    .checked_add(added_records)
+                    .ok_or_else(|| {
+                        SessionError::Limit("session record count overflow".to_owned())
+                    })?;
+                if new_records > MAX_SESSION_RECORDS {
+                    return Err(SessionError::Limit(format!(
+                        "write would grow session past {MAX_SESSION_RECORDS} records"
+                    )));
+                }
+                session.file.seek(std::io::SeekFrom::End(0))?;
+                session.file.write_all(bytes)?;
+                session.file.sync_data()?;
+                session.persisted_len = new_len;
+                session.persisted_records = new_records;
+                Ok(())
+            })();
+            let unlock_result = FileExt::unlock(&session.file);
+            result?;
+            unlock_result?;
             Ok(())
-        })();
-        let unlock_result = FileExt::unlock(&self.file);
-        result?;
-        unlock_result?;
-        Ok(())
+        }
+
+        // Every blocking filesystem operation below (flock wait, metadata,
+        // write_all, sync_data) executes on an async runtime worker in
+        // production (`worker_threads = 2`). On a multi-threaded runtime,
+        // block_in_place tells the scheduler this worker will stall, letting
+        // it migrate queued tasks to other workers instead of starving while
+        // a slow disk holds flock or fsync. The whole critical section stays
+        // together inside one call, so locking and error semantics are
+        // unchanged; outside a multi-threaded runtime (tests, sync callers)
+        // it runs inline exactly as before.
+        if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
+            matches!(
+                handle.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        }) {
+            tokio::task::block_in_place(|| critical_section(self, bytes))
+        } else {
+            critical_section(self, bytes)
+        }
     }
 
     /// Appends an entry (parented on the current head) and records the new

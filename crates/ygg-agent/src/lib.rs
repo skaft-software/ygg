@@ -208,9 +208,8 @@ pub use skills::{
 pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
     Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolDescriptor, ToolError,
-    ToolInputRequest, ToolInputResponse, ToolInputValidationIssue, ToolOutput,
-    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolOutputValidationError,
-    ToolProgress, ToolProgressSink, TypedTool, TypedToolAdapter, ValidateToolInput,
+    ToolInputRequest, ToolInputResponse, ToolOutput, ToolOutputContentPart, ToolOutputDetails,
+    ToolOutputMediaKind, ToolOutputValidationError, ToolProgress, ToolProgressSink,
     MAX_PROGRESS_CHUNK_BYTES, MAX_TOOL_METADATA_BYTES, MAX_TOOL_STRUCTURED_CONTENT_BYTES,
 };
 pub use tools::{BashTool, CoreTools, EditTool, ReadTool, SearchTool, WriteTool};

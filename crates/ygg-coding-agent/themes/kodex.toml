@@ -1,39 +1,31 @@
+# "Kodex" — a quiet monochrome folio with one cyan pen.
+# Shaded prompt rectangle, dim secondary text, and bullet rails. Very archival.
 [metadata]
-name = "Kawaii Pink"
-description = "A candy-bright pink workspace with blush rails, ribbon markers, tiny hearts, and the default theme's focused spacing."
+name = "Kodex"
+description = "A quiet monochrome folio with one cyan pen: a shaded prompt rectangle, dim secondary text, and bullet rails. Very archival."
 author = "Ygg theme pack"
 version = "1"
 terminal = "light-dark"
-adaptive = true
+adaptive = false
 
 [colors]
-accent = "#d63f8c"
-muted = "#8d667a"
-error = "#c63f61"
-warning = "#9d651d"
-success = "#3f8265"
-info = "#7657a8"
-border = "#a85d86"
+accent = "#347f88"
+muted = "#6f7a80"
+error = "#b25454"
+warning = "#9a7b3f"
+success = "#43845e"
+info = "#5f87a8"
+border = "#6c7680"
 border_focused = "accent"
-tool_title = "#b83e82"
-md_heading = "accent"
-md_link = "#7657a8"
-md_code = "#ad4f7b"
-md_code_border = "border"
-md_quote_border = "#df5b9e"
-md_list_bullet = "accent"
-syntax_comment = "#8d667a"
-syntax_keyword = "#b83e82"
-syntax_function = "#7657a8"
-syntax_string = "#3f8265"
-syntax_number = "#9d651d"
-syntax_type = "#9b4c85"
-syntax_operator = "#d63f8c"
-diff_added_bg = "#3f8265"
-diff_removed_bg = "#c63f61"
-kawaii_blush_bg = "default"
-kawaii_lilac_bg = "default"
-kawaii_note_bg = "default"
+tool_title = "foreground"
+md_heading = "default"
+md_link = "info"
+md_code = "default"
+md_quote_border = "muted"
+md_list_bullet = "muted"
+kodex_user_bg = "default"
+composer = "shaded"
+composer_bg = "kodex_user_bg"
 
 [model]
 use_lab_color = false
@@ -47,11 +39,9 @@ foreground = "md_heading"
 bold = true
 
 [roles.emphasis]
-foreground = "accent"
 italic = true
 
 [roles.strong]
-foreground = "accent"
 bold = true
 
 [roles.link]
@@ -66,7 +56,7 @@ foreground = "muted"
 italic = true
 
 [roles.notification]
-foreground = "info"
+foreground = "muted"
 italic = true
 
 [roles.confirmation]
@@ -78,7 +68,7 @@ foreground = "accent"
 italic = true
 
 [roles."extension.status"]
-foreground = "info"
+foreground = "muted"
 italic = true
 
 [roles."extension.header"]
@@ -87,76 +77,77 @@ bold = true
 
 [roles."surface.user"]
 foreground = "foreground"
-background = "kawaii_blush_bg"
+background = "kodex_user_bg"
 
 [roles."surface.user.border"]
-foreground = "accent"
+foreground = "muted"
+bold = true
+dim = true
 
 [roles."surface.user.label"]
-foreground = "accent"
+foreground = "muted"
 bold = true
 
 [roles."surface.assistant"]
 foreground = "foreground"
 
 [roles."surface.assistant.border"]
-foreground = "border"
+foreground = "muted"
 
 [roles."surface.assistant.label"]
-foreground = "accent"
+foreground = "muted"
 bold = true
 
 [roles."surface.reasoning"]
 foreground = "muted"
 italic = true
+dim = true
 
 [roles."surface.reasoning.border"]
-foreground = "border"
+foreground = "muted"
 
 [roles."surface.reasoning.label"]
-foreground = "accent"
+foreground = "muted"
 italic = true
 
 [roles."surface.tool"]
-foreground = "foreground"
-background = "kawaii_lilac_bg"
+foreground = "muted"
 
 [roles."surface.tool.border"]
-foreground = "info"
+foreground = "muted"
 
 [roles."surface.tool.label"]
-foreground = "info"
+foreground = "foreground"
 bold = true
 
 [roles."surface.shell"]
-foreground = "foreground"
+foreground = "muted"
 
 [roles."surface.shell.border"]
-foreground = "accent"
+foreground = "muted"
 
 [roles."surface.shell.label"]
-foreground = "accent"
-italic = true
+foreground = "foreground"
+bold = true
 
 [roles."surface.notice"]
-foreground = "foreground"
-background = "kawaii_note_bg"
+foreground = "muted"
 
 [roles."surface.notice.border"]
-foreground = "warning"
+foreground = "muted"
 
 [roles."surface.notice.label"]
-foreground = "accent"
+foreground = "muted"
 bold = true
 
 [roles."surface.outcome"]
 foreground = "muted"
 
 [roles."surface.outcome.border"]
-foreground = "accent"
+foreground = "muted"
 
 [roles."surface.outcome.label"]
-foreground = "accent"
+foreground = "muted"
 bold = true
 
 [roles."surface.compaction"]
@@ -164,37 +155,35 @@ foreground = "muted"
 italic = true
 
 [roles."surface.compaction.border"]
-foreground = "border"
+foreground = "muted"
 
 [roles."surface.compaction.label"]
-foreground = "info"
+foreground = "muted"
 italic = true
 
 [glyphs]
-top_left = "╭"
-top_right = "╮"
-bottom_left = "╰"
-bottom_right = "╯"
+top_left = "┌"
+top_right = "┐"
+bottom_left = "└"
+bottom_right = "┘"
 horizontal = "─"
 vertical = "│"
-branch = "♡"
-last_branch = "╰"
-rail = "│"
-prompt = "♡"
-shell = "⌘"
+rail = "•"
+prompt = "›"
+shell = "$"
 success = "✓"
-warning = "△"
-note = "✿"
-error = "×"
+warning = "▲"
+note = "□"
+error = "✗"
 interrupt = "■"
 pending = "·"
 collapsed = "▸"
 expanded = "▾"
-separator = " ·♡· "
+separator = " · "
 ellipsis = "…"
-bullet = "♡"
-reasoning = "✧"
-wordmark = "ygg ♡ kawaii"
+bullet = "•"
+reasoning = "…"
+wordmark = "kodex"
 
 [glyphs_ascii]
 top_left = "+"
@@ -203,36 +192,32 @@ bottom_left = "+"
 bottom_right = "+"
 horizontal = "-"
 vertical = "|"
-branch = "<3"
-last_branch = "`-"
-rail = "|"
+rail = "*"
 prompt = ">"
 shell = "$"
 success = "+"
 warning = "!"
-note = "*"
+note = "[]"
 error = "x"
 interrupt = "#"
 pending = "."
 collapsed = ">"
 expanded = "v"
-separator = " <3 "
+separator = " - "
 ellipsis = "..."
 bullet = "*"
-reasoning = "~"
-wordmark = "ygg <3 kawaii"
+reasoning = "..."
+wordmark = "kodex"
 
 [surfaces.user]
-chrome = "card"
-heading = "tab"
-label = "YOU ♡"
-padding = 1
-width = "content"
-align = "right"
-max_width = 88
-narrow_chrome = "rail"
-narrow_heading = "inline"
-narrow_label = "YOU"
+chrome = "band"
+heading = "none"
+padding = 0
+width = "full"
+align = "left"
+max_width = 96
+narrow_chrome = "plain"
+narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.assistant]
@@ -247,34 +232,30 @@ narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.reasoning]
-chrome = "rail"
-heading = "inline"
-label = "THINKING ✧"
-padding = 1
+chrome = "plain"
+heading = "none"
+padding = 0
 width = "content"
 align = "left"
-max_width = 84
+max_width = 92
 narrow_chrome = "plain"
 narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.tool]
-chrome = "card"
-heading = "tab"
-label = "TOOLBOX ✿"
+chrome = "rail"
+heading = "none"
 padding = 1
 width = "content"
 align = "left"
 max_width = 96
 narrow_chrome = "rail"
-narrow_heading = "inline"
-narrow_label = "TOOL"
+narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.shell]
 chrome = "rail"
-heading = "inline"
-label = "SHELL ♡"
+heading = "none"
 padding = 1
 width = "content"
 align = "left"
@@ -284,54 +265,50 @@ narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.notice]
-chrome = "band"
-heading = "inline"
-label = "NOTE ♡"
-padding = 1
+chrome = "plain"
+heading = "none"
+padding = 0
 width = "content"
-align = "center"
-max_width = 84
+align = "left"
+max_width = 92
 narrow_chrome = "plain"
-narrow_heading = "inline"
-narrow_label = "NOTE"
+narrow_heading = "none"
 narrow_padding = 0
 
 [surfaces.outcome]
 chrome = "rule"
 heading = "overline"
-label = "ALL DONE ♡"
+label = "archived"
 padding = 0
 width = "content"
-align = "center"
-max_width = 72
+align = "left"
+max_width = 80
 narrow_chrome = "plain"
 narrow_heading = "inline"
-narrow_label = "DONE"
+narrow_label = "archived"
 narrow_padding = 0
 
 [surfaces.compaction]
-chrome = "rail"
-heading = "inline"
-label = "MEMORY RIBBON"
-padding = 1
+chrome = "plain"
+heading = "none"
+padding = 0
 width = "content"
 align = "left"
-max_width = 88
+max_width = 92
 narrow_chrome = "plain"
-narrow_heading = "inline"
-narrow_label = "MEMORY"
+narrow_heading = "none"
 narrow_padding = 0
 
 [layout]
-density = "comfortable"
+density = "compact"
 show_header = false
 show_footer = true
 show_status_line = true
 show_reasoning = true
 show_panel_borders = true
-transcript_inset = 2
+transcript_inset = 0
 composer_padding = 1
-narrow_breakpoint = 64
+narrow_breakpoint = 60
 narrow_show_header = false
 narrow_show_footer = true
 narrow_show_status_line = true
@@ -339,39 +316,23 @@ narrow_show_reasoning = true
 narrow_show_panel_borders = false
 
 [variants.dark.colors]
-accent = "#ff75b5"
-muted = "#d09ab6"
-error = "#ff6f91"
-warning = "#eeb866"
-success = "#73cdaa"
-info = "#c09af2"
-border = "#dc8bb5"
-tool_title = "#ff92c4"
-md_heading = "#ff75b5"
-md_link = "#c09af2"
-md_code = "#ffacd0"
-md_code_border = "#dc8bb5"
-md_quote_border = "#ff75b5"
-md_list_bullet = "#ff75b5"
-kawaii_blush_bg = "#7a1f50"
-kawaii_lilac_bg = "#56335f"
-kawaii_note_bg = "#713949"
+accent = "#00cdcd"
+muted = "#767676"
+error = "#ff6b6b"
+warning = "#d0c060"
+success = "#5faf5f"
+info = "#6ea4c8"
+border = "#4d5966"
+kodex_user_bg = "#323232"
+composer_bg = "#323232"
 
 [variants.light.colors]
-accent = "#ad1457"
-muted = "#765468"
-error = "#b3264b"
-warning = "#744a08"
-success = "#17684d"
-info = "#5b378e"
-border = "#94486f"
-tool_title = "#9e1455"
-md_heading = "#ad1457"
-md_link = "#5b378e"
-md_code = "#8f315f"
-md_code_border = "#94486f"
-md_quote_border = "#ad1457"
-md_list_bullet = "#ad1457"
-kawaii_blush_bg = "#f7b4d3"
-kawaii_lilac_bg = "#ddc9f3"
-kawaii_note_bg = "#ffd5e5"
+accent = "#005f87"
+muted = "#6c6c6c"
+error = "#b4233a"
+warning = "#8a6d1a"
+success = "#1e7a3c"
+info = "#355f9e"
+border = "#4d5966"
+kodex_user_bg = "#f4f4f4"
+composer_bg = "#f4f4f4"

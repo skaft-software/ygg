@@ -125,9 +125,6 @@ pub struct Cli {
     /// Emit reasoning deltas in print mode.
     #[arg(long)]
     pub show_reasoning: bool,
-    /// Deprecated compatibility flag; accumulated session cost is always shown when available.
-    #[arg(long, hide = true)]
-    pub show_turn_cost: bool,
     /// Maximum model turns in one run.
     #[arg(long)]
     pub max_turns: Option<u64>,
@@ -263,7 +260,6 @@ struct ConfigLayer {
     max_turns: Option<u64>,
     max_cost_microdollars: Option<u64>,
     cost_warning_microdollars: Option<u64>,
-    show_turn_cost: Option<bool>,
     context_files: Option<bool>,
     offline: Option<bool>,
     strict_config: Option<bool>,
@@ -303,7 +299,6 @@ impl ConfigLayer {
         override_some!(max_turns);
         override_some!(max_cost_microdollars);
         override_some!(cost_warning_microdollars);
-        override_some!(show_turn_cost);
         override_some!(context_files);
         override_some!(offline);
         override_some!(strict_config);
@@ -738,7 +733,6 @@ const CONFIG_KEYS: &[&str] = &[
     "max_turns",
     "max_cost_microdollars",
     "cost_warning_microdollars",
-    "show_turn_cost",
     "context_files",
     "offline",
     "strict_config",
@@ -747,6 +741,11 @@ const CONFIG_KEYS: &[&str] = &[
     "system_prompt",
     "compaction",
 ];
+
+/// Legacy configuration keys accepted and ignored for backward
+/// compatibility. Removed settings must be listed here so older configs keep
+/// loading without unknown-key warnings or strict-mode rejections.
+const IGNORED_CONFIG_KEYS: &[&str] = &["show_turn_cost"];
 
 const COMPACTION_KEYS: &[&str] = &[
     "mode",
@@ -917,6 +916,9 @@ fn read_layer(path: &Path, source_kind: ConfigSourceKind) -> anyhow::Result<Load
         unknown_keys.push(segments);
     })
     .map_err(|error| anyhow::anyhow!("invalid config {}: {error}", path.display()))?;
+    unknown_keys.retain(|segments| {
+        segments.len() != 1 || !IGNORED_CONFIG_KEYS.contains(&segments[0].as_str())
+    });
     unknown_keys.sort();
     unknown_keys.dedup();
     let diagnostics = unknown_keys
@@ -992,7 +994,6 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         max_turns: env_parse("YGG_MAX_TURNS")?,
         max_cost_microdollars: env_parse("YGG_MAX_COST_MICRODOLLARS")?,
         cost_warning_microdollars: env_parse("YGG_COST_WARNING_MICRODOLLARS")?,
-        show_turn_cost: env_parse("YGG_SHOW_TURN_COST")?,
         context_files: env_parse("YGG_CONTEXT_FILES")?,
         offline: env_parse("YGG_OFFLINE")?,
         strict_config: env_parse("YGG_STRICT_CONFIG")?,
@@ -1296,7 +1297,6 @@ fn build_config_with_global_path(
         compaction,
         max_cost_microdollars: values.max_cost_microdollars,
         cost_warning_microdollars: values.cost_warning_microdollars,
-        show_turn_cost: cli.show_turn_cost || values.show_turn_cost.unwrap_or(false),
         max_turns: {
             let raw = cli.max_turns.or(values.max_turns).unwrap_or(0);
             if raw == 0 {
@@ -1363,7 +1363,6 @@ mod tests {
             mouse: None,
             plain: false,
             show_reasoning: false,
-            show_turn_cost: false,
             max_turns: None,
             session_dir: None,
             prompt_template: None,
@@ -1558,21 +1557,6 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::UnsafeHost);
-    }
-
-    #[test]
-    fn compact_footer_turn_cost_is_opt_in() {
-        let directory = cwd();
-        let mut cli = base();
-        cli.workspace = Some(directory.path().into());
-        let config = config_with_empty_global(cli, directory.path()).unwrap();
-        assert!(!config.show_turn_cost);
-
-        let mut cli = base();
-        cli.workspace = Some(directory.path().into());
-        cli.show_turn_cost = true;
-        let config = config_with_empty_global(cli, directory.path()).unwrap();
-        assert!(config.show_turn_cost);
     }
 
     #[test]
@@ -2018,18 +2002,16 @@ mod tests {
     #[test]
     fn cost_and_compaction_settings_merge_from_layered_toml() {
         let global: ConfigLayer = toml::from_str(
-            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\nshow_turn_cost = false\n[compaction]\nenabled = false\ncompact_model = 'cheap'",
+            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\n[compaction]\nenabled = false\ncompact_model = 'cheap'",
         )
         .unwrap();
-        let project: ConfigLayer = toml::from_str(
-            "cost_warning_microdollars = 40\nshow_turn_cost = true\n[compaction]\nkeep_recent_tokens = 2",
-        )
-        .unwrap();
+        let project: ConfigLayer =
+            toml::from_str("cost_warning_microdollars = 40\n[compaction]\nkeep_recent_tokens = 2")
+                .unwrap();
         let mut merged = global;
         merged.merge(project);
         assert_eq!(merged.max_cost_microdollars, Some(100));
         assert_eq!(merged.cost_warning_microdollars, Some(40));
-        assert_eq!(merged.show_turn_cost, Some(true));
         let compaction = merged.compaction.unwrap();
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));

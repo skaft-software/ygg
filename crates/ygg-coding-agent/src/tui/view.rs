@@ -15,8 +15,7 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer,
-    CURSOR_MARKER, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer, TUI,
 };
 use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
@@ -586,9 +585,6 @@ pub(crate) struct ShellState {
     pub(crate) run_cost_microdollars: u64,
     /// Distinguishes an exact zero from a legacy/unavailable resumed value.
     pub(crate) run_cost_available: bool,
-    /// Opt-in compact-footer visibility for the current provider turn's cost.
-    /// Accounting and detailed diagnostics do not depend on this flag.
-    pub(crate) show_turn_cost: bool,
     /// One authoritative presentation lifecycle for the newest run.
     pub(crate) run: RunTracker,
     /// Sum of settled agent-run durations for this interactive session.
@@ -1473,11 +1469,6 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-#[allow(dead_code)]
-fn prompt_cursor(_theme: &YggTheme) -> &'static str {
-    CURSOR_MARKER
-}
-
 pub(crate) fn fit_line(line: &str, width: u16) -> String {
     let width = usize::from(width);
     if visible_width(line) <= width {
@@ -1492,50 +1483,6 @@ pub(crate) fn fit_line(line: &str, width: u16) -> String {
         // transcript output.
         strip_terminal_sequences(&truncated)
     }
-}
-
-#[allow(dead_code)]
-fn render_prompt_box(state: &ShellState, width: u16, max_content_rows: usize) -> Vec<String> {
-    if width == 0 {
-        return vec![String::new()];
-    }
-    let marker = state.theme.fg("model_accent", prompt_marker(&state.theme));
-    let cursor_glyph = state.theme.fg("model_accent", prompt_cursor(&state.theme));
-    let (editor, editor_cursor) = sanitized_editor(&state.editor, state.editor_cursor);
-    if editor.is_empty() {
-        return vec![fit_line(&format!("{marker} {cursor_glyph}"), width)];
-    }
-
-    let layout = editor_layout(&editor, editor_cursor, width);
-    let visible_rows = max_content_rows.max(1).min(layout.lines.len());
-    let mut start = layout
-        .cursor_row
-        .saturating_add(1)
-        .saturating_sub(visible_rows);
-    let end = (start + visible_rows).min(layout.lines.len());
-    if end.saturating_sub(start) < visible_rows {
-        start = end.saturating_sub(visible_rows);
-    }
-
-    let mut rendered = Vec::with_capacity(end.saturating_sub(start));
-    for index in start..end {
-        let line = &layout.lines[index];
-        let content = if index == layout.cursor_row {
-            let cursor = editor_cursor.clamp(line.start, line.visible_end);
-            let before = &editor[line.start..cursor];
-            let after = &editor[cursor..line.visible_end];
-            format!("{before}{cursor_glyph}{after}")
-        } else {
-            editor[line.start..line.visible_end].to_owned()
-        };
-        let prefix = if index == 0 {
-            format!("{marker} ")
-        } else {
-            "  ".to_owned()
-        };
-        rendered.push(fit_line(&format!("{prefix}{content}"), width));
-    }
-    rendered
 }
 
 /// Full-screen terminal shell. It owns all terminal I/O and no Agent state.
@@ -2802,12 +2749,6 @@ impl InteractiveShell {
         state.invalidate_transcript_layout();
     }
 
-    #[allow(dead_code)]
-    pub fn columns(&self) -> u16 {
-        self.size.lock().expect("terminal size mutex poisoned").0
-    }
-
-    #[allow(dead_code)]
     pub fn theme(&self) -> YggTheme {
         self.state.borrow().theme.clone()
     }
@@ -2816,7 +2757,6 @@ impl InteractiveShell {
         let mut state = self.state.borrow_mut();
         state.safe_mode = config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost;
         state.max_session_cost_microdollars = config.max_cost_microdollars;
-        state.show_turn_cost = config.show_turn_cost;
         drop(state);
         self.theme_config = Some(config);
     }
@@ -3170,18 +3110,29 @@ impl InteractiveShell {
 
     /// Best-effort OSC 52 clipboard transport. The semantic fallback is
     /// retained separately in `copy_buffer`, so redirected output loses no data.
+    ///
+    /// `pbcopy`'s stdin write plus child wait block the caller, and this runs
+    /// from the interactive event loop, so the process handoff happens on a
+    /// detached thread. A detached thread (rather than `tokio::spawn`) keeps
+    /// this method callable from the synchronous view API and its runtime-less
+    /// unit tests. Errors stay ignored: `copy_buffer` remains authoritative.
     fn set_clipboard(text: &str) {
         #[cfg(target_os = "macos")]
         {
-            if let Ok(mut child) = std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .spawn()
-            {
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(text.as_bytes());
-                }
-                let _ = child.wait();
-            }
+            let text = text.to_owned();
+            let _ = std::thread::Builder::new()
+                .name("clipboard-pbcopy".to_owned())
+                .spawn(move || {
+                    if let Ok(mut child) = std::process::Command::new("pbcopy")
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()
+                    {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        let _ = child.wait();
+                    }
+                });
         }
 
         if !std::io::stdout().is_terminal() {
@@ -3263,28 +3214,6 @@ impl InteractiveShell {
         Some(copy)
     }
 
-    /// Copyable original Markdown for assistant blocks, with plain semantic
-    /// text for non-Markdown events. This preserves code and links faithfully.
-    #[allow(dead_code)] // Public presentation action; command wiring follows selection gestures.
-    pub fn copy_selected_markdown(&mut self) -> Option<String> {
-        let selection = self.state.borrow().transcript_selection.clone()?;
-        let (start, end) = if selection.anchor.block <= selection.focus.block {
-            (selection.anchor.block, selection.focus.block)
-        } else {
-            (selection.focus.block, selection.anchor.block)
-        };
-        let state = self.state.borrow();
-        Some(
-            (start..=end)
-                .map(|index| match &state.transcript[index] {
-                    TranscriptBlock::Assistant(assistant) => assistant.text.clone(),
-                    block => block_copy_text(block),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        )
-    }
-
     #[cfg(test)]
     fn copy_buffer(&self) -> Option<String> {
         self.state.borrow().copy_buffer.clone()
@@ -3353,12 +3282,6 @@ impl InteractiveShell {
     #[allow(dead_code)]
     pub fn show_styled_overlay_text(&mut self, text: String) {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Text(text));
-    }
-
-    #[allow(dead_code)]
-    pub fn show_status_text(&mut self, text: String) {
-        let mut state = self.state.borrow_mut();
-        state.overlay = Some(ShellOverlay::Text(styled_status_text(&state.theme, &text)));
     }
 
     pub fn show_status_text_with_telemetry(&mut self, text: String) {

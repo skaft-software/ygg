@@ -2616,6 +2616,148 @@ fn observe_context_tracker(
     Ok(breakdown)
 }
 
+/// Which queue a batch of control inputs came from; only the announced event
+/// differs between steering and follow-up delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlDeliveryKind {
+    Steering,
+    FollowUp,
+}
+
+impl ControlDeliveryKind {
+    fn delivered_event(self, messages: Vec<String>) -> AgentEvent {
+        match self {
+            Self::Steering => AgentEvent::SteeringDelivered { messages },
+            Self::FollowUp => AgentEvent::FollowUpDelivered { messages },
+        }
+    }
+}
+
+/// Outcome of appending one queued control-input batch (steering or
+/// follow-up) to the session.
+enum ControlDelivery {
+    /// Every input was appended; announce them with this event when present.
+    Completed { event: Option<AgentEvent> },
+    /// Persistence failed. Any prefix that did reach the session is announced
+    /// by `event`; the run must then end with `finish`.
+    Interrupted {
+        event: Option<AgentEvent>,
+        finish: FinishReason,
+    },
+}
+
+/// Snapshot of everything `observe_context_tracker` needs to re-observe the
+/// tracker after control inputs change the session.
+struct ContextObservation<'a> {
+    tracker: &'a ContextTracker,
+    model: &'a Model,
+    system: &'a str,
+    tools: &'a [ToolDef],
+}
+
+impl ContextObservation<'_> {
+    fn observe(&self, session: &Session) -> Result<ContextBreakdown, SessionError> {
+        observe_context_tracker(self.tracker, session, self.model, self.system, self.tools)
+    }
+}
+
+/// Result of applying one drained tool-progress item to the run.
+enum ProgressSettlement {
+    /// Cancellation took precedence before the item was accepted; semantic
+    /// state was discarded and the caller must stop accepting progress.
+    Cancelled,
+    /// Consumed internally as a durable session event (persisted, or its
+    /// reply resolved with the persistence error).
+    Settled,
+    /// Pure progress; surface it to observers as a `ToolProgress` event.
+    Emit(ToolProgress),
+}
+
+/// Apply one drained tool-progress item.
+///
+/// When `cancelled` won, any queued session event is rejected through its
+/// reply channel without touching the session. Otherwise a session event is
+/// appended durably and acknowledged; every other progress flavor is returned
+/// for the caller to emit.
+fn settle_tool_progress(
+    p: ToolProgress,
+    cancelled: bool,
+    session: &mut Session,
+) -> ProgressSettlement {
+    if cancelled {
+        // The biased select deliberately gives cancellation
+        // precedence. Events already accepted in the loop
+        // remain durable, but a queued semantic event must
+        // not take effect after the tool was reported as
+        // cancelled (notably, it must not activate a skill).
+        if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
+            if let Ok(mut opt) = reply_tx_mutex.lock() {
+                if let Some(reply_tx) = opt.take() {
+                    let _ = reply_tx.send(Err(
+                        "session event discarded because cancellation won".to_string()
+                    ));
+                }
+            }
+        }
+        return ProgressSettlement::Cancelled;
+    }
+    if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
+        let res = session.append(*event);
+        if let Ok(mut opt) = reply_tx_mutex.lock() {
+            if let Some(reply_tx) = opt.take() {
+                let _ = reply_tx.send(res.map_err(|e| e.to_string()));
+            }
+        }
+        ProgressSettlement::Settled
+    } else {
+        ProgressSettlement::Emit(p)
+    }
+}
+
+/// Append a batch of already-queued control inputs as durable user messages
+/// and report what was delivered.
+///
+/// Each summary is recorded for the terminal gate before its append is
+/// attempted, mirroring the original inline blocks. On append failure the
+/// context tracker is still observed (its error ignored) so observers see the
+/// partial delivery before the run ends.
+fn deliver_control_inputs(
+    queued: Vec<UserInput>,
+    kind: ControlDeliveryKind,
+    session: &mut Session,
+    metadata: &EntryMetadata,
+    terminal_gate_requests: &mut Vec<String>,
+    observation: &ContextObservation<'_>,
+) -> ControlDelivery {
+    let mut delivered = Vec::with_capacity(queued.len());
+    for input in queued {
+        let summary = input.text_summary();
+        terminal_gate_requests.push(summary.clone());
+        if let Err(e) = session.append_with_metadata(user_message(input), Some(metadata.clone())) {
+            let event = (!delivered.is_empty())
+                .then(|| kind.delivered_event(std::mem::take(&mut delivered)));
+            let _ = observation.observe(session);
+            return ControlDelivery::Interrupted {
+                event,
+                finish: FinishReason::Failed(e.into()),
+            };
+        }
+        delivered.push(summary);
+    }
+    if !delivered.is_empty() {
+        if let Err(error) = observation.observe(session) {
+            return ControlDelivery::Interrupted {
+                event: None,
+                finish: FinishReason::Failed(error.into()),
+            };
+        }
+        return ControlDelivery::Completed {
+            event: Some(kind.delivered_event(delivered)),
+        };
+    }
+    ControlDelivery::Completed { event: None }
+}
+
 fn worst_case_request_cost(model: &Model, input_tokens: u64, output_tokens: u64) -> Option<u64> {
     let pricing = model.spec.pricing.as_ref()?;
     let mut input_rate = pricing
@@ -2805,50 +2947,7 @@ impl PreparedTurn {
     }
 }
 
-impl<'a> CompactionContext<'a> {
-    #[allow(clippy::too_many_arguments)] // Mirrors the borrowed request-run state held by the context.
-    fn new(
-        client: &'a AiClient,
-        model: &'a Model,
-        compaction_model: &'a Model,
-        session: &'a mut Session,
-        usage: &'a mut Usage,
-        run_cost: &'a mut CostAccumulator,
-        cache_retention: CacheRetention,
-        reasoning: &'a ReasoningConfig,
-        reasoning_mode: ReasoningMode,
-        session_id: &'a str,
-        max_session_tokens: Option<u64>,
-        max_session_cost_microdollars: Option<u64>,
-        abort: &'a AbortFlag,
-        mode: AgentCompactionMode,
-        threshold_fraction: f64,
-        keep_recent_tokens: u64,
-        events: &'a mpsc::UnboundedSender<AgentEvent>,
-        context: &'a ContextTracker,
-    ) -> Self {
-        Self {
-            client,
-            model,
-            compaction_model,
-            session,
-            usage,
-            run_cost,
-            cache_retention,
-            reasoning,
-            reasoning_mode,
-            session_id,
-            max_session_tokens,
-            max_session_cost_microdollars,
-            abort,
-            mode,
-            threshold_fraction,
-            keep_recent_tokens,
-            events,
-            context,
-        }
-    }
-
+impl CompactionContext<'_> {
     async fn call(
         &mut self,
         system: &str,
@@ -4404,47 +4503,33 @@ impl Agent {
                         QueueDeliveryMode::All => std::mem::take(&mut pending_steer),
                         QueueDeliveryMode::OneAtATime => vec![pending_steer.remove(0)],
                     };
-                    let mut delivered = Vec::with_capacity(queued.len());
-                    for input in queued {
-                        let summary = input.text_summary();
-                        terminal_gate_requests.push(summary.clone());
-                        if let Err(e) = session.append_with_metadata(
-                            user_message(input),
-                            Some(control_prompt_metadata.clone()),
-                        ) {
-                            if !delivered.is_empty() {
-                                let _ = observe_context_tracker(
-                                    &stream_context,
-                                    session,
-                                    &model,
-                                    &system,
-                                    &tool_defs,
-                                );
-                                let ev = AgentEvent::SteeringDelivered {
-                                    messages: delivered,
-                                };
+                    let observation = ContextObservation {
+                        tracker: &stream_context,
+                        model: &model,
+                        system: &system,
+                        tools: &tool_defs,
+                    };
+                    match deliver_control_inputs(
+                        queued,
+                        ControlDeliveryKind::Steering,
+                        session,
+                        &control_prompt_metadata,
+                        &mut terminal_gate_requests,
+                        &observation,
+                    ) {
+                        ControlDelivery::Completed { event } => {
+                            if let Some(ev) = event {
                                 notify_observers(&observers, &ev);
                                 yield ev;
                             }
-                            break 'run FinishReason::Failed(e.into());
                         }
-                        delivered.push(summary);
-                    }
-                    if !delivered.is_empty() {
-                        if let Err(error) = observe_context_tracker(
-                            &stream_context,
-                            session,
-                            &model,
-                            &system,
-                            &tool_defs,
-                        ) {
-                            break 'run FinishReason::Failed(error.into());
+                        ControlDelivery::Interrupted { event, finish } => {
+                            if let Some(ev) = event {
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                            }
+                            break 'run finish;
                         }
-                        let ev = AgentEvent::SteeringDelivered {
-                            messages: delivered,
-                        };
-                        notify_observers(&observers, &ev);
-                        yield ev;
                     }
                 }
 
@@ -4484,26 +4569,26 @@ impl Agent {
                 let (compaction_event_tx, mut compaction_event_rx) =
                     mpsc::unbounded_channel::<AgentEvent>();
                 let capacity = {
-                    let mut compaction = CompactionContext::new(
-                        &client,
-                        &model,
-                        &compaction_model,
+                    let mut compaction = CompactionContext {
+                        client: &client,
+                        model: &model,
+                        compaction_model: &compaction_model,
                         session,
-                        &mut run_usage,
-                        &mut run_cost,
+                        usage: &mut run_usage,
+                        run_cost: &mut run_cost,
                         cache_retention,
-                        &reasoning,
+                        reasoning: &reasoning,
                         reasoning_mode,
-                        &session_id,
+                        session_id: &session_id,
                         max_session_tokens,
                         max_session_cost_microdollars,
-                        &abort,
-                        auto_compaction_mode,
-                        compaction_threshold_fraction,
-                        compaction_keep_recent_tokens,
-                        &compaction_event_tx,
-                        &stream_context,
-                    );
+                        abort: &abort,
+                        mode: auto_compaction_mode,
+                        threshold_fraction: compaction_threshold_fraction,
+                        keep_recent_tokens: compaction_keep_recent_tokens,
+                        events: &compaction_event_tx,
+                        context: &stream_context,
+                    };
                     let operation = compaction
                         .ensure_capacity(&system, &request_tool_defs, max_output_tokens);
                     tokio::pin!(operation);
@@ -4650,26 +4735,26 @@ impl Agent {
                     Err(error) if context_retries < MAX_PROVIDER_RETRIES && looks_like_context_error(&error) => {
                         context_retries += 1;
                         let compacted = {
-                            let mut compaction = CompactionContext::new(
-                                &client,
-                                &model,
-                                &compaction_model,
+                            let mut compaction = CompactionContext {
+                                client: &client,
+                                model: &model,
+                                compaction_model: &compaction_model,
                                 session,
-                                &mut run_usage,
-                                &mut run_cost,
+                                usage: &mut run_usage,
+                                run_cost: &mut run_cost,
                                 cache_retention,
-                                &reasoning,
+                                reasoning: &reasoning,
                                 reasoning_mode,
-                                &session_id,
+                                session_id: &session_id,
                                 max_session_tokens,
                                 max_session_cost_microdollars,
-                                &abort,
-                                auto_compaction_mode,
-                                compaction_threshold_fraction,
-                                compaction_keep_recent_tokens,
-                                &compaction_event_tx,
-                                &stream_context,
-                            );
+                                abort: &abort,
+                                mode: auto_compaction_mode,
+                                threshold_fraction: compaction_threshold_fraction,
+                                keep_recent_tokens: compaction_keep_recent_tokens,
+                                events: &compaction_event_tx,
+                                context: &stream_context,
+                            };
                             let operation = compaction.force_one_boundary(
                                 &system,
                                 &request_tool_defs,
@@ -4802,26 +4887,26 @@ impl Agent {
                                 stream_context.provider_retry();
                                 context_retries += 1;
                                 let compacted = {
-                                    let mut compaction = CompactionContext::new(
-                                        &client,
-                                        &model,
-                                        &compaction_model,
+                                    let mut compaction = CompactionContext {
+                                        client: &client,
+                                        model: &model,
+                                        compaction_model: &compaction_model,
                                         session,
-                                        &mut run_usage,
-                                        &mut run_cost,
+                                        usage: &mut run_usage,
+                                        run_cost: &mut run_cost,
                                         cache_retention,
-                                        &reasoning,
+                                        reasoning: &reasoning,
                                         reasoning_mode,
-                                        &session_id,
+                                        session_id: &session_id,
                                         max_session_tokens,
                                         max_session_cost_microdollars,
-                                        &abort,
-                                        auto_compaction_mode,
-                                        compaction_threshold_fraction,
-                                        compaction_keep_recent_tokens,
-                                        &compaction_event_tx,
-                                        &stream_context,
-                                    );
+                                        abort: &abort,
+                                        mode: auto_compaction_mode,
+                                        threshold_fraction: compaction_threshold_fraction,
+                                        keep_recent_tokens: compaction_keep_recent_tokens,
+                                        events: &compaction_event_tx,
+                                        context: &stream_context,
+                                    };
                                     let operation = compaction.force_one_boundary(
                                         &system,
                                         &request_tool_defs,
@@ -5187,47 +5272,33 @@ impl Agent {
                                 vec![followups.pop_front().expect("follow-up queue is non-empty")]
                             }
                         };
-                        let mut delivered = Vec::with_capacity(queued.len());
-                        for input in queued {
-                            let summary = input.text_summary();
-                            terminal_gate_requests.push(summary.clone());
-                            if let Err(e) = session.append_with_metadata(
-                                user_message(input),
-                                Some(control_prompt_metadata.clone()),
-                            ) {
-                                if !delivered.is_empty() {
-                                    let _ = observe_context_tracker(
-                                        &stream_context,
-                                        session,
-                                        &model,
-                                        &system,
-                                        &tool_defs,
-                                    );
-                                    let ev = AgentEvent::FollowUpDelivered {
-                                        messages: delivered,
-                                    };
+                        let observation = ContextObservation {
+                            tracker: &stream_context,
+                            model: &model,
+                            system: &system,
+                            tools: &tool_defs,
+                        };
+                        match deliver_control_inputs(
+                            queued,
+                            ControlDeliveryKind::FollowUp,
+                            session,
+                            &control_prompt_metadata,
+                            &mut terminal_gate_requests,
+                            &observation,
+                        ) {
+                            ControlDelivery::Completed { event } => {
+                                if let Some(ev) = event {
                                     notify_observers(&observers, &ev);
                                     yield ev;
                                 }
-                                break 'run FinishReason::Failed(e.into());
                             }
-                            delivered.push(summary);
-                        }
-                        if !delivered.is_empty() {
-                            if let Err(error) = observe_context_tracker(
-                                &stream_context,
-                                session,
-                                &model,
-                                &system,
-                                &tool_defs,
-                            ) {
-                                break 'run FinishReason::Failed(error.into());
+                            ControlDelivery::Interrupted { event, finish } => {
+                                if let Some(ev) = event {
+                                    notify_observers(&observers, &ev);
+                                    yield ev;
+                                }
+                                break 'run finish;
                             }
-                            let ev = AgentEvent::FollowUpDelivered {
-                                messages: delivered,
-                            };
-                            notify_observers(&observers, &ev);
-                            yield ev;
                         }
                         continue;
                     }
@@ -5555,32 +5626,17 @@ impl Agent {
                                                 // trigger cancellation during the same select poll,
                                                 // after the biased abort branch was already checked.
                                                 // Recheck before accepting semantic state.
-                                                if abort.is_set() {
-                                                    if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
-                                                        if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                                            if let Some(reply_tx) = opt.take() {
-                                                                let _ = reply_tx.send(Err(
-                                                                    "session event discarded because cancellation won".to_string()
-                                                                ));
-                                                            }
-                                                        }
+                                                match settle_tool_progress(p, abort.is_set(), session) {
+                                                    ProgressSettlement::Cancelled => break None,
+                                                    ProgressSettlement::Settled => {}
+                                                    ProgressSettlement::Emit(p) => {
+                                                        let ev = AgentEvent::ToolProgress {
+                                                            id: call.id.clone(),
+                                                            progress: p,
+                                                        };
+                                                        notify_observers(&observers, &ev);
+                                                        yield ev;
                                                     }
-                                                    break None;
-                                                }
-                                                if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
-                                                    let res = session.append(*event);
-                                                    if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                                        if let Some(reply_tx) = opt.take() {
-                                                            let _ = reply_tx.send(res.map_err(|e| e.to_string()));
-                                                        }
-                                                    }
-                                                } else {
-                                                    let ev = AgentEvent::ToolProgress {
-                                                        id: call.id.clone(),
-                                                        progress: p,
-                                                    };
-                                                    notify_observers(&observers, &ev);
-                                                    yield ev;
                                                 }
                                             }
                                         },
@@ -5704,38 +5760,17 @@ impl Agent {
 
                     // ── Drain accepted progress before ToolFinished ───────
                     while let Ok(p) = progress_rx.try_recv() {
-                        if cancellation_won {
-                            // The biased select deliberately gives cancellation
-                            // precedence. Events already accepted in the loop
-                            // remain durable, but a queued semantic event must
-                            // not take effect after the tool was reported as
-                            // cancelled (notably, it must not activate a skill).
-                            if let ToolProgress::SessionEvent(_, reply_tx_mutex) = p {
-                                if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                    if let Some(reply_tx) = opt.take() {
-                                        let _ = reply_tx.send(Err(
-                                            "session event discarded because cancellation won"
-                                                .to_string(),
-                                        ));
-                                    }
-                                }
+                        match settle_tool_progress(p, cancellation_won, session) {
+                            ProgressSettlement::Cancelled => continue,
+                            ProgressSettlement::Settled => {}
+                            ProgressSettlement::Emit(p) => {
+                                let ev = AgentEvent::ToolProgress {
+                                    id: call.id.clone(),
+                                    progress: p,
+                                };
+                                notify_observers(&observers, &ev);
+                                yield ev;
                             }
-                            continue;
-                        }
-                        if let ToolProgress::SessionEvent(event, reply_tx_mutex) = p {
-                            let res = session.append(*event);
-                            if let Ok(mut opt) = reply_tx_mutex.lock() {
-                                if let Some(reply_tx) = opt.take() {
-                                    let _ = reply_tx.send(res.map_err(|e| e.to_string()));
-                                }
-                            }
-                        } else {
-                            let ev = AgentEvent::ToolProgress {
-                                id: call.id.clone(),
-                                progress: p,
-                            };
-                            notify_observers(&observers, &ev);
-                            yield ev;
                         }
                     }
                     // Report dropped progress if any.
