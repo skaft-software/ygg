@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 const MAX_RESOURCE_ENTRIES_PER_ROOT: usize = 4096;
@@ -19,9 +18,6 @@ const MAX_RESOURCE_ENTRIES_PER_ROOT: usize = 4096;
 pub enum ResourceKind {
     Theme,
     Prompt,
-    /// Legacy skill discovery retained for resolver compatibility tests.
-    #[allow(dead_code)]
-    Skill,
     Extension,
 }
 
@@ -30,7 +26,6 @@ impl ResourceKind {
         match self {
             Self::Theme => "themes",
             Self::Prompt => "prompts",
-            Self::Skill => "skills",
             Self::Extension => "extensions",
         }
     }
@@ -39,7 +34,6 @@ impl ResourceKind {
         match self {
             Self::Theme => 256 * 1024,
             Self::Prompt => 512 * 1024,
-            Self::Skill => 256 * 1024,
             Self::Extension => 256 * 1024,
         }
     }
@@ -49,13 +43,12 @@ impl ResourceKind {
         match self {
             Self::Theme => extension == Some("toml"),
             Self::Prompt => matches!(extension, Some("md" | "toml")),
-            Self::Skill | Self::Extension => false,
+            Self::Extension => false,
         }
     }
 
     fn directory_entrypoint(self) -> Option<&'static str> {
         match self {
-            Self::Skill => Some("SKILL.md"),
             Self::Extension => Some("extension.toml"),
             Self::Theme | Self::Prompt => None,
         }
@@ -108,11 +101,9 @@ pub struct ResourceDiagnostic {
     pub message: String,
 }
 
-/// Immutable result of one discovery/reload pass.
+/// Immutable result of one discovery pass.
 #[derive(Clone, Debug)]
 pub struct ResourceSnapshot {
-    #[allow(dead_code)]
-    pub generation: u64,
     pub kind: ResourceKind,
     resources: Arc<[ResolvedResource]>,
     diagnostics: Arc<[ResourceDiagnostic]>,
@@ -132,12 +123,11 @@ impl ResourceSnapshot {
     }
 }
 
-/// Resolver shared by themes, prompts, skills, and executable extensions.
+/// Resolver shared by themes, prompts, and executable extensions.
 pub struct ResourceResolver {
     workspace: PathBuf,
     global_ygg_dir: Option<PathBuf>,
     workspace_trusted: bool,
-    next_generation: AtomicU64,
 }
 
 impl ResourceResolver {
@@ -149,7 +139,6 @@ impl ResourceResolver {
             workspace,
             global_ygg_dir: None,
             workspace_trusted,
-            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -164,7 +153,6 @@ impl ResourceResolver {
             workspace,
             global_ygg_dir: Some(global_ygg_dir),
             workspace_trusted,
-            next_generation: AtomicU64::new(1),
         }
     }
 
@@ -225,18 +213,10 @@ impl ResourceResolver {
         }
 
         ResourceSnapshot {
-            generation: self.next_generation.fetch_add(1, Ordering::Relaxed),
             kind,
             resources: selected.into_values().collect::<Vec<_>>().into(),
             diagnostics: diagnostics.into(),
         }
-    }
-
-    /// Reload is a fresh immutable snapshot. Existing consumers can finish a
-    /// prompt/run against the prior generation without observing half-reloads.
-    #[allow(dead_code)]
-    pub fn reload(&self, kind: ResourceKind, explicit_roots: &[PathBuf]) -> ResourceSnapshot {
-        self.discover(kind, explicit_roots)
     }
 
     /// Safely read a selected parser entrypoint with the resource family's
@@ -310,7 +290,7 @@ impl ResourceResolver {
                         match kind {
                             ResourceKind::Theme => " or a .toml file",
                             ResourceKind::Prompt => " or a .md/.toml file",
-                            ResourceKind::Skill | ResourceKind::Extension => "",
+                            ResourceKind::Extension => "",
                         }
                     ),
                 });
@@ -587,7 +567,6 @@ mod tests {
             workspace,
             global_ygg_dir: None,
             workspace_trusted: false,
-            next_generation: AtomicU64::new(1),
         };
 
         let snapshot = resolver.discover(ResourceKind::Extension, &[]);
@@ -660,21 +639,10 @@ mod tests {
     fn directory_resources_resolve_their_parser_entrypoints() {
         let root = tempfile::tempdir().unwrap();
         let (resolver, _, global) = resolver(&root, true);
-        let skill = global.join("skills/refactor");
         let extension = global.join("extensions/git-tools");
-        std::fs::create_dir_all(&skill).unwrap();
         std::fs::create_dir_all(&extension).unwrap();
-        std::fs::write(skill.join("SKILL.md"), "---\nname: refactor\n---\n").unwrap();
         std::fs::write(extension.join("extension.toml"), "name='git-tools'").unwrap();
 
-        assert_eq!(
-            resolver
-                .discover(ResourceKind::Skill, &[])
-                .get("refactor")
-                .unwrap()
-                .path,
-            skill.canonicalize().unwrap().join("SKILL.md")
-        );
         assert_eq!(
             resolver
                 .discover(ResourceKind::Extension, &[])
@@ -683,21 +651,6 @@ mod tests {
                 .path,
             extension.canonicalize().unwrap().join("extension.toml")
         );
-    }
-
-    #[test]
-    fn reload_generations_are_monotonic_and_snapshots_are_immutable() {
-        let root = tempfile::tempdir().unwrap();
-        let (resolver, _, global) = resolver(&root, true);
-        std::fs::create_dir_all(global.join("themes")).unwrap();
-        std::fs::write(global.join("themes/one.toml"), "accent='red'").unwrap();
-        let first = resolver.discover(ResourceKind::Theme, &[]);
-        std::fs::write(global.join("themes/two.toml"), "accent='blue'").unwrap();
-        let second = resolver.reload(ResourceKind::Theme, &[]);
-
-        assert!(second.generation > first.generation);
-        assert_eq!(first.resources().len(), 1);
-        assert_eq!(second.resources().len(), 2);
     }
 
     #[test]
@@ -751,11 +704,11 @@ mod tests {
                     .contains("candidate must not be a symlink")
         }));
 
-        let skill = global.join("skills/broken");
-        std::fs::create_dir_all(&skill).unwrap();
-        symlink(&target, skill.join("SKILL.md")).unwrap();
-        let skills = resolver.discover(ResourceKind::Skill, &[]);
-        assert!(skills.diagnostics().iter().any(|diagnostic| {
+        let broken_extension = global.join("extensions/broken");
+        std::fs::create_dir_all(&broken_extension).unwrap();
+        symlink(&target, broken_extension.join("extension.toml")).unwrap();
+        let extensions = resolver.discover(ResourceKind::Extension, &[]);
+        assert!(extensions.diagnostics().iter().any(|diagnostic| {
             diagnostic.path.ends_with("broken")
                 && diagnostic
                     .message

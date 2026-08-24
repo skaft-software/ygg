@@ -319,17 +319,6 @@ fn default_surfaces() -> BTreeMap<String, ThemeSurface> {
     .collect()
 }
 
-#[allow(dead_code)]
-fn valid_runtime_role_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 96
-        && !name.starts_with('.')
-        && !name.ends_with('.')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
-}
-
 fn semantic_text_role(name: &str) -> Option<(TextRole, &'static str)> {
     Some(match name {
         "text" | "foreground" => (TextRole::Text, "foreground"),
@@ -467,17 +456,11 @@ impl YggTheme {
             .unwrap_or_else(|| unicode_glyph(name))
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used only with the `serve` extension feature
     pub fn semantic_role_names(&self) -> impl Iterator<Item = &str> {
         self.semantic_styles.keys().map(String::as_str)
     }
 
-    #[allow(dead_code)]
-    pub fn has_semantic_role(&self, role: &str) -> bool {
-        self.semantic_styles.contains_key(role)
-    }
-
-    #[allow(dead_code)]
     pub fn semantic_style(&self, role: &str) -> TextStyle {
         self.semantic_styles
             .get(role)
@@ -492,7 +475,6 @@ impl YggTheme {
     /// Render a built-in or extension-defined semantic role. Extensions use
     /// stable role names and never need access to Ygg's private application
     /// state or raw terminal escape sequences.
-    #[allow(dead_code)]
     pub fn apply_semantic_role(&self, role: &str, text: &str) -> String {
         self.inner.apply_style(self.semantic_style(role), text)
     }
@@ -523,27 +505,9 @@ impl YggTheme {
         layered
     }
 
-    #[allow(dead_code)]
-    pub fn override_semantic_style(
-        &mut self,
-        role: impl Into<String>,
-        style: TextStyle,
-    ) -> anyhow::Result<()> {
-        let role = role.into();
-        if !valid_runtime_role_name(&role) {
-            anyhow::bail!("invalid semantic role {role:?}");
-        }
-        if let Some((text_role, _)) = semantic_text_role(&role) {
-            self.inner.override_style(text_role, style);
-        }
-        self.semantic_styles.insert(role, style);
-        Ok(())
-    }
-
     /// Reload the active file or bundled theme while preserving this terminal
     /// capability/background profile. Runtime model styling is reapplied by
     /// the shell when it swaps the returned theme in.
-    #[allow(dead_code)]
     pub fn reload(&self) -> anyhow::Result<Self> {
         match &self.source {
             ThemeSource::CompiledDefault => {
@@ -2075,7 +2039,6 @@ mod tests {
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,
             cost_warning_microdollars: None,
-            show_turn_cost: false,
             max_turns: Some(40),
             show_reasoning_in_print: false,
             initial_prompt: None,

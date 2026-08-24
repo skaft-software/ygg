@@ -427,10 +427,6 @@ pub enum RunOutcome {
     NeedsInput {
         prompt: String,
     },
-    #[allow(dead_code)]
-    Cancelled {
-        elapsed: Duration,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -517,8 +513,7 @@ impl RunPresentation {
             RunPhase::Finished(RunOutcome::Completed { elapsed, .. })
             | RunPhase::Finished(RunOutcome::CompletedWithWarnings { elapsed, .. })
             | RunPhase::Finished(RunOutcome::Failed { elapsed, .. })
-            | RunPhase::Finished(RunOutcome::Interrupted { elapsed })
-            | RunPhase::Finished(RunOutcome::Cancelled { elapsed }) => *elapsed,
+            | RunPhase::Finished(RunOutcome::Interrupted { elapsed }) => *elapsed,
             RunPhase::Finished(RunOutcome::NeedsInput { .. }) => self
                 .phase_started_at
                 .saturating_duration_since(self.started_at),
@@ -702,12 +697,6 @@ impl RunTracker {
         let run = self.active_mut(id)?;
         let elapsed = now.saturating_duration_since(run.started_at);
         run.finish(RunOutcome::Interrupted { elapsed }, now)
-    }
-
-    pub fn cancel_at(&mut self, id: RunId, now: Instant) -> Option<RunOutcome> {
-        let run = self.active_mut(id)?;
-        let elapsed = now.saturating_duration_since(run.started_at);
-        run.finish(RunOutcome::Cancelled { elapsed }, now)
     }
 
     pub fn fail(&mut self, id: RunId, reason: impl Into<String>) -> Option<RunOutcome> {
@@ -1618,21 +1607,6 @@ mod tests {
             tracker.current().unwrap().phase(),
             RunPhase::Finished(RunOutcome::Interrupted { .. })
         ));
-    }
-
-    #[test]
-    fn cancellation_cannot_later_become_completed() {
-        let now = Instant::now();
-        let mut tracker = RunTracker::default();
-        let id = tracker.begin_at("openai", now).unwrap();
-        assert!(matches!(
-            tracker.cancel_at(id, now),
-            Some(RunOutcome::Cancelled { .. })
-        ));
-        assert_eq!(
-            tracker.apply_event_at(id, &finished(FinishReason::Completed), now),
-            RunUpdate::default()
-        );
     }
 
     #[test]
