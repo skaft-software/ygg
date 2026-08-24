@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
 use crate::protocol::{
-    cache_session_id, cache_session_id_for, prompt_cache_key, prompt_cache_key_for,
-    HttpRequestParts, WireImageUrl,
+    cache_session_id, cache_session_id_for, emit_event, get_canonical_index, prompt_cache_key,
+    prompt_cache_key_for, HttpRequestParts, WireImageUrl,
 };
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{
@@ -1142,16 +1142,6 @@ struct ResponsesOutputTokensDetails {
 // OpenAI Responses is always streamed (design §12.2); there is no non-streaming
 // decode path, so this codec deliberately exposes none.
 
-fn emit_event(
-    events: &mut Vec<StreamEvent>,
-    builder: &mut ResponseBuilder,
-    ev: StreamEvent,
-) -> Result<(), AiError> {
-    builder.on_event(&ev)?;
-    events.push(ev);
-    Ok(())
-}
-
 /// Close any tool-call parts that a provider left open before its terminal
 /// response event. Some Responses-compatible gateways send complete arguments
 /// in `output_item.added` and omit `function_call_arguments.done`; closing here
@@ -1591,18 +1581,6 @@ pub(crate) fn decode_stream_event(
 }
 
 // --- Helpers ---
-
-fn get_canonical_index(builder: &mut ResponseBuilder, key: &str) -> usize {
-    if let Some(&idx) = builder.provider_to_canonical_indices.get(key) {
-        idx
-    } else {
-        let idx = builder.provider_to_canonical_indices.len();
-        builder
-            .provider_to_canonical_indices
-            .insert(key.to_string(), idx);
-        idx
-    }
-}
 
 fn map_usage(usage: &ResponsesUsageDto) -> Result<Usage, AiError> {
     // Design §15: OpenAI `input_tokens` INCLUDES cache, so cache read + write are
