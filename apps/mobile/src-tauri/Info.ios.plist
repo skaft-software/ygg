@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!--
+      Merged into the generated Info.plist by the tauri CLI on every
+      `tauri ios dev` / `tauri ios build`. Kept separately from
+      templates/ios-project.yml (which seeds Info.plist for fresh
+      `tauri ios init` checkouts) so both paths produce the same keys.
+    -->
+    <key>NSCameraUsageDescription</key>
+    <string>Ygg uses the camera to scan the pairing code your host generates. Camera images never leave this device.</string>
+  </dict>
+</plist>
