@@ -1095,20 +1095,28 @@ pub enum StopReason {
     Other(String),
 }
 
+impl StopReason {
+    /// Canonical lowercase wire name, matching the `serde::Serialize` form used
+    /// by session usage records and public failure diagnostics.
+    pub fn as_canonical(&self) -> &str {
+        match self {
+            StopReason::EndTurn => "end_turn",
+            StopReason::MaxTokens => "max_tokens",
+            StopReason::ToolUse => "tool_use",
+            StopReason::StopSequence => "stop_sequence",
+            StopReason::Refusal => "refusal",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Other(s) => s,
+        }
+    }
+}
+
 impl serde::Serialize for StopReason {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        match self {
-            StopReason::EndTurn => serializer.serialize_str("end_turn"),
-            StopReason::MaxTokens => serializer.serialize_str("max_tokens"),
-            StopReason::ToolUse => serializer.serialize_str("tool_use"),
-            StopReason::StopSequence => serializer.serialize_str("stop_sequence"),
-            StopReason::Refusal => serializer.serialize_str("refusal"),
-            StopReason::PauseTurn => serializer.serialize_str("pause_turn"),
-            StopReason::Other(s) => serializer.serialize_str(s),
-        }
+        serializer.serialize_str(self.as_canonical())
     }
 }
 
@@ -1444,5 +1452,31 @@ mod tests {
 
         let de_other: StopReason = serde_json::from_str("\"something_else\"").unwrap();
         assert_eq!(de_other, StopReason::Other("something_else".to_string()));
+    }
+
+    #[test]
+    fn test_stop_reason_as_canonical_matches_serde_form() {
+        assert_eq!(StopReason::EndTurn.as_canonical(), "end_turn");
+        assert_eq!(StopReason::MaxTokens.as_canonical(), "max_tokens");
+        assert_eq!(StopReason::ToolUse.as_canonical(), "tool_use");
+        assert_eq!(StopReason::StopSequence.as_canonical(), "stop_sequence");
+        assert_eq!(StopReason::Refusal.as_canonical(), "refusal");
+        assert_eq!(StopReason::PauseTurn.as_canonical(), "pause_turn");
+        assert_eq!(
+            StopReason::Other("network_error".to_string()).as_canonical(),
+            "network_error"
+        );
+        for stop in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::ToolUse,
+            StopReason::StopSequence,
+            StopReason::Refusal,
+            StopReason::PauseTurn,
+            StopReason::Other("network_error".to_string()),
+        ] {
+            let serialized = serde_json::to_string(&stop).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", stop.as_canonical()));
+        }
     }
 }

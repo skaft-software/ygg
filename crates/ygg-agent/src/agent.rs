@@ -150,13 +150,20 @@ pub enum AgentError {
 ///
 /// Provider failures retain operationally useful, bounded metadata: the route,
 /// execution phase, HTTP status/class, provider error code, safe provider
-/// message, retry hint, and request ID when supplied. Request bodies, URLs,
+/// message, retry hint, terminal stop reason, and request ID when supplied.
+/// Request bodies, URLs,
 /// credentials, and arbitrary response payloads are never copied into this
 /// string. The AI client redacts at the transport boundary; this function
 /// applies the final field allow-list and byte bound for UI/RPC consumers.
 pub fn public_error_diagnostic(error: &AgentError, endpoint: &str, model: &str) -> String {
     match error {
         AgentError::Ai(error) => public_ai_error_diagnostic(error, endpoint, model),
+        AgentError::IncompleteResponse { stop_reason } => {
+            let mut diagnostic = provider_phase_diagnostic(endpoint, model, "response completion");
+            append_provider_field(&mut diagnostic, "reason", Some(stop_reason));
+            truncate_public_diagnostic(&mut diagnostic);
+            diagnostic
+        }
         _ => match provider_failure_phase(error) {
             Some(phase) => provider_phase_diagnostic(endpoint, model, phase),
             None => error.to_string(),
@@ -350,6 +357,8 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
     match error {
         AgentError::Ai(error) => Some(ai_error_phase(error)),
         AgentError::NetworkUnavailable { .. } => Some("connection"),
+        // Handled with an extra `reason=` field by `public_error_diagnostic`;
+        // kept here so the phase table stays exhaustive.
         AgentError::IncompleteResponse { .. } => Some("response completion"),
         AgentError::Session(_)
         | AgentError::DuplicateTool(_)
@@ -5217,7 +5226,7 @@ impl Agent {
                     && !matches!(stop_reason, StopReason::ToolUse)
                 {
                     break 'run FinishReason::Failed(AgentError::IncompleteResponse {
-                        stop_reason: format!("{stop_reason:?}"),
+                        stop_reason: stop_reason.as_canonical().to_owned(),
                     });
                 }
 
@@ -5245,7 +5254,7 @@ impl Agent {
                     }
                     if !normal_end {
                         break 'run FinishReason::Failed(AgentError::IncompleteResponse {
-                            stop_reason: format!("{stop_reason:?}"),
+                            stop_reason: stop_reason.as_canonical().to_owned(),
                         });
                     }
                     // Steering and follow-ups make this a normal intermediate
@@ -6324,6 +6333,12 @@ mod tests {
                     message: "stream idle beyond its timeout".into(),
                 })),
                 "phase=response body timeout detail=stream idle beyond its timeout",
+            ),
+            (
+                AgentError::IncompleteResponse {
+                    stop_reason: "refusal".to_owned(),
+                },
+                "phase=response completion reason=refusal",
             ),
         ];
 
