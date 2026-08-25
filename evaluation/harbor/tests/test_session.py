@@ -39,7 +39,7 @@ class SessionConversionTests(unittest.TestCase):
                                 }
                             },
                         ],
-                        "model": "gpt-5.4",
+                        "model": "gpt-5.6-sol",
                         "protocol": "open_ai_responses",
                     },
                 },
@@ -83,7 +83,7 @@ class SessionConversionTests(unittest.TestCase):
                     "type": "message",
                     "Assistant": {
                         "content": [{"Text": "The workspace is ready."}],
-                        "model": "gpt-5.4",
+                        "model": "gpt-5.6-sol",
                         "protocol": "open_ai_responses",
                     },
                 },
@@ -96,8 +96,8 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.3.2-alpha",
-                model_name="openai/gpt-5.4",
+                agent_version="0.6.0",
+                model_name="gpt-5.6-sol",
                 reasoning="medium",
             )
 
@@ -156,7 +156,7 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.3.2-alpha",
+                agent_version="0.6.0",
                 model_name=None,
                 reasoning=None,
             )

@@ -31,7 +31,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(
                 Ygg(Path(directory), model_name=None).model_name,
-                "openai/gpt-5.4",
+                "gpt-5.6-sol",
             )
 
     async def test_setup_logs_and_verifies_pinned_version(self) -> None:
@@ -44,9 +44,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("install -m 0755", environment.calls[0]["command"])
             self.assertIn("mkdir -p /logs/agent/sessions", environment.calls[0]["command"])
             self.assertEqual(
-                (logs_dir / "setup-stdout.txt").read_text(), "ygg 0.3.2-alpha\n"
+                (logs_dir / "setup-stdout.txt").read_text(), "ygg 0.6.0\n"
             )
-            self.assertEqual(agent.version(), "0.3.2-alpha")
+            self.assertEqual(agent.version(), "0.6.0")
 
     async def test_run_writes_metrics_redacted_output_and_native_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -61,7 +61,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             )
             agent = Ygg(
                 logs_dir,
-                model_name="openai/gpt-5.4",
+                model_name="gpt-5.6-sol",
                 extra_env={"OPENAI_API_KEY": "secret-value"},
             )
             await agent.setup(environment)
@@ -151,7 +151,7 @@ class FakeEnvironment:
             {"command": command, "env": env, "timeout_sec": timeout_sec}
         )
         if "--version" in command:
-            version = getattr(self.run_result, "version", "0.3.2-alpha")
+            version = getattr(self.run_result, "version", "0.6.0")
             return SimpleNamespace(
                 return_code=0,
                 stdout=f"ygg {version}\n",
@@ -185,7 +185,7 @@ class FakeEnvironment:
                     "type": "message",
                     "Assistant": {
                         "content": [{"Text": "completed"}],
-                        "model": "gpt-5.4",
+                        "model": "gpt-5.6-sol",
                     },
                 },
             },

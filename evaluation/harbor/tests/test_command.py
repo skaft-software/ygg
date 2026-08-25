@@ -20,7 +20,7 @@ class CommandTests(unittest.TestCase):
         command = build_ygg_command(
             "/tmp/ygg",
             instruction,
-            model="openai/gpt-5.4",
+            model="gpt-5.6-sol",
             reasoning="medium",
             session_dir="/logs/agent/sessions",
             max_turns=8,
@@ -66,7 +66,7 @@ class CommandTests(unittest.TestCase):
                 )
 
     def test_version_parser_accepts_ygg_output(self) -> None:
-        self.assertEqual(parse_ygg_version("ygg 0.3.2-alpha\n"), "0.3.2-alpha")
+        self.assertEqual(parse_ygg_version("ygg 0.6.0\n"), "0.6.0")
         self.assertEqual(parse_ygg_version("ygg version 1.2.3"), "1.2.3")
         self.assertIsNone(parse_ygg_version("not a version"))
 

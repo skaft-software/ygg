@@ -11,13 +11,13 @@ The adapter records its pins in [`config.py`](config.py):
 
 | Input | Pin |
 | --- | --- |
-| Ygg source | `https://github.com/skaft-software/ygg.git` at `a2351bacd61311705c5480a714af65de1c6aaed6` (`0.3.2-alpha`) |
-| Ygg binary | `x86_64-unknown-linux-musl`, SHA-256 `d1afd17c9b415dd2fb7b315e5ede2e17dc904fb752ee2645074a6f5dd40a3957` |
-| Harbor source | `https://github.com/harbor-framework/harbor.git` at `e76f7e32f5644fb9f648cd23151aac5c67492ea0` |
-| Dataset | `terminal-bench/terminal-bench-2@2.0` |
-| Model | `openai/gpt-5.4` |
+| Ygg source | `https://github.com/skaft-software/ygg.git` at `3f4bb7c9e2923e5a23736e4baaa0d230a0bba335` (`0.6.0`) |
+| Ygg binary | `linux/amd64` Ygg executable (the SHA-256 is generated and passed to each run) |
+| Harbor source | `https://github.com/harbor-framework/harbor.git` at `6ecebe4ae9910ee0b28a2e6e8fa30934c0b41dfa` |
+| Dataset | `terminal-bench/terminal-bench@3.0.0` |
+| Model | `gpt-5.6-sol` |
 | Reasoning | `medium` |
-| Provider credential | `OPENAI_API_KEY` |
+| Provider credential | Local Codex OAuth (`~/.ygg/credentials/codex.json`) or `OPENAI_API_KEY` |
 
 The dataset is consumed as Harbor's published package; this adapter does not
 copy, regenerate, or silently alter its tasks. Record the resolved dataset
@@ -29,7 +29,8 @@ or use a local task directory explicitly.
 - Linux Docker with the daemon running (the normal Terminal-Bench environment).
 - Python 3.12 or newer and Harbor.
 - Rust 1.86.0 and `ripgrep` when building Ygg locally.
-- An OpenAI API key with access to `gpt-5.4`.
+- Either a local Codex subscription login (`ygg --login codex`) or an API key with access to `gpt-5.6-sol`.
+- A Ygg executable whose Linux architecture matches the Harbor Docker daemon; the standard remote target is `linux/amd64`.
 - A Linux Ygg executable built from the pinned source. Do not use an arbitrary
   `ygg` found on `PATH`.
 
@@ -37,7 +38,7 @@ For a fully pinned Harbor environment, use Harbor's own lock file:
 
 ```bash
 git clone https://github.com/harbor-framework/harbor.git /tmp/harbor-ygg
-git -C /tmp/harbor-ygg checkout e76f7e32f5644fb9f648cd23151aac5c67492ea0
+git -C /tmp/harbor-ygg checkout 6ecebe4ae9910ee0b28a2e6e8fa30934c0b41dfa
 cd /tmp/harbor-ygg
 uv sync --frozen
 ```
@@ -49,44 +50,87 @@ runtime dependencies too.
 
 ## Build and verify the Ygg binary
 
-Build from a clean checkout at the Ygg pin. The release executable is built
-for `x86_64-unknown-linux-musl` so it runs in Alpine and other minimal Linux
-images:
+Build from a clean checkout at the Ygg pin. The executable must target the
+Harbor Docker daemon. The standard remote target is `x86_64-unknown-linux-musl`;
+arm64 Docker Desktop needs an `aarch64` Linux build or a remote amd64 provider:
 
 ```bash
 git clone https://github.com/skaft-software/ygg.git /tmp/ygg-pinned
-git -C /tmp/ygg-pinned checkout a2351bacd61311705c5480a714af65de1c6aaed6
+git -C /tmp/ygg-pinned checkout 3f4bb7c9e2923e5a23736e4baaa0d230a0bba335
 rustup toolchain install 1.86.0
 cd /tmp/ygg-pinned
 rustup target add --toolchain 1.86.0 x86_64-unknown-linux-musl
 cargo +1.86.0 build --locked --release --target x86_64-unknown-linux-musl \
   -p ygg-coding-agent --bin ygg
-install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.3.2-alpha
-export YGG_BINARY=/tmp/ygg-0.3.2-alpha
+install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.6.0
+export YGG_BINARY=/tmp/ygg-0.6.0
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 "$YGG_BINARY" --version
 ```
 
-The repository's `deploy/Dockerfile.ygg` can build the same pinned checkout
-when the host should not install Rust. Extract the executable from the image
+For arm64 Docker Desktop, build an arm64 Linux binary in an arm64 Rust
+container instead of mounting the amd64 artifact:
+
+```bash
+docker run --rm --platform linux/arm64 \
+  -v /tmp/ygg-pinned:/src -w /src \
+  rust:1.86-bookworm bash -lc '
+    . /usr/local/cargo/env
+    apt-get update -qq && apt-get install -y --no-install-recommends musl-tools >/dev/null
+    rustup target add aarch64-unknown-linux-musl
+    cargo build --locked --release --target aarch64-unknown-linux-musl \
+      -p ygg-coding-agent --bin ygg
+  '
+export YGG_BINARY=/tmp/ygg-pinned/target/aarch64-unknown-linux-musl/release/ygg
+export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
+```
+
+When the host should not install Rust, the repository's `deploy/Dockerfile.ygg`
+can build the same pinned checkout. Extract the executable from the image
 and use that extracted file as `YGG_BINARY`:
 
 ```bash
 cd /tmp/ygg-pinned
-docker build --platform linux/amd64 -f deploy/Dockerfile.ygg -t ygg:0.3.2-alpha .
-container=$(docker create --platform linux/amd64 ygg:0.3.2-alpha)
-docker cp "${container}:/usr/local/bin/ygg" /tmp/ygg-0.3.2-alpha
+docker build --platform linux/amd64 -f deploy/Dockerfile.ygg -t ygg:0.6.0 .
+container=$(docker create --platform linux/amd64 ygg:0.6.0)
+docker cp "${container}:/usr/local/bin/ygg" /tmp/ygg-0.6.0
 docker rm "$container"
-export YGG_BINARY=/tmp/ygg-0.3.2-alpha
+export YGG_BINARY=/tmp/ygg-0.6.0
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 ```
 
 The binary must be made available inside each task container at
-`/usr/local/bin/ygg`. For local Docker runs, a read-only bind mount is the
-least invasive option:
+`/usr/local/bin/ygg`. For Codex OAuth, stage a disposable copy before building
+`YGG_MOUNTS`; for API mode, omit `CODEX_STAGE`:
 
 ```bash
-export YGG_MOUNTS="$(python3 -c 'import json, os; print(json.dumps([{"type":"bind","source":os.environ["YGG_BINARY"],"target":"/usr/local/bin/ygg","read_only":True}]))')"
+# Use this block only for Codex OAuth; omit it for API mode.
+# Never publish or retain this directory after the job.
+export CODEX_STAGE=$(mktemp -d)
+mkdir -p "$CODEX_STAGE/.ygg/credentials"
+cp "$HOME/.ygg/credentials/codex.json" "$CODEX_STAGE/.ygg/credentials/codex.json"
+chmod -R go-rwx "$CODEX_STAGE"
+
+export YGG_MOUNTS="$(python3 - <<'PY'
+import json
+import os
+mounts = [{
+    "type": "bind",
+    "source": os.environ["YGG_BINARY"],
+    "target": "/usr/local/bin/ygg",
+    "read_only": True,
+}]
+stage = os.environ.get("CODEX_STAGE")
+if stage:
+    mounts.append({
+        "type": "bind",
+        "source": os.path.join(stage, ".ygg"),
+        "target": "/root/.ygg",
+        "read_only": False,
+    })
+print(json.dumps(mounts))
+PY
+)"
 ```
 
 For a remote Harbor provider, publish or otherwise provision an image that
@@ -111,6 +155,31 @@ PYTHONPATH=/path/to/ygg /tmp/harbor-ygg/.venv/bin/python \
   -m unittest discover -s /path/to/ygg/evaluation/harbor/tests -v
 ```
 
+## Zero-token adapter gate
+
+Before spending model quota, run Harbor's setup phase only. This verifies the
+container architecture, binary digest/version, session directory, and mounted
+credential path without invoking Ygg's provider loop:
+
+```bash
+PYTHONPATH="$YGG_REPO" uv run harbor run \
+  -d 'terminal-bench/terminal-bench@3.0.0' \
+  --include-task-name terminal-bench/shadow-relay \
+  -a evaluation.harbor.ygg_agent:Ygg \
+  -e docker \
+  --install-only \
+  -n 1 \
+  --mounts "$YGG_MOUNTS" \
+  --agent-setup-timeout-multiplier 1 \
+  --agent-kwarg ygg_binary_sha256="$YGG_SHA256" \
+  --jobs-dir /tmp/ygg-tb3-install-only \
+  --job-name ygg-tb3-install-only \
+  --delete
+```
+
+A setup error is an infrastructure failure, not a model result. Fix it before
+running the smoke task.
+
 ## Smoke run
 
 First validate the dataset/environment independently with Harbor's oracle on
@@ -119,7 +188,7 @@ published dataset or the working tree:
 
 ```bash
 cd /tmp/harbor-ygg
-export DATASET='terminal-bench/terminal-bench-2@2.0'
+export DATASET='terminal-bench/terminal-bench@3.0.0'
 export SMOKE_ROOT=$(mktemp -d)
 uv run harbor download "$DATASET" --output-dir "$SMOKE_ROOT"
 export SMOKE_TASK=$(find "$SMOKE_ROOT" -type f -name task.toml -print -quit | xargs -r dirname)
@@ -132,12 +201,13 @@ adapter (it may be the same source tree used for the pinned binary):
 
 ```bash
 export YGG_REPO=/path/to/ygg
-export OPENAI_API_KEY='replace-me'
+# For API mode instead: export OPENAI_API_KEY='replace-me'
 PYTHONPATH="$YGG_REPO" uv run harbor trial start \
   -p "$SMOKE_TASK" \
   -a evaluation.harbor.ygg_agent:Ygg \
-  -m openai/gpt-5.4 \
+  -m gpt-5.6-sol \
   --mounts "$YGG_MOUNTS" \
+  --ae HOME=/root \
   --agent-kwarg reasoning=medium \
   --agent-kwarg ygg_binary_sha256="$YGG_SHA256"
 ```
@@ -155,12 +225,13 @@ Harbor package, not guessed filesystem names:
 
 ```bash
 PYTHONPATH="$YGG_REPO" uv run harbor run \
-  -d 'terminal-bench/terminal-bench-2@2.0' \
+  -d 'terminal-bench/terminal-bench@3.0.0' \
   --include-task-name '<resolved-task-name>' \
   -a evaluation.harbor.ygg_agent:Ygg \
-  -m openai/gpt-5.4 \
+  -m gpt-5.6-sol \
   -n 1 \
   --mounts "$YGG_MOUNTS" \
+  --ae HOME=/root \
   --agent-kwarg reasoning=medium \
   --agent-kwarg ygg_binary_sha256="$YGG_SHA256" \
   --job-name ygg-terminal-bench-subset
@@ -187,8 +258,8 @@ Use the pinned dataset with `oracle` before comparing model scores:
 
 ```bash
 uv run harbor run \
-  -d 'terminal-bench/terminal-bench-2@2.0' \
-  -a oracle -n 1 --job-name terminal-bench-2-oracle-baseline
+  -d 'terminal-bench/terminal-bench@3.0.0' \
+  -a oracle -n 1 --job-name terminal-bench-3-oracle-baseline
 ```
 
 Oracle is an environment/verifier baseline: it should establish that the
@@ -240,7 +311,7 @@ logs or API keys.
 
 - **`YggSetupError: version mismatch`**: check that the mounted executable was
   built from the Ygg commit above and that `--version` reports exactly
-  `0.3.2-alpha`.
+  `0.6.0`.
 - **`test -x /usr/local/bin/ygg` fails**: use an absolute Linux executable,
   verify the bind mount target, or build a remote-provider image containing the
   binary.
