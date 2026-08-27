@@ -119,12 +119,23 @@ fn emulated_shell_with_sync(
     height: u16,
     synchronized_output: bool,
 ) -> (InteractiveShell, Arc<Mutex<Vec<u8>>>) {
+    emulated_shell_with_mode(theme, width, height, synchronized_output, false)
+}
+
+fn emulated_shell_with_mode(
+    theme: YggTheme,
+    width: u16,
+    height: u16,
+    synchronized_output: bool,
+    application_viewport: bool,
+) -> (InteractiveShell, Arc<Mutex<Vec<u8>>>) {
     let bytes = Arc::new(Mutex::new(Vec::new()));
     let size = Arc::new(Mutex::new((width, height)));
     let state = SharedState::new(ShellState {
         theme,
         size: (width, height),
         follow_tail: true,
+        application_viewport_requested: application_viewport,
         ..ShellState::default()
     });
     let mut tui = TUI::new(Box::new(EmulatedTerminal {
@@ -132,8 +143,10 @@ fn emulated_shell_with_sync(
         bytes: bytes.clone(),
         synchronized_output,
     }));
-    tui.set_inline_scrollback(true);
-    tui.add_child(Box::new(ShellComponent::new(state.clone(), false)));
+    tui.add_child(Box::new(ShellComponent::new(
+        state.clone(),
+        application_viewport,
+    )));
     tui.start();
     (
         InteractiveShell {
@@ -142,10 +155,17 @@ fn emulated_shell_with_sync(
             size,
             render_tx: None,
             render_thread: None,
-            capture_mouse: false,
+            capture_mouse: application_viewport,
         },
         bytes,
     )
+}
+
+fn lazy_history_test_shell() -> InteractiveShell {
+    let mut shell = InteractiveShell::test_shell();
+    shell.capture_mouse = true;
+    shell.state.borrow_mut().application_viewport_requested = true;
+    shell
 }
 
 fn session_with_user_prompts(path: &std::path::Path, prefix: &str, count: usize) -> Session {
@@ -2137,7 +2157,24 @@ fn new_output_does_not_move_a_scrolled_reader_viewport() {
 }
 
 #[test]
-fn resumed_history_is_tail_first_and_materializes_when_scrolling_past_it() {
+fn terminal_native_resume_materializes_complete_history_for_pi_scrollback() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = session_with_user_prompts(
+        &directory.path().join("native-complete-session.jsonl"),
+        "native prompt",
+        100,
+    );
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 12);
+    shell.hydrate(&session).unwrap();
+    let snapshot = shell.debug_snapshot();
+    assert!(snapshot.contains("native prompt 0\n"));
+    assert!(snapshot.contains("native prompt 99"));
+    assert!(shell.state.borrow().deferred_session_history.is_none());
+}
+
+#[test]
+fn application_viewport_resume_is_tail_first_and_materializes_when_scrolling_past_it() {
     use ygg_agent::EntryValue;
     use ygg_ai::{Message, UserMessage, UserPart};
 
@@ -2152,7 +2189,7 @@ fn resumed_history_is_tail_first_and_materializes_when_scrolling_past_it() {
             .unwrap();
     }
 
-    let mut shell = InteractiveShell::test_shell();
+    let mut shell = lazy_history_test_shell();
     shell.set_size(80, 12);
     shell.hydrate(&session).unwrap();
     assert!(shell.debug_snapshot().contains("prompt 99"));
@@ -2217,7 +2254,7 @@ fn deferred_history_keeps_local_outcome_before_a_later_persisted_prompt() {
             .unwrap();
     }
 
-    let mut shell = InteractiveShell::test_shell();
+    let mut shell = lazy_history_test_shell();
     shell.set_size(80, 12);
     shell.hydrate(&session).unwrap();
     assert!(shell.state.borrow().deferred_session_history.is_some());
@@ -2285,7 +2322,8 @@ fn resize_keeps_deferred_history_lazy_during_an_active_stream() {
         "active resize prompt",
         100,
     );
-    let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+    let (mut shell, bytes) =
+        emulated_shell_with_mode(crate::tui::theme::test_theme(), WIDTH, HEIGHT, false, true);
     let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
         std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
     };
@@ -2332,7 +2370,7 @@ fn resize_keeps_deferred_history_lazy_during_an_active_stream() {
 
     shell.render();
     let resize = String::from_utf8_lossy(&drain(&bytes)).into_owned();
-    assert!(!resize.contains("\x1b[3J"), "{resize:?}");
+    assert!(resize.contains("\x1b[3J"), "{resize:?}");
     assert!(!resize.contains("active resize prompt 0"), "{resize:?}");
     assert!(resize.contains("active-stream-before-resize"), "{resize:?}");
 
@@ -2362,7 +2400,7 @@ fn delayed_resize_reconciliation_keeps_deferred_history_lazy() {
         "reconciled resize prompt",
         100,
     );
-    let mut shell = InteractiveShell::test_shell();
+    let mut shell = lazy_history_test_shell();
     shell.set_size(80, 12);
     shell.hydrate(&session).unwrap();
     assert!(shell.state.borrow().deferred_session_history.is_some());
@@ -2397,7 +2435,7 @@ fn deferred_history_identity_failure_is_transactional() {
         "transactional prompt",
         100,
     );
-    let mut shell = InteractiveShell::test_shell();
+    let mut shell = lazy_history_test_shell();
     shell.set_size(80, 12);
     shell.hydrate(&session).unwrap();
     assert!(shell.state.borrow().deferred_session_history.is_some());
@@ -2794,6 +2832,60 @@ fn streamed_assistant_rows_enter_native_scrollback_once() {
 }
 
 #[test]
+fn pi_renderer_keeps_streamed_transcript_complete_while_a_draft_is_open() {
+    const WIDTH: u16 = 72;
+    const HEIGHT: u16 = 12;
+    let (mut shell, bytes) = emulated_shell(crate::tui::theme::test_theme(), WIDTH, HEIGHT);
+    let drain = |bytes: &Arc<Mutex<Vec<u8>>>| {
+        std::mem::take(&mut *bytes.lock().expect("emulated terminal bytes"))
+    };
+    let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 512);
+    process_vt100_with_saved_line_clear(&mut terminal, &drain(&bytes), HEIGHT, WIDTH, 512);
+
+    for index in 0..12 {
+        shell.notice(format!("DRAFT-HISTORY-{index:02}"));
+    }
+    shell.apply_edit(EditAction::Char('x'));
+    shell.render();
+    process_vt100_with_saved_line_clear(&mut terminal, &drain(&bytes), HEIGHT, WIDTH, 512);
+
+    let run_id = shell.begin_run("openai");
+    for index in 0..32 {
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: format!(
+                    "DRAFT-STREAM-{index:02} stays present while the mutable composer remains open.\n\n"
+                ),
+            },
+        );
+        shell.render();
+        process_vt100_with_saved_line_clear(&mut terminal, &drain(&bytes), HEIGHT, WIDTH, 512);
+    }
+
+    terminal.set_size(256, WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    let physical = terminal.screen().contents();
+    for index in 0..12 {
+        let sentinel = format!("DRAFT-HISTORY-{index:02}");
+        assert_eq!(
+            physical.matches(&sentinel).count(),
+            1,
+            "{sentinel}:\n{physical}"
+        );
+    }
+    for index in 0..32 {
+        let sentinel = format!("DRAFT-STREAM-{index:02}");
+        assert_eq!(
+            physical.matches(&sentinel).count(),
+            1,
+            "{sentinel}:\n{physical}"
+        );
+    }
+}
+
+#[test]
 fn ctrl_o_expands_and_collapses_the_inline_compaction_summary() {
     let mut shell = InteractiveShell::test_shell();
     shell.compaction_marker(
@@ -3011,19 +3103,14 @@ fn compaction_disclosure_preserves_native_presentation() {
         let expansion = drain(&bytes);
         let expansion_text = String::from_utf8_lossy(&expansion);
         assert!(
-            expansion.len() < 8 * 1024,
-            "compaction expansion replayed an unbounded frame ({} bytes)",
-            expansion.len()
-        );
-        assert!(
             !expansion
                 .windows(b"\x1b[3J".len())
                 .any(|bytes| bytes == b"\x1b[3J"),
-            "compaction expansion cleared terminal-owned history: {expansion_text:?}"
+            "Pi can repaint a disclosure that begins inside the visible viewport: {expansion_text:?}"
         );
         assert!(
             !expansion_text.contains("compaction-history-00"),
-            "compaction expansion replayed committed history: {expansion_text:?}"
+            "visible-tail differential update replayed off-screen history: {expansion_text:?}"
         );
 
         terminal.process(&expansion);
@@ -3040,18 +3127,15 @@ fn compaction_disclosure_preserves_native_presentation() {
         shell.toggle_disclosure();
         shell.render();
         let collapse = drain(&bytes);
+        let collapse_text = String::from_utf8_lossy(&collapse);
         assert!(
-            collapse.len() < 8 * 1024,
-            "compaction collapse replayed an unbounded frame ({} bytes)",
-            collapse.len()
-        );
-        assert!(
-            !collapse
+            collapse
                 .windows(b"\x1b[3J".len())
                 .any(|bytes| bytes == b"\x1b[3J"),
-            "compaction collapse cleared terminal-owned history"
+            "Pi parity requires contraction above the viewport to clear and replay: {collapse_text:?}"
         );
-        terminal.process(&collapse);
+        assert!(collapse_text.contains("compaction-history-00"));
+        process_vt100_with_saved_line_clear(&mut terminal, &collapse, HEIGHT, WIDTH, 512);
         terminal.set_scrollback(0);
         let collapsed = terminal.screen().contents();
         assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
@@ -3124,7 +3208,7 @@ fn removed_streaming_tail_keeps_a_tombstoned_commit_seam() {
 }
 
 #[test]
-fn resize_preserves_native_history_and_repaints_visible_owned_rows() {
+fn resize_matches_pi_clear_and_complete_replay_semantics() {
     const WIDTH: u16 = 48;
     const RESIZED_WIDTH: u16 = 64;
     const HEIGHT: u16 = 10;
@@ -3158,24 +3242,27 @@ fn resize_preserves_native_history_and_repaints_visible_owned_rows() {
     let resize_text = String::from_utf8_lossy(&resize);
     assert!(resize_text.contains("\x1b[?2026h"), "{resize_text:?}");
     assert!(
-        !resize_text.contains("\x1b[3J"),
-        "text-only resize must preserve native history: {resize_text:?}"
+        resize_text.contains("\x1b[2J\x1b[H\x1b[3J"),
+        "Pi resize must clear saved lines before replay: {resize_text:?}"
     );
     assert!(
-        !resize_text.contains("YGG-OWNED-RESIZE-00"),
-        "off-screen history was replayed: {resize_text:?}"
+        resize_text.contains("YGG-OWNED-RESIZE-00"),
+        "Pi resize omitted off-screen logical history: {resize_text:?}"
     );
     assert!(
         resize_text.contains("YGG-OWNED-RESIZE-17"),
         "{resize_text:?}"
     );
     assert!(resize_text.contains("\x1b[?2026l"), "{resize_text:?}");
-    terminal.process(&resize);
+    process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
 
     terminal.set_size(256, RESIZED_WIDTH);
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
-    assert!(physical.contains(SHELL_SENTINEL), "{physical}");
+    assert!(
+        !physical.contains(SHELL_SENTINEL),
+        "Pi saved-line reset retained pre-application history: {physical}"
+    );
     for index in 0..18 {
         let sentinel = format!("YGG-OWNED-RESIZE-{index:02}");
         assert_eq!(
@@ -3187,7 +3274,7 @@ fn resize_preserves_native_history_and_repaints_visible_owned_rows() {
 }
 
 #[test]
-fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
+fn resize_while_overlayed_replays_the_pi_composited_frame() {
     const WIDTH: u16 = 48;
     const RESIZED_WIDTH: u16 = 64;
     const HEIGHT: u16 = 10;
@@ -3240,15 +3327,18 @@ fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
         "{resize_text:?}"
     );
     assert!(
-        resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
-        "{resize_text:?}"
+        !resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
+        "Pi replays the current composited frame, not rows hidden by its overlay: {resize_text:?}"
     );
-    for index in 0..18 {
+    for index in 0..16 {
         let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
         assert!(
             resize_text.contains(&sentinel),
-            "{sentinel} was not replayed beneath the overlay:\n{resize_text:?}"
+            "{sentinel} was not replayed with the composited overlay:\n{resize_text:?}"
         );
+    }
+    for index in 16..18 {
+        assert!(!resize_text.contains(&format!("YGG-OVERLAY-RESIZE-{index:02}")));
     }
 
     process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
@@ -3290,9 +3380,10 @@ fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
     shell.close_overlay();
     shell.render();
     let close = drain(&bytes);
+    let close_text = String::from_utf8_lossy(&close);
     assert!(
-        !String::from_utf8_lossy(&close).contains("\x1b[3J"),
-        "closing the overlay must use a differential repaint"
+        !close_text.contains("\x1b[3J"),
+        "Pi can restore an overlay whose first changed row remains visible: {close_text:?}"
     );
     terminal.process(&close);
     terminal.set_size(256, RESIZED_WIDTH);
@@ -3317,7 +3408,7 @@ fn resize_while_overlayed_replays_owned_transcript_before_repainting_overlay() {
 }
 
 #[test]
-fn slash_popup_then_context_overlay_repaints_the_complete_native_viewport() {
+fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
     const WIDTH: u16 = 80;
     const HEIGHT: u16 = 16;
 
@@ -3354,10 +3445,12 @@ fn slash_popup_then_context_overlay_repaints_the_complete_native_viewport() {
         shell.render();
         let context_frame = drain(&bytes);
         assert!(
-            !context_frame.contains(&b'\n'),
-            "viewport surface scrolled into native history"
+            context_frame
+                .windows(b"\x1b[3J".len())
+                .any(|bytes| bytes == b"\x1b[3J"),
+            "Pi must clear and replay when the overlay changes above its viewport"
         );
-        terminal.process(&context_frame);
+        process_vt100_with_saved_line_clear(&mut terminal, &context_frame, HEIGHT, WIDTH, 512);
         terminal.set_scrollback(0);
 
         let visible = terminal.screen().contents();
@@ -3386,7 +3479,7 @@ fn slash_popup_then_context_overlay_repaints_the_complete_native_viewport() {
             !close
                 .windows(b"\x1b[3J".len())
                 .any(|bytes| bytes == b"\x1b[3J"),
-            "closing the context report cleared native history"
+            "Pi can restore the context overlay from its visible first change"
         );
         terminal.process(&close);
         terminal.set_size(512, WIDTH);
@@ -4000,7 +4093,7 @@ fn native_ctrl_o_rebuilds_offscreen_compaction_and_contracts_the_complete_frame(
 }
 
 #[test]
-fn theme_swap_repaints_visible_native_tail_without_replaying_scrollback() {
+fn theme_swap_matches_pi_clear_and_complete_replay() {
     const WIDTH: u16 = 32;
     const HEIGHT: u16 = 10;
     let theme_source = |name: &str, foreground: &str| {
@@ -4060,50 +4153,30 @@ fn theme_swap_repaints_visible_native_tail_without_replaying_scrollback() {
         .expect("emulated terminal output mutex poisoned")
         .clone();
     assert!(
-        !complete
+        complete
             .windows(b"\x1b[3J".len())
             .any(|window| window == b"\x1b[3J"),
-        "theme swap must preserve terminal-owned scrollback"
+        "Pi theme changes above the viewport must clear and replay"
     );
     let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
-    terminal.process(&complete);
+    process_vt100_with_saved_line_clear(&mut terminal, &complete, HEIGHT, WIDTH, 128);
     assert!(
         find_ascii_cell(terminal.screen(), "historic-").is_some(),
-        "visible tail lost after theme repaint: {:?}",
+        "visible tail lost after theme replay: {:?}",
         terminal.screen().contents()
     );
     assert_ascii_foreground(&terminal, "historic-11", new_foreground);
     assert!(
         find_ascii_cell(terminal.screen(), "X").is_none(),
-        "full viewport repaint left a stale cell: {:?}",
+        "full replay left a stale cell: {:?}",
         terminal.screen().contents()
     );
 
-    let mut old_history = None;
-    for offset in 1..=usize::from(HEIGHT) {
-        terminal.set_scrollback(offset);
-        for (row, contents) in terminal.screen().rows(0, WIDTH).enumerate() {
-            let Some(column) = contents.find("historic-") else {
-                continue;
-            };
-            let color = terminal
-                .screen()
-                .cell(row as u16, column as u16)
-                .expect("historic cell inside terminal bounds")
-                .fgcolor();
-            if color == old_foreground {
-                old_history = Some((row as u16, column as u16));
-                break;
-            }
-        }
-        if old_history.is_some() {
-            break;
-        }
+    terminal.set_size(128, WIDTH);
+    terminal.set_scrollback(usize::MAX);
+    for number in 0..12 {
+        assert_ascii_foreground(&terminal, &format!("historic-{number}"), new_foreground);
     }
-    assert!(
-        old_history.is_some(),
-        "terminal-owned rows should retain their original cell style"
-    );
     assert_ne!(old_foreground, new_foreground);
 }
 
@@ -4155,14 +4228,8 @@ fn switching_back_to_default_clears_named_theme_attributes() {
         )));
     shell.render();
 
-    // Model a theme renderer ending a frame with every supported text
-    // attribute active. Returning to default must reset the terminal's
-    // rendition before it clears and repaints the visible viewport.
-    bytes
-        .lock()
-        .expect("emulated terminal output mutex poisoned")
-        .extend_from_slice(b"\x1b[1;3;4;7;48;2;12;34;56m");
-
+    // Pi terminates every rendered row with a full rendition reset. Switching
+    // themes then clears and replays the complete frame from that invariant.
     shell.set_theme(crate::tui::theme::test_theme());
     shell.render();
 

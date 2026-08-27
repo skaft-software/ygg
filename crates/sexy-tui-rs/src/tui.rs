@@ -1,5 +1,6 @@
 //! Retained component tree with line-differential terminal rendering.
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
 use crate::scrollback::reset_and_replay;
 use crate::terminal::{key_to_string, Terminal, TerminalInput};
@@ -17,7 +18,63 @@ pub(crate) fn is_image_line(line: &str) -> bool {
 /// Kitty graphics protocol escape that deletes every placed image. Destructive
 /// inline replays must emit it before rebuilding rows they may have erased.
 pub(crate) fn delete_all_kitty_images() -> String {
-    "\x1b_Ga=d\x1b\\".to_string()
+    "\x1b_Ga=d,d=A,q=2\x1b\\".to_string()
+}
+
+const KITTY_SEQUENCE_PREFIX: &str = "\x1b_G";
+const PI_LINE_RESET: &str = "\x1b[0m\x1b]8;;\x07";
+
+#[derive(Debug, Default)]
+struct KittyImageHeader {
+    ids: Vec<u32>,
+    rows: usize,
+}
+
+fn parse_kitty_image_header(line: &str) -> Option<KittyImageHeader> {
+    let sequence_start = line.find(KITTY_SEQUENCE_PREFIX)?;
+    let params_start = sequence_start.saturating_add(KITTY_SEQUENCE_PREFIX.len());
+    let params_end = line[params_start..].find(';')?.saturating_add(params_start);
+    let mut header = KittyImageHeader {
+        ids: Vec::new(),
+        rows: 1,
+    };
+    for parameter in line[params_start..params_end].split(',') {
+        let Some((key, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.parse::<u32>() else {
+            continue;
+        };
+        if value == 0 {
+            continue;
+        }
+        match key {
+            "i" => header.ids.push(value),
+            "r" => header.rows = value as usize,
+            _ => {}
+        }
+    }
+    Some(header)
+}
+
+fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
+    parse_kitty_image_header(line)
+        .map(|header| header.ids)
+        .unwrap_or_default()
+}
+
+fn extract_kitty_image_rows(line: &str) -> usize {
+    parse_kitty_image_header(line)
+        .map(|header| header.rows)
+        .unwrap_or(1)
+}
+
+fn delete_kitty_image(image_id: u32) -> String {
+    format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
+}
+
+fn is_termux_session() -> bool {
+    std::env::var_os("TERMUX_VERSION").is_some()
 }
 
 /// Global input listener. Returning `Some` consumes the input event.
@@ -213,6 +270,24 @@ pub struct TUI<'a> {
     running: bool,
     capabilities: crate::capabilities::TerminalCapabilities,
     input_listeners: Vec<InputListener<'a>>,
+    /// Pi-compatible logical row containing the end of rendered content.
+    cursor_row: usize,
+    /// Pi-compatible logical row containing the physical terminal cursor.
+    hardware_cursor_row: usize,
+    /// Largest logical frame painted since the most recent full redraw.
+    max_lines_rendered: usize,
+    /// Logical row represented by the top of the previous terminal viewport.
+    previous_viewport_top: usize,
+    /// Number of Pi full-frame renders, exposed for parity regressions.
+    full_redraw_count: usize,
+    /// Pi's optional full-redraw-on-shrink policy.
+    clear_on_shrink: bool,
+    /// Pi tracks Kitty placements by image ID so redraws delete only affected
+    /// images before retransmitting their rows.
+    previous_kitty_image_ids: BTreeSet<u32>,
+    /// Pi positions the hardware cursor for IME but hides it by default because
+    /// editor components render their own visual cursor.
+    show_hardware_cursor: bool,
     /// Render into the primary screen. The initial paint is limited to the
     /// visible tail; later appended lines can flow into native scrollback.
     /// Off-screen logical rows remain retained in `previous_frame`, so callers
@@ -264,6 +339,16 @@ impl<'a> TUI<'a> {
             running: false,
             capabilities,
             input_listeners: Vec::new(),
+            cursor_row: 0,
+            hardware_cursor_row: 0,
+            max_lines_rendered: 0,
+            previous_viewport_top: 0,
+            full_redraw_count: 0,
+            clear_on_shrink: std::env::var_os("PI_CLEAR_ON_SHRINK")
+                .is_some_and(|value| value == "1"),
+            previous_kitty_image_ids: BTreeSet::new(),
+            show_hardware_cursor: std::env::var_os("PI_HARDWARE_CURSOR")
+                .is_some_and(|value| value == "1"),
             inline_scrollback: false,
             inline_bottom_row: 0,
             inline_history_rows: 0,
@@ -280,6 +365,38 @@ impl<'a> TUI<'a> {
     /// Opt into inline scrollback rendering (see the field's invariants).
     pub fn set_inline_scrollback(&mut self, enabled: bool) {
         self.inline_scrollback = enabled;
+    }
+
+    /// Number of Pi-compatible full redraws performed by this TUI.
+    pub fn full_redraws(&self) -> usize {
+        self.full_redraw_count
+    }
+
+    /// Whether Pi's optional full redraw on frame shrink is enabled.
+    pub fn clear_on_shrink(&self) -> bool {
+        self.clear_on_shrink
+    }
+
+    /// Match Pi's `setClearOnShrink` runtime policy.
+    pub fn set_clear_on_shrink(&mut self, enabled: bool) {
+        self.clear_on_shrink = enabled;
+    }
+
+    /// Whether the hardware cursor is visible after IME positioning.
+    pub fn show_hardware_cursor(&self) -> bool {
+        self.show_hardware_cursor
+    }
+
+    /// Match Pi's hardware-cursor visibility policy.
+    pub fn set_show_hardware_cursor(&mut self, enabled: bool) {
+        if self.show_hardware_cursor == enabled {
+            return;
+        }
+        self.show_hardware_cursor = enabled;
+        if !enabled {
+            self.terminal.hide_cursor();
+        }
+        self.request_render();
     }
 
     /// Set the terminal window title via OSC 2. Useful with inline
@@ -320,7 +437,20 @@ impl<'a> TUI<'a> {
 
     /// Request a re-render at the next opportunity.
     pub fn request_render(&mut self) {
-        // Trigger immediate re-render
+        self.request_render_force(false);
+    }
+
+    /// Match Pi's forced-render path by invalidating every retained cursor and
+    /// viewport assumption before rendering.
+    pub fn request_render_force(&mut self, force: bool) {
+        if force {
+            self.previous_frame.clear();
+            self.previous_size = Some((u16::MAX, u16::MAX));
+            self.cursor_row = 0;
+            self.hardware_cursor_row = 0;
+            self.max_lines_rendered = 0;
+            self.previous_viewport_top = 0;
+        }
         if self.running {
             self.render_frame();
         }
@@ -346,6 +476,26 @@ impl<'a> TUI<'a> {
             return;
         }
         self.running = false;
+        if self.uses_pi_renderer() {
+            // Pi clears the editor's inverted fake cursor, moves to the line
+            // after the complete logical frame, and only then restores the
+            // process terminal.
+            if !self.previous_frame.is_empty() {
+                self.terminal.write(" ");
+                let target_row = self.previous_frame.len();
+                let mut buffer = String::new();
+                push_vertical_move(
+                    &mut buffer,
+                    signed_difference(target_row, self.hardware_cursor_row),
+                );
+                buffer.push_str("\r\n");
+                self.terminal.write(&buffer);
+                self.hardware_cursor_row = target_row;
+            }
+            self.terminal.show_cursor();
+            self.terminal.stop();
+            return;
+        }
         // Close any interrupted synchronized frame and all text/hyperlink
         // styling before restoring the backend. Repeated backend cleanup is
         // expected to be idempotent.
@@ -419,8 +569,463 @@ impl<'a> TUI<'a> {
         }
     }
 
-    /// Render the current frame using the differential rendering algorithm.
+    fn uses_pi_renderer(&self) -> bool {
+        !self.capabilities.plain
+            && !self.inline_scrollback
+            && self.capabilities.cursor_addressing
+            && self.capabilities.line_clearing
+    }
+
+    /// Render the current frame. Interactive non-inline terminals use Pi's
+    /// normative differential algorithm; plain output and the explicit legacy
+    /// inline extension retain their separate compatibility contracts.
     fn render_frame(&mut self) {
+        if self.uses_pi_renderer() {
+            self.render_pi_frame();
+        } else {
+            self.render_extended_frame();
+        }
+    }
+
+    /// Rust port of Pi TUI's `doRender()` at revision
+    /// `20be4b18d4c57487f8993d2762bace129f0cf7c6`.
+    /// Keep this control flow structurally aligned with
+    /// `packages/tui/src/tui.ts`; named upstream cases live in
+    /// `tests/pi_tui_render.rs`. Ygg-specific native-scrollback policy belongs
+    /// only to the explicit `inline_scrollback` compatibility path below.
+    fn render_pi_frame(&mut self) {
+        let width_u16 = self.terminal.columns();
+        let height_u16 = self.terminal.rows().max(1);
+        let width = usize::from(width_u16);
+        let height = usize::from(height_u16);
+        let previous_width = self.previous_size.map_or(0, |size| size.0);
+        let previous_height = self.previous_size.map_or(0, |size| size.1);
+        let width_changed = previous_width != 0 && previous_width != width_u16;
+        let height_changed = previous_height != 0 && previous_height != height_u16;
+        let previous_buffer_length = if previous_height > 0 {
+            self.previous_viewport_top
+                .saturating_add(usize::from(previous_height))
+        } else {
+            height
+        };
+        let mut previous_viewport_top = if height_changed {
+            previous_buffer_length.saturating_sub(height)
+        } else {
+            self.previous_viewport_top
+        };
+        let mut viewport_top = previous_viewport_top;
+        let mut hardware_cursor_row = self.hardware_cursor_row;
+
+        let mut new_lines = self.root_render(width_u16);
+        let cursor_position = extract_pi_cursor_position(&mut new_lines, height);
+        for line in &mut new_lines {
+            if !is_image_line(line) {
+                *line = format!(
+                    "{}{}",
+                    crate::utils::normalize_terminal_output(line),
+                    PI_LINE_RESET
+                );
+            }
+        }
+
+        // Pi's first render writes the complete frame without touching saved
+        // lines. Subsequent structural fallbacks clear and replay it.
+        if self.previous_frame.is_empty() && !width_changed && !height_changed {
+            self.pi_full_render(new_lines, width_u16, height_u16, false, cursor_position);
+            return;
+        }
+        if width_changed {
+            self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+            return;
+        }
+        if height_changed && !is_termux_session() {
+            self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+            return;
+        }
+        if self.clear_on_shrink && new_lines.len() < self.max_lines_rendered && !self.first_render {
+            self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+            return;
+        }
+
+        let mut first_changed = None;
+        let mut last_changed = None;
+        let max_lines = new_lines.len().max(self.previous_frame.len());
+        for index in 0..max_lines {
+            let old_line = self.previous_frame.get(index).map_or("", String::as_str);
+            let new_line = new_lines.get(index).map_or("", String::as_str);
+            if old_line != new_line {
+                first_changed.get_or_insert(index);
+                last_changed = Some(index);
+            }
+        }
+        let appended_lines = new_lines.len() > self.previous_frame.len();
+        if appended_lines {
+            first_changed.get_or_insert(self.previous_frame.len());
+            last_changed = new_lines.len().checked_sub(1);
+        }
+        if let (Some(first), Some(last)) = (first_changed, last_changed) {
+            let (expanded_first, expanded_last) =
+                self.pi_expand_changed_range_for_kitty_images(first, last, &new_lines);
+            first_changed = Some(expanded_first);
+            last_changed = Some(expanded_last);
+        }
+        let append_start = appended_lines
+            && first_changed == Some(self.previous_frame.len())
+            && first_changed.is_some_and(|index| index > 0);
+
+        if first_changed.is_none() {
+            self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+            self.previous_viewport_top = previous_viewport_top;
+            self.previous_size = Some((width_u16, height_u16));
+            self.first_render = false;
+            return;
+        }
+        let first_changed = first_changed.expect("checked above");
+        let last_changed = last_changed.expect("a changed frame has a last row");
+
+        // All changes are deleted rows. Clear those cells without scrolling
+        // unless the target moved above the old viewport, where Pi rebuilds.
+        if first_changed >= new_lines.len() {
+            if self.previous_frame.len() > new_lines.len() {
+                let target_row = new_lines.len().saturating_sub(1);
+                if target_row < previous_viewport_top {
+                    self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+                    return;
+                }
+                let extra_lines = self.previous_frame.len().saturating_sub(new_lines.len());
+                if extra_lines > height {
+                    self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+                    return;
+                }
+
+                let mut buffer = String::from("\x1b[?2026h");
+                buffer.push_str(&self.pi_delete_changed_kitty_images(first_changed, last_changed));
+                push_vertical_move(
+                    &mut buffer,
+                    pi_line_difference(
+                        hardware_cursor_row,
+                        previous_viewport_top,
+                        target_row,
+                        viewport_top,
+                    ),
+                );
+                buffer.push('\r');
+                let clear_start_offset = usize::from(!new_lines.is_empty());
+                if extra_lines > 0 && clear_start_offset > 0 {
+                    push_cursor_down(&mut buffer, clear_start_offset);
+                }
+                for index in 0..extra_lines {
+                    buffer.push_str("\r\x1b[2K");
+                    if index + 1 < extra_lines {
+                        push_cursor_down(&mut buffer, 1);
+                    }
+                }
+                let move_back = extra_lines
+                    .saturating_sub(1)
+                    .saturating_add(clear_start_offset);
+                if move_back > 0 {
+                    push_cursor_up(&mut buffer, move_back);
+                }
+                buffer.push_str("\x1b[?2026l");
+                self.terminal.write(&buffer);
+                self.cursor_row = target_row;
+                self.hardware_cursor_row = target_row;
+            }
+            self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+            self.previous_frame = new_lines;
+            self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&self.previous_frame);
+            self.previous_size = Some((width_u16, height_u16));
+            self.previous_viewport_top = previous_viewport_top;
+            self.first_render = false;
+            return;
+        }
+
+        if first_changed < previous_viewport_top {
+            self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+            return;
+        }
+
+        let mut buffer = String::from("\x1b[?2026h");
+        buffer.push_str(&self.pi_delete_changed_kitty_images(first_changed, last_changed));
+        let previous_viewport_bottom = previous_viewport_top.saturating_add(height - 1);
+        let move_target_row = if append_start {
+            first_changed.saturating_sub(1)
+        } else {
+            first_changed
+        };
+        if move_target_row > previous_viewport_bottom {
+            let current_screen_row = hardware_cursor_row
+                .saturating_sub(previous_viewport_top)
+                .min(height - 1);
+            let move_to_bottom = height.saturating_sub(1).saturating_sub(current_screen_row);
+            if move_to_bottom > 0 {
+                push_cursor_down(&mut buffer, move_to_bottom);
+            }
+            let scroll = move_target_row.saturating_sub(previous_viewport_bottom);
+            buffer.push_str(&"\r\n".repeat(scroll));
+            previous_viewport_top = previous_viewport_top.saturating_add(scroll);
+            viewport_top = viewport_top.saturating_add(scroll);
+            hardware_cursor_row = move_target_row;
+        }
+
+        push_vertical_move(
+            &mut buffer,
+            pi_line_difference(
+                hardware_cursor_row,
+                previous_viewport_top,
+                move_target_row,
+                viewport_top,
+            ),
+        );
+        buffer.push_str(if append_start { "\r\n" } else { "\r" });
+
+        let render_end = last_changed.min(new_lines.len().saturating_sub(1));
+        let mut index = first_changed;
+        while index <= render_end {
+            if index > first_changed {
+                buffer.push_str("\r\n");
+            }
+            let line = &new_lines[index];
+            let image = is_image_line(line);
+            let image_reserved_rows = if image {
+                self.pi_kitty_image_reserved_rows(&new_lines, index, render_end)
+            } else {
+                1
+            };
+            if image_reserved_rows > 1 {
+                let image_start_screen_row = index.checked_sub(viewport_top);
+                if image_start_screen_row
+                    .is_none_or(|row| row.saturating_add(image_reserved_rows) > height)
+                {
+                    self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
+                    return;
+                }
+                buffer.push_str("\x1b[2K");
+                for _ in 1..image_reserved_rows {
+                    buffer.push_str("\r\n\x1b[2K");
+                }
+                push_cursor_up(&mut buffer, image_reserved_rows - 1);
+                buffer.push_str(line);
+                push_cursor_down(&mut buffer, image_reserved_rows - 1);
+                index = index.saturating_add(image_reserved_rows);
+                continue;
+            }
+
+            buffer.push_str("\x1b[2K");
+            if !image && visible_width(line) > width {
+                self.stop();
+                panic!(
+                    "rendered line {index} exceeds terminal width ({} > {width}); components must wrap or truncate to the supplied width",
+                    visible_width(line)
+                );
+            }
+            buffer.push_str(line);
+            index = index.saturating_add(1);
+        }
+
+        let mut final_cursor_row = render_end;
+        if self.previous_frame.len() > new_lines.len() {
+            if render_end < new_lines.len().saturating_sub(1) {
+                let move_down = new_lines.len() - 1 - render_end;
+                push_cursor_down(&mut buffer, move_down);
+                final_cursor_row = new_lines.len() - 1;
+            }
+            let extra_lines = self.previous_frame.len().saturating_sub(new_lines.len());
+            for _ in new_lines.len()..self.previous_frame.len() {
+                buffer.push_str("\r\n\x1b[2K");
+            }
+            push_cursor_up(&mut buffer, extra_lines);
+        }
+        buffer.push_str("\x1b[?2026l");
+        self.terminal.write(&buffer);
+
+        self.cursor_row = new_lines.len().saturating_sub(1);
+        self.hardware_cursor_row = final_cursor_row;
+        self.max_lines_rendered = self.max_lines_rendered.max(new_lines.len());
+        self.previous_viewport_top =
+            previous_viewport_top.max(final_cursor_row.saturating_sub(height.saturating_sub(1)));
+        self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+        self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&new_lines);
+        self.previous_frame = new_lines;
+        self.previous_size = Some((width_u16, height_u16));
+        self.first_render = false;
+    }
+
+    fn pi_full_render(
+        &mut self,
+        new_lines: Vec<String>,
+        width: u16,
+        height: u16,
+        clear: bool,
+        cursor_position: Option<(usize, usize)>,
+    ) {
+        self.full_redraw_count = self.full_redraw_count.saturating_add(1);
+        let height_rows = usize::from(height.max(1));
+        let mut buffer = String::from("\x1b[?2026h");
+        if clear {
+            buffer.push_str(&self.pi_delete_kitty_images(&self.previous_kitty_image_ids));
+            buffer.push_str("\x1b[2J\x1b[H\x1b[3J");
+        }
+        let mut index = 0;
+        while index < new_lines.len() {
+            if index > 0 {
+                buffer.push_str("\r\n");
+            }
+            let line = &new_lines[index];
+            let image_reserved_rows = if is_image_line(line) {
+                self.pi_kitty_image_reserved_rows(
+                    &new_lines,
+                    index,
+                    new_lines.len().saturating_sub(1),
+                )
+            } else {
+                1
+            };
+            if image_reserved_rows > 1 && image_reserved_rows <= height_rows {
+                buffer.push_str(&"\r\n".repeat(image_reserved_rows - 1));
+                push_cursor_up(&mut buffer, image_reserved_rows - 1);
+                buffer.push_str(line);
+                push_cursor_down(&mut buffer, image_reserved_rows - 1);
+                index = index.saturating_add(image_reserved_rows);
+                continue;
+            }
+            buffer.push_str(line);
+            index = index.saturating_add(1);
+        }
+        buffer.push_str("\x1b[?2026l");
+        self.terminal.write(&buffer);
+
+        self.cursor_row = new_lines.len().saturating_sub(1);
+        self.hardware_cursor_row = self.cursor_row;
+        self.max_lines_rendered = if clear {
+            new_lines.len()
+        } else {
+            self.max_lines_rendered.max(new_lines.len())
+        };
+        let buffer_length = height_rows.max(new_lines.len());
+        self.previous_viewport_top = buffer_length.saturating_sub(height_rows);
+        self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+        self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&new_lines);
+        self.previous_frame = new_lines;
+        self.previous_size = Some((width, height));
+        self.first_render = false;
+    }
+
+    fn pi_position_hardware_cursor(
+        &mut self,
+        cursor_position: Option<(usize, usize)>,
+        total_lines: usize,
+    ) {
+        let Some((row, column)) = cursor_position.filter(|_| total_lines > 0) else {
+            self.terminal.hide_cursor();
+            return;
+        };
+        let target_row = row.min(total_lines.saturating_sub(1));
+        let mut buffer = String::new();
+        push_vertical_move(
+            &mut buffer,
+            signed_difference(target_row, self.hardware_cursor_row),
+        );
+        buffer.push_str(&format!("\x1b[{}G", column.saturating_add(1)));
+        self.terminal.write(&buffer);
+        self.hardware_cursor_row = target_row;
+        if self.show_hardware_cursor {
+            self.terminal.show_cursor();
+        } else {
+            self.terminal.hide_cursor();
+        }
+    }
+
+    fn pi_collect_kitty_image_ids(lines: &[String]) -> BTreeSet<u32> {
+        lines
+            .iter()
+            .flat_map(|line| extract_kitty_image_ids(line))
+            .collect()
+    }
+
+    fn pi_delete_kitty_images(&self, ids: &BTreeSet<u32>) -> String {
+        ids.iter()
+            .map(|image_id| delete_kitty_image(*image_id))
+            .collect()
+    }
+
+    fn pi_kitty_image_reserved_rows(
+        &self,
+        lines: &[String],
+        index: usize,
+        max_index: usize,
+    ) -> usize {
+        let rows = lines
+            .get(index)
+            .map_or(1, |line| extract_kitty_image_rows(line));
+        if rows <= 1 {
+            return 1;
+        }
+        let max_rows = rows
+            .min(max_index.saturating_sub(index).saturating_add(1))
+            .min(lines.len().saturating_sub(index));
+        let mut reserved_rows = 1;
+        while reserved_rows < max_rows {
+            let line = lines
+                .get(index.saturating_add(reserved_rows))
+                .map_or("", String::as_str);
+            if is_image_line(line) || visible_width(line) > 0 {
+                break;
+            }
+            reserved_rows = reserved_rows.saturating_add(1);
+        }
+        reserved_rows
+    }
+
+    fn pi_expand_changed_range_for_kitty_images(
+        &self,
+        first_changed: usize,
+        last_changed: usize,
+        new_lines: &[String],
+    ) -> (usize, usize) {
+        let mut expanded_first = first_changed;
+        let mut expanded_last = last_changed;
+        for lines in [&self.previous_frame, new_lines] {
+            for index in 0..lines.len() {
+                if extract_kitty_image_ids(&lines[index]).is_empty() {
+                    continue;
+                }
+                let block_end = index
+                    .saturating_add(self.pi_kitty_image_reserved_rows(
+                        lines,
+                        index,
+                        lines.len() - 1,
+                    ))
+                    .saturating_sub(1);
+                if index >= first_changed || (index <= last_changed && block_end >= first_changed) {
+                    expanded_first = expanded_first.min(index);
+                    expanded_last = expanded_last.max(block_end);
+                }
+            }
+        }
+        (expanded_first, expanded_last)
+    }
+
+    fn pi_delete_changed_kitty_images(&self, first_changed: usize, last_changed: usize) -> String {
+        if last_changed < first_changed {
+            return String::new();
+        }
+        let mut ids = BTreeSet::new();
+        let Some(max_line) = self
+            .previous_frame
+            .len()
+            .checked_sub(1)
+            .map(|last| last.min(last_changed))
+        else {
+            return String::new();
+        };
+        for index in first_changed..=max_line {
+            ids.extend(extract_kitty_image_ids(&self.previous_frame[index]));
+        }
+        self.pi_delete_kitty_images(&ids)
+    }
+
+    fn render_extended_frame(&mut self) {
         let width = self.terminal.columns();
         let height = self.terminal.rows();
         let size_changed = self
@@ -1496,6 +2101,58 @@ impl<'a> TUI<'a> {
         if self.synchronized_output_depth == 0 {
             self.terminal.write("\x1b[?2026l");
         }
+    }
+}
+
+fn extract_pi_cursor_position(lines: &mut [String], height: usize) -> Option<(usize, usize)> {
+    let viewport_top = lines.len().saturating_sub(height);
+    for row in (viewport_top..lines.len()).rev() {
+        let Some(marker) = lines[row].find(CURSOR_MARKER) else {
+            continue;
+        };
+        let column = visible_width(&lines[row][..marker]);
+        lines[row].replace_range(marker..marker + CURSOR_MARKER.len(), "");
+        return Some((row, column));
+    }
+    None
+}
+
+fn signed_difference(left: usize, right: usize) -> i64 {
+    if left >= right {
+        i64::try_from(left - right).unwrap_or(i64::MAX)
+    } else {
+        -i64::try_from(right - left).unwrap_or(i64::MAX)
+    }
+}
+
+fn pi_line_difference(
+    hardware_cursor_row: usize,
+    previous_viewport_top: usize,
+    target_row: usize,
+    viewport_top: usize,
+) -> i64 {
+    let current_screen_row = signed_difference(hardware_cursor_row, previous_viewport_top);
+    let target_screen_row = signed_difference(target_row, viewport_top);
+    target_screen_row.saturating_sub(current_screen_row)
+}
+
+fn push_cursor_up(buffer: &mut String, rows: usize) {
+    if rows > 0 {
+        buffer.push_str(&format!("\x1b[{rows}A"));
+    }
+}
+
+fn push_cursor_down(buffer: &mut String, rows: usize) {
+    if rows > 0 {
+        buffer.push_str(&format!("\x1b[{rows}B"));
+    }
+}
+
+fn push_vertical_move(buffer: &mut String, rows: i64) {
+    match rows.cmp(&0) {
+        Ordering::Greater => push_cursor_down(buffer, rows as usize),
+        Ordering::Less => push_cursor_up(buffer, rows.unsigned_abs() as usize),
+        Ordering::Equal => {}
     }
 }
 
@@ -3396,29 +4053,25 @@ mod tests {
     }
 
     #[test]
-    fn resize_forces_a_home_and_full_redraw() {
+    fn pi_resize_clears_saved_lines_and_replays_the_complete_frame() {
         let size = Rc::new(Cell::new((20, 8)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
             true,
         );
-        let (terminal, clears, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let (terminal, _, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
         let mut tui = TUI::new(Box::new(terminal));
         tui.add_child(Box::new(OneLine));
         tui.start();
+        let redraws = tui.full_redraws();
         writes.borrow_mut().clear();
         size.set((80, 24));
         tui.request_render();
 
-        assert_eq!(clears.get(), 1);
-        assert_eq!(
-            writes
-                .borrow()
-                .iter()
-                .filter(|write| write.as_str() == "\x1b[H")
-                .count(),
-            2
-        );
+        assert!(tui.full_redraws() > redraws);
+        let output = writes.borrow().join("");
+        assert!(output.contains("\x1b[2J\x1b[H\x1b[3J"), "{output:?}");
+        assert!(output.contains("line"), "{output:?}");
     }
 
     #[test]
@@ -3442,13 +4095,13 @@ mod tests {
     }
 
     #[test]
-    fn pure_append_and_shrink_update_only_the_changed_tail() {
+    fn pi_pure_append_and_shrink_update_only_the_changed_tail() {
         let size = Rc::new(Cell::new((20, 8)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
             true,
         );
-        let (terminal, _, tail_clears, _, _, writes) = recording_terminal(size, capabilities);
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
         let lines = Rc::new(RefCell::new(vec!["first".to_owned()]));
         let mut tui = TUI::new(Box::new(terminal));
         tui.add_child(Box::new(MutableLines(lines.clone())));
@@ -3457,12 +4110,17 @@ mod tests {
 
         lines.borrow_mut().push("second".to_owned());
         tui.request_render();
-        assert!(writes.borrow().iter().any(|write| write.contains("second")));
+        let append = writes.borrow().join("");
+        assert!(append.contains("\r\n"), "{append:?}");
+        assert!(append.contains("second"), "{append:?}");
+        assert!(!append.contains("\x1b[3J"), "{append:?}");
 
         writes.borrow_mut().clear();
         lines.borrow_mut().truncate(1);
         tui.request_render();
-        assert!(tail_clears.get() >= 2);
+        let shrink = writes.borrow().join("");
+        assert!(shrink.contains("\x1b[2K"), "{shrink:?}");
+        assert!(!shrink.contains("\x1b[3J"), "{shrink:?}");
     }
 
     #[test]
@@ -3482,20 +4140,21 @@ mod tests {
     }
 
     #[test]
-    fn cursor_marker_is_extracted_before_width_clipping() {
+    fn pi_cursor_marker_uses_unclipped_display_cells() {
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
             true,
         );
         let cases = [
-            (2, format!("界{CURSOR_MARKER}x"), "\x1b[1;2H"),
-            (3, format!("abcdef{CURSOR_MARKER}"), "\x1b[1;3H"),
+            (2, format!("界{CURSOR_MARKER}x"), "\x1b[3G"),
+            (3, format!("abcdef{CURSOR_MARKER}"), "\x1b[7G"),
         ];
 
         for (width, line, expected_cursor) in cases {
             let size = Rc::new(Cell::new((width, 2)));
             let (terminal, _, _, _, shows, writes) = recording_terminal(size, capabilities);
             let mut tui = TUI::new(Box::new(terminal));
+            tui.set_show_hardware_cursor(true);
             tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(vec![line])))));
             tui.start();
 
@@ -3527,7 +4186,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_output_is_gated_and_cursor_marker_uses_display_cells() {
+    fn pi_synchronized_frame_precedes_ime_cursor_positioning() {
         let size = Rc::new(Cell::new((20, 8)));
         let capabilities = crate::capabilities::TerminalCapabilities::interactive(
             crate::capabilities::ColorDepth::Ansi16,
@@ -3539,36 +4198,18 @@ mod tests {
         tui.add_child(Box::new(MutableLines(lines)));
         tui.start();
         let output = writes.borrow().join("");
-        assert!(!output.contains("?2026"));
         assert!(!output.contains(CURSOR_MARKER));
-        assert!(output.contains("\x1b[1;3H"));
-        assert_eq!(shows.get(), 1, "cursor marker must reveal the block cursor");
+        let begin = output.find("\x1b[?2026h").expect("Pi frame begin");
+        let end = output.find("\x1b[?2026l").expect("Pi frame end");
+        let cursor = output.rfind("\x1b[3G").expect("IME cursor column");
+        assert!(begin < end && end < cursor, "{output:?}");
+        assert_eq!(shows.get(), 0, "Pi hides the hardware cursor by default");
         drop(output);
 
         tui.stop();
         assert_eq!(stops.get(), 1);
-        assert_eq!(shows.get(), 2, "stop restores the user's cursor");
-        assert!(writes.borrow().join("").contains("\x1b]8;;\x1b\\"));
-
-        let synchronized = capabilities.with_overrides(&crate::capabilities::CapabilityOverrides {
-            synchronized_output: Some(true),
-            ..crate::capabilities::CapabilityOverrides::default()
-        });
-        let size = Rc::new(Cell::new((20, 8)));
-        let (terminal, _, _, _, _, synchronized_writes) = recording_terminal(size, synchronized);
-        let mut synchronized_tui = TUI::new(Box::new(terminal));
-        synchronized_tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(vec![
-            format!("ab{CURSOR_MARKER}c"),
-        ])))));
-        synchronized_tui.start();
-        let output = synchronized_writes.borrow().join("");
-        let begin = output.find("\x1b[?2026h").unwrap();
-        let cursor = output.rfind("\x1b[1;3H").unwrap();
-        let end = output.rfind("\x1b[?2026l").unwrap();
-        assert!(
-            begin < cursor && cursor < end,
-            "cursor placement must be atomic: {output:?}"
-        );
+        assert_eq!(shows.get(), 1, "stop restores the user's cursor");
+        assert!(writes.borrow().join("").contains("\r\n"));
     }
 
     #[test]

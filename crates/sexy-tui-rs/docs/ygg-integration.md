@@ -82,13 +82,22 @@ fn capabilities(&self) -> sexy_tui_rs::TerminalCapabilities {
 ```
 
 Store that exact profile in the terminal, renderer, theme, glyph selection, and
-image policy. Ygg remains responsible for alternate-screen/raw-mode guards and
-panic restoration; the generic TUI now also performs idempotent reset/stop
-cleanup. Test both cleanup layers as idempotent.
+image policy. Ygg remains responsible for primary-screen raw-mode guards and
+panic restoration; the generic TUI also performs Pi-compatible stop cleanup.
+Test both cleanup layers as idempotent.
 
-Ygg's terminal write coalescing currently recognizes CSI 2026 frame markers.
-The renderer emits those only when `synchronized_output` is true, so the backend
-must also flush ordinary non-synchronized writes correctly.
+Ygg's terminal write coalescing recognizes Pi's CSI 2026 frame markers. The
+Pi-equivalent interactive renderer emits them for every frame even when a
+terminal merely ignores the private mode; the plain and explicit compatibility
+paths can still issue ordinary non-synchronized writes, so the backend must
+flush those correctly as well.
+
+Ygg must leave `TUI::set_inline_scrollback` disabled. The default interactive
+path is the pinned Pi renderer and consumes the component's complete logical
+frame; enabling the compatibility extension reintroduces the semantic-commit
+ledger and changes resize/offscreen-mutation semantics. Incremental Markdown and
+transcript caches remain useful for constructing that frame, but they are not a
+replacement terminal algorithm.
 
 ## Transcript mapping
 

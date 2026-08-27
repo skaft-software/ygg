@@ -716,7 +716,7 @@ fn validate_provider(provider: Option<&str>) -> anyhow::Result<&str> {
     }
 }
 
-/// Run device-code login outside raw/alternate-screen mode and return the
+/// Run device-code login outside raw primary-screen rendering and return the
 /// refreshed catalog. The caller decides whether it can install the catalog
 /// into a live Agent or must ask the user to restart from a model-less shell.
 async fn login_codex_catalog(
@@ -758,7 +758,7 @@ async fn login_codex_catalog(
     Ok(Some(catalog))
 }
 
-/// Run device-code login outside raw/alternate-screen mode, then make the new
+/// Run device-code login outside raw primary-screen rendering, then make the new
 /// models available immediately without restarting the current Agent.
 async fn login_codex(app: &mut App, shell: &mut InteractiveShell) -> anyhow::Result<()> {
     if let Some(catalog) = login_codex_catalog(shell).await? {

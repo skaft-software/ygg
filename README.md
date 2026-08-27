@@ -578,13 +578,13 @@ compact_model = "openrouter/anthropic/claude-haiku-4.5"
 
 ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats native terminal behavior as a feature, not an implementation detail.
 
-- Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets committed transcript rows flow into terminal history.
-- The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. Ordinary frames reuse the retained stable prefix and render only the mutable/new suffix.
-- Slash/path completions, panels, reports, and other temporary chrome repaint a bounded screen surface without entering native history. If streamed Markdown contracts across the committed seam, the renderer holds that ledger until it can reconcile stable rows exactly once.
+- Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets Pi-compatible CRLF appends flow into terminal history.
+- The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. It uses Pi's complete retained frame: first render writes every materialized row, ordinary updates repaint the exact first-to-last changed range, and changes above the old viewport clear saved lines before one authoritative full replay.
+- Slash/path completions, panels, reports, streamed Markdown, and other temporary chrome participate in that same complete-frame differential algorithm. They can no longer freeze a semantic commit ledger while unwritten transcript rows fall out of the physical viewport.
 - Generic extension state remains on demand, but `ygg-subagents` is the observed exception: while an owning run has workers, an owner-scoped live block is pinned immediately above the composer with worker phase, tool calls, input/output tokens, and spend. Its 250 ms host refresh is nonblocking and retains the last fenced snapshot on failure. `/subagents` remains the arrow-key list/inspector whose Enter action opens a scrollable read-only worker transcript; no extension contribution is allowed to replace the cumulative footer.
 - A terminal resize reflows the retained semantic transcript at the new width, resets terminal saved lines, and replays Ygg's retained transcript once.
 - `--mouse app` explicitly captures the mouse and uses a bounded semantic viewport. In that mode, scrolling above the tail stays anchored while streamed Markdown grows, reports new output, and lets PageDown return to live output.
-- Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
+- Pi retained-frame differential rendering, synchronized frames, and exact changed-range repainting.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
@@ -592,7 +592,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
-Default `auto`, explicit `terminal`, and `off` modes leave mouse events to the terminal and begin on the native-scrollback renderer. PageUp claims Ygg's bounded semantic viewport in every mode and keeps that viewport anchored while output streams; `--mouse app` selects the same viewport from startup and additionally captures wheel scrolling and drag selection. Native, uncaptured wheel history remains terminal-owned because portable terminal protocols do not expose its reading offset.
+Default `auto`, explicit `terminal`, and `off` modes leave mouse events to the terminal and begin on Pi's primary-screen retained-frame renderer. Terminal-owned resume eagerly materializes the complete active branch so native scrollback never depends on an impossible deferred prepend. PageUp claims Ygg's bounded semantic viewport in every mode and keeps that viewport anchored while output streams; `--mouse app` selects the same viewport from startup, retains tail-first lazy hydration, and additionally captures wheel scrolling and drag selection. Native, uncaptured wheel history remains terminal-owned because portable terminal protocols do not expose its reading offset.
 
 Raw protocol arguments and envelopes, unsanitized failure payloads, and
 extension-rendered tool payloads remain internal accountability evidence and are

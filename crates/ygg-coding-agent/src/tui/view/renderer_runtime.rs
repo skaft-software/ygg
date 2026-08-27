@@ -126,13 +126,19 @@ pub(super) fn render_loop(
     size: TerminalSize,
     rx: Receiver<RenderCommand>,
     application_viewport: bool,
+    clear_on_start: bool,
 ) {
     let mut tui = TUI::new(Box::new(terminal));
-    tui.set_inline_scrollback(true);
     tui.add_child(Box::new(ShellComponent::new(
         state.clone(),
         application_viewport,
     )));
+    if clear_on_start {
+        // A resumed renderer has no copy of Pi's physical cursor/viewport
+        // state. Force one authoritative clear-and-replay instead of treating
+        // the retained transcript as a fresh append and duplicating it.
+        tui.request_render_force(true);
+    }
     tui.start();
 
     let mut last_render: Option<Instant> = None;

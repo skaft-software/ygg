@@ -21,7 +21,7 @@ use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
 
 use crate::config::Config;
-use crate::hydrate::hydrate_transcript_tail;
+use crate::hydrate::{hydrate_transcript_at, hydrate_transcript_tail};
 #[cfg(test)]
 use crate::presentation::summarize_tool;
 use crate::presentation::{
@@ -1765,6 +1765,7 @@ impl InteractiveShell {
                     render_size,
                     render_rx,
                     capture_mouse,
+                    false,
                 )
             })?;
 
@@ -1794,7 +1795,6 @@ impl InteractiveShell {
             ..ShellState::default()
         });
         let mut tui = TUI::new(Box::new(TestTerminal { size: size.clone() }));
-        tui.set_inline_scrollback(true);
         tui.add_child(Box::new(ShellComponent::new(state.clone(), false)));
         tui.start();
         Self {
@@ -1819,7 +1819,7 @@ impl InteractiveShell {
         }
     }
 
-    /// Temporarily leave the alternate screen while preserving shell state.
+    /// Temporarily leave raw primary-screen rendering while preserving shell state.
     /// OAuth uses this so the hosted verification code and browser fallback are
     /// visible in an ordinary terminal.
     pub fn suspend(&mut self) {
@@ -1827,7 +1827,7 @@ impl InteractiveShell {
         force_restore();
     }
 
-    /// Re-enter the alternate screen after a suspended operation.
+    /// Re-enter the primary-screen renderer after a suspended operation.
     pub fn resume(&mut self) -> Result<()> {
         if self.render_thread.is_some() || self.tui.is_some() {
             return Ok(());
@@ -1848,6 +1848,7 @@ impl InteractiveShell {
                     render_size,
                     render_rx,
                     application_viewport,
+                    true,
                 )
             })?;
         self.render_tx = Some(render_tx);
@@ -4310,7 +4311,20 @@ impl InteractiveShell {
         let entry_budget = usize::from(self.state.borrow().size.1)
             .saturating_mul(4)
             .clamp(64, 256);
-        let (items, history_deferred) = hydrate_transcript_tail(session, entry_budget)?;
+        let (items, history_deferred) = if self.capture_mouse {
+            // Explicit application-owned mode can hydrate older rows when its
+            // semantic viewport reaches the bounded first-paint tail.
+            hydrate_transcript_tail(session, entry_budget)?
+        } else {
+            // Pi's primary-screen renderer writes the complete logical frame.
+            // Native terminal scrollback cannot prepend deferred rows later, so
+            // materialize the active branch before rendering it.
+            let items = match session.head() {
+                Some(head) => hydrate_transcript_at(session, &head)?,
+                None => Vec::new(),
+            };
+            (items, false)
+        };
         let deferred_snapshot = history_deferred.then(|| DeferredSessionHistory {
             path: session.path().to_owned(),
             head: session

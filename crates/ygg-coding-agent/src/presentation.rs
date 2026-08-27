@@ -1571,30 +1571,38 @@ mod tests {
             .unwrap();
         let update = tracker.apply_event_at(
             id,
-            &finished(FinishReason::Failed(AgentError::Ai(AiError::StreamFailure {
-                inner: Box::new(AiError::Provider(ygg_ai::ProviderError {
-                    code: Some("stream_error".into()),
-                    kind: Some("internal".into()),
-                    message: "mid-stream decode failure".into(),
-                    request_id: Some("req-599".into()),
-                })),
-                progress: ygg_ai::StreamProgress {
-                    provider_events: 412,
-                    decoded_events: 38,
-                    content_bytes: 18_204,
-                    buffered_bytes: 0,
-                    first_body_seen: true,
-                    elapsed_ms: 94_300,
+            &finished(FinishReason::Failed(AgentError::Ai(
+                AiError::StreamFailure {
+                    inner: Box::new(AiError::Provider(ygg_ai::ProviderError {
+                        code: Some("stream_error".into()),
+                        kind: Some("internal".into()),
+                        message: "mid-stream decode failure".into(),
+                        request_id: Some("req-599".into()),
+                    })),
+                    progress: ygg_ai::StreamProgress {
+                        provider_events: 412,
+                        decoded_events: 38,
+                        content_bytes: 18_204,
+                        buffered_bytes: 0,
+                        first_body_seen: true,
+                        elapsed_ms: 94_300,
+                    },
                 },
-            }))),
+            ))),
             now,
         );
         let Some(RunOutcome::Failed { reason, .. }) = update.outcome else {
             panic!("expected failed outcome");
         };
         // The inner classification and its detail must be preserved.
-        assert!(reason.contains("phase=response body (provider error)"), "{reason}");
-        assert!(reason.contains("detail=mid-stream decode failure"), "{reason}");
+        assert!(
+            reason.contains("phase=response body (provider error)"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("detail=mid-stream decode failure"),
+            "{reason}"
+        );
         // The progress suffix is the last field of the diagnostic, so it is
         // the one that must survive: if it is intact, nothing of value was
         // clipped on the way to the TUI.

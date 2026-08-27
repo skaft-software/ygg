@@ -249,9 +249,23 @@ pub trait Component {
 
 Rich components include `RichText`, `Markdown`, and
 `StreamingMarkdownWidget`. `Input` and `Editor` move/delete whole grapheme
-clusters and emit a trusted cursor marker that `TUI` maps to a hardware cell.
-`TUI` performs changed-tail updates, full resize reflow, conditional CSI 2026,
-and terminal cleanup on interruption/stop.
+clusters and emit Pi's trusted cursor marker, which `TUI` maps to the IME
+hardware-cursor position.
+
+Interactive rendering defaults to a direct Rust port of Pi's retained-frame
+algorithm at the pinned revision. It writes the complete first frame, tracks
+Pi's logical/hardware cursor and viewport state, updates the exact first-to-last
+changed range, lets pure CRLF appends enter native scrollback, and clears saved
+lines plus replays the complete frame on width/height changes or changes above
+the old viewport. Every interactive frame uses Pi's CSI 2026 delimiters. Kitty
+image row reservation, changed-range expansion, targeted deletion, and fallback
+replay follow the same control flow. `set_clear_on_shrink`,
+`set_show_hardware_cursor`, and `request_render_force` expose the corresponding
+Pi policies.
+
+`set_inline_scrollback(true)` retains the older Ygg-specific pinned-frame
+experiment as an explicit compatibility extension. It is not the Pi-equivalent
+core and Ygg's coding-agent frontend no longer enables it.
 
 Terminal event-loop ownership is intentionally backend-specific: construct a
 `Terminal`, feed input to `TUI::handle_input`, call `request_render` after state
@@ -268,9 +282,12 @@ cargo run --release --example render_bench --features benchmarks
 ```
 
 Goldens cover widths 20/40/60/80/120/160 and plain/ANSI16/ANSI256/truecolor
-capability profiles. Unit tests include malformed Markdown, arbitrary byte chunk
-boundaries, hostile terminal controls, CJK/combining/emoji layout, syntax-cache
-hits, stale live updates, and resize redraws.
+capability profiles. `tests/pi_tui_render.rs` contains named physical-terminal
+ports of the pinned Pi resize, shrink, changed-range, cursor, synchronized-frame,
+and Kitty-placement rendering cases. Additional tests cover malformed Markdown,
+arbitrary byte chunk boundaries, hostile terminal controls,
+CJK/combining/emoji layout, syntax-cache hits, stale live updates, and the
+explicit legacy inline extension.
 
 ## Scope and provenance
 

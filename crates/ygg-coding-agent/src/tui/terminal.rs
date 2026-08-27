@@ -423,6 +423,10 @@ fn normalize_line_endings(data: &str, last_was_cr: &mut bool) -> String {
 
 /// Restore the process terminal state. Repeated calls are harmless.
 pub fn force_restore() {
+    restore_terminal(true);
+}
+
+fn restore_terminal(advance_line: bool) {
     let raw_active = RAW_ACTIVE.swap(false, Ordering::SeqCst);
     let keyboard_enhancement_active = KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, Ordering::SeqCst);
     if !raw_active && !keyboard_enhancement_active {
@@ -440,17 +444,13 @@ pub fn force_restore() {
             event::DisableBracketedPaste,
             event::DisableMouseCapture,
             cursor::SetCursorStyle::DefaultUserShape,
-            cursor::Show,
-            cursor::MoveToNextLine(1),
-            cursor::MoveToColumn(0)
+            cursor::Show
         );
     } else {
-        let _ = execute!(
-            out,
-            cursor::Show,
-            cursor::MoveToNextLine(1),
-            cursor::MoveToColumn(0)
-        );
+        let _ = execute!(out, cursor::Show);
+    }
+    if advance_line {
+        let _ = execute!(out, cursor::MoveToNextLine(1), cursor::MoveToColumn(0));
     }
     let _ = out.flush();
 }
@@ -706,14 +706,16 @@ impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
 
     fn stop(&mut self) {
         self.flush_pending();
-        force_restore();
+        // Pi's TUI already moved to the line after the complete frame. Restore
+        // terminal modes without adding a second blank line.
+        restore_terminal(false);
     }
 
     fn write(&mut self, data: &str) {
-        // sexy-tui writes each rendered line and its `\n` separately. In raw
-        // mode LF alone advances vertically but does not reliably return to
-        // column zero, which corrupts differential frames. Normalize to CRLF
-        // at this terminal boundary while preserving existing CRLF sequences.
+        // Pi's core renderer emits CRLF explicitly. Plain output and the
+        // opt-in legacy inline extension can still write bare LF; raw mode
+        // disables output post-processing, so normalize those at the backend
+        // while preserving Pi's existing CRLF sequences.
         let normalized = normalize_line_endings(data, &mut self.last_was_cr);
         self.pending.extend_from_slice(normalized.as_bytes());
 

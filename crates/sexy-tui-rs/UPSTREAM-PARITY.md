@@ -41,11 +41,13 @@ Port order:
 | Stdin buffering | `stdin-buffer.test.ts` | In progress; sequence splitting, semantic paste, timeout polling and Kitty duplicate suppression ported |
 | Terminal | `terminal.test.ts` | In progress; negotiation parser/lifecycle sequences and Apple Return normalization ported |
 | Terminal colors | `terminal-colors.test.ts` | In progress; strict OSC 11 and color-scheme parsers ported; TUI query lifecycle remains |
-| TUI | overlay tests plus `tui-*.test.ts` | In progress; options drive layout and segment composition, and resize uses Pi's clear-and-rebuild contract; full frame/focus parity remains |
+| Pi retained-frame rendering | rendering cases in `tui-render.test.ts` and `tui-shrink.test.ts` (debug-log destination excluded) | Ported; first/full render, viewport/cursor bookkeeping, changed-range updates, append/shrink, resize/Termux, line resets, CSI 2026, and Kitty placement cleanup have named physical-terminal Rust equivalents |
+| TUI overlay/focus orchestration | overlay tests plus remaining `tui-*.test.ts` | In progress; segment composition primitives are ported, but the complete generic overlay/focus API remains |
 | Input/keybindings/select list | corresponding pinned tests | In progress; core editing, kill/yank, undo, layout and selection behavior ported; complete named test parity remains |
 | Editor/autocomplete/widgets | corresponding pinned tests | Not ported |
 | Image/Markdown | corresponding pinned tests | Not ported |
 
-The existing `rich_text`, capability and inline/native-scrollback tests cover
-additive Rust behavior; they do not count as evidence that a Pi core module is
-ported.
+The Pi retained-frame row above is backed by named ports in
+`tests/pi_tui_render.rs`. Existing rich-text, capability, and opt-in
+inline/native-scrollback tests remain additive Rust behavior and do not count as
+evidence for any other Pi module.

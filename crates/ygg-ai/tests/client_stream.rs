@@ -710,7 +710,7 @@ async fn test_client_stream_http_error_handling() {
 /// The mid-stream annotation is an implementation detail: tests assert on
 /// the failure that actually ended the stream, so the wrapper is peeled off
 /// before matching.
-fn stream_inner<'a>(error: &'a AiError) -> &'a AiError {
+fn stream_inner(error: &AiError) -> &AiError {
     match error {
         AiError::StreamFailure { inner, .. } => inner,
         other => other,

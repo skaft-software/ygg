@@ -15,6 +15,13 @@
 
 ### Changed
 
+- Replaced the default retained renderer with a control-flow-aligned Rust port of
+  Pi's pinned `TUI.doRender`: complete first/full replay, logical and hardware
+  cursor state, previous viewport tracking, exact changed ranges, CRLF append,
+  shrink and Termux handling, unconditional interactive CSI 2026 frames, and
+  Kitty image reservation/deletion now have named physical-terminal parity tests.
+- Kept the former semantic-commit/native-scrollback renderer only behind explicit
+  `set_inline_scrollback(true)` compatibility opt-in; Ygg no longer enables it.
 - Pointed package metadata at the Ygg source of truth and documented the exact
   workspace dependency pin, imported `0.2.0` baseline, and unsynchronized
   standalone release boundary.

@@ -6,8 +6,13 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
-- Removed dead public API surface across the workspace and removed the dead
-  Pi-port TUI surface in `sexy-tui-rs`.
+- Replaced Ygg's experimental semantic-commit/native-scrollback renderer with a
+  direct Rust port of Pi's retained-frame algorithm. First render, changed-range
+  updates, append/shrink, resize and offscreen-change replay, cursor bookkeeping,
+  CSI 2026 framing, and Kitty cleanup now follow the pinned Pi control flow;
+  terminal-owned resume eagerly materializes its complete active branch.
+- Removed dead public API surface across the workspace and obsolete unused TUI
+  compatibility adapters in `sexy-tui-rs`.
 - Flattened the internal tool trait stack: `Tool` became the object-safe
   `ErasedTool` form and `TypedTool` was removed.
 - Retired the `show_turn_cost` flag.

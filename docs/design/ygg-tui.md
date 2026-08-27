@@ -8,13 +8,18 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 ## Terminal guarantees
 
 - The interactive frontend renders on the primary screen. `auto`, `terminal`,
-  and `off` begin with a logical-height frame whose committed rows flow into
-  terminal-native scrollback. PageUp transfers rendering to the bounded,
-  application-owned semantic viewport for the rest of that shell. Explicit
-  `--mouse app` selects that viewport from startup.
+  and `off` use Pi's complete logical-frame renderer: the first frame writes
+  every materialized row, pure appends flow naturally into terminal scrollback,
+  and a width/height change or mutation above the previous viewport clears the
+  screen and saved lines before replaying the complete frame. PageUp transfers
+  rendering to the bounded, application-owned semantic viewport for the rest of
+  that shell. Explicit `--mouse app` selects that viewport from startup.
 - Ygg v0.6.1 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely.
-- Raw mode, bracketed paste, keyboard enhancements, synchronized output, and
-  mouse reporting are enabled only when supported and restored idempotently.
+- Raw mode, bracketed paste, keyboard enhancements, and mouse reporting are
+  enabled only when supported and restored idempotently. Matching Pi, every
+  interactive frame is bracketed by CSI 2026 synchronized-output markers;
+  terminals that do not implement the private mode ignore it, while Ygg's
+  backend still uses the markers to batch each frame into one flush.
 - Mouse reporting is disabled by default, preserving native drag selection and
   wheel scrolling. `--mouse app` enables capture for semantic wheel navigation
   and selection, but keyboard viewport ownership does not depend on capture.
@@ -35,29 +40,28 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 
 The transcript is semantic blocks rather than a terminal framebuffer. Wrapped
 layouts are cached per block and width, and streaming invalidates only changed
-blocks. The default terminal-owned renderer reuses the retained stable prefix;
-ordinary frames lay out and paint only the mutable or newly appended suffix. It
-separately tracks immutable physical rows and width-independent semantic commit
-cursors: stable rows enter history through bottom-row newlines, while finalized
-Ctrl+O-sensitive blocks cross only at complete semantic boundaries. Composer
-completions, panels, reports, and other temporary chrome paint as bounded
-screen-relative surfaces without advancing that history seam. If a streaming
-Markdown layout contracts behind rows already owned by the terminal, the
-renderer similarly freezes the ledger and repaints a temporary surface until
-the semantic viewport catches up, then stages newly stable rows exactly once.
-Ordinary streaming therefore avoids replaying a shifted grid while a terminal
-user reads scrollback. Chrome follows logical content height rather than
-occupying a fixed full-screen viewport, and committed rows naturally enter
-terminal history.
+blocks, but the root component presents the complete materialized logical frame
+to `sexy-tui-rs` on every interactive render. The terminal renderer follows Pi's
+`previousLines`, logical cursor, hardware cursor, maximum working height, and
+previous viewport-top state. It finds the first and last changed physical rows,
+repaints only that range when it remains addressable, and uses bottom-row CRLF
+appends to let new rows enter native scrollback.
 
-A text-only native resize accepts the terminal's saved-line reflow and repaints
-one visible grid without clearing scrollback. If a replacement transcript
-generation arrives in the same frame, old native history remains terminal-owned
-but the new semantic tape starts at row zero rather than inheriting that history
-seam. Temporary surfaces and Kitty placements retain a bounded destructive
-fallback because their physical state cannot be reconstructed portably. Deferred
-session history remains lazy and is loaded only when semantic navigation or copy
-crosses into it.
+A change above the old viewport cannot be repaired with cursor addressing.
+Matching Pi, that path emits `ED 2`, homes, clears saved lines with `ED 3`, and
+replays the complete materialized frame. Width changes do the same because line
+wrapping changed; height changes do so outside Termux. Disclosure contraction,
+theme repaint, overlays, and dynamic composer chrome therefore cannot leave an
+unwritten semantic gap in terminal history: they either take Pi's visible-row
+differential path or its authoritative full replay path. Kitty image placements
+participate in the same changed-range expansion, targeted deletion, reserved-row
+painting, and full-replay fallback as upstream Pi.
+
+Default terminal-owned resume materializes the complete active branch before it
+is rendered, because terminal scrollback cannot prepend a deferred prefix later.
+Explicit application-owned mode may retain the bounded tail-first hydration
+optimization: semantic PageUp, selection, or copy can materialize older rows in
+that mode without claiming they already exist in native history.
 Application-owned mode—selected at startup by `--mouse app` or claimed by
 PageUp—uses `follow_tail` plus a monotonic transcript commit ID, semantic copy
 text offset/affinity, visual fallback, and desired screen row to select one
@@ -67,12 +71,14 @@ prepends, and width/height changes. Scrolling above the tail keeps semantic rows
 fixed while one Markdown block continues to grow, increments the new-output
 state, and exposes the PageDown return-to-live affordance.
 
-Terminal-owned modes preserve native selection and long-lived scrollback, but
-Ygg cannot observe or freeze a reader's position inside that history. Semantic
-copy retains stable coordinates in either renderer; application-owned drag
-selection is available only while mouse capture is enabled. Resume materializes
-only a bounded tail for first input; older active-branch blocks are loaded when
-semantic navigation, select-all, or resize replay reaches beyond that tail.
+Terminal-owned modes preserve native selection and ordinary append scrollback,
+but Ygg cannot observe or freeze a reader's position. A Pi full replay replaces
+the application's saved-line presentation and therefore returns the terminal to
+the live frame. Semantic copy retains stable coordinates in either renderer;
+application-owned drag selection is available only while mouse capture is
+enabled. Terminal-owned resume eagerly loads the complete active branch;
+application-owned resume loads a bounded tail and materializes older blocks when
+semantic navigation or selection reaches them.
 
 Held-key repeats are accepted only for text editing and navigation. One-shot
 actions such as submit, panel confirmation, close, abort, and reasoning/summary expansion

@@ -127,7 +127,8 @@ Progressive enhancement rules:
 - no color: textual structure and attributes where usable;
 - unknown italics: underlined emphasis;
 - no hyperlink support: visible destination only;
-- no synchronized output: ordinary differential writes;
+- no synchronized output: Pi's CSI 2026 markers are ignored and the enclosed
+  differential bytes apply normally;
 - no cursor addressing: no live cursor placement;
 - plain: no escape sequence or animation at all.
 
@@ -146,8 +147,11 @@ OSC 8 is emitted only when both capability and validation succeed. Link targets
 remain visible even when OSC 8 is active, preventing label-only destination
 spoofing.
 
-The retained TUI closes SGR and OSC 8 on every row and on stop, conditionally
-closes synchronized output, restores the cursor, and delegates backend cleanup.
+The retained TUI closes SGR and OSC 8 on every non-image row. Its Pi-equivalent
+interactive renderer brackets every frame with CSI 2026, positions the hidden
+hardware cursor for IME, and moves below the logical frame on stop. Plain output
+remains escape-free; terminals without synchronized-output support ignore the
+private mode.
 
 ## Themes
 
