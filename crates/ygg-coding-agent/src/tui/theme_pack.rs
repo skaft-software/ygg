@@ -1,5 +1,7 @@
 #![allow(missing_docs)]
 
+/// Renderer fixtures for named-theme regression tests. This module is compiled
+/// only under `cfg(test)` and is not included in release binaries.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BundledTheme {
     pub id: &'static str,

@@ -54,8 +54,8 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 | **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
 | **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
 | **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, three bundled themes, narrow layouts, and plain-output fallbacks share one terminal model. |
-| **Customization is local data** | Prompts, skills, themes, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
+| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, narrow layouts, and plain-output fallbacks share one terminal model. |
+| **Customization is local data** | Prompts, skills, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
 
 ## Install
 
@@ -389,7 +389,7 @@ omitted rates stay zero:
 
 | Mode | Command | Best for |
 | --- | --- | --- |
-| Interactive TUI | `ygg` | Daily work: streaming, tools, themes, pickers, branching, steering, and native scrollback. |
+| Interactive TUI | `ygg` | Daily work: streaming, tools, pickers, branching, steering, and native scrollback. |
 | Chronological plain mode | `ygg --plain` | Basic terminals, logs, accessibility tooling, and environments where cursor control is undesirable. |
 | Response-only print mode | `ygg -p "prompt"` | Shell composition and scripts that want the final response on stdout. |
 
@@ -587,9 +587,8 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Stable-prefix differential rendering, synchronized atomic frames, and bounded repaint regions.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
-- Prompt colors tied to model labs in the default theme; named themes retain their own authored palettes.
-- Exact theme replacement: switching back to default does not retain attributes from the previous theme.
-- Three bundled themes cloning familiar coding-agent benches: `clawed` (Claude Code's terracotta and rounded frames), `pie` (pi's airy tomorrow-night cards), and `kodex` (codex's compact cyan monochrome).
+- Prompt colors are tied to the selected model in the compiled default theme.
+- The compiled default theme is the only theme exposed by the v0.6.1 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -606,27 +605,16 @@ and sent to the provider only when required to continue the tool protocol; live
 progress is neither persisted nor sent to the model.
 
 ```sh
-ygg --theme clawed
 ygg --color auto
 ygg --mouse app
 ```
 
-Custom themes are local TOML files and can control semantic roles, glyphs, density, responsive breakpoints, transcript surfaces, and terminal capability fallbacks. See [docs/themes.md](docs/themes.md).
+## Terminal theming
 
-## sexy-tui-rs themability
-
-The vendored [`sexy-tui-rs`](crates/sexy-tui-rs) renderer is themeable by design. These recordings show the same terminal experience across four different visual treatments:
-
-<table>
-  <tr>
-    <td width="50%"><img src="docs/assets/ygg-theme-demo-1.gif" alt="sexy-tui-rs theme demo 1" width="100%"></td>
-    <td width="50%"><img src="docs/assets/ygg-theme-demo-2.gif" alt="sexy-tui-rs theme demo 2" width="100%"></td>
-  </tr>
-  <tr>
-    <td width="50%"><img src="docs/assets/ygg-theme-demo-3.gif" alt="sexy-tui-rs theme demo 3" width="100%"></td>
-    <td width="50%"><img src="docs/assets/ygg-theme-demo-4.gif" alt="sexy-tui-rs theme demo 4" width="100%"></td>
-  </tr>
-</table>
+Theme selection is disabled in v0.6.1. The TUI and graphical Serve frontend expose
+only Ygg's compiled default theme; legacy theme options are ignored or fall back
+to that theme. The theme schema is retained for a future release in
+[docs/themes.md](docs/themes.md).
 
 ## Interactive command reference
 
@@ -643,9 +631,8 @@ Type `/` in the composer to open live command discovery.
 | `/model [id]` | Open the model picker or select a model. |
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
 | `/compact` | Compact at the next safe boundary. |
-| `/theme [name\|list\|reload]` | Select, inspect, or reload themes. |
 | `/verbose [on\|off]` | Expand or collapse retained reasoning and bounded tool-output projections. |
-| `/reload` | Reload instructions, themes, prompts, skills, and enabled extensions. |
+| `/reload` | Reload instructions, prompts, skills, and enabled extensions. |
 | `/login [provider]` | Sign in to a subscription provider. |
 | `/logout [provider]` | Remove its stored credential. |
 | `/status` | Show active model, context, capabilities, and diagnostics. |
@@ -693,7 +680,6 @@ model = "custom/Qwen3 Coder Next"
 reasoning = "high"
 system_prompt = "You are a careful and concise reviewer."
 cache_retention = "short"
-theme = "default"
 color = "auto"
 # auto/terminal/off: native selection/history; app: semantic viewport
 mouse = "auto"
@@ -724,7 +710,7 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 For renderer diagnostics, `YGG_TUI_WRITE_LOG=/path/to/ansi.log` captures the
 raw ANSI stream written by the interactive TUI. An existing directory creates a
@@ -751,17 +737,16 @@ warning. New configuration should use `reasoning` alone.
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
 | Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
 | Pi compatibility | `pi install <PATH>`, `pi list` |
-| Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
+| Customization | `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
 Run `ygg --help`, `ygg sessions --help`, `ygg migrate pi --help`, and `ygg pi --help` for the authoritative generated reference.
 
 ## Filesystem-native customization
 
-Themes, prompts, skills, and extensions use one deterministic resolver:
+Prompts, skills, and extensions use one deterministic resolver:
 
 | Kind | Global | Trusted project | Explicit source |
 | --- | --- | --- | --- |
-| Themes | `~/.ygg/themes/*.toml` | `.ygg/themes/*.toml` | `--theme-dir` |
 | Prompts | `~/.ygg/prompts/*.{md,toml}` | `.ygg/prompts/*.{md,toml}` | `--prompt-template` |
 | Skills | `~/.ygg/skills/*/SKILL.md` | `.ygg/skills/*/SKILL.md` | `--skill-dir` |
 | Extensions | `~/.ygg/extensions/*/extension.toml` | `.ygg/extensions/*/extension.toml` | `--extension-dir` |
@@ -853,7 +838,7 @@ flowchart LR
     Bus --> Extensions["MCP · browser · web · LSP · memory · agents · caffeinate"]
     Agent --> Tools["Bounded host tools"]
     Agent --> Sessions["Append-only branchable sessions"]
-    Product --> Resources["Prompts · skills · themes · instructions"]
+    Product --> Resources["Prompts · skills · instructions"]
 ```
 
 ### `ygg-ai`
@@ -873,8 +858,8 @@ installed.
 ### `ygg-coding-agent`
 
 The product crate owns configuration, provider discovery, credentials, prompts,
-resources, extensions, session commands, hydration, terminal presentation,
-themes, and the three user-facing modes. It creates extension-owned child
+resources, extensions, session commands, hydration, terminal presentation, and
+three user-facing modes. It creates extension-owned child
 sessions at every effort when `ygg-subagents` is active, and permits Ultra only
 when live model metadata and that owner-bound observation service form complete
 Ultra semantics.
@@ -933,7 +918,7 @@ crates/ygg-coding-agent/  CLI, provider discovery, resources, and TUI
 crates/sexy-tui-rs/       vendored terminal rendering library
 sdk/python/              dependency-free Python extension SDK
 docs/                     public product and architecture contracts
-examples/                 prompts, skills, themes, and extensions
+examples/                 prompts, skills, and extensions
 fuzz/                     session-record fuzz target
 deploy/                   non-root container build
 scripts/                  pinned installer
@@ -952,12 +937,12 @@ third_party/              upstream license texts
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | Theme schema, roles, glyphs, responsive layout, and fallback behavior. |
+| [Themes](docs/themes.md) | v0.6.1 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |
 | [Product contract](docs/design/ygg-coding-agent.md) | Bootstrap, modes, configuration, resources, and UX. |
-| [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and themes. |
+| [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and the compiled default presentation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |
 
 ## Built by Achu

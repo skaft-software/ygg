@@ -16,6 +16,7 @@ const MAX_RESOURCE_ENTRIES_PER_ROOT: usize = 4096;
 /// A filesystem resource family understood by Ygg.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceKind {
+    #[allow(dead_code)]
     Theme,
     Prompt,
     Extension,
@@ -118,6 +119,7 @@ impl ResourceSnapshot {
         &self.diagnostics
     }
 
+    #[allow(dead_code)]
     pub fn get(&self, name: &str) -> Option<&ResolvedResource> {
         self.resources.iter().find(|resource| resource.name == name)
     }

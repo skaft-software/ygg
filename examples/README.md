@@ -14,8 +14,6 @@ extension into a project.
   resources.
 - [`skills/pi-migration/`](skills/pi-migration/) — low-token cleanup around the
   zero-token Pi inventory.
-- [Bundled theme pack](../crates/ygg-coding-agent/themes/) — three complete TOML
-  themes that can also be copied and edited as project themes.
 - [`extensions/hello-world/`](extensions/hello-world/) — a minimal executable
   JSON-RPC extension.
 - [`extensions/caffeinate/`](extensions/caffeinate/) — a macOS sleep inhibitor

@@ -142,7 +142,6 @@ fn emulated_shell_with_sync(
             size,
             render_tx: None,
             render_thread: None,
-            theme_config: None,
             capture_mouse: false,
         },
         bytes,
@@ -387,7 +386,7 @@ fn open_select_panel(shell: &mut InteractiveShell, items: &[&str]) {
         descriptions: vec![None; items.len()],
         selected: 0,
         filter: String::new(),
-        action: PanelAction::SelectTheme(vec![]),
+        action: PanelAction::SelectModel(vec![]),
     });
 }
 

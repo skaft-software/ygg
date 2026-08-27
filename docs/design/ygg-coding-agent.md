@@ -214,12 +214,14 @@ into the composed prompt.
 Commands run immediately when safe or queue to the next idle boundary when they
 need Agent/session ownership.
 
+Ygg v0.6.1 uses the compiled default theme only. Theme selection and filesystem
+theme discovery are disabled.
+
 - `/model [id]` — pick or select a model.
 - `/thinking [level]` — select a capability-gated reasoning level.
-- `/theme [name]` — change the current theme.
 - `/verbose [on|off]` — expand/collapse every tool panel.
 - `/compact` — force a compaction attempt.
-- `/reload` — reload AGENTS instructions, themes, prompts, and skills.
+- `/reload` — reload AGENTS instructions, prompts, skills, and extensions.
 - `/new`, `/resume [id]` — switch persistent sessions; the resume picker supports
   fuzzy/phrase/regex filtering, named-only filtering, recent/name/message-count
   sorting, current/all-workspace scopes, rename, and recoverable trash.

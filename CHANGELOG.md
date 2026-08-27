@@ -11,6 +11,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Flattened the internal tool trait stack: `Tool` became the object-safe
   `ErasedTool` form and `TypedTool` was removed.
 - Retired the `show_turn_cost` flag.
+- Disabled `/theme` and theme-file discovery; v0.6.1 exposes only the compiled
+  default theme in terminal and graphical Serve surfaces.
 - Hoisted protocol helpers that were duplicated across crates into `ygg-ai`.
 - Fixed concurrency bottlenecks so `Session::persist` and `DelegationManager`
   journal writes no longer block under load.

@@ -40,13 +40,11 @@ use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
     message_picker, optional_model_picker, read_only_document, read_only_document_live_styled,
-    session_picker, subagent_picker, theme_picker, thinking_picker, tool_input_picker,
-    SubagentPickerSnapshot,
+    session_picker, subagent_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
 };
 use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
-    available_themes, background_from_terminal_rgb, load_named_theme_for_background, load_theme,
-    load_theme_for_background, TerminalBackground,
+    background_from_terminal_rgb, load_theme, load_theme_for_background, TerminalBackground,
 };
 use crate::tui::view::InteractiveShell;
 
@@ -893,70 +891,6 @@ async fn logout_custom(
     Ok(app)
 }
 
-async fn apply_theme(
-    shell: &mut InteractiveShell,
-    input: &mut EventStream,
-    name: &str,
-) -> anyhow::Result<()> {
-    let config = shell
-        .theme_config()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("theme configuration is unavailable"))?;
-    let theme_name = name.to_owned();
-    let background = shell.theme().background();
-    let theme = run_blocking_lifecycle(shell, input, "loading theme…", move || {
-        load_named_theme_for_background(&theme_name, &config, background)
-    })
-    .await?;
-    shell.set_theme(theme);
-    shell.notice(format!("theme changed to {name}"));
-    Ok(())
-}
-
-async fn theme_choices(
-    shell: &mut InteractiveShell,
-    input: &mut EventStream,
-) -> anyhow::Result<Vec<String>> {
-    let config = shell
-        .theme_config()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("theme configuration is unavailable"))?;
-    run_blocking_lifecycle(shell, input, "discovering themes…", move || {
-        Ok(available_themes(&config))
-    })
-    .await
-}
-
-async fn show_theme_choices(
-    shell: &mut InteractiveShell,
-    input: &mut EventStream,
-) -> anyhow::Result<()> {
-    let names = theme_choices(shell, input).await?;
-    if names.is_empty() {
-        shell.notice("no themes found under .ygg/themes or ~/.ygg/themes");
-    } else {
-        shell.show_overlay_text(format!(
-            "Available themes:\n{}\n\nUse /theme <name> to switch.",
-            names.join("\n")
-        ));
-    }
-    Ok(())
-}
-
-async fn reload_active_theme(
-    shell: &mut InteractiveShell,
-    input: &mut EventStream,
-) -> anyhow::Result<()> {
-    let active_theme = shell.theme();
-    let theme = run_blocking_lifecycle(shell, input, "reloading theme…", move || {
-        active_theme.reload()
-    })
-    .await?;
-    shell.set_theme(theme);
-    shell.notice("theme reloaded");
-    Ok(())
-}
-
 fn handle_active_command(
     shell: &mut InteractiveShell,
     command: Command,
@@ -975,7 +909,6 @@ fn handle_active_command(
             shell.notice("cost and cache reports are available at the next idle boundary")
         }
         Command::Update => shell.notice("update checks are available at the next idle boundary"),
-        Command::Theme(_) => shell.notice("theme commands are available at the next idle boundary"),
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
@@ -1786,7 +1719,7 @@ async fn reload_resources(
     })
     .await?;
     shell.set_theme(theme);
-    shell.set_theme_config(app.config.clone());
+    shell.set_runtime_config(app.config.clone());
     shell.hydrate(app.agent.session())?;
     update_status(shell, &app);
     Ok(app)
@@ -3137,7 +3070,7 @@ async fn apply_pending_actions(
             }
             PendingIdleAction::ReloadResources => {
                 app = reload_resources(app, shell, input).await?;
-                shell.notice("instructions, themes, prompts, skills, and extensions reloaded");
+                shell.notice("instructions, prompts, skills, and extensions reloaded");
             }
             PendingIdleAction::ShowTree => {
                 shell.show_overlay_text(session_tree_text(app.agent.session()));
@@ -3684,33 +3617,6 @@ async fn run_idle_command(
                 shell.notice("thinking changed");
             }
         }
-        Command::Theme(Some(name)) if name == "list" => {
-            if let Err(error) = show_theme_choices(shell, input).await {
-                shell.error(error.to_string());
-            }
-        }
-        Command::Theme(Some(name)) if name == "reload" => {
-            if let Err(error) = reload_active_theme(shell, input).await {
-                shell.error(format!("unable to reload theme: {error}"));
-            }
-        }
-        Command::Theme(Some(name)) => {
-            if let Err(error) = apply_theme(shell, input, &name).await {
-                shell.error(error.to_string());
-            }
-        }
-        Command::Theme(None) => match theme_choices(shell, input).await {
-            Ok(names) => {
-                if let Some(name) = theme_picker(shell, input, &names).await? {
-                    if let Err(error) = apply_theme(shell, input, &name).await {
-                        shell.error(error.to_string());
-                    }
-                }
-            }
-            Err(error) => {
-                shell.error(error.to_string());
-            }
-        },
         Command::Verbose(value) => {
             let enabled = value.unwrap_or(!shell.verbose_tools());
             shell.set_verbose_tools(enabled);
@@ -3750,7 +3656,7 @@ async fn run_idle_command(
         Command::Reload => {
             app = reload_resources(app, shell, input).await?;
             request_extension_ui(shell, &mut app);
-            shell.notice("instructions, themes, prompts, skills, and extensions reloaded");
+            shell.notice("instructions, prompts, skills, and extensions reloaded");
         }
         Command::Tree => shell.show_overlay_text(session_tree_text(app.agent.session())),
         Command::Checkout(id) => {
@@ -4211,7 +4117,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let size = Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
     let mut shell =
         InteractiveShell::enter_with_mouse(theme, size, boot.config.mouse.application_owned())?;
-    shell.set_theme_config(boot.config.clone());
+    shell.set_runtime_config(boot.config.clone());
     apply_detected_terminal_background(&mut shell, &boot.config);
     let mut input = EventStream::new();
     // The shell owns a dedicated renderer thread, but sexy-tui still renders
@@ -5233,27 +5139,6 @@ mod tests {
             queue.pop_front(),
             Some(PendingIdleAction::ResumeSession(Some("id".into())))
         );
-    }
-
-    #[test]
-    fn active_theme_commands_wait_for_the_idle_boundary() {
-        for command in [
-            Command::Theme(None),
-            Command::Theme(Some("list".into())),
-            Command::Theme(Some("reload".into())),
-            Command::Theme(Some("default".into())),
-        ] {
-            let mut shell = InteractiveShell::test_shell();
-            let mut queue = VecDeque::new();
-            let mut quit_requested = false;
-            handle_active_command(&mut shell, command, &mut queue, &mut quit_requested);
-
-            assert!(shell
-                .debug_snapshot()
-                .contains("theme commands are available at the next idle boundary"));
-            assert!(queue.is_empty());
-            assert!(!quit_requested);
-        }
     }
 
     #[test]

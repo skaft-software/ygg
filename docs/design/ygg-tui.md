@@ -12,11 +12,7 @@ The interactive frontend owns terminal setup/restoration and presentation only;
   terminal-native scrollback. PageUp transfers rendering to the bounded,
   application-owned semantic viewport for the rest of that shell. Explicit
   `--mouse app` selects that viewport from startup.
-- A theme swap clears and repaints every cell in the visible viewport.
-  Application-owned history is semantic and therefore adopts the current theme
-  whenever it becomes visible. Rows already committed by a terminal-owned mode
-  cannot be rewritten through portable terminal APIs and retain their original
-  styling; Ygg preserves that history rather than clearing it implicitly.
+- Ygg v0.6.1 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely.
 - Raw mode, bracketed paste, keyboard enhancements, synchronized output, and
   mouse reporting are enabled only when supported and restored idempotently.
 - Mouse reporting is disabled by default, preserving native drag selection and
@@ -128,9 +124,7 @@ mark only their first content row; wrapped and explicit continuation rows use a
 blank indent instead of a vertical rail. Historical prompts with a persisted
 model-color highlight include one painted internal padding row above and below
 their content; those decorative rows stay outside semantic copy.
-Fenced Markdown code is borderless and uses `#202630` on known dark profiles or
-`#f1f5f4` on known light profiles, falling back to an unpainted surface when the
-background is unknown. Named and custom themes keep their authored chrome.
+Fenced Markdown code is borderless and uses the compiled default's terminal-adaptive shading. The unknown-profile fallback remains unpainted.
 
 ## Reasoning presentation
 
@@ -198,8 +192,8 @@ provenance metadata before the ordinary idle-boundary session rebuild.
 It marks every ancestor on the selected branch with `+`, the exact durable head
 with `*`, and keeps abandoned forks visible. `/checkout <entry-id>` changes the
 durable head and hydrates the selected branch. `/reload` recomposes AGENTS
-instructions, reloads theme files, rescans skills, and rebuilds the Agent only
-at an idle boundary.
+instructions, rescans skills and prompts, and rebuilds the Agent only at an idle
+boundary.
 
 Model selection is available through a picker or direct `/model <id>`. Thinking
 choices include only the active model's advertised `min_effort..=max_effort`

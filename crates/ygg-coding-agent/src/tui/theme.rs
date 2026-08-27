@@ -13,8 +13,10 @@ use sexy_tui_rs::{
 use ygg_ai::{Model, ModelSpec};
 
 use crate::config::{ColorMode, Config};
+#[cfg(test)]
 use crate::resource_resolver::{ResourceKind, ResourceResolver};
 use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
+#[cfg(test)]
 use crate::tui::theme_pack;
 use crate::tui::theme_schema::{self, ParsedTheme, RoleStyleSpec, ThemeSurface};
 
@@ -24,12 +26,13 @@ pub use crate::tui::theme_schema::{
     ThemeSurfaceAlign, ThemeSurfaceChrome, ThemeSurfaceHeading, ThemeSurfaceWidth, MAX_THEME_BYTES,
 };
 
-/// Name accepted by `/theme` for the compiled-in Ygg theme.
+/// Stable name for Ygg's compiled-in default theme and legacy selectors.
 pub const DEFAULT_THEME_NAME: &str = "default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ThemeSource {
     CompiledDefault,
+    #[allow(dead_code)]
     Bundled(&'static str),
     File(PathBuf),
 }
@@ -522,13 +525,22 @@ impl YggTheme {
     /// Reload the active file or bundled theme while preserving this terminal
     /// capability/background profile. Runtime model styling is reapplied by
     /// the shell when it swaps the returned theme in.
+    #[allow(dead_code)]
     pub fn reload(&self) -> anyhow::Result<Self> {
         match &self.source {
             ThemeSource::CompiledDefault => {
                 Ok(default_theme_for(self.background, self.capabilities))
             }
             ThemeSource::Bundled(name) => {
-                load_bundled_theme_for(name, self.capabilities, self.background)
+                #[cfg(test)]
+                {
+                    load_bundled_theme_for(name, self.capabilities, self.background)
+                }
+                #[cfg(not(test))]
+                {
+                    let _ = name;
+                    anyhow::bail!("bundled themes are unavailable in this release")
+                }
             }
             ThemeSource::File(path) => {
                 load_theme_path_for(path, self.capabilities, self.background)
@@ -1489,6 +1501,7 @@ fn project_theme_dir(config: &Config) -> PathBuf {
     config.workspace.join(".ygg").join("themes")
 }
 
+#[cfg(test)]
 fn theme_file_name(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty()
@@ -1706,6 +1719,7 @@ fn load_theme_path_for(
     )
 }
 
+#[cfg(test)]
 fn load_bundled_theme_for(
     name: &str,
     capabilities: TerminalCapabilities,
@@ -1772,6 +1786,7 @@ pub fn load_resolved_theme(
     )
 }
 
+#[cfg(test)]
 #[allow(dead_code)]
 pub fn bundled_theme_summaries() -> Vec<ThemeSummary> {
     theme_pack::THEMES
@@ -1803,16 +1818,7 @@ pub(crate) fn load_named_theme_for_background(
     if name.trim().eq_ignore_ascii_case(DEFAULT_THEME_NAME) {
         return Ok(default_theme_for(background, capabilities));
     }
-    let file_name =
-        theme_file_name(name).ok_or_else(|| anyhow::anyhow!("invalid theme name {name:?}"))?;
-    let resource_name = file_name.strip_suffix(".toml").unwrap_or(&file_name);
-    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
-    let snapshot = resolver.discover(ResourceKind::Theme, &config.theme_paths);
-    if let Some(resource) = snapshot.get(resource_name) {
-        let source = resolver.read_text(resource)?;
-        return load_resolved_theme_for(&resource.path, &source, capabilities, background);
-    }
-    load_bundled_theme_for(name, capabilities, background)
+    anyhow::bail!("only the default theme is available")
 }
 
 /// Load a named theme or return an error without altering the current theme.
@@ -1865,21 +1871,10 @@ fn available_themes_from_dirs(global: &Path, project: &Path) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// List the built-in default plus global and project theme names.
-pub fn available_themes(config: &Config) -> Vec<String> {
-    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
-    let snapshot = resolver.discover(ResourceKind::Theme, &config.theme_paths);
-    let mut names = snapshot
-        .resources()
-        .iter()
-        .map(|resource| resource.name.clone())
-        .collect::<Vec<_>>();
-    names.extend(theme_pack::THEMES.iter().map(|theme| theme.id.to_owned()));
-    names.sort();
-    names.dedup();
-    names.retain(|name| !name.eq_ignore_ascii_case(DEFAULT_THEME_NAME));
-    names.insert(0, DEFAULT_THEME_NAME.to_owned());
-    names
+/// Return the single theme exposed by the v0.6.1 runtime.
+#[allow(dead_code)]
+pub fn available_themes(_config: &Config) -> Vec<String> {
+    vec![DEFAULT_THEME_NAME.to_owned()]
 }
 
 fn contains_any(text: &str, markers: &[&str]) -> bool {
@@ -2118,12 +2113,35 @@ mod tests {
     }
 
     #[test]
-    fn builtin_default_is_always_a_theme_choice() {
+    fn only_compiled_default_is_exposed() {
         let directory = tempfile::tempdir().unwrap();
         let config = config(directory.path().to_owned());
-        let names = available_themes(&config);
-        assert_eq!(names.first().map(String::as_str), Some(DEFAULT_THEME_NAME));
+        assert_eq!(
+            available_themes(&config),
+            vec![DEFAULT_THEME_NAME.to_owned()]
+        );
         assert!(load_named_theme(DEFAULT_THEME_NAME, &config).is_ok());
+        for name in ["clawed", "kodex", "pie", "custom"] {
+            assert!(
+                load_named_theme(name, &config).is_err(),
+                "unexpected theme availability for {name}"
+            );
+        }
+
+        let custom_dir = directory.path().join("themes");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+        std::fs::write(custom_dir.join("custom.toml"), "accent = 'red'").unwrap();
+        let mut configured = config;
+        configured.theme_paths.push(custom_dir);
+        configured.theme = Some("clawed".to_owned());
+        assert_eq!(
+            available_themes(&configured),
+            vec![DEFAULT_THEME_NAME.to_owned()]
+        );
+        assert!(
+            load_theme_for_background(&configured, TerminalBackground::Unknown)
+                .is_compiled_default()
+        );
     }
 
     #[test]

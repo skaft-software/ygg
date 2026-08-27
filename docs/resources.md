@@ -1,14 +1,14 @@
 # Custom resource discovery
 
-Themes, prompts, skills, and executable extensions share one filesystem
+Prompts, skills, and executable extensions share one filesystem
 resolver. Resource-specific parsers own their schemas; the resolver owns the
-cross-cutting local safety and precedence contract.
+cross-cutting local safety and precedence contract. Theme customization is
+disabled in v0.6.1; the terminal uses its compiled default.
 
 ## Locations and precedence
 
 | Kind | Global | Trusted project | Explicit option |
 | --- | --- | --- | --- |
-| Theme | `~/.ygg/themes/*.toml` | `.ygg/themes/*.toml` | `--theme-dir` |
 | Prompt | `~/.ygg/prompts/*.{md,toml}` | `.ygg/prompts/*.{md,toml}` | `--prompt-template <file-or-dir>` |
 | Skill | `~/.ygg/skills/*/SKILL.md` plus managed `~/.ygg/extensions/*/skills/*/SKILL.md` | `.ygg/skills/*/SKILL.md` | `--skill-dir` |
 | Extension | `~/.ygg/extensions/*/extension.toml` | `.ygg/extensions/*/extension.toml` | `--extension-dir` |
@@ -47,7 +47,6 @@ opens and fixed byte limits:
 
 | Kind | Maximum parser input |
 | --- | ---: |
-| Theme | 256 KiB |
 | Prompt | 512 KiB |
 | Skill entrypoint | 256 KiB |
 | Extension manifest selected by the product resource resolver | 256 KiB |
@@ -68,7 +67,6 @@ Each discovery pass produces an immutable generation snapshot. Consumers build
 a complete replacement from the new snapshot and swap only after validation,
 so an in-flight prompt never observes half of a reload.
 
-- `/theme reload` reloads the selected theme safely.
 - `/skills reload` refreshes the shared prompt/skill resource boundary.
 - `/extensions reload` handshakes replacement processes under the default
   full-access policy when the independent process gate permits startup; safe mode

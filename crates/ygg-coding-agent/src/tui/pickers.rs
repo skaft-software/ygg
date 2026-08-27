@@ -867,30 +867,6 @@ where
     }
 }
 
-/// Ask the user to select an installed theme name.
-pub async fn theme_picker(
-    shell: &mut InteractiveShell,
-    input: &mut EventStream,
-    names: &[String],
-) -> anyhow::Result<Option<String>> {
-    let items: Vec<String> = names.to_vec();
-    let action_names = names.to_vec();
-    let Some(index) = pick_list(
-        shell,
-        input,
-        "Select theme",
-        items,
-        vec![None; names.len()],
-        0,
-        PanelAction::SelectTheme(action_names),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(names[index].clone()))
-}
-
 /// Ask the user to select a capability-supported thinking level.
 pub async fn thinking_picker(
     shell: &mut InteractiveShell,
@@ -1141,7 +1117,7 @@ mod tests {
             vec!["one".into()],
             vec![None],
             0,
-            PanelAction::SelectTheme(vec!["one".into()]),
+            PanelAction::SelectModel(vec![ModelId("one".into())]),
         )
         .await
         .unwrap();

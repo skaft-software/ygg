@@ -127,11 +127,11 @@ pub struct Cli {
     /// Workspace root override.
     #[arg(long)]
     pub workspace: Option<PathBuf>,
-    /// TUI theme name.
-    #[arg(long)]
+    /// Legacy TUI theme name; v0.6.1 always uses the compiled default.
+    #[arg(long, value_name = "NAME", hide = true)]
     pub theme: Option<String>,
-    /// Additional directory paths to scan for themes (repeatable).
-    #[arg(long = "theme-dir", value_name = "DIR")]
+    /// Legacy theme directory option; v0.6.1 does not load custom themes.
+    #[arg(long = "theme-dir", value_name = "DIR", hide = true)]
     pub theme_dirs: Vec<PathBuf>,
     /// Colour output policy: auto, always, or never.
     #[arg(long, value_name = "WHEN")]

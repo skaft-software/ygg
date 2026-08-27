@@ -10820,10 +10820,7 @@ fn thinking_label(level: crate::config::ThinkingLevel) -> String {
 fn graphical_themes(config: &Config) -> anyhow::Result<(Vec<ThemeOption>, ThemeId)> {
     const MAX_GRAPHICAL_THEMES: usize = 64;
 
-    let selected_name = match config.theme.as_deref() {
-        Some(name) if crate::tui::theme::load_named_theme(name, config).is_ok() => name.to_owned(),
-        _ => crate::tui::theme::DEFAULT_THEME_NAME.to_owned(),
-    };
+    let selected_name = crate::tui::theme::DEFAULT_THEME_NAME.to_owned();
     let mut names = crate::tui::theme::available_themes(config);
     names.retain(|name| name != &selected_name);
     names.insert(0, selected_name.clone());

@@ -421,7 +421,7 @@ impl MessagePicker {
 /// Two horizontal rules delimit it; the interior renders form content.
 #[derive(Clone, Debug)]
 pub(crate) enum Panel {
-    /// Select-list panel (model picker, session picker, thinking picker, theme picker).
+    /// Select-list panel (model picker, session picker, or thinking picker).
     SelectList {
         title: String,
         items: Vec<String>,
@@ -459,8 +459,6 @@ pub(crate) enum PanelAction {
     SelectThinking(Vec<crate::config::ThinkingLevel>),
     /// Select a reasoning execution mode.
     SelectReasoningMode(Vec<ygg_ai::ReasoningMode>),
-    /// Select a theme name.
-    SelectTheme(Vec<String>),
     /// Select an installed executable-extension bundle.
     SelectExtension(Vec<String>),
     /// Select one subagent presentation node.
@@ -1756,7 +1754,6 @@ pub struct InteractiveShell {
     size: TerminalSize,
     render_tx: Option<SyncSender<RenderCommand>>,
     render_thread: Option<JoinHandle<()>>,
-    theme_config: Option<Config>,
     capture_mouse: bool,
 }
 
@@ -1802,7 +1799,6 @@ impl InteractiveShell {
             size,
             render_tx: Some(render_tx),
             render_thread: Some(render_thread),
-            theme_config: None,
             capture_mouse,
         })
     }
@@ -1832,7 +1828,6 @@ impl InteractiveShell {
             size,
             render_tx: None,
             render_thread: None,
-            theme_config: None,
             capture_mouse: false,
         }
     }
@@ -3027,16 +3022,10 @@ impl InteractiveShell {
         self.size.lock().expect("terminal size mutex poisoned").0
     }
 
-    pub fn set_theme_config(&mut self, config: Config) {
+    pub fn set_runtime_config(&mut self, config: Config) {
         let mut state = self.state.borrow_mut();
         state.safe_mode = config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost;
         state.max_session_cost_microdollars = config.max_cost_microdollars;
-        drop(state);
-        self.theme_config = Some(config);
-    }
-
-    pub fn theme_config(&self) -> Option<&Config> {
-        self.theme_config.as_ref()
     }
 
     pub fn pending_is_empty(&self) -> bool {

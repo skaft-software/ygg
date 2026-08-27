@@ -7,7 +7,7 @@ workspace while the contract is experimental.
 The package contains:
 
 - bounded host, project, session, command, item, event, and replay DTOs;
-- host-authoritative model, authority, capability, and safe theme catalogs;
+- host-authoritative model, authority, capability, and the compiled default theme catalog;
 - stable session cursors and exact durable entry identity;
 - a deterministic session snapshot reducer;
 - bounded replay plus device-scoped command idempotency;
