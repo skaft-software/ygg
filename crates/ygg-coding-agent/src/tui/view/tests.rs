@@ -7940,7 +7940,7 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
 }
 
 #[test]
-fn ctrl_o_globally_expands_and_collapses_subagent_activity() {
+fn subagent_activity_renders_complete_roster_in_both_disclosure_modes() {
     let mut shell = InteractiveShell::test_shell();
     let child = |id: &str, task: &str, state: &str| ygg_agent::DelegationTelemetryChild {
         child_id: id.into(),
@@ -7982,6 +7982,11 @@ fn ctrl_o_globally_expands_and_collapses_subagent_activity() {
                 child("agent-1", "Read release history", "running"),
                 child("agent-2", "Audit release surface", "running"),
                 child("agent-3", "Scan changelog", "completed"),
+                child("agent-4", "Inspect tests", "running"),
+                child("agent-5", "Check package map", "running"),
+                child("agent-6", "Review docs", "completed"),
+                child("agent-7", "Audit extensions", "running"),
+                child("agent-8", "Verify release", "completed"),
             ],
             total_cost_microdollars: Some(3),
             failure_reason: None,
@@ -7991,27 +7996,37 @@ fn ctrl_o_globally_expands_and_collapses_subagent_activity() {
 
     assert!(!shell.verbose_tools());
     let collapsed = render(&shell);
-    assert!(!collapsed.contains("Read release history"), "{collapsed}");
-    assert!(collapsed.contains("Audit release surface"), "{collapsed}");
-    assert!(collapsed.contains("Scan changelog"), "{collapsed}");
+    for task in [
+        "Read release history",
+        "Audit release surface",
+        "Scan changelog",
+        "Inspect tests",
+        "Check package map",
+        "Review docs",
+        "Audit extensions",
+        "Verify release",
+    ] {
+        assert!(collapsed.contains(task), "missing {task}: {collapsed}");
+    }
 
+    // Ctrl+O still controls ordinary tool disclosure, but a subagents event is
+    // already bounded to the complete eight-worker roster in either mode.
     shell.toggle_disclosure();
     assert!(shell.verbose_tools());
     let expanded = render(&shell);
     assert!(expanded.contains("Read release history"), "{expanded}");
-    assert!(expanded.contains("Audit release surface"), "{expanded}");
-    assert!(expanded.contains("Scan changelog"), "{expanded}");
+    assert!(expanded.contains("Verify release"), "{expanded}");
 
     shell.toggle_disclosure();
     assert!(!shell.verbose_tools());
     let collapsed_again = render(&shell);
     assert!(
-        !collapsed_again.contains("Read release history"),
+        collapsed_again.contains("Read release history"),
         "{collapsed_again}"
     );
 
-    // Settlement does not create a second disclosure mode. The same global
-    // Ctrl+O state still expands every retained worker and every tool panel.
+    // Settlement preserves the complete roster; it does not introduce a
+    // separate disclosure mode for the subagents event.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 2,

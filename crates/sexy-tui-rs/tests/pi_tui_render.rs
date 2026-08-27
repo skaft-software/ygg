@@ -54,10 +54,14 @@ impl Terminal for VirtualTerminal {
     }
 
     fn move_by(&mut self, lines: i16) {
-        if lines > 0 {
-            self.write(&format!("\x1b[{}B", lines as u16));
-        } else if lines < 0 {
-            self.write(&format!("\x1b[{}A", lines.unsigned_abs()));
+        match lines.cmp(&0) {
+            std::cmp::Ordering::Greater => {
+                self.write(&format!("\x1b[{}B", lines as u16));
+            }
+            std::cmp::Ordering::Less => {
+                self.write(&format!("\x1b[{}A", lines.unsigned_abs()));
+            }
+            std::cmp::Ordering::Equal => {}
         }
     }
 

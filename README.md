@@ -147,9 +147,12 @@ ygg update           # run the update for the detected install method
 ```
 
 In the TUI, `/update` checks for a newer release and tells you to run
-`ygg update`. Extension packages are not updated by `ygg update`; after updating
-Ygg, run `ygg extension update <name>` for each installed official package so
-its exact compatibility matches the new release.
+`ygg update`. Extension packages normally remain separate from core updates.
+As a one-time repair for the v0.6.0 → v0.6.1 upgrade, the first v0.6.1 startup
+atomically refreshes installed managed first-party bundles, refreshes Ygg Serve,
+and removes the retired `ygg-hermes-memory` package while preserving its data.
+If a download is unavailable, Ygg continues startup and prints the exact
+`ygg extension update <name>` recovery command.
 
 ### Executable extension bundles
 

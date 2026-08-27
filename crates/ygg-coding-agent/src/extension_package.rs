@@ -217,6 +217,59 @@ pub async fn run(command: ExtensionCommand) -> anyhow::Result<()> {
     }
 }
 
+/// Upgrade managed v0.6.0 packages before the first normal v0.6.1 startup.
+///
+/// Core and package updates are separate atomic operations. This narrowly
+/// repairs the only released transition that failed to perform those package
+/// operations, while leaving local and future package policy explicit.
+pub(crate) async fn migrate_v0_6_0_packages() {
+    if env!("CARGO_PKG_VERSION") != "0.6.1" {
+        return;
+    }
+    let Ok(root) = extensions_root() else {
+        return;
+    };
+    let Ok(ids) = crate::extension_bundle::v0_6_0_managed_bundle_ids(&root) else {
+        return;
+    };
+
+    for id in ids {
+        if crate::extension_bundle::is_official_bundle(&id) {
+            match crate::extension_bundle::install_official(&root, &id, true).await {
+                Ok(manifest) => crate::output::stdout_line(format!(
+                    "Migrated {} to {} for Ygg 0.6.1.",
+                    manifest.id, manifest.version
+                )),
+                Err(error) => crate::output::stderr_line(format!(
+                    "warning: could not migrate {id} to Ygg 0.6.1: {error:#}; run `ygg extension update {id}`"
+                )),
+            }
+        } else if id == "ygg-hermes-memory" {
+            match crate::extension_bundle::remove_installed(&root, &id) {
+                Ok(()) => crate::output::stdout_line(
+                    "Removed retired ygg-hermes-memory bundle; its external data was preserved.",
+                ),
+                Err(error) => crate::output::stderr_line(format!(
+                    "warning: could not remove retired ygg-hermes-memory bundle: {error:#}; run `ygg extension remove ygg-hermes-memory`"
+                )),
+            }
+        }
+    }
+
+    let current = Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semantic");
+    if installed_version().is_some_and(|version| version != current) {
+        match install_official(&root, true).await {
+            Ok(manifest) => crate::output::stdout_line(format!(
+                "Migrated {} to {} for {}.",
+                manifest.id, manifest.version, manifest.target
+            )),
+            Err(error) => crate::output::stderr_line(format!(
+                "warning: could not migrate ygg-serve to Ygg 0.6.1: {error:#}; run `ygg extension update ygg-serve`"
+            )),
+        }
+    }
+}
+
 fn print_bundle_installed(
     action: &str,
     manifest: &crate::extension_bundle::InstalledBundleManifest,

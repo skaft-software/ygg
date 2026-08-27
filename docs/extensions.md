@@ -933,7 +933,10 @@ browser, provisions a model, starts a server, or invokes extension code.
 Runtime dependencies and explicit post-install setup remain the extension's
 responsibility and must be documented. Local packages have no remembered
 remote update source; published catalog updates are the only downloads made by
-`ygg extension update`.
+`ygg extension update`. The one exception is the bounded v0.6.0 → v0.6.1
+repair: v0.6.1 refreshes managed first-party v0.6.0 bundles before normal
+startup and removes the retired managed `ygg-hermes-memory` bundle without
+removing its external data.
 
 ## First-party application packages
 

@@ -38,31 +38,18 @@ fn extension_activity_state_label(state: ygg_agent::ExtensionPresentationState) 
     }
 }
 
-fn disclosed_activity_tail<T>(items: &[T], expanded: bool) -> &[T] {
-    if expanded {
-        items
-    } else {
-        &items[items.len().saturating_sub(2)..]
-    }
-}
-
-fn render_subagent_activity_panel(
-    panel: &ToolPanel,
-    theme: &YggTheme,
-    width: u16,
-    expanded: bool,
-) -> Vec<String> {
+fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
     let Some(view) = panel.subagent_activity.as_ref() else {
         return Vec::new();
     };
     let label = theme.bold(&theme.fg("foreground", "Subagents"));
     let mut lines = vec![label];
-    // Collapsed disclosure keeps the two most recent workers visible; Ctrl+O
-    // reveals the complete host-bounded roster.
+    // A subagents event is already a bounded roster (at most eight workers),
+    // so keep every child visible even when ordinary tool output is collapsed.
     let unicode = theme.unicode();
 
     if !view.telemetry.is_empty() {
-        let children = disclosed_activity_tail(&view.telemetry, expanded);
+        let children = &view.telemetry;
         let task_width = children
             .iter()
             .map(|child| visible_width(&sanitize_for_terminal(&child.task_name)))
@@ -131,7 +118,7 @@ fn render_subagent_activity_panel(
             ));
         }
     } else {
-        let activities = disclosed_activity_tail(&view.activities, expanded);
+        let activities = &view.activities;
         let summary_width = activities
             .iter()
             .map(|activity| visible_width(&sanitize_for_terminal(&activity.summary)))
@@ -274,12 +261,7 @@ pub(super) fn render_block_planned(
             content_background,
         ),
         TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
-            finish_transcript_block(render_subagent_activity_panel(
-                panel,
-                theme,
-                width,
-                verbose_tools,
-            ))
+            finish_transcript_block(render_subagent_activity_panel(panel, theme, width))
         }
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")

@@ -90,29 +90,20 @@ fn finalized_tool_rows_are_stable(panel: &ToolPanel) -> bool {
         return !disclosure_sensitive;
     }
 
-    let disclosure_sensitive = if let Some(activity) = panel.subagent_activity.as_ref() {
-        let retained = if activity.telemetry.is_empty() {
-            activity.activities.len()
-        } else {
-            activity.telemetry.len()
-        };
-        retained > 2
-    } else {
-        match panel.name.as_str() {
-            "bash" | "exec" => {
-                panel.display.shell_command.is_some() && bash_output_changes_when_expanded(panel)
-            }
-            "search" if !panel.is_error => panel
-                .output
-                .lines()
-                .filter(|line| !line.trim().is_empty() && *line != "(no output)")
-                .nth(COMPACT_EXEC_OUTPUT_ROWS)
-                .is_some(),
-            // Rendering determines diff truncation after width-dependent wrap.
-            // A recognized diff is therefore kept atomic conservatively.
-            "edit" | "write" if !panel.is_error => tool_diff(panel).is_some(),
-            _ => false,
+    let disclosure_sensitive = match panel.name.as_str() {
+        "bash" | "exec" => {
+            panel.display.shell_command.is_some() && bash_output_changes_when_expanded(panel)
         }
+        "search" if !panel.is_error => panel
+            .output
+            .lines()
+            .filter(|line| !line.trim().is_empty() && *line != "(no output)")
+            .nth(COMPACT_EXEC_OUTPUT_ROWS)
+            .is_some(),
+        // Rendering determines diff truncation after width-dependent wrap.
+        // A recognized diff is therefore kept atomic conservatively.
+        "edit" | "write" if !panel.is_error => tool_diff(panel).is_some(),
+        _ => false,
     };
     *panel.cached_disclosure_sensitive.borrow_mut() = Some(disclosure_sensitive);
     !disclosure_sensitive

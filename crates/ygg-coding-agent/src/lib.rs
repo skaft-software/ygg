@@ -72,6 +72,9 @@ async fn run() -> anyhow::Result<()> {
         return migrate::run(command, &std::env::current_dir()?);
     }
     if let Some(cli::TopLevelCommand::Extension { command }) = top_level_command.clone() {
+        if matches!(&command, extension_package::ExtensionCommand::List) {
+            extension_package::migrate_v0_6_0_packages().await;
+        }
         return extension_package::run(command).await;
     }
     if let Some(cli::TopLevelCommand::Update { check }) = top_level_command.clone() {
@@ -84,6 +87,7 @@ async fn run() -> anyhow::Result<()> {
         web_root,
     }) = top_level_command.clone()
     {
+        extension_package::migrate_v0_6_0_packages().await;
         return extension_package::run_serve(no_open, port, web_root);
     }
 
@@ -102,6 +106,7 @@ async fn run() -> anyhow::Result<()> {
     if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
     }
+    extension_package::migrate_v0_6_0_packages().await;
     #[cfg(feature = "serve")]
     if let Some(cli::TopLevelCommand::Serve {
         no_open,

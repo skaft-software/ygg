@@ -701,6 +701,37 @@ pub(super) fn list_installed(root: &Path) -> anyhow::Result<Vec<InstalledBundle>
     Ok(installed)
 }
 
+/// Managed bundles left by Ygg 0.6.0 that need the one-time 0.6.1 migration.
+pub(super) fn v0_6_0_managed_bundle_ids(root: &Path) -> anyhow::Result<Vec<String>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).context("cannot read extension package directory"),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let entry = entry.context("cannot read extension package directory entry")?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_bundle_id(&id).is_err() || id == super::extension_package::PACKAGE_ID {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Ok(record) = load_install_record(&entry.path(), &id) else {
+            continue;
+        };
+        if record.installed_by_ygg == "0.6.0" && record.requires_ygg == "=0.6.0" {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
 pub(super) fn installed_skill_roots(root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -920,6 +951,26 @@ mod tests {
 
         remove_installed(&root, "test-extension").unwrap();
         assert!(!root.join("test-extension").exists());
+    }
+
+    #[test]
+    fn finds_only_managed_v0_6_0_bundles_for_release_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("extensions");
+        let archive = create_bundle(directory.path(), "test-extension", b"runtime");
+        install_local(&root, &archive, false).unwrap();
+
+        let record_path = root.join("test-extension/install.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+        record["installed_by_ygg"] = serde_json::json!("0.6.0");
+        record["requires_ygg"] = serde_json::json!("=0.6.0");
+        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+        assert_eq!(
+            v0_6_0_managed_bundle_ids(&root).unwrap(),
+            vec!["test-extension"]
+        );
     }
 
     #[test]
