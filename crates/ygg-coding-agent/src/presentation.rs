@@ -1563,6 +1563,54 @@ mod tests {
     }
 
     #[test]
+    fn mid_stream_failure_outcome_preserves_the_wire_progress_suffix() {
+        let now = Instant::now();
+        let mut tracker = RunTracker::default();
+        let id = tracker
+            .begin_for_model_at("custom-endpoint", "test-model", now)
+            .unwrap();
+        let update = tracker.apply_event_at(
+            id,
+            &finished(FinishReason::Failed(AgentError::Ai(AiError::StreamFailure {
+                inner: Box::new(AiError::Provider(ygg_ai::ProviderError {
+                    code: Some("stream_error".into()),
+                    kind: Some("internal".into()),
+                    message: "mid-stream decode failure".into(),
+                    request_id: Some("req-599".into()),
+                })),
+                progress: ygg_ai::StreamProgress {
+                    provider_events: 412,
+                    decoded_events: 38,
+                    content_bytes: 18_204,
+                    buffered_bytes: 0,
+                    first_body_seen: true,
+                    elapsed_ms: 94_300,
+                },
+            }))),
+            now,
+        );
+        let Some(RunOutcome::Failed { reason, .. }) = update.outcome else {
+            panic!("expected failed outcome");
+        };
+        // The inner classification and its detail must be preserved.
+        assert!(reason.contains("phase=response body (provider error)"), "{reason}");
+        assert!(reason.contains("detail=mid-stream decode failure"), "{reason}");
+        // The progress suffix is the last field of the diagnostic, so it is
+        // the one that must survive: if it is intact, nothing of value was
+        // clipped on the way to the TUI.
+        assert!(
+            reason.ends_with(
+                "stream_progress=frames=412 events=38 content=18204B buffered=0B \
+                 first_byte=seen elapsed=94300ms"
+            ),
+            "{reason}"
+        );
+        // The TUI renders outcome detail under a 4 KiB bound; the diagnostic
+        // must already fit it.
+        assert!(reason.len() <= 4096);
+    }
+
+    #[test]
     fn recovered_tool_failure_completes_with_warnings() {
         let now = Instant::now();
         let mut tracker = RunTracker::default();

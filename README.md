@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.0"><img alt="Release: 0.6.0" src="https://img.shields.io/badge/release-0.6.0-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.1"><img alt="Release: 0.6.1" src="https://img.shields.io/badge/release-0.6.1-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -60,7 +60,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 ## Install
 
 ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.0`
+[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.1`
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
 silicon. Linux musl is not supported by this release.
 
@@ -72,7 +72,7 @@ architecture, verifies the matching release archive, and installs `ygg` and
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.0/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.1/install-ygg.sh | sh
 ```
 
 No Rust toolchain is needed for the default installation. Restart the shell,
@@ -88,7 +88,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.0/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.1/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -99,7 +99,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.0 \
+  --tag v0.6.1 \
   --bins \
   ygg-coding-agent
 ```
@@ -126,7 +126,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.0 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.1 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -180,8 +180,8 @@ bundle. For a one-shot launch instead:
 ygg --enable-extension ygg-web-search --trust-extension ygg-web-search
 ```
 
-The small release catalog contains `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`,
-`ygg-subagents`, and `ygg-web-search`. Use
+The small release catalog contains `ygg-browse`, `ygg-mcp`, `ygg-subagents`,
+and `ygg-web-search`. Use
 `ygg extension update <name>` or `ygg extension remove <name>` to manage one.
 Offline and third-party archives can be installed with
 `ygg extension install --path ./bundle.tar.gz`. Replace one atomically with
@@ -221,11 +221,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.0-dev
+scripts/build-ygg-image.sh ygg:0.6.1
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.0-dev --model claude-sonnet-4-6
+  ygg:0.6.1 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -931,7 +931,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.6.0.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.1.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |

@@ -2,7 +2,6 @@
 # Keep one lowercase package ID per line; release packaging and the compiled
 # package manager consume this same catalog.
 ygg-browse
-ygg-hermes-memory
 ygg-mcp
 ygg-subagents
 ygg-web-search

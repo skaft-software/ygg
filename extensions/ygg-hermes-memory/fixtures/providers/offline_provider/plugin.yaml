@@ -1,5 +1,0 @@
-name: offline-recall
-version: 1.0.0
-description: "Test-only network-free lexical provider with provider-owned storage"
-hooks:
-  - on_session_end

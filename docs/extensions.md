@@ -160,7 +160,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.0-dev"
+requires_ygg = "=0.6.1"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -872,14 +872,14 @@ compatibility alongside its independent extension version:
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.0-dev"
+requires_ygg = "=0.6.1"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present
 it is enforced during discovery. It is mandatory and must be the exact running
 Ygg version for every installed bundle. The first-party release catalog is
-intentionally small: `ygg-browse`, `ygg-hermes-memory`, `ygg-mcp`,
-`ygg-subagents`, and `ygg-web-search`. Install, inspect, update, and remove a
+intentionally small: `ygg-browse`, `ygg-mcp`, `ygg-subagents`, and
+`ygg-web-search`. Install, inspect, update, and remove a
 published package with:
 
 ```console
@@ -956,7 +956,7 @@ Official installs download the matching target archive and shared release
 `SHA256SUMS`; local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.6.0-dev-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.6.1-TARGET.tar.gz
 ```
 
 The application archive keeps its existing strict two-file payload contract and

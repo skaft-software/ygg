@@ -1,6 +1,6 @@
 # ygg-mcp changelog
 
-## 0.1.0 — Ygg 0.6.0-dev
+## 0.1.0 — Ygg 0.6.1
 
 - Add the first API `0.2` dynamic-catalog MCP bridge.
 - Support explicit user and digest-pinned trusted-project configuration for

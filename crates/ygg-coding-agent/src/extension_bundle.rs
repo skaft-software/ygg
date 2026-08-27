@@ -858,13 +858,7 @@ mod tests {
         let ids = official_bundle_ids().collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec![
-                "ygg-browse",
-                "ygg-hermes-memory",
-                "ygg-mcp",
-                "ygg-subagents",
-                "ygg-web-search",
-            ]
+            vec!["ygg-browse", "ygg-mcp", "ygg-subagents", "ygg-web-search",]
         );
         for id in ids {
             validate_bundle_id(id).unwrap();
