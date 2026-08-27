@@ -122,10 +122,10 @@ pub(super) fn session_picker_ordering(picker: &PickerState) -> Vec<usize> {
         .enumerate()
         .filter_map(|(index, meta)| {
             if picker.named_only
-                && !meta
+                && meta
                     .name
                     .as_deref()
-                    .is_some_and(|name| !name.trim().is_empty())
+                    .is_none_or(|name| name.trim().is_empty())
             {
                 return None;
             }
