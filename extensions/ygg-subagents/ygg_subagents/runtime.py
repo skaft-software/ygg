@@ -479,7 +479,7 @@ def create_runtime() -> tuple[Extension, Orchestrator, PresentationPublisher]:
     @extension.tool(
         name="subagent_status",
         description=(
-            "Read the authoritative owned worker tree and return bounded states, budgets, session/artifact references, and an optional terminal summary. "
+            "Read the authoritative host-present worker tree plus bounded terminal evidence retained after owning-run cleanup, and return states, budgets, session/artifact references, and an optional terminal summary. "
             "Prompts, tool arguments/results, and running child prose are excluded."
         ),
         parameters=STATUS_SCHEMA,

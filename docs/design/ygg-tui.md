@@ -14,12 +14,14 @@ The interactive frontend owns terminal setup/restoration and presentation only;
   screen and saved lines before replaying the complete frame. PageUp transfers
   rendering to the bounded, application-owned semantic viewport for the rest of
   that shell. Explicit `--mouse app` selects that viewport from startup.
-- Ygg v0.6.1 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely.
+- Ygg v0.6.2 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely.
 - Raw mode, bracketed paste, keyboard enhancements, and mouse reporting are
   enabled only when supported and restored idempotently. Matching Pi, every
   interactive frame is bracketed by CSI 2026 synchronized-output markers;
   terminals that do not implement the private mode ignore it, while Ygg's
-  backend still uses the markers to batch each frame into one flush.
+  backend still uses the markers to batch each frame into one flush. Ygg's
+  composer uses the positioned hardware cursor rather than Pi's painted fake
+  cursor, so every renderer construction explicitly keeps that cursor visible.
 - Mouse reporting is disabled by default, preserving native drag selection and
   wheel scrolling. `--mouse app` enables capture for semantic wheel navigation
   and selection, but keyboard viewport ownership does not depend on capture.
@@ -95,9 +97,11 @@ and the active match and hint keys use the selected model's adaptive accent.
 Executable-extension status/header/footer contributions never occupy that row.
 Generic presentation snapshots do not create persistent chrome. The first-party
 `ygg-subagents` observation surface is the bounded exception: while an owning
-run has workers, the host renders its owner-fenced `subagent` activities in a
-live block immediately above the composer. Each worker uses a content-free task/
-phase line and a structured `Tool Calls • ↑input ↓output • cost` line. A
+run has workers, the host renders its complete owner-fenced `subagent` roster in
+a persistent transcript event immediately above the composer. Each worker uses
+a content-free task/phase line and a structured
+`Tool Calls • ↑input ↓output • cost` line; ordinary tool disclosure never
+truncates the roster. A
 nonblocking 250 ms host tick invokes the owner-scoped status command, coalesces
 with normal extension events, and retains the last accepted snapshot on failure.
 Live child cost is added to the host-owned cumulative footer only until root

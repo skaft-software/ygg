@@ -160,7 +160,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.1"
+requires_ygg = "=0.6.2"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -455,12 +455,11 @@ in status labels, node titles, provenance, or reconnect state.
 Every action names an already manifest-declared extension command. Generic
 extension state stays out of persistent chrome. The coding TUI makes one
 first-party observed exception for `ygg-subagents`: while the owning root run
-has active (pending or running) workers, it renders the latest owner-fenced
-`subagent` activities directly above the composer from native
-`AgentEvent::DelegationUpdated` telemetry; the strip disappears once every
-worker settles and `Ctrl+O` expands it from the two most recent workers to the
-five most recent while it is visible. The
-footer remains host-owned; it adds live priced child spend while the run is
+has workers, it renders the latest owner-fenced `subagent` activities as a
+persistent transcript event directly above the composer from native
+`AgentEvent::DelegationUpdated` telemetry. The event always includes the
+complete bounded roster; ordinary `Ctrl+O` tool disclosure never truncates it.
+The footer remains host-owned; it adds live priced child spend while the run is
 active, then uses the root session's durable delegated-usage records after
 settlement, never an extension-supplied footer string.
 `/extensions` instead opens a host-owned menu for managing installed executable
@@ -552,7 +551,10 @@ The key is scoped to the extension principal and resource owner: retrying the
 same task/profile/fingerprint/input and policy while its owning-run record is
 retained returns the same child, while reuse with different input fails. At the
 next owning run, the host prunes idempotency entries whose child records were
-cleared, so a stale key can never return a nonexistent worker. The stable
+cleared, so a stale key can never return a nonexistent worker. The first-party
+orchestrator separately retains the last bounded summaries/errors and sibling
+roster as terminal evidence; an explicit identical retry replaces its matching
+orphaned cache entry before asking this host service for a new worker. The stable
 principal contains the manifest name plus a SHA-256 manifest-identity digest,
 never the manifest path.
 
@@ -872,7 +874,7 @@ compatibility alongside its independent extension version:
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.1"
+requires_ygg = "=0.6.2"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present
@@ -933,10 +935,9 @@ browser, provisions a model, starts a server, or invokes extension code.
 Runtime dependencies and explicit post-install setup remain the extension's
 responsibility and must be documented. Local packages have no remembered
 remote update source; published catalog updates are the only downloads made by
-`ygg extension update`. The one exception is the bounded v0.6.0 → v0.6.1
-repair: v0.6.1 refreshes managed first-party v0.6.0 bundles before normal
-startup and removes the retired managed `ygg-hermes-memory` bundle without
-removing its external data.
+`ygg extension update`. The one-time v0.6.2 hotfix migration refreshes managed
+first-party bundles and Ygg Serve installed by v0.6.0 or v0.6.1, and removes the
+retired managed `ygg-hermes-memory` bundle without removing its external data.
 
 ## First-party application packages
 
@@ -959,7 +960,7 @@ Official installs download the matching target archive and shared release
 `SHA256SUMS`; local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.6.1-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.6.2-TARGET.tar.gz
 ```
 
 The application archive keeps its existing strict two-file payload contract and

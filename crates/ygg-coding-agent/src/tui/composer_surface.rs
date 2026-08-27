@@ -859,11 +859,15 @@ pub fn render_composer_surface(
 ) -> Vec<String> {
     let w = usize::from(width);
     if w < 3 {
+        let cursor_marker = composer_cursor_marker(state);
         let prompt = if state.editor.is_empty() {
-            fit_line(state.theme.glyph("prompt"), width)
+            fit_line(
+                &format!("{cursor_marker}{}", state.theme.glyph("prompt")),
+                width,
+            )
         } else {
             let (editor, _) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
-            fit_line(&format!("> {editor}"), width)
+            fit_line(&format!("{cursor_marker}> {editor}"), width)
         };
         let mut lines = vec![prompt];
         append_status_footer(&mut lines, state, width, now);

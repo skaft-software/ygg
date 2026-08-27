@@ -3,7 +3,7 @@
 Prompts, skills, and executable extensions share one filesystem
 resolver. Resource-specific parsers own their schemas; the resolver owns the
 cross-cutting local safety and precedence contract. Theme customization is
-disabled in v0.6.1; the terminal uses its compiled default.
+disabled in v0.6.2; the terminal uses its compiled default.
 
 ## Locations and precedence
 

@@ -74,14 +74,6 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
     }
 }
 
-fn disclosed_activity_tail<T>(items: &[T], expanded: bool) -> &[T] {
-    if expanded {
-        items
-    } else {
-        &items[items.len().saturating_sub(2)..]
-    }
-}
-
 fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     // Delegated workers now render as persistent transcript tool blocks. Keep
     // this compatibility path empty so older shell-chrome callers cannot
@@ -92,14 +84,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     let Some(view) = state.subagent_activity.as_ref() else {
         return Vec::new();
     };
-    // When the strip is expanded (ctrl+o), the hint in the label flips so it
-    // keeps telling the truth about what ctrl+o will do next.
-    let status_label = if state.verbose_tools {
-        view.status_label
-            .replace("ctrl+o to expand", "ctrl+o to collapse")
-    } else {
-        view.status_label.clone()
-    };
+    let status_label = view.status_label.clone();
     let mut lines = vec![fit_line(
         &state.theme.bold(
             &state
@@ -109,10 +94,10 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
         width,
     )];
     let unicode = state.theme.unicode();
-    // Collapsed disclosure keeps the two most recent workers visible; Ctrl+O
-    // reveals the complete host-bounded roster.
+    // The host bounds the roster, so keep every worker visible even while
+    // ordinary tool disclosure is collapsed.
     if !view.telemetry.is_empty() {
-        let children = disclosed_activity_tail(&view.telemetry, state.verbose_tools);
+        let children = &view.telemetry;
         for (index, child) in children.iter().rev().enumerate() {
             let last = index + 1 == children.len();
             let branch = match (unicode, last) {
@@ -230,7 +215,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             width,
         ));
     } else {
-        let activities = disclosed_activity_tail(&view.activities, state.verbose_tools);
+        let activities = &view.activities;
         for (index, activity) in activities.iter().rev().enumerate() {
             let last = index + 1 == activities.len();
             let branch = match (unicode, last) {

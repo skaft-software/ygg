@@ -878,15 +878,24 @@ class Orchestrator:
                 for worker in state.workers.values()
                 if worker.agent_id not in observed
             ]
+            now = self._now_ms()
             for agent_id in stale_ids:
-                state.workers.pop(agent_id, None)
-            if stale_ids:
-                stale = set(stale_ids)
-                state.idempotency = {
-                    key: value
-                    for key, value in state.idempotency.items()
-                    if value[1] not in stale
-                }
+                worker = state.workers[agent_id]
+                worker.host_present = False
+                # A new owning run or host-side cleanup may retire the live
+                # record before the extension gets another list/wait call. Keep
+                # the last bounded summary/error and sibling roster as terminal
+                # evidence instead of making the entire tree disappear.
+                if worker.active:
+                    worker.state = "orphaned"
+                    worker.phase = "host worker record no longer available"
+                    worker.current_tool = None
+                    worker.completed_at_ms = now
+                    if worker.last_error is None:
+                        worker.last_error = (
+                            "The host no longer reports this worker; its last "
+                            "observed state is retained for diagnosis."
+                        )
             self._trim_workers_locked(state)
             persistence_error = snapshot.get("persistence_error")
             if isinstance(persistence_error, str) and persistence_error.strip():
@@ -976,6 +985,7 @@ class Orchestrator:
     def _update_worker_from_record(
         self, worker: Worker, record: Mapping[str, Any]
     ) -> None:
+        worker.host_present = True
         state_name, status = host_state(record)
         mapped = {
             "pending": "queued",
@@ -1184,6 +1194,9 @@ class Orchestrator:
                 % MAX_ACTIVE_CHILDREN,
                 code="concurrency_limit",
             )
+        while len(state.workers) + len(state.pending_spawns) >= MAX_WORKERS_PER_OWNER:
+            if not self._evict_terminal_worker_locked(state, missing_only=True):
+                break
         if len(state.workers) + len(state.pending_spawns) >= MAX_WORKERS_PER_OWNER:
             raise SubagentError(
                 "subagent total worker limit reached for this parent (%d)"
@@ -1207,6 +1220,13 @@ class Orchestrator:
         worker = state.workers.get(agent_id)
         if worker is None:
             state.idempotency.pop(request.idempotency_key, None)
+            return None
+        if not worker.host_present:
+            # The owning run was retired after this exact spawn. Preserve its
+            # evidence until an explicit retry, then let the host create a new
+            # authoritative worker instead of returning an orphaned record.
+            state.idempotency.pop(request.idempotency_key, None)
+            self._remove_worker_locked(state, agent_id)
             return None
         return worker
 
@@ -1310,25 +1330,39 @@ class Orchestrator:
             )
         return matches[0]
 
+    def _remove_worker_locked(self, state: OwnerState, agent_id: str) -> None:
+        del state.workers[agent_id]
+        for key, (_, candidate) in list(state.idempotency.items()):
+            if candidate == agent_id:
+                del state.idempotency[key]
+
+    def _evict_terminal_worker_locked(
+        self, state: OwnerState, *, missing_only: bool
+    ) -> bool:
+        removable = next(
+            (
+                agent_id
+                for agent_id, worker in state.workers.items()
+                if worker.terminal
+                and agent_id != state.selected_agent_id
+                and (not missing_only or not worker.host_present)
+            ),
+            None,
+        )
+        if removable is None:
+            return False
+        self._remove_worker_locked(state, removable)
+        return True
+
     def _trim_workers_locked(self, state: OwnerState) -> None:
         while len(state.workers) > MAX_WORKERS_PER_OWNER:
-            removable = next(
-                (
-                    agent_id
-                    for agent_id, worker in state.workers.items()
-                    if worker.terminal and agent_id != state.selected_agent_id
-                ),
-                None,
-            )
-            if removable is None:
+            if not self._evict_terminal_worker_locked(
+                state, missing_only=True
+            ) and not self._evict_terminal_worker_locked(state, missing_only=False):
                 raise SubagentError(
                     "authoritative worker tree exceeds the local retention bound",
                     code="worker_limit",
                 )
-            del state.workers[removable]
-            for key, (_, agent_id) in list(state.idempotency.items()):
-                if agent_id == removable:
-                    del state.idempotency[key]
 
     def _status_result_locked(
         self, state: OwnerState, selected: Optional[Worker]

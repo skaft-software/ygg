@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.1"><img alt="Release: 0.6.1" src="https://img.shields.io/badge/release-0.6.1-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.2"><img alt="Release: 0.6.2" src="https://img.shields.io/badge/release-0.6.2-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -60,7 +60,7 @@ Local endpoints are a primary path rather than a compatibility mode. Ygg keeps p
 ## Install
 
 ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.1`
+[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.2`
 binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
 silicon. Linux musl is not supported by this release.
 
@@ -72,7 +72,7 @@ architecture, verifies the matching release archive, and installs `ygg` and
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.1/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.2/install-ygg.sh | sh
 ```
 
 No Rust toolchain is needed for the default installation. Restart the shell,
@@ -88,7 +88,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.1/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.2/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -99,7 +99,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.1 \
+  --tag v0.6.2 \
   --bins \
   ygg-coding-agent
 ```
@@ -126,7 +126,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.1 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.2 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -148,10 +148,10 @@ ygg update           # run the update for the detected install method
 
 In the TUI, `/update` checks for a newer release and tells you to run
 `ygg update`. Extension packages normally remain separate from core updates.
-As a one-time repair for the v0.6.0 → v0.6.1 upgrade, the first v0.6.1 startup
-atomically refreshes installed managed first-party bundles, refreshes Ygg Serve,
-and removes the retired `ygg-hermes-memory` package while preserving its data.
-If a download is unavailable, Ygg continues startup and prints the exact
+As a one-time hotfix migration, the first v0.6.2 startup atomically refreshes
+managed first-party bundles and Ygg Serve installed by v0.6.0 or v0.6.1, and
+removes the retired `ygg-hermes-memory` package while preserving its data. If a
+download is unavailable, Ygg continues startup and prints the exact
 `ygg extension update <name>` recovery command.
 
 ### Executable extension bundles
@@ -224,11 +224,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.1
+scripts/build-ygg-image.sh ygg:0.6.2
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.1 --model claude-sonnet-4-6
+  ygg:0.6.2 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -327,7 +327,9 @@ thinks by default and exposes `on` as the only ygg thinking option; it does not
 support a configurable `reasoning_effort`, so keep `reasoning` enabled and
 `reasoning_configurable` disabled. The `pcc` model has a separate 32768-token
 context window and supports low/medium/high reasoning effort. Configured model
-metadata overrides matching discovery results.
+metadata overrides matching discovery results. When `fm serve` is not running,
+Ygg treats that optional loopback integration as unavailable and skips its
+`GET /v1/models` request without printing a connection warning.
 
 Each provider is independently discovered and selectable. Models use stable,
 provider-qualified IDs such as `custom/apple-fm/<model-id>`, and the configured
@@ -515,10 +517,13 @@ Extension workers inherit the parent's full standard tool scope (`read`,
 to a hard read-only pair, stay depth-one, and run under a bound of eight active
 children with thirty-two retained records. Each worker has an isolated durable
 session, inherited policy limits, host-owned cancellation and cost/token
-ceilings, and an owner-authorized read-only transcript. While a root run is
-active, the TUI keeps an owner-scoped `Subagents` block directly above the
-composer and keeps each worker's phase, tool-call count, disjoint input/cache
-and output token totals, and priced spend current. Completed child usage is
+ceilings, and an owner-authorized read-only transcript. If owning-run cleanup
+removes a live host record, the extension retains its last bounded summary/error
+and sibling roster as explicit terminal diagnostic evidence. While a root run is
+active, the TUI keeps an owner-scoped `Subagents` transcript event directly
+above the composer and always shows its complete bounded worker roster with each
+worker's phase, tool-call count, disjoint input/cache and output token totals,
+and priced spend. Completed child usage is
 copied from the child sessions into a dedicated root-session accounting record
 before the root run settles, so delegated spend is durable and appears exactly
 once in the cumulative footer. It also participates in later session cost-limit
@@ -584,14 +589,15 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Native scrollback and drag selection are the default (`mouse = "auto"`); Ygg leaves mouse reporting disabled and lets Pi-compatible CRLF appends flow into terminal history.
 - The default renderer follows logical content height instead of pinning the composer and footer inside a fixed full-screen viewport. It uses Pi's complete retained frame: first render writes every materialized row, ordinary updates repaint the exact first-to-last changed range, and changes above the old viewport clear saved lines before one authoritative full replay.
 - Slash/path completions, panels, reports, streamed Markdown, and other temporary chrome participate in that same complete-frame differential algorithm. They can no longer freeze a semantic commit ledger while unwritten transcript rows fall out of the physical viewport.
-- Generic extension state remains on demand, but `ygg-subagents` is the observed exception: while an owning run has workers, an owner-scoped live block is pinned immediately above the composer with worker phase, tool calls, input/output tokens, and spend. Its 250 ms host refresh is nonblocking and retains the last fenced snapshot on failure. `/subagents` remains the arrow-key list/inspector whose Enter action opens a scrollable read-only worker transcript; no extension contribution is allowed to replace the cumulative footer.
+- Generic extension state remains on demand, but `ygg-subagents` is the observed exception: while an owning run has workers, an owner-scoped transcript event is pinned immediately above the composer with the complete bounded roster, worker phase, tool calls, input/output tokens, and spend. Its 250 ms host refresh is nonblocking and retains the last fenced snapshot on failure. `/subagents` remains the arrow-key list/inspector whose Enter action opens a scrollable read-only worker transcript; no extension contribution is allowed to replace the cumulative footer.
+- The composer uses an explicitly visible hardware cursor in both the default Pi renderer and the application-owned viewport, including after panels, resize replays, and renderer resumes.
 - A terminal resize reflows the retained semantic transcript at the new width, resets terminal saved lines, and replays Ygg's retained transcript once.
 - `--mouse app` explicitly captures the mouse and uses a bounded semantic viewport. In that mode, scrolling above the tail stays anchored while streamed Markdown grows, reports new output, and lets PageDown return to live output.
 - Pi retained-frame differential rendering, synchronized frames, and exact changed-range repainting.
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
-- The compiled default theme is the only theme exposed by the v0.6.1 runtime.
+- The compiled default theme is the only theme exposed by the v0.6.2 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -614,7 +620,7 @@ ygg --mouse app
 
 ## Terminal theming
 
-Theme selection is disabled in v0.6.1. The TUI and graphical Serve frontend expose
+Theme selection is disabled in v0.6.2. The TUI and graphical Serve frontend expose
 only Ygg's compiled default theme; legacy theme options are ignored or fall back
 to that theme. The theme schema is retained for a future release in
 [docs/themes.md](docs/themes.md).
@@ -934,13 +940,13 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.6.1.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.2.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | v0.6.1 default-only status and reserved schema. |
+| [Themes](docs/themes.md) | v0.6.2 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |

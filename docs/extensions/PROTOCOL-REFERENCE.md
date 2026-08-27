@@ -78,7 +78,7 @@ The **first** host request, sent immediately after the child process starts.
   "method": "initialize",
   "params": {
     "api_version": "0.1",
-    "ygg_version": "0.6.1",
+    "ygg_version": "0.6.2",
     "extension": {
       "name": "hello-world",
       "version": "0.1.0",
@@ -962,9 +962,10 @@ and active resource owner, ignores or diagnoses stale updates, and retains the
 latest accepted replacement for explicit TUI views, Serve, and bounded headless
 fallbacks. Generic snapshots do not become ambient chrome. The coding TUI
 recognizes owner-fenced `ygg-subagents` activities as a first-party observed
-surface, renders their structured metrics above the composer during the owning
-run from native `AgentEvent::DelegationUpdated` events, and does not poll a
-status command; the extension cannot supply footer text or terminal rows. It
+surface, renders the complete bounded roster and its structured metrics in a
+persistent transcript event above the composer during the owning run from
+native `AgentEvent::DelegationUpdated` events, and does not poll a status
+command; the extension cannot supply footer text or terminal rows. It
 clears stale state on owner/process replacement; Serve action identity includes
 the instance fence, generation, and revision before routing the selected
 manifest process's command. The notification never invokes an action, repeats

@@ -2194,6 +2194,13 @@ fn is_apple_foundation_models_endpoint(base_url: &str) -> bool {
         && matches!(url.path().trim_end_matches('/'), "/v1")
 }
 
+fn custom_model_discovery_is_available(
+    base_url: &str,
+    apple_server_is_running: impl FnOnce() -> bool,
+) -> bool {
+    !is_apple_foundation_models_endpoint(base_url) || apple_server_is_running()
+}
+
 fn apple_foundation_model_defaults(api_name: &str) -> Option<crate::auth::custom::CustomModel> {
     let (context_window, reasoning_configurable, reasoning_values, reasoning_default) =
         match api_name {
@@ -2599,6 +2606,16 @@ fn register_custom_openai_provider(
 fn discover_models(
     cred: &crate::auth::custom::CustomCredential,
 ) -> Vec<crate::auth::custom::CustomModel> {
+    // Apple Foundation Models is an optional local integration. Its health
+    // endpoint gives us a cheap, exact readiness signal, so do not issue the
+    // noisier /v1/models request when `fm serve` is absent.
+    if !custom_model_discovery_is_available(
+        &cred.base_url,
+        apple_foundation_models_server_is_running,
+    ) {
+        return Vec::new();
+    }
+
     // Run blocking HTTP work on a separate thread so the reqwest::blocking
     // Client's internal tokio runtime is created and dropped outside the
     // outer #[tokio::main] async context, avoiding:

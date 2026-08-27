@@ -2,6 +2,28 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.6.2 — 2026-08-27
+
+### Fixed
+
+- Preserved bounded subagent summaries, fatal errors, usage, and the complete
+  sibling roster when owning-run cleanup removes the live host tree. Missing
+  active workers now settle as explicit `orphaned` diagnostic records instead
+  of making every worker disappear; an identical explicit retry can replace its
+  matching orphaned cache entry.
+- Skipped Apple Foundation Models `/v1/models` discovery when the optional
+  `fm serve` health probe says the local server is absent, eliminating the
+  routine loopback connection warning without hiding errors from other custom
+  providers.
+- Kept the interactive composer's hardware cursor visible in both retained-frame
+  renderers, including after panels, resize replays, renderer resumes, and
+  extreme narrow-width fallback rendering.
+- Rendered every bounded subagent in the persistent TUI transcript event and the
+  compatibility activity path regardless of ordinary `Ctrl+O` tool disclosure.
+- Added the one-time v0.6.2 managed-package migration so v0.6.0/v0.6.1
+  first-party bundles and Ygg Serve refresh to the exact hotfix version during
+  startup.
+
 ## 0.6.1 — 2026-08-27
 
 ### Changed

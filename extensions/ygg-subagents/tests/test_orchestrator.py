@@ -245,6 +245,46 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("Host-observed final summary", detail["body"])
         self.assertIn("Requested tool policy: granted mutation scope", detail["body"])
 
+    def test_host_cleanup_retains_failure_payload_and_sibling_roster(self):
+        failed_id = self.spawn("failed-worker", idempotency_key="failed-v1")["worker"]["id"]
+        sibling_id = self.spawn("running-sibling", idempotency_key="sibling-v1")["worker"]["id"]
+        self.host.start(failed_id)
+        self.host.start(sibling_id)
+        self.host.fail(failed_id, "fatal provider payload")
+
+        observed = self.orchestrator.status(
+            self.client, self.owner, {"target": failed_id}
+        )
+        self.assertEqual(observed["worker"]["last_error"], "fatal provider payload")
+
+        # Model the owning-run cleanup that used to make the complete local
+        # tree disappear on the next authoritative refresh.
+        self.host.owners[("ygg-subagents@test", "owner-a")] = []
+        self.host.agents.clear()
+        retained = self.orchestrator.status(
+            self.client, self.owner, {"target": failed_id}
+        )
+
+        self.assertEqual(retained["counts"], {"active": 0, "terminal": 2, "total": 2})
+        self.assertEqual(retained["worker"]["state"], "failed")
+        self.assertEqual(retained["worker"]["last_error"], "fatal provider payload")
+        sibling = next(
+            worker for worker in retained["workers"] if worker["id"] == sibling_id
+        )
+        self.assertEqual(sibling["state"], "orphaned")
+        self.assertIn("last observed state", sibling["last_error"])
+        self.assertEqual(len(self.snapshots[-1]["collection"]["nodes"]), 2)
+
+        self.host.spawns.clear()
+        retried = self.spawn("failed-worker", idempotency_key="failed-v1")
+        self.assertNotEqual(retried["worker"]["id"], failed_id)
+        self.assertFalse(retried["duplicate"])
+        workers = self.orchestrator.status(self.client, self.owner, {})["workers"]
+        self.assertEqual(
+            [worker["name"] for worker in workers],
+            ["running-sibling", "failed-worker"],
+        )
+
     def test_wall_timeout_interrupts_and_has_distinct_terminal_state(self):
         agent_id = self.spawn(timeout_seconds=5)["worker"]["id"]
         self.host.start(agent_id)

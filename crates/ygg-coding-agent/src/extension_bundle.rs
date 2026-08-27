@@ -701,8 +701,8 @@ pub(super) fn list_installed(root: &Path) -> anyhow::Result<Vec<InstalledBundle>
     Ok(installed)
 }
 
-/// Managed bundles left by Ygg 0.6.0 that need the one-time 0.6.1 migration.
-pub(super) fn v0_6_0_managed_bundle_ids(root: &Path) -> anyhow::Result<Vec<String>> {
+/// Managed bundles left by Ygg 0.6.0 or 0.6.1 that need the one-time 0.6.2 migration.
+pub(super) fn managed_bundle_ids_for_v0_6_2_migration(root: &Path) -> anyhow::Result<Vec<String>> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -724,7 +724,9 @@ pub(super) fn v0_6_0_managed_bundle_ids(root: &Path) -> anyhow::Result<Vec<Strin
         let Ok(record) = load_install_record(&entry.path(), &id) else {
             continue;
         };
-        if record.installed_by_ygg == "0.6.0" && record.requires_ygg == "=0.6.0" {
+        if matches!(record.installed_by_ygg.as_str(), "0.6.0" | "0.6.1")
+            && record.requires_ygg == format!("={}", record.installed_by_ygg)
+        {
             ids.push(id);
         }
     }
@@ -954,22 +956,26 @@ mod tests {
     }
 
     #[test]
-    fn finds_only_managed_v0_6_0_bundles_for_release_migration() {
+    fn finds_only_managed_v0_6_0_and_v0_6_1_bundles_for_v0_6_2_migration() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("extensions");
-        let archive = create_bundle(directory.path(), "test-extension", b"runtime");
-        install_local(&root, &archive, false).unwrap();
+        for id in ["legacy-zero", "legacy-one", "current"] {
+            let archive = create_bundle(directory.path(), id, b"runtime");
+            install_local(&root, &archive, false).unwrap();
+        }
 
-        let record_path = root.join("test-extension/install.json");
-        let mut record: serde_json::Value =
-            serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
-        record["installed_by_ygg"] = serde_json::json!("0.6.0");
-        record["requires_ygg"] = serde_json::json!("=0.6.0");
-        fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        for (id, version) in [("legacy-zero", "0.6.0"), ("legacy-one", "0.6.1")] {
+            let record_path = root.join(id).join("install.json");
+            let mut record: serde_json::Value =
+                serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+            record["installed_by_ygg"] = serde_json::json!(version);
+            record["requires_ygg"] = serde_json::json!(format!("={version}"));
+            fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+        }
 
         assert_eq!(
-            v0_6_0_managed_bundle_ids(&root).unwrap(),
-            vec!["test-extension"]
+            managed_bundle_ids_for_v0_6_2_migration(&root).unwrap(),
+            vec!["legacy-one", "legacy-zero"]
         );
     }
 

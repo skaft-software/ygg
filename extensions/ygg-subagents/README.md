@@ -2,7 +2,7 @@
 
 `ygg-subagents` is a small API `0.2` executable extension for Claude Code-like background workers. It launches named, single-purpose child conversations through Ygg's **host-owned `agent_sessions` service**. It is not an agent team, graph/recipe runtime, swarm, hosted-agent scheduler, or second Agent loop.
 
-Version `0.2.0` targets exactly Ygg `0.6.1`.
+Version `0.2.0` targets exactly Ygg `0.6.2`.
 
 ## Safety model
 
@@ -83,7 +83,7 @@ use the graph/recipe spike, built-in team mailboxes, or another scheduler.
 The release archive has one root directory named `ygg-subagents`. Install a local archive with:
 
 ```console
-ygg extension install --path ./ygg-subagents-0.6.1.tar.gz
+ygg extension install --path ./ygg-subagents-0.6.2.tar.gz
 ```
 
 Installation/discovery is inert: it does not enable, trust, or start the process. Explicitly enable and trust the selected manifest in full-access mode, preferably inside separate OS isolation:
@@ -139,13 +139,13 @@ There is intentionally no `max_tokens` argument. The child gets a fresh model
 context with the parent's model context/output limits and inherits the parent's
 optional cumulative session-token ceiling exactly (`null` remains unlimited).
 
-If no key is supplied, the extension derives one from the complete canonical request. Keys are scoped by Ygg to the extension principal and durable session owner. Identical retries return the same retained owning-run child; when a new root run clears that tree, both the host and extension prune the stale key instead of returning a nonexistent worker. Reuse with different input fails. The orchestration fingerprint is also placed in the canonical child message so a restart cannot accidentally make host-visible input equality narrower than extension input equality.
+If no key is supplied, the extension derives one from the complete canonical request. Keys are scoped by Ygg to the extension principal and durable session owner. Identical retries return the same host-present child. If a new owning run clears that live host record, the extension retains the last bounded summary/error and sibling roster as terminal diagnostic evidence; an explicit identical retry then replaces that orphaned cache entry and asks the host to create a new authoritative worker. Reuse with different input fails. The orchestration fingerprint is also placed in the canonical child message so a restart cannot accidentally make host-visible input equality narrower than extension input equality.
 
 The immediate result is an acknowledgement, not completion. Continue independent parent work and let Ygg deliver the worker's concise final output through its durable parent mailbox. Set `background: false` only when a bounded foreground wait is actually useful.
 
 ### `subagent_status`
 
-Refresh the authoritative owned tree. `target` may be a displayed name, stable agent ID, or host path. Without a target it returns a compact list. It never accepts a caller-supplied owner and never infers state from output prose.
+Refresh the authoritative host-present tree plus any bounded terminal evidence retained after owning-run cleanup. `target` may be a displayed name, stable agent ID, or host path. Without a target it returns a compact list. Missing active records become explicitly `orphaned`; captured summaries/errors and sibling rows do not disappear. It never accepts a caller-supplied owner and never infers state from output prose.
 
 ### `subagent_wait`
 
@@ -195,6 +195,8 @@ Worker states are authoritative projections of `agent/list`/`agent/wait`:
 - `interrupted` → `cancelled`, or `stopped`/`timed_out` when the extension issued that reason;
 - `shutdown`/missing active record → `orphaned`.
 
+When an owning run removes records before another status/wait observation, the extension keeps its last bounded terminal summaries, errors, usage, and complete sibling roster instead of deleting the local tree. Previously active missing records become explicit `orphaned` rows. An identical explicit spawn retry may replace its matching orphaned cache entry; the host remains authoritative for new execution.
+
 A supervised extension restart receives a new process generation but the host service retains trees by stable extension principal plus durable session owner. The next owner-scoped call resyncs with `agent/list`, marks recovered records as restarted, and restores the public task name, profile, idempotency fingerprint, host-created/started/completed/deadline timestamps, policy, usage, and stable session reference. Retrying the same spawn key returns the same child without creating another session. A complete process-host rebuild creates a new service boundary for mutation; retained transcript inspection remains separately read-only and provenance-authorized.
 
 Outstanding API requests are cooperatively cancelled. Cancelling a wait does not stop the worker. If spawn cancellation races a durable host create, the required idempotency key makes the next identical call safe; unsafe ambiguous work is not replayed with new input.
@@ -225,8 +227,10 @@ worker list or composer-adjacent activity block. The host returns per-worker
 structured phase/current tool, host-observed tool calls, disjoint provider token
 buckets, turn count, and priced cost. The extension places those values in
 generic activity `metrics`; it never supplies terminal rows or footer text. In
-the TUI, Ygg renders the latest owner-fenced worker activities immediately
-above the composer from native `AgentEvent::DelegationUpdated` events; it does
+the TUI, Ygg renders the complete latest owner-fenced worker roster as a
+persistent transcript event immediately above the composer from native
+`AgentEvent::DelegationUpdated` events; ordinary tool disclosure never truncates
+it. It does
 not poll `/subagents status` for the composer block. A worker row has the
 compact form `N Tool Calls • ↑input ↓output • $cost`; input includes the three
 disjoint uncached/cache-read/cache-write buckets, while reasoning remains a

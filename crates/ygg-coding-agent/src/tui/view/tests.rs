@@ -855,6 +855,33 @@ fn select_list_has_a_stable_filter_row_and_owns_the_only_cursor() {
 }
 
 #[test]
+fn composer_keeps_its_cursor_marker_at_extreme_narrow_widths() {
+    let mut shell = InteractiveShell::test_shell();
+    for width in [1, 2] {
+        let rendered = crate::tui::composer_surface::render_composer_surface(
+            &shell.state.borrow(),
+            width,
+            Instant::now(),
+        )
+        .join("\n");
+        assert_eq!(
+            rendered.matches(CURSOR_MARKER).count(),
+            1,
+            "width {width}: {rendered:?}"
+        );
+    }
+
+    open_select_panel(&mut shell, &["alpha"]);
+    let rendered = crate::tui::composer_surface::render_composer_surface(
+        &shell.state.borrow(),
+        2,
+        Instant::now(),
+    )
+    .join("\n");
+    assert_eq!(rendered.matches(CURSOR_MARKER).count(), 0);
+}
+
+#[test]
 fn select_list_long_filter_keeps_its_tail_and_cursor_in_narrow_panes() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(24, 12);

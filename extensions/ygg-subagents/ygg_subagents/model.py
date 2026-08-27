@@ -401,6 +401,7 @@ class Worker:
     restart_count: int = 0
     generation: int = 0
     delivery_state: str = "host_managed"
+    host_present: bool = True
 
     @property
     def terminal(self) -> bool:

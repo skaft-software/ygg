@@ -1871,7 +1871,7 @@ fn available_themes_from_dirs(global: &Path, project: &Path) -> Vec<String> {
     names.into_iter().collect()
 }
 
-/// Return the single theme exposed by the v0.6.1 runtime.
+/// Return the single theme exposed by the v0.6.2 runtime.
 #[allow(dead_code)]
 pub fn available_themes(_config: &Config) -> Vec<String> {
     vec![DEFAULT_THEME_NAME.to_owned()]

@@ -576,6 +576,22 @@ fn apple_foundation_models_health_requires_the_native_server_shape() {
 }
 
 #[test]
+fn apple_foundation_models_discovery_skips_an_absent_optional_server() {
+    assert!(!custom_model_discovery_is_available(
+        APPLE_FM_BASE_URL,
+        || false
+    ));
+    assert!(custom_model_discovery_is_available(
+        APPLE_FM_BASE_URL,
+        || true
+    ));
+    assert!(custom_model_discovery_is_available(
+        "http://127.0.0.1:8000/v1/",
+        || panic!("non-Apple discovery must not probe Apple Foundation Models")
+    ));
+}
+
+#[test]
 fn custom_model_cache_fingerprint_changes_with_configured_metadata() {
     let credential = custom_credential_fingerprint("key", &http::HeaderMap::new());
     let empty = custom_model_cache_fingerprint(&credential, &[]);

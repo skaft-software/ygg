@@ -217,19 +217,22 @@ pub async fn run(command: ExtensionCommand) -> anyhow::Result<()> {
     }
 }
 
-/// Upgrade managed v0.6.0 packages before the first normal v0.6.1 startup.
+/// Upgrade managed v0.6.0/v0.6.1 packages before the first normal v0.6.2 startup.
 ///
 /// Core and package updates are separate atomic operations. This narrowly
-/// repairs the only released transition that failed to perform those package
-/// operations, while leaving local and future package policy explicit.
-pub(crate) async fn migrate_v0_6_0_packages() {
-    if env!("CARGO_PKG_VERSION") != "0.6.1" {
+/// keeps exact-version first-party packages usable across the hotfix while
+/// preserving the v0.6.0 retirement repair.
+pub(crate) async fn migrate_v0_6_2_packages() {
+    let Ok(current) = Version::parse(env!("CARGO_PKG_VERSION")) else {
+        return;
+    };
+    if current != Version::new(0, 6, 2) {
         return;
     }
     let Ok(root) = extensions_root() else {
         return;
     };
-    let Ok(ids) = crate::extension_bundle::v0_6_0_managed_bundle_ids(&root) else {
+    let Ok(ids) = crate::extension_bundle::managed_bundle_ids_for_v0_6_2_migration(&root) else {
         return;
     };
 
@@ -237,11 +240,11 @@ pub(crate) async fn migrate_v0_6_0_packages() {
         if crate::extension_bundle::is_official_bundle(&id) {
             match crate::extension_bundle::install_official(&root, &id, true).await {
                 Ok(manifest) => crate::output::stdout_line(format!(
-                    "Migrated {} to {} for Ygg 0.6.1.",
+                    "Migrated {} to {} for Ygg {current}.",
                     manifest.id, manifest.version
                 )),
                 Err(error) => crate::output::stderr_line(format!(
-                    "warning: could not migrate {id} to Ygg 0.6.1: {error:#}; run `ygg extension update {id}`"
+                    "warning: could not migrate {id} to Ygg {current}: {error:#}; run `ygg extension update {id}`"
                 )),
             }
         } else if id == "ygg-hermes-memory" {
@@ -256,7 +259,6 @@ pub(crate) async fn migrate_v0_6_0_packages() {
         }
     }
 
-    let current = Version::parse(env!("CARGO_PKG_VERSION")).expect("package version is semantic");
     if installed_version().is_some_and(|version| version != current) {
         match install_official(&root, true).await {
             Ok(manifest) => crate::output::stdout_line(format!(
@@ -264,7 +266,7 @@ pub(crate) async fn migrate_v0_6_0_packages() {
                 manifest.id, manifest.version, manifest.target
             )),
             Err(error) => crate::output::stderr_line(format!(
-                "warning: could not migrate ygg-serve to Ygg 0.6.1: {error:#}; run `ygg extension update ygg-serve`"
+                "warning: could not migrate ygg-serve to Ygg {current}: {error:#}; run `ygg extension update ygg-serve`"
             )),
         }
     }

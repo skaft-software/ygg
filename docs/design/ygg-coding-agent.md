@@ -168,10 +168,11 @@ root's approved extensions, sandbox, model/reasoning and cache settings,
 compaction/completion/output policy, retry and turn bounds, and cost ceiling.
 During an active interactive run, the product schedules one nonblocking
 owner-scoped subagent status refresh every 250 ms, reduces the resulting fenced
-semantic snapshot, and renders at most two worker activities above the composer.
-It temporarily adds their structured priced cost to the host-owned footer; after
-`ygg-agent` mirrors the settled child usage into root `delegated_agent` records,
-the idle footer reads only the durable session total.
+semantic snapshot, and renders the complete bounded worker roster as one
+persistent transcript event above the composer. Ordinary tool disclosure never
+truncates that event. It temporarily adds structured priced child cost to the
+host-owned footer; after `ygg-agent` mirrors the settled child usage into root
+`delegated_agent` records, the idle footer reads only the durable session total.
 
 ## Skills
 
@@ -217,7 +218,7 @@ into the composed prompt.
 Commands run immediately when safe or queue to the next idle boundary when they
 need Agent/session ownership.
 
-Ygg v0.6.1 uses the compiled default theme only. Theme selection and filesystem
+Ygg v0.6.2 uses the compiled default theme only. Theme selection and filesystem
 theme discovery are disabled.
 
 - `/model [id]` — pick or select a model.

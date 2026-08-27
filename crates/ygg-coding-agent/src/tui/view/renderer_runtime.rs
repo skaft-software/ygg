@@ -129,6 +129,10 @@ pub(super) fn render_loop(
     clear_on_start: bool,
 ) {
     let mut tui = TUI::new(Box::new(terminal));
+    // Ygg's composer uses the terminal cursor itself; unlike Pi's editor, it
+    // does not paint a separate inverted cursor cell around CURSOR_MARKER.
+    // Restore visibility after panels, resize replays, and renderer resumes.
+    tui.set_show_hardware_cursor(true);
     tui.add_child(Box::new(ShellComponent::new(
         state.clone(),
         application_viewport,
