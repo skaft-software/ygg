@@ -644,13 +644,16 @@ fn panel_cell(text: &str) -> String {
     super::sanitize_for_terminal(text).replace('\n', " ")
 }
 
+pub(super) fn document_content_width(width: u16) -> u16 {
+    let inset = u16::from(width >= 5) * 2;
+    width.saturating_sub(inset.saturating_mul(2)).max(1)
+}
+
 /// `styled` text was already sanitized at its producing boundary and carries
 /// trusted theme ANSI that must survive wrapping.
 pub(super) fn document_visual_lines_styled(text: &str, width: u16, styled: bool) -> Vec<String> {
     let inset = usize::from(width >= 5) * 2;
-    let available = usize::from(width)
-        .saturating_sub(inset.saturating_mul(2))
-        .max(1);
+    let available = usize::from(document_content_width(width));
     let text = if styled {
         text.to_owned()
     } else {

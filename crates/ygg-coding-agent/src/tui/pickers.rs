@@ -500,7 +500,9 @@ where
 }
 
 /// Styled variant of [`read_only_document`]: the producer sanitizes its
-/// content once and applies trusted theme ANSI, which rendering preserves.
+/// content once and applies trusted theme ANSI, which rendering preserves. The
+/// refresh callback receives the current panel content width and is rerun
+/// immediately after a resize so pre-laid-out transcript surfaces stay exact.
 pub async fn read_only_document_live_styled<S, F, Fut>(
     shell: &mut InteractiveShell,
     input: &mut S,
@@ -510,7 +512,7 @@ pub async fn read_only_document_live_styled<S, F, Fut>(
 ) -> anyhow::Result<()>
 where
     S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
-    F: FnMut() -> Fut,
+    F: FnMut(u16) -> Fut,
     Fut: Future<Output = anyhow::Result<Option<String>>>,
 {
     shell.open_panel(Panel::ReadOnlyDocument {
@@ -551,14 +553,22 @@ where
                 if matches!(event, Event::Mouse(_)) {
                     continue;
                 }
+                let resized = matches!(&event, Event::Resize(_, _));
                 if shell.panel_input(&event).is_some() {
                     shell.render();
                     return Ok(());
                 }
+                if resized {
+                    let width = shell.read_only_document_width();
+                    if let Ok(Some(text)) = refresh(width).await {
+                        shell.update_read_only_document_styled(text);
+                    }
+                }
                 shell.render();
             }
             _ = refresh_tick.tick() => {
-                if let Ok(Some(text)) = refresh().await {
+                let width = shell.read_only_document_width();
+                if let Ok(Some(text)) = refresh(width).await {
                     shell.update_read_only_document_styled(text);
                     shell.render();
                 }
@@ -1095,6 +1105,41 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyEvent, KeyModifiers};
     use tokio_stream::wrappers::ReceiverStream;
+
+    #[tokio::test]
+    async fn live_styled_document_rerenders_at_panel_content_width_after_resize() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender.send(Ok(Event::Resize(44, 16))).await.unwrap();
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        drop(sender);
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(80, 20);
+        let widths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&widths);
+
+        read_only_document_live_styled(
+            &mut shell,
+            &mut input,
+            "worker transcript",
+            "initial".into(),
+            move |width| {
+                observed.lock().unwrap().push(width);
+                std::future::ready(Ok(Some(format!("rendered at {width}"))))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(widths.lock().unwrap().contains(&40));
+        assert!(!shell.has_panel());
+    }
 
     #[tokio::test]
     async fn ctrl_d_closes_a_picker_and_propagates_the_close_request() {

@@ -75,8 +75,8 @@ use self::terminal_text::{
 pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
-pub(crate) use self::tool_render::tool_display_label;
 use self::transcript_cache::TranscriptCache;
+pub(crate) use self::transcript_document::delegated_session_document;
 use self::transcript_history::{
     materialize_deferred_session_history, DeferredSessionHistory, NextTranscriptCommitId,
 };
@@ -1497,31 +1497,6 @@ fn understated_tool_output(theme: &YggTheme, text: &str) -> String {
     theme
         .role_rgb("muted")
         .map_or_else(|| text.to_owned(), |color| theme.rgb_fg(color, text))
-}
-
-/// Render user prompt text exactly as the main transcript renders it, for
-/// read-only documents such as delegated worker transcripts. No model-lab or
-/// prompt-colour provenance applies to delegated content.
-pub(crate) fn user_prompt_document_lines(
-    text: &str,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-) -> Vec<String> {
-    render_user_prompt(text, &None, None, renderer, theme, width)
-}
-
-/// Render assistant markdown exactly as the main transcript renders a settled
-/// assistant block.
-pub(crate) fn assistant_markdown_document_lines(
-    text: &str,
-    renderer: &RichRenderer,
-    theme: &YggTheme,
-    width: u16,
-) -> Vec<String> {
-    finish_transcript_block(
-        AssistantBlock::finalized(text.to_owned()).render_on_surface(renderer, theme, width, None),
-    )
 }
 
 fn finish_transcript_block(mut lines: Vec<String>) -> Vec<String> {
@@ -3016,10 +2991,12 @@ impl InteractiveShell {
         self.state.borrow().theme.clone()
     }
 
-    /// Current terminal column count, used by document producers that must
-    /// pre-render theme-styled lines at the live transcript width.
-    pub fn width(&self) -> u16 {
-        self.size.lock().expect("terminal size mutex poisoned").0
+    /// Content width inside the read-only panel's horizontal inset. Styled
+    /// transcript producers render at this width so the panel never has to
+    /// reflow already laid-out Markdown or tool surfaces.
+    pub fn read_only_document_width(&self) -> u16 {
+        let width = self.size.lock().expect("terminal size mutex poisoned").0;
+        self::panel_render::document_content_width(width)
     }
 
     pub fn set_runtime_config(&mut self, config: Config) {
@@ -4539,6 +4516,7 @@ mod terminal_text;
 mod tool_render;
 mod transcript_cache;
 mod transcript_commit;
+mod transcript_document;
 mod transcript_history;
 mod transcript_hydration;
 mod transcript_render;
