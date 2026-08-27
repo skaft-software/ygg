@@ -10,8 +10,9 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { Console } from "node:console";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -21,6 +22,7 @@ const API_VERSION = "0.2";
 const REQUIRED_FEATURES = ["request_cancellation", "content_parts"];
 const OPTIONAL_FEATURES = [
   "request_progress",
+  "artifacts",
   "lifecycle_events",
   "dynamic_tools",
 ];
@@ -39,7 +41,26 @@ const pendingHostRequests = new Map();
 const inflight = new Map();
 let nextHostRequestId = 1;
 let outputChain = Promise.resolve();
+let orderedInputChain = Promise.resolve();
 let bridge;
+
+class CancellationError extends Error {
+  constructor(message = "Pi compatibility request cancelled") {
+    super(message);
+    this.name = "CancellationError";
+    this.code = -32800;
+  }
+}
+
+function installProtocolSafeConsole() {
+  globalThis.console = new Console({
+    stdout: process.stderr,
+    stderr: process.stderr,
+    colorMode: false,
+  });
+}
+
+installProtocolSafeConsole();
 
 function parseArgs(argv) {
   const result = { extensions: [], agentDir: null, cwd: null, commandName: "pi" };
@@ -105,8 +126,16 @@ function diagnostic(message) {
   process.stderr.write(`${String(message).replaceAll("\n", " ")}\n`);
 }
 
+function boundedDiagnostic(message, maxBytes = 4096) {
+  const text = String(message).replaceAll("\n", " ");
+  diagnostic(Buffer.byteLength(text) <= maxBytes ? text : `${Buffer.from(text).subarray(0, maxBytes).toString("utf8")}…`);
+}
+
 async function requestHost(method, params) {
   const scope = scopes.getStore();
+  const signal = scope?.signal;
+  if (signal?.aborted) throw new CancellationError();
+
   const id = `pi:${nextHostRequestId++}`;
   const request = {
     jsonrpc: "2.0",
@@ -114,31 +143,39 @@ async function requestHost(method, params) {
     method,
     params,
   };
+  let rejectPending;
   const promise = new Promise((resolveReply, rejectReply) => {
+    rejectPending = rejectReply;
     pendingHostRequests.set(id, { resolve: resolveReply, reject: rejectReply });
   });
-  await send(request);
-  const signal = scope?.signal;
-  if (signal) {
-    if (signal.aborted) {
-      await cancelHostRequest(id);
-      throw new Error("Pi compatibility request cancelled");
-    }
-    signal.addEventListener("abort", () => void cancelHostRequest(id), {
-      once: true,
-    });
-  }
-  return promise;
-}
+  const onAbort = () => {
+    if (!pendingHostRequests.delete(id)) return;
+    rejectPending(new CancellationError());
+    void send({
+      jsonrpc: "2.0",
+      method: "$/cancelRequest",
+      params: { id, reason: "parent_cancelled" },
+    }).catch((error) => diagnostic(`Pi compatibility cancellation send failed: ${error}`));
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) onAbort();
 
-async function cancelHostRequest(id) {
-  const pending = pendingHostRequests.get(id);
-  if (!pending) return;
-  await send({
-    jsonrpc: "2.0",
-    method: "$/cancelRequest",
-    params: { id, reason: "parent_cancelled" },
-  });
+  if (pendingHostRequests.has(id)) {
+    try {
+      await send(request);
+    } catch (error) {
+      pendingHostRequests.delete(id);
+      signal?.removeEventListener("abort", onAbort);
+      throw error;
+    }
+  }
+
+  try {
+    return await promise;
+  } finally {
+    pendingHostRequests.delete(id);
+    signal?.removeEventListener("abort", onAbort);
+  }
 }
 
 function currentScope() {
@@ -308,7 +345,7 @@ function makeExtensionActions() {
     getActiveTools: () => bridge.toolNames,
     getAllTools: () => bridge.toolInfos,
     setActiveTools: () => unsupported("pi.setActiveTools"),
-    refreshTools: () => {},
+    refreshTools: () => scheduleToolRefresh(),
     getCommands: () => bridge.runner?.getRegisteredCommands?.() ?? [],
     setModel: () => Promise.reject(new Error("Pi compatibility API is not supported by Ygg: pi.setModel")),
     getThinkingLevel: () => "off",
@@ -395,6 +432,70 @@ function toolDefinitionToYgg(definition) {
   };
 }
 
+function setCurrentTools(tools, revision) {
+  bridge.tools = tools;
+  bridge.catalogRevision = revision;
+  bridge.toolNames = tools.map((tool) => tool.definition.name);
+  bridge.toolInfos = tools.map((tool) => ({
+    name: tool.definition.name,
+    description: tool.definition.description,
+    parameters: tool.definition.parameters,
+    promptGuidelines: tool.definition.promptGuidelines,
+    sourceInfo: tool.sourceInfo,
+  }));
+  bridge.toolSnapshots.set(revision, tools.slice());
+  while (bridge.toolSnapshots.size > 8) {
+    bridge.toolSnapshots.delete(bridge.toolSnapshots.keys().next().value);
+  }
+}
+
+function sameToolDefinition(left, right) {
+  return JSON.stringify(toolDefinitionToYgg(left.definition)) === JSON.stringify(toolDefinitionToYgg(right.definition));
+}
+
+function scheduleToolRefresh() {
+  if (!bridge) return;
+  if (!bridge.initialized) {
+    bridge.toolRefreshRequested = true;
+    return;
+  }
+  if (!bridge.features?.has("dynamic_tools")) return;
+  bridge.toolRefreshChain = bridge.toolRefreshChain
+    .then(() => refreshPublishedTools())
+    .catch((error) => diagnostic(`Pi dynamic tool publication failed: ${error instanceof Error ? error.message : String(error)}`));
+}
+
+async function refreshPublishedTools() {
+  const runtimeTools = bridge.runner.getAllRegisteredTools();
+  const runtimeByName = new Map(runtimeTools.map((tool) => [tool.definition.name, tool]));
+  const currentByName = new Map(bridge.tools.map((tool) => [tool.definition.name, tool]));
+  const removed = [...currentByName.keys()].filter((name) => !runtimeByName.has(name));
+  if (removed.length) {
+    const response = await requestHost("tools/unregister", { names: removed });
+    const accepted = new Set(response.tools ?? []);
+    setCurrentTools(
+      bridge.tools.filter((tool) => accepted.has(tool.definition.name)),
+      response.revision,
+    );
+  }
+
+  const publishedByName = new Map(bridge.tools.map((tool) => [tool.definition.name, tool]));
+  const changed = runtimeTools.filter((tool) => {
+    const published = publishedByName.get(tool.definition.name);
+    return !published || published !== tool || !sameToolDefinition(published, tool);
+  });
+  if (changed.length) {
+    const response = await requestHost("tools/register", {
+      tools: changed.map((tool) => toolDefinitionToYgg(tool.definition)),
+    });
+    const accepted = new Set(response.tools ?? []);
+    setCurrentTools(
+      runtimeTools.filter((tool) => accepted.has(tool.definition.name)),
+      response.revision,
+    );
+  }
+}
+
 function textFromContent(content) {
   return (content ?? [])
     .filter((part) => part?.type === "text")
@@ -411,6 +512,15 @@ async function lowerContent(content) {
       continue;
     }
     if (part.type === "image" && typeof part.data === "string") {
+      if (!bridge.features.has("artifacts")) {
+        lowered.push({
+          type: "text",
+          text: part.alt
+            ? `[Pi extension image: ${String(part.alt)}]`
+            : "[Pi extension returned an image, but Ygg artifact support was not negotiated]",
+        });
+        continue;
+      }
       const bytes = Buffer.from(part.data, "base64");
       const mimeType = String(part.mimeType ?? "image/png");
       const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -485,8 +595,26 @@ async function loadBridge(params) {
     commandName: args.commandName,
     toolNames: [],
     toolInfos: [],
+    toolSnapshots: new Map(),
+    toolRefreshChain: Promise.resolve(),
+    toolRefreshRequested: false,
+    catalogRevision: 0,
+    features: new Set(REQUIRED_FEATURES),
+    terminal: {
+      pendingCompletedTurn: null,
+      pendingAgentMessages: null,
+      sessionShutdown: false,
+    },
+    pendingPiToolCalls: new Map(),
+    startedPiToolCalls: new Map(),
+    hostToolCallIds: new Map(),
     initialized: false,
   };
+
+  const offeredOptionalFeatures = new Set(params.protocol?.optional_features ?? []);
+  for (const feature of OPTIONAL_FEATURES) {
+    if (offeredOptionalFeatures.has(feature)) bridge.features.add(feature);
+  }
 
   const packageRoot = findPiPackageRoot(bridge.extensionPaths);
   const pi = await import(pathToFileURL(join(packageRoot, "dist/index.js")).href);
@@ -519,18 +647,23 @@ async function loadBridge(params) {
     registerNativeProvider: () => unsupported("pi.registerProvider"),
     unregisterProvider: () => unsupported("pi.unregisterProvider"),
   });
-  bridge.runner.bindCommandContext();
+  bridge.runner.bindCommandContext({
+    waitForIdle: async () => {},
+    newSession: async () => unsupported("ctx.newSession"),
+    fork: async () => unsupported("ctx.fork"),
+    navigateTree: async () => unsupported("ctx.navigateTree"),
+    switchSession: async () => unsupported("ctx.switchSession"),
+    reload: async () => unsupported("ctx.reload"),
+  });
   bridge.runner.setUIContext(makeUi(), "rpc");
+  bridge.runner.onError((error) => {
+    const location = error?.extensionPath ? ` in ${error.extensionPath}` : "";
+    const event = error?.event ? ` during ${error.event}` : "";
+    boundedDiagnostic(`Pi extension handler failed${location}${event}: ${error?.error ?? error}`);
+  });
 
-  bridge.tools = bridge.runner.getAllRegisteredTools();
-  bridge.toolNames = bridge.tools.map((tool) => tool.definition.name);
-  bridge.toolInfos = bridge.tools.map((tool) => ({
-    name: tool.definition.name,
-    description: tool.definition.description,
-    parameters: tool.definition.parameters,
-    promptGuidelines: tool.definition.promptGuidelines,
-    sourceInfo: tool.sourceInfo,
-  }));
+  const initialTools = bridge.runner.getAllRegisteredTools();
+  setCurrentTools(initialTools, 0);
   bridge.commands = bridge.runner.getRegisteredCommands();
   bridge.unsupported = [];
   for (const extension of loaded.extensions) {
@@ -545,6 +678,10 @@ async function loadBridge(params) {
 async function handleInitialize(message) {
   await loadBridge(message.params ?? {});
   bridge.initialized = true;
+  if (bridge.toolRefreshRequested) {
+    bridge.toolRefreshRequested = false;
+    setImmediate(() => scheduleToolRefresh());
+  }
   const tools = bridge.tools.map((tool) => toolDefinitionToYgg(tool.definition));
   for (const warning of bridge.unsupported) diagnostic(`Pi compatibility: ${warning} is unavailable in Ygg`);
   return {
@@ -559,9 +696,9 @@ async function handleInitialize(message) {
     ],
     protocol: {
       version: API_VERSION,
-      features: [...REQUIRED_FEATURES, ...OPTIONAL_FEATURES],
+      features: [...bridge.features],
       limits: { max_concurrent_requests: 4 },
-      lifecycle_events: LIFECYCLE_EVENTS,
+      ...(bridge.features.has("lifecycle_events") ? { lifecycle_events: LIFECYCLE_EVENTS } : {}),
     },
   };
 }
@@ -580,28 +717,45 @@ async function runScoped(id, operation) {
       },
       operation,
     );
+  } catch (error) {
+    if (controller.signal.aborted && !(error instanceof CancellationError)) {
+      throw new CancellationError();
+    }
+    throw error;
   } finally {
     inflight.delete(keyOf(id));
   }
 }
 
+function enqueueByName(map, name, value) {
+  const queue = map.get(name) ?? [];
+  queue.push(value);
+  if (queue.length > 64) queue.shift();
+  map.set(name, queue);
+}
+
+function dequeueByName(map, name) {
+  const queue = map.get(name);
+  const value = queue?.shift();
+  if (queue?.length === 0) map.delete(name);
+  return value;
+}
+
 async function callPiTool(message) {
   const name = message.params?.name;
-  const registered = bridge.tools.find((tool) => tool.definition.name === name);
+  const revision = message.params?.catalog_revision ?? bridge.catalogRevision;
+  const tools = bridge.toolSnapshots.get(revision);
+  if (!tools) throw new Error(`unknown or retired Pi tool catalog revision ${revision}`);
+  const registered = tools.find((tool) => tool.definition.name === name);
   if (!registered) throw new Error(`unknown bridged Pi tool ${name}`);
   const definition = registered.definition;
-  let input = message.params?.arguments ?? {};
-  if (definition.prepareArguments) input = definition.prepareArguments(input);
-  const toolCallId = `pi-ygg-${String(message.id)}`;
-  const callEvent = { type: "tool_call", toolCallId, toolName: name, input };
-  const gate = await bridge.runner.emitToolCall(callEvent);
-  if (gate?.block) {
-    return {
-      content: [{ type: "text", text: gate.reason ?? "Blocked by Pi extension" }],
-      is_error: true,
-    };
+  const started = dequeueByName(bridge.startedPiToolCalls, name);
+  let input = started?.input ?? message.params?.arguments ?? {};
+  if (started?.input === undefined && definition.prepareArguments) {
+    input = definition.prepareArguments(input);
   }
-  await bridge.runner.emit({ type: "tool_execution_start", toolCallId, toolName: name, args: input });
+  const toolCallId = started?.id ?? `pi-ygg-${String(message.id)}`;
+  const callEvent = { type: "tool_call", toolCallId, toolName: name, input };
   let result;
   try {
     result = await definition.execute(
@@ -622,17 +776,9 @@ async function callPiTool(message) {
       bridge.runner.createContext(),
     );
   } catch (error) {
-    await bridge.runner.emit({
-      type: "tool_execution_end",
-      toolCallId,
-      toolName: name,
-      result: { content: [{ type: "text", text: String(error) }] },
-      isError: true,
-    });
     throw error;
   }
 
-  const resultContent = await lowerContent(result?.content);
   const toolResultEvent = {
     type: "tool_result",
     toolCallId,
@@ -643,16 +789,7 @@ async function callPiTool(message) {
     isError: result?.isError === true,
   };
   const transformed = await bridge.runner.emitToolResult(toolResultEvent);
-  const finalContent = transformed?.content
-    ? await lowerContent(transformed.content)
-    : resultContent;
-  await bridge.runner.emit({
-    type: "tool_execution_end",
-    toolCallId,
-    toolName: name,
-    result,
-    isError: result?.isError === true,
-  });
+  const finalContent = await lowerContent(transformed?.content ?? result?.content);
   return {
     content: finalContent,
     is_error: transformed?.isError ?? result?.isError === true,
@@ -680,13 +817,22 @@ async function runHook(message) {
   const hook = message.params?.hook;
   const payload = message.params?.payload ?? {};
   if (hook === "before_tool_call") {
+    const toolCallId = `pi-ygg-hook-${String(message.id)}`;
+    const registered = bridge.tools.find((tool) => tool.definition.name === payload.name);
+    let input = payload.arguments ?? {};
+    if (registered?.definition.prepareArguments) {
+      input = registered.definition.prepareArguments(input);
+    }
     const event = {
       type: "tool_call",
-      toolCallId: `pi-ygg-hook-${String(message.id)}`,
+      toolCallId,
       toolName: payload.name,
-      input: payload.arguments ?? {},
+      input,
     };
     const result = await bridge.runner.emitToolCall(event);
+    if (!result?.block && bridge.toolNames.includes(payload.name)) {
+      enqueueByName(bridge.pendingPiToolCalls, payload.name, { id: toolCallId, input });
+    }
     return {
       disposition: result?.block
         ? { action: "deny", reason: result.reason ?? "Blocked by Pi extension" }
@@ -696,14 +842,16 @@ async function runHook(message) {
     };
   }
   if (hook === "after_tool_call") {
-    await bridge.runner.emitToolResult({
-      type: "tool_result",
-      toolCallId: `pi-ygg-hook-${String(message.id)}`,
-      toolName: payload.name,
-      input: payload.arguments ?? {},
-      content: [{ type: "text", text: String(payload.output ?? "") }],
-      isError: payload.is_error === true,
-    });
+    if (!bridge.toolNames.includes(payload.name)) {
+      await bridge.runner.emitToolResult({
+        type: "tool_result",
+        toolCallId: `pi-ygg-hook-${String(message.id)}`,
+        toolName: payload.name,
+        input: payload.arguments ?? {},
+        content: [{ type: "text", text: String(payload.output ?? "") }],
+        isError: payload.is_error === true,
+      });
+    }
     return { disposition: { action: "continue" }, context: [], notifications: [] };
   }
   if (hook === "before_prompt") {
@@ -714,11 +862,15 @@ async function runHook(message) {
     };
   }
   if (hook === "after_response") {
-    await bridge.runner.emit({
-      type: "agent_end",
-      messages: [{ role: "assistant", content: [{ type: "text", text: String(payload.response ?? "") }] }],
-    });
-    await bridge.runner.emit({ type: "agent_settled" });
+    const messages = [
+      { role: "assistant", content: [{ type: "text", text: String(payload.response ?? "") }] },
+    ];
+    if (bridge.terminal.pendingCompletedTurn) {
+      bridge.terminal.pendingCompletedTurn = null;
+      await finishTurn(messages);
+    } else {
+      bridge.terminal.pendingAgentMessages = messages;
+    }
     return { disposition: { action: "continue" }, context: [], notifications: [] };
   }
   throw new Error(`unsupported Ygg hook ${hook}`);
@@ -734,33 +886,71 @@ async function collectContext(message) {
   return context;
 }
 
+async function finishTurn(messages) {
+  await bridge.runner.emit({
+    type: "turn_end",
+    turnIndex: 0,
+    message: messages[0] ?? { role: "assistant", content: [{ type: "text", text: "" }] },
+    toolResults: [],
+  });
+  await bridge.runner.emit({ type: "agent_end", messages });
+  await bridge.runner.emit({ type: "agent_settled" });
+  bridge.terminal.pendingAgentMessages = null;
+  bridge.pendingPiToolCalls.clear();
+  bridge.startedPiToolCalls.clear();
+  bridge.hostToolCallIds.clear();
+}
+
+async function emitSessionShutdown() {
+  if (bridge.terminal.sessionShutdown) return;
+  bridge.terminal.sessionShutdown = true;
+  await bridge.runner.emit({ type: "session_shutdown", reason: "quit" });
+}
+
 async function handleLifecycle(method, params) {
   if (method === "session/started") {
+    bridge.terminal.sessionShutdown = false;
     await bridge.runner.emit({ type: "session_start", reason: "startup" });
   } else if (method === "session/settled") {
-    await bridge.runner.emit({ type: "session_shutdown", reason: "quit" });
+    await emitSessionShutdown();
   } else if (method === "turn/started") {
+    bridge.terminal.pendingCompletedTurn = null;
+    bridge.terminal.pendingAgentMessages = null;
     await bridge.runner.emit({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
     await bridge.runner.emit({ type: "agent_start" });
   } else if (method === "turn/settled") {
-    await bridge.runner.emit({
-      type: "turn_end",
-      turnIndex: 0,
-      message: { role: "assistant", content: [{ type: "text", text: "" }] },
-      toolResults: [],
-    });
-    await bridge.runner.emit({ type: "agent_settled" });
+    if (params.outcome === "completed" && !bridge.terminal.pendingAgentMessages) {
+      bridge.terminal.pendingCompletedTurn = params;
+      return;
+    }
+    const messages = bridge.terminal.pendingAgentMessages ?? [];
+    await finishTurn(messages);
   } else if (method === "tool/started") {
+    const hostId = params.tool_call_id ?? "ygg-tool";
+    let piId = hostId;
+    if (bridge.toolNames.includes(params.tool_name)) {
+      const pending = dequeueByName(bridge.pendingPiToolCalls, params.tool_name);
+      piId = pending?.id ?? hostId;
+      enqueueByName(
+        bridge.startedPiToolCalls,
+        params.tool_name,
+        pending ?? { id: piId, input: undefined },
+      );
+      bridge.hostToolCallIds.set(hostId, piId);
+    }
     await bridge.runner.emit({
       type: "tool_execution_start",
-      toolCallId: params.tool_call_id ?? "ygg-tool",
+      toolCallId: piId,
       toolName: params.tool_name,
       args: {},
     });
   } else if (method === "tool/settled") {
+    const hostId = params.tool_call_id ?? "ygg-tool";
+    const piId = bridge.hostToolCallIds.get(hostId) ?? hostId;
+    bridge.hostToolCallIds.delete(hostId);
     await bridge.runner.emit({
       type: "tool_execution_end",
-      toolCallId: params.tool_call_id ?? "ygg-tool",
+      toolCallId: piId,
       toolName: params.tool_name,
       result: {},
       isError: params.outcome !== "completed",
@@ -780,7 +970,7 @@ async function handleRequest(message) {
   if (message.method === "hook/run") return runHook(message);
   if (message.method === "context/collect") return collectContext(message);
   if (message.method === "shutdown") {
-    await bridge.runner.emit({ type: "session_shutdown", reason: "quit" });
+    await emitSessionShutdown();
     setImmediate(() => process.exit(0));
     return {};
   }
@@ -819,12 +1009,29 @@ async function onMessage(message) {
     const result = await runScoped(message.id, () => handleRequest(message));
     await send({ jsonrpc: "2.0", id: message.id, result });
   } catch (error) {
+    const code = error instanceof CancellationError ? -32800 : -32000;
     await send({
       jsonrpc: "2.0",
       id: message.id,
-      error: { code: -32000, message: error instanceof Error ? error.message : String(error) },
+      error: { code, message: error instanceof Error ? error.message : String(error) },
     });
   }
+}
+
+function dispatchIncoming(message) {
+  const isResponse = message?.id !== undefined && !message?.method;
+  const isCancellation = message?.method === "$/cancelRequest";
+  if (isResponse || isCancellation) {
+    void onMessage(message);
+    return;
+  }
+  if (message?.method === "tool/call") {
+    void orderedInputChain.then(() => onMessage(message));
+    return;
+  }
+  orderedInputChain = orderedInputChain
+    .then(() => onMessage(message))
+    .catch((error) => boundedDiagnostic(`Pi compatibility dispatch failed: ${error}`));
 }
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -837,7 +1044,7 @@ input.on("line", (line) => {
     diagnostic(`Pi compatibility received invalid JSON: ${error}`);
     return;
   }
-  void onMessage(message);
+  dispatchIncoming(message);
 });
 input.on("close", () => process.exit(0));
 process.on("uncaughtException", (error) => diagnostic(`Pi compatibility uncaught exception: ${error.stack ?? error}`));

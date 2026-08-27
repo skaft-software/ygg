@@ -14,7 +14,7 @@ use ygg_agent::extension_process::{
 };
 use ygg_agent::EXTENSION_API_VERSION_0_2;
 
-const BRIDGE_VERSION: &str = "0.1.0";
+const BRIDGE_VERSION: &str = "0.1.1";
 const LINK_RECORD: &str = "pi-link.json";
 const MAX_SOURCE_PATH_BYTES: usize = 4096;
 
@@ -241,7 +241,6 @@ fn manifest(
             tools: Vec::new(),
             commands: vec![name.to_owned()],
             hooks: vec![
-                ExtensionHook::BeforePrompt,
                 ExtensionHook::AfterResponse,
                 ExtensionHook::BeforeToolCall,
                 ExtensionHook::AfterToolCall,
@@ -398,7 +397,11 @@ mod tests {
         .unwrap();
         assert_eq!(manifest.entrypoint.command, "node");
         assert_eq!(manifest.contributes.commands, ["pi-example"]);
-        assert_eq!(manifest.contributes.hooks.len(), 4);
+        assert_eq!(manifest.contributes.hooks.len(), 3);
+        assert!(!manifest
+            .contributes
+            .hooks
+            .contains(&ExtensionHook::BeforePrompt));
         assert!(manifest.contributes.context);
     }
 }

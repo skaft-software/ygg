@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+use rusqlite::types::Type;
 use rusqlite::{params, Connection, OpenFlags};
 
 const CATALOG_DIRECTORY: &str = ".catalog";
@@ -145,20 +146,26 @@ impl SessionCatalog {
             .connection
             .prepare("SELECT id, file_size, modified_ns, status, title, configured_model, configured_reasoning, message_count FROM sessions")?;
         let rows = statement.query_map([], |row| {
-            Ok((
+            let configured_reasoning_type = row.get_ref(6)?.data_type();
+            let configured_reasoning = match configured_reasoning_type {
+                Type::Null => None,
+                Type::Text => Some(row.get::<_, String>(6)?),
+                _ => return Ok(None),
+            };
+            Ok(Some((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
+                configured_reasoning,
                 row.get::<_, i64>(7)?,
-            ))
+            )))
         })?;
         let mut sessions = HashMap::new();
         for row in rows {
-            let (
+            let Some((
                 id,
                 file_size,
                 modified_ns,
@@ -167,7 +174,10 @@ impl SessionCatalog {
                 configured_model,
                 configured_reasoning,
                 message_count,
-            ) = row?;
+            )) = row?
+            else {
+                continue;
+            };
             let Ok(message_count) = usize::try_from(message_count) else {
                 continue;
             };
@@ -323,4 +333,58 @@ fn prepare_private_database_file(path: &Path) -> anyhow::Result<()> {
     }
     drop(file);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_text_reasoning_rows_are_ignored_for_transcript_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace_store = temp.path().join("sessions");
+        std::fs::create_dir(&workspace_store).unwrap();
+        let catalog = SessionCatalog::open(&workspace_store).unwrap();
+        catalog
+            .connection
+            .execute_batch(
+                "DROP TABLE sessions;
+                 CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY NOT NULL,
+                     file_size INTEGER NOT NULL,
+                     modified_ns INTEGER NOT NULL,
+                     status INTEGER NOT NULL,
+                     title TEXT,
+                     configured_model TEXT,
+                     configured_reasoning,
+                     message_count INTEGER NOT NULL
+                 ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        catalog
+            .connection
+            .execute(
+                "INSERT INTO sessions (id, file_size, modified_ns, status, title, configured_model, configured_reasoning, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, TRUE, ?7)",
+                params!["invalid-reasoning", 1_i64, 2_i64, STATUS_SUMMARY, "title", "model", 3_i64],
+            )
+            .unwrap();
+        catalog
+            .connection
+            .execute(
+                "INSERT INTO sessions (id, file_size, modified_ns, status, title, configured_model, configured_reasoning, message_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params!["valid-reasoning", 1_i64, 2_i64, STATUS_SUMMARY, "title", "model", "high", 3_i64],
+            )
+            .unwrap();
+
+        let loaded = catalog.load().unwrap();
+
+        assert!(!loaded.contains_key("invalid-reasoning"));
+        assert!(matches!(
+            loaded.get("valid-reasoning").map(|entry| &entry.summary),
+            Some(CachedTranscriptSummary::Summary {
+                configured_reasoning: Some(reasoning),
+                ..
+            }) if reasoning == "high"
+        ));
+    }
 }

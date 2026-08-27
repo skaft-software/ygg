@@ -187,10 +187,12 @@ pub(super) fn compile_surface_plan<'a>(
             }
         );
     // A highlighted prompt gets one painted row above and below its content,
-    // matching the breathing room in the active composer. User cards already
-    // carried that interior padding, including on no-colour terminals.
-    let vertical_padding_rows =
-        usize::from(highlighted_user || (kind == "user" && chrome == ThemeSurfaceChrome::Card));
+    // matching the breathing room in the active composer. Static prompts can
+    // opt into the same rows, while user cards retain their interior padding.
+    let vertical_padding_rows = usize::from(
+        highlighted_user
+            || (kind == "user" && (layout.prompt_padding || chrome == ThemeSurfaceChrome::Card)),
+    );
     let leading_rows = usize::from(has_heading_row) + vertical_padding_rows;
     let trailing_rows = usize::from(has_bottom_row) + vertical_padding_rows;
     SurfacePlan {

@@ -6248,6 +6248,22 @@ fn tool_lifecycle_styles_are_visible_in_terminal_cells() {
 }
 
 #[test]
+fn prompt_padding_adds_static_prompt_background_rows() {
+    let theme = crate::tui::theme::test_theme_from_source("[layout]\nprompt_padding = true");
+    let prompt = TranscriptBlock::User {
+        text: "padded prompt".into(),
+        model_lab: None,
+        prompt_color: None,
+        persisted: true,
+    };
+
+    let plan = compile_surface_plan(None, &prompt, &theme, 120);
+
+    assert_eq!(plan.geometry.leading_rows, 1);
+    assert_eq!(plan.geometry.trailing_rows, 1);
+}
+
+#[test]
 fn pie_keeps_bounded_cards_without_synthetic_padding() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::{self, TerminalBackground};
