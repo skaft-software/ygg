@@ -158,16 +158,16 @@ pub(crate) struct ResponseBuilder {
     pub(crate) stop_reason: Option<StopReason>,
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) observed_indices: HashSet<usize>,
-    aggregate_content_bytes: usize,
+    pub(crate) aggregate_content_bytes: usize,
     /// Bytes retained outside canonical response parts while a codec waits for
     /// enough provider data to classify them. Together with
     /// `aggregate_content_bytes`, this may never exceed the response cap.
-    buffered_content_bytes: usize,
-    event_count: usize,
+    pub(crate) buffered_content_bytes: usize,
+    pub(crate) event_count: usize,
     /// Raw provider events are counted before decoding because compatibility
     /// buffering can otherwise consume arbitrarily many events without
     /// producing a canonical [`StreamEvent`].
-    provider_event_count: usize,
+    pub(crate) provider_event_count: usize,
     pub(crate) provider_to_canonical_indices: HashMap<String, usize>,
     pub(crate) temp_buffers: HashMap<String, String>,
     /// Content buffered by a compatibility parser until it is known whether it

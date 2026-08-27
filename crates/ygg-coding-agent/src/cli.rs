@@ -13,6 +13,8 @@ use crate::config::{
     ToolPolicy,
 };
 use crate::extension_package::ExtensionCommand;
+use crate::migrate::MigrationCommand;
+use crate::pi::PiCommand;
 use crate::session_commands::SessionCommand;
 
 #[derive(Clone, Debug, Subcommand)]
@@ -26,6 +28,16 @@ pub enum TopLevelCommand {
     Extension {
         #[command(subcommand)]
         command: ExtensionCommand,
+    },
+    /// Inspect another coding-agent setup and plan a bounded migration.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommand,
+    },
+    /// Link existing Pi extensions through Ygg's compatibility host.
+    Pi {
+        #[command(subcommand)]
+        command: PiCommand,
     },
     /// Check for, and install, a newer Ygg release.
     Update {
@@ -91,6 +103,15 @@ pub struct Cli {
         conflicts_with = "continue_"
     )]
     pub resume: Option<Option<String>>,
+    /// Fork a session by id, or open the session picker when omitted.
+    #[arg(
+        long,
+        value_name = "ID",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with_all = ["continue_", "resume"]
+    )]
+    pub fork: Option<Option<String>>,
     /// Model id override.
     #[arg(long)]
     pub model: Option<String>,
@@ -118,8 +139,8 @@ pub struct Cli {
     /// Use chronological ASCII output without cursor control.
     #[arg(long)]
     pub plain: bool,
-    /// Mouse ownership: auto/terminal/off preserve native selection and
-    /// scrollback; app captures the mouse for a bounded semantic viewport.
+    /// Mouse ownership: auto/terminal/off preserve native gestures; app
+    /// captures wheel scrolling and drag selection for the semantic viewport.
     #[arg(long, value_name = "MODE")]
     pub mouse: Option<String>,
     /// Emit reasoning deltas in print mode.
@@ -1261,6 +1282,11 @@ fn build_config_with_global_path(
             let id = id.trim().to_owned();
             (!id.is_empty()).then_some(id)
         }))
+    } else if let Some(id) = cli.fork {
+        ResumeSelector::Fork(id.and_then(|id| {
+            let id = id.trim().to_owned();
+            (!id.is_empty()).then_some(id)
+        }))
     } else {
         ResumeSelector::New
     };
@@ -1352,6 +1378,7 @@ mod tests {
             print: false,
             continue_: false,
             resume: None,
+            fork: None,
             model: None,
             reasoning: None,
             reasoning_mode: None,
@@ -1592,6 +1619,38 @@ mod tests {
         let config = config_with_empty_global(cli, directory.path()).unwrap();
         assert!(matches!(config.resume, ResumeSelector::Continue));
         assert!(matches!(config.mode, Mode::Interactive));
+    }
+
+    #[test]
+    fn clap_parses_fork_and_rejects_resume_conflicts() {
+        let parsed = Cli::try_parse_from(["ygg", "--fork", "source-id"]).unwrap();
+        assert_eq!(parsed.fork, Some(Some("source-id".into())));
+        assert!(Cli::try_parse_from(["ygg", "--fork", "--resume"]).is_err());
+        assert!(Cli::try_parse_from(["ygg", "--fork", "--continue"]).is_err());
+    }
+
+    #[test]
+    fn fork_without_an_id_is_distinct_from_fork_by_id() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.fork = Some(None);
+        assert!(matches!(
+            config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .resume,
+            ResumeSelector::Fork(None)
+        ));
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.fork = Some(Some("session-id".into()));
+        assert!(matches!(
+            config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .resume,
+            ResumeSelector::Fork(Some(id)) if id == "session-id"
+        ));
     }
 
     #[test]
@@ -2345,6 +2404,55 @@ mod tests {
                 command: ExtensionCommand::Update {
                     name: None,
                     path: Some(_),
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn pi_migration_dry_run_parses_without_a_prompt() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "migrate",
+            "pi",
+            "--dry-run",
+            "--json",
+            "--project",
+            "./workspace",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Migrate {
+                command: MigrationCommand::Pi {
+                    dry_run: true,
+                    json: true,
+                    project: Some(_),
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn pi_install_parses_without_a_prompt() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "pi",
+            "install",
+            "./private-extension.ts",
+            "--pi-home",
+            "./pi/agent",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Pi {
+                command: PiCommand::Install {
+                    pi_home: Some(_),
+                    ..
                 }
             })
         ));

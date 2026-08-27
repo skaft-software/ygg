@@ -2290,7 +2290,8 @@ mod tests {
                 .map(|theme| format!("{:?}", theme.layout().density))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            3
+            2,
+            "Pie keeps its airy v0.6 geometry while Clawed and Kodex share the compact density"
         );
         assert_eq!(bundled_theme_summaries().len(), 3);
     }

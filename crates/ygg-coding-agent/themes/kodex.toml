@@ -1,8 +1,8 @@
 # "Kodex" — a quiet monochrome folio with one cyan pen.
-# Shaded prompt rectangle, dim secondary text, and bullet rails. Very archival.
+# Shaded prompt rectangle, dim secondary text, and the shared Ygg transcript geometry.
 [metadata]
 name = "Kodex"
-description = "A quiet monochrome folio with one cyan pen: a shaded prompt rectangle, dim secondary text, and bullet rails. Very archival."
+description = "A quiet monochrome folio with one cyan pen and a shaded prompt rectangle. Very archival."
 author = "Ygg theme pack"
 version = "1"
 terminal = "light-dark"
@@ -209,106 +209,17 @@ bullet = "*"
 reasoning = "..."
 wordmark = "kodex"
 
-[surfaces.user]
-chrome = "band"
-heading = "none"
-padding = 0
-width = "full"
-align = "left"
-max_width = 96
-narrow_chrome = "plain"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.assistant]
-chrome = "plain"
-heading = "none"
-padding = 0
-width = "content"
-align = "left"
-max_width = 96
-narrow_chrome = "plain"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.reasoning]
-chrome = "plain"
-heading = "none"
-padding = 0
-width = "content"
-align = "left"
-max_width = 92
-narrow_chrome = "plain"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.tool]
-chrome = "rail"
-heading = "none"
-padding = 1
-width = "content"
-align = "left"
-max_width = 96
-narrow_chrome = "rail"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.shell]
-chrome = "rail"
-heading = "none"
-padding = 1
-width = "content"
-align = "left"
-max_width = 96
-narrow_chrome = "rail"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.notice]
-chrome = "plain"
-heading = "none"
-padding = 0
-width = "content"
-align = "left"
-max_width = 92
-narrow_chrome = "plain"
-narrow_heading = "none"
-narrow_padding = 0
-
-[surfaces.outcome]
-chrome = "rule"
-heading = "overline"
-label = "archived"
-padding = 0
-width = "content"
-align = "left"
-max_width = 80
-narrow_chrome = "plain"
-narrow_heading = "inline"
-narrow_label = "archived"
-narrow_padding = 0
-
-[surfaces.compaction]
-chrome = "plain"
-heading = "none"
-padding = 0
-width = "content"
-align = "left"
-max_width = 92
-narrow_chrome = "plain"
-narrow_heading = "none"
-narrow_padding = 0
-
 [layout]
-density = "compact"
+density = "comfortable"
 show_header = false
 show_footer = true
 show_status_line = true
 show_reasoning = true
 show_panel_borders = true
-transcript_inset = 0
+prompt_padding = true
+transcript_inset = 2
 composer_padding = 1
-narrow_breakpoint = 60
+narrow_breakpoint = 64
 narrow_show_header = false
 narrow_show_footer = true
 narrow_show_status_line = true

@@ -84,9 +84,11 @@ complete display text once; therefore `finish()` equals static parsing regardles
 of chunk boundaries.
 
 `StreamingRenderCache` retains committed rows at a stable width/theme revision
-and lays out only newly committed blocks plus the mutable preview. Width or theme
-changes trigger a deterministic reflow. Callers should keep one cache per live
-surface.
+and lays out only newly committed blocks plus the mutable preview.
+`render_line_update` returns the byte-identical physical-row prefix and only the
+replacement suffix, so callers do not clone committed history on every token.
+Width or theme changes return a zero-length stable prefix and trigger
+deterministic reflow. Callers should keep one cache per live surface.
 
 ## Layout contract
 
@@ -188,6 +190,7 @@ Run the smoke benchmark in release mode:
 cargo run --release --example render_bench --features benchmarks
 ```
 
-It reports static parse/render time, 7-byte incremental layout time, streaming
-reparse bytes, and syntax-cache hit/miss data. The counters are also public for
+It reports static parse/render time plus legacy-document, full-lines, and
+stable-tail 7-byte streaming timings and allocation totals, along with streaming
+reparse bytes and syntax-cache hit/miss data. The counters are also public for
 application telemetry and regression tests.

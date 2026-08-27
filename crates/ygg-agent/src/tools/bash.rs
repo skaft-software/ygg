@@ -6,6 +6,8 @@
 //! `PATH`, then `sh`; an explicit host-configured shell path takes precedence.
 
 #[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::Stdio;
@@ -377,7 +379,7 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(unix)]
 struct Capture {
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: VecDeque<u8>,
     total_bytes: usize,
     truncated: bool,
 }
@@ -387,7 +389,7 @@ impl Capture {
     fn empty() -> Self {
         Self {
             head: Vec::new(),
-            tail: Vec::new(),
+            tail: VecDeque::new(),
             total_bytes: 0,
             truncated: false,
         }
@@ -398,7 +400,7 @@ impl Capture {
     /// otherwise retain balanced head/tail evidence within `budget`.
     fn fit_to_budget(&mut self, budget: usize) {
         if self.total_bytes <= budget {
-            self.head.append(&mut self.tail);
+            self.head.extend(self.tail.drain(..));
             self.truncated = false;
             return;
         }
@@ -441,7 +443,8 @@ impl Capture {
             format!("{name}: {lines} lines\n{text}\ncomplete_{name}=true")
         } else {
             let head = String::from_utf8_lossy(&self.head);
-            let tail = String::from_utf8_lossy(&self.tail);
+            let tail_bytes = self.tail.iter().copied().collect::<Vec<_>>();
+            let tail = String::from_utf8_lossy(&tail_bytes);
             // Drop the partial line at each cut so the output stays line-oriented.
             let head = head.rsplit_once('\n').map(|(kept, _)| kept).unwrap_or("");
             let tail = tail.split_once('\n').map(|(_, kept)| kept).unwrap_or("");
@@ -498,7 +501,7 @@ async fn read_bounded_with_progress<R: AsyncRead + Unpin>(
                     chunk = &chunk[take..];
                 }
                 if !chunk.is_empty() && tail_cap > 0 {
-                    capture.tail.extend_from_slice(chunk);
+                    capture.tail.extend(chunk.iter().copied());
                     if capture.tail.len() > tail_cap {
                         let excess = capture.tail.len() - tail_cap;
                         capture.tail.drain(..excess);

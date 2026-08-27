@@ -5,7 +5,12 @@ use sexy_tui_rs::{wrap_text_with_ansi, FrameUpdate};
 
 use super::renderer_runtime::ShellFrameState;
 use super::shell_chrome::{append_viewport_chrome, shell_chrome};
-use super::{fit_line, semantic_separator, ShellOverlay, ShellState};
+use super::transcript_selection::{
+    selection_position_for_visual_cell, visual_line_for_transcript_position, TranscriptPosition,
+};
+use super::{
+    fit_line, semantic_separator, ShellOverlay, ShellState, TranscriptBlock, ViewportAnchor,
+};
 
 pub(super) fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
@@ -49,9 +54,8 @@ pub(super) fn transcript_viewport_capacity_for_state(state: &ShellState, width: 
     }
     let chrome = shell_chrome(state, width, Instant::now());
     let transcript = transcript_lines(state, width);
-    let maximum = max_scroll_for_available(transcript.len(), chrome.transcript_rows);
-    let scrolled = state.scroll_from_bottom.get().min(maximum) > 0;
-    transcript_viewport_capacity(chrome.transcript_rows, scrolled)
+    let scroll = resolved_scroll_from_bottom(state, transcript.len(), chrome.transcript_rows);
+    transcript_viewport_capacity(chrome.transcript_rows, scroll > 0)
 }
 
 /// Wrap each logical overlay row independently and terminate its SGR state.
@@ -83,15 +87,157 @@ pub(super) fn overlay_lines(state: &ShellState, width: u16) -> Vec<String> {
     }
 }
 
+fn viewport_anchor_for_visual_row(
+    state: &ShellState,
+    visual_row: usize,
+    desired_screen_row: usize,
+) -> Option<ViewportAnchor> {
+    let (block, block_start, block_length) = {
+        let cache = state.transcript_cache.borrow();
+        let block = cache
+            .block_starts
+            .partition_point(|start| *start <= visual_row)
+            .checked_sub(1)?;
+        (
+            block,
+            *cache.block_starts.get(block)?,
+            *cache.block_lengths.get(block)?,
+        )
+    };
+    let fallback_block_row = visual_row.checked_sub(block_start)?;
+    if fallback_block_row >= block_length {
+        return None;
+    }
+    let commit_id = *state.transcript_commit_ids.get(block)?;
+    let position = selection_position_for_visual_cell(state, visual_row, 0);
+    // Tool and local-shell copy intentionally excludes disclosed output. A
+    // visual row is the only honest fallback for those non-copy surfaces.
+    let semantic = position.is_some()
+        && !matches!(
+            state.transcript.get(block),
+            Some(TranscriptBlock::Tool(_) | TranscriptBlock::Shell(_))
+        );
+    let position = position.unwrap_or(TranscriptPosition {
+        block,
+        offset: 0,
+        trailing_affinity: false,
+    });
+    Some(ViewportAnchor {
+        commit_id,
+        block_hint: block,
+        text_offset: position.offset,
+        trailing_affinity: position.trailing_affinity,
+        fallback_block_row,
+        fallback_visual_row: visual_row,
+        desired_screen_row,
+        semantic,
+    })
+}
+
+fn capture_viewport_anchor(state: &ShellState, start: usize, end: usize) {
+    if state.viewport_anchor.get().is_some() || start >= end {
+        return;
+    }
+    let mut fallback = None;
+    for (desired_screen_row, visual_row) in (start..end).enumerate() {
+        let Some(anchor) = viewport_anchor_for_visual_row(state, visual_row, desired_screen_row)
+        else {
+            continue;
+        };
+        if anchor.semantic {
+            state.viewport_anchor.set(Some(anchor));
+            return;
+        }
+        fallback.get_or_insert(anchor);
+    }
+    state.viewport_anchor.set(fallback);
+}
+
+fn resolve_viewport_anchor(state: &ShellState, mut anchor: ViewportAnchor) -> usize {
+    let block = if state.transcript_commit_ids.get(anchor.block_hint) == Some(&anchor.commit_id) {
+        Some(anchor.block_hint)
+    } else {
+        state
+            .transcript_commit_ids
+            .iter()
+            .position(|commit_id| *commit_id == anchor.commit_id)
+    };
+    let Some(block) = block else {
+        return anchor.fallback_visual_row;
+    };
+    anchor.block_hint = block;
+    state.viewport_anchor.set(Some(anchor));
+
+    let (start, length) = {
+        let cache = state.transcript_cache.borrow();
+        let Some(start) = cache.block_starts.get(block).copied() else {
+            return anchor.fallback_visual_row;
+        };
+        let Some(length) = cache.block_lengths.get(block).copied() else {
+            return anchor.fallback_visual_row;
+        };
+        (start, length)
+    };
+    if length == 0 {
+        return start;
+    }
+    if anchor.semantic {
+        let position = TranscriptPosition {
+            block,
+            offset: anchor.text_offset,
+            trailing_affinity: anchor.trailing_affinity,
+        };
+        if let Some(row) = visual_line_for_transcript_position(state, position) {
+            return row.clamp(start, start.saturating_add(length - 1));
+        }
+    }
+    start.saturating_add(anchor.fallback_block_row.min(length - 1))
+}
+
+fn anchored_scroll_from_bottom(
+    state: &ShellState,
+    transcript_len: usize,
+    available: usize,
+    maximum: usize,
+) -> Option<usize> {
+    let anchor = state.viewport_anchor.get()?;
+    let capacity = transcript_viewport_capacity(available, true).max(1);
+    let desired = anchor.desired_screen_row.min(capacity - 1);
+    let anchor_row = resolve_viewport_anchor(state, anchor).min(transcript_len);
+    let start = anchor_row.saturating_sub(desired);
+    let end = start.saturating_add(capacity).min(transcript_len);
+    Some(transcript_len.saturating_sub(end).min(maximum))
+}
+
+pub(super) fn resolved_scroll_from_bottom(
+    state: &ShellState,
+    transcript_len: usize,
+    available: usize,
+) -> usize {
+    let maximum = max_scroll_for_available(transcript_len, available);
+    let requested = state.scroll_from_bottom.get().min(maximum);
+    let scroll = if state.follow_tail {
+        0
+    } else {
+        anchored_scroll_from_bottom(state, transcript_len, available, maximum).unwrap_or(requested)
+    };
+    state.scroll_from_bottom.set(scroll);
+    scroll
+}
+
 fn transcript_viewport_lines(state: &ShellState, width: u16, available: usize) -> Vec<String> {
     let transcript = transcript_lines(state, width);
-    let max_scroll = max_scroll_for_available(transcript.len(), available);
-    let scroll = state.scroll_from_bottom.get().min(max_scroll);
+    let scroll = resolved_scroll_from_bottom(state, transcript.len(), available);
     let scrolled = scroll > 0;
     let capacity = transcript_viewport_capacity(available, scrolled);
     let end = transcript.len().saturating_sub(scroll);
     let start = end.saturating_sub(capacity);
     let mut lines = transcript[start..end].to_vec();
+    if scrolled {
+        capture_viewport_anchor(state, start, end);
+    } else if state.follow_tail {
+        state.viewport_anchor.set(None);
+    }
     drop(transcript);
 
     if scrolled && lines.len() < available {
@@ -140,18 +286,20 @@ pub(super) fn render_shell_viewport_update(
 ) -> FrameUpdate {
     let repaint_theme = frame.initialized && frame.theme_epoch != state.theme_epoch;
     let resized = frame.initialized && (frame.width != width || frame.height != state.size.1);
+    let entering_application_viewport = frame.initialized && !frame.application_viewport;
     frame.initialized = true;
     frame.width = width;
     frame.height = state.size.1;
     frame.theme_epoch = state.theme_epoch;
     frame.transcript_epoch = state.transcript_epoch;
     frame.verbose_tools = state.verbose_tools;
+    frame.application_viewport = true;
     FrameUpdate {
         stable_prefix: 0,
         replacement: render_shell_viewport_at(state, width, now),
         pinned: None,
         resize_replay: None,
-        reanchor_viewport: repaint_theme || resized,
+        reanchor_viewport: repaint_theme || resized || entering_application_viewport,
         rebuild_scrollback: false,
     }
 }

@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, Notify, OwnedSemaphorePermit, Semaphore};
 use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
 
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
@@ -521,7 +521,7 @@ impl DelegationBinding {
     /// telemetry stream. Child runs deliberately do not receive this stream.
     pub(crate) fn telemetry_receiver(
         &self,
-    ) -> Option<mpsc::UnboundedReceiver<DelegationTelemetrySnapshot>> {
+    ) -> Option<watch::Receiver<Option<DelegationTelemetrySnapshot>>> {
         self.is_root().then(|| self.manager.attach_telemetry())
     }
 
@@ -1058,12 +1058,15 @@ pub(crate) struct DelegationManager {
     journal_order: Mutex<()>,
     permits: RwLock<Arc<Semaphore>>,
     changed: Notify,
+    /// Lock order when both are needed: `state` → `telemetry`.
     telemetry: Mutex<DelegationTelemetryState>,
 }
 
 struct DelegationTelemetryState {
     revision: u64,
-    sender: Option<mpsc::UnboundedSender<DelegationTelemetrySnapshot>>,
+    // A slow frontend needs only the newest roster. `watch` coalesces updates
+    // instead of retaining an unbounded queue of increasingly large snapshots.
+    sender: Option<watch::Sender<Option<DelegationTelemetrySnapshot>>>,
 }
 
 struct ManagerState {
@@ -1360,8 +1363,8 @@ impl ProvenanceJournal {
 }
 
 impl DelegationManager {
-    fn attach_telemetry(&self) -> mpsc::UnboundedReceiver<DelegationTelemetrySnapshot> {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    fn attach_telemetry(&self) -> watch::Receiver<Option<DelegationTelemetrySnapshot>> {
+        let (sender, receiver) = watch::channel(None);
         {
             let mut telemetry = self
                 .telemetry
@@ -1451,7 +1454,6 @@ impl DelegationManager {
                 }
             })
             .collect::<Vec<_>>();
-        drop(state);
 
         let total_cost_microdollars = children
             .iter()
@@ -1471,10 +1473,15 @@ impl DelegationManager {
             failure_class,
         };
         if let Some(sender) = telemetry.sender.clone() {
-            if sender.send(snapshot).is_err() {
+            if sender.send(Some(snapshot)).is_err() {
                 telemetry.sender = None;
             }
         }
+        // Keep the state snapshot and telemetry revision/send in one ordered
+        // critical section. Otherwise an older captured roster can be
+        // published after a newer one and become the watch channel's latest.
+        drop(telemetry);
+        drop(state);
     }
 
     fn detach_telemetry(&self) {
@@ -5190,7 +5197,11 @@ mod tests {
         let manager = writable_manager_with_core_tools(&team_directory);
         let root = manager.root_binding();
         let mut telemetry = root.telemetry_receiver().expect("root telemetry stream");
-        let first = telemetry.recv().await.expect("initial snapshot");
+        telemetry.changed().await.expect("initial snapshot");
+        let first = telemetry
+            .borrow_and_update()
+            .clone()
+            .expect("initial snapshot");
         let service = root
             .extension_service("principal", "parent-session", "owner")
             .unwrap();
@@ -5201,7 +5212,11 @@ mod tests {
             )
             .unwrap();
         let agent_id = result["agent_id"].as_str().unwrap().to_owned();
-        let spawned = telemetry.recv().await.expect("spawn snapshot");
+        telemetry.changed().await.expect("spawn snapshot");
+        let spawned = telemetry
+            .borrow_and_update()
+            .clone()
+            .expect("spawn snapshot");
         let child = spawned
             .children
             .iter()
@@ -5217,7 +5232,11 @@ mod tests {
             "read".into(),
             "path=src/lib.rs".to_owned(),
         );
-        let using_tool = telemetry.recv().await.expect("tool-start snapshot");
+        telemetry.changed().await.expect("tool-start snapshot");
+        let using_tool = telemetry
+            .borrow_and_update()
+            .clone()
+            .expect("tool-start snapshot");
         let child = using_tool
             .children
             .iter()
@@ -5226,6 +5245,32 @@ mod tests {
         assert!(using_tool.revision > spawned.revision);
         assert_eq!(child.tool_use_count, 1);
         assert_eq!(child.current_tool.as_deref(), Some("read"));
+    }
+
+    #[tokio::test]
+    async fn telemetry_stream_coalesces_slow_consumer_updates_to_the_latest_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = writable_manager(directory.path());
+        let root = manager.root_binding();
+        let mut telemetry = root.telemetry_receiver().expect("root telemetry stream");
+        telemetry.changed().await.expect("initial snapshot");
+        let initial_revision = telemetry
+            .borrow_and_update()
+            .as_ref()
+            .expect("initial snapshot")
+            .revision;
+
+        for revision in 0..128 {
+            manager.publish_external_failure("test", &format!("failure-{revision}"));
+        }
+
+        telemetry.changed().await.expect("coalesced snapshot");
+        let latest = telemetry
+            .borrow_and_update()
+            .clone()
+            .expect("coalesced snapshot");
+        assert_eq!(latest.revision, initial_revision + 128);
+        assert_eq!(latest.failure_reason.as_deref(), Some("failure-127"));
     }
 
     #[test]

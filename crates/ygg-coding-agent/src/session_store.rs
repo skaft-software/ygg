@@ -26,11 +26,16 @@ const MAX_SESSION_METADATA_BYTES: usize = 64 * 1024;
 const MAX_SESSION_NAME_CHARS: usize = 120;
 const MAX_SESSION_TAGS: usize = 32;
 const MAX_SESSION_TAG_CHARS: usize = 48;
+/// Marker file recording the canonical workspace path in a workspace
+/// directory. Plain text (one path); older binaries ignore it.
+const WORKSPACE_MARKER: &str = ".workspace";
 
 /// Filesystem-backed sessions scoped to one canonical workspace.
 #[derive(Clone, Debug)]
 pub struct SessionStore {
     dir: PathBuf,
+    root: PathBuf,
+    workspace: Option<PathBuf>,
 }
 
 /// Metadata used by startup and session pickers.
@@ -53,7 +58,14 @@ pub struct SessionMeta {
     pub forked_from_session_id: Option<String>,
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub forked_from_entry_id: Option<String>,
+    /// Number of persisted message entries in the active branch.
+    pub message_count: usize,
     pub modified: SystemTime,
+    /// Canonical workspace path recorded in the store's `.workspace` marker,
+    /// when known. Enables cross-workspace browsing without reversing the
+    /// workspace-key hash.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub workspace: Option<PathBuf>,
 }
 
 /// Compact active-branch state derived without constructing a full `Session`.
@@ -693,6 +705,21 @@ pub fn active_branch_title(session: &Session) -> String {
     active_branch_catalog_title(session).unwrap_or_else(|| "(empty session)".to_owned())
 }
 
+fn active_branch_message_count(session: &Session) -> usize {
+    let mut count = 0usize;
+    let mut cursor = session.head_ref();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(id) else {
+            break;
+        };
+        if matches!(entry.value, EntryValue::Message(_)) {
+            count = count.saturating_add(1);
+        }
+        cursor = entry.parent.as_ref();
+    }
+    count
+}
+
 pub(crate) fn trim_title(title: &str) -> String {
     const LIMIT: usize = 60;
     let mut normalized = String::with_capacity(LIMIT + 3);
@@ -825,6 +852,7 @@ struct TranscriptSummary {
     title: Option<String>,
     configured_model: Option<String>,
     configured_reasoning: Option<String>,
+    message_count: usize,
     usage_records: Vec<SessionUsageRecord>,
 }
 
@@ -1113,11 +1141,18 @@ fn summarize_session_with_usage(
     let mut oldest_title = None;
     let mut configured_model = None;
     let mut configured_reasoning = None;
+    let mut message_count = 0usize;
     let mut cursor = head.as_ref();
     while let Some(id) = cursor {
         let Some(entry) = entries.get(id) else {
             break;
         };
+        if matches!(
+            entry.kind,
+            SummaryEntryKind::User | SummaryEntryKind::Assistant
+        ) {
+            message_count = message_count.saturating_add(1);
+        }
         if entry.kind == SummaryEntryKind::User {
             if let Some(title) = &entry.title {
                 oldest_title = Some(title.clone());
@@ -1135,6 +1170,7 @@ fn summarize_session_with_usage(
         title: oldest_title,
         configured_model,
         configured_reasoning,
+        message_count,
         usage_records,
     })
 }
@@ -1144,12 +1180,95 @@ impl SessionStore {
     pub fn new(session_dir: &Path, workspace: &Path) -> Self {
         Self {
             dir: session_dir.join(workspace_key(workspace)),
+            root: session_dir.to_path_buf(),
+            workspace: Some(workspace.to_path_buf()),
+        }
+    }
+
+    /// Create a store for an already-known workspace directory, recovering the
+    /// workspace path from its `.workspace` marker when present.
+    ///
+    /// Used for cross-workspace browsing and mutation (the workspace-key hash
+    /// is one-way, so the marker is the only way to learn which workspace a
+    /// directory belongs to). Older binaries ignore the marker file.
+    pub fn for_directory(dir: &Path, root: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            root: root.to_path_buf(),
+            workspace: Self::read_workspace_marker(dir),
         }
     }
 
     /// The workspace-scoped session directory.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The shared sessions root containing every workspace directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The canonical workspace path, when this store knows it.
+    pub fn workspace(&self) -> Option<&Path> {
+        self.workspace.as_deref()
+    }
+
+    /// Write the workspace path marker so future (and other) processes can
+    /// display and scope sessions from this directory.
+    pub fn write_workspace_marker(&self) -> anyhow::Result<()> {
+        let Some(workspace) = self.workspace.as_ref() else {
+            anyhow::bail!("store has no workspace to record");
+        };
+        std::fs::create_dir_all(&self.dir)?;
+        let marker = self.dir.join(WORKSPACE_MARKER);
+        crate::auth::write_private_atomic(
+            &marker,
+            format!("{}\n", workspace.display()).as_bytes(),
+            ".workspace-",
+        )?;
+        Ok(())
+    }
+
+    /// Read the workspace path marker from a workspace directory, if present.
+    pub(crate) fn read_workspace_marker(dir: &Path) -> Option<PathBuf> {
+        let bytes = std::fs::read(dir.join(WORKSPACE_MARKER)).ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let path = text.lines().next()?.trim().to_owned();
+        if path.is_empty() {
+            return None;
+        }
+        Some(PathBuf::from(path))
+    }
+
+    /// List sessions across every workspace under the shared root, newest
+    /// first. Each row carries its workspace path when the store marker is
+    /// readable; otherwise `workspace` is `None`.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub fn list_all(&self) -> Vec<SessionMeta> {
+        let mut all = Vec::new();
+        for entry in std::fs::read_dir(&self.root).into_iter().flatten() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            let is_dir = match entry.file_type() {
+                Ok(file_type) => file_type.is_dir(),
+                Err(_) => false,
+            };
+            if !is_dir {
+                continue;
+            }
+            let dir = entry.path();
+            let store = if dir == self.dir {
+                self.clone()
+            } else {
+                Self::for_directory(&dir, &self.root)
+            };
+            all.extend(store.list());
+        }
+        all.sort_by_key(|meta| std::cmp::Reverse(meta.modified));
+        all
     }
 
     /// Allocate a new JSONL path. The caller supplies a timestamp for testability.
@@ -1237,6 +1356,7 @@ impl SessionStore {
         id: String,
         fallback_title: String,
         metadata: SessionUserMetadata,
+        message_count: usize,
     ) -> SessionMeta {
         let title = metadata
             .name
@@ -1263,7 +1383,9 @@ impl SessionStore {
             purge_after_ms: metadata.purge_after_ms,
             forked_from_session_id: metadata.forked_from_session_id,
             forked_from_entry_id: metadata.forked_from_entry_id,
+            message_count,
             modified,
+            workspace: self.workspace.clone(),
         }
     }
 
@@ -1290,9 +1412,9 @@ impl SessionStore {
             .then(|| self.load_metadata(&id))
             .transpose()?
             .unwrap_or_default();
-        let meta = transcript
-            .title
-            .map(|title| self.meta_from_parts(candidate, id, title, metadata));
+        let meta = transcript.title.map(|title| {
+            self.meta_from_parts(candidate, id, title, metadata, transcript.message_count)
+        });
         Ok(SessionCatalogInspection {
             catalog: SessionCatalogEntry {
                 meta,
@@ -1328,6 +1450,7 @@ impl SessionStore {
                 title,
                 configured_model,
                 configured_reasoning,
+                message_count,
             } = summary
             else {
                 anyhow::bail!("session {id:?} is unreadable");
@@ -1338,8 +1461,9 @@ impl SessionStore {
                 .transpose()?
                 .unwrap_or_default();
             return Ok(SessionCatalogEntry {
-                meta: title
-                    .map(|title| self.meta_from_parts(candidate, id.to_owned(), title, metadata)),
+                meta: title.map(|title| {
+                    self.meta_from_parts(candidate, id.to_owned(), title, metadata, message_count)
+                }),
                 configured_model,
                 configured_reasoning,
             });
@@ -1354,6 +1478,11 @@ impl SessionStore {
                     .map(|meta| meta.title.clone()),
                 configured_model: inspection.catalog.configured_model.clone(),
                 configured_reasoning: inspection.catalog.configured_reasoning.clone(),
+                message_count: inspection
+                    .catalog
+                    .meta
+                    .as_ref()
+                    .map_or(0, |meta| meta.message_count),
             };
             catalog.apply(
                 &[CatalogUpdate {
@@ -1387,6 +1516,7 @@ impl SessionStore {
             id.to_owned(),
             title,
             self.load_metadata(id)?,
+            active_branch_message_count(session),
         )))
     }
 
@@ -1412,6 +1542,7 @@ impl SessionStore {
                 title: active_branch_catalog_title(session),
                 configured_model,
                 configured_reasoning,
+                message_count: active_branch_message_count(session),
             },
         };
         let (mut catalog, _) = SessionCatalog::open_loaded(&self.dir)?;
@@ -1443,12 +1574,16 @@ impl SessionStore {
         id: String,
         summary: CachedTranscriptSummary,
     ) -> Option<SessionMeta> {
-        let fallback_title = match summary {
-            CachedTranscriptSummary::Summary { title, .. } => title?,
-            CachedTranscriptSummary::Unreadable => "(unreadable session)".to_owned(),
+        let (fallback_title, message_count) = match summary {
+            CachedTranscriptSummary::Summary {
+                title,
+                message_count,
+                ..
+            } => (title?, message_count),
+            CachedTranscriptSummary::Unreadable => ("(unreadable session)".to_owned(), 0),
         };
         let metadata = self.load_metadata(&id).unwrap_or_default();
-        Some(self.meta_from_parts(candidate, id, fallback_title, metadata))
+        Some(self.meta_from_parts(candidate, id, fallback_title, metadata, message_count))
     }
 
     fn discover_with_summarizer<F>(
@@ -1505,6 +1640,7 @@ impl SessionStore {
                             title: transcript.title,
                             configured_model: transcript.configured_model,
                             configured_reasoning: transcript.configured_reasoning,
+                            message_count: transcript.message_count,
                         };
                         if let Some(fingerprint) = fingerprint.filter(|_| catalog.is_some()) {
                             updates.push(CatalogUpdate {
@@ -1929,6 +2065,50 @@ mod tests {
         assert_eq!(first.dir(), second.dir());
         assert_ne!(first.dir(), other.dir());
         assert!(first.dir().starts_with(root.path()));
+    }
+
+    #[test]
+    fn list_all_discovers_marked_workspace_stores_and_message_counts() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let store_a = SessionStore::new(root.path(), workspace_a.path());
+        let store_b = SessionStore::new(root.path(), workspace_b.path());
+        std::fs::create_dir_all(store_a.dir()).unwrap();
+        std::fs::create_dir_all(store_b.dir()).unwrap();
+        store_a.write_workspace_marker().unwrap();
+        store_b.write_workspace_marker().unwrap();
+
+        let path_a = store_a.new_path("a");
+        let mut session_a = Session::create(&path_a).unwrap();
+        session_a
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("a".into())],
+            })))
+            .unwrap();
+        drop(session_a);
+        let path_b = store_b.new_path("b");
+        let mut session_b = Session::create(&path_b).unwrap();
+        session_b
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("b".into())],
+            })))
+            .unwrap();
+        session_b
+            .append(EntryValue::Message(Message::User(ygg_ai::UserMessage {
+                content: vec![UserPart::Text("b2".into())],
+            })))
+            .unwrap();
+        drop(session_b);
+
+        let all = store_a.list_all();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|meta| {
+            meta.workspace.as_deref() == Some(workspace_a.path()) && meta.message_count == 1
+        }));
+        assert!(all.iter().any(|meta| {
+            meta.workspace.as_deref() == Some(workspace_b.path()) && meta.message_count == 2
+        }));
     }
 
     #[test]

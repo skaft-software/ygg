@@ -49,6 +49,24 @@ fn welcome_workspace(state: &ShellState) -> String {
     path.display().to_string()
 }
 
+fn render_pi_startup(state: &ShellState, width: u16) -> Vec<String> {
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let accent = |text: &str| state.theme.fg("accent", text);
+    let muted = |text: &str| state.theme.dim(text);
+    [
+        format!("{} {}", accent("ygg"), muted(&version)),
+        muted("escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more"),
+        muted("Press ctrl+o to show full startup help and loaded resources."),
+        String::new(),
+        muted(
+            "Ygg can explain its own features and look up its docs. Ask it how to use or extend Ygg.",
+        ),
+    ]
+    .into_iter()
+    .map(|line| fit_line(&line, width))
+    .collect()
+}
+
 pub(super) fn render_welcome_card(
     state: &ShellState,
     width: u16,
@@ -60,6 +78,13 @@ pub(super) fn render_welcome_card(
     };
     if state.overlay.is_some() || width < 24 || max_rows < 7 {
         return Vec::new();
+    }
+    if state
+        .theme
+        .resolve::<String>("startup")
+        .is_some_and(|startup| startup.trim().eq_ignore_ascii_case("pi"))
+    {
+        return render_pi_startup(state, width);
     }
 
     const ROWS: usize = 6;
@@ -74,8 +99,25 @@ pub(super) fn render_welcome_card(
         .is_compiled_default()
         .then(|| state.theme.model_rgb(state.model_lab))
         .flatten();
-    let logo =
-        crate::tui::splash::render_logo(&state.theme, logo_width, ROWS, elapsed, adaptive_accent);
+    let splash_color = state.theme.role_rgb("splash");
+    let logo = crate::tui::splash::render_logo(
+        &state.theme,
+        logo_width,
+        ROWS,
+        elapsed,
+        adaptive_accent,
+        splash_color,
+    );
+    let splash_text = |text: &str| {
+        splash_color
+            .map(|_| state.theme.fg("splash", text))
+            .unwrap_or_else(|| text.to_owned())
+    };
+    let splash_bold = |text: &str| {
+        splash_color
+            .map(|_| state.theme.bold(&state.theme.fg("splash", text)))
+            .unwrap_or_else(|| state.theme.bold(text))
+    };
 
     let model = if state.model_display.trim().is_empty() {
         state.model.as_str()
@@ -87,44 +129,112 @@ pub(super) fn render_welcome_card(
     } else {
         model
     };
-    let text = [
-        format!(
-            "{} {}",
-            state.theme.bold(&state.theme.fg("model_accent", "ygg")),
-            state.theme.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
-        ),
-        String::new(),
-        state
-            .theme
-            .fg("foreground", &format!("{model} / {}", state.reasoning)),
-        state.theme.dim(&welcome_workspace(state)),
-        if state.safe_mode {
+    let text = if splash_color.is_some() {
+        [
             format!(
                 "{} {}",
-                state.theme.dim("permissions:"),
-                state.theme.bold(&state.theme.fg("accent", "safe mode"))
-            )
-        } else {
+                splash_bold("ygg"),
+                splash_text(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            ),
+            String::new(),
+            splash_text(&format!("{model} / {}", state.reasoning)),
+            splash_text(&welcome_workspace(state)),
+            if state.safe_mode {
+                format!(
+                    "{} {}",
+                    splash_text("permissions:"),
+                    splash_bold("safe mode")
+                )
+            } else {
+                format!(
+                    "{} {}",
+                    splash_text("permissions:"),
+                    splash_bold("full access")
+                )
+            },
+            format!("{} {}", splash_bold("Ctrl+D"), splash_text("to exit")),
+        ]
+    } else {
+        [
             format!(
                 "{} {}",
-                state.theme.dim("permissions:"),
-                state.theme.bold(&state.theme.fg("error", "full access"))
-            )
-        },
-        format!(
-            "{} {}",
-            state.theme.bold("Ctrl+D"),
-            state.theme.dim("to exit")
-        ),
-    ];
+                state.theme.bold(&state.theme.fg("model_accent", "ygg")),
+                state.theme.dim(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+            ),
+            String::new(),
+            state
+                .theme
+                .fg("foreground", &format!("{model} / {}", state.reasoning)),
+            state.theme.dim(&welcome_workspace(state)),
+            if state.safe_mode {
+                format!(
+                    "{} {}",
+                    state.theme.dim("permissions:"),
+                    state.theme.bold(&state.theme.fg("accent", "safe mode"))
+                )
+            } else {
+                format!(
+                    "{} {}",
+                    state.theme.dim("permissions:"),
+                    state.theme.bold(&state.theme.fg("error", "full access"))
+                )
+            },
+            format!(
+                "{} {}",
+                state.theme.bold("Ctrl+D"),
+                state.theme.dim("to exit")
+            ),
+        ]
+    };
 
-    let mut lines = Vec::with_capacity(ROWS + 2);
-    lines.push(String::new());
-    for row in 0..ROWS {
-        lines.push(fit_line(&format!("  {}   {}", logo[row], text[row]), width));
+    let box_color = state.theme.role_rgb("splash_box");
+    if let Some(color) = box_color {
+        let inner_width = usize::from(width).saturating_sub(2);
+        let paint = |text: &str| state.theme.rgb_fg(color, text);
+        let pad = |text: String| {
+            let text_width = sexy_tui_rs::visible_width(&text);
+            format!(
+                "{text}{}",
+                " ".repeat(inner_width.saturating_sub(text_width))
+            )
+        };
+        let edge = |left: &str, right: &str| {
+            paint(&format!(
+                "{left}{}{right}",
+                state.theme.glyph("horizontal").repeat(inner_width)
+            ))
+        };
+        let body = |content: String| {
+            let content = pad(fit_line(&content, inner_width as u16));
+            paint(&format!(
+                "{}{}{}",
+                state.theme.glyph("vertical"),
+                content,
+                state.theme.glyph("vertical")
+            ))
+        };
+        let mut lines = Vec::with_capacity(ROWS + 2);
+        lines.push(edge(
+            state.theme.glyph("top_left"),
+            state.theme.glyph("top_right"),
+        ));
+        for row in 0..ROWS {
+            lines.push(body(format!("  {}   {}", logo[row], text[row])));
+        }
+        lines.push(edge(
+            state.theme.glyph("bottom_left"),
+            state.theme.glyph("bottom_right"),
+        ));
+        lines
+    } else {
+        let mut lines = Vec::with_capacity(ROWS + 2);
+        lines.push(String::new());
+        for row in 0..ROWS {
+            lines.push(fit_line(&format!("  {}   {}", logo[row], text[row]), width));
+        }
+        lines.push(String::new());
+        lines
     }
-    lines.push(String::new());
-    lines
 }
 
 #[cfg(test)]
@@ -132,6 +242,40 @@ mod tests {
     use super::*;
     use crate::tui::view::InteractiveShell;
     use sexy_tui_rs::strip_terminal_sequences;
+
+    #[test]
+    fn clawed_welcome_is_solid_orange_and_framed() {
+        let shell =
+            InteractiveShell::test_shell_with_theme(crate::tui::theme::test_bundled_theme_with(
+                "clawed",
+                crate::tui::terminal::TerminalCapabilities::test(
+                    true,
+                    true,
+                    crate::tui::terminal::ColorDepth::TrueColor,
+                ),
+                crate::tui::theme::TerminalBackground::Dark,
+            ));
+        shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
+        let rendered = render_welcome_card(&shell.state.borrow(), 80, 10, Instant::now());
+        assert!(
+            rendered.iter().all(|line| line.contains("38;2;217;119;87")),
+            "{rendered:?}"
+        );
+        let plain = rendered
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        assert!(
+            plain[0].starts_with('╭') && plain[0].ends_with('╮'),
+            "{plain:?}"
+        );
+        assert!(plain
+            .last()
+            .is_some_and(|line| line.starts_with('╰') && line.ends_with('╯')));
+        assert!(rendered
+            .iter()
+            .all(|line| sexy_tui_rs::visible_width(line) == 80));
+    }
 
     #[test]
     fn welcome_card_shows_access_mode_and_safe_mode_hint() {

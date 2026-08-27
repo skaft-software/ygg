@@ -459,12 +459,12 @@ impl<'a> TUI<'a> {
         let resize_replay = lazy_update
             .as_mut()
             .and_then(|update| update.resize_replay.take())
-            .map(|lines| {
+            .map(|mut lines| {
+                let _ = extract_cursor_position(&mut lines, width, height);
                 let mut lines = lines
                     .into_iter()
                     .map(|line| self.prepare_line(line, width))
                     .collect::<Vec<_>>();
-                let _ = extract_cursor_position(&mut lines, height);
                 if !self.capabilities.plain {
                     for line in &mut lines {
                         line.push_str("\x1b[0m\x1b]8;;\x1b\\");
@@ -509,14 +509,19 @@ impl<'a> TUI<'a> {
 
         let new_lines: Vec<String> = if let Some(update) = lazy_update {
             let stable_prefix = update.stable_prefix.min(previous_len);
-            let mut replacement = update
-                .replacement
+            let mut replacement = update.replacement;
+            let total_len = stable_prefix.saturating_add(replacement.len());
+            cursor = extract_cursor_position_from(
+                &mut replacement,
+                stable_prefix,
+                total_len,
+                width,
+                height,
+            );
+            let mut replacement = replacement
                 .into_iter()
                 .map(|line| self.prepare_line(line, width))
                 .collect::<Vec<_>>();
-            let total_len = stable_prefix.saturating_add(replacement.len());
-            cursor =
-                extract_cursor_position_from(&mut replacement, stable_prefix, total_len, height);
             if !self.capabilities.plain {
                 for line in &mut replacement {
                     line.push_str("\x1b[0m\x1b]8;;\x1b\\");
@@ -533,19 +538,21 @@ impl<'a> TUI<'a> {
             reused.extend(replacement);
             reused
         } else {
-            let mut rendered = Vec::new();
-            // Render the children in order. Plain/log mode is escape-free and
+            let mut rendered = self.root_render(width);
+            // Extract the typed cursor marker before clipping or sanitizing the
+            // line. It is a trusted library control token, never accepted from
+            // semantic text.
+            cursor = extract_cursor_position(&mut rendered, width, height);
+
+            // Prepare the children in order. Plain/log mode is escape-free and
             // does not right-pad every row with terminal-width spaces. Inline
             // scrollback also skips padding: every repaint erases before
             // writing, and padded rows would put trailing spaces into native
             // text selection.
-            for line in self.root_render(width) {
-                rendered.push(self.prepare_line(line, width));
-            }
-
-            // Extract the typed cursor marker before frame comparison. It is a
-            // trusted library control token, never accepted from semantic text.
-            cursor = extract_cursor_position(&mut rendered, height);
+            rendered = rendered
+                .into_iter()
+                .map(|line| self.prepare_line(line, width))
+                .collect();
 
             // Apply per-line resets only in terminal-control mode. Plain/log
             // backends receive escape-free chronological output.
@@ -694,6 +701,74 @@ impl<'a> TUI<'a> {
     ) {
         let rows = usize::from(height.max(1));
         if size_changed && !self.first_render {
+            let displayed_window_top = new_lines.len().saturating_sub(rows);
+            let retained_generation = self
+                .inline_generation
+                .or_else(|| self.inline_commit_cursor.map(|cursor| cursor.generation));
+            let generation_continues = pinned.is_none_or(|frame| {
+                retained_generation.is_none_or(|generation| generation == frame.generation)
+            });
+            let preserve_native_history = pinned.filter(|frame| {
+                generation_continues
+                    && !frame.viewport_surface
+                    && frame.stable_rows >= displayed_window_top
+                    && resize_replay.is_none()
+                    && !rebuild_scrollback
+                    && !previous_frame_has_image
+                    && !new_lines.iter().any(|line| is_image_line(line))
+            });
+            if let Some(pinned) = preserve_native_history {
+                // The terminal has already reflowed its grid and saved lines.
+                // Treat that reflowed prefix as the new physical history seam
+                // and repaint only one complete visible grid. Replaying the
+                // application tape here duplicates history in multiplexers and
+                // makes resize cost proportional to the whole conversation.
+                self.inline_history_rows = displayed_window_top;
+                self.inline_committed_rows = 0;
+                self.inline_commit_cursor = None;
+                self.inline_generation = Some(pinned.generation);
+                self.inline_window_top = displayed_window_top;
+                self.inline_surface_active = false;
+                self.inline_surface_window.clear();
+                self.write_inline_pinned(
+                    new_lines,
+                    rows,
+                    pinned,
+                    true,
+                    false,
+                    pinned_previous_window,
+                );
+                return;
+            }
+
+            let reanchor_replacement_timeline = pinned.filter(|frame| {
+                !generation_continues
+                    && !frame.viewport_surface
+                    && resize_replay.is_none()
+                    && !previous_frame_has_image
+                    && !new_lines.iter().any(|line| is_image_line(line))
+            });
+            if let Some(pinned) = reanchor_replacement_timeline {
+                // The terminal may reflow its old saved lines, but they belong
+                // to another semantic tape. Preserve that native history while
+                // starting the replacement generation at row zero and repainting
+                // its live grid; never claim the old off-screen prefix as new
+                // history and never clear scrollback merely because resize and
+                // timeline replacement arrived in the same frame.
+                self.write_inline_pinned(
+                    new_lines,
+                    rows,
+                    pinned,
+                    true,
+                    rebuild_scrollback,
+                    pinned_previous_window,
+                );
+                return;
+            }
+
+            // A temporary surface or Kitty placement cannot be reconstructed
+            // safely from terminal reflow alone. Keep the destructive replay
+            // fallback for those bounded exceptional paths.
             // Modern terminals reflow both the grid and saved lines before the
             // application observes a resize. Physical-row repair cannot be
             // made terminal-independent, so discard that presentation and
@@ -1476,26 +1551,28 @@ fn ensure_plain_line(line: &str, width: u16) -> String {
     )
 }
 
-fn extract_cursor_position(lines: &mut [String], height: u16) -> Option<(u16, u16)> {
+fn extract_cursor_position(lines: &mut [String], width: u16, height: u16) -> Option<(u16, u16)> {
     let total_lines = lines.len();
-    extract_cursor_position_from(lines, 0, total_lines, height)
+    extract_cursor_position_from(lines, 0, total_lines, width, height)
 }
 
 fn extract_cursor_position_from(
     lines: &mut [String],
     row_offset: usize,
     total_lines: usize,
+    width: u16,
     height: u16,
 ) -> Option<(u16, u16)> {
     let viewport_start = total_lines.saturating_sub(usize::from(height));
+    let max_column = usize::from(width.saturating_sub(1));
     let mut cursor = None;
     for (local_row, line) in lines.iter_mut().enumerate() {
         let row = row_offset.saturating_add(local_row);
         while let Some(offset) = line.find(CURSOR_MARKER) {
-            let column = visible_width(&line[..offset]);
+            let column = visible_width(&line[..offset]).min(max_column) as u16;
             line.replace_range(offset..offset + CURSOR_MARKER.len(), "");
             if row >= viewport_start {
-                cursor = Some(((row - viewport_start) as u16, column as u16));
+                cursor = Some(((row - viewport_start) as u16, column));
             }
         }
     }
@@ -1721,6 +1798,7 @@ mod tests {
         lines: Rc<RefCell<Vec<String>>>,
         commit_boundary: Rc<Cell<usize>>,
         rebuild_scrollback: Rc<Cell<bool>>,
+        generation: Rc<Cell<u64>>,
     }
 
     impl Component for LazyPinnedLines {
@@ -1738,13 +1816,32 @@ mod tests {
             cursor: Option<CommitCursor>,
         ) -> Option<FrameUpdate> {
             let boundary = self.commit_boundary.get();
+            let generation = self.generation.get();
+            let acknowledged =
+                cursor
+                    .filter(|cursor| cursor.generation == generation)
+                    .map(|cursor| CommitPosition {
+                        row: cursor.block as usize,
+                        cursor,
+                    });
+            let target = (boundary > 0).then_some(CommitPosition {
+                cursor: CommitCursor {
+                    generation,
+                    block: boundary as u64,
+                    segment: 0,
+                },
+                row: boundary,
+            });
             Some(FrameUpdate {
                 stable_prefix: 0,
                 replacement: self.lines.borrow().clone(),
-                pinned: Some(test_pinned_frame(
-                    cursor,
-                    (boundary > 0).then_some(boundary),
-                )),
+                pinned: Some(PinnedFrame {
+                    generation,
+                    acknowledged,
+                    target,
+                    stable_rows: boundary,
+                    viewport_surface: false,
+                }),
                 resize_replay: None,
                 reanchor_viewport: false,
                 rebuild_scrollback: self.rebuild_scrollback.replace(false),
@@ -3048,6 +3145,7 @@ mod tests {
             lines,
             commit_boundary: Rc::new(Cell::new(5)),
             rebuild_scrollback: Rc::new(Cell::new(true)),
+            generation: Rc::new(Cell::new(0)),
         }));
         tui.previous_frame = [
             "committed history 0",
@@ -3090,6 +3188,121 @@ mod tests {
     }
 
     #[test]
+    fn text_only_pinned_resize_preserves_native_history_and_repaints_one_grid() {
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        )
+        .with_overrides(&crate::capabilities::CapabilityOverrides {
+            synchronized_output: Some(true),
+            ..crate::capabilities::CapabilityOverrides::default()
+        });
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let mut initial_lines = [
+            "history 0",
+            "history 1",
+            "history 2",
+            "history 3",
+            "visible 4",
+            "visible 5",
+            "empty composer",
+            "footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        initial_lines[6].push_str(CURSOR_MARKER);
+        let lines = Rc::new(RefCell::new(initial_lines));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyPinnedLines {
+            lines,
+            commit_boundary: Rc::new(Cell::new(2)),
+            rebuild_scrollback: Rc::new(Cell::new(false)),
+            generation: Rc::new(Cell::new(0)),
+        }));
+        tui.start();
+        let clears_after_start = clears.get();
+
+        writes.borrow_mut().clear();
+        size.set((50, 6));
+        tui.request_render();
+        let resized = writes.borrow().join("");
+
+        assert_eq!(clears.get(), clears_after_start);
+        assert!(!resized.contains("\x1b[3J"), "{resized:?}");
+        assert!(!resized.contains("history 0"), "{resized:?}");
+        assert!(!resized.contains("history 1"), "{resized:?}");
+        assert!(resized.contains("history 2"), "{resized:?}");
+        assert!(resized.contains("footer"), "{resized:?}");
+        assert_eq!(tui.inline_history_rows, 2);
+        assert_eq!(tui.inline_window_top, 2);
+        assert_eq!(tui.inline_bottom_row, 5);
+    }
+
+    #[test]
+    fn resize_and_generation_change_start_a_new_tape_without_clearing_old_history() {
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size.clone(), capabilities);
+        let lines = Rc::new(RefCell::new(
+            [
+                "old history 0",
+                "old history 1",
+                "old visible 2",
+                "old visible 3",
+                "old composer",
+                "old footer",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        ));
+        let boundary = Rc::new(Cell::new(2));
+        let generation = Rc::new(Cell::new(0));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyPinnedLines {
+            lines: Rc::clone(&lines),
+            commit_boundary: Rc::clone(&boundary),
+            rebuild_scrollback: Rc::new(Cell::new(false)),
+            generation: Rc::clone(&generation),
+        }));
+        tui.start();
+        let clears_after_start = clears.get();
+
+        *lines.borrow_mut() = [
+            "new history 0",
+            "new history 1",
+            "new visible 2",
+            "new visible 3",
+            "new composer",
+            "new footer",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        boundary.set(0);
+        generation.set(1);
+        writes.borrow_mut().clear();
+        size.set((50, 6));
+        tui.request_render();
+
+        let resized = writes.borrow().join("");
+        assert_eq!(clears.get(), clears_after_start);
+        assert!(!resized.contains("\x1b[3J"), "{resized:?}");
+        assert!(!resized.contains("old history"), "{resized:?}");
+        assert!(resized.contains("new history 0"), "{resized:?}");
+        assert!(resized.contains("new footer"), "{resized:?}");
+        assert_eq!(tui.inline_history_rows, 0);
+        assert_eq!(tui.inline_generation, Some(1));
+    }
+
+    #[test]
     fn pinned_resize_resets_scrollback_and_updates_the_next_diff_origin() {
         const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=9,s=1,v=1,c=1,r=1;AAAA\x1b\\";
         let size = Rc::new(Cell::new((30, 4)));
@@ -3124,6 +3337,7 @@ mod tests {
             lines: lines.clone(),
             commit_boundary: Rc::new(Cell::new(2)),
             rebuild_scrollback: Rc::new(Cell::new(false)),
+            generation: Rc::new(Cell::new(0)),
         }));
         tui.start();
         assert_eq!(tui.inline_window_top, 4);
@@ -3265,6 +3479,51 @@ mod tests {
         assert!(!output.contains('\x07'));
         assert!(output.starts_with("safe^["));
         assert!(!output.contains("                    "));
+    }
+
+    #[test]
+    fn cursor_marker_is_extracted_before_width_clipping() {
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let cases = [
+            (2, format!("界{CURSOR_MARKER}x"), "\x1b[1;2H"),
+            (3, format!("abcdef{CURSOR_MARKER}"), "\x1b[1;3H"),
+        ];
+
+        for (width, line, expected_cursor) in cases {
+            let size = Rc::new(Cell::new((width, 2)));
+            let (terminal, _, _, _, shows, writes) = recording_terminal(size, capabilities);
+            let mut tui = TUI::new(Box::new(terminal));
+            tui.add_child(Box::new(MutableLines(Rc::new(RefCell::new(vec![line])))));
+            tui.start();
+
+            let output = writes.borrow().join("");
+            assert!(!output.contains(CURSOR_MARKER), "{output:?}");
+            assert!(output.contains(expected_cursor), "{output:?}");
+            assert_eq!(shows.get(), 1, "width {width} did not reveal the cursor");
+        }
+    }
+
+    #[test]
+    fn lazy_replacement_extracts_cursor_before_width_clipping() {
+        let size = Rc::new(Cell::new((3, 2)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, _, _, _, shows, writes) = recording_terminal(size, capabilities);
+        let lines = Rc::new(RefCell::new(vec![format!("abcdef{CURSOR_MARKER}")]));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(LazyFixedLines { lines }));
+        tui.start();
+
+        let output = writes.borrow().join("");
+        assert!(!output.contains(CURSOR_MARKER), "{output:?}");
+        assert!(output.contains("\x1b[1;3H"), "{output:?}");
+        assert_eq!(shows.get(), 1);
     }
 
     #[test]

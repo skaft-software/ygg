@@ -2,16 +2,15 @@
 
 use sexy_tui_rs::{visible_width, RichRenderer};
 
-use super::terminal_text::sanitize_for_terminal;
+use super::output_window::bounded_tail_rows;
+use super::terminal_text::{normalize_carriage_return_progress, sanitize_for_terminal};
 use super::tool_render::tool_value_indent_width;
-use super::{fit_line, subdued_text, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_LINES};
+use super::{fit_line, subdued_text, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_ROWS};
 use crate::tui::theme::YggTheme;
 
-/// Locate the final canonical `bash` result after any live progress bytes.
-/// The bash tool streams output while it runs, then emits a durable envelope
-/// containing the exit status and bounded stdout/stderr capture. The panel
-/// retains both, so presentation should prefer the last envelope without
-/// mutating the stored tool result.
+/// Locate the final canonical `bash` result after any legacy live progress
+/// bytes. New panels replace live output at completion, while hydrated sessions
+/// may still contain the older concatenated representation.
 fn final_bash_result(output: &str) -> &str {
     for (index, _) in output.rmatch_indices("exit=") {
         let candidate = &output[index..];
@@ -57,7 +56,6 @@ struct BashCaptureTruncation {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CompactBashOutput {
     lines: Vec<String>,
-    omitted_lines: usize,
     capture_truncations: Vec<BashCaptureTruncation>,
     panel_elided: bool,
 }
@@ -79,11 +77,12 @@ fn is_bash_complete_footer(line: &str) -> bool {
     })
 }
 
-/// Project a bounded result into Pi-style tail output. Protocol envelope lines
-/// are excluded; capture loss is retained separately because Ctrl+O can reveal
-/// UI-tail omissions but cannot recover bytes discarded by the bash tool.
-fn compact_bash_output(panel: &ToolPanel, expanded: bool) -> CompactBashOutput {
-    let result = sanitize_for_terminal(final_bash_result(&panel.output));
+/// Project a bounded result into display-oriented output. Protocol envelope
+/// lines are excluded; capture loss is retained separately because Ctrl+O can
+/// reveal UI-tail omissions but cannot recover bytes discarded by the tool.
+fn compact_bash_output(panel: &ToolPanel) -> CompactBashOutput {
+    let normalized = normalize_carriage_return_progress(final_bash_result(&panel.output));
+    let result = sanitize_for_terminal(&normalized);
     let mut capture_truncations = Vec::new();
     for line in result.lines().map(str::trim) {
         let Some((stream, detail)) = bash_capture_footer(line) else {
@@ -146,30 +145,41 @@ fn compact_bash_output(panel: &ToolPanel, expanded: bool) -> CompactBashOutput {
         }
     }
 
-    let omitted_lines = if expanded {
-        0
-    } else {
-        let omitted_lines = content.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
-        if omitted_lines > 0 {
-            content.drain(..omitted_lines);
-        }
-        omitted_lines
-    };
     CompactBashOutput {
         lines: content,
-        omitted_lines,
         capture_truncations,
         panel_elided,
     }
 }
 
+/// Disclosure-sensitive Bash rows must cross native history only at a complete
+/// semantic boundary. Width-dependent wrapping makes every retained output row
+/// conservatively sensitive, including a single long logical line.
 pub(super) fn bash_output_changes_when_expanded(panel: &ToolPanel) -> bool {
-    compact_bash_output(panel, false) != compact_bash_output(panel, true)
+    let compact = compact_bash_output(panel);
+    compact.panel_elided || !compact.capture_truncations.is_empty() || !compact.lines.is_empty()
 }
 
 fn bash_content_gutter() -> usize {
     let action = "Bash";
     visible_width(action) + 6usize.saturating_sub(visible_width(action)).max(2)
+}
+
+fn capture_loss_details(compact: &CompactBashOutput) -> Vec<String> {
+    let mut details = Vec::new();
+    if compact.panel_elided {
+        details.push("older live output was elided; unavailable to expand".to_owned());
+    }
+    for truncation in &compact.capture_truncations {
+        let omitted = truncation
+            .omitted_bytes
+            .map_or_else(|| "some bytes".to_owned(), |bytes| format!("{bytes} bytes"));
+        details.push(format!(
+            "{} capture omitted {omitted}; unavailable to expand",
+            truncation.stream
+        ));
+    }
+    details
 }
 
 pub(super) fn render_compact_bash_output(
@@ -179,77 +189,76 @@ pub(super) fn render_compact_bash_output(
     expanded: bool,
     output_indent: &str,
 ) -> Vec<String> {
-    let compact = compact_bash_output(panel, expanded);
+    let compact = compact_bash_output(panel);
     let ellipsis = if theme.unicode() { "…" } else { "..." };
-    let mut lines = Vec::new();
-    let mut first_detail = true;
-    let push_output = |lines: &mut Vec<String>, first_detail: &mut bool, output: String| {
-        *first_detail = false;
-        lines.extend(wrap_hanging(
-            &subdued_text(theme, &output),
-            output_indent,
-            output_indent,
-            width,
-        ));
-    };
-    let push_metadata = |lines: &mut Vec<String>, first_detail: &mut bool, detail: String| {
-        *first_detail = false;
-        lines.extend(wrap_hanging(
-            &subdued_text(theme, &detail),
-            output_indent,
-            output_indent,
-            width,
-        ));
-    };
-    if compact.panel_elided {
-        push_metadata(
-            &mut lines,
-            &mut first_detail,
-            format!(
-                "{ellipsis} (older live output was elided before display; unavailable to expand)"
+    let loss_details = capture_loss_details(&compact);
+    if panel.is_error && !expanded {
+        let hidden = vec![fit_line(
+            &format!(
+                "{output_indent}{}",
+                subdued_text(theme, "(failed output hidden; ctrl+o to expand)")
             ),
-        );
+            width,
+        )];
+        return bounded_tail_rows(hidden, COMPACT_EXEC_OUTPUT_ROWS, false, |_| {
+            unreachable!("short failure placeholder never needs omission metadata")
+        });
     }
-    for truncation in compact.capture_truncations {
-        let detail = truncation
-            .omitted_bytes
-            .map_or_else(|| "some bytes".to_owned(), |bytes| format!("{bytes} bytes"));
-        push_metadata(
-            &mut lines,
-            &mut first_detail,
-            format!(
-                "{ellipsis} ({} capture omitted {detail}; unavailable to expand)",
-                truncation.stream
-            ),
-        );
-    }
-    if compact.omitted_lines > 0 {
-        let unit = if compact.omitted_lines == 1 {
-            "line"
-        } else {
-            "lines"
-        };
-        push_metadata(
-            &mut lines,
-            &mut first_detail,
-            format!("{ellipsis} {} {unit} hidden", compact.omitted_lines),
-        );
-    }
+    let mut output_rows = Vec::new();
     for output_line in compact.lines {
-        push_output(&mut lines, &mut first_detail, output_line);
+        output_rows.extend(wrap_hanging(
+            &subdued_text(theme, &output_line),
+            output_indent,
+            output_indent,
+            width,
+        ));
     }
-    if first_detail {
-        push_metadata(
-            &mut lines,
-            &mut first_detail,
-            if panel.finished {
-                "(no output)".to_owned()
-            } else {
-                "(waiting for output)".to_owned()
-            },
-        );
+    if output_rows.is_empty() {
+        let placeholder = if panel.finished {
+            "(no output)"
+        } else {
+            "(waiting for output)"
+        };
+        output_rows.extend(wrap_hanging(
+            &subdued_text(theme, placeholder),
+            output_indent,
+            output_indent,
+            width,
+        ));
     }
-    lines
+
+    if expanded {
+        let mut rows = Vec::new();
+        for detail in loss_details {
+            rows.extend(wrap_hanging(
+                &subdued_text(theme, &format!("{ellipsis} ({detail})")),
+                output_indent,
+                output_indent,
+                width,
+            ));
+        }
+        rows.extend(output_rows);
+        return rows;
+    }
+
+    let force_metadata = !loss_details.is_empty();
+    bounded_tail_rows(
+        output_rows,
+        COMPACT_EXEC_OUTPUT_ROWS,
+        force_metadata,
+        move |hidden_rows| {
+            let mut details = loss_details;
+            if hidden_rows > 0 {
+                let unit = if hidden_rows == 1 { "row" } else { "rows" };
+                details.push(format!("{hidden_rows} earlier visual {unit} hidden"));
+            }
+            let detail = format!("{ellipsis} {}", details.join(" · "));
+            fit_line(
+                &format!("{output_indent}{}", subdued_text(theme, &detail)),
+                width,
+            )
+        },
+    )
 }
 
 pub(super) fn render_bash_row(

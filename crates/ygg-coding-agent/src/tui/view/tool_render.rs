@@ -4,7 +4,7 @@ use sexy_tui_rs::{visible_width, DiffRenderOptions, RichRenderer, UnifiedDiff};
 
 use super::terminal_text::sanitize_for_terminal;
 use super::{
-    subdued_text, understated_tool_output, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_LINES,
+    subdued_text, understated_tool_output, wrap_hanging, ToolPanel, COMPACT_EXEC_OUTPUT_ROWS,
 };
 use crate::tui::theme::YggTheme;
 
@@ -156,7 +156,7 @@ pub(super) fn render_compact_tool_output(
     let omitted = if expanded {
         0
     } else {
-        let omitted = lines.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
+        let omitted = lines.len().saturating_sub(COMPACT_EXEC_OUTPUT_ROWS);
         if omitted > 0 {
             lines.drain(..omitted);
         }

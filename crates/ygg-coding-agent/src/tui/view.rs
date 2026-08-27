@@ -28,6 +28,7 @@ use crate::presentation::{
     summarize_tool_with_workspace, tool_failure_reason, tool_result_is_failure,
     ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker, ToolDisplay,
 };
+use crate::session_store::SessionMeta;
 use crate::tui::composer::{self, ComposedInput};
 use crate::tui::keymap::{EditAction, SlashMenuAction};
 use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
@@ -46,11 +47,12 @@ use self::input_overlays::input_slash_suggestions;
 use self::input_overlays::render_slash_suggestions;
 #[cfg(test)]
 use self::native_scrollback::{render_shell, render_shell_at, render_shell_update};
-use self::panel_render::filtered_indices;
+use self::output_window::bounded_tail_rows;
 #[cfg(test)]
 pub(crate) use self::panel_render::panel_render_test_hook;
 #[cfg(test)]
 use self::panel_render::render_panel;
+use self::panel_render::{filtered_indices, session_picker_ordering};
 use self::reasoning_render::collapsed_reasoning_lines;
 #[cfg(test)]
 use self::renderer_runtime::{
@@ -66,8 +68,10 @@ use self::status_telemetry::{
 };
 #[cfg(test)]
 use self::surface_frame::event_margin_marker;
-pub use self::terminal_text::bounded_append;
-use self::terminal_text::sanitize_extension_tool_render_segments;
+pub use self::terminal_text::bounded_live_append;
+use self::terminal_text::{
+    normalize_carriage_return_progress, sanitize_extension_tool_render_segments,
+};
 pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
@@ -83,12 +87,14 @@ use self::transcript_selection::{
     block_copy_text, selection_position_for_visual_cell, semantic_selected_text,
     TranscriptPosition, TranscriptSelection,
 };
+#[cfg(test)]
 use self::viewport::{
-    max_scroll_for_available, max_scroll_from_bottom, transcript_lines,
+    max_scroll_for_available, render_shell_viewport_at, render_shell_viewport_update,
+};
+use self::viewport::{
+    max_scroll_from_bottom, resolved_scroll_from_bottom, transcript_lines,
     transcript_viewport_capacity, transcript_viewport_capacity_for_state,
 };
-#[cfg(test)]
-use self::viewport::{render_shell_viewport_at, render_shell_viewport_update};
 
 const SUBAGENT_TOOL_NAMES: [&str; 4] = [
     "subagent_spawn",
@@ -101,8 +107,8 @@ fn is_subagent_tool(name: &str) -> bool {
     SUBAGENT_TOOL_NAMES.contains(&name)
 }
 
-/// while preventing noisy output from swallowing the transcript.
-const COMPACT_EXEC_OUTPUT_LINES: usize = 5;
+/// Maximum physical rows retained in a collapsed command-output tail.
+const COMPACT_EXEC_OUTPUT_ROWS: usize = 5;
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -196,8 +202,6 @@ struct ToolPanel {
     /// and disclosure behavior match real tool calls without pretending that
     /// `subagents` was a provider tool invocation.
     subagent_activity: Option<SubagentActivityView>,
-    /// Whether Ctrl+O has expanded the delegated-worker roster.
-    subagent_activity_expanded: bool,
     /// Model family captured with the call for durable presentation
     /// provenance. Lifecycle chrome deliberately no longer consumes it:
     /// active, successful, and failed headers use muted, foreground, and
@@ -238,14 +242,13 @@ impl ToolPanel {
             failure_reason,
             extension_render_segments: Vec::new(),
             subagent_activity: None,
-            subagent_activity_expanded: false,
             model_lab,
             cached_diff: RefCell::new(None),
             cached_disclosure_sensitive: RefCell::new(None),
         }
     }
 
-    fn subagent_activity(view: &SubagentActivityView, expanded: bool) -> Self {
+    fn subagent_activity(view: &SubagentActivityView) -> Self {
         let mut panel = Self::new(
             ToolCallId("subagents".into()),
             "subagents".into(),
@@ -258,13 +261,11 @@ impl ToolPanel {
             None,
         );
         panel.subagent_activity = Some(view.clone());
-        panel.subagent_activity_expanded = expanded;
         panel
     }
 
-    fn update_subagent_activity(&mut self, view: &SubagentActivityView, expanded: bool) {
+    fn update_subagent_activity(&mut self, view: &SubagentActivityView) {
         self.subagent_activity = Some(view.clone());
-        self.subagent_activity_expanded = expanded;
         self.finished = !subagent_activity_is_active(view);
         self.is_error = subagent_activity_has_failure(view);
         self.failure_reason = subagent_activity_failure_reason(view);
@@ -288,6 +289,134 @@ enum ShellOverlay {
     Context(crate::tui::context::ContextReport),
 }
 
+/// Scope used by the session picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PickerScope {
+    Current,
+    All,
+}
+
+impl PickerScope {
+    pub(crate) fn toggle(self) -> Self {
+        match self {
+            Self::Current => Self::All,
+            Self::All => Self::Current,
+        }
+    }
+}
+
+/// Ordering used by the session picker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PickerSort {
+    Recent,
+    Name,
+    Messages,
+}
+
+impl PickerSort {
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::Recent => Self::Name,
+            Self::Name => Self::Messages,
+            Self::Messages => Self::Recent,
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Recent => "Recent",
+            Self::Name => "Name",
+            Self::Messages => "Messages",
+        }
+    }
+}
+
+/// An operation requested by a view-only picker and executed by its driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PanelRequest {
+    LoadAll,
+    TrashSession {
+        id: String,
+        path: PathBuf,
+    },
+    RenameSession {
+        id: String,
+        path: PathBuf,
+        name: String,
+    },
+}
+
+/// Mutable state for the enhanced session picker.
+#[derive(Clone, Debug)]
+pub(crate) struct PickerState {
+    pub(crate) rows: Vec<SessionMeta>,
+    pub(crate) all_rows: Option<Vec<SessionMeta>>,
+    pub(crate) scope: PickerScope,
+    pub(crate) sort: PickerSort,
+    pub(crate) named_only: bool,
+    pub(crate) show_path: bool,
+    pub(crate) filter: String,
+    pub(crate) selected: usize,
+    pub(crate) scroll: usize,
+    pub(crate) confirming_delete: bool,
+    /// The active rename buffer, when Ctrl+R has entered rename mode.
+    pub(crate) rename: Option<String>,
+    /// `(message, expiration)` for transient picker status text.
+    pub(crate) message: Option<(String, Instant)>,
+    pub(crate) current_session_path: Option<PathBuf>,
+}
+
+impl PickerState {
+    pub(crate) fn new(rows: Vec<SessionMeta>, current_session_path: Option<PathBuf>) -> Self {
+        Self {
+            rows,
+            all_rows: None,
+            scope: PickerScope::Current,
+            sort: PickerSort::Recent,
+            named_only: false,
+            show_path: false,
+            filter: String::new(),
+            selected: 0,
+            scroll: 0,
+            confirming_delete: false,
+            rename: None,
+            message: None,
+            current_session_path,
+        }
+    }
+
+    pub(crate) fn active_rows(&self) -> &[SessionMeta] {
+        match self.scope {
+            PickerScope::Current => &self.rows,
+            PickerScope::All => self.all_rows.as_deref().unwrap_or(&[]),
+        }
+    }
+}
+
+/// One user-message boundary available to `/fork`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForkMessage {
+    pub(crate) entry_id: String,
+    pub(crate) text: String,
+    pub(crate) whole_conversation: bool,
+}
+
+/// State for the `/fork` message selector.
+#[derive(Clone, Debug)]
+pub(crate) struct MessagePicker {
+    pub(crate) messages: Vec<ForkMessage>,
+    pub(crate) selected: usize,
+}
+
+impl MessagePicker {
+    pub(crate) fn new(messages: Vec<ForkMessage>) -> Self {
+        Self {
+            selected: messages.len().saturating_sub(1),
+            messages,
+        }
+    }
+}
+
 /// An interactive panel wedged between the transcript and composer.
 /// Two horizontal rules delimit it; the interior renders form content.
 #[derive(Clone, Debug)]
@@ -302,6 +431,10 @@ pub(crate) enum Panel {
         /// What to do with the confirmed index.
         action: PanelAction,
     },
+    /// Searchable session browser with lazy all-workspaces discovery.
+    SessionPicker { picker: PickerState },
+    /// User-message boundary picker used by `/fork`.
+    MessagePicker { picker: MessagePicker },
     /// Scrollable, read-only document used for delegated worker transcripts.
     /// `styled` marks text that was already sanitized at the producing
     /// boundary and carries trusted theme ANSI; rendering must preserve it.
@@ -332,10 +465,14 @@ pub(crate) enum PanelAction {
     SelectExtension(Vec<String>),
     /// Select one subagent presentation node.
     SelectSubagent(Vec<String>),
+    /// Drive the enhanced session browser without copying its row data.
+    SessionPicker,
+    /// Drive the user-message fork browser without copying its row data.
+    MessagePicker,
     /// Navigate a read-only transcript document.
     ReadOnlyDocument,
-    /// Confirm or deny a typed executable-extension request.
-    ExtensionConfirmation,
+    /// Confirm or deny a typed tool request.
+    Confirmation,
 }
 
 /// Outcome produced by closing a panel.
@@ -343,6 +480,8 @@ pub(crate) enum PanelAction {
 pub(crate) enum PanelResult {
     /// User confirmed the selection at the given index.
     Confirm(usize),
+    /// User selected an outbox-backed item.
+    Select(String),
     /// User cancelled (Esc).
     Cancel,
 }
@@ -429,10 +568,28 @@ pub(super) fn subagent_activity_copy_text(view: &SubagentActivityView) -> String
     lines.join("\n")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ViewportAnchor {
+    commit_id: u64,
+    block_hint: usize,
+    text_offset: usize,
+    trailing_affinity: bool,
+    fallback_block_row: usize,
+    fallback_visual_row: usize,
+    desired_screen_row: usize,
+    semantic: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct ShellState {
     /// Active interactive panel, if any.
     pub(crate) panel: Option<Panel>,
+    /// View-layer requests waiting for the picker driver to execute.
+    pending_panel_requests: Vec<PanelRequest>,
+    /// Selected session `(id, path)` produced by the session picker.
+    picker_selection: Option<(String, PathBuf)>,
+    /// Selected message `(entry id, text)` produced by the fork picker.
+    message_picker_selection: Option<(String, String)>,
     pub(crate) theme: YggTheme,
     /// Whether this session uses explicit approval gates instead of full host access.
     pub(crate) safe_mode: bool,
@@ -457,6 +614,8 @@ pub(crate) struct ShellState {
     /// Shared phase for every active event marker. This is presentation-only
     /// and toggles at a fixed cadence on the renderer thread.
     event_dot_visible: bool,
+    /// Current frame in the optional theme-owned animated spinner.
+    event_spinner_frame: usize,
     /// Small set of transcript indices that can currently own the shared
     /// activity pulse. Keeping it explicit makes each tick O(active work)
     /// instead of O(total session history).
@@ -507,9 +666,6 @@ pub(crate) struct ShellState {
     /// block. It is reset at the next root run so settled history remains
     /// immutable while a new delegation event gets its own row.
     pub(crate) subagent_activity_block: Option<usize>,
-    /// Whether the subagent activity roster is showing all children instead of
-    /// the latest two (ctrl+o toggle). Reset whenever the strip is cleared.
-    pub(crate) subagent_activity_expanded: bool,
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
@@ -521,9 +677,17 @@ pub(crate) struct ShellState {
     tool_panels: HashMap<ToolCallId, usize>,
     active_text: Option<usize>,
     active_reasoning: Option<usize>,
+    /// Once keyboard navigation requests a semantic viewport, rendering stays
+    /// application-owned for the rest of this shell. Mouse capture remains an
+    /// independent terminal-input policy.
+    pub(crate) application_viewport_requested: bool,
     /// Distance from the live tail in visual rows. Kept for cheap wheel/page
     /// movement; `follow_tail` decides whether new output may change it.
     scroll_from_bottom: Cell<usize>,
+    /// Stable semantic coordinate held at a fixed screen row while the
+    /// application-owned viewport is away from the live tail. The commit ID
+    /// survives prepends; the text offset survives streaming reflow and resize.
+    viewport_anchor: Cell<Option<ViewportAnchor>>,
     /// New output follows only while the reader is at the tail. Scrolling is
     /// never a modal operation and never moves editor focus.
     pub(crate) follow_tail: bool,
@@ -740,12 +904,11 @@ impl ShellState {
     /// row, matching the tool-call presentation.
     fn set_subagent_activity(&mut self, view: SubagentActivityView) {
         self.subagent_activity = Some(view.clone());
-        let expanded = self.subagent_activity_expanded;
         if let Some(index) = self.subagent_activity_block {
             if let Some(TranscriptBlock::Tool(panel)) = self.transcript.get_mut(index) {
                 if panel.subagent_activity.is_some() {
                     let was_active = !panel.finished;
-                    panel.update_subagent_activity(&view, expanded);
+                    panel.update_subagent_activity(&view);
                     let is_active = !panel.finished;
                     if was_active && !is_active {
                         self.unregister_active_event(index);
@@ -770,7 +933,7 @@ impl ShellState {
         }
 
         let index = self.active_reasoning.unwrap_or(self.transcript.len());
-        let panel = ToolPanel::subagent_activity(&view, expanded);
+        let panel = ToolPanel::subagent_activity(&view);
         let active = !panel.finished;
         self.insert_block(index, TranscriptBlock::Tool(Box::new(panel)));
         self.subagent_activity_block = Some(index);
@@ -795,6 +958,7 @@ impl ShellState {
 
     pub(crate) fn jump_to_tail(&mut self) {
         self.scroll_from_bottom.set(0);
+        self.viewport_anchor.set(None);
         self.follow_tail = true;
         self.new_output_count = 0;
     }
@@ -995,6 +1159,7 @@ impl ShellState {
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
         self.event_dot_visible = true;
+        self.event_spinner_frame = 0;
         let mut status = AssistantBlock::streaming_reasoning("").with_model_lab(model_lab);
         status.reasoning_heading = label.map(str::to_owned);
         status.show_reasoning_hint = show_reasoning_hint;
@@ -1101,6 +1266,7 @@ impl ShellState {
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
         self.event_dot_visible = true;
+        self.event_spinner_frame = 0;
         self.push_block(match channel {
             OutputChannel::Text => TranscriptBlock::Assistant(Box::new(
                 AssistantBlock::streaming(text).with_model_lab(model_lab),
@@ -1184,18 +1350,66 @@ impl ShellState {
     }
 
     fn has_active_event_dot(&self) -> bool {
+        let markers_enabled = self.theme.resolve::<bool>("margin_markers").unwrap_or(true);
+        let thinking_spinner = self
+            .theme
+            .resolve::<bool>("thinking_spinner")
+            .unwrap_or(false);
         self.active_event_blocks
             .iter()
             .any(|index| match self.transcript.get(*index) {
-                // Assistant dots are solid light and never pulse; only tool,
-                // shell, and collapsed-reasoning blocks animate the dot.
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
                     !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
                 }
-                Some(TranscriptBlock::Tool(panel)) => !panel.finished,
-                Some(TranscriptBlock::Shell(shell)) => shell.running,
+                Some(TranscriptBlock::Tool(panel)) => markers_enabled && !panel.finished,
+                Some(TranscriptBlock::Shell(shell)) => markers_enabled && shell.running,
                 _ => false,
             })
+            && (markers_enabled || thinking_spinner)
+    }
+
+    /// Whether any live collapsed reasoning block currently shows the theme's
+    /// braille thinking spinner. Themes without `thinking_spinner` keep the
+    /// slow shared event-dot cadence.
+    pub(crate) fn has_active_thinking_spinner(&self) -> bool {
+        let thinking_spinner = self
+            .theme
+            .resolve::<bool>("thinking_spinner")
+            .unwrap_or(false);
+        thinking_spinner
+            && !self.verbose_tools
+            && self.active_event_blocks.iter().any(|index| {
+                matches!(
+                    self.transcript.get(*index),
+                    Some(TranscriptBlock::Reasoning(reasoning))
+                        if !reasoning.finished && !reasoning.reasoning_expanded
+                )
+            })
+    }
+
+    /// Advance only the braille thinking spinner. Unlike the shared event-dot
+    /// cycle this never toggles the tool/shell dots, so a fast spinner frame
+    /// rate does not hurry the rest of the transcript's pulse.
+    pub(crate) fn advance_thinking_spinner(&mut self) {
+        if !self.has_active_thinking_spinner() {
+            return;
+        }
+        self.event_spinner_frame = self.event_spinner_frame.wrapping_add(1) % 10;
+        let active = self
+            .active_event_blocks
+            .iter()
+            .copied()
+            .filter(|index| {
+                matches!(
+                    self.transcript.get(*index),
+                    Some(TranscriptBlock::Reasoning(reasoning))
+                        if !reasoning.finished && !reasoning.reasoning_expanded
+                )
+            })
+            .collect::<Vec<_>>();
+        for index in active {
+            self.touch_block(index);
+        }
     }
 
     fn advance_event_dot_animation(&mut self) {
@@ -1203,14 +1417,23 @@ impl ShellState {
             return;
         }
         self.event_dot_visible = !self.event_dot_visible;
+        self.event_spinner_frame = self.event_spinner_frame.wrapping_add(1) % 10;
         for position in 0..self.active_event_blocks.len() {
             let index = self.active_event_blocks[position];
+            let markers_enabled = self.theme.resolve::<bool>("margin_markers").unwrap_or(true);
+            let thinking_spinner = self
+                .theme
+                .resolve::<bool>("thinking_spinner")
+                .unwrap_or(false);
             let visible = match self.transcript.get(index) {
                 Some(TranscriptBlock::Reasoning(reasoning)) => {
-                    !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
+                    !self.verbose_tools
+                        && !reasoning.finished
+                        && !reasoning.reasoning_expanded
+                        && (markers_enabled || thinking_spinner)
                 }
-                Some(TranscriptBlock::Tool(panel)) => !panel.finished,
-                Some(TranscriptBlock::Shell(shell)) => shell.running,
+                Some(TranscriptBlock::Tool(panel)) => markers_enabled && !panel.finished,
+                Some(TranscriptBlock::Shell(shell)) => markers_enabled && shell.running,
                 _ => false,
             };
             if visible {
@@ -1423,41 +1646,54 @@ fn render_shell_output(
     width: u16,
     verbose: bool,
 ) -> Vec<String> {
-    let mut lines = shell
-        .output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let omitted = if verbose {
-        0
-    } else {
-        let omitted = lines.len().saturating_sub(COMPACT_EXEC_OUTPUT_LINES);
-        if omitted > 0 {
-            lines.drain(..omitted);
-        }
-        omitted
-    };
-    let mut rendered = Vec::new();
-    if omitted > 0 {
-        let unit = if omitted == 1 { "line" } else { "lines" };
-        let hint = format!("  {omitted} {unit} hidden");
-        rendered.extend(wrap_hanging(
-            &understated_tool_output(theme, &hint),
-            "",
-            "  ",
-            width,
-        ));
-    }
-    for line in lines {
-        rendered.extend(wrap_hanging(
-            &understated_tool_output(theme, &sanitize_for_terminal(&line)),
+    let normalized = normalize_carriage_return_progress(&shell.output);
+    let safe = sanitize_for_terminal(&normalized);
+    let mut output_rows = Vec::new();
+    for line in safe.lines().filter(|line| !line.trim().is_empty()) {
+        output_rows.extend(wrap_hanging(
+            &understated_tool_output(theme, line),
             "  ",
             "  ",
             width,
         ));
     }
-    rendered
+    if output_rows.is_empty() {
+        let placeholder = if shell.running {
+            "(waiting for output)"
+        } else {
+            "(no output)"
+        };
+        output_rows.extend(wrap_hanging(
+            &understated_tool_output(theme, placeholder),
+            "  ",
+            "  ",
+            width,
+        ));
+    }
+
+    if verbose {
+        return output_rows;
+    }
+
+    let ellipsis = if theme.unicode() { "…" } else { "..." };
+    bounded_tail_rows(
+        output_rows,
+        COMPACT_EXEC_OUTPUT_ROWS,
+        false,
+        |hidden_rows| {
+            let unit = if hidden_rows == 1 { "row" } else { "rows" };
+            fit_line(
+                &format!(
+                    "  {}",
+                    understated_tool_output(
+                        theme,
+                        &format!("{ellipsis} {hidden_rows} earlier visual {unit} hidden")
+                    )
+                ),
+                width,
+            )
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1541,6 +1777,7 @@ impl InteractiveShell {
             theme,
             size: initial_size,
             follow_tail: true,
+            application_viewport_requested: capture_mouse,
             startup_card_started_at: Some(Instant::now()),
             ..ShellState::default()
         });
@@ -1677,7 +1914,6 @@ impl InteractiveShell {
         // overlay while its first authoritative refresh is still pending.
         state.subagent_activity = None;
         state.subagent_activity_block = None;
-        state.subagent_activity_expanded = false;
         state.run_model = Some(state.model.clone());
         state.run_model_lab = state.model_lab;
         state.run_prompt_color = state.prompt_color.clone();
@@ -1895,6 +2131,7 @@ impl InteractiveShell {
             AgentEvent::ToolStarted { id, name, args } => {
                 state.close_streaming_blocks();
                 state.event_dot_visible = true;
+                state.event_spinner_frame = 0;
                 if !is_subagent_tool(name) {
                     let index = state.transcript.len();
                     let workspace = state.workspace.clone();
@@ -1926,13 +2163,13 @@ impl InteractiveShell {
                 if let Some(panel) = state.tool_output_mut(id) {
                     match progress {
                         ToolProgress::Output { bytes, .. } => {
-                            bounded_append(&mut panel.output, &String::from_utf8_lossy(bytes));
+                            bounded_live_append(&mut panel.output, &String::from_utf8_lossy(bytes));
                         }
                         ToolProgress::Status(message) => {
-                            bounded_append(&mut panel.output, &format!("{message}\n"));
+                            bounded_live_append(&mut panel.output, &format!("{message}\n"));
                         }
                         ToolProgress::Confirmation(request) => {
-                            bounded_append(
+                            bounded_live_append(
                                 &mut panel.output,
                                 &format!("confirmation requested: {}\n", request.prompt),
                             );
@@ -1940,13 +2177,13 @@ impl InteractiveShell {
                         ToolProgress::Input(_) => {}
                         ToolProgress::Dropped { bytes, events } => {
                             if *bytes > 0 {
-                                bounded_append(
+                                bounded_live_append(
                                     &mut panel.output,
                                     &format!("... {bytes} bytes of live output elided ...\n"),
                                 );
                             }
                             if *events > 0 {
-                                bounded_append(
+                                bounded_live_append(
                                     &mut panel.output,
                                     &format!(
                                         "... {events} session event(s) could not be recorded ...\n"
@@ -1989,9 +2226,13 @@ impl InteractiveShell {
                     match result {
                         Ok(output) => {
                             panel.display.mark_media_read(output.media_kinds());
-                            bounded_append(&mut panel.output, &output.text);
+                            panel.output.clear();
+                            panel.output.push_str(&output.text);
                         }
-                        Err(error) => bounded_append(&mut panel.output, &error.message),
+                        Err(error) => {
+                            panel.output.clear();
+                            panel.output.push_str(&error.message);
+                        }
                     }
                 }
                 if let Some(index) = index {
@@ -2486,6 +2727,9 @@ impl InteractiveShell {
         templates: Arc<[crate::prompts::PromptTemplateDescriptor]>,
     ) {
         let mut state = self.state.borrow_mut();
+        if state.prompt_templates.as_ref() == templates.as_ref() {
+            return;
+        }
         state.prompt_templates = templates;
         state.slash_selection = 0;
         state.slash_scroll = 0;
@@ -2493,6 +2737,9 @@ impl InteractiveShell {
 
     pub fn set_skill_commands(&mut self, commands: Arc<[(String, String)]>) {
         let mut state = self.state.borrow_mut();
+        if state.skill_commands.as_ref() == commands.as_ref() {
+            return;
+        }
         state.skill_commands = commands;
         state.slash_selection = 0;
         state.slash_scroll = 0;
@@ -2500,6 +2747,11 @@ impl InteractiveShell {
 
     pub fn set_extension_commands(&mut self, commands: Arc<[(String, String)]>) {
         let mut state = self.state.borrow_mut();
+        // Background extension polling republishes this snapshot on every tick;
+        // an equivalent catalog must not reset the live popup cursor.
+        if state.extension_commands.as_ref() == commands.as_ref() {
+            return;
+        }
         state.extension_commands = commands;
         state.slash_selection = 0;
         state.slash_scroll = 0;
@@ -2540,7 +2792,6 @@ impl InteractiveShell {
         if snapshot.is_none() {
             state.subagent_activity = None;
             state.subagent_activity_block = None;
-            state.subagent_activity_expanded = false;
         }
         false
     }
@@ -2579,7 +2830,6 @@ impl InteractiveShell {
         if snapshot.is_none() {
             state.subagent_activity = None;
             state.subagent_activity_block = None;
-            state.subagent_activity_expanded = false;
         }
         false
     }
@@ -2755,19 +3005,12 @@ impl InteractiveShell {
     }
 
     pub fn set_size(&mut self, columns: u16, rows: u16) {
-        let resized = self.state.borrow().size != (columns, rows);
-        if resized {
-            // A resize discards terminal-owned history. Materialize the exact
-            // deferred branch snapshot first so the destructive replay owns a
-            // complete transcript, even while a new run is active.
-            if let Err(error) = self.materialize_deferred_history() {
-                self.state.borrow_mut().error =
-                    Some(format!("could not load older session history: {error}"));
-            }
-        }
         *self.size.lock().expect("terminal size mutex poisoned") = (columns, rows);
         let mut state = self.state.borrow_mut();
         state.size = (columns, rows);
+        // Deferred session history remains semantic and lazy. Resize reflows
+        // only the materialized branch tail; PageUp/select-all loads older
+        // blocks if and when the user asks for them.
         // Reflow belongs exclusively to `ygg-tui-render`. Computing the scroll
         // maximum here used to rebuild a long transcript on the input thread,
         // immediately discard that layout, and rebuild it again for paint.
@@ -2927,6 +3170,10 @@ impl InteractiveShell {
             }
         }
         let mut state = self.state.borrow_mut();
+        state.viewport_anchor.set(None);
+        if direction < 0 {
+            state.application_viewport_requested = true;
+        }
         let page = usize::from(state.size.1.max(4) / 2);
         let maximum = max_scroll_from_bottom(&state, state.size.0);
         let current = state.scroll_from_bottom.get().min(maximum);
@@ -2966,6 +3213,10 @@ impl InteractiveShell {
             }
         }
         let mut state = self.state.borrow_mut();
+        state.viewport_anchor.set(None);
+        if direction < 0 {
+            state.application_viewport_requested = true;
+        }
         if direction < 0 {
             let next = state
                 .scroll_from_bottom
@@ -3001,8 +3252,7 @@ impl InteractiveShell {
     ) -> Option<TranscriptPosition> {
         let chrome = shell_chrome(state, state.size.0, Instant::now());
         let transcript = transcript_lines(state, state.size.0);
-        let max_scroll = max_scroll_for_available(transcript.len(), chrome.transcript_rows);
-        let scroll = state.scroll_from_bottom.get().min(max_scroll);
+        let scroll = resolved_scroll_from_bottom(state, transcript.len(), chrome.transcript_rows);
         let capacity = transcript_viewport_capacity(chrome.transcript_rows, scroll > 0);
         if usize::from(row) >= capacity {
             return None;
@@ -3087,6 +3337,7 @@ impl InteractiveShell {
             return;
         }
         if row == 0 {
+            state.viewport_anchor.set(None);
             let maximum = max_scroll_from_bottom(&state, state.size.0);
             let next = state
                 .scroll_from_bottom
@@ -3096,6 +3347,7 @@ impl InteractiveShell {
             state.scroll_from_bottom.set(next);
             state.follow_tail = next == 0;
         } else if usize::from(row) >= transcript_rows {
+            state.viewport_anchor.set(None);
             let next = state.scroll_from_bottom.get().saturating_sub(2);
             state.scroll_from_bottom.set(next);
             if next == 0 {
@@ -3269,28 +3521,9 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
     }
 
-    /// Toggle the global transcript disclosure mode (ctrl+o).
-    pub fn expand_focused_tool(&mut self) {
-        // ctrl+o is the documented way to expand the subagent activity strip
-        // (its label says "ctrl+o to expand"). Only fall back to verbose tool
-        // output when no subagent activity is visible, so that hint stays
-        // truthful.
-        let activity_visible = self.state.borrow().subagent_activity.is_some();
-        if activity_visible {
-            let mut state = self.state.borrow_mut();
-            state.subagent_activity_expanded = !state.subagent_activity_expanded;
-            let expanded = state.subagent_activity_expanded;
-            if let Some(index) = state.subagent_activity_block {
-                if let Some(TranscriptBlock::Tool(panel)) = state.transcript.get_mut(index) {
-                    if panel.subagent_activity.is_some() {
-                        panel.subagent_activity_expanded = expanded;
-                        state.touch_block(index);
-                    }
-                }
-            }
-        } else {
-            self.toggle_verbose_tools();
-        }
+    /// Toggle the one global transcript disclosure mode (ctrl+o).
+    pub fn toggle_disclosure(&mut self) {
+        self.toggle_verbose_tools();
     }
 
     pub fn show_compaction_summary(&mut self) {
@@ -3351,6 +3584,72 @@ impl InteractiveShell {
 
     pub fn has_panel(&self) -> bool {
         self.state.borrow().panel.is_some()
+    }
+
+    /// Drain view-owned picker operations for the driver that has store access.
+    pub(crate) fn drain_panel_requests(&mut self) -> Vec<PanelRequest> {
+        std::mem::take(&mut self.state.borrow_mut().pending_panel_requests)
+    }
+
+    /// Take the selected session after the panel has closed itself.
+    pub(crate) fn take_picker_selection(&mut self) -> Option<(String, PathBuf)> {
+        self.state.borrow_mut().picker_selection.take()
+    }
+
+    /// Take the selected fork boundary and the text to restore in the editor.
+    pub(crate) fn take_message_picker_selection(&mut self) -> Option<(String, String)> {
+        self.state.borrow_mut().message_picker_selection.take()
+    }
+
+    /// Replace session rows after discovery or a picker mutation while keeping
+    /// the selected session stable when it still exists.
+    pub(crate) fn refresh_panel_sessions(
+        &mut self,
+        rows: Vec<SessionMeta>,
+        all_rows: Option<Vec<SessionMeta>>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        let Some(Panel::SessionPicker { picker }) = state.panel.as_mut() else {
+            return;
+        };
+        let previous = session_picker_ordering(picker)
+            .get(picker.selected)
+            .and_then(|index| picker.active_rows().get(*index))
+            .map(|meta| (meta.id.clone(), meta.path.clone()));
+        let old_selected = picker.selected;
+        picker.rows = rows;
+        picker.all_rows = all_rows;
+        let ordering = session_picker_ordering(picker);
+        picker.selected = previous
+            .and_then(|(id, path)| {
+                ordering.iter().position(|index| {
+                    picker
+                        .active_rows()
+                        .get(*index)
+                        .is_some_and(|meta| meta.id == id && meta.path == path)
+                })
+            })
+            .unwrap_or_else(|| old_selected.min(ordering.len().saturating_sub(1)));
+        picker.scroll = 0;
+    }
+
+    /// Set transient text in the session-picker hint row.
+    pub(crate) fn set_picker_message(&mut self, message: impl Into<String>, ttl: Duration) {
+        let mut state = self.state.borrow_mut();
+        if let Some(Panel::SessionPicker { picker }) = state.panel.as_mut() {
+            picker.message = Some((message.into(), Instant::now() + ttl));
+        }
+    }
+
+    /// Put a selected user message back into the ordinary composer.
+    pub(crate) fn prefill_editor(&mut self, text: String) {
+        let mut state = self.state.borrow_mut();
+        state.editor = text;
+        state.editor_cursor = state.editor.len();
+        state.slash_selection = 0;
+        state.slash_scroll = 0;
+        state.slash_popup_dismissed = false;
+        *state.cached_layout.get_mut() = None;
     }
 
     /// Replace a live subagent list without losing its filter or stable-node
@@ -3471,9 +3770,11 @@ impl InteractiveShell {
         // Snapshot the action before we potentially mutate/drop the panel.
         let action = match panel {
             Panel::SelectList { action, .. } => action.clone(),
+            Panel::SessionPicker { .. } => PanelAction::SessionPicker,
+            Panel::MessagePicker { .. } => PanelAction::MessagePicker,
             Panel::ReadOnlyDocument { .. } => PanelAction::ReadOnlyDocument,
         };
-        let confirmation = matches!(&action, PanelAction::ExtensionConfirmation);
+        let confirmation = matches!(&action, PanelAction::Confirmation);
         match panel {
             Panel::SelectList {
                 items,
@@ -3554,6 +3855,277 @@ impl InteractiveShell {
                             KeyCode::Backspace if !confirmation && key.modifiers.is_empty() => {
                                 filter.pop();
                                 *selected = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Resize(columns, rows) => {
+                        drop(state);
+                        self.set_size(*columns, *rows);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            Panel::SessionPicker { picker } => {
+                use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+                match event {
+                    Event::Key(key) if crate::tui::keymap::accepts_key_event(key) => {
+                        // Rename owns the complete key stream until it is
+                        // committed or cancelled. This keeps ordinary picker
+                        // shortcuts from mutating the name buffer.
+                        if picker.rename.is_some() {
+                            match key.code {
+                                KeyCode::Esc if key.modifiers.is_empty() => {
+                                    picker.rename = None;
+                                }
+                                KeyCode::Backspace if key.modifiers.is_empty() => {
+                                    if let Some(rename) = picker.rename.as_mut() {
+                                        rename.pop();
+                                    }
+                                }
+                                KeyCode::Char(character)
+                                    if !key.modifiers.intersects(
+                                        KeyModifiers::CONTROL
+                                            | KeyModifiers::ALT
+                                            | KeyModifiers::SUPER,
+                                    ) =>
+                                {
+                                    if let Some(rename) = picker.rename.as_mut() {
+                                        rename.push(character);
+                                    }
+                                }
+                                KeyCode::Enter if key.modifiers.is_empty() => {
+                                    let name = picker
+                                        .rename
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|name| !name.is_empty())
+                                        .map(str::to_owned);
+                                    if let Some(name) = name {
+                                        let ordering = session_picker_ordering(picker);
+                                        if let Some(index) = ordering.get(picker.selected).copied()
+                                        {
+                                            if let Some(meta) = picker.active_rows().get(index) {
+                                                let request = PanelRequest::RenameSession {
+                                                    id: meta.id.clone(),
+                                                    path: meta.path.clone(),
+                                                    name,
+                                                };
+                                                picker.rename = None;
+                                                state.pending_panel_requests.push(request);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => picker.rename = None,
+                            }
+                            return None;
+                        }
+
+                        // Delete confirmation intentionally ignores every key
+                        // other than the two terminal decisions.
+                        if picker.confirming_delete {
+                            match key.code {
+                                KeyCode::Enter if key.modifiers.is_empty() => {
+                                    let ordering = session_picker_ordering(picker);
+                                    let request = ordering
+                                        .get(picker.selected)
+                                        .and_then(|index| picker.active_rows().get(*index))
+                                        .map(|meta| PanelRequest::TrashSession {
+                                            id: meta.id.clone(),
+                                            path: meta.path.clone(),
+                                        });
+                                    picker.confirming_delete = false;
+                                    if let Some(request) = request {
+                                        state.pending_panel_requests.push(request);
+                                    }
+                                }
+                                KeyCode::Esc if key.modifiers.is_empty() => {
+                                    picker.confirming_delete = false;
+                                }
+                                _ => {}
+                            }
+                            return None;
+                        }
+
+                        match key.code {
+                            KeyCode::Tab if key.modifiers.is_empty() => {
+                                picker.scope = picker.scope.toggle();
+                                picker.selected = 0;
+                                picker.scroll = 0;
+                                if picker.scope == PickerScope::All && picker.all_rows.is_none() {
+                                    state.pending_panel_requests.push(PanelRequest::LoadAll);
+                                }
+                            }
+                            KeyCode::Char('s') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.sort = picker.sort.next();
+                                picker.selected = 0;
+                                picker.scroll = 0;
+                            }
+                            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.named_only = !picker.named_only;
+                                picker.selected = 0;
+                                picker.scroll = 0;
+                            }
+                            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.show_path = !picker.show_path;
+                            }
+                            KeyCode::Char('r') if key.modifiers == KeyModifiers::CONTROL => {
+                                let ordering = session_picker_ordering(picker);
+                                if let Some(index) = ordering.get(picker.selected).copied() {
+                                    if let Some(meta) = picker.active_rows().get(index) {
+                                        picker.rename = Some(
+                                            meta.name.clone().unwrap_or_else(|| meta.title.clone()),
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Delete if key.modifiers.is_empty() => {
+                                let ordering = session_picker_ordering(picker);
+                                if let Some(index) = ordering.get(picker.selected).copied() {
+                                    if let Some(meta) = picker.active_rows().get(index) {
+                                        if picker.current_session_path.as_ref() == Some(&meta.path)
+                                        {
+                                            picker.message = Some((
+                                                "Cannot delete the currently active session"
+                                                    .to_owned(),
+                                                Instant::now() + Duration::from_secs(3),
+                                            ));
+                                        } else {
+                                            picker.confirming_delete = true;
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Esc if key.modifiers.is_empty() => {
+                                drop(state);
+                                self.close_panel();
+                                return Some((PanelResult::Cancel, action));
+                            }
+                            KeyCode::Enter if key.modifiers.is_empty() => {
+                                let ordering = session_picker_ordering(picker);
+                                if let Some(index) = ordering.get(picker.selected).copied() {
+                                    if let Some(meta) = picker.active_rows().get(index).cloned() {
+                                        let selection = (meta.id.clone(), meta.path.clone());
+                                        let result = PanelResult::Select(meta.id);
+                                        state.picker_selection = Some(selection);
+                                        drop(state);
+                                        self.close_panel();
+                                        return Some((result, action));
+                                    }
+                                }
+                            }
+                            KeyCode::Up if key.modifiers.is_empty() => {
+                                picker.selected = picker.selected.saturating_sub(1);
+                            }
+                            KeyCode::Down if key.modifiers.is_empty() => {
+                                let count = session_picker_ordering(picker).len();
+                                if picker.selected + 1 < count {
+                                    picker.selected += 1;
+                                }
+                            }
+                            KeyCode::Home if key.modifiers.is_empty() => {
+                                picker.selected = 0;
+                            }
+                            KeyCode::End if key.modifiers.is_empty() => {
+                                picker.selected =
+                                    session_picker_ordering(picker).len().saturating_sub(1);
+                            }
+                            KeyCode::PageUp if key.modifiers.is_empty() => {
+                                picker.selected = picker.selected.saturating_sub(page_step);
+                            }
+                            KeyCode::PageDown if key.modifiers.is_empty() => {
+                                let last = session_picker_ordering(picker).len().saturating_sub(1);
+                                picker.selected =
+                                    picker.selected.saturating_add(page_step).min(last);
+                            }
+                            KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.selected = picker.selected.saturating_sub(1);
+                            }
+                            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                                let count = session_picker_ordering(picker).len();
+                                if picker.selected + 1 < count {
+                                    picker.selected += 1;
+                                }
+                            }
+                            KeyCode::Char(character)
+                                if !key.modifiers.intersects(
+                                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                                ) =>
+                            {
+                                picker.filter.push(character);
+                                picker.selected = 0;
+                                picker.scroll = 0;
+                            }
+                            KeyCode::Backspace if key.modifiers.is_empty() => {
+                                picker.filter.pop();
+                                picker.selected = 0;
+                                picker.scroll = 0;
+                            }
+                            _ => {}
+                        }
+                    }
+                    Event::Resize(columns, rows) => {
+                        drop(state);
+                        self.set_size(*columns, *rows);
+                    }
+                    _ => {}
+                }
+                None
+            }
+            Panel::MessagePicker { picker } => {
+                use crossterm::event::{Event, KeyCode, KeyModifiers};
+                match event {
+                    Event::Key(key) if crate::tui::keymap::accepts_key_event(key) => {
+                        match key.code {
+                            KeyCode::Esc if key.modifiers.is_empty() => {
+                                drop(state);
+                                self.close_panel();
+                                return Some((PanelResult::Cancel, action));
+                            }
+                            KeyCode::Enter if key.modifiers.is_empty() => {
+                                if let Some(message) = picker.messages.get(picker.selected).cloned()
+                                {
+                                    let selection = (message.entry_id.clone(), message.text);
+                                    let result = PanelResult::Select(message.entry_id);
+                                    state.message_picker_selection = Some(selection);
+                                    drop(state);
+                                    self.close_panel();
+                                    return Some((result, action));
+                                }
+                            }
+                            KeyCode::Up if key.modifiers.is_empty() => {
+                                picker.selected = picker.selected.saturating_sub(1);
+                            }
+                            KeyCode::Down if key.modifiers.is_empty() => {
+                                picker.selected = picker
+                                    .selected
+                                    .saturating_add(1)
+                                    .min(picker.messages.len().saturating_sub(1));
+                            }
+                            KeyCode::Home if key.modifiers.is_empty() => picker.selected = 0,
+                            KeyCode::End if key.modifiers.is_empty() => {
+                                picker.selected = picker.messages.len().saturating_sub(1)
+                            }
+                            KeyCode::PageUp if key.modifiers.is_empty() => {
+                                picker.selected = picker.selected.saturating_sub(page_step);
+                            }
+                            KeyCode::PageDown if key.modifiers.is_empty() => {
+                                picker.selected = picker
+                                    .selected
+                                    .saturating_add(page_step)
+                                    .min(picker.messages.len().saturating_sub(1));
+                            }
+                            KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.selected = picker.selected.saturating_sub(1);
+                            }
+                            KeyCode::Char('j') if key.modifiers == KeyModifiers::CONTROL => {
+                                picker.selected = picker
+                                    .selected
+                                    .saturating_add(1)
+                                    .min(picker.messages.len().saturating_sub(1));
                             }
                             _ => {}
                         }
@@ -3747,6 +4319,14 @@ impl InteractiveShell {
     }
 
     pub fn set_theme(&mut self, mut theme: YggTheme) {
+        // Native terminal history cannot be recoloured in place. Materialize a
+        // deferred resume before the swap so the replay below includes every
+        // persisted tool card, not just the first-paint tail.
+        if let Err(error) = self.materialize_deferred_history() {
+            self.state.borrow_mut().error = Some(format!(
+                "could not load older session history before theme change: {error}"
+            ));
+        }
         let mut state = self.state.borrow_mut();
         if let Some(lab) = state.model_lab {
             crate::tui::theme::apply_model_lab(&mut theme, lab);
@@ -3830,7 +4410,6 @@ impl InteractiveShell {
         // hydrated history never contains an executable worker event.
         state.subagent_activity = None;
         state.subagent_activity_block = None;
-        state.subagent_activity_expanded = false;
         state.session_work_elapsed = Duration::ZERO;
         state.run_model = None;
         state.run_model_lab = None;
@@ -3959,6 +4538,7 @@ mod editor_layout;
 mod input_overlays;
 mod native_scrollback;
 mod outcome_render;
+mod output_window;
 mod panel_render;
 mod reasoning_render;
 mod renderer_runtime;

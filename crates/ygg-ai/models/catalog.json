@@ -8,7 +8,7 @@
         "var": "OPENAI_API_KEY"
       },
       "default_headers": {},
-      "timeout_secs": 30
+      "timeout_secs": 900
     },
     {
       "id": "anthropic",
@@ -19,7 +19,7 @@
         "var": "ANTHROPIC_API_KEY"
       },
       "default_headers": {},
-      "timeout_secs": 30
+      "timeout_secs": 900
     }
   ],
   "models": [

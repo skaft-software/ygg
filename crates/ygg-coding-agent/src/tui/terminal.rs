@@ -1,8 +1,10 @@
 #![allow(missing_docs)]
 
+use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Stdout, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -557,6 +559,21 @@ pub fn install_signal_restore() -> std::io::Result<()> {
     Ok(())
 }
 
+fn open_tui_write_log(configured: Option<std::ffi::OsString>) -> Option<File> {
+    let mut path = PathBuf::from(configured?);
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    if path.is_dir() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        path.push(format!("tui-{timestamp}-{}.log", std::process::id()));
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
 /// Render-only terminal adapter used by sexy-tui.
 ///
 /// Input is deliberately driven by the application's async crossterm stream;
@@ -566,6 +583,7 @@ pub struct YggTerminal<W: Write = Stdout> {
     size: TerminalSize,
     last_was_cr: bool,
     pending: Vec<u8>,
+    write_log: Option<File>,
     in_synchronized_frame_depth: usize,
 }
 
@@ -632,6 +650,7 @@ impl YggTerminal<Stdout> {
             size,
             last_was_cr: false,
             pending: Vec::with_capacity(16 * 1024),
+            write_log: open_tui_write_log(std::env::var_os("YGG_TUI_WRITE_LOG")),
             in_synchronized_frame_depth: 0,
         })
     }
@@ -643,6 +662,14 @@ impl<W: Write> YggTerminal<W> {
             return;
         }
         let _ = self.out.write_all(&self.pending);
+        let log_failed = self.write_log.as_mut().is_some_and(|log| {
+            log.write_all(&self.pending)
+                .and_then(|()| log.flush())
+                .is_err()
+        });
+        if log_failed {
+            self.write_log = None;
+        }
         self.pending.clear();
         let _ = self.out.flush();
     }
@@ -910,6 +937,25 @@ mod tests {
     }
 
     #[test]
+    fn tui_write_log_captures_the_exact_normalized_backend_bytes_when_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ansi.log");
+        let writer = RecordingWriter::default();
+        let mut terminal = YggTerminal {
+            out: writer,
+            size: Arc::new(Mutex::new((80, 24))),
+            last_was_cr: false,
+            pending: Vec::new(),
+            write_log: open_tui_write_log(Some(path.clone().into_os_string())),
+            in_synchronized_frame_depth: 0,
+        };
+
+        sexy_tui_rs::Terminal::write(&mut terminal, "one\ntwo\r\n");
+
+        assert_eq!(std::fs::read(path).unwrap(), b"one\r\ntwo\r\n");
+    }
+
+    #[test]
     fn synchronized_frame_is_one_atomic_backend_write_even_without_csi_2026_support() {
         let writer = RecordingWriter::default();
         let writes = writer.writes.clone();
@@ -919,6 +965,7 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
+            write_log: None,
             in_synchronized_frame_depth: 0,
         };
 
@@ -954,6 +1001,7 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
+            write_log: None,
             in_synchronized_frame_depth: 0,
         };
 

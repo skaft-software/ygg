@@ -40,7 +40,7 @@ pub struct EndpointConfig {
     /// Preferred response transport.
     #[serde(default)]
     pub transport: crate::types::EndpointTransport,
-    /// Request timeout in seconds.
+    /// Maximum time to send a request and receive response headers, in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
 }

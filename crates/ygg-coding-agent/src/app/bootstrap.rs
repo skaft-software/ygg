@@ -2,7 +2,7 @@
 
 use std::cell::RefCell;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -155,14 +155,14 @@ const DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 384_000;
 
 const OPENCODE_ANTHROPIC_ENDPOINT_ID: &str = "opencode-anthropic";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
-// Streaming providers should return response headers before generation. Keep
-// this phase short and separately bounded; the response body has its own idle
-// and absolute deadlines in ygg-ai.
-const PROVIDER_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+// A provider may spend minutes queueing or processing a large prompt before
+// it emits response headers. Connection establishment remains separately
+// bounded in ygg-ai; this phase needs a generous, cancellable allowance.
+const PROVIDER_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 // Local servers may need to load a model before they can return response
-// headers. Match Pi's cold-start-safe five-minute default for custom endpoints
-// without weakening the fail-fast behavior of hosted providers.
-const CUSTOM_ENDPOINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+// headers. Keep the same fifteen-minute default for custom endpoints while
+// allowing each provider to override it for its own cold-start behavior.
+const CUSTOM_ENDPOINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_DISCOVERY_BODY_BYTES: usize = 8 * 1024 * 1024;
 // Version 2 invalidated inventories whose llama.cpp context length was guessed
 // because older discovery ignored hlid's nested `meta.n_ctx` field. Version 4
@@ -3512,6 +3512,11 @@ pub fn model_catalog_without_codex() -> anyhow::Result<ModelCatalog> {
 pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
     let catalog = model_catalog_with_offline(config.offline)?;
     let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+    // Record the workspace path so cross-workspace browsing can name each
+    // session's home. Non-fatal: pickers fall back to directory names.
+    if let Err(error) = sessions.write_workspace_marker() {
+        crate::output::stderr!("warning: could not write session workspace marker: {error}");
+    }
     let client = AiClient::try_new()?;
     Ok(Bootstrap {
         config,
@@ -3697,6 +3702,69 @@ fn launch_configuration(
     Ok((model, reasoning, reasoning_mode))
 }
 
+fn resolve_fork_source_path(
+    config: &Config,
+    store: &SessionStore,
+    source: &str,
+) -> anyhow::Result<PathBuf> {
+    let candidate = Path::new(source);
+    if candidate.is_absolute()
+        || candidate.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+    {
+        let path = if candidate.is_absolute() {
+            candidate.to_owned()
+        } else {
+            config.invocation_cwd.join(candidate)
+        };
+        return path
+            .canonicalize()
+            .with_context(|| format!("could not resolve fork source {}", path.display()));
+    }
+    store.path_by_id(source)
+}
+
+fn fork_session_into(
+    store: &SessionStore,
+    source_path: &std::path::Path,
+    destination_path: PathBuf,
+) -> anyhow::Result<PathBuf> {
+    let source = Session::open_read_only(source_path).with_context(|| {
+        format!(
+            "could not open source session for forking: {}",
+            source_path.display()
+        )
+    })?;
+    let source_id = source
+        .path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("source session has no valid id"))?;
+    let checkpoint = source.head();
+    let forked = source
+        .fork_to(destination_path.clone(), checkpoint.as_ref())
+        .with_context(|| {
+            format!(
+                "could not fork session {} into {}",
+                source_path.display(),
+                destination_path.display()
+            )
+        })?;
+    drop(forked);
+    if let Some(checkpoint) = checkpoint {
+        let destination_id = destination_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| anyhow::anyhow!("forked session has no valid id"))?;
+        if let Err(error) =
+            store.set_fork_provenance(destination_id, source_id, checkpoint.0.as_str())
+        {
+            let _ = std::fs::remove_file(&destination_path);
+            return Err(error);
+        }
+    }
+    Ok(destination_path)
+}
+
 /// Resolve an interactive launch and open pickers only while no Agent exists.
 pub async fn resolve_launch_interactive(
     boot: &Bootstrap,
@@ -3724,15 +3792,41 @@ pub async fn resolve_launch_interactive(
             .await?;
             SessionSelection::OpenExisting(path)
         }
+        ResumeSelector::Fork(source_id) => {
+            let source_path = if let Some(id) = source_id {
+                let sessions = boot.sessions.clone();
+                let config = boot.config.clone();
+                run_blocking_lifecycle(shell, input, "opening source session…", move || {
+                    resolve_fork_source_path(&config, &sessions, &id)
+                })
+                .await?
+            } else {
+                let sessions = boot.sessions.clone();
+                let available =
+                    run_blocking_lifecycle(shell, input, "discovering sessions…", move || {
+                        Ok(sessions.list())
+                    })
+                    .await?;
+                session_picker(shell, input, &available, &boot.sessions, None)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("session selection cancelled"))?
+            };
+            let store = boot.sessions.clone();
+            let destination = boot.sessions.new_path(&crate::modes::timestamp());
+            let path = run_blocking_lifecycle(shell, input, "forking session…", move || {
+                fork_session_into(&store, &source_path, destination)
+            })
+            .await?;
+            SessionSelection::OpenExisting(path)
+        }
         ResumeSelector::Resume(None) => {
             let sessions = boot.sessions.clone();
-            let session_dir = sessions.dir().to_owned();
             let available =
                 run_blocking_lifecycle(shell, input, "discovering sessions…", move || {
                     Ok(sessions.list())
                 })
                 .await?;
-            session_picker(shell, input, &available, &session_dir)
+            session_picker(shell, input, &available, &boot.sessions, None)
                 .await?
                 .map(SessionSelection::OpenExisting)
                 .ok_or_else(|| anyhow::anyhow!("session selection cancelled"))?
@@ -3779,6 +3873,14 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
         ResumeSelector::Continue => SessionSelection::OpenExisting(boot.sessions.latest()?.path),
         ResumeSelector::Resume(Some(id)) => {
             SessionSelection::OpenExisting(boot.sessions.path_by_id(id)?)
+        }
+        ResumeSelector::Fork(Some(id)) => {
+            let source = resolve_fork_source_path(&boot.config, &boot.sessions, id)?;
+            let destination = boot.sessions.new_path(stamp);
+            SessionSelection::OpenExisting(fork_session_into(&boot.sessions, &source, destination)?)
+        }
+        ResumeSelector::Fork(None) => {
+            anyhow::bail!("--fork needs a session id in print mode")
         }
         ResumeSelector::Resume(None) => {
             anyhow::bail!("--resume needs a session id in print mode")

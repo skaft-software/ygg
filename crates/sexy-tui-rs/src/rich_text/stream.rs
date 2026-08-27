@@ -363,6 +363,14 @@ impl StreamingMarkdown {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamingLineUpdate {
+    /// Physical rows at the start of the previous render that remain unchanged.
+    pub stable_prefix: usize,
+    /// Selected styled/plain rows replacing everything after `stable_prefix`.
+    pub replacement: Vec<String>,
+}
+
 /// Incremental line-layout cache. At a stable width, only newly committed
 /// blocks and the bounded mutable tail are rendered.
 #[derive(Clone, Debug, Default)]
@@ -419,7 +427,9 @@ impl StreamingRenderCache {
         }
     }
 
-    fn update(&mut self, stream: &StreamingMarkdown, renderer: &RichRenderer, width: u16) {
+    fn update(&mut self, stream: &StreamingMarkdown, renderer: &RichRenderer, width: u16) -> usize {
+        let prior_committed_rows = self.committed_lines.len();
+        let prior_committed_blocks = self.committed_blocks;
         let full_reflow = self.width != Some(width)
             || self.options != Some(renderer.options())
             || self.theme_revision != renderer.theme().revision()
@@ -461,6 +471,15 @@ impl StreamingRenderCache {
         self.committed_revision = stream.committed_revision();
         self.tail_revision = stream.tail_revision();
         self.finished = stream.is_finished();
+
+        if full_reflow {
+            0
+        } else if self.committed_blocks > prior_committed_blocks {
+            prior_committed_rows
+        } else {
+            self.committed_lines.len()
+                + usize::from(!self.committed_lines.is_empty() && !self.tail_lines.is_empty())
+        }
     }
 
     fn merged_lines(&mut self) -> &[RenderedLine] {
@@ -503,6 +522,56 @@ impl StreamingRenderCache {
         }
     }
 
+    fn selected_lines_from(&self, start: usize, styled: bool) -> Vec<String> {
+        let separator =
+            usize::from(!self.committed_lines.is_empty() && !self.tail_lines.is_empty());
+        let total = self.committed_lines.len() + separator + self.tail_lines.len();
+        let start = start.min(total);
+        let mut lines = Vec::with_capacity(total.saturating_sub(start));
+
+        if start < self.committed_lines.len() {
+            lines.extend(self.committed_lines[start..].iter().map(|line| {
+                if styled {
+                    line.styled.clone()
+                } else {
+                    line.plain.clone()
+                }
+            }));
+        }
+        if separator > 0 && start <= self.committed_lines.len() {
+            lines.push(String::new());
+        }
+        let tail_start = start.saturating_sub(self.committed_lines.len() + separator);
+        lines.extend(
+            self.tail_lines[tail_start.min(self.tail_lines.len())..]
+                .iter()
+                .map(|line| {
+                    if styled {
+                        line.styled.clone()
+                    } else {
+                        line.plain.clone()
+                    }
+                }),
+        );
+        lines
+    }
+
+    /// Render only the mutable suffix while reporting the unchanged physical
+    /// prefix from the previous call at the same width/theme.
+    pub fn render_line_update(
+        &mut self,
+        stream: &StreamingMarkdown,
+        renderer: &RichRenderer,
+        width: u16,
+        styled: bool,
+    ) -> StreamingLineUpdate {
+        let stable_prefix = self.update(stream, renderer, width);
+        StreamingLineUpdate {
+            stable_prefix,
+            replacement: self.selected_lines_from(stable_prefix, styled),
+        }
+    }
+
     /// Render one terminal representation without constructing the semantic
     /// copy text or cloning the unused styled/plain representation. This is the
     /// hot path for transcript surfaces, which already store copy text in their
@@ -515,32 +584,7 @@ impl StreamingRenderCache {
         styled: bool,
     ) -> Vec<String> {
         self.update(stream, renderer, width);
-        let total = self.committed_lines.len()
-            + if self.committed_lines.is_empty() || self.tail_lines.is_empty() {
-                0
-            } else {
-                1
-            }
-            + self.tail_lines.len();
-        let mut lines = Vec::with_capacity(total);
-        for line in &self.committed_lines {
-            lines.push(if styled {
-                line.styled.clone()
-            } else {
-                line.plain.clone()
-            });
-        }
-        if !self.committed_lines.is_empty() && !self.tail_lines.is_empty() {
-            lines.push(String::new());
-        }
-        for line in &self.tail_lines {
-            lines.push(if styled {
-                line.styled.clone()
-            } else {
-                line.plain.clone()
-            });
-        }
-        lines
+        self.selected_lines_from(0, styled)
     }
 }
 
@@ -821,6 +865,33 @@ mod tests {
             assert_eq!(narrow.last().copied(), Some(cache.committed_rows()));
             assert!(narrow.windows(2).all(|ends| ends[0] < ends[1]));
         }
+    }
+
+    #[test]
+    fn line_update_reuses_committed_rows_and_replaces_only_the_mutable_tail() {
+        let renderer = RichRenderer::plain();
+        let mut stream = StreamingMarkdown::new();
+        let mut cache = StreamingRenderCache::default();
+
+        stream.push_str("# Stable heading\n\nmutable");
+        let first = cache.render_line_update(&stream, &renderer, 40, false);
+        assert_eq!(first.stable_prefix, 0);
+        let mut frame = first.replacement;
+
+        stream.push_str(" tail");
+        let next = cache.render_line_update(&stream, &renderer, 40, false);
+        assert!(next.stable_prefix > 0, "{next:?}");
+        frame.truncate(next.stable_prefix);
+        frame.extend(next.replacement);
+
+        let mut full_cache = StreamingRenderCache::default();
+        assert_eq!(
+            frame,
+            full_cache.render_lines(&stream, &renderer, 40, false)
+        );
+
+        let resized = cache.render_line_update(&stream, &renderer, 20, false);
+        assert_eq!(resized.stable_prefix, 0);
     }
 
     #[test]

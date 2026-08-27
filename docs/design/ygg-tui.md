@@ -8,9 +8,10 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 ## Terminal guarantees
 
 - The interactive frontend renders on the primary screen. `auto`, `terminal`,
-  and `off` use a logical-height frame whose committed rows flow into
-  terminal-native scrollback. Explicit `--mouse app` uses a bounded,
-  application-owned semantic viewport instead.
+  and `off` begin with a logical-height frame whose committed rows flow into
+  terminal-native scrollback. PageUp transfers rendering to the bounded,
+  application-owned semantic viewport for the rest of that shell. Explicit
+  `--mouse app` selects that viewport from startup.
 - A theme swap clears and repaints every cell in the visible viewport.
   Application-owned history is semantic and therefore adopts the current theme
   whenever it becomes visible. Rows already committed by a terminal-owned mode
@@ -19,10 +20,10 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 - Raw mode, bracketed paste, keyboard enhancements, synchronized output, and
   mouse reporting are enabled only when supported and restored idempotently.
 - Mouse reporting is disabled by default, preserving native drag selection and
-  wheel scrolling. `--mouse app` explicitly enables capture for semantic
-  scrolling and selection. Portable terminal protocols do not report a user's
-  native scrollback offset, so terminal-owned modes cannot guarantee stable
-  read-while-streaming anchoring.
+  wheel scrolling. `--mouse app` enables capture for semantic wheel navigation
+  and selection, but keyboard viewport ownership does not depend on capture.
+  Portable terminal protocols do not report a user's native scrollback offset,
+  so uncaptured wheel history remains terminal-owned.
 - Redirected, unknown, or explicitly plain terminals use the chronological
   fallback without cursor-control sequences.
 - Provider, tool, and user text is sanitized before terminal output.
@@ -30,6 +31,9 @@ The interactive frontend owns terminal setup/restoration and presentation only;
   structure.
 - The generic renderer crate enforces `#![forbid(unsafe_code)]`; OS-specific
   terminal setup remains isolated in Ygg's terminal boundary.
+- Raw ANSI diagnostics are disabled by default. `YGG_TUI_WRITE_LOG` enables an
+  exact backend-byte capture to an explicit file or a unique file in an existing
+  directory; these traces are sensitive because they include displayed content.
 
 ## Transcript and input
 
@@ -50,13 +54,22 @@ user reads scrollback. Chrome follows logical content height rather than
 occupying a fixed full-screen viewport, and committed rows naturally enter
 terminal history.
 
-A resize reflows the retained semantic transcript at the new width, resets the
-terminal's saved-line presentation, and replays Ygg's transcript once. Deferred
-session history is materialized before that destructive replay. Explicit
-application-owned mode instead uses `follow_tail` and `scroll_from_bottom` to
-select one bounded viewport. Scrolling above its tail keeps semantic rows fixed
-while one Markdown block continues to grow, increments the new-output state,
-and exposes the PageDown return-to-live affordance.
+A text-only native resize accepts the terminal's saved-line reflow and repaints
+one visible grid without clearing scrollback. If a replacement transcript
+generation arrives in the same frame, old native history remains terminal-owned
+but the new semantic tape starts at row zero rather than inheriting that history
+seam. Temporary surfaces and Kitty placements retain a bounded destructive
+fallback because their physical state cannot be reconstructed portably. Deferred
+session history remains lazy and is loaded only when semantic navigation or copy
+crosses into it.
+Application-owned mode—selected at startup by `--mouse app` or claimed by
+PageUp—uses `follow_tail` plus a monotonic transcript commit ID, semantic copy
+text offset/affinity, visual fallback, and desired screen row to select one
+bounded viewport. `scroll_from_bottom` remains only the cheap navigation delta;
+the semantic anchor rebases it after growth, contraction, deferred-history
+prepends, and width/height changes. Scrolling above the tail keeps semantic rows
+fixed while one Markdown block continues to grow, increments the new-output
+state, and exposes the PageDown return-to-live affordance.
 
 Terminal-owned modes preserve native selection and long-lived scrollback, but
 Ygg cannot observe or freeze a reader's position inside that history. Semantic
@@ -168,6 +181,18 @@ bounded accountability input to the gate checker only, not ordinary model
 context.
 
 ## Sessions and resources
+
+The session resume panel opens with current-workspace sessions and can lazily
+switch to all workspace directories. It supports fuzzy, quoted-phrase, and
+`re:` regular-expression filtering; recent, title, and message-count ordering;
+named-only filtering; optional path details; pinned/fork/current markers;
+recoverable trash; and in-place renaming. Cross-workspace rows are browseable
+but cannot be resumed into a differently scoped live App.
+
+`/fork` opens a bounded active-branch user-message picker, including a
+whole-conversation head row, and restores the selected prompt into the new
+composer. `/clone` copies the active head without opening a picker. Both create
+provenance metadata before the ordinary idle-boundary session rebuild.
 
 `/tree` presents durable entry IDs and kinds in a deterministic connector tree.
 It marks every ancestor on the selected branch with `+`, the exact durable head

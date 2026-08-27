@@ -11,13 +11,16 @@ open the conversation unchanged.
 Each workspace store may also contain `.catalog/sessions-v1.sqlite3`. This is a
 private, disposable SQLite projection used to make session listing and the
 resume picker independent of total transcript bytes. It contains bounded
-derived titles and transcript size/mtime fingerprints; JSONL and `.metadata/`
-remain authoritative. Ygg streams only missing or stale transcripts, refreshes
-the active row when an app closes normally, and removes rows for missing
-sessions. An unavailable, locked, corrupt, oversized, or newer-version catalog
-never blocks session access: Ygg falls back to bounded JSONL scans, and rebuilds
-catalogs whose SQLite contents are corrupt. Deleting the `.catalog/` directory
-is safe; Ygg recreates it on demand.
+derived titles, active-branch message counts, and transcript size/mtime
+fingerprints; JSONL and `.metadata/` remain authoritative. The interactive
+picker can enumerate all workspace-key directories under the shared session
+root and uses each directory's `.workspace` marker for display. Ygg streams only
+missing or stale transcripts, refreshes the active row when an app closes
+normally, and removes rows for missing sessions. An unavailable, locked,
+corrupt, oversized, or newer-version catalog never blocks session access: Ygg
+falls back to bounded JSONL scans, and rebuilds catalogs whose SQLite contents
+are corrupt. Deleting the `.catalog/` directory is safe; Ygg recreates it on
+demand.
 
 ## Commands
 
@@ -49,6 +52,12 @@ Interactive commands operate on the current session:
 
 - `/name [name]` shows or changes its readable name.
 - `/export [path]` writes a redacted portable export.
+- `/resume [id]` opens the session picker; `Tab` toggles current/all workspace
+  scope, `Ctrl+S` cycles recent/title/message-count ordering, `Ctrl+N` shows
+  named sessions, `Ctrl+P` toggles paths, `Delete` trashes, and `Ctrl+R` renames.
+- `/fork` creates a new session from a selected active-branch user message;
+  `/clone` creates one from the current head. `--fork <id|path>` performs the
+  same head fork before startup, while bare `--fork` opens the picker.
 
 `delete` is recoverable: it moves the JSONL and metadata into `.trash/` rather
 than unlinking them. `repair` is deliberately narrow. It first writes an

@@ -2,6 +2,30 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Provider-observed progress at the moment a provider stream fails.
+///
+/// These are the raw wire counts the client actually observed: provider
+/// frames before protocol decoding, canonical events after decoding, and the
+/// retained content bytes. They are diagnostic only and never affect retry
+/// policy; they exist so that a mid-stream failure ("the response died after
+/// 90 seconds") can be distinguished from a request that never produced
+/// anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamProgress {
+    /// Raw provider frames observed before protocol decoding.
+    pub provider_events: usize,
+    /// Canonical stream events decoded before the failure.
+    pub decoded_events: usize,
+    /// Content bytes retained in canonical parts at the time of failure.
+    pub content_bytes: usize,
+    /// Bytes held in compatibility buffers at the time of failure.
+    pub buffered_bytes: usize,
+    /// Whether at least one response-body byte was observed.
+    pub first_body_seen: bool,
+    /// Elapsed milliseconds from stream start until the failure.
+    pub elapsed_ms: u64,
+}
+
 /// Main error type for all ygg-ai operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AiError {
@@ -35,6 +59,15 @@ pub enum AiError {
     /// Stream protocol state machine violation.
     #[error("Stream protocol error: {0}")]
     StreamProtocol(#[from] StreamProtocolError),
+    /// A failure mid-provider-stream, annotated with how far the response
+    /// had progressed before it died.
+    #[error("{inner}")]
+    StreamFailure {
+        /// The underlying failure that ended the stream.
+        inner: Box<AiError>,
+        /// Provider-observed progress at the time of the failure.
+        progress: StreamProgress,
+    },
     /// The request was canceled by dropping the stream.
     #[error("Request canceled")]
     Canceled,
@@ -448,5 +481,43 @@ mod tests {
             retryable: true,
         };
         assert!(!err_500.is_safe_to_retry());
+    }
+
+    #[test]
+    fn test_stream_failure_display_delegates_to_inner() {
+        let err = AiError::StreamFailure {
+            inner: Box::new(AiError::Decode(DecodeError::Json(
+                "unterminated string at line 1 column 20".into(),
+            ))),
+            progress: StreamProgress {
+                provider_events: 412,
+                decoded_events: 38,
+                content_bytes: 18204,
+                buffered_bytes: 96,
+                first_body_seen: true,
+                elapsed_ms: 97321,
+            },
+        };
+        // Display delegates to the inner error so existing log lines stay
+        // stable; the progress data travels in the struct, not the text.
+        assert_eq!(
+            err.to_string(),
+            "Decode error: JSON decode error: unterminated string at line 1 column 20"
+        );
+    }
+
+    #[test]
+    fn test_stream_progress_serde_roundtrip() {
+        let progress = StreamProgress {
+            provider_events: 7,
+            decoded_events: 3,
+            content_bytes: 100,
+            buffered_bytes: 4,
+            first_body_seen: true,
+            elapsed_ms: 1200,
+        };
+        let json = serde_json::to_string(&progress).unwrap();
+        let back: StreamProgress = serde_json::from_str(&json).unwrap();
+        assert_eq!(progress, back);
     }
 }

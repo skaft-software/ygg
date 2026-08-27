@@ -8,7 +8,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
@@ -21,6 +22,8 @@ use crate::error::{AiError, ConfigError, TransportError, TransportPhase};
 
 const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CONNECTION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn transport_error(phase: TransportPhase, message: impl Into<String>) -> AiError {
     AiError::Transport(TransportError {
@@ -222,40 +225,33 @@ impl ResponsesWsPool {
                 }
             }
             state.sessions.remove(key);
-            // Holding this small pool lock while establishing one connection
-            // prevents duplicate sockets for the same session. Requests for a
-            // different session still only wait for the handshake, not a file or
-            // provider operation.
-            let connection =
-                Self::open_connection(Some(key), url, headers, Arc::clone(&self.state)).await?;
-            state.sessions.insert(key.to_owned(), connection.clone());
-            Ok(connection)
-        } else {
-            Self::open_connection(None, url, headers, Arc::clone(&self.state)).await
         }
-    }
 
-    async fn open_connection(
-        key: Option<&str>,
-        url: Url,
-        headers: http::HeaderMap,
-        state: Arc<Mutex<PoolState>>,
-    ) -> Result<Connection, AiError> {
+        // The handshake is deliberately outside the pool lock. Concurrent
+        // opens are reconciled below so one slow endpoint cannot block every
+        // cached session.
         let url = websocket_url(url)?;
         let request = connect_request(url, &headers)?;
-        let (socket, _) = connect_async(request).await.map_err(|error| {
-            if let Some(key) = key {
-                let state = Arc::clone(&state);
-                let key = key.to_owned();
-                tokio::spawn(async move {
-                    state.lock().await.disabled.insert(key);
-                });
+        let (socket, _) = match connect_async(request).await {
+            Ok(connected) => connected,
+            Err(error) => {
+                let error = transport_error(
+                    TransportPhase::Connect,
+                    format!("Responses WebSocket connect: {error}"),
+                );
+                if let Some(key) = key {
+                    let mut state = self.state.lock().await;
+                    if let Some(connection) = state.sessions.get(key) {
+                        if connection.alive.load(Ordering::Acquire) {
+                            return Ok(connection.clone());
+                        }
+                    }
+                    state.sessions.remove(key);
+                    state.disabled.insert(key.to_owned());
+                }
+                return Err(error);
             }
-            transport_error(
-                TransportPhase::Connect,
-                format!("Responses WebSocket connect: {error}"),
-            )
-        })?;
+        };
 
         let (sender, receiver) = mpsc::channel(4);
         let alive = Arc::new(AtomicBool::new(true));
@@ -263,14 +259,73 @@ impl ResponsesWsPool {
             sender,
             alive: Arc::clone(&alive),
         };
-        tokio::spawn(run_connection(
-            socket,
-            receiver,
-            alive,
-            key.map(str::to_owned),
-            state,
-        ));
-        Ok(connection)
+
+        if let Some(key) = key {
+            enum Registration {
+                Installed,
+                Existing(Connection),
+                Disabled,
+            }
+
+            let registration = {
+                let mut state = self.state.lock().await;
+                if state.disabled.contains(key) {
+                    Registration::Disabled
+                } else if let Some(existing) = state
+                    .sessions
+                    .get(key)
+                    .filter(|existing| existing.alive.load(Ordering::Acquire))
+                {
+                    Registration::Existing(existing.clone())
+                } else {
+                    state.sessions.remove(key);
+                    state.sessions.insert(key.to_owned(), connection.clone());
+                    Registration::Installed
+                }
+            };
+
+            match registration {
+                Registration::Installed => {
+                    tokio::spawn(run_connection(
+                        socket,
+                        receiver,
+                        alive,
+                        Some(key.to_owned()),
+                        Arc::downgrade(&self.state),
+                        CONNECTION_IDLE_TIMEOUT,
+                    ));
+                    Ok(connection)
+                }
+                Registration::Existing(existing) => {
+                    // Both handshakes raced for the same key. The map's current
+                    // live connection wins; close the unobserved socket rather
+                    // than leaving a detached actor behind.
+                    connection.alive.store(false, Ordering::Release);
+                    drop(receiver);
+                    retire_socket(socket);
+                    Ok(existing)
+                }
+                Registration::Disabled => {
+                    connection.alive.store(false, Ordering::Release);
+                    drop(receiver);
+                    retire_socket(socket);
+                    Err(transport_error(
+                        TransportPhase::Connect,
+                        "Responses WebSocket disabled after an earlier failure",
+                    ))
+                }
+            }
+        } else {
+            tokio::spawn(run_connection(
+                socket,
+                receiver,
+                alive,
+                None,
+                Arc::downgrade(&self.state),
+                CONNECTION_IDLE_TIMEOUT,
+            ));
+            Ok(connection)
+        }
     }
 
     async fn remove(&self, key: &str, connection: &Connection) {
@@ -308,7 +363,7 @@ impl ResponsesWsPool {
                 self.remove(key, &connection).await;
             }
             return Err(transport_error(
-                TransportPhase::ResponseHeaders,
+                TransportPhase::Connect,
                 "Responses WebSocket connection closed before request send",
             ));
         }
@@ -328,7 +383,7 @@ impl ResponsesWsPool {
                 }
                 Err(transport_error(
                     TransportPhase::ResponseHeaders,
-                    "Responses WebSocket actor stopped before request send",
+                    "Responses WebSocket actor stopped before request start was acknowledged",
                 ))
             }
         }
@@ -369,10 +424,45 @@ impl ResponsesWsPool {
     }
 }
 
-async fn disable_key(state: &Arc<Mutex<PoolState>>, key: Option<&str>) {
-    if let Some(key) = key {
-        state.lock().await.disabled.insert(key.to_owned());
+async fn disable_key(state: &Weak<Mutex<PoolState>>, key: Option<&str>) {
+    let (Some(state), Some(key)) = (state.upgrade(), key) else {
+        return;
+    };
+    state.lock().await.disabled.insert(key.to_owned());
+}
+
+async fn remove_connection(
+    state: &Weak<Mutex<PoolState>>,
+    key: Option<&str>,
+    alive: &Arc<AtomicBool>,
+) {
+    let (Some(state), Some(key)) = (state.upgrade(), key) else {
+        return;
+    };
+    let mut state = state.lock().await;
+    if state
+        .sessions
+        .get(key)
+        .is_some_and(|connection| Arc::ptr_eq(&connection.alive, alive))
+    {
+        state.sessions.remove(key);
     }
+}
+
+async fn close_socket<S>(socket: &mut S)
+where
+    S: futures_util::Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    let _ = tokio::time::timeout(CONNECTION_CLOSE_TIMEOUT, socket.close()).await;
+}
+
+fn retire_socket<S>(mut socket: S)
+where
+    S: futures_util::Sink<Message, Error = tungstenite::Error> + Send + Unpin + 'static,
+{
+    tokio::spawn(async move {
+        close_socket(&mut socket).await;
+    });
 }
 
 async fn run_connection<S>(
@@ -380,14 +470,68 @@ async fn run_connection<S>(
     mut commands: mpsc::Receiver<RequestCommand>,
     alive: Arc<AtomicBool>,
     key: Option<String>,
-    state: Arc<Mutex<PoolState>>,
+    state: Weak<Mutex<PoolState>>,
+    idle_timeout: Duration,
 ) where
     S: futures_core::Stream<Item = Result<Message, tungstenite::Error>>
         + futures_util::Sink<Message, Error = tungstenite::Error>
         + Unpin,
 {
     let mut continuation = None;
-    while let Some(command) = commands.recv().await {
+    'actor: loop {
+        // Poll the socket even without an active request so peer closes and
+        // control frames are handled promptly. Control traffic does not extend
+        // the request-idle lifetime.
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
+        let command = loop {
+            if idle.is_elapsed() {
+                break 'actor;
+            }
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else {
+                        break 'actor;
+                    };
+                    break command;
+                }
+                message = socket.next() => {
+                    match message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if !matches!(
+                                tokio::time::timeout(
+                                    CONNECTION_CLOSE_TIMEOUT,
+                                    socket.send(Message::Pong(payload)),
+                                )
+                                .await,
+                                Ok(Ok(()))
+                            ) {
+                                break 'actor;
+                            }
+                        }
+                        Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                            break 'actor;
+                        }
+                        Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                            // A data event outside a request cannot safely be
+                            // associated with a later generation.
+                            alive.store(false, Ordering::Release);
+                            disable_key(&state, key.as_deref()).await;
+                            break 'actor;
+                        }
+                    }
+                }
+                _ = &mut idle => break 'actor,
+            }
+        };
+
+        // A request future can be cancelled while this command waits behind an
+        // active turn. Do not send an orphaned generation after its receiver is
+        // already gone.
+        if command.reply.is_closed() {
+            continue;
+        }
         let (wire_body, _) = incremental_body(&command.body, continuation.as_ref());
         let Value::Object(mut payload) = wire_body else {
             let _ = command
@@ -400,7 +544,7 @@ async fn run_connection<S>(
                     "Responses WebSocket body is not an object",
                 )))
                 .await;
-            break;
+            break 'actor;
         };
         payload.insert(
             "type".to_owned(),
@@ -418,20 +562,50 @@ async fn run_connection<S>(
                         message,
                     )))
                     .await;
-                break;
+                break 'actor;
             }
         };
-        if let Err(error) = socket.send(Message::Text(text.into())).await {
+        if command.reply.is_closed() {
+            continue;
+        }
+        let send_result = tokio::select! {
+            biased;
+            _ = command.reply.closed() => {
+                // Cancelling a send can leave the WebSocket sink in an
+                // indeterminate state. Discard it rather than reusing a socket
+                // that may have transmitted part or all of the frame.
+                alive.store(false, Ordering::Release);
+                disable_key(&state, key.as_deref()).await;
+                break 'actor;
+            }
+            result = socket.send(Message::Text(text.into())) => result,
+        };
+        if let Err(error) = send_result {
             let message = format!("Responses WebSocket request send: {error}");
             let _ = command.started.send(Err(message.clone()));
             alive.store(false, Ordering::Release);
             disable_key(&state, key.as_deref()).await;
-            break;
+            break 'actor;
         }
         let _ = command.started.send(Ok(()));
 
         let mut terminal = false;
-        while let Some(message) = socket.next().await {
+        loop {
+            let message = tokio::select! {
+                biased;
+                _ = command.reply.closed() => {
+                    // The consumer dropped or timed out. Stop the provider-side
+                    // stream instead of leaving this actor and socket blocked
+                    // forever waiting for another frame.
+                    alive.store(false, Ordering::Release);
+                    disable_key(&state, key.as_deref()).await;
+                    break 'actor;
+                }
+                message = socket.next() => message,
+            };
+            let Some(message) = message else {
+                break;
+            };
             let message = match message {
                 Ok(message) => message,
                 Err(error) => {
@@ -444,7 +618,7 @@ async fn run_connection<S>(
                         .await;
                     alive.store(false, Ordering::Release);
                     disable_key(&state, key.as_deref()).await;
-                    return;
+                    break 'actor;
                 }
             };
             match message {
@@ -460,7 +634,7 @@ async fn run_connection<S>(
                                 .await;
                             alive.store(false, Ordering::Release);
                             disable_key(&state, key.as_deref()).await;
-                            return;
+                            break 'actor;
                         }
                     };
                     let is_terminal = terminal_kind(&value).is_some();
@@ -470,8 +644,7 @@ async fn run_connection<S>(
                     if command.reply.send(Ok(value)).await.is_err() {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
-                        let _ = socket.close().await;
-                        return;
+                        break 'actor;
                     }
                     if is_terminal {
                         terminal = true;
@@ -490,7 +663,7 @@ async fn run_connection<S>(
                                 .await;
                             alive.store(false, Ordering::Release);
                             disable_key(&state, key.as_deref()).await;
-                            return;
+                            break 'actor;
                         }
                     };
                     let is_terminal = terminal_kind(&value).is_some();
@@ -500,8 +673,7 @@ async fn run_connection<S>(
                     if command.reply.send(Ok(value)).await.is_err() {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
-                        let _ = socket.close().await;
-                        return;
+                        break 'actor;
                     }
                     if is_terminal {
                         terminal = true;
@@ -509,10 +681,19 @@ async fn run_connection<S>(
                     }
                 }
                 Message::Ping(payload) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
+                    let pong_result = tokio::select! {
+                        biased;
+                        _ = command.reply.closed() => {
+                            alive.store(false, Ordering::Release);
+                            disable_key(&state, key.as_deref()).await;
+                            break 'actor;
+                        }
+                        result = socket.send(Message::Pong(payload)) => result,
+                    };
+                    if pong_result.is_err() {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
-                        return;
+                        break 'actor;
                     }
                 }
                 Message::Close(_) => {
@@ -525,7 +706,7 @@ async fn run_connection<S>(
                         .await;
                     alive.store(false, Ordering::Release);
                     disable_key(&state, key.as_deref()).await;
-                    return;
+                    break 'actor;
                 }
                 Message::Pong(_) | Message::Frame(_) => {}
             }
@@ -540,18 +721,180 @@ async fn run_connection<S>(
                 .await;
             alive.store(false, Ordering::Release);
             disable_key(&state, key.as_deref()).await;
-            return;
+            break 'actor;
         }
     }
+
     alive.store(false, Ordering::Release);
+    remove_connection(&state, key.as_deref(), &alive).await;
+    close_socket(&mut socket).await;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinHandle;
+    use tokio_tungstenite::{accept_async, MaybeTlsStream, WebSocketStream};
+
+    type ClientSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+    type ServerSocket = WebSocketStream<TcpStream>;
 
     fn item(id: &str) -> Value {
         serde_json::json!({"type": "message", "id": id})
+    }
+
+    async fn websocket_pair() -> (ClientSocket, ServerSocket) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            accept_async(stream).await.unwrap()
+        });
+        let (client, _) = connect_async(format!("ws://{address}/")).await.unwrap();
+        (client, server.await.unwrap())
+    }
+
+    async fn spawn_test_actor(
+        socket: ClientSocket,
+        state: &Arc<Mutex<PoolState>>,
+        key: &str,
+        idle_timeout: Duration,
+    ) -> (Connection, JoinHandle<()>) {
+        let (sender, receiver) = mpsc::channel(4);
+        let alive = Arc::new(AtomicBool::new(true));
+        let connection = Connection {
+            sender,
+            alive: Arc::clone(&alive),
+        };
+        state
+            .lock()
+            .await
+            .sessions
+            .insert(key.to_owned(), connection.clone());
+        let actor = tokio::spawn(run_connection(
+            socket,
+            receiver,
+            alive,
+            Some(key.to_owned()),
+            Arc::downgrade(state),
+            idle_timeout,
+        ));
+        (connection, actor)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_same_key_handshakes_share_one_connection_and_close_the_loser() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (closed, closed_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            // Do not complete either handshake until both clients arrive. This
+            // would deadlock if the first handshake held the global pool lock.
+            let (first, _) = listener.accept().await.unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            let (first, second) = tokio::join!(accept_async(first), accept_async(second));
+            let mut first = first.unwrap();
+            let mut second = second.unwrap();
+            let closed_message = tokio::select! {
+                message = first.next() => message,
+                message = second.next() => message,
+            };
+            let _ = closed.send(matches!(closed_message, Some(Ok(Message::Close(_))) | None));
+            let _ = release_rx.await;
+        });
+
+        let pool = ResponsesWsPool::default();
+        let url = Url::parse(&format!("ws://{address}/")).unwrap();
+        let first = tokio::spawn({
+            let pool = pool.clone();
+            let url = url.clone();
+            async move {
+                pool.connect(Some("shared"), url, http::HeaderMap::new())
+                    .await
+            }
+        });
+        let second = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.connect(Some("shared"), url, http::HeaderMap::new())
+                    .await
+            }
+        });
+        let (first, second) = tokio::time::timeout(Duration::from_secs(3), async move {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("same-key handshakes must not serialize on the global pool lock");
+        let first = first.unwrap().unwrap();
+        let second = second.unwrap().unwrap();
+
+        assert!(first.sender.same_channel(&second.sender));
+        assert_eq!(pool.state.lock().await.sessions.len(), 1);
+        assert!(tokio::time::timeout(Duration::from_secs(1), closed_rx)
+            .await
+            .expect("racing socket was not retired")
+            .unwrap());
+
+        let _ = release.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_actor_detects_peer_close_and_evicts_itself() {
+        let (client, mut server) = websocket_pair().await;
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        let (connection, actor) =
+            spawn_test_actor(client, &state, "closed", Duration::from_secs(60)).await;
+
+        server.close(None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("idle actor did not observe peer close")
+            .unwrap();
+
+        assert!(!connection.alive.load(Ordering::Acquire));
+        let state = state.lock().await;
+        assert!(!state.sessions.contains_key("closed"));
+        assert!(!state.disabled.contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn idle_actor_times_out_and_evicts_itself() {
+        let (client, mut server) = websocket_pair().await;
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        let (connection, actor) =
+            spawn_test_actor(client, &state, "idle", Duration::from_millis(20)).await;
+
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("idle actor was retained past its timeout")
+            .unwrap();
+
+        assert!(!connection.alive.load(Ordering::Acquire));
+        assert!(!state.lock().await.sessions.contains_key("idle"));
+        let close = tokio::time::timeout(Duration::from_secs(1), server.next())
+            .await
+            .expect("idle socket was not closed");
+        assert!(matches!(close, Some(Ok(Message::Close(_))) | None));
+    }
+
+    #[tokio::test]
+    async fn idle_actor_does_not_retain_pool_state() {
+        let (client, _server) = websocket_pair().await;
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        let (connection, actor) =
+            spawn_test_actor(client, &state, "cycle", Duration::from_secs(60)).await;
+        let weak_state = Arc::downgrade(&state);
+
+        drop(connection);
+        drop(state);
+        assert!(weak_state.upgrade().is_none());
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("actor did not stop after its pool was dropped")
+            .unwrap();
     }
 
     #[test]

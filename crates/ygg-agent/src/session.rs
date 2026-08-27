@@ -1481,21 +1481,38 @@ impl Session {
     ///
     /// Entry IDs and semantic sidecar references are preserved, but sibling
     /// branches, usage telemetry, and later checkpoints are deliberately not
-    /// copied. The destination is created atomically enough to remain absent
-    /// on every validation/write failure.
+    /// copied. When the selected chain crosses a compaction boundary, entries
+    /// older than that boundary's `first_kept` are omitted: the fork replays
+    /// from the compaction summary exactly like the source session, so the
+    /// replaced history is never copied again. The boundary's root-side entry
+    /// keeps a source-side parent that was not copied, so it is detached and
+    /// re-rooted in the destination.
+    ///
+    /// A `None` checkpoint copies no entries at all: the destination is an
+    /// empty session (for forking "before" a root message).
+    ///
+    /// The destination is created atomically enough to remain absent on
+    /// every validation/write failure.
     pub fn fork_to(
         &self,
         path: impl Into<PathBuf>,
-        checkpoint: EntryId,
+        checkpoint: Option<&EntryId>,
     ) -> Result<Self, SessionError> {
         let path = path.into();
         let mut newest_first = Vec::<&Entry>::new();
-        let mut cursor = Some(&checkpoint);
+        let mut stop_at: Option<&EntryId> = None;
+        let mut cursor = checkpoint;
         while let Some(id) = cursor {
             let entry = self
                 .entry(id)
                 .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
             newest_first.push(entry);
+            if stop_at == Some(id) {
+                break;
+            }
+            if let EntryValue::Compaction { first_kept, .. } = &entry.value {
+                stop_at = Some(first_kept);
+            }
             cursor = entry.parent.as_ref();
         }
         newest_first.reverse();
@@ -1503,17 +1520,32 @@ impl Session {
         let mut destination = Session::create(path.clone())?;
         let result = (|| {
             let mut bytes = Vec::new();
-            for entry in newest_first {
-                write_json_line(&mut bytes, &SessionRecordRef::Entry(entry))?;
+            let mut remaining = newest_first.into_iter();
+            if let Some(first) = remaining.next() {
+                if first.parent.is_some() {
+                    // The chain starts inside a compacted span: detach the
+                    // root-side entry from its source-side parent, which was
+                    // deliberately not copied.
+                    let mut detached = (*first).clone();
+                    detached.parent = None;
+                    write_json_line(&mut bytes, &SessionRecordRef::Entry(&detached))?;
+                } else {
+                    write_json_line(&mut bytes, &SessionRecordRef::Entry(first))?;
+                }
+                for entry in remaining {
+                    write_json_line(&mut bytes, &SessionRecordRef::Entry(entry))?;
+                }
             }
-            write_json_line(
-                &mut bytes,
-                &SessionRecordRef::Head {
-                    id: &checkpoint,
-                    total_cost_microdollars: &0,
-                    total_cost_picodollars_remainder: &0,
-                },
-            )?;
+            if let Some(id) = checkpoint {
+                write_json_line(
+                    &mut bytes,
+                    &SessionRecordRef::Head {
+                        id,
+                        total_cost_microdollars: &0,
+                        total_cost_picodollars_remainder: &0,
+                    },
+                )?;
+            }
             destination.persist(&bytes)?;
             drop(destination);
             Session::open(&path)
@@ -3347,7 +3379,7 @@ mod tests {
         source.checkout(root.clone()).unwrap();
         let sibling = source.append(assistant("sibling answer")).unwrap();
 
-        let mut fork = source.fork_to(&fork_path, selected.clone()).unwrap();
+        let mut fork = source.fork_to(&fork_path, Some(&selected)).unwrap();
         assert_eq!(fork.head(), Some(selected.clone()));
         assert_eq!(fork.entries().len(), 2);
         assert!(fork.entry(&root).is_some());
@@ -3371,6 +3403,135 @@ mod tests {
 
         assert_eq!(source.head(), Some(sibling));
         assert_eq!(source.entries().len(), 4);
+    }
+
+    #[test]
+    fn fork_to_stops_at_the_compaction_boundary_and_reroots_the_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut source = Session::create(&source_path).unwrap();
+
+        let root = source.append(user("root")).unwrap();
+        let first_answer = source.append(assistant("first answer")).unwrap();
+        let first_kept = source.append(user("second prompt")).unwrap();
+        source.append(assistant("second answer")).unwrap();
+        source.append(user("third prompt")).unwrap();
+        source.append(assistant("third answer")).unwrap();
+        let compaction = source
+            .compact("summary of the replaced history", first_kept.clone())
+            .unwrap();
+
+        let fork = source.fork_to(&fork_path, Some(&compaction)).unwrap();
+        assert_eq!(fork.head(), Some(compaction.clone()));
+        // Only the retained span plus the boundary itself was copied.
+        assert!(fork.entry(&root).is_none());
+        assert!(fork.entry(&first_answer).is_none());
+        assert!(fork.entry(&first_kept).is_some());
+        assert_eq!(fork.entries().len(), 5);
+        // The root-side entry of the retained span was detached from the
+        // replaced history and re-rooted in the fork.
+        assert_eq!(
+            fork.entry(&first_kept).unwrap().parent,
+            None,
+            "retained span must be re-rooted"
+        );
+
+        // The fork replays exactly like the source: summary, then the span.
+        let texts = |messages: &[Message]| messages.iter().map(text_of).collect::<Vec<_>>();
+        let fork_context = fork.context().unwrap();
+        assert_eq!(
+            texts(&fork_context),
+            texts(&source.context().unwrap()),
+            "fork context must match the source context"
+        );
+        assert_eq!(
+            texts(&fork_context),
+            vec![
+                "[summary of earlier conversation]\nsummary of the replaced history".to_string(),
+                "second prompt".to_string(),
+                "second answer".to_string(),
+                "third prompt".to_string(),
+                "third answer".to_string(),
+            ]
+        );
+
+        // The re-rooted span survives a reopen: the file validates on its own.
+        drop(fork);
+        let reopened = Session::open(&fork_path).unwrap();
+        assert_eq!(reopened.head(), Some(compaction));
+        assert_eq!(reopened.entries().len(), 5);
+        assert_eq!(
+            reopened.entry(&first_kept).unwrap().parent,
+            None,
+            "re-rooting must be durable"
+        );
+    }
+
+    #[test]
+    fn fork_to_stops_at_the_oldest_compaction_on_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut source = Session::create(&source_path).unwrap();
+
+        let root = source.append(user("root")).unwrap();
+        source.append(assistant("first answer")).unwrap();
+        let first_kept = source.append(user("second prompt")).unwrap();
+        source.append(assistant("second answer")).unwrap();
+        source.append(user("third prompt")).unwrap();
+        let first_compaction = source.compact("first summary", first_kept.clone()).unwrap();
+        let second_kept = source.append(user("fourth prompt")).unwrap();
+        source.append(assistant("fourth answer")).unwrap();
+        // A second, newer compaction whose boundary is the prompt appended
+        // after the first one. Its replaced span subsumes the first boundary.
+        let second_compaction = source
+            .compact("second summary", second_kept.clone())
+            .unwrap();
+
+        let fork = source
+            .fork_to(&fork_path, Some(&second_compaction))
+            .unwrap();
+        assert_eq!(fork.head(), Some(second_compaction));
+        // The walk stops at the oldest boundary on the chain, so the first
+        // compaction and its retained span are not copied: the newer summary
+        // already subsumes them.
+        assert!(fork.entry(&first_compaction).is_none());
+        assert!(fork.entry(&first_kept).is_none());
+        assert!(fork.entry(&root).is_none());
+        assert_eq!(fork.entries().len(), 3);
+        // The retained prompt's source-side parent is the first compaction,
+        // which was not copied, so it must be re-rooted.
+        assert_eq!(
+            fork.entry(&second_kept).unwrap().parent,
+            None,
+            "retained span must be re-rooted"
+        );
+    }
+
+    #[test]
+    fn fork_to_with_none_creates_an_empty_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.jsonl");
+        let fork_path = dir.path().join("fork.jsonl");
+        let mut source = Session::create(&source_path).unwrap();
+        source.append(user("root")).unwrap();
+
+        let mut fork = source.fork_to(&fork_path, None).unwrap();
+        assert!(fork.head().is_none());
+        assert!(fork.entries().is_empty());
+
+        // The empty fork continues as a fresh root branch.
+        let new_root = fork.append(user("fresh start")).unwrap();
+        assert_eq!(
+            fork.entry(&new_root).unwrap().parent,
+            None,
+            "first entry of an empty fork is a root"
+        );
+        drop(fork);
+        let reopened = Session::open(&fork_path).unwrap();
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.head(), Some(new_root));
     }
 
     #[test]

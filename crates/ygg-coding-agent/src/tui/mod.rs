@@ -3,6 +3,7 @@
 pub mod composer;
 pub mod composer_surface;
 pub(crate) mod context;
+pub(crate) mod fuzzy;
 pub mod keymap;
 pub mod pickers;
 pub(crate) mod splash;

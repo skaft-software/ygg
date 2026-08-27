@@ -1,7 +1,7 @@
 use std::cell::Ref;
 use std::time::Instant;
 
-use super::transcript_render::render_block_planned;
+use super::transcript_render::{render_assistant_update_planned, render_block_planned};
 use super::welcome_card::render_welcome_card;
 use super::ShellState;
 
@@ -121,7 +121,7 @@ impl ShellState {
                         reasoning_renderer,
                         width,
                         self.show_tool_details(block),
-                        self.event_dot_visible,
+                        self.event_spinner_frame,
                     );
                     let start = cache.lines.len();
                     let length = rendered.lines.len();
@@ -146,7 +146,7 @@ impl ShellState {
                         reasoning_renderer,
                         width,
                         self.show_tool_details(&self.transcript[index]),
-                        self.event_dot_visible,
+                        self.event_spinner_frame,
                     );
                     let start = cache.lines.len();
                     first_changed = first_changed.min(start);
@@ -174,19 +174,53 @@ impl ShellState {
                         continue;
                     }
                     let start = cache.block_starts[index];
-                    first_changed = first_changed.min(start);
                     let old_length = cache.block_lengths[index];
+                    let previous = index
+                        .checked_sub(1)
+                        .and_then(|previous| self.transcript.get(previous));
+                    if let Some(update) = render_assistant_update_planned(
+                        previous,
+                        &self.transcript[index],
+                        &self.theme,
+                        rich_renderer,
+                        width,
+                    )
+                    .filter(|update| update.stable_rows <= old_length)
+                    {
+                        let replacement_start = start.saturating_add(update.stable_rows);
+                        first_changed = first_changed.min(replacement_start);
+                        let new_length =
+                            update.stable_rows.saturating_add(update.replacement.len());
+                        cache
+                            .lines
+                            .splice(replacement_start..start + old_length, update.replacement);
+                        cache.block_lengths[index] = new_length;
+                        cache.block_geometries[index] = update.geometry;
+                        cache.block_revisions[index] = self.block_revisions[index];
+
+                        let delta = new_length as isize - old_length as isize;
+                        if delta != 0 {
+                            for following in cache.block_starts.iter_mut().skip(index + 1) {
+                                if delta > 0 {
+                                    *following += delta as usize;
+                                } else {
+                                    *following = following.saturating_sub((-delta) as usize);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    first_changed = first_changed.min(start);
                     let rendered = render_block_planned(
-                        index
-                            .checked_sub(1)
-                            .and_then(|previous| self.transcript.get(previous)),
+                        previous,
                         &self.transcript[index],
                         &self.theme,
                         rich_renderer,
                         reasoning_renderer,
                         width,
                         self.show_tool_details(&self.transcript[index]),
-                        self.event_dot_visible,
+                        self.event_spinner_frame,
                     );
                     let new_length = rendered.lines.len();
                     cache
@@ -213,7 +247,7 @@ impl ShellState {
             cache.dirty = false;
             cache.generation = cache.generation.saturating_add(1);
             let history_prepended = self.history_prepended.replace(false);
-            if !self.follow_tail && !history_prepended {
+            if !self.follow_tail && self.viewport_anchor.get().is_none() && !history_prepended {
                 let current = self.scroll_from_bottom.get();
                 if cache.lines.len() >= previous_line_count {
                     self.scroll_from_bottom

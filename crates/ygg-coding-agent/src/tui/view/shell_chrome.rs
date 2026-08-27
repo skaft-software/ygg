@@ -74,6 +74,14 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
     }
 }
 
+fn disclosed_activity_tail<T>(items: &[T], expanded: bool) -> &[T] {
+    if expanded {
+        items
+    } else {
+        &items[items.len().saturating_sub(2)..]
+    }
+}
+
 fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     // Delegated workers now render as persistent transcript tool blocks. Keep
     // this compatibility path empty so older shell-chrome callers cannot
@@ -86,7 +94,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
     };
     // When the strip is expanded (ctrl+o), the hint in the label flips so it
     // keeps telling the truth about what ctrl+o will do next.
-    let status_label = if state.subagent_activity_expanded {
+    let status_label = if state.verbose_tools {
         view.status_label
             .replace("ctrl+o to expand", "ctrl+o to collapse")
     } else {
@@ -101,11 +109,10 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
         width,
     )];
     let unicode = state.theme.unicode();
-    // The host caps concurrent children at eight with depth one, so the full
-    // roster always fits; hiding rows behind a recency window leaves running
-    // workers invisible.
+    // Collapsed disclosure keeps the two most recent workers visible; Ctrl+O
+    // reveals the complete host-bounded roster.
     if !view.telemetry.is_empty() {
-        let children = &view.telemetry[..];
+        let children = disclosed_activity_tail(&view.telemetry, state.verbose_tools);
         for (index, child) in children.iter().rev().enumerate() {
             let last = index + 1 == children.len();
             let branch = match (unicode, last) {
@@ -223,7 +230,7 @@ fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
             width,
         ));
     } else {
-        let activities = &view.activities[..];
+        let activities = disclosed_activity_tail(&view.activities, state.verbose_tools);
         for (index, activity) in activities.iter().rev().enumerate() {
             let last = index + 1 == activities.len();
             let branch = match (unicode, last) {

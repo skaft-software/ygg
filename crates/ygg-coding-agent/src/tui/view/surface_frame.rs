@@ -80,6 +80,7 @@ fn render_surface_content_line(
     plan: &SurfacePlan<'_>,
     theme: &YggTheme,
     prompt_color: Option<&str>,
+    _collapsed_reasoning: bool,
 ) -> String {
     let (content_role, border_role, _) = surface_roles(plan.kind);
     let content = fit_line(line, plan.geometry.content_width);
@@ -143,15 +144,48 @@ fn render_surface_content_line(
     }
 }
 
+fn surface_bottom_row(plan: &SurfacePlan<'_>, theme: &YggTheme) -> Option<String> {
+    (plan.chrome == ThemeSurfaceChrome::Card).then(|| {
+        let (_, border_role, _) = surface_roles(plan.kind);
+        let middle = horizontal_rule(theme, usize::from(plan.frame_width.saturating_sub(2)));
+        let bottom = format!(
+            "{}{}{}",
+            theme.glyph("bottom_left"),
+            middle,
+            theme.glyph("bottom_right")
+        );
+        theme.apply_semantic_role_layered(border_role, &bottom)
+    })
+}
+
+#[cfg(test)]
 pub(super) fn event_margin_marker(
     block: &TranscriptBlock,
     theme: &YggTheme,
     active_dot_visible: bool,
     collapsed_reasoning: bool,
 ) -> Option<String> {
+    event_margin_marker_with_frame(
+        block,
+        theme,
+        usize::from(!active_dot_visible),
+        collapsed_reasoning,
+    )
+}
+
+pub(super) fn event_margin_marker_with_frame(
+    block: &TranscriptBlock,
+    theme: &YggTheme,
+    spinner_frame: usize,
+    collapsed_reasoning: bool,
+) -> Option<String> {
+    let markers_enabled = theme.resolve::<bool>("margin_markers").unwrap_or(true);
+    let thinking_spinner = theme.resolve::<bool>("thinking_spinner").unwrap_or(false);
+    if !markers_enabled && !matches!(block, TranscriptBlock::Reasoning(_)) {
+        return None;
+    }
     let event_dot = if theme.unicode() { "•" } else { "*" };
-    // Active tool and reasoning dots pulse through tone rather than swapping
-    // differently sized glyphs. Their settled colour communicates the result.
+    let active_dot_visible = spinner_frame % 2 == 0;
     let active_phase_dot = || {
         if active_dot_visible {
             theme.fg("foreground", event_dot)
@@ -160,7 +194,17 @@ pub(super) fn event_margin_marker(
         }
     };
     match block {
-        TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning => {
+        TranscriptBlock::Reasoning(_) if collapsed_reasoning && thinking_spinner => {
+            const BRAILLE_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            const ASCII_FRAMES: [&str; 10] = [".", ":", "*", "+", "x", "X", "+", "*", ":", "."];
+            let spinner = if theme.unicode() {
+                BRAILLE_FRAMES[spinner_frame % BRAILLE_FRAMES.len()]
+            } else {
+                ASCII_FRAMES[spinner_frame % ASCII_FRAMES.len()]
+            };
+            Some(theme.fg("accent", spinner))
+        }
+        TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning && markers_enabled => {
             Some(if active_dot_visible {
                 theme.model_fg(reasoning.model_lab, event_dot)
             } else {
@@ -168,44 +212,54 @@ pub(super) fn event_margin_marker(
             })
         }
         TranscriptBlock::Reasoning(_) => None,
-        // Assistant dots stay solid light while streaming and after settling.
-        TranscriptBlock::Assistant(_) => Some(theme.fg("foreground", event_dot)),
-        TranscriptBlock::Tool(panel) if !panel.finished => Some(active_phase_dot()),
-        TranscriptBlock::Tool(panel) => Some(if panel.is_error {
+        TranscriptBlock::Assistant(_) if markers_enabled => Some(theme.fg("foreground", event_dot)),
+        TranscriptBlock::Tool(panel) if markers_enabled && !panel.finished => {
+            Some(active_phase_dot())
+        }
+        TranscriptBlock::Tool(panel) if markers_enabled => Some(if panel.is_error {
             theme.settled_event_dot("error", event_dot)
         } else {
             theme.settled_event_dot("success", event_dot)
         }),
-        TranscriptBlock::Shell(shell) if shell.running => Some(active_phase_dot()),
-        TranscriptBlock::Shell(shell) => Some(if shell.exit_code == 0 {
+        TranscriptBlock::Shell(shell) if markers_enabled && shell.running => {
+            Some(active_phase_dot())
+        }
+        TranscriptBlock::Shell(shell) if markers_enabled => Some(if shell.exit_code == 0 {
             theme.settled_event_dot("success", event_dot)
         } else {
             theme.settled_event_dot("error", event_dot)
         }),
-        TranscriptBlock::Notice(_) => Some(theme.settled_event_dot("neutral", event_dot)),
-        TranscriptBlock::NoticeStatus { tone, .. } => Some(theme.settled_event_dot(
-            match tone {
-                super::NoticeTone::Success => "success",
-                super::NoticeTone::Error => "error",
-            },
-            event_dot,
-        )),
+        TranscriptBlock::Notice(_) if markers_enabled => {
+            Some(theme.settled_event_dot("neutral", event_dot))
+        }
+        TranscriptBlock::NoticeStatus { tone, .. } if markers_enabled => {
+            Some(theme.settled_event_dot(
+                match tone {
+                    super::NoticeTone::Success => "success",
+                    super::NoticeTone::Error => "error",
+                },
+                event_dot,
+            ))
+        }
         TranscriptBlock::User { .. }
         | TranscriptBlock::Outcome(_)
-        | TranscriptBlock::Compaction(_) => None,
+        | TranscriptBlock::Compaction(_)
+        | TranscriptBlock::Tool(_)
+        | TranscriptBlock::Shell(_)
+        | TranscriptBlock::Assistant(_)
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::NoticeStatus { .. } => None,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn decorate_surface(
+pub(super) fn decorate_surface_with_frame(
     content: Vec<String>,
-    block: &TranscriptBlock,
     plan: &SurfacePlan<'_>,
     theme: &YggTheme,
     outer_width: u16,
     prompt_color: Option<&str>,
-    active_dot_visible: bool,
     collapsed_reasoning: bool,
+    marker: Option<String>,
 ) -> Vec<String> {
     let mut rows = Vec::with_capacity(
         plan.geometry.transition_rows
@@ -228,31 +282,20 @@ pub(super) fn decorate_surface(
         rows.push(styled_surface_heading(plan, theme));
     }
     rows.extend(std::iter::repeat_n(
-        render_surface_content_line("", plan, theme, prompt_color),
+        render_surface_content_line("", plan, theme, prompt_color, collapsed_reasoning),
         leading_padding_rows,
     ));
-    rows.extend(
-        content
-            .iter()
-            .map(|line| render_surface_content_line(line, plan, theme, prompt_color)),
-    );
+    rows.extend(content.iter().map(|line| {
+        render_surface_content_line(line, plan, theme, prompt_color, collapsed_reasoning)
+    }));
     rows.extend(std::iter::repeat_n(
-        render_surface_content_line("", plan, theme, prompt_color),
+        render_surface_content_line("", plan, theme, prompt_color, collapsed_reasoning),
         trailing_padding_rows,
     ));
-    if has_bottom_row {
-        let (_, border_role, _) = surface_roles(plan.kind);
-        let middle = horizontal_rule(theme, usize::from(plan.frame_width.saturating_sub(2)));
-        let bottom = format!(
-            "{}{}{}",
-            theme.glyph("bottom_left"),
-            middle,
-            theme.glyph("bottom_right")
-        );
-        rows.push(theme.apply_semantic_role_layered(border_role, &bottom));
+    if let Some(bottom) = surface_bottom_row(plan, theme) {
+        rows.push(bottom);
     }
 
-    let marker = event_margin_marker(block, theme, active_dot_visible, collapsed_reasoning);
     let mut marker_pending = true;
     rows.into_iter()
         .enumerate()
@@ -278,4 +321,49 @@ pub(super) fn decorate_surface(
             }
         })
         .collect()
+}
+
+/// Decorate a replacement that starts after at least one stable content row.
+/// The event marker and leading frame rows are already retained in the stable
+/// prefix, so this returns only content-tail and trailing-frame rows.
+pub(super) fn decorate_surface_content_suffix(
+    content_tail: Vec<String>,
+    plan: &SurfacePlan<'_>,
+    theme: &YggTheme,
+    outer_width: u16,
+    prompt_color: Option<&str>,
+    collapsed_reasoning: bool,
+) -> Vec<String> {
+    let has_bottom_row = plan.chrome == ThemeSurfaceChrome::Card;
+    let trailing_padding_rows = plan.geometry.trailing_rows - usize::from(has_bottom_row);
+    let frame_left = " ".repeat(usize::from(plan.frame_left));
+    let mut rows = content_tail
+        .iter()
+        .map(|line| {
+            render_surface_content_line(line, plan, theme, prompt_color, collapsed_reasoning)
+        })
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                fit_line(&format!("{frame_left}{line}"), outer_width)
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.extend(
+        std::iter::repeat_with(|| {
+            let line =
+                render_surface_content_line("", plan, theme, prompt_color, collapsed_reasoning);
+            if line.is_empty() {
+                String::new()
+            } else {
+                fit_line(&format!("{frame_left}{line}"), outer_width)
+            }
+        })
+        .take(trailing_padding_rows),
+    );
+    if let Some(bottom) = surface_bottom_row(plan, theme) {
+        rows.push(fit_line(&format!("{frame_left}{bottom}"), outer_width));
+    }
+    rows
 }

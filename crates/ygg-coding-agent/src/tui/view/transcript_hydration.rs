@@ -3,8 +3,7 @@
 use std::time::Duration;
 
 use super::{
-    bounded_append, sanitize_for_terminal, AssistantBlock, CompactionBlock, ShellState, ToolPanel,
-    TranscriptBlock,
+    sanitize_for_terminal, AssistantBlock, CompactionBlock, ShellState, ToolPanel, TranscriptBlock,
 };
 use crate::hydrate::TranscriptItem;
 use crate::presentation::{
@@ -26,7 +25,8 @@ fn apply_hydrated_tool_result(panel: &mut ToolPanel, text: &str, is_error: bool)
     } else {
         tool_failure_reason(&panel.name, &replayed)
     };
-    bounded_append(&mut panel.output, text);
+    panel.output.clear();
+    panel.output.push_str(text);
 }
 
 pub(super) fn append_hydrated_items(

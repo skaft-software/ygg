@@ -22,29 +22,21 @@ repeatable explicit roots with `--theme-dir <directory>`.
 
 ## Bundled theme pack
 
-The pack recreates the look and feel of three familiar coding-agent
-workbenches, so switching to Ygg feels like sitting at a bench you already
-know. Each is a faithful visual clone — exact palette values, prompt markers,
-frame shapes, and spacing — expressed entirely as theme data:
+The bundled themes keep their own authored geometry as well as their palettes:
 
-- `clawed` — a warm terracotta workspace in the style of Claude Code: rounded
-  `╭─╮` frames, a plain `>` prompt, `⏺` record-button tool dots, `⎿` bracket
-  result rails, `✻` thinking sparks, and comfortable spacing. Dark terminals
-  get the signature `#d97757` accent.
-- `pie` — pi's airy tomorrow-night bench: a `❯` prompt, rounded blue-bordered
-  composer, full-width filled user cards (`#343541` on dark), state-tinted
-  tool bands, and generous breathing room.
-- `kodex` — codex's quiet monochrome: a `›` prompt, cyan-only accent
-  (`#00cdcd` dark / `#005f87` light), a subtle shaded user band, dim
-  secondary text, a rule-less shaded composer rectangle, and compact spacing.
+- `clawed` — Claude Code's terracotta palette, a `>` prompt, and a static
+  full-width prompt highlight.
+- `pie` — pi's airy tomorrow-night treatment: a `❯` prompt, rounded blue
+  composer, bounded filled user/tool cards, margin dots, and the standard
+  two-row `Thinking` plus disclosure-elbow treatment.
+- `kodex` — codex's cyan palette, a `›` prompt, a static mint prompt rectangle,
+  and the default theme's padded prompt rows.
 
-The clones pin their palettes with hand-authored `[variants.dark]` and
+The themes pin their palettes with hand-authored `[variants.dark]` and
 `[variants.light]` tables instead of adaptive balancing (`adaptive = false`),
-so the exact reference colors survive on both profiles. Base `[colors]`
-accents are conservative values that stay readable when the terminal
-background is unknown. All three set `model.use_lab_color = false`: only
-Ygg's compiled-in default theme colors prompts and accents per model family;
-a pack theme keeps its own fixed identity regardless of the active model.
+so the reference colors survive on both profiles. All three set
+`model.use_lab_color = false`, keeping their identity independent of the active
+model.
 Terminal-profile detection first honors `YGG_COLOR_SCHEME` and `COLORFGBG`;
 in the interactive TUI, when those are absent, Ygg sends a short OSC 11
 background query after entering raw mode and uses the response when the
@@ -71,9 +63,10 @@ outside that rectangle. Ygg stores the exact `#RRGGBB` value with the session
 entry, so changing the model or theme cannot recolour old prompts. Only output
 capability changes the wire encoding: truecolor uses the stored RGB exactly,
 ANSI 256/16 quantize it, and plain/no-color terminals retain the same row
-geometry without escapes. Themes that set `model.use_lab_color = false` — all
-three bundled pack themes do — suppress the provenance paint entirely and
-render user prompts through their own `[surfaces.user]` recipe instead.
+geometry without escapes. Themes that set `model.use_lab_color = false` — all three bundled pack themes do —
+suppress model provenance paint. Their user rows use the authored static
+surface colors instead. Set `layout.prompt_padding = true` to give a static
+user background the same leading/trailing rows as the compiled default.
 
 ## Runtime reload and scrolling ownership
 
@@ -206,6 +199,7 @@ show_footer = true
 show_status_line = true
 show_reasoning = true
 show_panel_borders = true
+prompt_padding = false # static prompt backgrounds may opt into default padding
 transcript_inset = 2
 composer_padding = 1
 narrow_breakpoint = 72
@@ -275,7 +269,9 @@ Role styles are live for rich Markdown/diff roles, host-owned interactive
 panels, and all three layers of each transcript surface: `surface.<kind>`,
 `surface.<kind>.border`, and `surface.<kind>.label`. The eight typed surface
 kinds are `user`, `assistant`, `reasoning`, `tool`, `shell`, `notice`, `outcome`,
-and `compaction`. Every layout field alters the current renderer:
+and `compaction`. Settled tool cards may additionally use the opt-in roles
+`surface.tool.success` and `surface.tool.error`; themes that omit those roles
+fall back to `surface.tool`. Every layout field alters the current renderer:
 
 - `density` selects zero, one, or two rows between semantic transcript blocks.
 - `transcript_inset` moves and reflows transcript content without breaking

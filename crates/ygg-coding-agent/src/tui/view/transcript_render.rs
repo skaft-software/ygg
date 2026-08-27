@@ -6,7 +6,9 @@ use super::assistant_block::AssistantBlock;
 use super::bash_render::{render_bash_row, render_compact_bash_output};
 use super::outcome_render::render_outcome;
 use super::reasoning_render::render_reasoning_on_surface;
-use super::surface_frame::decorate_surface;
+use super::surface_frame::{
+    decorate_surface_content_suffix, decorate_surface_with_frame, event_margin_marker_with_frame,
+};
 use super::surface_layout::{compile_surface_plan, surface_roles};
 use super::terminal_text::sanitize_for_terminal;
 use super::tool_render::{
@@ -36,19 +38,31 @@ fn extension_activity_state_label(state: ygg_agent::ExtensionPresentationState) 
     }
 }
 
-fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
+fn disclosed_activity_tail<T>(items: &[T], expanded: bool) -> &[T] {
+    if expanded {
+        items
+    } else {
+        &items[items.len().saturating_sub(2)..]
+    }
+}
+
+fn render_subagent_activity_panel(
+    panel: &ToolPanel,
+    theme: &YggTheme,
+    width: u16,
+    expanded: bool,
+) -> Vec<String> {
     let Some(view) = panel.subagent_activity.as_ref() else {
         return Vec::new();
     };
     let label = theme.bold(&theme.fg("foreground", "Subagents"));
     let mut lines = vec![label];
-    // The host caps concurrent children at eight with depth one, so the full
-    // roster always fits; hiding rows behind a recency window leaves running
-    // workers invisible.
+    // Collapsed disclosure keeps the two most recent workers visible; Ctrl+O
+    // reveals the complete host-bounded roster.
     let unicode = theme.unicode();
 
     if !view.telemetry.is_empty() {
-        let children = &view.telemetry[..];
+        let children = disclosed_activity_tail(&view.telemetry, expanded);
         let task_width = children
             .iter()
             .map(|child| visible_width(&sanitize_for_terminal(&child.task_name)))
@@ -117,7 +131,7 @@ fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u1
             ));
         }
     } else {
-        let activities = &view.activities[..];
+        let activities = disclosed_activity_tail(&view.activities, expanded);
         let summary_width = activities
             .iter()
             .map(|activity| visible_width(&sanitize_for_terminal(&activity.summary)))
@@ -169,6 +183,45 @@ fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u1
     finish_transcript_block(lines)
 }
 
+pub(super) struct RenderedTranscriptBlockUpdate {
+    pub(super) stable_rows: usize,
+    pub(super) replacement: Vec<String>,
+    pub(super) geometry: SurfaceGeometry,
+}
+
+/// Incrementally decorate a streaming assistant tail. Stable Markdown rows and
+/// their outer surface frame remain in `TranscriptCache`; only the mutable
+/// content suffix plus trailing frame rows are rebuilt.
+pub(super) fn render_assistant_update_planned(
+    previous: Option<&TranscriptBlock>,
+    block: &TranscriptBlock,
+    theme: &YggTheme,
+    rich_renderer: &RichRenderer,
+    outer_width: u16,
+) -> Option<RenderedTranscriptBlockUpdate> {
+    let TranscriptBlock::Assistant(assistant) = block else {
+        return None;
+    };
+    let plan = compile_surface_plan(previous, block, theme, outer_width);
+    let update = assistant.render_update(rich_renderer, theme, plan.geometry.content_width)?;
+    if update.stable_prefix == 0 {
+        return None;
+    }
+
+    let stable_rows = plan
+        .geometry
+        .transition_rows
+        .saturating_add(plan.geometry.leading_rows)
+        .saturating_add(update.stable_prefix);
+    let replacement =
+        decorate_surface_content_suffix(update.replacement, &plan, theme, outer_width, None, false);
+    Some(RenderedTranscriptBlockUpdate {
+        stable_rows,
+        replacement,
+        geometry: plan.geometry,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_block_planned(
     previous: Option<&TranscriptBlock>,
@@ -178,7 +231,7 @@ pub(super) fn render_block_planned(
     reasoning_renderer: &RichRenderer,
     outer_width: u16,
     verbose_tools: bool,
-    active_dot_visible: bool,
+    spinner_frame: usize,
 ) -> RenderedTranscriptBlock {
     let plan = compile_surface_plan(previous, block, theme, outer_width);
     let width = plan.geometry.content_width;
@@ -221,7 +274,12 @@ pub(super) fn render_block_planned(
             content_background,
         ),
         TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
-            finish_transcript_block(render_subagent_activity_panel(panel, theme, width))
+            finish_transcript_block(render_subagent_activity_panel(
+                panel,
+                theme,
+                width,
+                verbose_tools,
+            ))
         }
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
@@ -269,34 +327,32 @@ pub(super) fn render_block_planned(
                 wrap_hanging(&text, &label_prefix, &continuation, width)
             };
 
-            if !panel.is_error {
-                match panel.name.as_str() {
-                    "bash" | "exec" if compact_bash => lines.extend(render_compact_bash_output(
+            match panel.name.as_str() {
+                "bash" | "exec" if compact_bash => lines.extend(render_compact_bash_output(
+                    panel,
+                    theme,
+                    width,
+                    verbose_tools,
+                    &output_indent,
+                )),
+                "search" if !panel.is_error => lines.extend(render_compact_tool_output(
+                    panel,
+                    theme,
+                    width,
+                    verbose_tools,
+                    &output_indent,
+                )),
+                "edit" | "write" if !panel.is_error && tool_diff(panel).is_some() => {
+                    lines.extend(render_diff_only(
                         panel,
+                        rich_renderer,
                         theme,
                         width,
                         verbose_tools,
                         &output_indent,
-                    )),
-                    "search" => lines.extend(render_compact_tool_output(
-                        panel,
-                        theme,
-                        width,
-                        verbose_tools,
-                        &output_indent,
-                    )),
-                    "edit" | "write" if tool_diff(panel).is_some() => {
-                        lines.extend(render_diff_only(
-                            panel,
-                            rich_renderer,
-                            theme,
-                            width,
-                            verbose_tools,
-                            &output_indent,
-                        ))
-                    }
-                    _ => {}
+                    ))
                 }
+                _ => {}
             }
             finish_transcript_block(lines)
         }
@@ -375,15 +431,15 @@ pub(super) fn render_block_planned(
             .filter(|_| theme.uses_model_lab_color()),
         _ => None,
     };
-    let lines = decorate_surface(
+    let marker = event_margin_marker_with_frame(block, theme, spinner_frame, collapsed_reasoning);
+    let lines = decorate_surface_with_frame(
         lines,
-        block,
         &plan,
         theme,
         outer_width,
         prompt_color,
-        active_dot_visible,
         collapsed_reasoning,
+        marker,
     );
     RenderedTranscriptBlock {
         lines,
@@ -409,7 +465,7 @@ pub(super) fn render_block(
         reasoning_renderer,
         outer_width,
         verbose_tools,
-        true,
+        0,
     )
     .lines
 }

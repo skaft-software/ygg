@@ -29,9 +29,10 @@ pub fn resolve_workspace(explicit: Option<&Path>, cwd: &Path) -> std::io::Result
     cwd.canonicalize()
 }
 
-/// Mouse ownership policy. `Auto`, `Terminal`, and `Off` preserve the
-/// terminal's native selection and scrollback. `App` explicitly opts into
-/// Ygg's bounded semantic viewport and application-owned selection.
+/// Mouse ownership policy. `Auto`, `Terminal`, and `Off` preserve terminal
+/// selection and uncaptured wheel history. `App` explicitly captures mouse
+/// gestures for Ygg's semantic viewport; keyboard navigation can claim that
+/// viewport independently in every mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MouseMode {
     #[default]
@@ -52,8 +53,8 @@ impl MouseMode {
         }
     }
 
-    /// Native selection and scrollback are the default. Application mouse
-    /// ownership remains available only through explicit `App` mode.
+    /// Whether Ygg captures mouse gestures. Semantic keyboard viewport
+    /// ownership is intentionally independent of this setting.
     pub fn application_owned(self) -> bool {
         matches!(self, Self::App)
     }
@@ -73,6 +74,8 @@ pub enum ResumeSelector {
     New,
     Continue,
     Resume(Option<String>),
+    /// Fork a selected session into a new session before launch.
+    Fork(Option<String>),
 }
 
 /// Product-level sandbox settings.

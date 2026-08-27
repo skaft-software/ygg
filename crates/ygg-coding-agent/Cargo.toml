@@ -72,12 +72,15 @@ base64 = "0.22"
 regex = "1"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 semver = "1"
+tree-sitter = "0.25"
+tree-sitter-typescript = "0.23"
 async-trait = "0.1"
 tempfile = "3"
 signal-hook = "0.3"
 sha2 = "0.10"
 libc = "0.2"
 getrandom = { version = "0.3", optional = true }
+globset = "0.4"
 ygg-serve-backend = { version = "0.1.0", path = "../../extensions/ygg-serve", optional = true }
 
 [build-dependencies]

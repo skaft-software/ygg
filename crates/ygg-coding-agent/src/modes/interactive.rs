@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
@@ -38,8 +39,9 @@ use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
-    optional_model_picker, read_only_document, read_only_document_live_styled, session_picker,
-    subagent_picker, theme_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
+    message_picker, optional_model_picker, read_only_document, read_only_document_live_styled,
+    session_picker, subagent_picker, theme_picker, thinking_picker, tool_input_picker,
+    SubagentPickerSnapshot,
 };
 use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
@@ -146,6 +148,8 @@ pub enum PendingIdleAction {
     PickThinking,
     NewSession,
     ResumeSession(Option<String>),
+    Fork,
+    Clone,
     Compact,
     AutoCompact(Option<commands::AutoCompactSetting>),
     ShowContext,
@@ -339,8 +343,8 @@ where
                         shell.show_compaction_summary();
                         shell.render();
                     }
-                    InputAction::ExpandFocusedTool => {
-                        shell.expand_focused_tool();
+                    InputAction::ToggleDisclosure => {
+                        shell.toggle_disclosure();
                         shell.render();
                     }
                     InputAction::CycleThinking => return Ok(Idle::CycleThinking),
@@ -554,6 +558,8 @@ fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> a
         Command::Thinking(None) => PendingIdleAction::PickThinking,
         Command::New => PendingIdleAction::NewSession,
         Command::Resume(id) => PendingIdleAction::ResumeSession(id),
+        Command::Fork => PendingIdleAction::Fork,
+        Command::Clone => PendingIdleAction::Clone,
         Command::Compact => PendingIdleAction::Compact,
         Command::AutoCompact(setting) => PendingIdleAction::AutoCompact(setting),
         Command::Context => PendingIdleAction::ShowContext,
@@ -1017,6 +1023,22 @@ fn request_active_close(
     shell.render();
 }
 
+fn confirmation_action(tool_name: Option<&str>) -> &str {
+    match tool_name {
+        Some(name) if matches!(name, "bash" | "edit" | "write") => name,
+        Some(_) => "extension",
+        None => "tool",
+    }
+}
+
+fn confirmation_notice(tool_name: Option<&str>, confirmed: bool) -> String {
+    format!(
+        "{} action {}",
+        confirmation_action(tool_name),
+        if confirmed { "approved" } else { "denied" }
+    )
+}
+
 /// Drive one active frozen-Agent run. Control sends are queued locally, and
 /// input polling pauses while a bounded send waits so a full control channel
 /// can never starve the run stream that drains it.
@@ -1048,7 +1070,7 @@ where
     let mut last_run_cost = 0u64;
     let mut extension_tick = tokio::time::interval(Duration::from_millis(50));
     extension_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut extension_tool_calls =
+    let mut tool_calls =
         std::collections::HashMap::<ToolCallId, (String, serde_json::Value)>::new();
 
     loop {
@@ -1320,8 +1342,8 @@ where
                         shell.show_compaction_summary();
                         shell.render();
                     }
-                    InputAction::ExpandFocusedTool => {
-                        shell.expand_focused_tool();
+                    InputAction::ToggleDisclosure => {
+                        shell.toggle_disclosure();
                         shell.render();
                     }
                     InputAction::CycleThinking => {
@@ -1352,9 +1374,10 @@ where
                 Some(event) => {
                     if let AgentEvent::ToolStarted { id, name, args } = &event {
                         *made_tool_call = true;
-                        extension_tool_calls.insert(id.clone(), (name.clone(), args.clone()));
+                        tool_calls.insert(id.clone(), (name.clone(), args.clone()));
                     }
                     if let AgentEvent::ToolProgress {
+                        id,
                         progress: ygg_agent::ToolProgress::Confirmation(request),
                         ..
                     } = &event
@@ -1396,10 +1419,12 @@ where
                                 quit_requested,
                             );
                         }
+                        let tool_name = tool_calls.get(id).map(|(name, _)| name.as_str());
+                        let notice = confirmation_notice(tool_name, confirmed);
                         if confirmed {
-                            shell.notice_success("extension action approved");
+                            shell.notice_success(notice);
                         } else {
-                            shell.notice_error("extension action denied");
+                            shell.notice_error(notice);
                         }
                     }
                     if let AgentEvent::ToolProgress {
@@ -1437,7 +1462,7 @@ where
                     }
                     shell.on_run_event(run_id, &event);
                     if let AgentEvent::ToolFinished { id, result, .. } = &event {
-                        if let Some((name, arguments)) = extension_tool_calls.remove(id) {
+                        if let Some((name, arguments)) = tool_calls.remove(id) {
                             let (output, is_error) = match result {
                                 Ok(output) => (Some(output.text.clone()), output.is_error()),
                                 Err(error) => (Some(error.message.clone()), true),
@@ -2863,14 +2888,147 @@ async fn pick_session_path(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
     store: &crate::session_store::SessionStore,
+    current_session_path: Option<&std::path::Path>,
 ) -> anyhow::Result<Option<std::path::PathBuf>> {
-    let store = store.clone();
-    let session_dir = store.dir().to_owned();
+    let store_for_listing = store.clone();
     let sessions = run_blocking_lifecycle(shell, input, "discovering sessions…", move || {
-        Ok(store.list())
+        Ok(store_for_listing.list())
     })
     .await?;
-    session_picker(shell, input, &sessions, &session_dir).await
+    session_picker(shell, input, &sessions, store, current_session_path).await
+}
+
+fn active_fork_messages(session: &Session) -> Vec<crate::tui::view::ForkMessage> {
+    let mut newest_first = Vec::new();
+    let mut cursor = session.head_ref();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(id) else {
+            break;
+        };
+        newest_first.push(entry);
+        cursor = entry.parent.as_ref();
+    }
+    newest_first.reverse();
+
+    let mut messages = newest_first
+        .into_iter()
+        .filter_map(|entry| {
+            let ygg_agent::EntryValue::Message(ygg_ai::Message::User(user)) = &entry.value else {
+                return None;
+            };
+            let text = user
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    ygg_ai::UserPart::Text(text) => Some(text.as_str()),
+                    ygg_ai::UserPart::Media(_) | ygg_ai::UserPart::ToolResult(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then(|| crate::tui::view::ForkMessage {
+                entry_id: entry.id.0.clone(),
+                text,
+                whole_conversation: false,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if !messages.is_empty() {
+        if let Some(head) = session.head_ref() {
+            messages.push(crate::tui::view::ForkMessage {
+                entry_id: head.0.clone(),
+                text: String::new(),
+                whole_conversation: true,
+            });
+        }
+    }
+    messages
+}
+
+fn fork_active_session(
+    sessions: &crate::session_store::SessionStore,
+    source_path: &std::path::Path,
+    destination: std::path::PathBuf,
+    checkpoint: Option<&EntryId>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let source = Session::open_read_only(source_path).with_context(|| {
+        format!(
+            "could not open current session for forking: {}",
+            source_path.display()
+        )
+    })?;
+    let source_id = source
+        .path()
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| anyhow::anyhow!("current session has no valid id"))?;
+    let forked = source.fork_to(destination.clone(), checkpoint)?;
+    drop(forked);
+    if let Some(checkpoint) = checkpoint {
+        let destination_id = destination
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .ok_or_else(|| anyhow::anyhow!("forked session has no valid id"))?;
+        if let Err(error) =
+            sessions.set_fork_provenance(destination_id, source_id, checkpoint.0.as_str())
+        {
+            let _ = std::fs::remove_file(&destination);
+            return Err(error);
+        }
+    }
+    Ok(destination)
+}
+
+async fn fork_active_session_lifecycle(
+    app: &App,
+    checkpoint: EntryId,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<std::path::PathBuf> {
+    let sessions = app.sessions.clone();
+    let source_path = app.agent.session().path().to_owned();
+    let destination = sessions.new_path(&crate::modes::timestamp());
+    run_blocking_lifecycle(shell, input, "forking session…", move || {
+        fork_active_session(&sessions, &source_path, destination, Some(&checkpoint))
+    })
+    .await
+}
+
+async fn fork_session(
+    mut app: App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<App> {
+    let messages = active_fork_messages(app.agent.session());
+    if messages.is_empty() {
+        shell.notice("No messages to fork from");
+        return Ok(app);
+    }
+    let Some((entry_id, text)) = message_picker(shell, input, messages).await? else {
+        return Ok(app);
+    };
+    let checkpoint = EntryId(entry_id);
+    let destination = fork_active_session_lifecycle(&app, checkpoint, shell, input).await?;
+    app = transition(app, shell, input, Reconfig::Resume(destination)).await?;
+    shell.prefill_editor(text);
+    shell.notice("Forked to new session");
+    Ok(app)
+}
+
+async fn clone_session(
+    mut app: App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<App> {
+    let Some(head) = app.agent.session().head() else {
+        shell.notice("Nothing to clone yet");
+        return Ok(app);
+    };
+    let destination = fork_active_session_lifecycle(&app, head, shell, input).await?;
+    app = transition(app, shell, input, Reconfig::Resume(destination)).await?;
+    shell.clear_editor();
+    shell.notice("Cloned to new session");
+    Ok(app)
 }
 
 async fn apply_pending_actions(
@@ -2944,10 +3102,23 @@ async fn apply_pending_actions(
                 shell.notice("queued session resumed");
             }
             PendingIdleAction::ResumeSession(None) => {
-                if let Some(path) = pick_session_path(shell, input, &app.sessions).await? {
+                if let Some(path) = pick_session_path(
+                    shell,
+                    input,
+                    &app.sessions,
+                    Some(app.agent.session().path()),
+                )
+                .await?
+                {
                     app = transition(app, shell, input, Reconfig::Resume(path)).await?;
                     shell.notice("queued session resumed");
                 }
+            }
+            PendingIdleAction::Fork => {
+                app = fork_session(app, shell, input).await?;
+            }
+            PendingIdleAction::Clone => {
+                app = clone_session(app, shell, input).await?;
             }
             PendingIdleAction::Compact => {
                 shell.set_run_label("compacting…");
@@ -3449,10 +3620,23 @@ async fn run_idle_command(
             shell.notice("resumed session");
         }
         Command::Resume(None) => {
-            if let Some(path) = pick_session_path(shell, input, &app.sessions).await? {
+            if let Some(path) = pick_session_path(
+                shell,
+                input,
+                &app.sessions,
+                Some(app.agent.session().path()),
+            )
+            .await?
+            {
                 app = transition(app, shell, input, Reconfig::Resume(path)).await?;
                 shell.notice("resumed session");
             }
+        }
+        Command::Fork => {
+            app = fork_session(app, shell, input).await?;
+        }
+        Command::Clone => {
+            app = clone_session(app, shell, input).await?;
         }
         Command::Model(Some(id)) => {
             app = transition(app, shell, input, Reconfig::Model(ModelId(id))).await?;
@@ -3693,7 +3877,7 @@ async fn run_idle_command(
 #[derive(Default)]
 struct BoundedShellOutput {
     head: Vec<u8>,
-    tail: Vec<u8>,
+    tail: VecDeque<u8>,
     total_bytes: usize,
     budget: usize,
 }
@@ -3722,7 +3906,7 @@ impl BoundedShellOutput {
         if remaining.len() >= tail_capacity {
             self.tail.clear();
             self.tail
-                .extend_from_slice(&remaining[remaining.len() - tail_capacity..]);
+                .extend(remaining[remaining.len() - tail_capacity..].iter().copied());
             return;
         }
         let overflow = self
@@ -3733,24 +3917,25 @@ impl BoundedShellOutput {
         if overflow > 0 {
             self.tail.drain(..overflow);
         }
-        self.tail.extend_from_slice(remaining);
+        self.tail.extend(remaining.iter().copied());
     }
 
     fn render(&self, stream: &str) -> String {
         if self.total_bytes <= self.budget {
             let mut complete = Vec::with_capacity(self.total_bytes);
             complete.extend_from_slice(&self.head);
-            complete.extend_from_slice(&self.tail);
+            complete.extend(self.tail.iter().copied());
             return String::from_utf8_lossy(&complete).into_owned();
         }
         let omitted = self
             .total_bytes
             .saturating_sub(self.head.len())
             .saturating_sub(self.tail.len());
+        let tail = self.tail.iter().copied().collect::<Vec<_>>();
         format!(
             "{}\n[… {stream} truncated; {omitted} bytes omitted …]\n{}",
             String::from_utf8_lossy(&self.head),
-            String::from_utf8_lossy(&self.tail)
+            String::from_utf8_lossy(&tail)
         )
     }
 }
@@ -4299,7 +4484,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                                         && key.code == KeyCode::Char('o')
                                         && key.modifiers == KeyModifiers::CONTROL =>
                                 {
-                                    shell.expand_focused_tool();
+                                    shell.toggle_disclosure();
                                     shell.render();
                                 }
                                 Some(Ok(Event::Resize(columns, rows))) => {
@@ -4634,6 +4819,60 @@ mod tests {
 
     fn test_theme() -> crate::tui::theme::YggTheme {
         crate::tui::theme::test_theme()
+    }
+
+    #[test]
+    fn confirmation_notices_identify_core_tools_and_extensions() {
+        assert_eq!(
+            confirmation_notice(Some("write"), true),
+            "write action approved"
+        );
+        assert_eq!(
+            confirmation_notice(Some("bash"), false),
+            "bash action denied"
+        );
+        assert_eq!(
+            confirmation_notice(Some("custom_tool"), true),
+            "extension action approved"
+        );
+        assert_eq!(confirmation_notice(None, false), "tool action denied");
+    }
+
+    #[test]
+    fn fork_message_projection_uses_the_active_branch_and_adds_a_head_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        session
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("first prompt".into())],
+                },
+            )))
+            .unwrap();
+        session
+            .append(EntryValue::Message(ygg_ai::Message::Assistant(
+                ygg_ai::AssistantMessage {
+                    content: vec![ygg_ai::AssistantPart::Text("answer".into())],
+                    model: ygg_ai::ModelId("test".into()),
+                    protocol: ygg_ai::Protocol::OpenAiChat,
+                },
+            )))
+            .unwrap();
+        session
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("second prompt".into())],
+                },
+            )))
+            .unwrap();
+
+        let messages = active_fork_messages(&session);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].text, "first prompt");
+        assert_eq!(messages[1].text, "second prompt");
+        assert!(messages[2].whole_conversation);
+        assert_eq!(messages[2].entry_id, session.head().unwrap().0);
     }
 
     #[test]

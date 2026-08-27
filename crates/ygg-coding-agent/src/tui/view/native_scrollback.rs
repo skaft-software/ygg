@@ -97,6 +97,7 @@ pub(super) fn synchronize_shell_frame(state: &ShellState, width: u16, frame: &mu
     frame.transcript_len = cache.lines.len();
     frame.verbose_tools = state.verbose_tools;
     frame.overlay_active = state.overlay.is_some();
+    frame.application_viewport = false;
     frame.overlay_prefix_len = overlay_prefix_len;
 }
 
@@ -131,19 +132,23 @@ pub(super) fn render_shell_update_with_cursor(
         && frame.width == width
         && !frame.overlay_active
         && frame.transcript_epoch != state.transcript_epoch;
-    let mut requested_stable_prefix =
-        if !presentation_changed && frame.initialized && frame.width == width && !leaving_overlay {
-            if frame.transcript_generation == cache.generation {
-                frame.transcript_len.min(transcript_len)
-            } else {
-                cache
-                    .last_update_start
-                    .min(frame.transcript_len)
-                    .min(transcript_len)
-            }
+    let mut requested_stable_prefix = if !repaint_theme
+        && !presentation_changed
+        && frame.initialized
+        && frame.width == width
+        && !leaving_overlay
+    {
+        if frame.transcript_generation == cache.generation {
+            frame.transcript_len.min(transcript_len)
         } else {
-            0
-        };
+            cache
+                .last_update_start
+                .min(frame.transcript_len)
+                .min(transcript_len)
+        }
+    } else {
+        0
+    };
     if frame.overlay_active {
         requested_stable_prefix = requested_stable_prefix.min(frame.overlay_prefix_len);
     }
@@ -174,6 +179,7 @@ pub(super) fn render_shell_update_with_cursor(
         frame.transcript_len = transcript_len;
         frame.verbose_tools = state.verbose_tools;
         frame.overlay_active = true;
+        frame.application_viewport = false;
         frame.overlay_prefix_len = overlay_prefix_len;
         return FrameUpdate {
             stable_prefix,
@@ -207,10 +213,14 @@ pub(super) fn render_shell_update_with_cursor(
     frame.transcript_len = transcript_len;
     frame.verbose_tools = state.verbose_tools;
     frame.overlay_active = false;
+    frame.application_viewport = false;
     frame.overlay_prefix_len = 0;
     FrameUpdate {
         stable_prefix,
         replacement,
+        // A theme swap cannot restyle rows already owned by native
+        // scrollback. Keep the semantic commit handshake and repaint only the
+        // visible tail; terminal-owned history retains its original palette.
         pinned: Some(pinned),
         resize_replay: None,
         reanchor_viewport: repaint_theme || resized || leaving_overlay || transcript_replaced,

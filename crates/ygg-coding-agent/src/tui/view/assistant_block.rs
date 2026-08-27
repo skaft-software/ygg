@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use sexy_tui_rs::{
-    parse_markdown, Block, Color, DiffRenderOptions, Inline, RichRenderer, StreamingMarkdown,
-    StreamingRenderCache, UnifiedDiff,
+    parse_markdown, Block, Color, DiffRenderOptions, Inline, RichRenderer, StreamingLineUpdate,
+    StreamingMarkdown, StreamingRenderCache, UnifiedDiff,
 };
 
 use super::terminal_text::sanitize_for_terminal;
@@ -248,6 +248,24 @@ impl AssistantBlock {
         width: u16,
     ) -> Vec<String> {
         self.render_on_surface(renderer, theme, width, None)
+    }
+
+    pub(super) fn render_update(
+        &self,
+        renderer: &RichRenderer,
+        theme: &YggTheme,
+        width: u16,
+    ) -> Option<StreamingLineUpdate> {
+        if self.finished || looks_like_diff(&self.text) {
+            return None;
+        }
+        let use_plain = theme.capabilities().color == crate::tui::terminal::ColorDepth::None;
+        Some(self.layout.borrow_mut().render_line_update(
+            &self.markdown,
+            renderer,
+            width,
+            !use_plain,
+        ))
     }
 
     pub(super) fn render_on_surface(

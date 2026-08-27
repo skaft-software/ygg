@@ -55,6 +55,8 @@ pub struct ThemeLayout {
     pub show_status_line: bool,
     pub show_reasoning: bool,
     pub show_panel_borders: bool,
+    /// Paint static user-message backgrounds with the default theme's vertical breathing rows.
+    pub prompt_padding: bool,
     pub transcript_inset: u16,
     pub composer_padding: u16,
     pub narrow_breakpoint: u16,
@@ -77,6 +79,7 @@ impl Default for ThemeLayout {
             show_status_line: true,
             show_reasoning: true,
             show_panel_borders: true,
+            prompt_padding: false,
             transcript_inset: 2,
             composer_padding: 1,
             narrow_breakpoint: 64,
@@ -98,6 +101,7 @@ pub struct ResolvedThemeLayout {
     pub show_status_line: bool,
     pub show_reasoning: bool,
     pub show_panel_borders: bool,
+    pub prompt_padding: bool,
     pub transcript_inset: u16,
     pub composer_padding: u16,
 }
@@ -133,6 +137,7 @@ impl ThemeLayout {
             } else {
                 self.show_panel_borders
             },
+            prompt_padding: self.prompt_padding,
             transcript_inset: self.transcript_inset,
             composer_padding: self.composer_padding,
         }
@@ -741,6 +746,7 @@ fn parse_layout(value: Option<&Value>, source_name: &str) -> anyhow::Result<Them
             "show_status_line" => layout.show_status_line = boolean(value, source_name, key)?,
             "show_reasoning" => layout.show_reasoning = boolean(value, source_name, key)?,
             "show_panel_borders" => layout.show_panel_borders = boolean(value, source_name, key)?,
+            "prompt_padding" => layout.prompt_padding = boolean(value, source_name, key)?,
             "transcript_inset" => {
                 layout.transcript_inset = bounded_u16(value, source_name, key, 0, 8)?
             }

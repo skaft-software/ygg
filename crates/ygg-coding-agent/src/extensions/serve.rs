@@ -252,6 +252,22 @@ fn goal_mutation_outcome(
     )]))
 }
 
+async fn wait_for_serve_shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            interrupted = tokio::signal::ctrl_c() => interrupted,
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 pub async fn run(
     config: Config,
     port: u16,
@@ -306,10 +322,10 @@ pub async fn run(
         }
         crate::output::stdout_line(format!("ygg graphical host: {clean_url}"));
     }
-    let interrupted = tokio::signal::ctrl_c().await;
+    let shutdown_requested = wait_for_serve_shutdown_signal().await;
     pull_request_refresh.abort();
     let _ = pull_request_refresh.await;
-    interrupted?;
+    shutdown_requested?;
     server.shutdown().await?;
     Ok(())
 }
@@ -1564,7 +1580,9 @@ impl YggHost {
                             purge_after_ms: None,
                             forked_from_session_id: None,
                             forked_from_entry_id: None,
+                            message_count: 0,
                             modified,
+                            workspace: None,
                         },
                         fingerprint,
                     });
@@ -4685,7 +4703,31 @@ async fn run_worker(
                         }
                     },
                 };
-                match create_conversation_fork(&owned_app, &plan, &entry_id) {
+                let sessions = plan.sessions.clone();
+                let source_session_id = plan.session_id.clone();
+                let project_id = plan.project_id.clone();
+                let projects = Arc::clone(&plan.projects);
+                let fork = tokio::task::spawn_blocking(move || {
+                    let result = create_conversation_fork(
+                        &owned_app,
+                        &sessions,
+                        &source_session_id,
+                        project_id.as_ref(),
+                        &projects,
+                        &entry_id,
+                    );
+                    (owned_app, result)
+                })
+                .await;
+                let (owned_app, result) = match fork {
+                    Ok(outcome) => outcome,
+                    Err(_) => {
+                        app = None;
+                        let _ = message.response.send(Err(ServiceError::Internal));
+                        continue;
+                    }
+                };
+                match result {
                     Ok(created_session_id) => {
                         let outcome = DriverCommandOutcome::fork(created_session_id.clone());
                         if message.response.send(Ok(outcome)).is_err() {
@@ -5847,7 +5889,10 @@ async fn drive_sibling_conversation_branch(
 
 fn create_conversation_fork(
     app: &App,
-    plan: &WorkerPlan,
+    sessions: &SessionStore,
+    source_session_id: &SessionId,
+    project_id: Option<&ProjectId>,
+    projects: &Arc<Mutex<ProjectRegistry>>,
     source_entry_id: &DurableEntryId,
 ) -> Result<SessionId, ServiceError> {
     let source_entry = EntryId(source_entry_id.as_str().to_owned());
@@ -5864,39 +5909,32 @@ fn create_conversation_fork(
     ) {
         return Err(ServiceError::InvalidBoundary);
     }
-    let project_id = plan
-        .project_id
-        .as_ref()
+    let project_id = project_id
         .ok_or(ServiceError::InvalidBoundary)
         .and_then(registry_project_id)?;
-    let destination = plan.sessions.new_path(&crate::modes::timestamp());
+    let destination = sessions.new_path(&crate::modes::timestamp());
     let created_session_id = session_id_from_path(&destination)?;
     let forked = app
         .agent
         .session()
-        .fork_to(&destination, source_entry)
+        .fork_to(&destination, Some(&source_entry))
         .map_err(|_| ServiceError::Internal)?;
     drop(forked);
-    if plan
-        .sessions
+    if sessions
         .set_fork_provenance(
             created_session_id.as_str(),
-            plan.session_id.as_str(),
+            source_session_id.as_str(),
             source_entry_id.as_str(),
         )
         .is_err()
     {
-        let _ = plan
-            .sessions
-            .discard_unacknowledged(created_session_id.as_str());
+        let _ = sessions.discard_unacknowledged(created_session_id.as_str());
         return Err(ServiceError::Internal);
     }
-    let mut projects = plan.projects.lock().map_err(|_| ServiceError::Internal)?;
+    let mut projects = projects.lock().map_err(|_| ServiceError::Internal)?;
     if let Err(error) = projects.bind_session(created_session_id.as_str(), &project_id) {
         drop(projects);
-        let _ = plan
-            .sessions
-            .discard_unacknowledged(created_session_id.as_str());
+        let _ = sessions.discard_unacknowledged(created_session_id.as_str());
         return Err(project_registry_service_error(error));
     }
     Ok(created_session_id)

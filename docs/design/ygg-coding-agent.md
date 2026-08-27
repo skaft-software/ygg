@@ -16,11 +16,23 @@ The workspace MSRV is Rust 1.86. `sexy-tui-rs` is vendored as
 `crates/sexy-tui-rs`; builds must not depend on a sibling checkout. Its import
 provenance is recorded in `crates/sexy-tui-rs/VENDORED.md`.
 
+## Offline migration inventory
+
+The `migrate pi` top-level command is dispatched before normal product
+configuration and bootstrap. It reads bounded Pi settings/package resources,
+parses extension source with a real TypeScript syntax tree, and emits a
+versioned dry-run report. It never constructs an `Agent`, discovers a provider,
+executes package code, writes either setup, or invokes a model. A malformed
+package becomes a local diagnostic rather than preventing independent packages
+from being inventoried. The user contract and future compatibility boundary are
+documented in [`../pi-migration.md`](../pi-migration.md).
+
 ## Startup and resume
 
 Startup resolves the persistent session before final model selection:
 
-1. Select a new, latest, named, or interactively picked session.
+1. Select a new, latest, named, or interactively picked session, or fork a
+   selected source into a new session before replay.
 2. For an existing session, walk its active parent chain and recover the newest
    model and reasoning values from `EntryValue::Config` records.
 3. Explicit `--model` and `--reasoning` flags override recovered values.
@@ -40,7 +52,10 @@ the complete branch is materialized when the user first navigates beyond that
 tail or selects the complete semantic transcript.
 
 Session discovery uses a workspace-local disposable SQLite projection of
-bounded active-branch titles keyed by transcript size and modification time.
+bounded active-branch titles and message counts keyed by transcript size and
+modification time. The resume picker can lazily enumerate all workspace
+subdirectories under the shared session root; `.workspace` markers provide
+canonical display paths while JSONL and `.metadata/` remain authoritative.
 JSONL remains authoritative: cache misses and stale fingerprints are streamed
 under the same byte/record bounds, cache failures fall back to JSONL, and
 normally dropped `App` instances refresh their already-replayed active session
@@ -205,8 +220,12 @@ need Agent/session ownership.
 - `/verbose [on|off]` — expand/collapse every tool panel.
 - `/compact` — force a compaction attempt.
 - `/reload` — reload AGENTS instructions, themes, prompts, and skills.
-- `/new`, `/resume [id]` — switch persistent sessions.
-- `/tree`, `/checkout <entry-id>` — inspect durable entries and fork from one.
+- `/new`, `/resume [id]` — switch persistent sessions; the resume picker supports
+  fuzzy/phrase/regex filtering, named-only filtering, recent/name/message-count
+  sorting, current/all-workspace scopes, rename, and recoverable trash.
+- `/fork` — fork from a selected user message (or the whole current conversation)
+  and prefill that message in the new session; `/clone` forks at the current head.
+- `/tree`, `/checkout <entry-id>` — inspect durable entries and switch branches.
 - `/name [name]`, `/export [path]` — name and safely export the current session.
 - `/prompt [name] [arguments]` — inspect or expand prompt templates.
 - `/skills search|load|reload|off ...` — inspect and explicitly activate skills.

@@ -10,7 +10,6 @@ use sexy_tui_rs::{CommitCursor, Component, FrameUpdate, TUI};
 use super::native_scrollback::{
     render_shell, render_shell_update_with_cursor, synchronize_shell_frame,
 };
-use super::transcript_history::materialize_deferred_session_history;
 use super::viewport::{render_shell_viewport_at, render_shell_viewport_update};
 use super::welcome_card::welcome_animating;
 use super::ShellState;
@@ -22,6 +21,10 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(16);
 /// response and active tool or shell dots breathe between foreground and muted
 /// tones without changing size.
 const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(500);
+/// The braille thinking spinner reads as motion only at a fluid cadence; the
+/// shared dot pulse above stays deliberately slow. Themes without
+/// `thinking_spinner` never enter this faster cycle.
+const THINKING_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -56,13 +59,18 @@ pub(super) fn event_dot_animating(state: &ShellState) -> bool {
     capabilities.animation && capabilities.interactive && state.has_active_event_dot()
 }
 
+pub(super) fn thinking_spinner_animating(state: &ShellState) -> bool {
+    let capabilities = state.theme.capabilities();
+    capabilities.animation && capabilities.interactive && state.has_active_thinking_spinner()
+}
+
 fn render_wake_requires_frame(
     semantic_command: bool,
     resized: bool,
     welcome: bool,
-    event_dot_due: bool,
+    animation_due: bool,
 ) -> bool {
-    semantic_command || resized || welcome || event_dot_due
+    semantic_command || resized || welcome || animation_due
 }
 
 fn frame_coalesce_delay(last_render: Option<Instant>, now: Instant) -> Duration {
@@ -99,15 +107,11 @@ pub(super) fn reconcile_terminal_size(
         return false;
     }
 
-    // This delayed-signal fallback must obey the same transcript contract as
-    // the normal resize path: destructive replay cannot run from a bounded
-    // first-paint tail.
-    if let Err(error) = materialize_deferred_session_history(state) {
-        state.borrow_mut().error = Some(format!("could not load older session history: {error}"));
-    }
-
     let mut shell = state.borrow_mut();
     shell.size = dimensions;
+    // Deferred history remains lazy; only the materialized tail participates
+    // in this resize reflow. Semantic navigation can hydrate older blocks
+    // later without delaying the resize or replaying them through the PTY.
     // Do not ask for transcript geometry here: that would synchronously reflow
     // the complete history and then invalidate it, paying the resize cost
     // twice. Viewport readers clamp the retained scroll offset after the render
@@ -133,20 +137,25 @@ pub(super) fn render_loop(
 
     let mut last_render: Option<Instant> = None;
     let mut last_event_dot_toggle = Instant::now();
+    let mut last_spinner_toggle = Instant::now();
     loop {
         // Only the short-lived welcome card gets a high-frequency wake. Work
         // itself is event-driven; the transcript pulse owns the sole slow
         // timer once a run is underway.
-        let (welcome, event_dot) = {
+        let (welcome, event_dot, thinking_spinner) = {
             let shell = state.borrow();
             let welcome = welcome_animating(&shell, Instant::now());
             let event_dot = event_dot_animating(&shell);
-            (welcome, event_dot)
+            let thinking_spinner = thinking_spinner_animating(&shell);
+            (welcome, event_dot, thinking_spinner)
         };
         if !event_dot {
             last_event_dot_toggle = Instant::now();
         }
-        let poll = if welcome {
+        if !thinking_spinner {
+            last_spinner_toggle = Instant::now();
+        }
+        let poll = if welcome || thinking_spinner {
             RENDER_INTERVAL
         } else {
             RESIZE_POLL_INTERVAL
@@ -167,8 +176,15 @@ pub(super) fn render_loop(
         };
         let advance_event_dot =
             event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
+        let advance_spinner =
+            thinking_spinner && last_spinner_toggle.elapsed() >= THINKING_SPINNER_INTERVAL;
         let semantic_command = matches!(command, Some(RenderCommand::Render));
-        if !render_wake_requires_frame(semantic_command, resized, welcome, advance_event_dot) {
+        if !render_wake_requires_frame(
+            semantic_command,
+            resized,
+            welcome,
+            advance_event_dot || advance_spinner,
+        ) {
             continue;
         }
 
@@ -206,7 +222,7 @@ pub(super) fn render_loop(
             break;
         }
 
-        if welcome || advance_event_dot {
+        if welcome || advance_event_dot || advance_spinner {
             let mut shell = state.borrow_mut();
             if welcome {
                 shell.invalidate_transcript_layout();
@@ -214,6 +230,10 @@ pub(super) fn render_loop(
             if advance_event_dot {
                 shell.advance_event_dot_animation();
                 last_event_dot_toggle = Instant::now();
+            }
+            if advance_spinner {
+                shell.advance_thinking_spinner();
+                last_spinner_toggle = Instant::now();
             }
         }
         tui.request_render();
@@ -268,6 +288,9 @@ pub(super) struct ShellFrameState {
     pub(super) transcript_len: usize,
     pub(super) verbose_tools: bool,
     pub(super) overlay_active: bool,
+    /// Whether the retained frame currently represents the bounded semantic
+    /// viewport rather than the native append-only transcript tail.
+    pub(super) application_viewport: bool,
     /// Rows of the native transcript frame retained above the screen-sized
     /// overlay surface. This bounds lazy diffs when mutable chrome changes the
     /// overlay's seam with terminal-owned history.
@@ -279,10 +302,9 @@ pub(super) struct ShellFrameState {
 pub(super) struct ShellComponent {
     state: SharedState,
     frame: RefCell<ShellFrameState>,
-    /// Explicit `--mouse app` mode keeps a bounded semantic viewport and pins
-    /// chrome inside it. The default terminal-owned path lets committed rows
-    /// enter native scrollback and leaves selection to the terminal.
-    application_viewport: bool,
+    /// Mouse capture starts in bounded semantic mode. Keyboard PageUp can
+    /// request the same renderer later without changing terminal mouse policy.
+    mouse_application_viewport: bool,
 }
 
 impl ShellComponent {
@@ -290,15 +312,19 @@ impl ShellComponent {
         Self {
             state,
             frame: RefCell::new(ShellFrameState::default()),
-            application_viewport,
+            mouse_application_viewport: application_viewport,
         }
+    }
+
+    fn uses_application_viewport(&self, state: &ShellState) -> bool {
+        self.mouse_application_viewport || state.application_viewport_requested
     }
 }
 
 impl Component for ShellComponent {
     fn render(&self, width: u16) -> Vec<String> {
         let state = self.state.borrow();
-        if self.application_viewport {
+        if self.uses_application_viewport(&state) {
             let lines = render_shell_viewport_at(&state, width, Instant::now());
             let mut frame = self.frame.borrow_mut();
             frame.initialized = true;
@@ -307,6 +333,7 @@ impl Component for ShellComponent {
             frame.theme_epoch = state.theme_epoch;
             frame.transcript_epoch = state.transcript_epoch;
             frame.verbose_tools = state.verbose_tools;
+            frame.application_viewport = true;
             lines
         } else {
             let lines = render_shell(&state, width);
@@ -325,7 +352,7 @@ impl Component for ShellComponent {
         cursor: Option<CommitCursor>,
     ) -> Option<FrameUpdate> {
         let state = self.state.borrow();
-        Some(if self.application_viewport {
+        Some(if self.uses_application_viewport(&state) {
             render_shell_viewport_update(
                 &state,
                 width,

@@ -28,6 +28,10 @@ pub enum Command {
     Reload,
     New,
     Resume(Option<String>),
+    /// Fork the active session from a selected user-message boundary.
+    Fork,
+    /// Clone the active session at its current head.
+    Clone,
     Tree,
     Checkout(String),
     Status,
@@ -131,6 +135,8 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "re-open or list recent sessions",
         true
     ),
+    slash!("fork", "/fork", "fork from a previous user message", false),
+    slash!("clone", "/clone", "clone the current session", false),
     slash!("tree", "/tree", "show the conversation branch tree", false),
     slash!(
         "checkout",
@@ -459,6 +465,8 @@ pub fn parse(input: &str) -> Command {
         "reload" if argument.is_none() => Command::Reload,
         "new" if argument.is_none() => Command::New,
         "resume" => Command::Resume(argument),
+        "fork" if argument.is_none() => Command::Fork,
+        "clone" if argument.is_none() => Command::Clone,
         "tree" if argument.is_none() => Command::Tree,
         "checkout" => match argument {
             Some(id) => Command::Checkout(id),
@@ -978,6 +986,8 @@ mod tests {
         assert_eq!(parse("/reload"), Command::Reload);
         assert_eq!(parse("/new"), Command::New);
         assert_eq!(parse("/resume id"), Command::Resume(Some("id".into())));
+        assert_eq!(parse("/fork"), Command::Fork);
+        assert_eq!(parse("/clone"), Command::Clone);
         assert_eq!(parse("/tree"), Command::Tree);
         assert_eq!(parse("/checkout 001"), Command::Checkout("001".into()));
         assert_eq!(parse("/status"), Command::Status);

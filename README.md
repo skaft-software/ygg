@@ -536,6 +536,8 @@ ygg sessions are bounded append-only JSONL, namespaced by workspace. Complete se
 ygg --continue
 ygg --resume
 ygg --resume SESSION_ID
+ygg --fork SESSION_ID
+ygg --fork
 
 ygg sessions list
 ygg sessions list --query parser
@@ -553,6 +555,8 @@ ygg sessions repair SESSION_ID
 - Export validates the session and redacts credential-like values by default.
 - A dropped run never silently replays an unresolved mutating tool call.
 - Resume restores the selected model, reasoning, prompt identity, tool panels, branches, and historical prompt colors.
+- The interactive resume picker supports current/all-workspace scope, fuzzy/phrase/regex filtering, named-only filtering, recent/title/message-count sorting, optional paths, rename, and recoverable trash.
+- `/fork` creates a new session from an active-branch user message (or the whole conversation); `/clone` creates one from the current head.
 
 See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics, redaction contract, and recovery behavior.
 
@@ -589,7 +593,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
-Default `auto`, explicit `terminal`, and `off` modes all leave mouse events to the terminal and use the native-scrollback renderer. Application-owned `app` mode captures mouse events for semantic scrolling and selection. Portable terminal protocols do not expose the native history's reading offset, so only `app` mode can guarantee an anchored read-while-streaming viewport. Keyboard transcript navigation remains available in every mode.
+Default `auto`, explicit `terminal`, and `off` modes leave mouse events to the terminal and begin on the native-scrollback renderer. PageUp claims Ygg's bounded semantic viewport in every mode and keeps that viewport anchored while output streams; `--mouse app` selects the same viewport from startup and additionally captures wheel scrolling and drag selection. Native, uncaptured wheel history remains terminal-owned because portable terminal protocols do not expose its reading offset.
 
 Raw protocol arguments and envelopes, unsanitized failure payloads, and
 extension-rendered tool payloads remain internal accountability evidence and are
@@ -632,6 +636,8 @@ Type `/` in the composer to open live command discovery.
 | --- | --- |
 | `/new` | Start a fresh conversation. |
 | `/resume [id]` | Open the session picker or resume a session. |
+| `/fork` | Fork from an active-branch user message or the whole conversation. |
+| `/clone` | Clone the current session at its active head. |
 | `/tree` | Show the complete conversation branch tree. |
 | `/checkout <id>` | Move the durable head to another entry and branch from it. |
 | `/model [id]` | Open the model picker or select a model. |
@@ -662,7 +668,7 @@ Useful keys:
 | `Shift+Enter` | Insert a newline when the terminal reports enhanced key events. |
 | `Ctrl+C` | Clear a nonempty draft; with an empty draft, abort active work and do nothing when idle. |
 | `Ctrl+D` | Close ygg from any interactive input surface, settling active work and child-process cleanup first. |
-| `Ctrl+O` | Expand or collapse the subagent activity strip while workers are active; otherwise expand or collapse reasoning, tool evidence, or shell output. |
+| `Ctrl+O` | Globally expand or collapse retained reasoning, compaction, delegated-worker activity, tool evidence, and shell output. |
 | `PageUp` / `PageDown` | Navigate transcript history. |
 | `Tab` | Complete trailing `./`, `../`, `~/`, and absolute path tokens. Directories remain open for continued completion, and spaces are backslash-escaped. |
 | `@` | Fuzzy-complete gitignore-aware workspace file mentions; path-prefixed mentions also use filesystem completion. |
@@ -720,6 +726,11 @@ keep_recent_tokens = 20000
 
 Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_THEME`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
+For renderer diagnostics, `YGG_TUI_WRITE_LOG=/path/to/ansi.log` captures the
+raw ANSI stream written by the interactive TUI. An existing directory creates a
+unique `tui-<timestamp>-<pid>.log` inside it. Capture is disabled by default;
+logs can contain displayed prompts and tool output, so handle them as sensitive.
+
 `reasoning_mode = "pro"`, `YGG_REASONING_MODE=pro`, and
 `--reasoning-mode pro` are accepted only to load legacy configuration and
 sessions. Ygg migrates that selection to `reasoning = "ultra"` only when current
@@ -733,14 +744,16 @@ warning. New configuration should use `reasoning` alone.
 | --- | --- |
 | Provider auth | `--login`, `--logout`, `--headless` |
 | Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
-| Session | `--continue`, `--resume`, `--session-dir`, `sessions ...` |
+| Session | `--continue`, `--resume`, `--fork`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes` |
+| Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
+| Pi compatibility | `pi install <PATH>`, `pi list` |
 | Customization | `--theme`, `--theme-dir`, `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
-Run `ygg --help` and `ygg sessions --help` for the authoritative generated reference.
+Run `ygg --help`, `ygg sessions --help`, `ygg migrate pi --help`, and `ygg pi --help` for the authoritative generated reference.
 
 ## Filesystem-native customization
 
@@ -754,6 +767,20 @@ Themes, prompts, skills, and extensions use one deterministic resolver:
 | Extensions | `~/.ygg/extensions/*/extension.toml` | `.ygg/extensions/*/extension.toml` | `--extension-dir` |
 
 Roots are resolved global → trusted project → explicit. Inputs must be bounded regular files; symlinked roots, candidates, and entrypoints are rejected. Reload builds a complete immutable generation before swapping it into the running product.
+
+### Pi migration inventory
+
+`ygg migrate pi --dry-run` reads bounded Pi user/project settings and package
+manifests, resolves installed local/npm/git packages without installing them,
+and parses JavaScript, TypeScript, and TSX with tree-sitter to classify
+portable resources and extension API dependencies. It executes no package
+code, starts no provider or model, changes no files, and reports an estimated
+model use of zero tokens.
+
+Use `--json` for the versioned machine-readable inventory. This release does
+not yet copy resources, apply package recipes, or start a Pi compatibility
+process; see [docs/pi-migration.md](docs/pi-migration.md) for classifications,
+bounds, and the staged compatibility architecture.
 
 ### Prompt templates
 
@@ -921,6 +948,7 @@ third_party/              upstream license texts
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
 | [Release notes](docs/releases/v0.6.0.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
+| [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |

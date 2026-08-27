@@ -337,6 +337,37 @@ fn panel_key(code: crossterm::event::KeyCode) -> crossterm::event::Event {
     ))
 }
 
+fn panel_key_with_modifiers(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> crossterm::event::Event {
+    crossterm::event::Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+}
+
+fn picker_session(
+    id: &str,
+    title: &str,
+    message_count: usize,
+    modified_seconds: u64,
+) -> SessionMeta {
+    SessionMeta {
+        id: id.to_owned(),
+        path: PathBuf::from(format!("/tmp/{id}.jsonl")),
+        title: title.to_owned(),
+        name: None,
+        tags: Vec::new(),
+        pinned: false,
+        archived: false,
+        trashed_at_ms: None,
+        purge_after_ms: None,
+        forked_from_session_id: None,
+        forked_from_entry_id: None,
+        message_count,
+        modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(modified_seconds),
+        workspace: Some(PathBuf::from("/work")),
+    }
+}
+
 fn panel_key_kind(
     code: crossterm::event::KeyCode,
     kind: crossterm::event::KeyEventKind,
@@ -374,6 +405,173 @@ fn panel_state(shell: &InteractiveShell) -> (Vec<String>, usize, String) {
     (items.clone(), *selected, filter.clone())
 }
 
+#[test]
+fn session_picker_ordering_filters_and_cycles_sorts() {
+    let mut named = picker_session("named", "Zebra", 2, 30);
+    named.name = Some("Release notes".into());
+    named.tags = vec!["rust".into()];
+    let rows = vec![
+        picker_session("recent", "Beta", 1, 40),
+        named,
+        picker_session("long", "Alpha", 9, 20),
+    ];
+    let mut picker = PickerState::new(rows, None);
+
+    assert_eq!(session_picker_ordering(&picker), vec![0, 1, 2]);
+    picker.sort = PickerSort::Name;
+    assert_eq!(session_picker_ordering(&picker), vec![2, 0, 1]);
+    picker.sort = PickerSort::Messages;
+    assert_eq!(session_picker_ordering(&picker), vec![2, 1, 0]);
+
+    picker.named_only = true;
+    assert_eq!(session_picker_ordering(&picker), vec![1]);
+    picker.named_only = false;
+    picker.filter = "rse".into();
+    assert_eq!(session_picker_ordering(&picker), vec![1]);
+    picker.filter = "re:beta".into();
+    assert_eq!(session_picker_ordering(&picker), vec![0]);
+}
+
+#[test]
+fn session_picker_panel_handles_scope_filter_and_selection_outbox() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(100, 24);
+    let mut first = picker_session("one", "First", 1, 1);
+    first.name = Some("First name".into());
+    let rows = vec![first, picker_session("two", "Second", 2, 2)];
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(rows.clone(), Some(rows[0].path.clone())),
+    });
+
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Down));
+    shell.panel_input(&panel_key_with_modifiers(
+        crossterm::event::KeyCode::Char('n'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    let state = shell.state.borrow();
+    let Some(Panel::SessionPicker { picker }) = state.panel.as_ref() else {
+        panic!("session picker should be open");
+    };
+    assert_eq!(picker.selected, 0, "named-filter changes reset selection");
+    drop(state);
+
+    // Restore the complete list; the current row is protected from deletion.
+    shell.panel_input(&panel_key_with_modifiers(
+        crossterm::event::KeyCode::Char('n'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Delete));
+    let state = shell.state.borrow();
+    let Some(Panel::SessionPicker { picker }) = state.panel.as_ref() else {
+        panic!("session picker should be open");
+    };
+    assert!(!picker.confirming_delete);
+    assert_eq!(
+        picker.message.as_ref().map(|(message, _)| message.as_str()),
+        Some("Cannot delete the currently active session")
+    );
+    drop(state);
+
+    // Clear the named/filter state and select the second row.
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Char('x')));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Down));
+    let (result, action) = shell
+        .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+        .expect("session selection should close the panel");
+    assert_eq!(result, PanelResult::Select("two".into()));
+    assert!(matches!(action, PanelAction::SessionPicker));
+    assert_eq!(
+        shell.take_picker_selection(),
+        Some(("two".into(), PathBuf::from("/tmp/two.jsonl")))
+    );
+    assert!(!shell.has_panel());
+}
+
+#[test]
+fn session_picker_rename_and_delete_emit_driver_requests() {
+    let mut shell = InteractiveShell::test_shell();
+    let row = picker_session("one", "First", 1, 1);
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(vec![row], None),
+    });
+
+    shell.panel_input(&panel_key_with_modifiers(
+        crossterm::event::KeyCode::Char('r'),
+        crossterm::event::KeyModifiers::CONTROL,
+    ));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Backspace));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Char('X')));
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Enter));
+    assert!(matches!(
+        shell.drain_panel_requests().as_slice(),
+        [PanelRequest::RenameSession { id, name, .. }] if id == "one" && name == "X"
+    ));
+
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Delete));
+    assert!(shell.has_panel());
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Enter));
+    assert!(matches!(
+        shell.drain_panel_requests().as_slice(),
+        [PanelRequest::TrashSession { id, .. }] if id == "one"
+    ));
+}
+
+#[test]
+fn message_picker_returns_selected_text_through_outbox() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.open_panel(Panel::MessagePicker {
+        picker: MessagePicker::new(vec![
+            ForkMessage {
+                entry_id: "entry-a".into(),
+                text: "first prompt".into(),
+                whole_conversation: false,
+            },
+            ForkMessage {
+                entry_id: "entry-head".into(),
+                text: String::new(),
+                whole_conversation: true,
+            },
+        ]),
+    });
+    shell.panel_input(&panel_key(crossterm::event::KeyCode::Up));
+    let (result, action) = shell
+        .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+        .expect("message selection should close the panel");
+    assert_eq!(result, PanelResult::Select("entry-a".into()));
+    assert!(matches!(action, PanelAction::MessagePicker));
+    assert_eq!(
+        shell.take_message_picker_selection(),
+        Some(("entry-a".into(), "first prompt".into()))
+    );
+}
+
+#[test]
+fn session_picker_render_shows_scope_markers_and_fork_metadata() {
+    let mut shell = InteractiveShell::test_shell();
+    let mut fork = picker_session("fork", "Forked", 3, 1);
+    fork.pinned = true;
+    fork.forked_from_session_id = Some("source".into());
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(vec![fork], None),
+    });
+    let raw = render_panel(&shell.state.borrow(), 100);
+    let rendered = raw
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Resume Session (Current Folder)"));
+    assert!(rendered.contains("Forked (fork)"));
+    assert!(!rendered.contains("(current)"));
+    assert!(rendered.contains("^s sort"));
+    assert_eq!(raw.join("\n").matches(CURSOR_MARKER).count(), 1);
+}
+
 fn plain_composer_surface(shell: &InteractiveShell, width: u16, now: Instant) -> Vec<String> {
     crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), width, now)
         .into_iter()
@@ -400,7 +598,7 @@ fn confirmation_panel_keeps_two_choices_plain_and_unfiltered() {
         ],
         selected: 0,
         filter: String::new(),
-        action: PanelAction::ExtensionConfirmation,
+        action: PanelAction::Confirmation,
     });
 
     let lines = render_panel(&shell.state.borrow(), 100)
@@ -890,6 +1088,52 @@ fn rich_text_renders_gfm_tables_tasks_links_and_fenced_code() {
 }
 
 #[test]
+fn slash_popup_event_path_keeps_arrow_navigation_active() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.apply_edit(EditAction::Char('/'));
+    let total = commands::slash_suggestions("/").len();
+    for expected in 1..total {
+        let pending = shell.pending();
+        let action = crate::tui::keymap::translate_with_popup(
+            Some(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Down,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+            )),
+            false,
+            &pending,
+            shell.slash_popup_open(),
+        );
+        assert_eq!(
+            action,
+            crate::tui::keymap::InputAction::SlashMenu(SlashMenuAction::Next)
+        );
+        shell.slash_menu(SlashMenuAction::Next);
+        assert_eq!(shell.state.borrow().slash_selection, expected);
+    }
+}
+
+#[test]
+fn refreshing_unchanged_slash_catalog_preserves_selection() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.apply_edit(EditAction::Char('/'));
+
+    let commands: Arc<[(String, String)]> = Arc::from(vec![
+        ("extension-one".to_owned(), "first".to_owned()),
+        ("extension-two".to_owned(), "second".to_owned()),
+    ]);
+    shell.set_extension_commands(commands.clone());
+    shell.slash_menu(SlashMenuAction::Next);
+    assert_eq!(shell.state.borrow().slash_selection, 1);
+
+    // The extension polling path republishes an equivalent Arc on every tick.
+    // That refresh must not move the highlighted command back to the first row.
+    shell.set_extension_commands(commands);
+    assert_eq!(shell.state.borrow().slash_selection, 1);
+}
+
+#[test]
 fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     let mut shell = InteractiveShell::test_shell();
     shell.apply_edit(EditAction::Char('/'));
@@ -1340,7 +1584,12 @@ fn running_local_shell_repaints_the_latest_output_tail_before_exit() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rendered.contains("LIVE OUTPUT 1"), "{rendered}");
-    assert!(rendered.contains("LIVE OUTPUT 4"), "{rendered}");
+    assert!(!rendered.contains("LIVE OUTPUT 4"), "{rendered}");
+    assert!(rendered.contains("LIVE OUTPUT 5"), "{rendered}");
+    assert!(
+        rendered.contains("4 earlier visual rows hidden"),
+        "{rendered}"
+    );
     assert!(rendered.contains("LIVE OUTPUT 8"), "{rendered}");
 }
 
@@ -2026,7 +2275,7 @@ fn deferred_history_keeps_local_outcome_before_a_later_persisted_prompt() {
 }
 
 #[test]
-fn resize_materializes_deferred_history_during_an_active_stream() {
+fn resize_keeps_deferred_history_lazy_during_an_active_stream() {
     const WIDTH: u16 = 80;
     const RESIZED_WIDTH: u16 = 96;
     const HEIGHT: u16 = 12;
@@ -2063,29 +2312,29 @@ fn resize_materializes_deferred_history_during_an_active_stream() {
     shell.set_size(RESIZED_WIDTH, HEIGHT);
     let active_index_after = {
         let state = shell.state.borrow();
-        assert!(state.deferred_session_history.is_none());
+        assert!(state.deferred_session_history.is_some());
         assert!(state.run.is_active());
         assert!(
-            state.transcript.iter().any(|block| matches!(
+            !state.transcript.iter().any(|block| matches!(
                 block,
                 TranscriptBlock::User { text, .. } if text == "active resize prompt 0"
             )),
-            "resize must materialize the complete immutable branch"
+            "resize must not materialize deferred history"
         );
         assert!(state
             .transcript_commit_ids
             .windows(2)
             .all(|ids| ids[0] < ids[1]));
-        let index = state.active_text.expect("remapped assistant stream");
-        assert!(index > active_index_before);
+        let index = state.active_text.expect("retained assistant stream");
+        assert_eq!(index, active_index_before);
         assert_eq!(state.transcript_commit_ids[index], active_commit_id);
         index
     };
 
     shell.render();
     let resize = String::from_utf8_lossy(&drain(&bytes)).into_owned();
-    assert!(resize.contains("\x1b[2J\x1b[H\x1b[3J"), "{resize:?}");
-    assert!(resize.contains("active resize prompt 0"), "{resize:?}");
+    assert!(!resize.contains("\x1b[3J"), "{resize:?}");
+    assert!(!resize.contains("active resize prompt 0"), "{resize:?}");
     assert!(resize.contains("active-stream-before-resize"), "{resize:?}");
 
     shell.on_run_event(
@@ -2107,7 +2356,7 @@ fn resize_materializes_deferred_history_during_an_active_stream() {
 }
 
 #[test]
-fn delayed_resize_reconciliation_materializes_deferred_history() {
+fn delayed_resize_reconciliation_keeps_deferred_history_lazy() {
     let directory = tempfile::tempdir().unwrap();
     let session = session_with_user_prompts(
         &directory.path().join("reconciled-resize-session.jsonl"),
@@ -2129,8 +2378,8 @@ fn delayed_resize_reconciliation_materializes_deferred_history() {
     assert!(reconcile_terminal_size(&shell.state, &shell.size, (91, 17)));
     let state = shell.state.borrow();
     assert_eq!(state.size, (91, 17));
-    assert!(state.deferred_session_history.is_none());
-    assert!(state.transcript.iter().any(|block| matches!(
+    assert!(state.deferred_session_history.is_some());
+    assert!(!state.transcript.iter().any(|block| matches!(
         block,
         TranscriptBlock::User { text, .. } if text == "reconciled resize prompt 0"
     )));
@@ -2329,6 +2578,57 @@ fn duplicate_hydrated_tool_call_ids_never_leave_a_running_card() {
 }
 
 #[test]
+fn streaming_assistant_cache_replaces_only_the_mutable_block_suffix() {
+    const WIDTH: u16 = 80;
+    let shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Assistant(Box::new(
+            AssistantBlock::streaming("# Stable heading\n\nmutable"),
+        )));
+        let _ = state.rendered_transcript(WIDTH);
+    }
+
+    let (block_start, old_lines) = {
+        let state = shell.state.borrow();
+        let cache = state.transcript_cache.borrow();
+        (cache.block_starts[0], cache.lines.clone())
+    };
+    {
+        let mut state = shell.state.borrow_mut();
+        let TranscriptBlock::Assistant(assistant) = &mut state.transcript[0] else {
+            unreachable!()
+        };
+        assistant.append(" tail");
+        state.touch_block(0);
+        let _ = state.rendered_transcript(WIDTH);
+    }
+
+    let state = shell.state.borrow();
+    let cache = state.transcript_cache.borrow();
+    assert!(cache.last_update_start > block_start);
+    assert_eq!(
+        &cache.lines[..cache.last_update_start],
+        &old_lines[..cache.last_update_start],
+        "parser-committed rows were rebuilt"
+    );
+    let expected = render_block(
+        None,
+        &TranscriptBlock::Assistant(Box::new(AssistantBlock::streaming(
+            "# Stable heading\n\nmutable tail",
+        ))),
+        &state.theme,
+        &state.theme.rich_renderer(),
+        &state.theme.reasoning_renderer(),
+        WIDTH,
+        false,
+    );
+    let start = cache.block_starts[0];
+    let end = start + cache.block_lengths[0];
+    assert_eq!(&cache.lines[start..end], expected);
+}
+
+#[test]
 fn streamed_delta_marks_only_its_changed_cached_block() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_theme(crate::tui::theme::test_theme_from_source(
@@ -2513,14 +2813,14 @@ fn ctrl_o_expands_and_collapses_the_inline_compaction_summary() {
     assert!(collapsed.contains("ctrl+o to view"), "{collapsed}");
     assert!(!collapsed.contains("summary sentinel"), "{collapsed}");
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = plain(&shell);
     assert!(expanded.contains("Grounded summary"), "{expanded}");
     assert!(expanded.contains("summary sentinel"), "{expanded}");
     assert!(expanded.contains("ctrl+o to collapse"), "{expanded}");
     assert!(!shell.has_overlay(), "compaction must expand inline");
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let collapsed_again = plain(&shell);
     assert!(
         !collapsed_again.contains("summary sentinel"),
@@ -2577,7 +2877,7 @@ fn autonomous_compaction_events_show_work_success_and_failure_inline() {
     );
     assert!(!collapsed.contains("Compacting context"), "{collapsed}");
     assert!(!collapsed.contains("auto-summary sentinel"), "{collapsed}");
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded =
         strip_terminal_sequences(&shell.state.borrow().rendered_transcript(80).join("\n"));
     assert!(expanded.contains("auto-summary sentinel"), "{expanded}");
@@ -2668,7 +2968,7 @@ fn resumed_compaction_summary_remains_expandable_after_theme_switch() {
     };
     assert!(!render(&shell).contains("resume-only sentinel"));
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     assert!(render(&shell).contains("resume-only sentinel"));
     shell.set_theme(crate::tui::theme::test_theme());
     let restyled = render(&shell);
@@ -2707,7 +3007,7 @@ fn compaction_disclosure_preserves_native_presentation() {
         shell.render();
         terminal.process(&drain(&bytes));
 
-        shell.expand_focused_tool();
+        shell.toggle_disclosure();
         shell.render();
         let expansion = drain(&bytes);
         let expansion_text = String::from_utf8_lossy(&expansion);
@@ -2738,7 +3038,7 @@ fn compaction_disclosure_preserves_native_presentation() {
             "composer disappeared: {visible}"
         );
 
-        shell.expand_focused_tool();
+        shell.toggle_disclosure();
         shell.render();
         let collapse = drain(&bytes);
         assert!(
@@ -2825,7 +3125,7 @@ fn removed_streaming_tail_keeps_a_tombstoned_commit_seam() {
 }
 
 #[test]
-fn resize_discards_pre_ygg_history_and_replays_all_owned_rows() {
+fn resize_preserves_native_history_and_repaints_visible_owned_rows() {
     const WIDTH: u16 = 48;
     const RESIZED_WIDTH: u16 = 64;
     const HEIGHT: u16 = 10;
@@ -2859,30 +3159,30 @@ fn resize_discards_pre_ygg_history_and_replays_all_owned_rows() {
     let resize_text = String::from_utf8_lossy(&resize);
     assert!(resize_text.contains("\x1b[?2026h"), "{resize_text:?}");
     assert!(
-        resize_text.contains("\x1b[2J\x1b[H\x1b[3J"),
-        "{resize_text:?}"
+        !resize_text.contains("\x1b[3J"),
+        "text-only resize must preserve native history: {resize_text:?}"
     );
     assert!(
-        resize_text.contains("YGG-OWNED-RESIZE-00"),
-        "{resize_text:?}"
+        !resize_text.contains("YGG-OWNED-RESIZE-00"),
+        "off-screen history was replayed: {resize_text:?}"
     );
     assert!(
         resize_text.contains("YGG-OWNED-RESIZE-17"),
         "{resize_text:?}"
     );
     assert!(resize_text.contains("\x1b[?2026l"), "{resize_text:?}");
-    process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
+    terminal.process(&resize);
 
     terminal.set_size(256, RESIZED_WIDTH);
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
-    assert!(!physical.contains(SHELL_SENTINEL), "{physical}");
+    assert!(physical.contains(SHELL_SENTINEL), "{physical}");
     for index in 0..18 {
         let sentinel = format!("YGG-OWNED-RESIZE-{index:02}");
         assert_eq!(
             physical.matches(&sentinel).count(),
             1,
-            "{sentinel} was not replayed exactly once:\n{physical}"
+            "{sentinel} was lost or duplicated after resize:\n{physical}"
         );
     }
 }
@@ -3152,7 +3452,7 @@ fn native_scrollback_keeps_finalized_tool_stable_while_streaming_scrolled_away()
         shell.render();
         terminal.process(&drain(&bytes));
 
-        for index in 0..6 {
+        for index in 0..4 {
             shell.on_run_event(
                 run_id,
                 &AgentEvent::OutputDelta {
@@ -3675,7 +3975,7 @@ fn native_ctrl_o_rebuilds_offscreen_compaction_and_contracts_the_complete_frame(
         .iter()
         .any(|line| line.contains("COMPLETE COMPACTION SUMMARY")));
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
     assert_eq!(expanded.stable_prefix, 0);
     assert!(expanded.rebuild_scrollback);
@@ -3685,7 +3985,7 @@ fn native_ctrl_o_rebuilds_offscreen_compaction_and_contracts_the_complete_frame(
         .iter()
         .any(|line| line.contains("COMPLETE COMPACTION SUMMARY")));
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let collapsed = render_shell_update(&shell.state.borrow(), 80, Instant::now(), &mut frame);
     assert_eq!(collapsed.stable_prefix, 0);
     assert!(collapsed.rebuild_scrollback);
@@ -3701,7 +4001,7 @@ fn native_ctrl_o_rebuilds_offscreen_compaction_and_contracts_the_complete_frame(
 }
 
 #[test]
-fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
+fn theme_swap_repaints_visible_native_tail_without_replaying_scrollback() {
     const WIDTH: u16 = 32;
     const HEIGHT: u16 = 10;
     let theme_source = |name: &str, foreground: &str| {
@@ -3764,7 +4064,7 @@ fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
         !complete
             .windows(b"\x1b[3J".len())
             .any(|window| window == b"\x1b[3J"),
-        "theme swap cleared terminal-owned scrollback"
+        "theme swap must preserve terminal-owned scrollback"
     );
     let mut terminal = vt100::Parser::new(HEIGHT, WIDTH, 128);
     terminal.process(&complete);
@@ -3780,7 +4080,7 @@ fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
         terminal.screen().contents()
     );
 
-    let mut native_history = None;
+    let mut old_history = None;
     for offset in 1..=usize::from(HEIGHT) {
         terminal.set_scrollback(offset);
         for (row, contents) in terminal.screen().rows(0, WIDTH).enumerate() {
@@ -3793,18 +4093,19 @@ fn theme_swap_repaints_visible_cells_but_preserves_native_scrollback_styles() {
                 .expect("historic cell inside terminal bounds")
                 .fgcolor();
             if color == old_foreground {
-                native_history = Some((row as u16, column as u16));
+                old_history = Some((row as u16, column as u16));
                 break;
             }
         }
-        if native_history.is_some() {
+        if old_history.is_some() {
             break;
         }
     }
     assert!(
-        native_history.is_some(),
-        "rows committed before the theme swap should retain their original cell style"
+        old_history.is_some(),
+        "terminal-owned rows should retain their original cell style"
     );
+    assert_ne!(old_foreground, new_foreground);
 }
 
 #[test]
@@ -3932,6 +4233,49 @@ fn new_session_shrink_reanchors_but_picker_growth_does_not() {
 }
 
 #[test]
+fn keyboard_page_navigation_claims_the_semantic_viewport_without_mouse_capture() {
+    const WIDTH: u16 = 80;
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(WIDTH, 14);
+    for number in 0..80 {
+        shell.notice(format!("keyboard viewport {number:02}"));
+    }
+    assert!(!shell.state.borrow().application_viewport_requested);
+
+    let component = ShellComponent::new(shell.state.clone(), false);
+    let native = sexy_tui_rs::Component::render_update(&component, WIDTH).expect("native frame");
+    assert!(native.pinned.is_some());
+
+    shell.scroll(-1);
+    assert!(shell.state.borrow().application_viewport_requested);
+    let scrolled =
+        sexy_tui_rs::Component::render_update(&component, WIDTH).expect("semantic viewport frame");
+    assert!(scrolled.pinned.is_none());
+    assert!(scrolled.reanchor_viewport);
+    assert!(
+        scrolled
+            .replacement
+            .iter()
+            .any(|line| line.contains("PageDown returns to live")),
+        "{:?}",
+        scrolled.replacement
+    );
+    assert!(scrolled.replacement.len() <= 14);
+
+    // Returning to live keeps semantic viewport ownership; mouse reporting was
+    // never enabled and therefore remains an independent policy decision.
+    shell.jump_to_tail();
+    let live =
+        sexy_tui_rs::Component::render_update(&component, WIDTH).expect("semantic live frame");
+    assert!(live.pinned.is_none());
+    assert!(live.replacement.len() <= 14);
+    assert!(!live
+        .replacement
+        .iter()
+        .any(|line| line.contains("PageDown returns to live")));
+}
+
+#[test]
 fn explicit_application_viewport_bounds_history_and_keeps_old_rows_reachable() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 14);
@@ -4009,6 +4353,113 @@ fn application_viewport_stays_anchored_while_one_markdown_block_streams() {
         render_shell_viewport_at(&shell.state.borrow(), WIDTH, Instant::now()).join("\n");
     assert!(scrolled.contains("new"), "{scrolled}");
     assert!(scrolled.contains("PageDown returns to live"), "{scrolled}");
+}
+
+#[test]
+fn semantic_viewport_anchor_survives_wrapped_markdown_resize() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 16);
+    let markdown = (0..80)
+        .map(|number| {
+            format!(
+                "paragraph-{number:02} carries enough stable prose to wrap differently after a narrow resize"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Assistant(Box::new(
+            AssistantBlock::finalized(markdown),
+        )));
+        state.push_block(TranscriptBlock::Notice("live tail".into()));
+    }
+
+    let _ = render_shell_viewport_at(&shell.state.borrow(), 80, Instant::now());
+    shell.scroll_lines(-40);
+    let _ = render_shell_viewport_at(&shell.state.borrow(), 80, Instant::now());
+    let before = shell
+        .state
+        .borrow()
+        .viewport_anchor
+        .get()
+        .expect("scrolled semantic anchor");
+    assert!(before.semantic);
+
+    shell.set_size(42, 16);
+    let _ = render_shell_viewport_at(&shell.state.borrow(), 42, Instant::now());
+    let state = shell.state.borrow();
+    let after = state
+        .viewport_anchor
+        .get()
+        .expect("anchor retained after resize");
+    assert_eq!(after.commit_id, before.commit_id);
+    assert_eq!(after.text_offset, before.text_offset);
+
+    let chrome = shell_chrome(&state, 42, Instant::now());
+    let transcript = state.rendered_transcript(42);
+    let maximum = max_scroll_for_available(transcript.len(), chrome.transcript_rows);
+    let scroll = state.scroll_from_bottom.get().min(maximum);
+    let capacity = transcript_viewport_capacity(chrome.transcript_rows, scroll > 0);
+    let end = transcript.len().saturating_sub(scroll);
+    let start = end.saturating_sub(capacity);
+    drop(transcript);
+    let anchored = selection_position_for_visual_cell(
+        &state,
+        start + after.desired_screen_row.min(capacity.saturating_sub(1)),
+        0,
+    )
+    .expect("anchored semantic row after resize");
+    assert_eq!(state.transcript_commit_ids[anchored.block], after.commit_id);
+    assert!(anchored.offset <= after.text_offset);
+    let next = selection_position_for_visual_cell(
+        &state,
+        start + after.desired_screen_row.min(capacity.saturating_sub(1)) + 1,
+        0,
+    )
+    .expect("row following semantic anchor");
+    assert!(
+        after.text_offset <= next.offset,
+        "semantic point {after:?} escaped anchored rows {anchored:?}..{next:?}"
+    );
+}
+
+#[test]
+fn semantic_viewport_anchor_survives_disclosure_contraction_above_it() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 16);
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Compaction(Box::new(CompactionBlock {
+            label: "Context compacted".into(),
+            summary: (0..60)
+                .map(|number| format!("expanded summary row {number}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+            expanded: false,
+        })));
+        for number in 0..80 {
+            state.push_block(TranscriptBlock::Notice(format!(
+                "stable event after compaction {number:02}"
+            )));
+        }
+    }
+    shell.toggle_disclosure();
+    let _ = render_shell_viewport_at(&shell.state.borrow(), 80, Instant::now());
+    shell.scroll_lines(-24);
+    let visible_events = |shell: &InteractiveShell| {
+        render_shell_viewport_at(&shell.state.borrow(), 80, Instant::now())
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .filter(|line| line.contains("stable event after compaction"))
+            .collect::<Vec<_>>()
+    };
+    let before = visible_events(&shell);
+    assert!(!before.is_empty());
+
+    shell.toggle_disclosure();
+    let after = visible_events(&shell);
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -4265,7 +4716,7 @@ fn ctrl_o_keeps_width_cache_and_invalidates_only_disclosure_blocks() {
         assert_eq!(state.transcript_cache.borrow().width, Some(100));
     }
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let state = shell.state.borrow();
     let cache = state.transcript_cache.borrow();
     assert_eq!(cache.width, Some(100));
@@ -4753,7 +5204,7 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert_eq!(rendered[0], "• Thinking", "{rendered:?}");
-    assert!(rendered[1].contains("(ctrl+o to expand)"), "{rendered:?}");
+    assert!(rendered[1].contains("└ (ctrl+o to expand)"), "{rendered:?}");
 }
 
 #[test]
@@ -5094,13 +5545,13 @@ fn streamed_reasoning_shows_one_live_indicator_until_ctrl_o() {
         );
     }
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = transcript(&shell).join("\n");
     assert!(expanded.contains("first private sentinel"), "{expanded}");
     assert!(expanded.contains("private reasoning row 127"), "{expanded}");
     assert!(!expanded.contains("(ctrl+o to expand)"), "{expanded}");
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     assert_eq!(transcript(&shell), initial);
 }
 
@@ -5142,7 +5593,7 @@ fn a_new_reasoning_event_retires_the_previous_ctrl_o_hint() {
         1,
         "{rendered}"
     );
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = shell
         .state
         .borrow()
@@ -5249,12 +5700,12 @@ fn hydrated_reasoning_is_retained_but_collapsed_until_ctrl_o() {
     assert!(reasoning.finished);
     drop(state);
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = render(&shell).join("\n");
     assert!(expanded.contains("durable private thought"), "{expanded}");
     assert!(expanded.contains("with a second line"), "{expanded}");
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     assert_eq!(render(&shell), collapsed);
 }
 
@@ -5294,7 +5745,7 @@ fn completed_reasoning_uses_rich_markdown_without_raw_delimiters() {
         assert!(reasoning.text.contains("****"));
         assert!(!reasoning.markdown.raw_text().contains("****"));
     }
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let live = render_shell(&shell.state.borrow(), 80).join("\n");
     assert!(live.contains("Planning validation"), "{live}");
     assert!(live.contains("Inspecting"), "{live}");
@@ -5794,6 +6245,56 @@ fn tool_lifecycle_styles_are_visible_in_terminal_cells() {
             "tool label must not inherit lifecycle red"
         );
     }
+}
+
+#[test]
+fn pie_keeps_bounded_cards_without_synthetic_padding() {
+    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
+    use crate::tui::theme::{self, TerminalBackground};
+
+    let theme = theme::test_bundled_theme_with(
+        "pie",
+        TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
+        TerminalBackground::Dark,
+    );
+    let renderer = theme.rich_renderer();
+    let prompt = TranscriptBlock::User {
+        text: "hello from pie".into(),
+        model_lab: None,
+        prompt_color: None,
+        persisted: true,
+    };
+    let plan = compile_surface_plan(None, &prompt, &theme, 120);
+    assert!(
+        plan.frame_width <= 96,
+        "Pie cards must retain their v0.6 width cap: {plan:?}"
+    );
+    assert_eq!(plan.geometry.leading_rows, 0);
+    assert_eq!(plan.geometry.trailing_rows, 0);
+    let rendered = render_block(None, &prompt, &theme, &renderer, &renderer, 120, false);
+    assert_eq!(
+        rendered.len(),
+        1,
+        "Pie prompt added synthetic blank rows: {rendered:?}"
+    );
+
+    let reasoning = TranscriptBlock::Reasoning(Box::new(AssistantBlock::streaming_reasoning(
+        "private detail",
+    )));
+    let reasoning_lines = render_block(None, &reasoning, &theme, &renderer, &renderer, 120, false)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+    assert!(
+        reasoning_lines[0].contains('•') && reasoning_lines[0].contains("Thinking"),
+        "{reasoning_lines:?}"
+    );
+    assert!(
+        reasoning_lines
+            .iter()
+            .any(|line| line.contains("└ (ctrl+o to expand)")),
+        "Pie must retain the two-row disclosure treatment: {reasoning_lines:?}"
+    );
 }
 
 #[test]
@@ -6381,7 +6882,7 @@ fn scripted_agent_events_map_to_distinct_transcript_and_tool_state() {
     assert!(snapshot.contains("considering"));
     assert!(snapshot.contains("answer"));
     assert!(snapshot.contains("read"));
-    assert!(shell.debug_tool_output(&id).unwrap().contains("reading"));
+    assert_eq!(shell.debug_tool_output(&id).as_deref(), Some("contents"));
 }
 
 #[test]
@@ -6538,11 +7039,11 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
     let command_column = visible_width(&rendered[0][..command_byte]);
     let hidden = rendered
         .iter()
-        .find(|line| line.contains("3 lines hidden"))
+        .find(|line| line.contains("4 earlier visual rows hidden"))
         .expect("synthetic hidden-line metadata");
     let output = rendered
         .iter()
-        .find(|line| line.contains("result line 4"))
+        .find(|line| line.contains("result line 5"))
         .expect("first retained output row");
     let hidden_byte = hidden.find('…').expect("hidden metadata marker");
     assert_eq!(
@@ -6551,7 +7052,7 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
         "{rendered:?}"
     );
     assert_eq!(
-        output.find("result line 4"),
+        output.find("result line 5"),
         Some(command_column),
         "{rendered:?}"
     );
@@ -6565,8 +7066,250 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
 }
 
 #[test]
+fn compact_bash_window_is_capped_at_five_physical_rows_after_wrapping() {
+    let theme = crate::tui::theme::test_theme();
+    let args = serde_json::json!({"command": "printf wrapped"});
+    let panel = ToolPanel::new(
+        ToolCallId("bash-physical-window".into()),
+        "bash".into(),
+        args.to_string(),
+        summarize_tool("bash", &args),
+        format!(
+            "exit=0 duration=0.2s\nstdout: 4 lines\n\x1b[31m{}\x1b[0m\n{}\n{}\npartial-tail",
+            "界".repeat(30),
+            "wrapped-ascii-".repeat(12),
+            "e\u{301}".repeat(50),
+        ),
+        true,
+        false,
+        None,
+        None,
+    );
+
+    for width in [18, 24, 42, 80] {
+        let rows =
+            render_compact_bash_output(&panel, &theme, width, false, &tool_value_indent("Bash"));
+        assert_eq!(
+            rows.len(),
+            COMPACT_EXEC_OUTPUT_ROWS,
+            "width {width}: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| visible_width(row) <= usize::from(width)),
+            "width {width}: {rows:?}"
+        );
+    }
+}
+
+#[test]
+fn carriage_return_bash_progress_replaces_one_visual_row() {
+    let theme = crate::tui::theme::test_theme();
+    let args = serde_json::json!({"command": "progress"});
+    let panel = ToolPanel::new(
+        ToolCallId("bash-cr-progress".into()),
+        "bash".into(),
+        args.to_string(),
+        summarize_tool("bash", &args),
+        "phase\nprogress 0\rprogress 10\rprogress 100".into(),
+        false,
+        false,
+        None,
+        None,
+    );
+    let rows = render_compact_bash_output(&panel, &theme, 80, false, &tool_value_indent("Bash"));
+    let plain = rows
+        .iter()
+        .map(|row| strip_terminal_sequences(row))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        rows.len(),
+        2,
+        "short progress output must not reserve blank rows"
+    );
+    assert!(plain.contains("progress 100"), "{plain}");
+    assert!(!plain.contains("progress 10\n"), "{plain}");
+    assert!(!plain.contains("progress 0\n"), "{plain}");
+}
+
+#[test]
+fn adjacent_bash_cards_do_not_reserve_blank_output_rows() {
+    let shell = InteractiveShell::test_shell();
+    let args = serde_json::json!({"command": "first"});
+    let second_args = serde_json::json!({"command": "second"});
+    {
+        let mut state = shell.state.borrow_mut();
+        state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("compact-first".into()),
+            "bash".into(),
+            args.to_string(),
+            summarize_tool("bash", &args),
+            String::new(),
+            false,
+            false,
+            None,
+            None,
+        ))));
+        state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
+            ToolCallId("compact-second".into()),
+            "bash".into(),
+            second_args.to_string(),
+            summarize_tool("bash", &second_args),
+            String::new(),
+            false,
+            false,
+            None,
+            None,
+        ))));
+    }
+
+    let card_height = |state: &ShellState| {
+        let _ = state.rendered_transcript(32);
+        let cache = state.transcript_cache.borrow();
+        cache.block_starts[1].saturating_sub(cache.block_starts[0])
+    };
+    let waiting_height = card_height(&shell.state.borrow());
+
+    let mut heights = Vec::new();
+    for (index, output) in [
+        "one partial line".to_owned(),
+        format!("{}\nlast", "界 wrapped output ".repeat(20)),
+        "exit=0 duration=0.1s\nstdout: 2 lines\nfinal one\nfinal two".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut state = shell.state.borrow_mut();
+        let TranscriptBlock::Tool(panel) = &mut state.transcript[0] else {
+            unreachable!()
+        };
+        panel.output = output;
+        panel.finished = index == 2;
+        state.touch_block(0);
+        heights.push(card_height(&state));
+    }
+
+    assert_eq!(
+        heights[0], waiting_height,
+        "one output row should replace the waiting row without adding whitespace"
+    );
+    assert!(
+        heights[1] > heights[0],
+        "a full five-row tail may grow the card"
+    );
+    assert!(
+        heights[1] < heights[0] + COMPACT_EXEC_OUTPUT_ROWS,
+        "collapsed output exceeded its five-row budget: {heights:?}"
+    );
+    assert!(
+        heights[2] < heights[1],
+        "a short final result should release unused output rows: {heights:?}"
+    );
+}
+
+#[test]
+fn final_tool_result_replaces_live_output_without_the_tui_byte_cap() {
+    use ygg_agent::ToolOutput;
+
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("local");
+    let id = ToolCallId("bash-final-replaces-live".into());
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolStarted {
+            id: id.clone(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "large-final"}),
+        },
+    );
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolProgress {
+            id: id.clone(),
+            progress: ToolProgress::Output {
+                stream: ygg_agent::OutputStream::Stdout,
+                bytes: bytes::Bytes::from_static(b"LIVE-ONLY-SENTINEL"),
+            },
+        },
+    );
+    let final_output = format!(
+        "exit=0 duration=0.1s\nstdout: 1 lines\n{}FINAL-SENTINEL",
+        "x".repeat(70 * 1024)
+    );
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolFinished {
+            id: id.clone(),
+            result: Ok(ToolOutput::new(final_output.clone())),
+            duration: Duration::from_millis(10),
+        },
+    );
+
+    let retained = shell.debug_tool_output(&id).expect("retained final output");
+    assert_eq!(retained, final_output);
+    assert!(!retained.contains("LIVE-ONLY-SENTINEL"));
+    assert!(retained.ends_with("FINAL-SENTINEL"));
+}
+
+#[test]
+fn failed_bash_output_is_available_in_expanded_rendering() {
+    let theme = crate::tui::theme::test_theme();
+    let args = serde_json::json!({"command": "failing-command"});
+    let output = (1..=8)
+        .map(|line| format!("failed output line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+        ToolCallId("failed-bash-output".into()),
+        "bash".into(),
+        args.to_string(),
+        summarize_tool("bash", &args),
+        format!("error nonzero_exit\nexit=1 duration=0.2s\nstdout: 8 lines\n{output}"),
+        true,
+        true,
+        Some("command exited with code 1".into()),
+        None,
+    )));
+
+    let collapsed = render_block(
+        None,
+        &block,
+        &theme,
+        &theme.rich_renderer(),
+        &theme.reasoning_renderer(),
+        80,
+        false,
+    )
+    .into_iter()
+    .map(|line| strip_terminal_sequences(&line))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(!collapsed.contains("failed output line 1"), "{collapsed}");
+    assert!(!collapsed.contains("failed output line 8"), "{collapsed}");
+    assert!(collapsed.contains("failed output hidden"), "{collapsed}");
+
+    let expanded = render_block(
+        None,
+        &block,
+        &theme,
+        &theme.rich_renderer(),
+        &theme.reasoning_renderer(),
+        80,
+        true,
+    )
+    .into_iter()
+    .map(|line| strip_terminal_sequences(&line))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(expanded.contains("failed output line 1"), "{expanded}");
+    assert!(expanded.contains("failed output line 8"), "{expanded}");
+}
+
+#[test]
 fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
     let mut shell = InteractiveShell::test_shell();
+    shell.set_workspace(PathBuf::from("/work/ygg-footer-regression"));
     shell.set_identity(
         "custom-openai",
         "custom/unsloth/Qwen3.6-35B-A3B-MTP-GGUF",
@@ -7115,7 +7858,7 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
 }
 
 #[test]
-fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
+fn ctrl_o_globally_expands_and_collapses_subagent_activity() {
     let mut shell = InteractiveShell::test_shell();
     let child = |id: &str, task: &str, state: &str| ygg_agent::DelegationTelemetryChild {
         child_id: id.into(),
@@ -7139,6 +7882,16 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
         failure_reason: None,
         session: Some("agent-session:opaque".into()),
     };
+    let render = |shell: &InteractiveShell| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(120)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 1,
@@ -7153,42 +7906,30 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
             failure_class: None,
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_some());
-    assert!(!shell.state.borrow().subagent_activity_expanded);
-    let collapsed = shell
-        .state
-        .borrow()
-        .rendered_transcript(120)
-        .iter()
-        .map(|line| strip_terminal_sequences(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+
+    assert!(!shell.verbose_tools());
+    let collapsed = render(&shell);
+    assert!(!collapsed.contains("Read release history"), "{collapsed}");
     assert!(collapsed.contains("Audit release surface"), "{collapsed}");
-    assert!(collapsed.contains("Read release history"), "{collapsed}");
     assert!(collapsed.contains("Scan changelog"), "{collapsed}");
 
-    // Every child renders regardless of expansion; ctrl+o remains reserved
-    // for verbose tool disclosure when no subagent activity is visible.
-    shell.expand_focused_tool();
-    assert!(shell.state.borrow().subagent_activity_expanded);
-    assert!(shell.state.borrow().subagent_activity.is_some());
-    let expanded = shell
-        .state
-        .borrow()
-        .rendered_transcript(120)
-        .iter()
-        .map(|line| strip_terminal_sequences(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+    shell.toggle_disclosure();
+    assert!(shell.verbose_tools());
+    let expanded = render(&shell);
     assert!(expanded.contains("Read release history"), "{expanded}");
     assert!(expanded.contains("Audit release surface"), "{expanded}");
     assert!(expanded.contains("Scan changelog"), "{expanded}");
 
-    shell.expand_focused_tool();
-    assert!(!shell.state.borrow().subagent_activity_expanded);
+    shell.toggle_disclosure();
+    assert!(!shell.verbose_tools());
+    let collapsed_again = render(&shell);
+    assert!(
+        !collapsed_again.contains("Read release history"),
+        "{collapsed_again}"
+    );
 
-    // After every child settles the event remains in the transcript, so ctrl+o
-    // still expands the roster rather than flipping verbose tool output.
+    // Settlement does not create a second disclosure mode. The same global
+    // Ctrl+O state still expands every retained worker and every tool panel.
     shell.on_agent_event(&ygg_agent::AgentEvent::DelegationUpdated {
         snapshot: ygg_agent::DelegationTelemetrySnapshot {
             revision: 2,
@@ -7203,11 +7944,9 @@ fn ctrl_o_expands_the_subagent_strip_while_it_is_visible() {
             failure_class: None,
         },
     });
-    assert!(shell.state.borrow().subagent_activity.is_some());
-    assert!(!shell.verbose_tools());
-    shell.expand_focused_tool();
-    assert!(shell.state.borrow().subagent_activity_expanded);
-    assert!(!shell.verbose_tools());
+    shell.toggle_disclosure();
+    assert!(shell.verbose_tools());
+    assert!(render(&shell).contains("Read release history"));
 }
 
 #[test]
@@ -7450,7 +8189,7 @@ fn read_results_stay_hidden_in_collapsed_and_expanded_modes() {
     assert!(!collapsed.contains("READ RESULT SENTINEL"), "{collapsed}");
     assert!(!collapsed.to_ascii_lowercase().contains("evidence"));
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = transcript(&shell);
     assert!(expanded.contains("src/private.rs:41-47"), "{expanded}");
     assert!(!expanded.contains("READ RESULT SENTINEL"), "{expanded}");
@@ -7502,20 +8241,23 @@ fn tool_output_tail_expands_with_global_ctrl_o_and_copy_stays_safe() {
     let collapsed = transcript(&shell);
     assert!(collapsed.contains("private result line 8"), "{collapsed}");
     assert!(!collapsed.contains("private result line 1"), "{collapsed}");
-    assert!(collapsed.contains("3 lines hidden"), "{collapsed}");
+    assert!(
+        collapsed.contains("4 earlier visual rows hidden"),
+        "{collapsed}"
+    );
     assert_eq!(
         shell.debug_tool_output(&id).as_deref(),
         Some(secret.as_str())
     );
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     assert!(shell.verbose_tools());
     let expanded = transcript(&shell);
     assert!(expanded.contains("private result line 1"), "{expanded}");
     assert!(expanded.contains("private result line 8"), "{expanded}");
     assert!(!expanded.to_ascii_lowercase().contains("evidence"));
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     assert!(!shell.verbose_tools());
     let collapsed_again = transcript(&shell);
     assert!(
@@ -7609,7 +8351,7 @@ fn search_output_and_edit_write_diffs_expand_with_global_ctrl_o() {
         "{collapsed}"
     );
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = transcript(&shell);
     assert!(expanded.contains("SEARCH MATCH 1"), "{expanded}");
     assert!(expanded.contains("SEARCH MATCH 8"), "{expanded}");
@@ -7679,7 +8421,7 @@ fn ctrl_o_toggles_all_expandable_transcript_blocks() {
         "{collapsed}"
     );
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     {
         let mut state = shell.state.borrow_mut();
         state.push_block(TranscriptBlock::Reasoning(Box::new(
@@ -7693,7 +8435,7 @@ fn ctrl_o_toggles_all_expandable_transcript_blocks() {
     assert!(expanded.contains("shell output 1"), "{expanded}");
     assert!(expanded.contains("private compaction body"), "{expanded}");
 
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let collapsed_again = transcript(&shell);
     assert!(
         !collapsed_again.contains("private reasoning body"),
@@ -7757,7 +8499,7 @@ fn extension_tool_renderer_stays_internal_to_the_tool_record() {
         .join("\n");
     assert!(!rendered.contains("RAW EVIDENCE"), "{rendered}");
     assert!(!rendered.contains("branch: main"), "{rendered}");
-    shell.expand_focused_tool();
+    shell.toggle_disclosure();
     let expanded = shell
         .state
         .borrow()
@@ -7889,8 +8631,9 @@ fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
         lines
     };
 
-    // clawed and pie: a cornered frame in the theme's border colour.
-    for name in ["clawed", "pie"] {
+    // Pie retains its v0.6 rounded composer.
+    {
+        let name = "pie";
         let lines = composer_lines(name);
         let plain = lines
             .iter()
@@ -7912,6 +8655,20 @@ fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
             plain[top + 1]
         );
     }
+
+    // Clawed now uses the shared static top/bottom-rule composer.
+    let clawed = composer_lines("clawed")
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert!(
+        clawed
+            .iter()
+            .filter(|line| !line.is_empty() && line.chars().all(|character| character == '─'))
+            .count()
+            >= 2,
+        "clawed composer lost its rules: {clawed:?}"
+    );
 
     // kodex: no rules at all — a shaded rectangle painted with composer_bg.
     let lines = composer_lines("kodex");
@@ -8415,8 +9172,7 @@ fn card_surface_degrades_to_rail_with_exact_cached_narrow_geometry() {
     assert_eq!(narrow.geometry.leading_rows, 0);
     assert_eq!(narrow.geometry.trailing_rows, 0);
     let renderer = theme.rich_renderer();
-    let rendered =
-        render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false, true);
+    let rendered = render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false, 0);
     assert_eq!(rendered.geometry, narrow.geometry);
     let plain = rendered
         .lines
@@ -8722,27 +9478,6 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
     state.editor = "draft a local patch".into();
 }
 
-/// Remove colors and semantic words while retaining whitespace,
-/// punctuation, rails, rules, and card geometry. Palette/wordmark-only
-/// changes therefore cannot satisfy the bundled identity test.
-fn structural_signature(rendered: &str) -> String {
-    let plain = strip_terminal_sequences(rendered);
-    let mut signature = String::with_capacity(plain.len());
-    let mut word = false;
-    for character in plain.chars() {
-        if character.is_alphanumeric() || character == '_' {
-            if !word {
-                signature.push('x');
-                word = true;
-            }
-        } else {
-            word = false;
-            signature.push(character);
-        }
-    }
-    signature
-}
-
 fn ansi_background_is_open_at_end(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut index = 0;
@@ -8792,13 +9527,10 @@ fn ansi_background_is_open_at_end(line: &str) -> bool {
 }
 
 #[test]
-fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
+fn bundled_theme_pack_shares_safe_transcript_geometry_across_wide_and_narrow_identities() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
-    let mut wide = HashSet::new();
-    let mut ascii = HashSet::new();
-    let mut narrow = HashSet::new();
     for name in BUNDLED_THEME_NAMES {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(96, 80);
@@ -8825,10 +9557,6 @@ fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
             unclosed_backgrounds.is_empty(),
             "{name} leaked a painted surface beyond its row: {unclosed_backgrounds:?}"
         );
-        assert!(
-            wide.insert(structural_signature(&transcript)),
-            "{name} duplicated another color-stripped transcript geometry"
-        );
 
         let mut plain_shell = InteractiveShell::test_shell();
         plain_shell.set_size(96, 80);
@@ -8846,10 +9574,6 @@ fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
         assert!(
             !plain.contains('\x1b'),
             "{name} emitted ANSI in no-color mode"
-        );
-        assert!(
-            ascii.insert(structural_signature(&plain)),
-            "{name} duplicated another ASCII transcript geometry"
         );
 
         let mut narrow_shell = InteractiveShell::test_shell();
@@ -8869,10 +9593,6 @@ fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
             narrow_frame.lines().all(|line| visible_width(line) <= 40),
             "{name} overflowed a narrow terminal"
         );
-        assert!(
-            narrow.insert(structural_signature(&narrow_frame)),
-            "{name} duplicated another narrow transcript geometry"
-        );
 
         if std::env::var_os("YGG_DUMP_THEME_FRAMES").is_some() {
             eprintln!(
@@ -8882,9 +9602,6 @@ fn bundled_theme_pack_has_three_color_independent_wide_and_narrow_identities() {
             eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
         }
     }
-    assert_eq!(wide.len(), 3);
-    assert_eq!(ascii.len(), 3);
-    assert_eq!(narrow.len(), 3);
 }
 
 #[test]

@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use crate::auth::CredentialRedactor;
 use crate::catalog::Model;
 use crate::error::{
-    AiError, DecodeError, HttpError, ProviderError, StreamProtocolError, TransportError,
-    TransportPhase,
+    AiError, DecodeError, HttpError, ProviderError, StreamProgress, StreamProtocolError,
+    TransportError, TransportPhase,
 };
 use crate::responses_ws::ResponsesWsPool;
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
@@ -27,10 +27,23 @@ const MAX_SUCCESS_ERROR_BODY_BYTES: usize = 64 * 1024;
 /// timeout. Without this, a dead route can consume the full endpoint timeout on
 /// every retry before the UI receives an error.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Maximum silence allowed between SSE body chunks.
-const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Absolute deadline for one generation request.
-const DEFAULT_STREAM_DEADLINE: Duration = Duration::from_secs(30 * 60);
+/// Maximum time to wait for the first response-body chunk after headers. A
+/// provider may have accepted the request and still be processing a very large
+/// prompt or loading a local model.
+const DEFAULT_STREAM_INITIAL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Maximum silence allowed between SSE body chunks after the response starts.
+/// Slow local servers can pause for several minutes between reasoning/output
+/// chunks without being dead, especially while paging or swapping a large
+/// model.
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Absolute deadline for one response-body read. This remains finite so a
+/// wedged provider is eventually surfaced, while leaving room for large
+/// compaction/reasoning turns and rate-limited gateways.
+const DEFAULT_STREAM_DEADLINE: Duration = Duration::from_secs(60 * 60);
+/// Error bodies are optional diagnostics after the status and retry metadata
+/// are already known. Never let a slow snippet inherit generation-scale waits.
+const MAX_ERROR_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_ERROR_BODY_DEADLINE: Duration = Duration::from_secs(5);
 /// Compression level used by the ChatGPT Codex SSE endpoint and the official
 /// Codex-compatible client. Level 3 is fast enough to keep request preparation
 /// cheap while substantially shrinking replayed tool history.
@@ -146,6 +159,13 @@ fn sanitize_ai_error(redactor: &CredentialRedactor, mut error: AiError) -> AiErr
         | AiError::StreamProtocol(StreamProtocolError::UnexpectedEvent(message)) => {
             *message = sanitize_diagnostic(redactor, message, MAX_PROVIDER_DIAGNOSTIC_BYTES);
         }
+        AiError::StreamFailure { inner, .. } => {
+            // The progress counters are purely numeric and can never carry
+            // provider text; only the wrapped inner error can, so sanitize
+            // that in place.
+            let drained = std::mem::replace(&mut **inner, AiError::Canceled);
+            **inner = sanitize_ai_error(redactor, drained);
+        }
         AiError::Config(_)
         | AiError::Auth(_)
         | AiError::Validation(_)
@@ -156,6 +176,32 @@ fn sanitize_ai_error(redactor: &CredentialRedactor, mut error: AiError) -> AiErr
         | AiError::Canceled => {}
     }
     error
+}
+
+/// Annotate a mid-stream failure with how far the response had progressed.
+///
+/// Wrapping only happens inside the response-body loop, where the builder is
+/// still alive: the raw provider frame/event counts and the retained content
+/// bytes are exactly what distinguishes "the provider sent 400 frames and
+/// then went silent" from "the provider sent nothing". Pre-stream failures
+/// (connection, headers, HTTP status) are left unannotated.
+fn annotate_stream_failure(
+    inner: AiError,
+    builder: &ResponseBuilder,
+    first_body_chunk: bool,
+    started_at: Instant,
+) -> AiError {
+    AiError::StreamFailure {
+        inner: Box::new(inner),
+        progress: StreamProgress {
+            provider_events: builder.provider_event_count,
+            decoded_events: builder.event_count,
+            content_bytes: builder.aggregate_content_bytes,
+            buffered_bytes: builder.buffered_content_bytes,
+            first_body_seen: !first_body_chunk,
+            elapsed_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        },
+    }
 }
 
 fn reqwest_transport_error(
@@ -293,6 +339,8 @@ async fn prepare_request_body(
 async fn next_body_chunk<S>(
     stream: &mut S,
     idle_timeout: Duration,
+    initial_timeout: Duration,
+    first_chunk: bool,
     started_at: Instant,
     deadline: Duration,
     body_name: &'static str,
@@ -308,13 +356,20 @@ where
             message: format!("{body_name} exceeded its overall deadline"),
         }));
     }
-    let wait_for = remaining.min(idle_timeout);
+    let quiet_timeout = if first_chunk {
+        initial_timeout
+    } else {
+        idle_timeout
+    };
+    let wait_for = remaining.min(quiet_timeout);
     match tokio::time::timeout(wait_for, stream.next()).await {
         Err(_) => Err(AiError::Transport(TransportError {
             phase: TransportPhase::Body,
             timeout: true,
-            message: if remaining <= idle_timeout {
+            message: if remaining <= quiet_timeout {
                 format!("{body_name} exceeded its overall deadline")
+            } else if first_chunk {
+                format!("{body_name} was idle beyond its initial timeout")
             } else {
                 format!("{body_name} was idle beyond its timeout")
             },
@@ -339,13 +394,24 @@ struct HttpStreamRequest {
     diagnostic_redactor: CredentialRedactor,
 }
 
-fn should_fallback_from_websocket(error: &AiError) -> bool {
-    matches!(error, AiError::Transport(_) | AiError::Decode(_))
+/// Falling back is replay-safe only when opening the WebSocket failed before
+/// the generation request could have been sent. Once the request actor accepts
+/// a frame, every timeout, decode failure, or disconnect is ambiguous and must
+/// remain terminal unless the provider supplies an idempotency contract.
+fn websocket_open_failure_is_replay_safe(error: &AiError) -> bool {
+    matches!(
+        error,
+        AiError::Transport(TransportError {
+            phase: TransportPhase::Connect,
+            ..
+        })
+    )
 }
 
 async fn stream_http(
     http: reqwest::Client,
     request: HttpStreamRequest,
+    stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
 ) -> Result<ResponseStream, AiError> {
@@ -413,9 +479,11 @@ async fn stream_http(
         while body.len() < 4096 {
             match next_body_chunk(
                 &mut error_stream,
-                stream_idle_timeout,
+                stream_idle_timeout.min(MAX_ERROR_BODY_IDLE_TIMEOUT),
+                stream_idle_timeout.min(MAX_ERROR_BODY_IDLE_TIMEOUT),
+                false,
                 started_at,
-                stream_deadline,
+                stream_deadline.min(MAX_ERROR_BODY_DEADLINE),
                 "HTTP error response body",
             )
             .await
@@ -497,40 +565,60 @@ async fn stream_http(
             let mut terminal_seen = false;
             let mut provider_event_seen = false;
             let mut successful_body_prefix = Vec::new();
+            let mut first_body_chunk = true;
             let started_at = Instant::now();
             'read: loop {
                 let remaining = stream_deadline.saturating_sub(started_at.elapsed());
                 if remaining.is_zero() {
-                    Err(AiError::Transport(TransportError {
-                        phase: TransportPhase::Body,
-                        timeout: true,
-                        message: "stream exceeded its overall deadline".to_string(),
-                    }))?;
-                }
-                let wait_for = remaining.min(stream_idle_timeout);
-                let chunk_res = tokio::time::timeout(wait_for, stream.next())
-                    .await
-                    .map_err(|_| {
+                    Err(annotate_stream_failure(
                         AiError::Transport(TransportError {
                             phase: TransportPhase::Body,
                             timeout: true,
-                            message: if remaining <= stream_idle_timeout {
-                                "stream exceeded its overall deadline".to_string()
-                            } else {
-                                "stream was idle beyond its timeout".to_string()
-                            },
-                        })
+                            message: "stream exceeded its overall deadline".to_string(),
+                        }),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                    ))?;
+                }
+                let quiet_timeout = if first_body_chunk {
+                    stream_initial_timeout
+                } else {
+                    stream_idle_timeout
+                };
+                let wait_for = remaining.min(quiet_timeout);
+                let chunk_res = tokio::time::timeout(wait_for, stream.next())
+                    .await
+                    .map_err(|_| {
+                        annotate_stream_failure(
+                            AiError::Transport(TransportError {
+                                phase: TransportPhase::Body,
+                                timeout: true,
+                                message: if remaining <= quiet_timeout {
+                                    "stream exceeded its overall deadline".to_string()
+                                } else if first_body_chunk {
+                                    "stream was idle beyond its initial timeout".to_string()
+                                } else {
+                                    "stream was idle beyond its timeout".to_string()
+                                },
+                            }),
+                            &builder,
+                            first_body_chunk,
+                            started_at,
+                        )
                     })?;
                 let Some(chunk_res) = chunk_res else {
                     break;
                 };
                 let chunk = chunk_res.map_err(|error| {
-                    reqwest_transport_error(
-                        error,
-                        TransportPhase::Body,
-                        "response body",
+                    annotate_stream_failure(
+                        reqwest_transport_error(error, TransportPhase::Body, "response body"),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
                     )
                 })?;
+                first_body_chunk = false;
 
                 if !provider_event_seen
                     && successful_body_prefix.len() < MAX_SUCCESS_ERROR_BODY_BYTES
@@ -540,7 +628,9 @@ async fn stream_http(
                         .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
 
-                let sse_events = sse_decoder.push(&chunk).map_err(AiError::Decode)?;
+                let sse_events = sse_decoder.push(&chunk).map_err(|error| {
+                    annotate_stream_failure(AiError::Decode(error), &builder, first_body_chunk, started_at)
+                })?;
                 if !sse_events.is_empty() {
                     provider_event_seen = true;
                     successful_body_prefix.clear();
@@ -548,10 +638,13 @@ async fn stream_http(
 
                 for sse in sse_events {
                     let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                    };
+                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                    }
+                    .map_err(|error| {
+                        annotate_stream_failure(error, &builder, first_body_chunk, started_at)
+                    })?;
                     for ev in stream_events {
                         let terminal = matches!(ev, StreamEvent::Finished(_));
                         yield ev;
@@ -567,14 +660,21 @@ async fn stream_http(
             // seen; after `Finished` the stream is closed and any residue is
             // ignored rather than decoded into post-terminal events.
             if !terminal_seen {
-                if let Some(sse) = sse_decoder.finish().map_err(AiError::Decode)? {
+                if let Some(sse) =
+                    sse_decoder.finish().map_err(|error| {
+                        annotate_stream_failure(AiError::Decode(error), &builder, first_body_chunk, started_at)
+                    })?
+                {
                     provider_event_seen = true;
                     successful_body_prefix.clear();
                     let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder)?,
-                    };
+                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                    }
+                    .map_err(|error| {
+                        annotate_stream_failure(error, &builder, first_body_chunk, started_at)
+                    })?;
                     for ev in stream_events {
                         yield ev;
                     }
@@ -584,7 +684,12 @@ async fn stream_http(
                 if let Some(error) =
                     provider_error_from_success_body(&successful_body_prefix)
                 {
-                    Err(AiError::Provider(error))?;
+                    Err(annotate_stream_failure(
+                        AiError::Provider(error),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                    ))?;
                 }
             }
         };
@@ -597,11 +702,14 @@ async fn stream_http(
         // Non-streaming path (completed response, e.g. Chat Audio output)
         let mut body_bytes = Vec::new();
         let mut byte_stream = res.bytes_stream();
+        let mut first_body_chunk = true;
         let started_at = Instant::now();
 
         while let Some(chunk) = next_body_chunk(
             &mut byte_stream,
             stream_idle_timeout,
+            stream_initial_timeout,
+            first_body_chunk,
             started_at,
             stream_deadline,
             "completed response body",
@@ -609,6 +717,7 @@ async fn stream_http(
         .await
         .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?
         {
+            first_body_chunk = false;
             if body_bytes
                 .len()
                 .checked_add(chunk.len())
@@ -702,8 +811,7 @@ fn responses_websocket_stream(
     diagnostics: Vec<crate::error::Diagnostic>,
     buffer_ambiguous_compatibility_content: bool,
     diagnostic_redactor: CredentialRedactor,
-    http: reqwest::Client,
-    fallback: Option<HttpStreamRequest>,
+    stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
 ) -> ResponseStream {
@@ -723,7 +831,6 @@ fn responses_websocket_stream(
         let started_at = Instant::now();
         let mut terminal_seen = false;
         let mut emitted_event = false;
-        let mut fallback = fallback;
         while !terminal_seen {
             let remaining = stream_deadline.saturating_sub(started_at.elapsed());
             let event_result = if remaining.is_zero() {
@@ -733,20 +840,24 @@ fn responses_websocket_stream(
                     message: "websocket stream exceeded its overall deadline".to_owned(),
                 }))
             } else {
-                tokio::time::timeout(
-                    remaining.min(stream_idle_timeout),
-                    events.recv(),
-                )
-                .await
-                .map_err(|_| AiError::Transport(TransportError {
-                    phase: TransportPhase::Body,
-                    timeout: true,
-                    message: if remaining <= stream_idle_timeout {
-                        "websocket stream exceeded its overall deadline".to_owned()
-                    } else {
-                        "websocket stream was idle beyond its timeout".to_owned()
-                    },
-                }))
+                let quiet_timeout = if emitted_event {
+                    stream_idle_timeout
+                } else {
+                    stream_initial_timeout
+                };
+                tokio::time::timeout(remaining.min(quiet_timeout), events.recv())
+                    .await
+                    .map_err(|_| AiError::Transport(TransportError {
+                        phase: TransportPhase::Body,
+                        timeout: true,
+                        message: if remaining <= quiet_timeout {
+                            "websocket stream exceeded its overall deadline".to_owned()
+                        } else if emitted_event {
+                            "websocket stream was idle beyond its timeout".to_owned()
+                        } else {
+                            "websocket stream was idle beyond its initial timeout".to_owned()
+                        },
+                    }))
             };
             let event = match event_result {
                 Ok(Some(event)) => event,
@@ -759,26 +870,18 @@ fn responses_websocket_stream(
             };
             let event = match event {
                 Ok(event) => event,
-                Err(error)
-                    if !emitted_event
-                        && fallback.is_some()
-                        && should_fallback_from_websocket(&error) =>
-                {
-                    let request = fallback
-                        .take()
-                        .expect("WebSocket fallback request checked above");
-                    let mut fallback_stream =
-                        stream_http(http.clone(), request, stream_idle_timeout, stream_deadline)
-                            .await?;
-                    while let Some(event) = fallback_stream.next().await {
-                        yield event?;
-                    }
-                    break;
+                Err(error) => {
+                    events.close();
+                    Err(error)?
                 }
-                Err(error) => Err(error)?,
             };
-            let data = serde_json::to_string(&event)
-                .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+            let data = match serde_json::to_string(&event) {
+                Ok(data) => data,
+                Err(error) => {
+                    events.close();
+                    Err(AiError::Decode(DecodeError::Json(error.to_string())))?
+                }
+            };
             let sse_event = crate::protocol::sse::SseEvent {
                 event: None,
                 data,
@@ -789,23 +892,10 @@ fn responses_websocket_stream(
                 &mut builder,
             ) {
                 Ok(decoded) => decoded,
-                Err(error)
-                    if !emitted_event
-                        && fallback.is_some()
-                        && should_fallback_from_websocket(&error) =>
-                {
-                    let request = fallback
-                        .take()
-                        .expect("WebSocket fallback request checked above");
-                    let mut fallback_stream =
-                        stream_http(http.clone(), request, stream_idle_timeout, stream_deadline)
-                            .await?;
-                    while let Some(event) = fallback_stream.next().await {
-                        yield event?;
-                    }
-                    break;
+                Err(error) => {
+                    events.close();
+                    Err(error)?
                 }
-                Err(error) => Err(error)?,
             };
             for event in decoded {
                 let terminal = matches!(event, StreamEvent::Finished(_));
@@ -828,6 +918,7 @@ fn responses_websocket_stream(
 pub struct AiClient {
     http: reqwest::Client,
     responses_ws: ResponsesWsPool,
+    stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
 }
@@ -852,8 +943,9 @@ impl AiClient {
     /// Creates a new AiClient, preserving ygg's no-redirect transport policy.
     ///
     /// Reqwest has no useful generation deadline by itself. Ygg applies the
-    /// endpoint timeout while waiting for headers, then enforces stream-idle
-    /// and overall generation deadlines in [`Self::stream`].
+    /// endpoint timeout while waiting for headers, then allows a generous
+    /// first body chunk before enforcing inter-chunk idle and overall body
+    /// deadlines in [`Self::stream`].
     pub fn try_new() -> Result<Self, reqwest::Error> {
         Ok(Self {
             http: reqwest::Client::builder()
@@ -861,6 +953,7 @@ impl AiClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             responses_ws: ResponsesWsPool::default(),
+            stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
         })
@@ -871,17 +964,36 @@ impl AiClient {
         Self {
             http,
             responses_ws: ResponsesWsPool::default(),
+            stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
         }
     }
 
-    /// Sets the maximum quiet interval and absolute lifetime of every response
-    /// body, including SSE, completed JSON, and bounded HTTP error bodies.
+    /// Sets the maximum quiet interval and absolute lifetime of response bodies,
+    /// including SSE and completed JSON. Bounded HTTP error snippets also obey
+    /// these values but retain shorter internal ceilings so an already-known
+    /// status is surfaced promptly.
+    /// The idle value also bounds the first body chunk; callers that need a
+    /// longer time-to-first-body-byte can override it with
+    /// [`Self::with_initial_stream_timeout`].
     /// Callers can use shorter values in tests or batch workers.
     pub fn with_stream_timeouts(mut self, idle_timeout: Duration, deadline: Duration) -> Self {
-        self.stream_idle_timeout = idle_timeout.max(Duration::from_millis(1));
+        let idle_timeout = idle_timeout.max(Duration::from_millis(1));
+        self.stream_initial_timeout = idle_timeout;
+        self.stream_idle_timeout = idle_timeout;
         self.stream_deadline = deadline.max(Duration::from_millis(1));
+        self
+    }
+
+    /// Sets the maximum time allowed for the first successful response-body
+    /// chunk after headers arrive, or the first decoded WebSocket event. This is
+    /// independent from the shorter inter-chunk idle timeout and is useful for
+    /// large prompts or cold local model servers. Bounded error bodies use a
+    /// separate short ceiling so their already-known HTTP status is surfaced
+    /// promptly.
+    pub fn with_initial_stream_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_initial_timeout = timeout.max(Duration::from_millis(1));
         self
     }
 
@@ -1052,9 +1164,10 @@ impl AiClient {
         };
 
         // Responses WebSockets are deliberately opt-in per endpoint. A
-        // handshake failure, stale cursor, or provider-side socket reset falls
-        // back to the ordinary durable HTTP/SSE request below; the pool marks
-        // a failed session so repeated turns do not pay the failed handshake.
+        // connection/handshake failure is replay-safe and falls back to the
+        // ordinary HTTP/SSE request below. Once the generation frame may have
+        // been sent, every timeout or disconnect is terminal: silently replaying
+        // the POST could duplicate provider work and billing.
         if matches!(
             model.endpoint.transport,
             crate::types::EndpointTransport::WebSocketPreferred
@@ -1085,18 +1198,31 @@ impl AiClient {
                     ),
                 )
                 .await;
-                if let Ok(Ok(events)) = result {
-                    return Ok(responses_websocket_stream(
-                        model.clone(),
-                        events,
-                        fallback_request.pre_send_diagnostics.clone(),
-                        buffer_ambiguous_compatibility_content,
-                        diagnostic_redactor,
-                        self.http.clone(),
-                        Some(fallback_request),
-                        self.stream_idle_timeout,
-                        self.stream_deadline,
-                    ));
+                match result {
+                    Ok(Ok(events)) => {
+                        return Ok(responses_websocket_stream(
+                            model.clone(),
+                            events,
+                            fallback_request.pre_send_diagnostics.clone(),
+                            buffer_ambiguous_compatibility_content,
+                            diagnostic_redactor,
+                            self.stream_initial_timeout,
+                            self.stream_idle_timeout,
+                            self.stream_deadline,
+                        ));
+                    }
+                    Ok(Err(error)) if websocket_open_failure_is_replay_safe(&error) => {}
+                    Ok(Err(error)) => {
+                        return Err(sanitize_ai_error(&diagnostic_redactor, error));
+                    }
+                    Err(_) => {
+                        return Err(AiError::Transport(TransportError {
+                            phase: TransportPhase::ResponseHeaders,
+                            timeout: true,
+                            message: "Responses WebSocket request timed out before stream start"
+                                .to_owned(),
+                        }));
+                    }
                 }
             }
         }
@@ -1104,6 +1230,7 @@ impl AiClient {
         stream_http(
             self.http.clone(),
             fallback_request,
+            self.stream_initial_timeout,
             self.stream_idle_timeout,
             self.stream_deadline,
         )
@@ -1221,9 +1348,11 @@ impl AiClient {
             while body.len() < 4096 {
                 match next_body_chunk(
                     &mut body_stream,
-                    self.stream_idle_timeout,
+                    self.stream_idle_timeout.min(MAX_ERROR_BODY_IDLE_TIMEOUT),
+                    self.stream_idle_timeout.min(MAX_ERROR_BODY_IDLE_TIMEOUT),
+                    false,
                     started_at,
-                    self.stream_deadline,
+                    self.stream_deadline.min(MAX_ERROR_BODY_DEADLINE),
                     "compact HTTP error response body",
                 )
                 .await
@@ -1279,10 +1408,13 @@ impl AiClient {
                 .min(MAX_COMPLETED_BODY_BYTES as u64) as usize,
         );
         let mut body_stream = response.bytes_stream();
+        let mut first_body_chunk = true;
         let started_at = Instant::now();
         while let Some(chunk) = next_body_chunk(
             &mut body_stream,
             self.stream_idle_timeout,
+            self.stream_initial_timeout,
+            first_body_chunk,
             started_at,
             self.stream_deadline,
             "compact response body",
@@ -1290,6 +1422,7 @@ impl AiClient {
         .await
         .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?
         {
+            first_body_chunk = false;
             if body
                 .len()
                 .checked_add(chunk.len())

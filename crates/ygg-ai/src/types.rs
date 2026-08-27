@@ -134,7 +134,8 @@ pub struct Endpoint {
     pub default_headers: http::HeaderMap,
     /// Preferred response transport.
     pub transport: EndpointTransport,
-    /// Request timeout.
+    /// Maximum time to send a request and receive response headers. Streaming
+    /// body idle and overall deadlines are owned by [`crate::AiClient`].
     pub timeout: std::time::Duration,
 }
 

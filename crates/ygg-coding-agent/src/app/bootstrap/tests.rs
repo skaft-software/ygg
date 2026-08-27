@@ -24,7 +24,7 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
     assert_eq!(
         resolve_custom_startup_timeout(None, None).unwrap(),
-        Duration::from_secs(300)
+        Duration::from_secs(15 * 60)
     );
     assert_eq!(
         resolve_custom_startup_timeout(Some(420), None).unwrap(),
@@ -36,6 +36,18 @@ fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
     );
     assert!(resolve_custom_startup_timeout(None, Some("0")).is_err());
     assert!(resolve_custom_startup_timeout(None, Some("not-a-number")).is_err());
+}
+
+#[test]
+fn embedded_builtin_endpoints_use_provider_response_header_timeout() {
+    let catalog = base_model_catalog(true).unwrap();
+    for model_id in ["gpt-4o-mini", "claude-sonnet-4-6"] {
+        let model = catalog.resolve(&ModelId(model_id.to_owned())).unwrap();
+        assert_eq!(
+            model.endpoint.timeout, PROVIDER_RESPONSE_HEADER_TIMEOUT,
+            "{model_id} retained a stale embedded response-header timeout"
+        );
+    }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_clients_do_not_follow_authenticated_redirects() {
@@ -2478,4 +2490,47 @@ fn rebuild_prevalidates_native_replay_before_replacing_the_agent() {
             .contains("requires complete route-affine opaque replay"),
         "{error:#}"
     );
+}
+
+#[test]
+fn fork_launch_copies_the_source_head_and_records_provenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let session_root = directory.path().join("sessions");
+    let store = SessionStore::new(&session_root, directory.path());
+    std::fs::create_dir_all(store.dir()).unwrap();
+    let source = store.new_path("source");
+    let mut session = Session::create(&source).unwrap();
+    session
+        .append(EntryValue::Message(ygg_ai::Message::User(
+            ygg_ai::UserMessage {
+                content: vec![ygg_ai::UserPart::Text("source prompt".into())],
+            },
+        )))
+        .unwrap();
+    session
+        .append(EntryValue::Message(ygg_ai::Message::Assistant(
+            ygg_ai::AssistantMessage {
+                content: vec![ygg_ai::AssistantPart::Text("source answer".into())],
+                model: ModelId("test".into()),
+                protocol: Protocol::OpenAiChat,
+            },
+        )))
+        .unwrap();
+    let source_head = session.head().unwrap();
+    drop(session);
+
+    let destination = store.new_path("fork");
+    let path = fork_session_into(&store, &source, destination).unwrap();
+    let forked = Session::open_read_only(&path).unwrap();
+    assert_eq!(forked.head(), Some(source_head.clone()));
+    assert_eq!(forked.context().unwrap().len(), 2);
+    let destination_id = path.file_stem().unwrap().to_str().unwrap();
+    let metadata = store.load_metadata(destination_id).unwrap();
+    assert_eq!(
+        metadata.forked_from_session_id,
+        source
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    );
+    assert_eq!(metadata.forked_from_entry_id, Some(source_head.0));
 }

@@ -18,9 +18,9 @@ pub enum InputAction {
     SlashMenu(SlashMenuAction),
     CompletePath,
     ShowCompactionSummary,
-    /// Toggle verbose tool output (ctrl+o). While the subagent activity
-    /// strip is visible, toggles its expanded view (all children) instead.
-    ExpandFocusedTool,
+    /// Toggle the global transcript disclosure mode (ctrl+o) for reasoning,
+    /// summaries, retained tool output, and delegated-worker activity.
+    ToggleDisclosure,
     /// Cycle to the next thinking level supported by the active model.
     CycleThinking,
     Edit(EditAction),
@@ -290,7 +290,7 @@ pub fn translate_with_popup(
                         InputAction::Steer(editor_text.to_owned())
                     }
                 }
-                (_, KeyCode::Char('o'), KeyModifiers::CONTROL) => InputAction::ExpandFocusedTool,
+                (_, KeyCode::Char('o'), KeyModifiers::CONTROL) => InputAction::ToggleDisclosure,
                 (_, KeyCode::Backspace, modifiers)
                     if !modifiers.intersects(
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
@@ -790,11 +790,11 @@ mod tests {
         let ctrl_o = Some(key(KeyCode::Char('o'), KeyModifiers::CONTROL));
         assert_eq!(
             translate(ctrl_o.clone(), false, "draft prompt"),
-            InputAction::ExpandFocusedTool
+            InputAction::ToggleDisclosure
         );
         assert_eq!(
             translate(ctrl_o, true, "queued steering"),
-            InputAction::ExpandFocusedTool
+            InputAction::ToggleDisclosure
         );
     }
 

@@ -1,7 +1,9 @@
 #![allow(missing_docs)]
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -10,9 +12,13 @@ use ygg_agent::tool::{ToolConfirmation, ToolInputRequest};
 use ygg_ai::{ModelCatalog, ModelId};
 
 use crate::config::ThinkingLevel;
+use crate::modes::interactive::run_blocking_lifecycle;
 use crate::presentation::{format_token_rate_value, ModelDisplayMetadata};
-use crate::session_store::SessionMeta;
-use crate::tui::view::{InteractiveShell, Panel, PanelAction, PanelResult};
+use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
+use crate::tui::view::{
+    ForkMessage, InteractiveShell, MessagePicker, Panel, PanelAction, PanelRequest, PanelResult,
+    PickerState,
+};
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
 #[cfg(not(test))]
@@ -299,6 +305,7 @@ where
             return Ok(match result {
                 PanelResult::Confirm(index) => Some(index),
                 PanelResult::Cancel => None,
+                PanelResult::Select(_) => None,
             });
         }
         // Panel consumed the event; render updated state.
@@ -560,38 +567,304 @@ where
     }
 }
 
+/// Hide recoverably trashed sessions from resume/fork browsing.
+fn picker_rows(sessions: impl Iterator<Item = SessionMeta>) -> Vec<SessionMeta> {
+    sessions
+        .filter(|session| session.trashed_at_ms.is_none())
+        .collect()
+}
+
 /// Ask the user to select a stored session from a precomputed snapshot.
-/// Callers discover and summarize sessions off the raw-terminal input task.
 pub async fn session_picker(
     shell: &mut InteractiveShell,
     input: &mut EventStream,
     sessions: &[SessionMeta],
-    session_dir: &std::path::Path,
-) -> anyhow::Result<Option<std::path::PathBuf>> {
-    if sessions.is_empty() {
-        shell.error(format!("no sessions in {}", session_dir.display()));
+    store: &SessionStore,
+    current_session_path: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    let mut rows = picker_rows(sessions.iter().cloned());
+    if rows.is_empty() {
+        shell.error(format!("no sessions in {}", store.dir().display()));
         shell.render();
         return Ok(None);
     }
-    let items: Vec<String> = sessions.iter().map(|s| s.title.clone()).collect();
-    let descs: Vec<Option<String>> = sessions
-        .iter()
-        .map(|s| Some(format!("{}", s.path.display())))
-        .collect();
-    let Some(index) = pick_list(
-        shell,
-        input,
-        "Select session",
-        items,
-        descs,
-        0,
-        PanelAction::SelectSession(vec![]), // dummy — blocking path ignores this
-    )
-    .await?
-    else {
-        return Ok(None);
+
+    let current_session_path = current_session_path.map(Path::to_owned);
+    let mut all_rows = None;
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(rows.clone(), current_session_path),
+    });
+    shell.render();
+
+    loop {
+        let requests = shell.drain_panel_requests();
+        for request in requests {
+            match request {
+                PanelRequest::LoadAll => {
+                    let discovery_store = store.clone();
+                    let discovered = run_blocking_lifecycle(
+                        shell,
+                        input,
+                        "discovering sessions in all workspaces…",
+                        move || Ok(discovery_store.list_all()),
+                    )
+                    .await?;
+                    all_rows = Some(picker_rows(discovered.into_iter()));
+                    shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
+                    shell.render();
+                }
+                PanelRequest::TrashSession { path, .. } => {
+                    let Some(id) = session_id_from_path(&path) else {
+                        shell.set_picker_message(
+                            "Failed to trash session: path has no valid id",
+                            std::time::Duration::from_secs(3),
+                        );
+                        continue;
+                    };
+                    let target_store = store_for_session_path(store, &path);
+                    let changed_at_ms = unix_now_ms();
+                    let result = run_blocking_lifecycle(
+                        shell,
+                        input,
+                        "moving session to trash…",
+                        move || {
+                            target_store
+                                .set_lifecycle(&id, SessionStorageLifecycle::Trash, changed_at_ms)
+                                .map(|_| ())
+                        },
+                    )
+                    .await;
+                    match result {
+                        Ok(()) => {
+                            let (next_rows, next_all) =
+                                refresh_session_rows(shell, input, store, all_rows.is_some())
+                                    .await?;
+                            rows = next_rows;
+                            all_rows = next_all;
+                            shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
+                            shell.set_picker_message(
+                                "Session moved to trash",
+                                std::time::Duration::from_secs(2),
+                            );
+                        }
+                        Err(error) => shell.set_picker_message(
+                            format!("Failed to trash session: {error}"),
+                            std::time::Duration::from_secs(3),
+                        ),
+                    }
+                    shell.render();
+                }
+                PanelRequest::RenameSession { path, name, .. } => {
+                    let Some(id) = session_id_from_path(&path) else {
+                        shell.set_picker_message(
+                            "Failed to rename session: path has no valid id",
+                            std::time::Duration::from_secs(3),
+                        );
+                        continue;
+                    };
+                    let target_store = store_for_session_path(store, &path);
+                    let result =
+                        run_blocking_lifecycle(shell, input, "renaming session…", move || {
+                            target_store.rename(&id, &name).map(|_| ())
+                        })
+                        .await;
+                    match result {
+                        Ok(()) => {
+                            let (next_rows, next_all) =
+                                refresh_session_rows(shell, input, store, all_rows.is_some())
+                                    .await?;
+                            rows = next_rows;
+                            all_rows = next_all;
+                            shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
+                            shell.set_picker_message(
+                                "Session renamed",
+                                std::time::Duration::from_secs(2),
+                            );
+                        }
+                        Err(error) => shell.set_picker_message(
+                            format!("Failed to rename session: {error}"),
+                            std::time::Duration::from_secs(3),
+                        ),
+                    }
+                    shell.render();
+                }
+            }
+        }
+
+        if shell.close_requested() {
+            shell.close_panel();
+            return Ok(None);
+        }
+        let next = tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                shell.close_panel();
+                return Ok(None);
+            }
+            next = input.next() => next,
+        };
+        let event = match next {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                shell.close_panel();
+                return Err(error.into());
+            }
+            None => {
+                shell.close_panel();
+                shell.request_close();
+                return Ok(None);
+            }
+        };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.close_panel();
+            shell.request_close();
+            shell.render();
+            return Ok(None);
+        }
+        if matches!(event, Event::Mouse(_)) {
+            continue;
+        }
+        if let Some((result, _action)) = shell.panel_input(&event) {
+            shell.render();
+            match result {
+                PanelResult::Cancel => return Ok(None),
+                PanelResult::Select(_) => {
+                    let Some((id, path)) = shell.take_picker_selection() else {
+                        return Ok(None);
+                    };
+                    if !selection_is_in_current_workspace(store, &rows, &all_rows, &id, &path) {
+                        shell.notice_error("cannot resume a session from another workspace");
+                        shell.render();
+                        return Ok(None);
+                    }
+                    return Ok(Some(path));
+                }
+                PanelResult::Confirm(_) => {}
+            }
+        }
+        shell.render();
+    }
+}
+
+fn session_id_from_path(path: &Path) -> Option<String> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn store_for_session_path(base: &SessionStore, path: &Path) -> SessionStore {
+    let Some(directory) = path.parent() else {
+        return base.clone();
     };
-    Ok(Some(sessions[index].path.clone()))
+    if directory == base.dir() {
+        base.clone()
+    } else {
+        SessionStore::for_directory(directory, base.root())
+    }
+}
+
+fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+async fn refresh_session_rows(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    store: &SessionStore,
+    include_all: bool,
+) -> anyhow::Result<(Vec<SessionMeta>, Option<Vec<SessionMeta>>)> {
+    let store = store.clone();
+    run_blocking_lifecycle(shell, input, "refreshing sessions…", move || {
+        let rows = picker_rows(store.list().into_iter());
+        let all = include_all.then(|| picker_rows(store.list_all().into_iter()));
+        Ok((rows, all))
+    })
+    .await
+}
+
+fn selection_is_in_current_workspace(
+    store: &SessionStore,
+    rows: &[SessionMeta],
+    all_rows: &Option<Vec<SessionMeta>>,
+    id: &str,
+    path: &Path,
+) -> bool {
+    let meta = rows
+        .iter()
+        .chain(all_rows.as_deref().unwrap_or(&[]).iter())
+        .find(|meta| meta.id == id && meta.path == path);
+    match meta.and_then(|meta| meta.workspace.as_deref()) {
+        Some(workspace) => store.workspace() == Some(workspace),
+        None => path.parent() == Some(store.dir()),
+    }
+}
+
+/// Ask the user to choose a message boundary for `/fork`.
+pub async fn message_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    messages: Vec<ForkMessage>,
+) -> anyhow::Result<Option<(String, String)>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    shell.open_panel(Panel::MessagePicker {
+        picker: MessagePicker::new(messages),
+    });
+    shell.render();
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = crate::tui::terminal::wait_for_shutdown_signal() => {
+                shell.close_panel();
+                return Ok(None);
+            }
+            next = input.next() => next,
+        };
+        let event = match next {
+            Some(Ok(event)) => event,
+            Some(Err(error)) => {
+                shell.close_panel();
+                return Err(error.into());
+            }
+            None => {
+                shell.close_panel();
+                shell.request_close();
+                return Ok(None);
+            }
+        };
+        if matches!(&event, Event::Key(key) if crate::tui::keymap::is_close_key(key)) {
+            shell.close_panel();
+            shell.request_close();
+            shell.render();
+            return Ok(None);
+        }
+        if matches!(event, Event::Mouse(_)) {
+            continue;
+        }
+        if shell.close_requested() {
+            shell.close_panel();
+            return Ok(None);
+        }
+        if let Some((result, _action)) = shell.panel_input(&event) {
+            shell.render();
+            match result {
+                PanelResult::Cancel => return Ok(None),
+                PanelResult::Select(_) => return Ok(shell.take_message_picker_selection()),
+                PanelResult::Confirm(_) => {}
+            }
+        }
+        shell.render();
+    }
 }
 
 /// Ask the user to select an installed theme name.
@@ -646,7 +919,7 @@ pub async fn thinking_picker(
     Ok(Some(selected))
 }
 
-/// Ask the user to approve a typed extension/tool request. Escape and input
+/// Ask the user to approve a typed tool request. Escape and input
 /// closure are denials; approval is never inferred from a missing frontend.
 pub async fn confirmation_picker<S>(
     shell: &mut InteractiveShell,
@@ -720,7 +993,7 @@ where
         items,
         descriptions,
         0,
-        PanelAction::ExtensionConfirmation,
+        PanelAction::Confirmation,
     )
     .await?;
     Ok(selected.map(|index| decisions[index]).unwrap_or(false))
@@ -876,6 +1149,49 @@ mod tests {
         assert_eq!(selected, None);
         assert!(!shell.has_panel());
         assert!(shell.close_requested());
+    }
+
+    #[tokio::test]
+    async fn message_picker_driver_returns_the_selected_message() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Up,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        sender
+            .send(Ok(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            ))))
+            .await
+            .unwrap();
+        drop(sender);
+        let mut input = ReceiverStream::new(receiver);
+        let mut shell = InteractiveShell::test_shell();
+        let selected = message_picker(
+            &mut shell,
+            &mut input,
+            vec![
+                ForkMessage {
+                    entry_id: "entry-a".into(),
+                    text: "first".into(),
+                    whole_conversation: false,
+                },
+                ForkMessage {
+                    entry_id: "entry-b".into(),
+                    text: "second".into(),
+                    whole_conversation: false,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(selected, Some(("entry-a".into(), "first".into())));
+        assert!(!shell.has_panel());
     }
 
     struct LivePickerRefresh {

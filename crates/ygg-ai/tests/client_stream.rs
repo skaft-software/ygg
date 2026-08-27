@@ -408,6 +408,10 @@ async fn handle_test_responses_connection(
     if !request_head.contains("upgrade: websocket") {
         let mut request = [0_u8; 16 * 1024];
         let _ = stream.read(&mut request).await?;
+        requests
+            .lock()
+            .await
+            .push(serde_json::json!({"transport": "http"}));
         let response = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
             fallback_body.len(), fallback_body
@@ -586,10 +590,14 @@ async fn responses_websocket_handshake_failure_falls_back_to_http_sse() {
         }
     }
     assert_eq!(deltas, vec!["http"]);
+    assert_eq!(
+        server.requests().await,
+        vec![serde_json::json!({"transport": "http"})]
+    );
 }
 
 #[tokio::test]
-async fn responses_websocket_failure_before_output_falls_back_to_http_sse() {
+async fn responses_websocket_failure_after_send_is_terminal() {
     let server = TestResponsesServer::start(
         WebSocketBehavior::CloseBeforeEvents,
         fallback_responses_body(),
@@ -603,17 +611,24 @@ async fn responses_websocket_failure_before_output_falls_back_to_http_sse() {
         )
         .await
         .unwrap();
-    let mut deltas = Vec::new();
-    while let Some(event) = stream.next().await {
-        if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
-            deltas.push(delta);
-        }
-    }
-    assert_eq!(deltas, vec!["http"]);
+    let error = stream
+        .next()
+        .await
+        .expect("post-send socket failure must be surfaced")
+        .expect_err("post-send socket failure must not replay over HTTP");
+    assert!(matches!(
+        error,
+        AiError::Transport(ref transport)
+            if transport.phase == ygg_ai::TransportPhase::Body && !transport.timeout
+    ));
+    assert!(stream.next().await.is_none());
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("transport").is_none());
 }
 
 #[tokio::test]
-async fn responses_websocket_idle_timeout_falls_back_to_http_sse() {
+async fn responses_websocket_idle_timeout_after_send_is_terminal() {
     let server =
         TestResponsesServer::start(WebSocketBehavior::Stall, fallback_responses_body()).await;
     let model = websocket_test_model(&server.base_url);
@@ -625,13 +640,20 @@ async fn responses_websocket_idle_timeout_falls_back_to_http_sse() {
         )
         .await
         .unwrap();
-    let mut deltas = Vec::new();
-    while let Some(event) = stream.next().await {
-        if let StreamEvent::TextDelta { delta, .. } = event.unwrap() {
-            deltas.push(delta);
-        }
-    }
-    assert_eq!(deltas, vec!["http"]);
+    let error = stream
+        .next()
+        .await
+        .expect("post-send idle timeout must be surfaced")
+        .expect_err("post-send idle timeout must not replay over HTTP");
+    assert!(matches!(
+        error,
+        AiError::Transport(ref transport)
+            if transport.phase == ygg_ai::TransportPhase::Body && transport.timeout
+    ));
+    assert!(stream.next().await.is_none());
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].get("transport").is_none());
 }
 
 #[tokio::test]
@@ -682,6 +704,16 @@ async fn test_client_stream_http_error_handling() {
         assert_eq!(http_err.request_id, Some("req-abc-123".to_string()));
     } else {
         panic!("Expected HttpError");
+    }
+}
+
+/// The mid-stream annotation is an implementation detail: tests assert on
+/// the failure that actually ended the stream, so the wrapper is peeled off
+/// before matching.
+fn stream_inner<'a>(error: &'a AiError) -> &'a AiError {
+    match error {
+        AiError::StreamFailure { inner, .. } => inner,
+        other => other,
     }
 }
 
@@ -768,7 +800,7 @@ async fn successful_provider_error_diagnostics_redact_credentials_and_controls()
         .await
         .expect("provider error event")
         .expect_err("JSON error envelope must fail");
-    let AiError::Provider(provider) = &error else {
+    let AiError::Provider(provider) = stream_inner(&error) else {
         panic!("expected provider error, got {error:?}");
     };
     assert_eq!(
@@ -897,6 +929,103 @@ async fn completed_response_body_obeys_idle_timeout() {
 }
 
 #[tokio::test]
+async fn initial_response_body_timeout_is_separate_from_inter_chunk_idle_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let body = concat!(
+        "data: {\"id\":\"chatcmpl-initial\",\"choices\":[{\"delta\":{\"content\":\"ready\"}}]}\n\n",
+        "data: {\"id\":\"chatcmpl-initial\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        socket.write_all(body.as_bytes()).await.unwrap();
+    });
+
+    let model = make_test_model(&uri, Protocol::OpenAiChat, false);
+    let client = AiClient::new()
+        .with_stream_timeouts(Duration::from_millis(30), Duration::from_secs(1))
+        .with_initial_stream_timeout(Duration::from_millis(200));
+    let mut stream = client
+        .stream(&model, text_request())
+        .await
+        .expect("initial response-body allowance should cover prompt processing");
+    let mut saw_finished = false;
+    while let Some(event) = stream.next().await {
+        saw_finished |= matches!(event.unwrap(), StreamEvent::Finished(_));
+    }
+    assert!(saw_finished);
+}
+
+#[tokio::test]
+async fn inter_chunk_idle_timeout_applies_after_a_delayed_first_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let first =
+        "data: {\"id\":\"chatcmpl-initial\",\"choices\":[{\"delta\":{\"content\":\"ready\"}}]}\n\n";
+    let rest = concat!(
+        "data: {\"id\":\"chatcmpl-initial\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n",
+        first.len() + rest.len()
+    );
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = vec![0; 8192];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        socket.write_all(first.as_bytes()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let _ = socket.write_all(rest.as_bytes()).await;
+    });
+
+    let model = make_test_model(&uri, Protocol::OpenAiChat, false);
+    let client = AiClient::new()
+        .with_stream_timeouts(Duration::from_millis(30), Duration::from_secs(1))
+        .with_initial_stream_timeout(Duration::from_millis(200));
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut saw_ready = false;
+    let mut saw_idle_timeout = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta { delta, .. }) if delta == "ready" => saw_ready = true,
+            Err(error)
+                if matches!(
+                    stream_inner(&error),
+                    AiError::Transport(transport)
+                        if transport.phase == ygg_ai::TransportPhase::Body
+                            && transport.timeout
+                ) =>
+            {
+                saw_idle_timeout = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => panic!("unexpected stream error: {error}"),
+        }
+    }
+    assert!(saw_ready, "the longer initial allowance was not applied");
+    assert!(
+        saw_idle_timeout,
+        "the shorter inter-chunk idle timeout was not applied"
+    );
+}
+
+#[tokio::test]
 async fn error_response_body_obeys_idle_timeout_but_preserves_status() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -917,8 +1046,9 @@ async fn error_response_body_obeys_idle_timeout_but_preserves_status() {
     });
 
     let model = make_test_model(&uri, Protocol::OpenAiChat, false);
-    let client =
-        AiClient::new().with_stream_timeouts(Duration::from_millis(30), Duration::from_millis(200));
+    let client = AiClient::new()
+        .with_stream_timeouts(Duration::from_millis(30), Duration::from_millis(200))
+        .with_initial_stream_timeout(Duration::from_secs(1));
     let started = std::time::Instant::now();
     let error = match client.stream(&model, text_request()).await {
         Err(error) => error,
@@ -959,7 +1089,7 @@ async fn successful_status_json_error_is_not_misreported_as_missing_sse_finish()
         .expect("provider error event")
         .expect_err("JSON error envelope must fail");
     assert!(matches!(
-        error,
+        stream_inner(&error),
         AiError::Provider(ref provider)
             if provider.code.as_deref() == Some("400")
                 && provider.kind.as_deref() == Some("Bad Request")

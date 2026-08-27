@@ -31,7 +31,8 @@ pub use rich_text::render::{
     UnorderedListMarker,
 };
 pub use rich_text::stream::{
-    StreamingMarkdown, StreamingRenderCache, StreamingStats, MAX_UNSTABLE_PARSE_BYTES,
+    StreamingLineUpdate, StreamingMarkdown, StreamingRenderCache, StreamingStats,
+    MAX_UNSTABLE_PARSE_BYTES,
 };
 pub use rich_text::{
     Block, CodeBlock, DetailBlock, Document, Inline, List, ListItem, ListKind, StatusKind,

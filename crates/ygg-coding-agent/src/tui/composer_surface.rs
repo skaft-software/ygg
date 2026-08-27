@@ -133,21 +133,14 @@ fn render_composer_box(
     let focused =
         state.panel.is_none() && (!state.editor.is_empty() || state.tool_input_prompt.is_some());
     let compacting = state.run_label == "compacting";
-    let border_rgb = if chrome == ComposerChrome::Framed {
-        // Framed chrome keeps the theme's fixed border colour; the frame is
-        // part of the theme's identity, not a model/activity indicator.
+    let border_rgb =
         theme
             .role_rgb("composer_border")
             .unwrap_or(if focused || run_active || compacting {
                 accent
             } else {
                 idle_border
-            })
-    } else if focused || run_active || compacting {
-        accent
-    } else {
-        idle_border
-    };
+            });
     let shaded_bg = (chrome == ComposerChrome::Shaded)
         .then(|| theme.role_rgb("composer_bg"))
         .flatten();
@@ -738,14 +731,20 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, now: Instan
     let context_is_urgent = displayed_context
         .is_some_and(|(used, limit)| limit > 0 && used as f64 * 100.0 / limit as f64 >= 90.0);
     let style_segment = |segment: &FooterSegment| match segment.kind {
-        FooterKind::Identity => state.theme.model_fg(
-            if active {
-                state.run_model_lab
+        FooterKind::Identity => {
+            if state.theme.resolve::<String>("footer_identity").is_some() {
+                state.theme.fg("footer_identity", segment.text())
             } else {
-                state.model_lab
-            },
-            segment.text(),
-        ),
+                state.theme.model_fg(
+                    if active {
+                        state.run_model_lab
+                    } else {
+                        state.model_lab
+                    },
+                    segment.text(),
+                )
+            }
+        }
         FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.text()),
         FooterKind::Cost
             if state

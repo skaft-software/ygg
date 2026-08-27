@@ -55,10 +55,17 @@ fn allocation_stats() -> AllocationStats {
     }
 }
 
+#[derive(Clone, Copy)]
+enum StreamRenderMode {
+    Document,
+    Lines,
+    TailUpdate,
+}
+
 fn run_stream(
     source: &str,
     renderer: &RichRenderer,
-    lines_only: bool,
+    mode: StreamRenderMode,
 ) -> (Duration, AllocationStats, sexy_tui_rs::StreamingStats) {
     let mut stream = StreamingMarkdown::new();
     let mut cache = StreamingRenderCache::default();
@@ -66,18 +73,30 @@ fn run_stream(
     let start = Instant::now();
     for chunk in source.as_bytes().chunks(7) {
         stream.push_bytes(chunk);
-        if lines_only {
-            black_box(cache.render_lines(&stream, renderer, 80, true));
-        } else {
-            black_box(cache.render(&stream, renderer, 80));
-        }
+        match mode {
+            StreamRenderMode::Document => {
+                black_box(cache.render(&stream, renderer, 80));
+            }
+            StreamRenderMode::Lines => {
+                black_box(cache.render_lines(&stream, renderer, 80, true));
+            }
+            StreamRenderMode::TailUpdate => {
+                black_box(cache.render_line_update(&stream, renderer, 80, true));
+            }
+        };
     }
     stream.finish();
-    if lines_only {
-        black_box(cache.render_lines(&stream, renderer, 80, true));
-    } else {
-        black_box(cache.render(&stream, renderer, 80));
-    }
+    match mode {
+        StreamRenderMode::Document => {
+            black_box(cache.render(&stream, renderer, 80));
+        }
+        StreamRenderMode::Lines => {
+            black_box(cache.render_lines(&stream, renderer, 80, true));
+        }
+        StreamRenderMode::TailUpdate => {
+            black_box(cache.render_line_update(&stream, renderer, 80, true));
+        }
+    };
     let elapsed = start.elapsed();
     let stats = allocation_stats();
     (elapsed, stats, stream.stats())
@@ -129,11 +148,14 @@ fn main() {
     // Run both APIs against the same tokenization workload. The legacy path
     // remains here as a regression baseline for the lines-only hot path.
     let (legacy_stream_elapsed, legacy_allocations, stats) =
-        run_stream(&stream_source, &renderer, false);
+        run_stream(&stream_source, &renderer, StreamRenderMode::Document);
     let (stream_elapsed, stream_allocations, selected_stats) =
-        run_stream(&stream_source, &renderer, true);
+        run_stream(&stream_source, &renderer, StreamRenderMode::Lines);
+    let (tail_elapsed, tail_allocations, tail_stats) =
+        run_stream(&stream_source, &renderer, StreamRenderMode::TailUpdate);
 
     assert_eq!(stats, selected_stats);
+    assert_eq!(stats, tail_stats);
 
     // Exercise syntax-cache misses and hits when that feature is enabled.
     let syntax_capabilities = TerminalCapabilities::interactive(ColorDepth::TrueColor, true);
@@ -160,6 +182,10 @@ fn main() {
     println!(
         "7-byte streaming + lines-only layout: {stream_elapsed:?} ({} allocs, {} bytes requested)",
         stream_allocations.allocations, stream_allocations.bytes
+    );
+    println!(
+        "7-byte streaming + stable-tail updates: {tail_elapsed:?} ({} allocs, {} bytes requested)",
+        tail_allocations.allocations, tail_allocations.bytes
     );
     println!(
         "stream parse passes={}, reparsed={} bytes; syntax hits={}, misses={}, cache={} bytes",

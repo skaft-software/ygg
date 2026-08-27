@@ -18,7 +18,13 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Fixed documentation drift: subagent worker tool-scope and limit wording in
   `README.md`, `docs/extensions.md`, and `docs/design/ygg-agent.md`, plus the
   supported-fixes target in `SECURITY.md`.
-
+- Added a zero-token `ygg migrate pi --dry-run` inventory that resolves bounded
+  Pi user/project packages and resources, hashes source and lock inputs, parses
+  JavaScript/TypeScript API use without executing package code, and emits human
+  or schema-versioned JSON compatibility classifications.
+- Added `ygg pi install`/`list` and the persistent `ygg-pi-compat` subprocess for
+  explicitly trusted local Pi tools, commands, lifecycle, notification, input,
+  and confirmation compatibility.
 ## 0.6.0 — 2026-08-23
 
 ### Added

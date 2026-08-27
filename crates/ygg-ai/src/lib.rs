@@ -56,8 +56,8 @@ pub use catalog::{AuthConfig, CatalogConfig, EndpointConfig, Model, ModelCatalog
 pub use client::AiClient;
 pub use error::{
     AiError, AuthError, ConfigError, DecodeError, Diagnostic, HttpError, PricingError,
-    ProviderError, StreamProtocolError, TransportError, TransportPhase, UnsupportedError,
-    ValidationError,
+    ProviderError, StreamProgress, StreamProtocolError, TransportError, TransportPhase,
+    UnsupportedError, ValidationError,
 };
 pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};

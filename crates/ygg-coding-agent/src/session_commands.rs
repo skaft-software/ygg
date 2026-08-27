@@ -818,7 +818,9 @@ mod tests {
             purge_after_ms: None,
             forked_from_session_id: None,
             forked_from_entry_id: None,
+            message_count: 0,
             modified: now,
+            workspace: None,
         };
 
         let row = format_list_row(&session, now, true);
@@ -845,7 +847,9 @@ mod tests {
             purge_after_ms: None,
             forked_from_session_id: None,
             forked_from_entry_id: None,
+            message_count: 0,
             modified: now,
+            workspace: None,
         };
 
         let row = format_list_row(&session, now, false);
@@ -1450,7 +1454,9 @@ mod tests {
             purge_after_ms: None,
             forked_from_session_id: None,
             forked_from_entry_id: None,
+            message_count: 0,
             modified: UNIX_EPOCH,
+            workspace: None,
         };
         for query in ["compiler", "local-model", "2026-07", "project"] {
             assert!(matches_query(&session, Some(query)));

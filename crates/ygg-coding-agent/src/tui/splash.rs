@@ -31,6 +31,7 @@ pub(crate) fn render_logo(
     symbol_rows: usize,
     elapsed: f32,
     model_accent: Option<(u8, u8, u8)>,
+    solid_color: Option<(u8, u8, u8)>,
 ) -> Vec<String> {
     if width == 0 || symbol_rows == 0 {
         return Vec::new();
@@ -74,7 +75,7 @@ pub(crate) fn render_logo(
         let sx = (sub_width as f32 * 0.5 + x * sub_width as f32 * 0.43).round() as i32;
         let sy = (sub_height as f32 * 0.49 + y * sub_height as f32 * 0.47).round() as i32;
         let radius = ((dot.size / 3.0) * local_scale * (1.0 + ripple * 0.10)).max(0.48);
-        let color = gradient(vertical, ripple * 0.20, model_accent);
+        let color = gradient(vertical, ripple * 0.20, model_accent, solid_color);
         let extent = radius.ceil() as i32;
 
         for py in (sy - extent)..=(sy + extent) {
@@ -195,7 +196,15 @@ fn braille_bit(x: usize, y: usize) -> u8 {
     }
 }
 
-fn gradient(position: f32, lift: f32, model_accent: Option<(u8, u8, u8)>) -> Rgb {
+fn gradient(
+    position: f32,
+    lift: f32,
+    model_accent: Option<(u8, u8, u8)>,
+    solid_color: Option<(u8, u8, u8)>,
+) -> Rgb {
+    if let Some((red, green, blue)) = solid_color {
+        return Rgb(red, green, blue);
+    }
     let stops = [
         Rgb(0x4b, 0x8d, 0xff),
         Rgb(0x45, 0xd9, 0xe8),

@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use ygg_ai::{
     AiClient, AiError, AssistantMessage, AssistantPart, AudioPayload, CacheRetention,
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
@@ -205,8 +205,63 @@ fn public_ai_error_diagnostic(error: &AiError, endpoint: &str, model: &str) -> S
             truncate_public_diagnostic(&mut diagnostic);
             diagnostic
         }
-        _ => context(ai_error_phase(error)),
+        // A mid-stream failure is annotated with the wire progress that
+        // distinguishes "died after 400 frames" from "never started": raw
+        // provider frames, decoded events, retained content bytes, and
+        // elapsed time. The inner diagnostic is first bounded to leave room
+        // for this compact field, so a verbose inner detail can never push
+        // the progress out of the truncation window.
+        AiError::StreamFailure { inner, progress } => {
+            let progress = format_stream_progress(progress);
+            let mut diagnostic = public_ai_error_diagnostic(inner, endpoint, model);
+            let budget = MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES
+                .saturating_sub(progress.len())
+                .saturating_sub("stream_progress=".len() + 1);
+            truncate_public_diagnostic_to(&mut diagnostic, budget);
+            append_provider_field(&mut diagnostic, "stream_progress", Some(&progress));
+            truncate_public_diagnostic(&mut diagnostic);
+            diagnostic
+        }
+        // The remaining variants previously surfaced as a bare phase label
+        // with their message discarded. Their text is already
+        // credential-redacted at the request boundary, so a bounded
+        // `detail` field is safe to show.
+        AiError::Config(error) => detail_diagnostic(&context("request preparation"), error),
+        AiError::Auth(error) => detail_diagnostic(&context("authentication"), error),
+        AiError::Validation(error) => detail_diagnostic(&context("request preparation"), error),
+        AiError::Unsupported(error) => detail_diagnostic(&context("request preparation"), error),
+        AiError::Decode(error) => detail_diagnostic(&context("response decoding"), error),
+        AiError::Pricing(error) => detail_diagnostic(&context("usage accounting"), error),
+        AiError::StreamProtocol(error) => detail_diagnostic(&context("stream protocol"), error),
+        AiError::Canceled => context("request cancellation"),
     }
+}
+
+/// One-line enrichment for an error variant: the phase context plus the
+/// (already credential-redacted) error text as a bounded `detail` field.
+fn detail_diagnostic(prefix: &str, error: &impl std::fmt::Display) -> String {
+    let mut diagnostic = prefix.to_string();
+    append_provider_field(&mut diagnostic, "detail", Some(&error.to_string()));
+    truncate_public_diagnostic(&mut diagnostic);
+    diagnostic
+}
+
+/// Compact, greppable rendering of mid-stream progress counters.
+fn format_stream_progress(progress: &ygg_ai::StreamProgress) -> String {
+    let first_byte = if progress.first_body_seen {
+        "seen"
+    } else {
+        "none"
+    };
+    format!(
+        "frames={} events={} content={}B buffered={}B first_byte={} elapsed={}ms",
+        progress.provider_events,
+        progress.decoded_events,
+        progress.content_bytes,
+        progress.buffered_bytes,
+        first_byte,
+        progress.elapsed_ms,
+    )
 }
 
 const MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES: usize = 2 * 1024;
@@ -325,10 +380,14 @@ fn redact_common_secret_patterns(value: &str) -> String {
 }
 
 fn truncate_public_diagnostic(diagnostic: &mut String) {
-    if diagnostic.len() <= MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES {
+    truncate_public_diagnostic_to(diagnostic, MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES)
+}
+
+fn truncate_public_diagnostic_to(diagnostic: &mut String, budget: usize) {
+    if diagnostic.len() <= budget {
         return;
     }
-    let mut end = MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES - '…'.len_utf8();
+    let mut end = budget.saturating_sub('…'.len_utf8());
     while end > 0 && !diagnostic.is_char_boundary(end) {
         end -= 1;
     }
@@ -393,6 +452,10 @@ fn ai_error_phase(error: &AiError) -> &'static str {
         AiError::Decode(_) => "response decoding",
         AiError::Pricing(_) => "usage accounting",
         AiError::StreamProtocol(_) => "stream protocol",
+        // A mid-stream wrapper reports the phase of the failure that
+        // actually ended the stream, so the UI shows e.g. "response
+        // decoding", not an uninformative wrapper label.
+        AiError::StreamFailure { inner, .. } => ai_error_phase(inner),
         AiError::Canceled => "request cancellation",
     }
 }
@@ -1801,6 +1864,10 @@ fn close_failed_turn(session: &mut Session, model: &Model) -> Result<(), AgentEr
 }
 
 fn retryable_before_generation(error: &AiError) -> bool {
+    // A wrapper is replayable before generation only if its inner failure is.
+    if let AiError::StreamFailure { inner, .. } = error {
+        return retryable_before_generation(inner);
+    }
     match error {
         AiError::Http(error) => error.is_safe_to_retry(),
         AiError::Transport(error) => {
@@ -1811,6 +1878,12 @@ fn retryable_before_generation(error: &AiError) -> bool {
 }
 
 fn is_replayable_network_failure(error: &AiError) -> bool {
+    // A mid-stream wrapper keeps the replayability of the failure that ended
+    // the stream (e.g. a body disconnect that already streamed bytes is
+    // replayable exactly as the bare transport error was).
+    if let AiError::StreamFailure { inner, .. } = error {
+        return is_replayable_network_failure(inner);
+    }
     matches!(
         error,
         AiError::Transport(transport)
@@ -1823,6 +1896,13 @@ fn is_replayable_network_failure(error: &AiError) -> bool {
 }
 
 fn looks_like_context_error(error: &AiError) -> bool {
+    // A mid-stream wrapper delegates classification to the failure that
+    // actually ended the stream: a provider context-error frame inside a 2xx
+    // stream must still be detected, while a wrapped transport timeout must
+    // still never be mistaken for context overflow.
+    if let AiError::StreamFailure { inner, .. } = error {
+        return looks_like_context_error(inner);
+    }
     // Transport timeouts often contain phrases such as "context deadline
     // exceeded". They are connectivity failures, not evidence that model
     // history is too large, and must never destroy full-fidelity context.
@@ -1916,9 +1996,21 @@ fn retryable_stream_start(error: &AiError) -> bool {
                     | ygg_ai::StreamProtocolError::PrematureEof
             )
         )
+        // The clauses above are variant-specific; a mid-stream wrapper
+        // delegates so that e.g. a stream ending without a terminal event is
+        // retried exactly as the bare protocol error was.
+        || matches!(
+            error,
+            AiError::StreamFailure { inner, .. } if retryable_stream_start(inner)
+        )
 }
 
 fn provider_retry_limit(error: &AiError) -> usize {
+    // A mid-stream wrapper inherits the retry budget of the failure that
+    // ended the stream, so introducing the wrapper changes no retry behavior.
+    if let AiError::StreamFailure { inner, .. } = error {
+        return provider_retry_limit(inner);
+    }
     if matches!(
         error,
         AiError::Transport(transport)
@@ -2686,6 +2778,13 @@ impl ContextObservation<'_> {
     fn observe(&self, session: &Session) -> Result<ContextBreakdown, SessionError> {
         observe_context_tracker(self.tracker, session, self.model, self.system, self.tools)
     }
+}
+
+async fn next_delegation_snapshot(
+    receiver: &mut watch::Receiver<Option<DelegationTelemetrySnapshot>>,
+) -> Option<DelegationTelemetrySnapshot> {
+    receiver.changed().await.ok()?;
+    receiver.borrow_and_update().clone()
 }
 
 /// Result of applying one drained tool-progress item to the run.
@@ -4837,7 +4936,7 @@ impl Agent {
                         c = control_rx.recv(), if control_open => Next::Ctl(c),
                         snapshot = async {
                             match &mut delegation_telemetry {
-                                Some(receiver) => receiver.recv().await,
+                                Some(receiver) => next_delegation_snapshot(receiver).await,
                                 None => std::future::pending().await,
                             }
                         }, if delegation_telemetry.is_some() => Next::Delegation(snapshot),
@@ -5669,7 +5768,7 @@ impl Agent {
                                         },
                                         snapshot = async {
                                             match &mut delegation_telemetry {
-                                                Some(receiver) => receiver.recv().await,
+                                                Some(receiver) => next_delegation_snapshot(receiver).await,
                                                 None => std::future::pending().await,
                                             }
                                         }, if delegation_telemetry.is_some() => {
@@ -5882,10 +5981,13 @@ impl Agent {
                     }
                 }
                 if let Some(receiver) = delegation_telemetry.as_mut() {
-                    while let Ok(snapshot) = receiver.try_recv() {
-                        let event = AgentEvent::DelegationUpdated { snapshot };
-                        notify_observers(&observers, &event);
-                        yield event;
+                    if receiver.has_changed().unwrap_or(false) {
+                        let snapshot = { receiver.borrow_and_update().clone() };
+                        if let Some(snapshot) = snapshot {
+                            let event = AgentEvent::DelegationUpdated { snapshot };
+                            notify_observers(&observers, &event);
+                            yield event;
+                        }
                     }
                 }
                 delegation.detach_telemetry();
@@ -6378,6 +6480,175 @@ mod tests {
         assert!(!retryable_before_generation(&error));
         assert!(!retryable_stream_start(&error));
         assert_eq!(provider_retry_limit(&error), 0);
+    }
+
+    #[test]
+    fn stream_failure_delegates_classification_to_inner_failure() {
+        let progress = ygg_ai::StreamProgress {
+            provider_events: 412,
+            decoded_events: 38,
+            content_bytes: 18_204,
+            buffered_bytes: 96,
+            first_body_seen: true,
+            elapsed_ms: 97_321,
+        };
+
+        // A body-phase disconnect that already streamed bytes: replayable
+        // network failure, exactly as the bare transport error was.
+        let disconnect = AiError::StreamFailure {
+            inner: Box::new(AiError::Transport(ygg_ai::TransportError {
+                phase: ygg_ai::TransportPhase::Body,
+                timeout: false,
+                message: "connection reset by peer".into(),
+            })),
+            progress,
+        };
+        assert_eq!(ai_error_phase(&disconnect), "response body");
+        assert!(!retryable_before_generation(&disconnect));
+        assert!(retryable_stream_start(&disconnect));
+        assert!(is_replayable_network_failure(&disconnect));
+        assert!(!looks_like_context_error(&disconnect));
+        assert_eq!(provider_retry_limit(&disconnect), MAX_NETWORK_RETRIES);
+
+        // A stream that ended on a provider 503 frame keeps that frame's
+        // retry budget instead of being demoted to the wrapper's behavior.
+        let server_error = AiError::StreamFailure {
+            inner: Box::new(AiError::Provider(ygg_ai::ProviderError {
+                code: Some("503".into()),
+                kind: Some("server_error".into()),
+                message: "temporarily unavailable".into(),
+                request_id: None,
+            })),
+            progress,
+        };
+        assert_eq!(
+            ai_error_phase(&server_error),
+            "response body (provider error)"
+        );
+        assert!(retryable_stream_start(&server_error));
+        assert!(!is_replayable_network_failure(&server_error));
+        assert_eq!(provider_retry_limit(&server_error), MAX_PROVIDER_RETRIES);
+
+        // A transport timeout with a context-flavoured message must still
+        // never be classified as context overflow, wrapped or bare.
+        let deadline = AiError::StreamFailure {
+            inner: Box::new(AiError::Transport(ygg_ai::TransportError {
+                phase: ygg_ai::TransportPhase::Body,
+                timeout: true,
+                message: "context deadline exceeded".into(),
+            })),
+            progress,
+        };
+        assert!(!looks_like_context_error(&deadline));
+        assert!(!retryable_stream_start(&deadline));
+        assert_eq!(provider_retry_limit(&deadline), 0);
+
+        // And a provider context-error frame inside a 2xx stream must still
+        // be detected through the wrapper, so compaction still triggers.
+        let overflow = AiError::StreamFailure {
+            inner: Box::new(AiError::Provider(ygg_ai::ProviderError {
+                code: None,
+                kind: None,
+                message: "prompt is too long".into(),
+                request_id: None,
+            })),
+            progress,
+        };
+        assert!(looks_like_context_error(&overflow));
+
+        // Even the unit variant keeps its exact phase label through the
+        // wrapper.
+        let canceled = AiError::StreamFailure {
+            inner: Box::new(AiError::Canceled),
+            progress,
+        };
+        assert_eq!(ai_error_phase(&canceled), "request cancellation");
+    }
+
+    #[test]
+    fn stream_failure_diagnostic_appends_wire_progress_inside_the_public_bound() {
+        let progress = ygg_ai::StreamProgress {
+            provider_events: 412,
+            decoded_events: 38,
+            content_bytes: 18_204,
+            buffered_bytes: 96,
+            first_body_seen: true,
+            elapsed_ms: 97_321,
+        };
+        let suffix = "stream_progress=frames=412 events=38 content=18204B buffered=96B first_byte=seen elapsed=97321ms";
+
+        let inner = AiError::Provider(ygg_ai::ProviderError {
+            // Four oversized fields push the bare diagnostic past the public
+            // bound, so the wrapper must reserve room for its progress field
+            // instead of letting truncation clip the progress off the end.
+            code: Some("x".repeat(600)),
+            kind: Some("y".repeat(600)),
+            message: "z".repeat(600),
+            request_id: Some("w".repeat(600)),
+        });
+        let bare = public_ai_error_diagnostic(&inner, "openai", "gpt-test");
+        assert_eq!(
+            bare.len(),
+            MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES,
+            "fixture must overflow the public bound"
+        );
+        assert!(bare.ends_with('…'));
+
+        let wrapped = public_ai_error_diagnostic(
+            &AiError::StreamFailure {
+                inner: Box::new(inner),
+                progress,
+            },
+            "openai",
+            "gpt-test",
+        );
+        assert!(
+            wrapped.len() <= MAX_PUBLIC_PROVIDER_DIAGNOSTIC_BYTES,
+            "wrapped diagnostic must stay inside the public bound: {}",
+            wrapped.len()
+        );
+        assert!(
+            wrapped.ends_with(suffix),
+            "truncation must not clip the progress field: {wrapped}"
+        );
+        assert!(wrapped.contains("phase=response body (provider error)"));
+    }
+
+    #[test]
+    fn bare_ai_error_variants_surface_bounded_detail() {
+        let errors = [
+            AiError::Config(ygg_ai::ConfigError::Parse("malformed endpoint file".into())),
+            AiError::Auth(ygg_ai::AuthError::Resolve),
+            AiError::Validation(ygg_ai::ValidationError::OrphanToolResult(
+                ygg_ai::ToolCallId("call_orphan".into()),
+            )),
+            AiError::Unsupported(ygg_ai::UnsupportedError::Image),
+            AiError::Decode(ygg_ai::DecodeError::Json("unterminated string".into())),
+            AiError::Pricing(ygg_ai::PricingError::ArithmeticOverflow),
+            AiError::StreamProtocol(ygg_ai::StreamProtocolError::MissingFinish),
+        ];
+        for error in &errors {
+            let diagnostic = public_ai_error_diagnostic(error, "openai", "gpt-test");
+            assert!(diagnostic.contains("detail="), "{diagnostic}");
+            assert!(
+                diagnostic.starts_with("provider=openai model=gpt-test phase="),
+                "{diagnostic}"
+            );
+        }
+        let config = public_ai_error_diagnostic(
+            &AiError::Config(ygg_ai::ConfigError::Parse("malformed endpoint file".into())),
+            "openai",
+            "gpt-test",
+        );
+        assert_eq!(
+            config,
+            "provider=openai model=gpt-test phase=request preparation detail=Parse error: malformed endpoint file"
+        );
+        let canceled = public_ai_error_diagnostic(&AiError::Canceled, "openai", "gpt-test");
+        assert_eq!(
+            canceled,
+            "provider=openai model=gpt-test phase=request cancellation"
+        );
     }
 
     #[test]

@@ -12,6 +12,8 @@ extension into a project.
   TOML form.
 - [`skills/`](skills/) — explicit, inspectable skills with bounded text
   resources.
+- [`skills/pi-migration/`](skills/pi-migration/) — low-token cleanup around the
+  zero-token Pi inventory.
 - [Bundled theme pack](../crates/ygg-coding-agent/themes/) — three complete TOML
   themes that can also be copied and edited as project themes.
 - [`extensions/hello-world/`](extensions/hello-world/) — a minimal executable

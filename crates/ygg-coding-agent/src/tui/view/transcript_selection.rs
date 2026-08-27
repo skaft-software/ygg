@@ -159,12 +159,32 @@ fn newline_col_offset(text: &str, line_index: usize, col: u16) -> usize {
     start_offset + cell_offset
 }
 
+fn wrapped_lines_with_source_offsets(text: &str, wrap_width: usize) -> (Vec<String>, Vec<usize>) {
+    let wrapped = wrap_text_with_ansi(text, wrap_width.max(1));
+    let mut offsets = Vec::with_capacity(wrapped.len());
+    let mut cursor = 0usize;
+    for line in &wrapped {
+        if line.is_empty() {
+            offsets.push(cursor.min(text.len()));
+            continue;
+        }
+        let start = text[cursor..]
+            .find(line)
+            .map(|relative| cursor.saturating_add(relative))
+            .unwrap_or(cursor)
+            .min(text.len());
+        offsets.push(start);
+        cursor = start.saturating_add(line.len()).min(text.len());
+    }
+    (wrapped, offsets)
+}
+
 fn wrapped_line_col_offset(text: &str, line_index: usize, col: u16, wrap_width: usize) -> usize {
-    let wrapped = wrap_text_with_ansi(text, wrap_width);
-    let start_offset: usize = wrapped.iter().take(line_index).map(|line| line.len()).sum();
+    let (wrapped, offsets) = wrapped_lines_with_source_offsets(text, wrap_width);
+    let start_offset = offsets.get(line_index).copied().unwrap_or(text.len());
     let line = wrapped.get(line_index).map(String::as_str).unwrap_or("");
     let cell_offset = visual_col_to_offset(line, usize::from(col));
-    start_offset + cell_offset
+    (start_offset + cell_offset).min(text.len())
 }
 
 fn visual_cell_to_copy_offset(
@@ -204,6 +224,99 @@ fn visual_cell_to_copy_offset(
             wrapped_line_col_offset(copy_text, local_row, col, usize::from(width).max(1))
         }
     }
+}
+
+fn wrapped_offset_to_line(text: &str, offset: usize, wrap_width: usize, trailing: bool) -> usize {
+    let (wrapped, offsets) = wrapped_lines_with_source_offsets(text, wrap_width);
+    let offset = clamp_copy_offset(text, offset);
+    let boundary = offsets.partition_point(|start| *start < offset);
+    if boundary < offsets.len() && offsets[boundary] == offset && !trailing {
+        return boundary;
+    }
+    boundary
+        .saturating_sub(1)
+        .min(wrapped.len().saturating_sub(1))
+}
+
+fn newline_offset_to_line(text: &str, offset: usize, trailing: bool) -> usize {
+    let offset = clamp_copy_offset(text, offset);
+    let mut start = 0usize;
+    for (line_index, line) in text.split_inclusive('\n').enumerate() {
+        let end = start.saturating_add(line.len());
+        if offset < end || (trailing && offset == end) {
+            return line_index;
+        }
+        start = end;
+    }
+    text.split('\n').count().saturating_sub(1)
+}
+
+fn copy_offset_to_visual_row(
+    block: &TranscriptBlock,
+    copy_text: &str,
+    offset: usize,
+    trailing_affinity: bool,
+    width: u16,
+) -> usize {
+    match block {
+        TranscriptBlock::Assistant(assistant) if looks_like_diff(&assistant.text) => {
+            newline_offset_to_line(copy_text, offset, trailing_affinity)
+        }
+        TranscriptBlock::Assistant(_)
+        | TranscriptBlock::Reasoning(_)
+        | TranscriptBlock::Notice(_)
+        | TranscriptBlock::NoticeStatus { .. }
+        | TranscriptBlock::Compaction(_)
+        | TranscriptBlock::Shell(_) => wrapped_offset_to_line(
+            copy_text,
+            offset,
+            usize::from(width).max(1),
+            trailing_affinity,
+        ),
+        TranscriptBlock::User { .. } => wrapped_offset_to_line(
+            copy_text,
+            offset,
+            usize::from(width.saturating_sub(2)).max(1),
+            trailing_affinity,
+        ),
+        TranscriptBlock::Outcome(_) => 0,
+        TranscriptBlock::Tool(_) => newline_offset_to_line(copy_text, offset, trailing_affinity),
+    }
+}
+
+pub(super) fn visual_line_for_transcript_position(
+    state: &ShellState,
+    position: TranscriptPosition,
+) -> Option<usize> {
+    let cache = state.transcript_cache.borrow();
+    let start = *cache.block_starts.get(position.block)?;
+    let total_rows = *cache.block_lengths.get(position.block)?;
+    let geometry = *cache.block_geometries.get(position.block)?;
+    let content_rows = total_rows
+        .saturating_sub(geometry.transition_rows)
+        .saturating_sub(geometry.leading_rows)
+        .saturating_sub(geometry.trailing_rows);
+    if content_rows == 0 {
+        return None;
+    }
+    drop(cache);
+
+    let block = state.transcript.get(position.block)?;
+    let copy_text = block_copy_text(block);
+    let content_row = copy_offset_to_visual_row(
+        block,
+        &copy_text,
+        position.offset,
+        position.trailing_affinity,
+        geometry.content_width,
+    )
+    .min(content_rows.saturating_sub(1));
+    Some(
+        start
+            .saturating_add(geometry.transition_rows)
+            .saturating_add(geometry.leading_rows)
+            .saturating_add(content_row),
+    )
 }
 
 pub(super) fn selection_position_for_visual_cell(

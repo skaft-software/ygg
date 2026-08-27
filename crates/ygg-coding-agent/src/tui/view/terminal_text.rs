@@ -1,6 +1,7 @@
 use sexy_tui_rs::strip_terminal_sequences;
 
-const MAX_PANEL_BYTES: usize = 64 * 1024;
+const MAX_LIVE_PANEL_BYTES: usize = 64 * 1024;
+const MAX_EXTENSION_RENDER_BYTES: usize = 64 * 1024;
 const MAX_EXTENSION_TOOL_RENDER_SEGMENTS: usize = 128;
 const ELISION_MARKER: &str = "\n… older tool output elided …\n";
 
@@ -77,6 +78,35 @@ pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
     out
 }
 
+/// Project carriage-return progress into the terminal-visible text state.
+/// CRLF remains a newline; a bare CR replaces the current logical line instead
+/// of retaining every intermediate progress frame and allowing it to wrap.
+pub(crate) fn normalize_carriage_return_progress(raw: &str) -> String {
+    if !raw.contains('\r') {
+        return raw.to_owned();
+    }
+
+    let mut out = String::with_capacity(raw.len());
+    let mut line_start = 0usize;
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                out.push('\n');
+                line_start = out.len();
+            }
+            '\r' => out.truncate(line_start),
+            '\n' => {
+                out.push('\n');
+                line_start = out.len();
+            }
+            visible => out.push(visible),
+        }
+    }
+    out
+}
+
 fn bounded_plain_prefix(mut text: String, byte_budget: usize) -> String {
     if text.len() <= byte_budget {
         return text;
@@ -92,7 +122,7 @@ fn bounded_plain_prefix(mut text: String, byte_budget: usize) -> String {
 pub(super) fn sanitize_extension_tool_render_segments(
     segments: &[ygg_agent::extension_process::ToolRenderSegment],
 ) -> Vec<ygg_agent::extension_process::ToolRenderSegment> {
-    let mut remaining = MAX_PANEL_BYTES;
+    let mut remaining = MAX_EXTENSION_RENDER_BYTES;
     let mut sanitized = Vec::new();
     for segment in segments.iter().take(MAX_EXTENSION_TOOL_RENDER_SEGMENTS) {
         if remaining == 0 {
@@ -149,27 +179,30 @@ pub(crate) fn sanitized_editor(raw: &str, cursor: usize) -> (String, usize) {
     (before + &after, safe_cursor)
 }
 
-/// Append display output while retaining only the newest 64 KiB.
-pub fn bounded_append(existing: &mut String, additional: &str) {
-    let safe = sanitize_for_terminal(additional);
-    if existing.len().saturating_add(safe.len()) <= MAX_PANEL_BYTES {
-        existing.push_str(&safe);
+/// Append ephemeral live display output while retaining only the newest 64 KiB.
+/// Final tool results replace this buffer instead of passing through it.
+pub fn bounded_live_append(existing: &mut String, additional: &str) {
+    // Keep raw display bytes (already lossily decoded at the event boundary)
+    // until rendering so split terminal/progress sequences are interpreted as
+    // one retained stream rather than independently per chunk.
+    if existing.len().saturating_add(additional.len()) <= MAX_LIVE_PANEL_BYTES {
+        existing.push_str(additional);
         return;
     }
 
     // Retain the newest bytes in place. The old implementation allocated a
     // second combined String on every overflow event, which is a hot path for
     // noisy tools; reserve once and shift only the retained tail.
-    let tail_budget = MAX_PANEL_BYTES.saturating_sub(ELISION_MARKER.len());
-    let mut additional_start = if safe.len() >= tail_budget {
-        safe.len() - tail_budget
+    let tail_budget = MAX_LIVE_PANEL_BYTES.saturating_sub(ELISION_MARKER.len());
+    let mut additional_start = if additional.len() >= tail_budget {
+        additional.len() - tail_budget
     } else {
         0
     };
-    while additional_start < safe.len() && !safe.is_char_boundary(additional_start) {
+    while additional_start < additional.len() && !additional.is_char_boundary(additional_start) {
         additional_start += 1;
     }
-    let existing_budget = tail_budget.saturating_sub(safe.len() - additional_start);
+    let existing_budget = tail_budget.saturating_sub(additional.len() - additional_start);
     let mut existing_start = existing.len().saturating_sub(existing_budget);
     while existing_start < existing.len() && !existing.is_char_boundary(existing_start) {
         existing_start += 1;
@@ -177,11 +210,11 @@ pub fn bounded_append(existing: &mut String, additional: &str) {
 
     let final_len = ELISION_MARKER.len()
         + existing.len().saturating_sub(existing_start)
-        + safe.len().saturating_sub(additional_start);
+        + additional.len().saturating_sub(additional_start);
     existing.replace_range(..existing_start, "");
     existing.reserve(final_len.saturating_sub(existing.len()));
     existing.insert_str(0, ELISION_MARKER);
-    existing.push_str(&safe[additional_start..]);
+    existing.push_str(&additional[additional_start..]);
 }
 
 #[cfg(test)]
@@ -189,10 +222,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bounded_append_retains_a_tail_and_marks_elision() {
+    fn bounded_live_append_retains_a_tail_and_marks_elision() {
         let mut output = "prefix".repeat(20_000);
-        bounded_append(&mut output, "THE-TAIL");
-        assert!(output.len() <= MAX_PANEL_BYTES);
+        bounded_live_append(&mut output, "THE-TAIL");
+        assert!(output.len() <= MAX_LIVE_PANEL_BYTES);
         assert!(output.contains("elided"));
         assert!(output.ends_with("THE-TAIL"));
     }
@@ -219,6 +252,15 @@ mod tests {
     }
 
     #[test]
+    fn carriage_return_progress_replaces_the_current_logical_line() {
+        assert_eq!(
+            normalize_carriage_return_progress("phase\n0%\r10%\r100%\r\ndone"),
+            "phase\n100%\ndone"
+        );
+        assert_eq!(normalize_carriage_return_progress("plain"), "plain");
+    }
+
+    #[test]
     fn composer_sanitization_preserves_the_cursor_without_mutating_input() {
         let raw = "before \x1b[31m after";
         let cursor = "before \x1b".len();
@@ -230,9 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn bounded_append_keeps_valid_utf8_at_the_cut_boundary() {
+    fn bounded_live_append_keeps_valid_utf8_at_the_cut_boundary() {
         let mut output = "é".repeat(40_000);
-        bounded_append(&mut output, " tail");
+        bounded_live_append(&mut output, " tail");
         assert!(output.is_char_boundary(output.len()));
         assert!(output.ends_with(" tail"));
     }
