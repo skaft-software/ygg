@@ -22,6 +22,8 @@ from .command import (
     build_ygg_command,
     classify_failure,
     parse_ygg_version,
+    terminate_process_group_command,
+    wrap_in_process_group,
     wrap_with_timeout,
 )
 from .config import (
@@ -37,7 +39,10 @@ from .redaction import redact_jsonl, redact_text
 from .session import SessionConversion, convert_native_sessions
 
 _TIMEOUT_GRACE_SECONDS = 15
+_PROCESS_GROUP_TERM_GRACE_SECONDS = 5
+_PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 10
 _SESSION_CONTAINER_ROOT = PurePosixPath("/logs/agent")
+_PROCESS_GROUP_FILE = str(_SESSION_CONTAINER_ROOT / "ygg-process-group.pid")
 
 
 class YggSetupError(RuntimeError):
@@ -209,9 +214,13 @@ class Ygg(BaseAgent):
             hash_check = self._expected_hash_check()
             checks = [
                 "set -eu",
+                "command -v bash >/dev/null",
+                "command -v setsid >/dev/null",
                 f"test -x {shlex.quote(self._source_binary)}",
                 f"mkdir -p {shlex.quote(self._session_dir)}",
             ]
+            if self._agent_timeout_sec:
+                checks.append("command -v timeout >/dev/null")
             if hash_check:
                 checks.append(hash_check)
             checks.extend(
@@ -275,6 +284,7 @@ class Ygg(BaseAgent):
                 "workspace_trusted": self._workspace_trusted,
                 "telemetry": self._telemetry,
                 "timeout_sec": self._agent_timeout_sec,
+                "process_group_cleanup": True,
             },
         )
 
@@ -299,7 +309,9 @@ class Ygg(BaseAgent):
         )
         self._write_text("failure-classification.txt", f"{kind.value}\n")
         if error is not None:
-            self._write_text("execution-error.txt", f"{type(error).__name__}: {error}\n")
+            self._write_text(
+                "execution-error.txt", f"{type(error).__name__}: {error}\n"
+            )
         self._write_json(
             "run-metadata.json",
             {
@@ -445,6 +457,32 @@ class Ygg(BaseAgent):
         text = str(error).casefold()
         return "timed out" in text or "timeout" in text
 
+    async def _terminate_run_process_group(self, environment: BaseEnvironment) -> None:
+        """Stop and reap the exact process group before exposing final artifacts."""
+
+        cleanup = terminate_process_group_command(
+            _PROCESS_GROUP_FILE,
+            term_grace_sec=_PROCESS_GROUP_TERM_GRACE_SECONDS,
+        )
+        result = await asyncio.shield(
+            environment.exec(
+                command=cleanup.shell,
+                timeout_sec=_PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS,
+            )
+        )
+        if result.return_code != 0:
+            detail = redact_text(
+                result.stderr or result.stdout or "no cleanup output",
+                self._secrets(),
+            ).strip()
+            raise YggAgentError(
+                "Ygg process-group cleanup failed "
+                f"with exit {result.return_code}: {detail}"
+            )
+
+    def _write_termination_error(self, error: BaseException) -> None:
+        self._write_text("termination-error.txt", f"{type(error).__name__}: {error}\n")
+
     async def run(
         self,
         instruction: str,
@@ -462,16 +500,19 @@ class Ygg(BaseAgent):
             max_turns=self._max_turns,
             bash_timeout_secs=self._bash_timeout_secs,
             workspace_trusted=self._workspace_trusted,
-            telemetry_path="/logs/agent/ygg-telemetry.jsonl" if self._telemetry else None,
+            telemetry_path="/logs/agent/ygg-telemetry.jsonl"
+            if self._telemetry
+            else None,
         )
         self._write_invocation(command, instruction)
         self._last_conversion = None
         started = time.monotonic()
-        executed_command = (
+        deadline_command = (
             wrap_with_timeout(command, self._agent_timeout_sec)
             if self._agent_timeout_sec
             else command
         )
+        executed_command = wrap_in_process_group(deadline_command, _PROCESS_GROUP_FILE)
         environment_timeout = (
             self._agent_timeout_sec + _TIMEOUT_GRACE_SECONDS
             if self._agent_timeout_sec
@@ -485,6 +526,23 @@ class Ygg(BaseAgent):
                 timeout_sec=environment_timeout,
             )
         except asyncio.CancelledError as error:
+            try:
+                await self._terminate_run_process_group(environment)
+            except Exception as termination_error:
+                self._write_termination_error(termination_error)
+                self._write_run_result(
+                    command=command,
+                    instruction=instruction,
+                    kind=FailureKind.TIMEOUT,
+                    started=started,
+                    stdout=None,
+                    stderr=None,
+                    return_code=None,
+                    timed_out=True,
+                    error=termination_error,
+                )
+                # Artifacts are not immutable while process death is unproven.
+                raise error
             self._write_run_result(
                 command=command,
                 instruction=instruction,
@@ -499,6 +557,24 @@ class Ygg(BaseAgent):
             self._finalize_session_artifacts()
             raise
         except Exception as error:
+            try:
+                await self._terminate_run_process_group(environment)
+            except Exception as termination_error:
+                self._write_termination_error(termination_error)
+                self._write_run_result(
+                    command=command,
+                    instruction=instruction,
+                    kind=FailureKind.AGENT,
+                    started=started,
+                    stdout=None,
+                    stderr=None,
+                    return_code=None,
+                    timed_out=False,
+                    error=termination_error,
+                )
+                raise YggAgentError(
+                    "Ygg process death was not confirmed; artifacts were not finalized"
+                ) from termination_error
             timed_out = self._is_timeout_error(error)
             kind = FailureKind.TIMEOUT if timed_out else FailureKind.AGENT
             self._write_run_result(
@@ -522,7 +598,26 @@ class Ygg(BaseAgent):
                 "Ygg execution infrastructure failed; inspect execution-error.txt"
             ) from error
 
-        timed_out = bool(self._agent_timeout_sec and result.return_code == 124)
+        try:
+            await self._terminate_run_process_group(environment)
+        except Exception as termination_error:
+            self._write_termination_error(termination_error)
+            self._write_run_result(
+                command=command,
+                instruction=instruction,
+                kind=FailureKind.AGENT,
+                started=started,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                return_code=result.return_code,
+                timed_out=False,
+                error=termination_error,
+            )
+            raise YggAgentError(
+                "Ygg process death was not confirmed; artifacts were not finalized"
+            ) from termination_error
+
+        timed_out = bool(self._agent_timeout_sec and result.return_code in (124, 137))
         kind = classify_failure(
             result.return_code,
             result.stdout,

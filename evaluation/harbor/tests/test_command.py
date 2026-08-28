@@ -12,6 +12,9 @@ from evaluation.harbor.command import (
     build_ygg_command,
     classify_failure,
     parse_ygg_version,
+    terminate_process_group_command,
+    wrap_in_process_group,
+    wrap_with_timeout,
 )
 
 
@@ -73,8 +76,30 @@ class CommandTests(unittest.TestCase):
                     **kwargs,
                 )
 
+    def test_timeout_runs_inside_an_independently_cleanable_process_group(self) -> None:
+        command = build_ygg_command(
+            "/tmp/ygg",
+            "task",
+            model=None,
+            reasoning=None,
+            session_dir="/logs/agent/sessions",
+        )
+        timed = wrap_with_timeout(command, 2)
+        grouped = wrap_in_process_group(timed, "/logs/agent/ygg-process-group.pid")
+        cleanup = terminate_process_group_command("/logs/agent/ygg-process-group.pid")
+
+        self.assertEqual(grouped.argv[:3], ("setsid", "sh", "-c"))
+        self.assertIn("timeout", grouped.argv)
+        self.assertIn("--kill-after=5s", grouped.argv)
+        self.assertEqual(grouped.argv[-1], "task")
+        self.assertEqual(cleanup.argv[:3], ("bash", "-c", cleanup.argv[2]))
+        self.assertIn("ygg-process-group-cleanup", cleanup.argv)
+        self.assertIn('kill -KILL -- "-$pgid"', cleanup.argv[2])
+
     def test_version_parser_accepts_ygg_output(self) -> None:
-        self.assertEqual(parse_ygg_version(f"ygg {PINNED_YGG_VERSION}\n"), PINNED_YGG_VERSION)
+        self.assertEqual(
+            parse_ygg_version(f"ygg {PINNED_YGG_VERSION}\n"), PINNED_YGG_VERSION
+        )
         self.assertEqual(parse_ygg_version("ygg version 1.2.3"), "1.2.3")
         self.assertIsNone(parse_ygg_version("not a version"))
 

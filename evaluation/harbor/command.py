@@ -133,7 +133,87 @@ def wrap_with_timeout(command: YggCommand, timeout_sec: int) -> YggCommand:
     )
 
 
-_VERSION_RE = re.compile(r"\bygg(?:\s+version)?\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b")
+_PROCESS_GROUP_RUNNER = (
+    'pid_file=$1; shift; umask 077; tmp_file="$pid_file.$$"; '
+    'printf "%s\\n" "$$" > "$tmp_file"; mv -f -- "$tmp_file" "$pid_file"; '
+    '"$@"; status=$?; exit "$status"'
+)
+_PROCESS_GROUP_CLEANUP = """\
+pid_file=$1
+term_grace=$2
+pgid=
+find_group() {
+  if [ -f "$pid_file" ]; then IFS= read -r pgid < "$pid_file" || pgid=; fi
+  case "$pgid" in ''|*[!0-9]*|0|1) pgid= ;; *) return 0 ;; esac
+  for proc in /proc/[0-9]*; do
+    [ -r "$proc/cmdline" ] || continue
+    if tr '\\0' '\\n' < "$proc/cmdline" 2>/dev/null | grep -Fxq 'ygg-process-group'; then
+      pgid=$(awk '{print $5}' "$proc/stat" 2>/dev/null || true)
+      case "$pgid" in ''|*[!0-9]*|0|1) pgid= ;; *) return 0 ;; esac
+    fi
+  done
+  return 1
+}
+for _ in {1..10}; do find_group && break; sleep 0.1; done
+if [ -z "$pgid" ]; then rm -f -- "$pid_file"; exit 0; fi
+group_alive() { kill -0 -- "-$pgid" 2>/dev/null; }
+if group_alive; then
+  kill -TERM -- "-$pgid" 2>/dev/null || true
+  deadline=$((SECONDS + term_grace))
+  while group_alive && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+fi
+if group_alive; then
+  kill -KILL -- "-$pgid" 2>/dev/null || true
+  deadline=$((SECONDS + 2))
+  while group_alive && [ "$SECONDS" -lt "$deadline" ]; do sleep 0.1; done
+fi
+rm -f -- "$pid_file"
+if group_alive; then exit 70; fi
+"""
+
+
+def wrap_in_process_group(command: YggCommand, pid_file: str) -> YggCommand:
+    """Run one invocation in a separately killable Linux process group."""
+
+    if not pid_file.strip():
+        raise ValueError("pid_file must not be empty")
+    return YggCommand(
+        (
+            "setsid",
+            "sh",
+            "-c",
+            _PROCESS_GROUP_RUNNER,
+            "ygg-process-group",
+            pid_file,
+            *command.argv,
+        )
+    )
+
+
+def terminate_process_group_command(
+    pid_file: str, *, term_grace_sec: int = 5
+) -> YggCommand:
+    """Build the independent cleanup command used after every harness exec."""
+
+    if not pid_file.strip():
+        raise ValueError("pid_file must not be empty")
+    if term_grace_sec < 1:
+        raise ValueError("term_grace_sec must be greater than zero")
+    return YggCommand(
+        (
+            "bash",
+            "-c",
+            _PROCESS_GROUP_CLEANUP,
+            "ygg-process-group-cleanup",
+            pid_file,
+            str(term_grace_sec),
+        )
+    )
+
+
+_VERSION_RE = re.compile(
+    r"\bygg(?:\s+version)?\s+v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b"
+)
 _FALLBACK_VERSION_RE = re.compile(r"\bv?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)\b")
 
 

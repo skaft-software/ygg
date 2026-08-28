@@ -15,6 +15,7 @@ try:
 
     from evaluation.harbor.ygg_agent import (
         Ygg,
+        YggAgentError,
         YggBenchmarkTimeoutError,
         YggProviderError,
         YggSetupError,
@@ -22,6 +23,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - exercised in the dependency-free job
     AgentContext = None  # type: ignore[assignment,misc]
     Ygg = None  # type: ignore[assignment]
+    YggAgentError = None  # type: ignore[assignment,misc]
     YggBenchmarkTimeoutError = None  # type: ignore[assignment,misc]
     YggProviderError = None  # type: ignore[assignment,misc]
     YggSetupError = None  # type: ignore[assignment,misc]
@@ -44,9 +46,12 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await agent.setup(environment)
 
             self.assertIn("install -m 0755", environment.calls[0]["command"])
-            self.assertIn("mkdir -p /logs/agent/sessions", environment.calls[0]["command"])
+            self.assertIn(
+                "mkdir -p /logs/agent/sessions", environment.calls[0]["command"]
+            )
             self.assertEqual(
-                (logs_dir / "setup-stdout.txt").read_text(), f"ygg {PINNED_YGG_VERSION}\n"
+                (logs_dir / "setup-stdout.txt").read_text(),
+                f"ygg {PINNED_YGG_VERSION}\n",
             )
             self.assertEqual(agent.version(), PINNED_YGG_VERSION)
 
@@ -61,12 +66,16 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             await agent.setup(environment)
             await agent.run("task", environment, AgentContext())
 
-            run_call = environment.calls[-1]
-            self.assertIn("--telemetry /logs/agent/ygg-telemetry.jsonl", run_call["command"])
+            run_call = environment.run_call
+            self.assertIn(
+                "--telemetry /logs/agent/ygg-telemetry.jsonl", run_call["command"]
+            )
             invocation = json.loads((logs_dir / "invocation.json").read_text())
             self.assertTrue(invocation["telemetry"])
 
-    async def test_run_writes_metrics_redacted_output_and_native_artifacts(self) -> None:
+    async def test_run_writes_metrics_redacted_output_and_native_artifacts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logs_dir = Path(directory)
             environment = FakeEnvironment(
@@ -121,26 +130,53 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
                 "provider_failure\n",
             )
 
-    async def test_process_timeout_is_wrapped_and_classified(self) -> None:
+    async def test_cleanup_failure_prevents_artifact_finalization(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             logs_dir = Path(directory)
-            environment = FakeEnvironment(
+            environment = CleanupFailureEnvironment(
                 logs_dir,
-                SimpleNamespace(return_code=124, stdout="", stderr="Terminated"),
+                SimpleNamespace(return_code=0, stdout="completed\n", stderr=""),
             )
-            agent = Ygg(logs_dir, agent_timeout_sec=2, bash_timeout_secs=600)
+            agent = Ygg(logs_dir)
             await agent.setup(environment)
-            with self.assertRaises(YggBenchmarkTimeoutError):
+
+            with self.assertRaises(YggAgentError):
                 await agent.run("task", environment, AgentContext())
-            run_call = environment.calls[-1]
-            self.assertTrue(run_call["command"].startswith("timeout --signal=TERM"))
-            self.assertIn(" 2s /tmp/ygg ", run_call["command"])
-            self.assertIn("--bash-timeout-secs 600", run_call["command"])
-            self.assertEqual(run_call["timeout_sec"], 17)
+
+            self.assertTrue((logs_dir / "termination-error.txt").is_file())
+            self.assertFalse((logs_dir / "native-session-manifest.json").exists())
             self.assertEqual(
                 (logs_dir / "failure-classification.txt").read_text(),
-                "benchmark_timeout\n",
+                "agent_failure\n",
             )
+
+    async def test_process_timeout_is_wrapped_and_classified(self) -> None:
+        for return_code in (124, 137):
+            with (
+                self.subTest(return_code=return_code),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                logs_dir = Path(directory)
+                environment = FakeEnvironment(
+                    logs_dir,
+                    SimpleNamespace(
+                        return_code=return_code, stdout="", stderr="Terminated"
+                    ),
+                )
+                agent = Ygg(logs_dir, agent_timeout_sec=2, bash_timeout_secs=600)
+                await agent.setup(environment)
+                with self.assertRaises(YggBenchmarkTimeoutError):
+                    await agent.run("task", environment, AgentContext())
+                run_call = environment.run_call
+                self.assertTrue(run_call["command"].startswith("setsid sh -c"))
+                self.assertIn("timeout --signal=TERM", run_call["command"])
+                self.assertIn(" 2s /tmp/ygg ", run_call["command"])
+                self.assertIn("--bash-timeout-secs 600", run_call["command"])
+                self.assertEqual(run_call["timeout_sec"], 17)
+                self.assertEqual(
+                    (logs_dir / "failure-classification.txt").read_text(),
+                    "benchmark_timeout\n",
+                )
 
     async def test_setup_rejects_version_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -158,6 +194,12 @@ class FakeEnvironment:
         self.run_result = run_result
         self.calls: list[dict[str, object]] = []
 
+    @property
+    def run_call(self) -> dict[str, object]:
+        return next(
+            call for call in self.calls if str(call["command"]).startswith("setsid ")
+        )
+
     async def exec(
         self,
         *,
@@ -165,9 +207,9 @@ class FakeEnvironment:
         env: dict[str, str] | None = None,
         timeout_sec: int | None = None,
     ) -> SimpleNamespace:
-        self.calls.append(
-            {"command": command, "env": env, "timeout_sec": timeout_sec}
-        )
+        self.calls.append({"command": command, "env": env, "timeout_sec": timeout_sec})
+        if "ygg-process-group-cleanup" in command:
+            return SimpleNamespace(return_code=0, stdout="", stderr="")
         if "--version" in command:
             version = getattr(self.run_result, "version", PINNED_YGG_VERSION)
             return SimpleNamespace(
@@ -221,6 +263,26 @@ class FakeEnvironment:
             },
             {"type": "head", "id": "002"},
         ]
+
+
+class CleanupFailureEnvironment(FakeEnvironment):
+    async def exec(
+        self,
+        *,
+        command: str,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+    ) -> SimpleNamespace:
+        if "ygg-process-group-cleanup" in command:
+            self.calls.append(
+                {"command": command, "env": env, "timeout_sec": timeout_sec}
+            )
+            return SimpleNamespace(
+                return_code=70,
+                stdout="",
+                stderr="process group still alive",
+            )
+        return await super().exec(command=command, env=env, timeout_sec=timeout_sec)
 
 
 if __name__ == "__main__":

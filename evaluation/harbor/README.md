@@ -155,6 +155,16 @@ PYTHONPATH=/path/to/ygg /tmp/harbor-ygg/.venv/bin/python \
   -m unittest discover -s /path/to/ygg/evaluation/harbor/tests -v
 ```
 
+The discovery suite includes a Linux/Docker cancellation reproduction when the
+Docker daemon and an already-cached `debian:bookworm-slim` image are available.
+It deliberately cancels the local Docker exec while a TERM-resistant process,
+tool child, and grandchild continue writing session, telemetry, and workspace
+heartbeats in the container. The test then requires the adapter's independent
+cleanup exec to kill the process group before manifest finalization and proves
+all watched files remain byte-for-byte unchanged during a simulated verifier
+window. It also runs a normal-completion negative control. The test skips rather
+than pulling an image or contacting a provider.
+
 ## Zero-token adapter gate
 
 Before spending model quota, run Harbor's setup phase only. This verifies the
@@ -243,7 +253,15 @@ single-trial result is healthy; provider rate limits and Docker resource
 contention otherwise change failure rates. Keep `--n-attempts 1` for a single
 reproducible pass, or report every attempt when estimating variance.
 
-The adapter's optional inner timeout can be set with
+The adapter runs every Ygg invocation in a dedicated Linux process group and
+retains its group ID under `/logs/agent` until an independent cleanup exec has
+confirmed the group is gone. This boundary applies both to an optional inner
+timeout and to arbitrary cancellation of Harbor's outer environment exec.
+Artifacts are converted and manifested only after that cleanup succeeds; a
+cleanup failure writes `termination-error.txt` and leaves the mutable native
+artifacts unfinalized rather than exposing a false immutable boundary.
+
+The optional inner timeout can be set with
 `--agent-kwarg agent_timeout_sec=<seconds>`. Keep it below Harbor's task agent
 timeout so the adapter's `timeout` wrapper gets a chance to terminate Ygg and
 retain its artifacts. A timeout is classified as `benchmark_timeout`, not as a
@@ -285,6 +303,8 @@ Each trial's `agent/` directory retains the following evidence:
 - `setup-*.txt` — setup output, status, and version/hash failure evidence.
 - `stdout.txt`, `stderr.txt`, `exit-status.txt`, `failure-classification.txt`,
   and `run-metadata.json` — redacted execution evidence and timing.
+  `termination-error.txt` records a failed cleanup; in that case the failure
+  metadata remains available but no native-session manifest is published.
 - `sessions/**/*.jsonl` — the native append-only Ygg session, retained as the
   authoritative replay/debug artifact. Only the active branch is converted.
 - `trajectory.json` — conservative ATIF-v1.6 conversion of durable user,
