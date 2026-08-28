@@ -60,12 +60,14 @@ first-body allowance, a five-minute inter-chunk idle allowance, and a one-hour
 overall body deadline. Optional error snippets use tighter two-second idle and
 five-second overall ceilings after the HTTP status is known. A preferred
 WebSocket falls back to HTTP when connection establishment fails before a
-generation frame could have been sent; post-send timeouts, decode failures, and
-disconnects are terminal so provider work is never replayed ambiguously. The one
-explicit exception is a provider error that reports WebSocket connection-lifetime
-exhaustion before any generated output: Ygg retires the socket, and the agent may
-retry the unchanged request through the HTTP fallback. Once generation
-has been observed, that retry path remains disabled. The coding product uses a
+generation frame could have been sent. A bounded body-disconnect retry is also
+allowed only before any text, reasoning, media, or tool generation is observed;
+post-send header timeouts and every failure after generation are terminal so
+provider work is never replayed ambiguously. A provider error reporting WebSocket
+connection-lifetime exhaustion retires and disables the poisoned socket before
+the error is published, so an immediate safe pre-generation retry uses HTTP.
+Once generation has been observed, every automatic retry path remains disabled.
+The coding product uses a
 fifteen-minute response-header default for built-in and custom routes; custom
 providers can override that startup allowance for their own cold-start profile.
 All of these are cancellable bounds, not a requirement to wait before cancelling

@@ -1614,6 +1614,14 @@ fn annotate_repeated_tool_result(
     }
 }
 
+fn assistant_has_terminal_content(assistant: &AssistantMessage) -> bool {
+    assistant.content.iter().any(|part| match part {
+        AssistantPart::Text(text) => !text.trim().is_empty(),
+        AssistantPart::ToolCall(_) | AssistantPart::Media(_) => true,
+        AssistantPart::Reasoning(_) => false,
+    })
+}
+
 fn truncate_tool_text(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_owned();
@@ -5206,8 +5214,7 @@ impl Agent {
                                 }
                             }
                             while provider_retries_enabled
-                                && (!attempt_saw_generation
-                                    || is_replayable_network_failure(&error))
+                                && !attempt_saw_generation
                                 && stream_retries < provider_retry_limit(&error)
                                 && retryable_stream_start(&error)
                             {
@@ -5420,6 +5427,11 @@ impl Agent {
                 let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);
                 let needs_continuation = matches!(stop_reason, StopReason::MaxTokens | StopReason::PauseTurn)
                     || matches!(&stop_reason, StopReason::Other(reason) if reason == "tool_output_locked");
+                if normal_end && calls.is_empty() && !assistant_has_terminal_content(&assistant) {
+                    break 'run FinishReason::Failed(AgentError::IncompleteResponse {
+                        stop_reason: "provider returned no user-visible content".to_owned(),
+                    });
+                }
                 let gated_candidate = completion_policy == CompletionPolicy::TerminalGate
                     && calls.is_empty()
                     && normal_end;

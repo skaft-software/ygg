@@ -17,9 +17,17 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
-- Retire a preferred Responses WebSocket when the provider reports a
-  connection-lifetime limit, then allow a bounded pre-generation retry through
-  the HTTP fallback instead of reusing the poisoned socket.
+- Fail normal terminal responses that contain no visible text, media, or tool
+  call instead of silently reporting success.
+- Keep one stable `Working` TUI state for every active run, promote it to
+  `Thinking` only on actual reasoning deltas, and remove the timer-only marker
+  repaint that made long turns flicker.
+- Decode observed Codex Responses error envelopes with a nullable provider code
+  while still rejecting a missing or nullable error message.
+- Retire a preferred Responses WebSocket before publishing a provider
+  connection-lifetime error, then allow a bounded pre-generation retry through
+  the HTTP fallback instead of racing the poisoned socket. Never replay a
+  request after generated output has been observed.
 - Keep repeated-call diagnostics out of same-response batches and preserve
   machine-readable JSON tool results.
 

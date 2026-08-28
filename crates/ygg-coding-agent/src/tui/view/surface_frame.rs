@@ -205,11 +205,7 @@ pub(super) fn event_margin_marker_with_frame(
             Some(theme.fg("accent", spinner))
         }
         TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning && markers_enabled => {
-            Some(if active_dot_visible {
-                theme.model_fg(reasoning.model_lab, event_dot)
-            } else {
-                theme.settled_event_dot("neutral", event_dot)
-            })
+            Some(theme.model_fg(reasoning.model_lab, event_dot))
         }
         TranscriptBlock::Reasoning(_) => None,
         TranscriptBlock::Assistant(_) if markers_enabled => Some(theme.fg("foreground", event_dot)),

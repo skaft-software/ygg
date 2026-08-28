@@ -3363,16 +3363,14 @@ fn resize_while_overlayed_replays_the_pi_composited_frame() {
         !resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
         "Pi replays the current composited frame, not rows hidden by its overlay: {resize_text:?}"
     );
-    for index in 0..16 {
+    for index in 0..17 {
         let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
         assert!(
             resize_text.contains(&sentinel),
             "{sentinel} was not replayed with the composited overlay:\n{resize_text:?}"
         );
     }
-    for index in 16..18 {
-        assert!(!resize_text.contains(&format!("YGG-OVERLAY-RESIZE-{index:02}")));
-    }
+    assert!(!resize_text.contains("YGG-OVERLAY-RESIZE-17"));
 
     process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
     assert!(
@@ -3921,9 +3919,9 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         },
     );
     let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-    // Active reasoning occupies two rows. Once real output arrives, the empty
-    // display-only status disappears and the assistant owns a single row.
-    assert_eq!(composer_row(&streamed) + 1, initial_composer);
+    // The response adds its durable row while the stable Working row remains
+    // below it until authoritative run settlement.
+    assert_eq!(composer_row(&streamed), initial_composer + 2);
     assert!(streamed.len() < 40);
 
     shell.on_run_event(
@@ -3935,7 +3933,11 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         },
     );
     let tool = render_shell_at(&shell.state.borrow(), 80, now);
-    assert!(composer_row(&tool) > composer_row(&streamed));
+    assert_eq!(
+        composer_row(&tool),
+        composer_row(&streamed),
+        "the tool lifecycle replaces Working without moving composer chrome"
+    );
     assert!(tool.len() < 40);
 
     shell.queue_steering(&ComposedInput::from_text("also inspect tests".into()));
@@ -5290,7 +5292,7 @@ fn assistant_markdown_uses_full_rich_pipeline_without_rewriting_source() {
 }
 
 #[test]
-fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
+fn active_run_starts_with_working_until_reasoning_is_observed() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     shell.begin_run("codex");
@@ -5301,16 +5303,21 @@ fn reasoning_enabled_run_shows_fallback_before_provider_deltas() {
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
-    assert_eq!(rendered.len(), 2, "{rendered:?}");
-    assert_eq!(rendered[0], "• Thinking", "{rendered:?}");
-    assert!(rendered[1].contains("└ (ctrl+o to expand)"), "{rendered:?}");
+    assert_eq!(rendered, vec!["• Working"], "{rendered:?}");
 }
 
 #[test]
-fn collapsed_reasoning_status_has_a_blinking_event_dot() {
+fn collapsed_activity_marker_is_stable_without_periodic_repaints() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
-    shell.begin_run("codex");
+    let run_id = shell.begin_run("codex");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "private trace".into(),
+        },
+    );
     let raw = |shell: &InteractiveShell| {
         shell
             .state
@@ -5321,26 +5328,18 @@ fn collapsed_reasoning_status_has_a_blinking_event_dot() {
             .cloned()
             .expect("reasoning status row")
     };
-    let before = strip_terminal_sequences(&raw(&shell));
-    assert_eq!(before, "• Thinking");
+    let before = raw(&shell);
+    assert_eq!(strip_terminal_sequences(&before), "• Thinking");
     {
         let mut state = shell.state.borrow_mut();
-        assert!(event_dot_animating(&state));
+        assert!(!event_dot_animating(&state));
         assert_eq!(state.active_event_blocks, vec![0]);
         state.advance_event_dot_animation();
     }
-    // The dot pulses into its dim slot: the glyph stays and only the tone
-    // changes.
-    let after_raw = raw(&shell);
-    assert_eq!(strip_terminal_sequences(&after_raw), "• Thinking");
-    {
-        let mut state = shell.state.borrow_mut();
-        state.advance_event_dot_animation();
-    }
-    let before_raw = raw(&shell);
-    assert_ne!(
-        before_raw, after_raw,
-        "collapsed reasoning dots should pulse through colour only"
+    assert_eq!(
+        raw(&shell),
+        before,
+        "marker-only ticks must not repaint state"
     );
 }
 
@@ -5488,7 +5487,7 @@ fn empty_working_status_leaves_no_ghost_block_when_interrupted() {
 }
 
 #[test]
-fn empty_thinking_status_is_replaced_by_the_first_text_block() {
+fn first_text_delta_moves_working_below_the_stream_without_churn() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     let run_id = shell.begin_run("codex");
@@ -5500,16 +5499,104 @@ fn empty_thinking_status_is_replaced_by_the_first_text_block() {
             text: "Ready.".into(),
         },
     );
+    let working_index = shell
+        .state
+        .borrow()
+        .active_reasoning
+        .expect("working row remains while the run is active");
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: " Still running.".into(),
+        },
+    );
 
     let state = shell.state.borrow();
     assert!(matches!(
         state.transcript.first(),
         Some(TranscriptBlock::Assistant(_))
     ));
-    assert!(state
-        .transcript
-        .iter()
-        .all(|block| !matches!(block, TranscriptBlock::Reasoning(_))));
+    assert_eq!(state.active_reasoning, Some(working_index));
+    let TranscriptBlock::Reasoning(activity) = &state.transcript[working_index] else {
+        panic!("working activity expected")
+    };
+    assert_eq!(activity.reasoning_heading.as_deref(), Some("Working"));
+    assert!(activity.text.is_empty());
+    assert!(!activity.show_reasoning_hint);
+}
+
+#[test]
+fn activity_lifecycle_is_working_thinking_working_then_settled() {
+    use ygg_agent::{EntryId, FinishReason};
+    use ygg_ai::{AssistantMessage, AssistantPart, ModelId, Protocol, StopReason};
+
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("openai");
+    let rendered = |shell: &InteractiveShell| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+    };
+    assert!(rendered(&shell).iter().any(|line| line == "• Working"));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "real private trace".into(),
+        },
+    );
+    let thinking = rendered(&shell);
+    assert!(thinking.iter().any(|line| line.contains("Thinking")));
+    assert!(!thinking.iter().any(|line| line == "• Working"));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Answer".into(),
+        },
+    );
+    let responding = rendered(&shell);
+    assert!(responding.iter().any(|line| line.contains("Answer")));
+    assert!(responding.iter().any(|line| line == "• Working"));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::TurnFinished {
+            message: AssistantMessage {
+                content: vec![AssistantPart::Text("Answer".into())],
+                model: ModelId("m".into()),
+                protocol: Protocol::OpenAiResponses,
+            },
+            stop_reason: StopReason::EndTurn,
+            turn_usage: Usage::default(),
+            usage: Usage::default(),
+            session_cost_microdollars: None,
+            run_cost_microdollars: 0,
+        },
+    );
+    assert!(
+        rendered(&shell).iter().any(|line| line == "• Working"),
+        "a completed turn is not an authoritative run terminal"
+    );
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::RunFinished {
+            head: EntryId("head".into()),
+            reason: FinishReason::Completed,
+        },
+    );
+    let settled = rendered(&shell);
+    assert!(!settled.iter().any(|line| line.contains("Working")));
+    assert!(shell.state.borrow().active_reasoning.is_none());
 }
 
 #[test]
@@ -6513,13 +6600,9 @@ fn event_margin_markers_cover_responses_tools_and_collapsed_reasoning() {
         Some("•".into())
     );
     let reasoning_slot = event_margin_marker(&reasoning, &theme, false, true)
-        .expect("quiet collapsed reasoning marker");
-    assert_eq!(
-        strip_terminal_sequences(&reasoning_slot),
-        "•",
-        "quiet reasoning dots keep a dim slot instead of vanishing"
-    );
-    assert_eq!(reasoning_slot, theme.settled_event_dot("neutral", "•"));
+        .expect("steady collapsed reasoning marker");
+    assert_eq!(strip_terminal_sequences(&reasoning_slot), "•");
+    assert_eq!(reasoning_slot, theme.model_fg(None, "•"));
     let compaction = TranscriptBlock::Compaction(Box::new(CompactionBlock {
         label: "Context compacted".into(),
         summary: "summary".into(),
@@ -6628,8 +6711,9 @@ fn streaming_response_dot_stays_solid_light_and_settles_solid() {
     );
     {
         let mut state = shell.state.borrow_mut();
-        // The assistant block is tracked, but its solid dot never pulses.
-        assert_eq!(state.active_event_blocks, vec![0]);
+        // The assistant and stable Working row are tracked, but neither dot
+        // enters the periodic tool/shell pulse.
+        assert_eq!(state.active_event_blocks, vec![0, 1]);
         assert!(!event_dot_animating(&state));
         state.advance_event_dot_animation();
     }

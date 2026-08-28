@@ -137,6 +137,14 @@ fn text_turn_with_stop(text: &str, stop_reason: &str) -> String {
     msg_start() + &text_block(0, &[text]) + &msg_end(stop_reason)
 }
 
+fn empty_turn() -> String {
+    msg_start() + &msg_end("end_turn")
+}
+
+fn reasoning_only_turn(text: &str) -> String {
+    msg_start() + &thinking_block(0, text) + &msg_end("end_turn")
+}
+
 fn openai_text_turn(text: &str) -> String {
     let text = serde_json::to_string(text).unwrap();
     format!(
@@ -1166,6 +1174,46 @@ fn request_has_no_tools(request: &serde_json::Value) -> bool {
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn normal_terminal_turn_without_user_visible_content_fails_loudly() {
+    for body in [empty_turn(), reasoning_only_turn("private trace only")] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("messages"))
+            .respond_with(Script {
+                bodies: vec![body],
+                next: AtomicUsize::new(0),
+            })
+            .mount(&server)
+            .await;
+
+        let workspace_dir = tempfile::tempdir().unwrap();
+        let session_dir = tempfile::tempdir().unwrap();
+        let workspace = workspace_dir.path().canonicalize().unwrap();
+        let session_path = session_dir.path().join("session.jsonl");
+        let mut agent = build_agent(&server.uri(), &workspace, &session_path, Some(4));
+
+        let mut run = agent.prompt("return an answer").await.unwrap();
+        let events = collect(&mut run).await;
+        match assert_single_run_finished(&events) {
+            FinishReason::Failed(error) => {
+                assert!(
+                    error.to_string().contains("no user-visible content"),
+                    "unexpected failure: {error}"
+                );
+            }
+            other => panic!("empty terminal response must fail, got {other:?}"),
+        }
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnFinished { .. })),
+            "an empty turn must not be presented as a completed model turn"
+        );
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
 async fn retryable_initial_stream_open_is_retried_by_the_agent() {
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
@@ -1645,10 +1693,10 @@ async fn connect_retry_delay_is_cancellable() {
 }
 
 #[tokio::test]
-async fn body_disconnect_after_output_discards_partial_and_retries_network_loss() {
+async fn body_disconnect_after_output_never_replays_ambiguous_generation() {
     let (uri, calls) = interrupted_body_server(
-        partial_text_turn("discarded partial"),
-        text_turn("recovered exactly once"),
+        partial_text_turn("observed partial generation"),
+        text_turn("must never be requested"),
     )
     .await;
     let workspace_dir = tempfile::tempdir().unwrap();
@@ -1661,39 +1709,29 @@ async fn body_disconnect_after_output_discards_partial_and_retries_network_loss(
     let events = collect(&mut run).await;
     assert!(matches!(
         assert_single_run_finished(&events),
-        FinishReason::Completed
+        FinishReason::Failed(_)
     ));
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::OutputDelta {
             channel: OutputChannel::Text,
             text,
-        } if text.contains("discarded partial")
+        } if text.contains("observed partial generation")
     )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ProviderRetry {
-            attempt: 1,
-            max_attempts: 5,
-            error,
-            ..
-        } if error.contains("Are you connected to the internet?")
-    )));
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::OutputDelta {
-            channel: OutputChannel::Text,
-            text,
-        } if text.contains("recovered exactly once")
-    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ProviderRetry { .. })),
+        "observed generation makes the request ambiguous and non-replayable"
+    );
     assert_eq!(
         events
             .iter()
             .filter(|event| matches!(event, AgentEvent::TurnStarted))
             .count(),
-        2
+        1
     );
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

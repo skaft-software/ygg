@@ -940,7 +940,7 @@ impl ShellState {
             // Keep the model-status row below the delegated event while the
             // child is alive. This is the same status the hidden spawn tool
             // would otherwise reopen after its ToolFinished event.
-            self.open_reasoning_status();
+            self.open_working_status();
         }
     }
 
@@ -1125,19 +1125,8 @@ impl ShellState {
         self.verbose_tools
     }
 
-    fn reasoning_status_enabled(&self) -> bool {
-        let reasoning = self
-            .run_reasoning
-            .as_deref()
-            .unwrap_or(&self.reasoning)
-            .trim()
-            .to_ascii_lowercase();
-        !reasoning.is_empty() && !matches!(reasoning.as_str(), "off" | "none" | "disabled")
-    }
-
-    fn open_reasoning_status(&mut self) {
-        let expandable = self.reasoning_status_enabled();
-        self.open_activity_status((!expandable).then_some("Working"), expandable);
+    fn open_working_status(&mut self) {
+        self.open_activity_status(Some("Working"), false);
     }
 
     fn open_activity_status(&mut self, label: Option<&str>, show_reasoning_hint: bool) {
@@ -1183,12 +1172,14 @@ impl ShellState {
     }
 
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
-        if channel == OutputChannel::Text {
+        // The first public response delta ends the reasoning phase. Move the
+        // activity row below the response exactly once; later text deltas update
+        // the same block without removing/reinserting `Working` on every token.
+        if channel == OutputChannel::Text && self.active_text.is_none() {
             if let Some(index) = self.active_reasoning {
                 let transient = matches!(
                     self.transcript.get(index),
-                    Some(TranscriptBlock::Reasoning(reasoning))
-                        if reasoning.text.is_empty()
+                    Some(TranscriptBlock::Reasoning(reasoning)) if reasoning.text.is_empty()
                 );
                 if transient {
                     self.remove_transient_activity_block(index);
@@ -1204,6 +1195,7 @@ impl ShellState {
                 }
             }
         }
+
         let active_index = match channel {
             OutputChannel::Text => self.active_text,
             OutputChannel::Reasoning => self.active_reasoning,
@@ -1221,10 +1213,8 @@ impl ShellState {
                         && !existing.show_reasoning_hint
                         && existing.reasoning_heading.as_deref() == Some("Working")
                     {
-                        // A reasoning-off placeholder is still truthful before
-                        // first output. If the provider nevertheless emits a
-                        // private trace, promote it to the normal expandable
-                        // reasoning presentation.
+                        // A generic request placeholder becomes `Thinking` only
+                        // when the provider actually emits reasoning content.
                         existing.reasoning_heading = None;
                         existing.show_reasoning_hint = true;
                     }
@@ -1238,6 +1228,9 @@ impl ShellState {
                     self.register_active_event(index);
                 }
                 self.touch_block(index);
+                if channel == OutputChannel::Text && self.run.is_active() {
+                    self.open_working_status();
+                }
                 return;
             }
             match channel {
@@ -1277,6 +1270,9 @@ impl ShellState {
             OutputChannel::Text => {
                 self.active_text = Some(index);
                 self.register_active_event(index);
+                if self.run.is_active() {
+                    self.open_working_status();
+                }
             }
             OutputChannel::Reasoning => {
                 self.active_reasoning = Some(index);
@@ -1347,6 +1343,40 @@ impl ShellState {
         }
     }
 
+    /// Settle one provider turn without implying that the owning run is done.
+    /// The stable `Working` row survives tool-selection and finalization gaps;
+    /// only an authoritative run outcome removes it.
+    fn finish_turn_streaming_blocks(&mut self) {
+        if let Some(index) = self.active_text.take() {
+            self.unregister_active_event(index);
+            if let Some(TranscriptBlock::Assistant(assistant)) = self.transcript.get_mut(index) {
+                assistant.finish();
+                self.touch_block(index);
+            }
+        }
+
+        let working = self.active_reasoning.is_some_and(|index| {
+            matches!(
+                self.transcript.get(index),
+                Some(TranscriptBlock::Reasoning(reasoning))
+                    if reasoning.text.is_empty()
+                        && !reasoning.show_reasoning_hint
+                        && reasoning.reasoning_heading.as_deref() == Some("Working")
+            )
+        });
+        if !working {
+            if let Some(index) = self.active_reasoning.take() {
+                self.unregister_active_event(index);
+                if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
+                {
+                    reasoning.finish_reasoning();
+                    self.touch_block(index);
+                }
+            }
+            self.open_working_status();
+        }
+    }
+
     fn has_active_event_dot(&self) -> bool {
         let markers_enabled = self.theme.resolve::<bool>("margin_markers").unwrap_or(true);
         let thinking_spinner = self
@@ -1356,9 +1386,7 @@ impl ShellState {
         self.active_event_blocks
             .iter()
             .any(|index| match self.transcript.get(*index) {
-                Some(TranscriptBlock::Reasoning(reasoning)) => {
-                    !self.verbose_tools && !reasoning.finished && !reasoning.reasoning_expanded
-                }
+                Some(TranscriptBlock::Reasoning(_)) => false,
                 Some(TranscriptBlock::Tool(panel)) => markers_enabled && !panel.finished,
                 Some(TranscriptBlock::Shell(shell)) => markers_enabled && shell.running,
                 _ => false,
@@ -1419,17 +1447,8 @@ impl ShellState {
         for position in 0..self.active_event_blocks.len() {
             let index = self.active_event_blocks[position];
             let markers_enabled = self.theme.resolve::<bool>("margin_markers").unwrap_or(true);
-            let thinking_spinner = self
-                .theme
-                .resolve::<bool>("thinking_spinner")
-                .unwrap_or(false);
             let visible = match self.transcript.get(index) {
-                Some(TranscriptBlock::Reasoning(reasoning)) => {
-                    !self.verbose_tools
-                        && !reasoning.finished
-                        && !reasoning.reasoning_expanded
-                        && (markers_enabled || thinking_spinner)
-                }
+                Some(TranscriptBlock::Reasoning(_)) => false,
                 Some(TranscriptBlock::Tool(panel)) => markers_enabled && !panel.finished,
                 Some(TranscriptBlock::Shell(shell)) => markers_enabled && shell.running,
                 _ => false,
@@ -1904,7 +1923,7 @@ impl InteractiveShell {
             .run
             .begin_route(&provider_status, provider, model)
             .expect("a new prompt is accepted only after the previous run terminates");
-        state.open_reasoning_status();
+        state.open_working_status();
         id
     }
 
@@ -2011,7 +2030,7 @@ impl InteractiveShell {
             }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();
-                state.open_reasoning_status();
+                state.open_working_status();
                 state.turn_generation_started_at = None;
                 state.turn_streamed_output_bytes = 0;
             }
@@ -2032,7 +2051,7 @@ impl InteractiveShell {
                         persisted: true,
                     });
                 }
-                state.open_reasoning_status();
+                state.open_working_status();
             }
             AgentEvent::FollowUpDelivered { messages } => {
                 state.close_streaming_blocks();
@@ -2046,7 +2065,7 @@ impl InteractiveShell {
                         persisted: true,
                     });
                 }
-                state.open_reasoning_status();
+                state.open_working_status();
             }
             AgentEvent::CompactionStarted { .. } => {
                 // Overflow recovery can begin after a partial provider
@@ -2090,7 +2109,7 @@ impl InteractiveShell {
                     }
                 }
                 if result.is_ok() {
-                    state.open_reasoning_status();
+                    state.open_working_status();
                 }
             }
             AgentEvent::TurnStarted => {
@@ -2232,7 +2251,7 @@ impl InteractiveShell {
                     )
                 });
                 if !tool_still_running {
-                    state.open_reasoning_status();
+                    state.open_working_status();
                 }
             }
             AgentEvent::TurnFinished {
@@ -2241,7 +2260,7 @@ impl InteractiveShell {
                 run_cost_microdollars,
                 ..
             } => {
-                state.close_streaming_blocks();
+                state.finish_turn_streaming_blocks();
                 let requested_at = state.turn_requested_at;
                 if let Some(started_at) = state.turn_generation_started_at.take() {
                     let elapsed = started_at.elapsed();

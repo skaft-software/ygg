@@ -1104,8 +1104,16 @@ struct ResponsesResponseFailedBlock {
 
 #[derive(Deserialize)]
 struct ResponsesErrorDto {
-    code: String,
+    /// OpenAI-compatible gateways emit JSON `null` when no stable error code is
+    /// available. Preserve the provider message instead of turning that valid
+    /// error envelope into a decoder failure.
+    #[serde(default)]
+    code: Option<String>,
+    /// The human-readable provider error remains required. Missing or nullable
+    /// messages are malformed and must not be silently replaced.
     message: String,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 // OpenAI Responses usage uses `input_tokens`/`output_tokens` (NOT the Chat
@@ -1552,8 +1560,8 @@ pub(crate) fn decode_stream_event(
         }
         ResponsesSseEvent::ResponseFailed { response } => {
             return Err(AiError::Provider(ProviderError {
-                code: Some(response.error.code),
-                kind: None,
+                code: response.error.code,
+                kind: response.error.kind,
                 message: response.error.message,
                 request_id: None,
             }));
@@ -1563,11 +1571,12 @@ pub(crate) fn decode_stream_event(
             message,
             error,
         } => {
-            let nested_code = error.as_ref().map(|error| error.code.clone());
+            let nested_code = error.as_ref().and_then(|error| error.code.clone());
+            let nested_kind = error.as_ref().and_then(|error| error.kind.clone());
             let nested_message = error.map(|error| error.message);
             return Err(AiError::Provider(ProviderError {
                 code: code.or(nested_code),
-                kind: None,
+                kind: nested_kind,
                 message: message
                     .or(nested_message)
                     .unwrap_or_else(|| "provider stream error".to_owned()),
@@ -2777,6 +2786,34 @@ data: {"type":"response.completed","response":{"output":[{"type":"function_call"
             }
             other => panic!("expected Provider, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn codex_nested_error_accepts_observed_nullable_code() {
+        let err = run(fx!("codex_nested_nullable_error.sse"), 1)
+            .await
+            .unwrap_err();
+        match err {
+            AiError::Provider(provider) => {
+                assert_eq!(provider.code, None);
+                assert_eq!(provider.kind.as_deref(), Some("server_error"));
+                assert_eq!(provider.message, "The upstream provider ended the request");
+            }
+            other => panic!("expected Provider, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_nested_error_still_requires_a_string_message() {
+        let err = run(fx!("codex_nested_error_missing_message.sse"), 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AiError::Decode(_)), "got {err:?}");
+        assert!(
+            err.to_string()
+                .contains("invalid OpenAI Responses `error` event"),
+            "got {err}"
+        );
     }
 
     // f5: opaque reasoning with no visible delta must still surface a reasoning

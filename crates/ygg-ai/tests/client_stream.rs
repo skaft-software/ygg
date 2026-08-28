@@ -628,9 +628,8 @@ async fn responses_websocket_connection_limit_retires_socket_and_falls_back() {
     ));
     assert!(stream.next().await.is_none());
 
-    // Let the actor retire the poisoned socket before the next request. The
-    // pool then takes the ordinary HTTP/SSE path for this session key.
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    // Retirement is authoritative before the provider error is published, so
+    // an immediate next request deterministically takes HTTP/SSE.
     let mut fallback = client
         .stream(
             &model,

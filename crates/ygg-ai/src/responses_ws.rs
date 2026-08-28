@@ -659,19 +659,20 @@ async fn run_connection<S>(
                         update_continuation(&command.body, &value, &mut continuation);
                     }
                     let connection_refresh = connection_refresh_error(&value);
+                    if connection_refresh {
+                        // Retire the poisoned socket before publishing the
+                        // provider error. An immediate agent retry must observe
+                        // the disabled key and take the safe HTTP fallback,
+                        // never race another command onto this actor.
+                        alive.store(false, Ordering::Release);
+                        disable_key(&state, key.as_deref()).await;
+                    }
                     if command.reply.send(Ok(value)).await.is_err() {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
                         break 'actor;
                     }
                     if connection_refresh {
-                        // The provider has retired this long-lived socket for
-                        // connection-lifetime reasons. Do not leave a poisoned
-                        // connection in the session pool: the next request
-                        // falls back to HTTP/SSE instead of receiving the same
-                        // terminal error forever.
-                        alive.store(false, Ordering::Release);
-                        disable_key(&state, key.as_deref()).await;
                         break 'actor;
                     }
                     if is_terminal {
@@ -699,19 +700,20 @@ async fn run_connection<S>(
                         update_continuation(&command.body, &value, &mut continuation);
                     }
                     let connection_refresh = connection_refresh_error(&value);
+                    if connection_refresh {
+                        // Retire the poisoned socket before publishing the
+                        // provider error. An immediate agent retry must observe
+                        // the disabled key and take the safe HTTP fallback,
+                        // never race another command onto this actor.
+                        alive.store(false, Ordering::Release);
+                        disable_key(&state, key.as_deref()).await;
+                    }
                     if command.reply.send(Ok(value)).await.is_err() {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
                         break 'actor;
                     }
                     if connection_refresh {
-                        // The provider has retired this long-lived socket for
-                        // connection-lifetime reasons. Do not leave a poisoned
-                        // connection in the session pool: the next request
-                        // falls back to HTTP/SSE instead of receiving the same
-                        // terminal error forever.
-                        alive.store(false, Ordering::Release);
-                        disable_key(&state, key.as_deref()).await;
                         break 'actor;
                     }
                     if is_terminal {
@@ -965,6 +967,42 @@ mod tests {
             .await
             .expect("actor did not stop after its pool was dropped")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_an_active_response_retires_the_socket_and_provider_work() {
+        let (client, mut server) = websocket_pair().await;
+        let state = Arc::new(Mutex::new(PoolState::default()));
+        let (connection, actor) =
+            spawn_test_actor(client, &state, "cancel", Duration::from_secs(60)).await;
+        let (reply, events) = mpsc::channel(1);
+        let (started, started_rx) = oneshot::channel();
+        connection
+            .sender
+            .send(RequestCommand {
+                body: serde_json::json!({"model": "gpt", "input": []}),
+                reply,
+                started,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(server.next().await, Some(Ok(Message::Text(_)))));
+        started_rx.await.unwrap().unwrap();
+        drop(events);
+
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("cancelled request left its WebSocket actor running")
+            .unwrap();
+        let close = tokio::time::timeout(Duration::from_secs(1), server.next())
+            .await
+            .expect("cancelled request did not close the provider socket");
+        assert!(matches!(close, Some(Ok(Message::Close(_))) | None));
+        assert!(!connection.alive.load(Ordering::Acquire));
+        let state = state.lock().await;
+        assert!(!state.sessions.contains_key("cancel"));
+        assert!(state.disabled.contains("cancel"));
     }
 
     #[test]

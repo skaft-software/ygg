@@ -138,16 +138,17 @@ Fenced Markdown code is borderless and uses the compiled default's terminal-adap
 
 ## Reasoning presentation
 
-Live reasoning is collapsed into a plain-weight model-colored row with a
-blinking model-colored dot in the event margin, plus a subdued, aligned
-`└ (ctrl+o to expand)` disclosure row. The heading cache advances only from
-semantic ATX headings or paragraphs consisting solely of bold text. It never
-infers a label from body prose, sanitizes provider text before display, and uses
-`Thinking` until the model emits a heading. A reasoning-off wait uses the
-truthful label `Working` but no disclosure affordance; compaction similarly uses
-`Compacting context`. Expanded reasoning keeps the same inset without an
-event-margin dot or a synthetic first-row bullet. Completed collapsed reasoning
-and transient activity leave no rows.
+Every accepted run opens a stable `Working` row immediately. It becomes
+`Thinking` with a subdued, aligned `└ (ctrl+o to expand)` disclosure only after
+the provider emits an actual reasoning delta, and returns to `Working` while
+public output or finalization continues. The steady model-colored event-margin
+dot does not repaint on a timer. The heading cache advances only from semantic
+ATX headings or paragraphs consisting solely of bold text; it never infers a
+label from body prose and sanitizes provider text before display. Compaction uses
+`Compacting context`, and tool execution may retain its tool-specific lifecycle
+row. Expanded reasoning keeps the same inset without an event-margin dot or a
+synthetic first-row bullet. Only authoritative run settlement removes transient
+activity rows.
 
 ## Run outcomes
 
@@ -162,10 +163,11 @@ recovering raw provider envelopes or headers.
 Tool calls expose deterministic intent and lifecycle rows. Event-margin dots
 identify active collapsed reasoning, assistant responses, and tool or shell
 execution, and every dot uses the same glyph footprint. The collapsed-reasoning
-dot blinks; other active dots pulse through foreground and muted tones rather
-than changing size. Successful completed event dots use green, and failed tools
-use red. Raw protocol arguments and envelopes, unsanitized failure evidence,
-and extension-rendered payloads remain internal accountability/provenance data
+dot remains steady; active tool and shell dots may pulse through foreground and
+muted tones rather than changing size. Successful completed event dots use green,
+and failed tools use red. Raw protocol arguments and envelopes, unsanitized
+failure evidence, and extension-rendered payloads remain internal
+accountability/provenance data
 and are excluded from transcript copy. For operational feedback, the TUI renders
 bounded sanitized projections: search results and Bash/local-shell output use a
 muted tail, while edit/write results use a bounded unified diff. Omission
