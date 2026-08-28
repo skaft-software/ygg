@@ -6,8 +6,10 @@ and any adjudication exclusions are retained.
 
 Current artifacts include the frozen control fingerprint
 ([baseline-v0.6.2.md](baseline-v0.6.2.md)), the dated aggregate failure report
-([failure-report-v0.6.2-2026-08-28.md](failure-report-v0.6.2-2026-08-28.md)), and
-the opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
+([failure-report-v0.6.2-2026-08-28.md](failure-report-v0.6.2-2026-08-28.md)),
+the complete token-efficiency audit
+([token-efficiency-v0.6.2-2026-08-28.md](token-efficiency-v0.6.2-2026-08-28.md)),
+and the opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
 
 ## Optional agent telemetry
 
@@ -40,9 +42,12 @@ Telemetry records:
 
 Usage semantics are explicit: `uncached_input_tokens` is the provider's
 standard-rate input bucket. `cache_read_tokens` and `cache_write_tokens` are
-disjoint additions. `provider_input_tokens` is their sum. `total_tokens` is the
-provider-reported total and must not be recomputed by adding a second copy of
-the cache buckets.
+disjoint additions; `cache_write_1h_tokens` is a subset of cache writes.
+`provider_input_tokens` is the three disjoint prompt buckets' sum.
+`reasoning_tokens` is a subset of output. `total_tokens` is Ygg's canonical
+normalized sum, not a promise that an overlapping or omitted provider wire
+`total_tokens` was preserved. Records with usage include `usage_scope`:
+`request`, `operation`, or `run_cumulative`; never sum cumulative snapshots.
 
 Telemetry is an observer, not a wire capture. It does not currently expose
 provider request IDs, exact response-header timing for compaction/gate calls,

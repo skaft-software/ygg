@@ -1194,6 +1194,14 @@ async fn retryable_initial_stream_open_is_retried_by_the_agent() {
         .filter(|event| matches!(event, AgentEvent::ProviderRetry { .. }))
         .count();
     assert_eq!(retries, 1, "the retry must be visible while it happens");
+    let starts = events
+        .iter()
+        .filter(|event| matches!(event, AgentEvent::TurnStarted))
+        .count();
+    assert_eq!(
+        starts, 2,
+        "each physical provider attempt needs its own timing lifecycle"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -1678,6 +1686,13 @@ async fn body_disconnect_after_output_discards_partial_and_retries_network_loss(
             text,
         } if text.contains("recovered exactly once")
     )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnStarted))
+            .count(),
+        2
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
@@ -1713,6 +1728,13 @@ async fn body_disconnect_before_output_retries_as_network_loss() {
             text,
         } if text.contains("recovered after reconnect")
     )));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnStarted))
+            .count(),
+        2
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 

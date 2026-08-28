@@ -4983,6 +4983,13 @@ impl Agent {
                             if cancelled {
                                 break Ok(None);
                             }
+                            // The retry is a distinct physical provider request.
+                            // Re-open its lifecycle after backoff so observers can
+                            // measure this attempt without charging sleep time to
+                            // request latency or losing its TTFT.
+                            let ev = AgentEvent::TurnStarted;
+                            notify_observers(&observers, &ev);
+                            yield ev;
                         }
                         result => break result,
                     }
@@ -5107,27 +5114,28 @@ impl Agent {
                                 };
                                 notify_observers(&observers, &ev);
                                 yield ev;
-                                let reopened = tokio::select! {
-                                    result = async {
-                                        tokio::time::sleep(delay).await;
-                                        open_provider_stream(
-                                            &client,
-                                            &model,
-                                            request_for_retry.clone(),
-                                            &abort,
-                                        ).await
-                                    } => result,
-                                    _ = abort.wait() => Ok(None),
+                                let cancelled = tokio::select! {
+                                    _ = tokio::time::sleep(delay) => false,
+                                    _ = abort.wait() => true,
                                 };
+                                if cancelled {
+                                    break 'consume Err(FinishReason::Aborted);
+                                }
+                                // Count and time the physical replacement request,
+                                // including stream establishment and TTFT but not backoff.
+                                let ev = AgentEvent::TurnStarted;
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                let reopened = open_provider_stream(
+                                    &client,
+                                    &model,
+                                    request_for_retry.clone(),
+                                    &abort,
+                                )
+                                .await;
                                 match reopened {
                                     Ok(Some(stream)) => {
                                         response_stream = stream;
-                                        // The replacement stream is established:
-                                        // a new attempt on the same model turn
-                                        // begins.
-                                        let ev = AgentEvent::TurnStarted;
-                                        notify_observers(&observers, &ev);
-                                        yield ev;
                                         attempt_saw_generation = false;
                                         continue 'consume;
                                     }
@@ -5215,27 +5223,28 @@ impl Agent {
                                 };
                                 notify_observers(&observers, &ev);
                                 yield ev;
-                                let reopened = tokio::select! {
-                                    result = async {
-                                        tokio::time::sleep(delay).await;
-                                        open_provider_stream(
-                                            &client,
-                                            &model,
-                                            request_for_retry.clone(),
-                                            &abort,
-                                        ).await
-                                    } => result,
-                                    _ = abort.wait() => Ok(None),
+                                let cancelled = tokio::select! {
+                                    _ = tokio::time::sleep(delay) => false,
+                                    _ = abort.wait() => true,
                                 };
+                                if cancelled {
+                                    break 'consume Err(FinishReason::Aborted);
+                                }
+                                // Count and time the physical replacement request,
+                                // including stream establishment and TTFT but not backoff.
+                                let ev = AgentEvent::TurnStarted;
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                                let reopened = open_provider_stream(
+                                    &client,
+                                    &model,
+                                    request_for_retry.clone(),
+                                    &abort,
+                                )
+                                .await;
                                 match reopened {
                                     Ok(Some(stream)) => {
                                         response_stream = stream;
-                                        // The replacement stream is established:
-                                        // a new attempt on the same model turn
-                                        // begins.
-                                        let ev = AgentEvent::TurnStarted;
-                                        notify_observers(&observers, &ev);
-                                        yield ev;
                                         attempt_saw_generation = false;
                                         // The retried stream re-emits every
                                         // event; drop shadow state from the

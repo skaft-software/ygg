@@ -183,7 +183,7 @@ def _microdollars_to_usd(cost: Any) -> float:
     return 0.0
 
 
-def _metrics_for_usage(record: dict[str, Any], metrics: SessionMetrics) -> dict[str, Any] | None:
+def _numeric_usage(record: dict[str, Any]) -> tuple[dict[str, int], float] | None:
     usage = record.get("usage")
     if not isinstance(usage, dict):
         return None
@@ -207,15 +207,40 @@ def _metrics_for_usage(record: dict[str, Any], metrics: SessionMetrics) -> dict[
     )
     if not numeric and cost_usd == 0:
         return None
-    input_tokens = numeric.get("input_tokens", 0)
-    cache_tokens = numeric.get("cache_read_tokens", 0)
-    output_tokens = numeric.get("output_tokens", 0)
-    metrics.input_tokens += input_tokens + cache_tokens
-    metrics.cache_tokens += cache_tokens
-    metrics.output_tokens += output_tokens
+    return numeric, cost_usd
+
+
+def _accumulate_usage(record: dict[str, Any], metrics: SessionMetrics) -> None:
+    parsed = _numeric_usage(record)
+    if parsed is None:
+        return
+    numeric, cost_usd = parsed
+    cache_read_tokens = numeric.get("cache_read_tokens", 0)
+    # Canonical Ygg prompt buckets are disjoint. Cache writes are provider-visible
+    # input too; cache_write_1h_tokens is a subset and must not be added again.
+    metrics.input_tokens += (
+        numeric.get("input_tokens", 0)
+        + cache_read_tokens
+        + numeric.get("cache_write_tokens", 0)
+    )
+    metrics.cache_tokens += cache_read_tokens
+    metrics.output_tokens += numeric.get("output_tokens", 0)
     metrics.cost_usd += cost_usd
-    metrics.turns += 1
+    if _usage_for_record(record) is not None:
+        metrics.turns += 1
     metrics.saw_usage = True
+
+
+def _metrics_for_usage(record: dict[str, Any]) -> dict[str, Any] | None:
+    parsed = _numeric_usage(record)
+    if parsed is None:
+        return None
+    numeric, cost_usd = parsed
+    input_tokens = numeric.get("input_tokens", 0)
+    cache_read_tokens = numeric.get("cache_read_tokens", 0)
+    cache_write_tokens = numeric.get("cache_write_tokens", 0)
+    provider_input_tokens = input_tokens + cache_read_tokens + cache_write_tokens
+    output_tokens = numeric.get("output_tokens", 0)
     extra = {
         key: value
         for key, value in numeric.items()
@@ -224,9 +249,11 @@ def _metrics_for_usage(record: dict[str, Any], metrics: SessionMetrics) -> dict[
     if record.get("endpoint") is not None:
         extra["endpoint"] = record["endpoint"]
     return {
-        "prompt_tokens": input_tokens + cache_tokens,
+        "prompt_tokens": provider_input_tokens,
         "completion_tokens": output_tokens,
-        "cached_tokens": cache_tokens,
+        # ATIF cached_tokens is a cache-hit subset of prompt_tokens, not an
+        # additional prompt bucket.
+        "cached_tokens": cache_read_tokens,
         "cost_usd": cost_usd,
         "extra": extra or None,
     }
@@ -285,17 +312,21 @@ def convert_session_file(
     if not records:
         raise ValueError("session contains no valid JSONL records")
 
+    metrics = SessionMetrics()
     usage_by_assistant: dict[str, dict[str, Any]] = {}
     for record in records:
         if record.get("type") != "usage":
             continue
         usage_record = record.get("record")
         if isinstance(usage_record, dict):
+            # Every durable usage record is one physical billable operation.
+            # Aggregate the complete run even when the associated message is no
+            # longer on the active branch; branch filtering is presentation-only.
+            _accumulate_usage(usage_record, metrics)
             result = _usage_for_record(usage_record)
             if result is not None:
                 usage_by_assistant[result[0] or ""] = usage_record
 
-    metrics = SessionMetrics()
     steps: list[dict[str, Any]] = []
     pending_results: list[dict[str, Any]] = []
     tool_call_steps: dict[str, int] = {}
@@ -369,7 +400,7 @@ def convert_session_file(
             )
         usage_record = usage_by_assistant.get(str(record.get("id")))
         if usage_record is not None:
-            atif_metrics = _metrics_for_usage(usage_record, metrics)
+            atif_metrics = _metrics_for_usage(usage_record)
             if atif_metrics is not None:
                 step["metrics"] = atif_metrics
         steps.append(step)

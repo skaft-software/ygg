@@ -356,12 +356,16 @@ def telemetry_summary(paths: list[str]) -> dict[str, Any]:
                 continue
             files.append(str(path))
             try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    value = json.loads(line)
-                    if isinstance(value, dict) and value.get("schema") == "ygg.telemetry.v1":
-                        records.append(value)
-            except (OSError, UnicodeError, json.JSONDecodeError):
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError):
                 continue
+            for line in lines:
+                try:
+                    value = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(value, dict) and value.get("schema") == "ygg.telemetry.v1":
+                    records.append(value)
     request_latencies = [float(record["elapsed_ms"]) for record in records if record.get("record") == "model_request_finished" and isinstance(record.get("elapsed_ms"), (int, float))]
     ttft = [float(record["ttft_ms"]) for record in records if record.get("record") == "model_request_finished" and isinstance(record.get("ttft_ms"), (int, float))]
     tool_latencies = [float(record["elapsed_ms"]) for record in records if record.get("record") == "tool_finished" and isinstance(record.get("elapsed_ms"), (int, float))]
@@ -378,7 +382,7 @@ def telemetry_summary(paths: list[str]) -> dict[str, Any]:
         "request_elapsed_ms": summarize(request_latencies),
         "ttft_ms": summarize(ttft),
         "tool_elapsed_ms": summarize(tool_latencies),
-        "usage_semantics": "uncached_input_tokens + cache_read_tokens + cache_write_tokens = provider_input_tokens; total_tokens is provider-reported.",
+        "usage_semantics": "uncached_input_tokens + cache_read_tokens + cache_write_tokens = provider_input_tokens; total_tokens is Ygg's normalized canonical total.",
     }
 
 

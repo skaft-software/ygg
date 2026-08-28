@@ -525,6 +525,7 @@ impl EventObserver for TelemetryObserver {
                 );
                 match result {
                     Ok(info) => {
+                        accumulate_usage(&mut state.last_usage, &info.usage);
                         fields.insert("status".into(), Value::String("committed".into()));
                         fields.insert(
                             "summary_bytes".into(),
@@ -548,6 +549,7 @@ impl EventObserver for TelemetryObserver {
                                 .input_tokens
                                 .saturating_add(info.usage.cache_read_tokens)
                                 .saturating_add(info.usage.cache_write_tokens),
+                            "operation",
                         ));
                         if let Some(cost) = info.cost_microdollars {
                             fields.insert("cost_microdollars".into(), Value::Number(cost.into()));
@@ -609,7 +611,7 @@ impl EventObserver for TelemetryObserver {
                     .input_tokens
                     .saturating_add(turn_usage.cache_read_tokens)
                     .saturating_add(turn_usage.cache_write_tokens);
-                let mut fields = usage_fields(turn_usage, provider_input_tokens);
+                let mut fields = usage_fields(turn_usage, provider_input_tokens, "request");
                 fields.insert("logical_turn".into(), Value::Number(logical_turn.into()));
                 fields.insert("attempt".into(), Value::Number(attempt_number.into()));
                 fields.insert("step".into(), Value::Number(step.into()));
@@ -654,6 +656,7 @@ impl EventObserver for TelemetryObserver {
                         .input_tokens
                         .saturating_add(usage.cache_read_tokens)
                         .saturating_add(usage.cache_write_tokens),
+                    "run_cumulative",
                 );
                 fields.insert("status".into(), Value::String("candidate_rejected".into()));
                 inner.emit(
@@ -710,6 +713,7 @@ impl EventObserver for TelemetryObserver {
                         .input_tokens
                         .saturating_add(state.last_usage.cache_read_tokens)
                         .saturating_add(state.last_usage.cache_write_tokens),
+                    "run_cumulative",
                 ));
                 inner.emit(Some(resource_owner), Some(&run_id), "run_finished", fields);
                 inner.owners.remove(resource_owner);
@@ -888,8 +892,29 @@ fn finish_reason_label(reason: &FinishReason) -> &'static str {
     }
 }
 
-fn usage_fields(usage: &Usage, provider_input_tokens: u64) -> Map<String, Value> {
+fn accumulate_usage(total: &mut Usage, next: &Usage) {
+    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
+    total.cache_read_tokens = total
+        .cache_read_tokens
+        .saturating_add(next.cache_read_tokens);
+    total.cache_write_tokens = total
+        .cache_write_tokens
+        .saturating_add(next.cache_write_tokens);
+    total.cache_write_1h_tokens = total
+        .cache_write_1h_tokens
+        .saturating_add(next.cache_write_1h_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
+    total.reasoning_tokens = total.reasoning_tokens.saturating_add(next.reasoning_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
+}
+
+fn usage_fields(
+    usage: &Usage,
+    provider_input_tokens: u64,
+    usage_scope: &'static str,
+) -> Map<String, Value> {
     let mut fields = Map::new();
+    fields.insert("usage_scope".into(), Value::String(usage_scope.into()));
     fields.insert(
         "uncached_input_tokens".into(),
         Value::Number(usage.input_tokens.into()),
@@ -1097,6 +1122,62 @@ mod tests {
         assert_eq!(request["uncached_input_tokens"], 3);
         assert_eq!(request["cache_read_tokens"], 4);
         assert_eq!(request["provider_input_tokens"], 7);
+        assert_eq!(request["usage_scope"], "request");
+        let run = records
+            .iter()
+            .find(|record| record["record"] == "run_finished")
+            .unwrap();
+        assert_eq!(run["usage_scope"], "run_cumulative");
+    }
+
+    #[test]
+    fn run_usage_includes_compaction_when_the_following_request_never_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let observer = TelemetryObserver::new(&path, "test").unwrap();
+        observer.on_run_started_for_owner("entry-1", &UserInput::from("task"), &model(), "owner-1");
+        observer.on_event_for_owner(
+            &AgentEvent::CompactionFinished {
+                reason: CompactionReason::Threshold,
+                result: Ok(crate::events::CompactionInfo {
+                    kind: CompactionKind::Local,
+                    summary: "summary".into(),
+                    first_kept: crate::EntryId("entry-1".into()),
+                    usage: Usage {
+                        input_tokens: 5,
+                        cache_read_tokens: 2,
+                        output_tokens: 3,
+                        total_tokens: 10,
+                        ..Usage::default()
+                    },
+                    elapsed: Duration::from_millis(1),
+                    cost_microdollars: None,
+                }),
+            },
+            "owner-1",
+        );
+        observer.on_event_for_owner(
+            &AgentEvent::RunFinished {
+                head: crate::EntryId("entry-1".into()),
+                reason: FinishReason::Failed(crate::AgentError::Workspace("failed".into())),
+            },
+            "owner-1",
+        );
+        drop(observer);
+
+        let records = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let run = records
+            .iter()
+            .find(|record| record["record"] == "run_finished")
+            .unwrap();
+        assert_eq!(run["uncached_input_tokens"], 5);
+        assert_eq!(run["cache_read_tokens"], 2);
+        assert_eq!(run["output_tokens"], 3);
+        assert_eq!(run["total_tokens"], 10);
     }
 
     #[cfg(unix)]

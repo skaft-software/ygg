@@ -289,7 +289,11 @@ Each trial's `agent/` directory retains the following evidence:
   authoritative replay/debug artifact. Only the active branch is converted.
 - `trajectory.json` — conservative ATIF-v1.6 conversion of durable user,
   assistant, tool-call, tool-result, and usage records. Harbor's `Trajectory`
-  model validates it when Harbor is installed.
+  model validates it when Harbor is installed. Its `prompt_tokens` and Harbor
+  `n_input_tokens` equal uncached input + cache reads + cache writes; cached
+  tokens are an included cache-hit subset and must not be added again. Run
+  totals include every durable usage operation even when its message is no
+  longer on the active presentation branch.
 - `native-session-manifest.json` — paths, byte counts, and SHA-256 hashes of the
   redacted native JSONL files.
 - `session-*-error.txt` — non-fatal conversion/retention diagnostics when an
