@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify the compact Terminal-Bench 2.1 evidence package."""
+
 from __future__ import annotations
 
 import hashlib
