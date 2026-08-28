@@ -1,94 +1,97 @@
 <p align="center">
   <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-braille.svg" alt="Ygg braille tree app icon" width="180">
+    <img src="docs/assets/ygg-braille.svg" alt="Yggdrasil braille tree app icon" width="180">
   </a>
 </p>
 
-<h1 align="center">ygg</h1>
+<h1 align="center">yggdrasil</h1>
 
 <p align="center">
-  <strong>The local-first coding agent.</strong><br>Provider agnostic. Language agnostic. Written fully in Rust.
+  <strong>Tiny coding agent. Serious throughput.</strong><br>
+  Run more agents without sacrificing your machine.
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.2"><img alt="Release: 0.6.2" src="https://img.shields.io/badge/release-0.6.2-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.3"><img alt="Release: 0.6.3" src="https://img.shields.io/badge/release-0.6.3-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
 </p>
 
 <p align="center">
-  <a href="https://skaft.org/ygg"><strong>Website</strong></a> ·
-  <a href="https://skaft.org/ygg/#install"><strong>Install</strong></a> ·
+  <a href="#install"><strong>Install</strong></a> ·
+  <a href="docs/benchmarks/tb21-v0.6.2/README.md"><strong>Evidence</strong></a> ·
   <a href="https://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-<p align="center">
-  <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-demo-v0.3.1-alpha.gif" alt="ygg — a local-first coding agent — terminal demo" width="800">
-  </a>
-</p>
-
----
-
-ygg is a local-first coding agent written in Rust. Everything important happens on your machine: model traffic goes directly from you to the endpoint you choose, sessions are local inspectable JSONL, and a supervised extension runtime lets you teach ygg new tricks without giving up control.
-
-**Provider agnostic.** Local OpenAI-compatible servers (llama.cpp, vLLM, LM Studio, Ollama-style endpoints) sit beside OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, and more as equal citizens — same tools, same session model, same terminal.
-
-**Language agnostic.** The extension API is line-delimited JSON-RPC over stdio, so an extension can be written in any language; the official Python SDK is a convenience, not a requirement. Prompt templates are Pi-compatible, skills follow the open Agent Skills spec (`SKILL.md`), and packaged tool catalogs can port adapters written for other agents.
-
-**Supervised extensions.** First-party bundles ship separately, install checksum-verified and inert, and stay disabled until you explicitly enable **and** trust them. Bounded subagent delegation runs up to eight concurrent workers with live telemetry, mutation grants you opt into, and continue/resume across sessions.
-
-> **Apple Foundation Models:** On macOS 27, run `fm serve` from Terminal.app, then configure its OpenAI-compatible endpoint as a custom provider. See the [ygg documentation](https://skaft.org/ygg/docs/) for the current setup.
-
-## Why ygg
-
-Local endpoints are a primary path rather than a compatibility mode. Ygg keeps provider capabilities explicit, regression-tests its default base prompt, loads project context only from trusted workspaces, lets users remove tool authority, and stores sessions on disk.
-
-| Principle | What it means in ygg |
-| --- | --- |
-| **Local models first** | First-class custom endpoints, offline startup, cold-start-aware timeouts, model discovery, endpoint-reported reasoning controls, and token metrics. |
-| **Provider agnostic** | One conversation model across OpenAI Chat, OpenAI Responses, and Anthropic Messages; hosted and local endpoints are configured identically and swapped with a flag. |
-| **Language agnostic extensions** | The extension runtime speaks JSON-RPC over stdio — any language works. Pi-compatible prompt templates and Agent-Skills-spec skills port existing agent plugins to ygg. |
-| **One conversation model** | OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages share typed request, message, tool, usage, and streaming models. |
-| **Durable by construction** | Sessions are append-only, parent-linked, branchable, locked, synced, repairable, and inspectable without ygg running. |
-| **Authority is explicit** | Workspace trust, tool allowlists, mutation controls, command controls, bounded I/O, and extension trust are visible user decisions. |
-| **The terminal handles presentation** | Native scrollback and selection by default, opt-in semantic scrolling, semantic rendering, narrow layouts, and plain-output fallbacks share one terminal model. |
-| **Customization is local data** | Prompts, skills, instructions, and extensions are ordinary files with deterministic precedence and reloadable snapshots. |
+Yggdrasil is a small, local-first coding agent written in Rust. The `ygg` CLI
+works with local OpenAI-compatible servers and cloud providers, keeps durable
+inspectable sessions on disk, and puts optional capabilities outside its minimal
+core so it stays out of the model's way.
 
 ## Install
 
-ygg currently supports macOS and Linux and requires
-[ripgrep](https://github.com/BurntSushi/ripgrep). Prebuilt `v0.6.2`
-binaries are available for GNU/Linux x86-64, macOS x86-64, and macOS Apple
-silicon. Linux musl is not supported by this release.
-
-### Installer
-
-The version-pinned installer detects the current operating system and
-architecture, verifies the matching release archive, and installs `ygg` and
-`ygg-host` under `~/.local/bin`:
+Yggdrasil supports macOS and GNU/Linux x86-64 and requires
+[ripgrep](https://github.com/BurntSushi/ripgrep). The version-pinned installer
+verifies the release archive and installs `ygg` and `ygg-host` under
+`~/.local/bin`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.2/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.3/install-ygg.sh | sh
 ```
-
-No Rust toolchain is needed for the default installation. Restart the shell,
-then verify the installation:
 
 ```sh
-ygg --version
+ygg --version   # ygg 0.6.3
 ygg --help
 ```
+
+No Rust toolchain is needed. Prebuilt binaries cover GNU/Linux x86-64, macOS
+x86-64, and macOS Apple silicon; Linux musl is not included. Use the same binary
+with [cloud providers](#use-a-cloud-model) or [your own local endpoint](#use-custom-openai-compatible-providers).
+
+## Current proof
+
+On the frozen Ygg v0.6.2 Terminal-Bench 2.1 campaign with GPT-5.6 Sol at
+maximum reasoning, 89 tasks × 5 trials:
+
+| Result scope | Score |
+| --- | ---: |
+| Raw Harbor verifier | **87.87% — 391/445** |
+| Primary independent rubric audit | **86.97% — 387/445** |
+| Strict audit sensitivity | **86.52% — 385/445** |
+| Audited Pass@5 | **97.75% — 87/89** |
+
+The integrity review used GLM-5.3 Flash as a surrogate judge over all 391 raw
+successes, followed by manual review. It is **not official Terminal-Bench
+maintainer adjudication**, and the campaign was not rerun for v0.6.3. Read the
+[methodology, artifact hashes, exclusions, and reproduction guide](docs/benchmarks/tb21-v0.6.2/README.md).
+
+In the matched published GPT-5.6 Sol/max run, Codex scored **83.37% raw**
+(inferred from its published official result plus 32 exclusions); Ygg scored
+**87.87% raw**. This is a raw aggregate comparison across different run
+dates/provider snapshots—not a comparison between Ygg's surrogate audit and
+Codex's official maintainer adjudication.
+
+## Why Yggdrasil
+
+- **Minimal native core:** the CLI and host ship as Rust binaries; normal use needs no language runtime.
+- **Local models are first-class:** custom endpoints, offline startup, discovery,
+  explicit context limits, and the same tools/session model as cloud routes.
+- **Durable work:** local append-only sessions can resume, branch, repair, and
+  export without a hosted control plane.
+- **Capability at the edges:** browser, MCP, web search, Serve, and subagents stay
+  in separately installed, explicitly trusted extensions.
+- **Inspectable performance work:** benchmark methodology, limitations, raw score
+  scopes, and accounting are versioned with the code.
 
 To compile the pinned tag instead, install
 [Rust 1.86 or newer](https://rustup.rs/) and run:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.2/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.3/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -99,7 +102,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.2 \
+  --tag v0.6.3 \
   --bins \
   ygg-coding-agent
 ```
@@ -126,7 +129,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.2 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.3 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -224,11 +227,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.2
+scripts/build-ygg-image.sh ygg:0.6.3
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.2 --model claude-sonnet-4-6
+  ygg:0.6.3 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -602,7 +605,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
-- The compiled default theme is the only theme exposed by the v0.6.2 runtime.
+- The compiled default theme is the only theme exposed by the v0.6.3 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -625,7 +628,7 @@ ygg --mouse app
 
 ## Terminal theming
 
-Theme selection is disabled in v0.6.2. The TUI and graphical Serve frontend expose
+Theme selection is disabled in v0.6.3. The TUI and graphical Serve frontend expose
 only Ygg's compiled default theme; that does **not** mean a fixed accent hue.
 The selected model's deterministic palette changes the atmosphere while layout,
 interaction grammar, and semantic status colours remain stable. See
@@ -957,13 +960,13 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.6.2.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.3.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | v0.6.2 default-only status and reserved schema. |
+| [Themes](docs/themes.md) | v0.6.3 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |

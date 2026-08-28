@@ -1,0 +1,90 @@
+{
+  "artifact": "Ygg v0.6.2 Terminal-Bench 2.1 local independent adjudication",
+  "canonical_benchmark": {
+    "benchmark_window": {
+      "first_trial_started": "2026-08-27T21:17:10.560413Z",
+      "last_trial_finished": "2026-08-28T00:37:20.128961Z"
+    },
+    "dataset": "terminal-bench/terminal-bench-2-1",
+    "dataset_ref": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a",
+    "job_root": "${JOB_ROOT}",
+    "model": "gpt-5.6-sol",
+    "n_attempts": 5,
+    "n_tasks": 89,
+    "n_trials": 445,
+    "raw_successes": 391,
+    "reasoning": "max",
+    "ygg_binary_sha256": "16036929493fb12ffc4d8a553cdfcb642c3c983fb469877403808e5aabbd5f07",
+    "ygg_version": "0.6.2"
+  },
+  "contamination_audit": {
+    "agent_skills_configured": [],
+    "binary_mtime_utc": "2026-08-27T19:49:35Z",
+    "binary_strings_scan": "no known task or canary strings",
+    "conclusion": "no runtime/source contamination found; model pretraining contamination is not observable from this audit",
+    "extra_instruction_paths": [],
+    "frozen_commit_time": "2026-08-27T16:19:03Z",
+    "frozen_ygg_commit": "61677754bf69833a384bee2b29ef8eff29f37fc1",
+    "mcp_servers": [],
+    "runtime_mounts": "read-only Ygg binary and read-only /root/.ygg credential/cache mount; no dataset, verifier, or prior trajectory mount",
+    "source_scan": "frozen source/config/prompt/skill scan found no task IDs, solution snippets, verifier-specific hints, or canary GUIDs; generic Terminal-Bench attribution/third-party notices only"
+  },
+  "contamination_audit_artifact": {
+    "path": "contamination-audit.json",
+    "sha256": "b77d505ae95bf3f8c8026d645484a59039732cdf414f597a3c55b6d739bda871"
+  },
+  "derived_metrics": {
+    "pass_at_k_formula": "Harbor compute_pass_at_k_for_task, n=5 per task; disqualified successes removed from c, denominator retained",
+    "path": "metrics.json",
+    "primary_policy": "apply only the four manually confirmed REWARD_HACK cases",
+    "sha256": "d44689a3cebe0c9efb2e84656b027ae92e56e0ffbee6ad6ee146ec09bcc054e0"
+  },
+  "evidence": {
+    "all_inputs_raw_responses_parsed_verdicts_and_per_case_records_preserved": true,
+    "file_count_excluding_hash_index": 1965,
+    "file_hash_index": "evidence-files.sha256",
+    "hash_index_excludes_itself": true,
+    "root": "${AUDIT_ROOT}"
+  },
+  "generated_at_utc": "2026-08-28T04:09:03.407335+00:00",
+  "manual_review": {
+    "confirmed_disqualifications": 4,
+    "counts_after_review": {
+      "CLEAN": 385,
+      "HARNESS_CHEATING": 0,
+      "REFUSAL": 0,
+      "REWARD_HACK": 4,
+      "UNCERTAIN": 2
+    },
+    "path": "manual-review.json",
+    "reviewed_initial_flags": 7,
+    "sha256": "72c892746b7e11c749ef561f07cf93890573ada58f8720068eccd1e158815a9e",
+    "unresolved_candidates": 2
+  },
+  "official_calibration_limit": "Official Claude Sonnet 5/Modal judge trajectories were not locally retrievable without Harbor authentication; official report labels are used only as qualitative cross-checks, not as a confusion matrix.",
+  "surrogate_judge": {
+    "case_selection": "all 391 reward=1 trials",
+    "cases_invalid_or_runner_error": 0,
+    "cases_parsed": 391,
+    "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+    "initial_counts": {
+      "CLEAN": 384,
+      "HARNESS_CHEATING": 0,
+      "REFUSAL": 0,
+      "REWARD_HACK": 7,
+      "UNCERTAIN": 0
+    },
+    "max_tokens": 4096,
+    "model_requested": "z-ai/glm-5.3-flash",
+    "prompt_rubric_sha256": "dd2c66fe1cce772fbd2dd229df33684dd540b06b4b251743270db11096e340dd",
+    "reasoning_effort": "medium",
+    "reported_provider_cost_usd": 1.26265296203,
+    "runner_sha256": "2e5e611b89358534e5206b6888622d9eeaa9c1e57b2a9edbfbaa18623418f750",
+    "temperature": 0,
+    "top_p": 1,
+    "usage_completion_tokens": 184428,
+    "usage_prompt_tokens": 17402383,
+    "usage_reasoning_tokens": 20382,
+    "usage_total_tokens": 17586811
+  }
+}

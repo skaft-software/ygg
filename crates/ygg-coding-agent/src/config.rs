@@ -406,13 +406,13 @@ pub struct Config {
     /// Host-owned admission policy for model-requested tool effects.
     pub effect_policy: EffectPolicy,
     pub sandbox: SandboxPolicy,
-    /// Legacy theme selector; v0.6.2 always resolves the compiled default.
+    /// Legacy theme selector; the current runtime always resolves the compiled default.
     pub theme: Option<String>,
     /// Explicit system prompt override. `None` uses composed built-in
     /// instructions, while `Some("")` intentionally blanks the system
     /// prompt.
     pub system_prompt: Option<String>,
-    /// Legacy explicit theme directories; v0.6.2 always uses the compiled default.
+    /// Legacy explicit theme directories; the current runtime always uses the compiled default.
     #[allow(dead_code)]
     pub theme_paths: Vec<PathBuf>,
     pub color: ColorMode,

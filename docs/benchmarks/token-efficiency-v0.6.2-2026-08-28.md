@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-28
 **Control:** Ygg `0.6.2` (`61677754bf69833a384bee2b29ef8eff29f37fc1`)
-**Harbor job:** `/home/achu/tb21-run/jobs/ygg-tb21-sol-max-k5-n20` on `temper-inference`
+**Harbor job:** retained canonical `${JOB_ROOT}` on a Linux amd64 Docker host
 **Workload:** 89 tasks, 5 attempts, 445 trials, GPT-5.6 Sol, reasoning `max`
 
 ## Verdict
@@ -271,7 +271,7 @@ On reported aggregates, Ygg used **16.2% fewer processed tokens per raw success*
 
 Do not overstate this. Codex per-trial trajectories/distributions are unavailable, its published run predates Ygg's, exact provider snapshots may differ, missing usage on errored trials would be counted as zero, and Codex received an official 32-trial reward-hack adjudication while Ygg's separate local audit had only four confirmed exclusions and two ambiguous cases. The raw token normalization is apples-to-apples; adjudicated efficiency is not.
 
-Public Codex aggregate: <https://github.com/harbor-framework/terminal-bench-2-1/blob/main/leaderboard/submissions/2026-07-10-gpt-5-6-sol-max-codex.json>.
+Public Codex aggregate (pinned): <https://github.com/harbor-framework/terminal-bench-2-1/blob/67f1daf5b331fd10f5e8bc05bfc626aac26eeb39/leaderboard/submissions/2026-07-10-gpt-5-6-sol-max-codex.json>.
 
 ## Ranked real efficiency problems and recommendations
 

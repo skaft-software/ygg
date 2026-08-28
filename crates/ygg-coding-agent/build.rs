@@ -8,10 +8,13 @@ use flate2::write::GzEncoder;
 use flate2::Compression;
 use tar::{Builder, Header};
 
-const TEXT_EXTENSIONS: &[&str] = &["md", "toml", "py", "json", "txt", "yaml", "yml"];
+const TEXT_EXTENSIONS: &[&str] = &[
+    "md", "toml", "py", "json", "txt", "yaml", "yml", "sha256", "sh",
+];
 
 fn should_include(path: &Path) -> bool {
-    path.file_name().is_some_and(|name| name == "README.md")
+    path.file_name()
+        .is_some_and(|name| name == "README.md" || name == "SHA256SUMS")
         || path
             .extension()
             .and_then(|extension| extension.to_str())

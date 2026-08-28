@@ -1,0 +1,3130 @@
+[
+  {
+    "trial_name": "adaptive-rejection-sampler__2GjkwCC",
+    "task_slug": "adaptive-rejection-sampler",
+    "trial_dir": "${JOB_ROOT}/adaptive-rejection-sampler__2GjkwCC",
+    "task_dir": "${TASK_ROOT}/adaptive-rejection-sampler/bcaa2399985cd57666018025846289ab25e193ae0dd8fb7f0ffab2410c24d4de",
+    "trajectory_path": "${JOB_ROOT}/adaptive-rejection-sampler__2GjkwCC/agent/trajectory.json",
+    "case_id": "case-0001"
+  },
+  {
+    "trial_name": "adaptive-rejection-sampler__8DM5rRP",
+    "task_slug": "adaptive-rejection-sampler",
+    "trial_dir": "${JOB_ROOT}/adaptive-rejection-sampler__8DM5rRP",
+    "task_dir": "${TASK_ROOT}/adaptive-rejection-sampler/bcaa2399985cd57666018025846289ab25e193ae0dd8fb7f0ffab2410c24d4de",
+    "trajectory_path": "${JOB_ROOT}/adaptive-rejection-sampler__8DM5rRP/agent/trajectory.json",
+    "case_id": "case-0002"
+  },
+  {
+    "trial_name": "adaptive-rejection-sampler__S2ZCozA",
+    "task_slug": "adaptive-rejection-sampler",
+    "trial_dir": "${JOB_ROOT}/adaptive-rejection-sampler__S2ZCozA",
+    "task_dir": "${TASK_ROOT}/adaptive-rejection-sampler/bcaa2399985cd57666018025846289ab25e193ae0dd8fb7f0ffab2410c24d4de",
+    "trajectory_path": "${JOB_ROOT}/adaptive-rejection-sampler__S2ZCozA/agent/trajectory.json",
+    "case_id": "case-0003"
+  },
+  {
+    "trial_name": "adaptive-rejection-sampler__ZNhcuWh",
+    "task_slug": "adaptive-rejection-sampler",
+    "trial_dir": "${JOB_ROOT}/adaptive-rejection-sampler__ZNhcuWh",
+    "task_dir": "${TASK_ROOT}/adaptive-rejection-sampler/bcaa2399985cd57666018025846289ab25e193ae0dd8fb7f0ffab2410c24d4de",
+    "trajectory_path": "${JOB_ROOT}/adaptive-rejection-sampler__ZNhcuWh/agent/trajectory.json",
+    "case_id": "case-0004"
+  },
+  {
+    "trial_name": "bn-fit-modify__Gw5niBW",
+    "task_slug": "bn-fit-modify",
+    "trial_dir": "${JOB_ROOT}/bn-fit-modify__Gw5niBW",
+    "task_dir": "${TASK_ROOT}/bn-fit-modify/b5f9644970c17ad9ddb46b7266f7bcd87c761d77d7e6f55d7cfe7284d5ff66e9",
+    "trajectory_path": "${JOB_ROOT}/bn-fit-modify__Gw5niBW/agent/trajectory.json",
+    "case_id": "case-0005"
+  },
+  {
+    "trial_name": "bn-fit-modify__LWKKZnx",
+    "task_slug": "bn-fit-modify",
+    "trial_dir": "${JOB_ROOT}/bn-fit-modify__LWKKZnx",
+    "task_dir": "${TASK_ROOT}/bn-fit-modify/b5f9644970c17ad9ddb46b7266f7bcd87c761d77d7e6f55d7cfe7284d5ff66e9",
+    "trajectory_path": "${JOB_ROOT}/bn-fit-modify__LWKKZnx/agent/trajectory.json",
+    "case_id": "case-0006"
+  },
+  {
+    "trial_name": "bn-fit-modify__LjyEzby",
+    "task_slug": "bn-fit-modify",
+    "trial_dir": "${JOB_ROOT}/bn-fit-modify__LjyEzby",
+    "task_dir": "${TASK_ROOT}/bn-fit-modify/b5f9644970c17ad9ddb46b7266f7bcd87c761d77d7e6f55d7cfe7284d5ff66e9",
+    "trajectory_path": "${JOB_ROOT}/bn-fit-modify__LjyEzby/agent/trajectory.json",
+    "case_id": "case-0007"
+  },
+  {
+    "trial_name": "bn-fit-modify__TfpsTLv",
+    "task_slug": "bn-fit-modify",
+    "trial_dir": "${JOB_ROOT}/bn-fit-modify__TfpsTLv",
+    "task_dir": "${TASK_ROOT}/bn-fit-modify/b5f9644970c17ad9ddb46b7266f7bcd87c761d77d7e6f55d7cfe7284d5ff66e9",
+    "trajectory_path": "${JOB_ROOT}/bn-fit-modify__TfpsTLv/agent/trajectory.json",
+    "case_id": "case-0008"
+  },
+  {
+    "trial_name": "bn-fit-modify__WRYu3xB",
+    "task_slug": "bn-fit-modify",
+    "trial_dir": "${JOB_ROOT}/bn-fit-modify__WRYu3xB",
+    "task_dir": "${TASK_ROOT}/bn-fit-modify/b5f9644970c17ad9ddb46b7266f7bcd87c761d77d7e6f55d7cfe7284d5ff66e9",
+    "trajectory_path": "${JOB_ROOT}/bn-fit-modify__WRYu3xB/agent/trajectory.json",
+    "case_id": "case-0009"
+  },
+  {
+    "trial_name": "break-filter-js-from-html__QytcQWx",
+    "task_slug": "break-filter-js-from-html",
+    "trial_dir": "${JOB_ROOT}/break-filter-js-from-html__QytcQWx",
+    "task_dir": "${TASK_ROOT}/break-filter-js-from-html/678008d1a4fd1e6e1b9b3cc9a327219fe4b410a31eafc52e9099bbf947eea600",
+    "trajectory_path": "${JOB_ROOT}/break-filter-js-from-html__QytcQWx/agent/trajectory.json",
+    "case_id": "case-0010"
+  },
+  {
+    "trial_name": "break-filter-js-from-html__magbkkw",
+    "task_slug": "break-filter-js-from-html",
+    "trial_dir": "${JOB_ROOT}/break-filter-js-from-html__magbkkw",
+    "task_dir": "${TASK_ROOT}/break-filter-js-from-html/678008d1a4fd1e6e1b9b3cc9a327219fe4b410a31eafc52e9099bbf947eea600",
+    "trajectory_path": "${JOB_ROOT}/break-filter-js-from-html__magbkkw/agent/trajectory.json",
+    "case_id": "case-0011"
+  },
+  {
+    "trial_name": "break-filter-js-from-html__ngDFVY9",
+    "task_slug": "break-filter-js-from-html",
+    "trial_dir": "${JOB_ROOT}/break-filter-js-from-html__ngDFVY9",
+    "task_dir": "${TASK_ROOT}/break-filter-js-from-html/678008d1a4fd1e6e1b9b3cc9a327219fe4b410a31eafc52e9099bbf947eea600",
+    "trajectory_path": "${JOB_ROOT}/break-filter-js-from-html__ngDFVY9/agent/trajectory.json",
+    "case_id": "case-0012"
+  },
+  {
+    "trial_name": "break-filter-js-from-html__s5Xt2EX",
+    "task_slug": "break-filter-js-from-html",
+    "trial_dir": "${JOB_ROOT}/break-filter-js-from-html__s5Xt2EX",
+    "task_dir": "${TASK_ROOT}/break-filter-js-from-html/678008d1a4fd1e6e1b9b3cc9a327219fe4b410a31eafc52e9099bbf947eea600",
+    "trajectory_path": "${JOB_ROOT}/break-filter-js-from-html__s5Xt2EX/agent/trajectory.json",
+    "case_id": "case-0013"
+  },
+  {
+    "trial_name": "break-filter-js-from-html__u4Z6UFr",
+    "task_slug": "break-filter-js-from-html",
+    "trial_dir": "${JOB_ROOT}/break-filter-js-from-html__u4Z6UFr",
+    "task_dir": "${TASK_ROOT}/break-filter-js-from-html/678008d1a4fd1e6e1b9b3cc9a327219fe4b410a31eafc52e9099bbf947eea600",
+    "trajectory_path": "${JOB_ROOT}/break-filter-js-from-html__u4Z6UFr/agent/trajectory.json",
+    "case_id": "case-0014"
+  },
+  {
+    "trial_name": "build-cython-ext__ENhGgT6",
+    "task_slug": "build-cython-ext",
+    "trial_dir": "${JOB_ROOT}/build-cython-ext__ENhGgT6",
+    "task_dir": "${TASK_ROOT}/build-cython-ext/35dc561790e73f13e59837828ac0863c0893edc6b71d42cf7d58656c843adf12",
+    "trajectory_path": "${JOB_ROOT}/build-cython-ext__ENhGgT6/agent/trajectory.json",
+    "case_id": "case-0015"
+  },
+  {
+    "trial_name": "build-cython-ext__hL6mMG9",
+    "task_slug": "build-cython-ext",
+    "trial_dir": "${JOB_ROOT}/build-cython-ext__hL6mMG9",
+    "task_dir": "${TASK_ROOT}/build-cython-ext/35dc561790e73f13e59837828ac0863c0893edc6b71d42cf7d58656c843adf12",
+    "trajectory_path": "${JOB_ROOT}/build-cython-ext__hL6mMG9/agent/trajectory.json",
+    "case_id": "case-0016"
+  },
+  {
+    "trial_name": "build-cython-ext__mRgnyhD",
+    "task_slug": "build-cython-ext",
+    "trial_dir": "${JOB_ROOT}/build-cython-ext__mRgnyhD",
+    "task_dir": "${TASK_ROOT}/build-cython-ext/35dc561790e73f13e59837828ac0863c0893edc6b71d42cf7d58656c843adf12",
+    "trajectory_path": "${JOB_ROOT}/build-cython-ext__mRgnyhD/agent/trajectory.json",
+    "case_id": "case-0017"
+  },
+  {
+    "trial_name": "build-cython-ext__mmHdhiD",
+    "task_slug": "build-cython-ext",
+    "trial_dir": "${JOB_ROOT}/build-cython-ext__mmHdhiD",
+    "task_dir": "${TASK_ROOT}/build-cython-ext/35dc561790e73f13e59837828ac0863c0893edc6b71d42cf7d58656c843adf12",
+    "trajectory_path": "${JOB_ROOT}/build-cython-ext__mmHdhiD/agent/trajectory.json",
+    "case_id": "case-0018"
+  },
+  {
+    "trial_name": "build-cython-ext__zH6cEuL",
+    "task_slug": "build-cython-ext",
+    "trial_dir": "${JOB_ROOT}/build-cython-ext__zH6cEuL",
+    "task_dir": "${TASK_ROOT}/build-cython-ext/35dc561790e73f13e59837828ac0863c0893edc6b71d42cf7d58656c843adf12",
+    "trajectory_path": "${JOB_ROOT}/build-cython-ext__zH6cEuL/agent/trajectory.json",
+    "case_id": "case-0019"
+  },
+  {
+    "trial_name": "build-pmars__CYh7ntj",
+    "task_slug": "build-pmars",
+    "trial_dir": "${JOB_ROOT}/build-pmars__CYh7ntj",
+    "task_dir": "${TASK_ROOT}/build-pmars/63f0449b276f081986740c941ea9372068b310a02b062c1e5e3400f575241893",
+    "trajectory_path": "${JOB_ROOT}/build-pmars__CYh7ntj/agent/trajectory.json",
+    "case_id": "case-0020"
+  },
+  {
+    "trial_name": "build-pmars__EHHsdbT",
+    "task_slug": "build-pmars",
+    "trial_dir": "${JOB_ROOT}/build-pmars__EHHsdbT",
+    "task_dir": "${TASK_ROOT}/build-pmars/63f0449b276f081986740c941ea9372068b310a02b062c1e5e3400f575241893",
+    "trajectory_path": "${JOB_ROOT}/build-pmars__EHHsdbT/agent/trajectory.json",
+    "case_id": "case-0021"
+  },
+  {
+    "trial_name": "build-pmars__ZthHDG4",
+    "task_slug": "build-pmars",
+    "trial_dir": "${JOB_ROOT}/build-pmars__ZthHDG4",
+    "task_dir": "${TASK_ROOT}/build-pmars/63f0449b276f081986740c941ea9372068b310a02b062c1e5e3400f575241893",
+    "trajectory_path": "${JOB_ROOT}/build-pmars__ZthHDG4/agent/trajectory.json",
+    "case_id": "case-0022"
+  },
+  {
+    "trial_name": "build-pmars__kondBiP",
+    "task_slug": "build-pmars",
+    "trial_dir": "${JOB_ROOT}/build-pmars__kondBiP",
+    "task_dir": "${TASK_ROOT}/build-pmars/63f0449b276f081986740c941ea9372068b310a02b062c1e5e3400f575241893",
+    "trajectory_path": "${JOB_ROOT}/build-pmars__kondBiP/agent/trajectory.json",
+    "case_id": "case-0023"
+  },
+  {
+    "trial_name": "build-pmars__qxboFbT",
+    "task_slug": "build-pmars",
+    "trial_dir": "${JOB_ROOT}/build-pmars__qxboFbT",
+    "task_dir": "${TASK_ROOT}/build-pmars/63f0449b276f081986740c941ea9372068b310a02b062c1e5e3400f575241893",
+    "trajectory_path": "${JOB_ROOT}/build-pmars__qxboFbT/agent/trajectory.json",
+    "case_id": "case-0024"
+  },
+  {
+    "trial_name": "build-pov-ray__PmsgZX5",
+    "task_slug": "build-pov-ray",
+    "trial_dir": "${JOB_ROOT}/build-pov-ray__PmsgZX5",
+    "task_dir": "${TASK_ROOT}/build-pov-ray/4f08dab602fe2e9e2f42051cc6aef684a88cf2822e8b499b3ca19e670759fddb",
+    "trajectory_path": "${JOB_ROOT}/build-pov-ray__PmsgZX5/agent/trajectory.json",
+    "case_id": "case-0025"
+  },
+  {
+    "trial_name": "build-pov-ray__bFe9YAe",
+    "task_slug": "build-pov-ray",
+    "trial_dir": "${JOB_ROOT}/build-pov-ray__bFe9YAe",
+    "task_dir": "${TASK_ROOT}/build-pov-ray/4f08dab602fe2e9e2f42051cc6aef684a88cf2822e8b499b3ca19e670759fddb",
+    "trajectory_path": "${JOB_ROOT}/build-pov-ray__bFe9YAe/agent/trajectory.json",
+    "case_id": "case-0026"
+  },
+  {
+    "trial_name": "build-pov-ray__cNhWsT8",
+    "task_slug": "build-pov-ray",
+    "trial_dir": "${JOB_ROOT}/build-pov-ray__cNhWsT8",
+    "task_dir": "${TASK_ROOT}/build-pov-ray/4f08dab602fe2e9e2f42051cc6aef684a88cf2822e8b499b3ca19e670759fddb",
+    "trajectory_path": "${JOB_ROOT}/build-pov-ray__cNhWsT8/agent/trajectory.json",
+    "case_id": "case-0027"
+  },
+  {
+    "trial_name": "build-pov-ray__xxddCLw",
+    "task_slug": "build-pov-ray",
+    "trial_dir": "${JOB_ROOT}/build-pov-ray__xxddCLw",
+    "task_dir": "${TASK_ROOT}/build-pov-ray/4f08dab602fe2e9e2f42051cc6aef684a88cf2822e8b499b3ca19e670759fddb",
+    "trajectory_path": "${JOB_ROOT}/build-pov-ray__xxddCLw/agent/trajectory.json",
+    "case_id": "case-0028"
+  },
+  {
+    "trial_name": "caffe-cifar-10__7TXoDEj",
+    "task_slug": "caffe-cifar-10",
+    "trial_dir": "${JOB_ROOT}/caffe-cifar-10__7TXoDEj",
+    "task_dir": "${TASK_ROOT}/caffe-cifar-10/7b0045106d7d5af724efe96b610ba64f7893f5c88528401c573c4d47e384e2bf",
+    "trajectory_path": "${JOB_ROOT}/caffe-cifar-10__7TXoDEj/agent/trajectory.json",
+    "case_id": "case-0029"
+  },
+  {
+    "trial_name": "caffe-cifar-10__jAXoZa3",
+    "task_slug": "caffe-cifar-10",
+    "trial_dir": "${JOB_ROOT}/caffe-cifar-10__jAXoZa3",
+    "task_dir": "${TASK_ROOT}/caffe-cifar-10/7b0045106d7d5af724efe96b610ba64f7893f5c88528401c573c4d47e384e2bf",
+    "trajectory_path": "${JOB_ROOT}/caffe-cifar-10__jAXoZa3/agent/trajectory.json",
+    "case_id": "case-0030"
+  },
+  {
+    "trial_name": "caffe-cifar-10__oouR6tm",
+    "task_slug": "caffe-cifar-10",
+    "trial_dir": "${JOB_ROOT}/caffe-cifar-10__oouR6tm",
+    "task_dir": "${TASK_ROOT}/caffe-cifar-10/7b0045106d7d5af724efe96b610ba64f7893f5c88528401c573c4d47e384e2bf",
+    "trajectory_path": "${JOB_ROOT}/caffe-cifar-10__oouR6tm/agent/trajectory.json",
+    "case_id": "case-0031"
+  },
+  {
+    "trial_name": "caffe-cifar-10__yMcv7aE",
+    "task_slug": "caffe-cifar-10",
+    "trial_dir": "${JOB_ROOT}/caffe-cifar-10__yMcv7aE",
+    "task_dir": "${TASK_ROOT}/caffe-cifar-10/7b0045106d7d5af724efe96b610ba64f7893f5c88528401c573c4d47e384e2bf",
+    "trajectory_path": "${JOB_ROOT}/caffe-cifar-10__yMcv7aE/agent/trajectory.json",
+    "case_id": "case-0032"
+  },
+  {
+    "trial_name": "cancel-async-tasks__3HfmCq7",
+    "task_slug": "cancel-async-tasks",
+    "trial_dir": "${JOB_ROOT}/cancel-async-tasks__3HfmCq7",
+    "task_dir": "${TASK_ROOT}/cancel-async-tasks/a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+    "trajectory_path": "${JOB_ROOT}/cancel-async-tasks__3HfmCq7/agent/trajectory.json",
+    "case_id": "case-0033"
+  },
+  {
+    "trial_name": "cancel-async-tasks__4ZD2Dvb",
+    "task_slug": "cancel-async-tasks",
+    "trial_dir": "${JOB_ROOT}/cancel-async-tasks__4ZD2Dvb",
+    "task_dir": "${TASK_ROOT}/cancel-async-tasks/a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+    "trajectory_path": "${JOB_ROOT}/cancel-async-tasks__4ZD2Dvb/agent/trajectory.json",
+    "case_id": "case-0034"
+  },
+  {
+    "trial_name": "cancel-async-tasks__N5VM3f7",
+    "task_slug": "cancel-async-tasks",
+    "trial_dir": "${JOB_ROOT}/cancel-async-tasks__N5VM3f7",
+    "task_dir": "${TASK_ROOT}/cancel-async-tasks/a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+    "trajectory_path": "${JOB_ROOT}/cancel-async-tasks__N5VM3f7/agent/trajectory.json",
+    "case_id": "case-0035"
+  },
+  {
+    "trial_name": "cancel-async-tasks__Us8uxHA",
+    "task_slug": "cancel-async-tasks",
+    "trial_dir": "${JOB_ROOT}/cancel-async-tasks__Us8uxHA",
+    "task_dir": "${TASK_ROOT}/cancel-async-tasks/a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+    "trajectory_path": "${JOB_ROOT}/cancel-async-tasks__Us8uxHA/agent/trajectory.json",
+    "case_id": "case-0036"
+  },
+  {
+    "trial_name": "cancel-async-tasks__py9XWnC",
+    "task_slug": "cancel-async-tasks",
+    "trial_dir": "${JOB_ROOT}/cancel-async-tasks__py9XWnC",
+    "task_dir": "${TASK_ROOT}/cancel-async-tasks/a3d048d351136e48070696cda8bb79660dfd74db1fea3b6da88559f0332699c1",
+    "trajectory_path": "${JOB_ROOT}/cancel-async-tasks__py9XWnC/agent/trajectory.json",
+    "case_id": "case-0037"
+  },
+  {
+    "trial_name": "chess-best-move__86uuCCN",
+    "task_slug": "chess-best-move",
+    "trial_dir": "${JOB_ROOT}/chess-best-move__86uuCCN",
+    "task_dir": "${TASK_ROOT}/chess-best-move/9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da",
+    "trajectory_path": "${JOB_ROOT}/chess-best-move__86uuCCN/agent/trajectory.json",
+    "case_id": "case-0038"
+  },
+  {
+    "trial_name": "chess-best-move__QM42GJF",
+    "task_slug": "chess-best-move",
+    "trial_dir": "${JOB_ROOT}/chess-best-move__QM42GJF",
+    "task_dir": "${TASK_ROOT}/chess-best-move/9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da",
+    "trajectory_path": "${JOB_ROOT}/chess-best-move__QM42GJF/agent/trajectory.json",
+    "case_id": "case-0039"
+  },
+  {
+    "trial_name": "chess-best-move__VVvsd8W",
+    "task_slug": "chess-best-move",
+    "trial_dir": "${JOB_ROOT}/chess-best-move__VVvsd8W",
+    "task_dir": "${TASK_ROOT}/chess-best-move/9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da",
+    "trajectory_path": "${JOB_ROOT}/chess-best-move__VVvsd8W/agent/trajectory.json",
+    "case_id": "case-0040"
+  },
+  {
+    "trial_name": "chess-best-move__uFgnCfq",
+    "task_slug": "chess-best-move",
+    "trial_dir": "${JOB_ROOT}/chess-best-move__uFgnCfq",
+    "task_dir": "${TASK_ROOT}/chess-best-move/9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da",
+    "trajectory_path": "${JOB_ROOT}/chess-best-move__uFgnCfq/agent/trajectory.json",
+    "case_id": "case-0041"
+  },
+  {
+    "trial_name": "chess-best-move__vj8TZpr",
+    "task_slug": "chess-best-move",
+    "trial_dir": "${JOB_ROOT}/chess-best-move__vj8TZpr",
+    "task_dir": "${TASK_ROOT}/chess-best-move/9ab8e4b3674282e751edafbd9b5bd551fef995fd6601585a2cdb04fd70c520da",
+    "trajectory_path": "${JOB_ROOT}/chess-best-move__vj8TZpr/agent/trajectory.json",
+    "case_id": "case-0042"
+  },
+  {
+    "trial_name": "circuit-fibsqrt__D4dmL2q",
+    "task_slug": "circuit-fibsqrt",
+    "trial_dir": "${JOB_ROOT}/circuit-fibsqrt__D4dmL2q",
+    "task_dir": "${TASK_ROOT}/circuit-fibsqrt/9bcffe1054bb33249aa578a9a2a74f3c8cca66b0cb7aa1328233f1d31822aae3",
+    "trajectory_path": "${JOB_ROOT}/circuit-fibsqrt__D4dmL2q/agent/trajectory.json",
+    "case_id": "case-0043"
+  },
+  {
+    "trial_name": "circuit-fibsqrt__GjFWaen",
+    "task_slug": "circuit-fibsqrt",
+    "trial_dir": "${JOB_ROOT}/circuit-fibsqrt__GjFWaen",
+    "task_dir": "${TASK_ROOT}/circuit-fibsqrt/9bcffe1054bb33249aa578a9a2a74f3c8cca66b0cb7aa1328233f1d31822aae3",
+    "trajectory_path": "${JOB_ROOT}/circuit-fibsqrt__GjFWaen/agent/trajectory.json",
+    "case_id": "case-0044"
+  },
+  {
+    "trial_name": "circuit-fibsqrt__KtQWLJ6",
+    "task_slug": "circuit-fibsqrt",
+    "trial_dir": "${JOB_ROOT}/circuit-fibsqrt__KtQWLJ6",
+    "task_dir": "${TASK_ROOT}/circuit-fibsqrt/9bcffe1054bb33249aa578a9a2a74f3c8cca66b0cb7aa1328233f1d31822aae3",
+    "trajectory_path": "${JOB_ROOT}/circuit-fibsqrt__KtQWLJ6/agent/trajectory.json",
+    "case_id": "case-0045"
+  },
+  {
+    "trial_name": "circuit-fibsqrt__oCoRLCf",
+    "task_slug": "circuit-fibsqrt",
+    "trial_dir": "${JOB_ROOT}/circuit-fibsqrt__oCoRLCf",
+    "task_dir": "${TASK_ROOT}/circuit-fibsqrt/9bcffe1054bb33249aa578a9a2a74f3c8cca66b0cb7aa1328233f1d31822aae3",
+    "trajectory_path": "${JOB_ROOT}/circuit-fibsqrt__oCoRLCf/agent/trajectory.json",
+    "case_id": "case-0046"
+  },
+  {
+    "trial_name": "circuit-fibsqrt__xySmNxW",
+    "task_slug": "circuit-fibsqrt",
+    "trial_dir": "${JOB_ROOT}/circuit-fibsqrt__xySmNxW",
+    "task_dir": "${TASK_ROOT}/circuit-fibsqrt/9bcffe1054bb33249aa578a9a2a74f3c8cca66b0cb7aa1328233f1d31822aae3",
+    "trajectory_path": "${JOB_ROOT}/circuit-fibsqrt__xySmNxW/agent/trajectory.json",
+    "case_id": "case-0047"
+  },
+  {
+    "trial_name": "cobol-modernization__GvpPGG5",
+    "task_slug": "cobol-modernization",
+    "trial_dir": "${JOB_ROOT}/cobol-modernization__GvpPGG5",
+    "task_dir": "${TASK_ROOT}/cobol-modernization/e03aa03965eee48c9f772d566ff9bcd741fceeac9693123f82a13fdd46be0d88",
+    "trajectory_path": "${JOB_ROOT}/cobol-modernization__GvpPGG5/agent/trajectory.json",
+    "case_id": "case-0048"
+  },
+  {
+    "trial_name": "cobol-modernization__TXsvJSf",
+    "task_slug": "cobol-modernization",
+    "trial_dir": "${JOB_ROOT}/cobol-modernization__TXsvJSf",
+    "task_dir": "${TASK_ROOT}/cobol-modernization/e03aa03965eee48c9f772d566ff9bcd741fceeac9693123f82a13fdd46be0d88",
+    "trajectory_path": "${JOB_ROOT}/cobol-modernization__TXsvJSf/agent/trajectory.json",
+    "case_id": "case-0049"
+  },
+  {
+    "trial_name": "cobol-modernization__hM87GXo",
+    "task_slug": "cobol-modernization",
+    "trial_dir": "${JOB_ROOT}/cobol-modernization__hM87GXo",
+    "task_dir": "${TASK_ROOT}/cobol-modernization/e03aa03965eee48c9f772d566ff9bcd741fceeac9693123f82a13fdd46be0d88",
+    "trajectory_path": "${JOB_ROOT}/cobol-modernization__hM87GXo/agent/trajectory.json",
+    "case_id": "case-0050"
+  },
+  {
+    "trial_name": "cobol-modernization__jNcb8Y7",
+    "task_slug": "cobol-modernization",
+    "trial_dir": "${JOB_ROOT}/cobol-modernization__jNcb8Y7",
+    "task_dir": "${TASK_ROOT}/cobol-modernization/e03aa03965eee48c9f772d566ff9bcd741fceeac9693123f82a13fdd46be0d88",
+    "trajectory_path": "${JOB_ROOT}/cobol-modernization__jNcb8Y7/agent/trajectory.json",
+    "case_id": "case-0051"
+  },
+  {
+    "trial_name": "cobol-modernization__o5NfLCe",
+    "task_slug": "cobol-modernization",
+    "trial_dir": "${JOB_ROOT}/cobol-modernization__o5NfLCe",
+    "task_dir": "${TASK_ROOT}/cobol-modernization/e03aa03965eee48c9f772d566ff9bcd741fceeac9693123f82a13fdd46be0d88",
+    "trajectory_path": "${JOB_ROOT}/cobol-modernization__o5NfLCe/agent/trajectory.json",
+    "case_id": "case-0052"
+  },
+  {
+    "trial_name": "code-from-image__DtYCodL",
+    "task_slug": "code-from-image",
+    "trial_dir": "${JOB_ROOT}/code-from-image__DtYCodL",
+    "task_dir": "${TASK_ROOT}/code-from-image/ef2907bb300d9b3352410c2a75dbf831278c187c073298371870ea9c83526f78",
+    "trajectory_path": "${JOB_ROOT}/code-from-image__DtYCodL/agent/trajectory.json",
+    "case_id": "case-0053"
+  },
+  {
+    "trial_name": "code-from-image__R8aZisR",
+    "task_slug": "code-from-image",
+    "trial_dir": "${JOB_ROOT}/code-from-image__R8aZisR",
+    "task_dir": "${TASK_ROOT}/code-from-image/ef2907bb300d9b3352410c2a75dbf831278c187c073298371870ea9c83526f78",
+    "trajectory_path": "${JOB_ROOT}/code-from-image__R8aZisR/agent/trajectory.json",
+    "case_id": "case-0054"
+  },
+  {
+    "trial_name": "code-from-image__RPWA9VD",
+    "task_slug": "code-from-image",
+    "trial_dir": "${JOB_ROOT}/code-from-image__RPWA9VD",
+    "task_dir": "${TASK_ROOT}/code-from-image/ef2907bb300d9b3352410c2a75dbf831278c187c073298371870ea9c83526f78",
+    "trajectory_path": "${JOB_ROOT}/code-from-image__RPWA9VD/agent/trajectory.json",
+    "case_id": "case-0055"
+  },
+  {
+    "trial_name": "code-from-image__f6E6xdD",
+    "task_slug": "code-from-image",
+    "trial_dir": "${JOB_ROOT}/code-from-image__f6E6xdD",
+    "task_dir": "${TASK_ROOT}/code-from-image/ef2907bb300d9b3352410c2a75dbf831278c187c073298371870ea9c83526f78",
+    "trajectory_path": "${JOB_ROOT}/code-from-image__f6E6xdD/agent/trajectory.json",
+    "case_id": "case-0056"
+  },
+  {
+    "trial_name": "code-from-image__puWC3TV",
+    "task_slug": "code-from-image",
+    "trial_dir": "${JOB_ROOT}/code-from-image__puWC3TV",
+    "task_dir": "${TASK_ROOT}/code-from-image/ef2907bb300d9b3352410c2a75dbf831278c187c073298371870ea9c83526f78",
+    "trajectory_path": "${JOB_ROOT}/code-from-image__puWC3TV/agent/trajectory.json",
+    "case_id": "case-0057"
+  },
+  {
+    "trial_name": "compile-compcert__cETRbDH",
+    "task_slug": "compile-compcert",
+    "trial_dir": "${JOB_ROOT}/compile-compcert__cETRbDH",
+    "task_dir": "${TASK_ROOT}/compile-compcert/22bde2a73d62fa46f5ab96f710561a72e8d1aa4266f008605a17f174622ad785",
+    "trajectory_path": "${JOB_ROOT}/compile-compcert__cETRbDH/agent/trajectory.json",
+    "case_id": "case-0058"
+  },
+  {
+    "trial_name": "compile-compcert__ggSASoM",
+    "task_slug": "compile-compcert",
+    "trial_dir": "${JOB_ROOT}/compile-compcert__ggSASoM",
+    "task_dir": "${TASK_ROOT}/compile-compcert/22bde2a73d62fa46f5ab96f710561a72e8d1aa4266f008605a17f174622ad785",
+    "trajectory_path": "${JOB_ROOT}/compile-compcert__ggSASoM/agent/trajectory.json",
+    "case_id": "case-0059"
+  },
+  {
+    "trial_name": "compile-compcert__jU3kJjN",
+    "task_slug": "compile-compcert",
+    "trial_dir": "${JOB_ROOT}/compile-compcert__jU3kJjN",
+    "task_dir": "${TASK_ROOT}/compile-compcert/22bde2a73d62fa46f5ab96f710561a72e8d1aa4266f008605a17f174622ad785",
+    "trajectory_path": "${JOB_ROOT}/compile-compcert__jU3kJjN/agent/trajectory.json",
+    "case_id": "case-0060"
+  },
+  {
+    "trial_name": "compile-compcert__rx9ew3J",
+    "task_slug": "compile-compcert",
+    "trial_dir": "${JOB_ROOT}/compile-compcert__rx9ew3J",
+    "task_dir": "${TASK_ROOT}/compile-compcert/22bde2a73d62fa46f5ab96f710561a72e8d1aa4266f008605a17f174622ad785",
+    "trajectory_path": "${JOB_ROOT}/compile-compcert__rx9ew3J/agent/trajectory.json",
+    "case_id": "case-0061"
+  },
+  {
+    "trial_name": "compile-compcert__vPZEaXp",
+    "task_slug": "compile-compcert",
+    "trial_dir": "${JOB_ROOT}/compile-compcert__vPZEaXp",
+    "task_dir": "${TASK_ROOT}/compile-compcert/22bde2a73d62fa46f5ab96f710561a72e8d1aa4266f008605a17f174622ad785",
+    "trajectory_path": "${JOB_ROOT}/compile-compcert__vPZEaXp/agent/trajectory.json",
+    "case_id": "case-0062"
+  },
+  {
+    "trial_name": "configure-git-webserver__VxQbCPX",
+    "task_slug": "configure-git-webserver",
+    "trial_dir": "${JOB_ROOT}/configure-git-webserver__VxQbCPX",
+    "task_dir": "${TASK_ROOT}/configure-git-webserver/e3dc712acfecdb1338a889f86c97b37422c3778351253f9aca4236e895fdb36e",
+    "trajectory_path": "${JOB_ROOT}/configure-git-webserver__VxQbCPX/agent/trajectory.json",
+    "case_id": "case-0063"
+  },
+  {
+    "trial_name": "configure-git-webserver__xJkYAo8",
+    "task_slug": "configure-git-webserver",
+    "trial_dir": "${JOB_ROOT}/configure-git-webserver__xJkYAo8",
+    "task_dir": "${TASK_ROOT}/configure-git-webserver/e3dc712acfecdb1338a889f86c97b37422c3778351253f9aca4236e895fdb36e",
+    "trajectory_path": "${JOB_ROOT}/configure-git-webserver__xJkYAo8/agent/trajectory.json",
+    "case_id": "case-0064"
+  },
+  {
+    "trial_name": "constraints-scheduling__E9ohbLg",
+    "task_slug": "constraints-scheduling",
+    "trial_dir": "${JOB_ROOT}/constraints-scheduling__E9ohbLg",
+    "task_dir": "${TASK_ROOT}/constraints-scheduling/91dd6f87e1ee508328d5aafbd99a6bd1ccc47bc22671b4aaa4060bda492deb53",
+    "trajectory_path": "${JOB_ROOT}/constraints-scheduling__E9ohbLg/agent/trajectory.json",
+    "case_id": "case-0065"
+  },
+  {
+    "trial_name": "constraints-scheduling__LqtTn9y",
+    "task_slug": "constraints-scheduling",
+    "trial_dir": "${JOB_ROOT}/constraints-scheduling__LqtTn9y",
+    "task_dir": "${TASK_ROOT}/constraints-scheduling/91dd6f87e1ee508328d5aafbd99a6bd1ccc47bc22671b4aaa4060bda492deb53",
+    "trajectory_path": "${JOB_ROOT}/constraints-scheduling__LqtTn9y/agent/trajectory.json",
+    "case_id": "case-0066"
+  },
+  {
+    "trial_name": "constraints-scheduling__TNahUou",
+    "task_slug": "constraints-scheduling",
+    "trial_dir": "${JOB_ROOT}/constraints-scheduling__TNahUou",
+    "task_dir": "${TASK_ROOT}/constraints-scheduling/91dd6f87e1ee508328d5aafbd99a6bd1ccc47bc22671b4aaa4060bda492deb53",
+    "trajectory_path": "${JOB_ROOT}/constraints-scheduling__TNahUou/agent/trajectory.json",
+    "case_id": "case-0067"
+  },
+  {
+    "trial_name": "constraints-scheduling__q7acrin",
+    "task_slug": "constraints-scheduling",
+    "trial_dir": "${JOB_ROOT}/constraints-scheduling__q7acrin",
+    "task_dir": "${TASK_ROOT}/constraints-scheduling/91dd6f87e1ee508328d5aafbd99a6bd1ccc47bc22671b4aaa4060bda492deb53",
+    "trajectory_path": "${JOB_ROOT}/constraints-scheduling__q7acrin/agent/trajectory.json",
+    "case_id": "case-0068"
+  },
+  {
+    "trial_name": "constraints-scheduling__wyk7qMh",
+    "task_slug": "constraints-scheduling",
+    "trial_dir": "${JOB_ROOT}/constraints-scheduling__wyk7qMh",
+    "task_dir": "${TASK_ROOT}/constraints-scheduling/91dd6f87e1ee508328d5aafbd99a6bd1ccc47bc22671b4aaa4060bda492deb53",
+    "trajectory_path": "${JOB_ROOT}/constraints-scheduling__wyk7qMh/agent/trajectory.json",
+    "case_id": "case-0069"
+  },
+  {
+    "trial_name": "count-dataset-tokens__4TiZWCP",
+    "task_slug": "count-dataset-tokens",
+    "trial_dir": "${JOB_ROOT}/count-dataset-tokens__4TiZWCP",
+    "task_dir": "${TASK_ROOT}/count-dataset-tokens/cd0574ec8281f53854256acc93702ed1441407c0428849e1dd4f27e863c6b08a",
+    "trajectory_path": "${JOB_ROOT}/count-dataset-tokens__4TiZWCP/agent/trajectory.json",
+    "case_id": "case-0070"
+  },
+  {
+    "trial_name": "count-dataset-tokens__dqkDh7q",
+    "task_slug": "count-dataset-tokens",
+    "trial_dir": "${JOB_ROOT}/count-dataset-tokens__dqkDh7q",
+    "task_dir": "${TASK_ROOT}/count-dataset-tokens/cd0574ec8281f53854256acc93702ed1441407c0428849e1dd4f27e863c6b08a",
+    "trajectory_path": "${JOB_ROOT}/count-dataset-tokens__dqkDh7q/agent/trajectory.json",
+    "case_id": "case-0071"
+  },
+  {
+    "trial_name": "count-dataset-tokens__eyAyTP9",
+    "task_slug": "count-dataset-tokens",
+    "trial_dir": "${JOB_ROOT}/count-dataset-tokens__eyAyTP9",
+    "task_dir": "${TASK_ROOT}/count-dataset-tokens/cd0574ec8281f53854256acc93702ed1441407c0428849e1dd4f27e863c6b08a",
+    "trajectory_path": "${JOB_ROOT}/count-dataset-tokens__eyAyTP9/agent/trajectory.json",
+    "case_id": "case-0072"
+  },
+  {
+    "trial_name": "count-dataset-tokens__hN8QQ5q",
+    "task_slug": "count-dataset-tokens",
+    "trial_dir": "${JOB_ROOT}/count-dataset-tokens__hN8QQ5q",
+    "task_dir": "${TASK_ROOT}/count-dataset-tokens/cd0574ec8281f53854256acc93702ed1441407c0428849e1dd4f27e863c6b08a",
+    "trajectory_path": "${JOB_ROOT}/count-dataset-tokens__hN8QQ5q/agent/trajectory.json",
+    "case_id": "case-0073"
+  },
+  {
+    "trial_name": "count-dataset-tokens__ks3jSCP",
+    "task_slug": "count-dataset-tokens",
+    "trial_dir": "${JOB_ROOT}/count-dataset-tokens__ks3jSCP",
+    "task_dir": "${TASK_ROOT}/count-dataset-tokens/cd0574ec8281f53854256acc93702ed1441407c0428849e1dd4f27e863c6b08a",
+    "trajectory_path": "${JOB_ROOT}/count-dataset-tokens__ks3jSCP/agent/trajectory.json",
+    "case_id": "case-0074"
+  },
+  {
+    "trial_name": "crack-7z-hash__3Pi4qU7",
+    "task_slug": "crack-7z-hash",
+    "trial_dir": "${JOB_ROOT}/crack-7z-hash__3Pi4qU7",
+    "task_dir": "${TASK_ROOT}/crack-7z-hash/99cbb2269f6bd112d3387fd01cb6900118fe4aded3f75a8d656580a8296a1ae5",
+    "trajectory_path": "${JOB_ROOT}/crack-7z-hash__3Pi4qU7/agent/trajectory.json",
+    "case_id": "case-0075"
+  },
+  {
+    "trial_name": "crack-7z-hash__4jKKHGs",
+    "task_slug": "crack-7z-hash",
+    "trial_dir": "${JOB_ROOT}/crack-7z-hash__4jKKHGs",
+    "task_dir": "${TASK_ROOT}/crack-7z-hash/99cbb2269f6bd112d3387fd01cb6900118fe4aded3f75a8d656580a8296a1ae5",
+    "trajectory_path": "${JOB_ROOT}/crack-7z-hash__4jKKHGs/agent/trajectory.json",
+    "case_id": "case-0076"
+  },
+  {
+    "trial_name": "crack-7z-hash__8QCdgtW",
+    "task_slug": "crack-7z-hash",
+    "trial_dir": "${JOB_ROOT}/crack-7z-hash__8QCdgtW",
+    "task_dir": "${TASK_ROOT}/crack-7z-hash/99cbb2269f6bd112d3387fd01cb6900118fe4aded3f75a8d656580a8296a1ae5",
+    "trajectory_path": "${JOB_ROOT}/crack-7z-hash__8QCdgtW/agent/trajectory.json",
+    "case_id": "case-0077"
+  },
+  {
+    "trial_name": "crack-7z-hash__iPkS7BW",
+    "task_slug": "crack-7z-hash",
+    "trial_dir": "${JOB_ROOT}/crack-7z-hash__iPkS7BW",
+    "task_dir": "${TASK_ROOT}/crack-7z-hash/99cbb2269f6bd112d3387fd01cb6900118fe4aded3f75a8d656580a8296a1ae5",
+    "trajectory_path": "${JOB_ROOT}/crack-7z-hash__iPkS7BW/agent/trajectory.json",
+    "case_id": "case-0078"
+  },
+  {
+    "trial_name": "crack-7z-hash__yKQGyEW",
+    "task_slug": "crack-7z-hash",
+    "trial_dir": "${JOB_ROOT}/crack-7z-hash__yKQGyEW",
+    "task_dir": "${TASK_ROOT}/crack-7z-hash/99cbb2269f6bd112d3387fd01cb6900118fe4aded3f75a8d656580a8296a1ae5",
+    "trajectory_path": "${JOB_ROOT}/crack-7z-hash__yKQGyEW/agent/trajectory.json",
+    "case_id": "case-0079"
+  },
+  {
+    "trial_name": "custom-memory-heap-crash__3NeWXjg",
+    "task_slug": "custom-memory-heap-crash",
+    "trial_dir": "${JOB_ROOT}/custom-memory-heap-crash__3NeWXjg",
+    "task_dir": "${TASK_ROOT}/custom-memory-heap-crash/61e021e0304c9818a9be2c9173c8a0938ce5d136e95c5422e099f1fdb2dc080e",
+    "trajectory_path": "${JOB_ROOT}/custom-memory-heap-crash__3NeWXjg/agent/trajectory.json",
+    "case_id": "case-0080"
+  },
+  {
+    "trial_name": "custom-memory-heap-crash__DpPtkki",
+    "task_slug": "custom-memory-heap-crash",
+    "trial_dir": "${JOB_ROOT}/custom-memory-heap-crash__DpPtkki",
+    "task_dir": "${TASK_ROOT}/custom-memory-heap-crash/61e021e0304c9818a9be2c9173c8a0938ce5d136e95c5422e099f1fdb2dc080e",
+    "trajectory_path": "${JOB_ROOT}/custom-memory-heap-crash__DpPtkki/agent/trajectory.json",
+    "case_id": "case-0081"
+  },
+  {
+    "trial_name": "custom-memory-heap-crash__NfeDVUM",
+    "task_slug": "custom-memory-heap-crash",
+    "trial_dir": "${JOB_ROOT}/custom-memory-heap-crash__NfeDVUM",
+    "task_dir": "${TASK_ROOT}/custom-memory-heap-crash/61e021e0304c9818a9be2c9173c8a0938ce5d136e95c5422e099f1fdb2dc080e",
+    "trajectory_path": "${JOB_ROOT}/custom-memory-heap-crash__NfeDVUM/agent/trajectory.json",
+    "case_id": "case-0082"
+  },
+  {
+    "trial_name": "custom-memory-heap-crash__R3WyoTr",
+    "task_slug": "custom-memory-heap-crash",
+    "trial_dir": "${JOB_ROOT}/custom-memory-heap-crash__R3WyoTr",
+    "task_dir": "${TASK_ROOT}/custom-memory-heap-crash/61e021e0304c9818a9be2c9173c8a0938ce5d136e95c5422e099f1fdb2dc080e",
+    "trajectory_path": "${JOB_ROOT}/custom-memory-heap-crash__R3WyoTr/agent/trajectory.json",
+    "case_id": "case-0083"
+  },
+  {
+    "trial_name": "custom-memory-heap-crash__XQBJ8dR",
+    "task_slug": "custom-memory-heap-crash",
+    "trial_dir": "${JOB_ROOT}/custom-memory-heap-crash__XQBJ8dR",
+    "task_dir": "${TASK_ROOT}/custom-memory-heap-crash/61e021e0304c9818a9be2c9173c8a0938ce5d136e95c5422e099f1fdb2dc080e",
+    "trajectory_path": "${JOB_ROOT}/custom-memory-heap-crash__XQBJ8dR/agent/trajectory.json",
+    "case_id": "case-0084"
+  },
+  {
+    "trial_name": "db-wal-recovery__7wJ5RgU",
+    "task_slug": "db-wal-recovery",
+    "trial_dir": "${JOB_ROOT}/db-wal-recovery__7wJ5RgU",
+    "task_dir": "${TASK_ROOT}/db-wal-recovery/07e9193513bfce038b9f9d84962ecc85683eee0a642d14ee6fb7104b086ddab4",
+    "trajectory_path": "${JOB_ROOT}/db-wal-recovery__7wJ5RgU/agent/trajectory.json",
+    "case_id": "case-0085"
+  },
+  {
+    "trial_name": "db-wal-recovery__EDkL973",
+    "task_slug": "db-wal-recovery",
+    "trial_dir": "${JOB_ROOT}/db-wal-recovery__EDkL973",
+    "task_dir": "${TASK_ROOT}/db-wal-recovery/07e9193513bfce038b9f9d84962ecc85683eee0a642d14ee6fb7104b086ddab4",
+    "trajectory_path": "${JOB_ROOT}/db-wal-recovery__EDkL973/agent/trajectory.json",
+    "case_id": "case-0086"
+  },
+  {
+    "trial_name": "db-wal-recovery__LBGaFvv",
+    "task_slug": "db-wal-recovery",
+    "trial_dir": "${JOB_ROOT}/db-wal-recovery__LBGaFvv",
+    "task_dir": "${TASK_ROOT}/db-wal-recovery/07e9193513bfce038b9f9d84962ecc85683eee0a642d14ee6fb7104b086ddab4",
+    "trajectory_path": "${JOB_ROOT}/db-wal-recovery__LBGaFvv/agent/trajectory.json",
+    "case_id": "case-0087"
+  },
+  {
+    "trial_name": "db-wal-recovery__LNZ2abh",
+    "task_slug": "db-wal-recovery",
+    "trial_dir": "${JOB_ROOT}/db-wal-recovery__LNZ2abh",
+    "task_dir": "${TASK_ROOT}/db-wal-recovery/07e9193513bfce038b9f9d84962ecc85683eee0a642d14ee6fb7104b086ddab4",
+    "trajectory_path": "${JOB_ROOT}/db-wal-recovery__LNZ2abh/agent/trajectory.json",
+    "case_id": "case-0088"
+  },
+  {
+    "trial_name": "db-wal-recovery__gWpPSPx",
+    "task_slug": "db-wal-recovery",
+    "trial_dir": "${JOB_ROOT}/db-wal-recovery__gWpPSPx",
+    "task_dir": "${TASK_ROOT}/db-wal-recovery/07e9193513bfce038b9f9d84962ecc85683eee0a642d14ee6fb7104b086ddab4",
+    "trajectory_path": "${JOB_ROOT}/db-wal-recovery__gWpPSPx/agent/trajectory.json",
+    "case_id": "case-0089"
+  },
+  {
+    "trial_name": "distribution-search__CG9Jtpy",
+    "task_slug": "distribution-search",
+    "trial_dir": "${JOB_ROOT}/distribution-search__CG9Jtpy",
+    "task_dir": "${TASK_ROOT}/distribution-search/8787d3004ac4dd9d78f0c14f5b5ef94a4ad3e69d8828d7d35b9fbd7828a69ed1",
+    "trajectory_path": "${JOB_ROOT}/distribution-search__CG9Jtpy/agent/trajectory.json",
+    "case_id": "case-0090"
+  },
+  {
+    "trial_name": "distribution-search__Nm6KCHf",
+    "task_slug": "distribution-search",
+    "trial_dir": "${JOB_ROOT}/distribution-search__Nm6KCHf",
+    "task_dir": "${TASK_ROOT}/distribution-search/8787d3004ac4dd9d78f0c14f5b5ef94a4ad3e69d8828d7d35b9fbd7828a69ed1",
+    "trajectory_path": "${JOB_ROOT}/distribution-search__Nm6KCHf/agent/trajectory.json",
+    "case_id": "case-0091"
+  },
+  {
+    "trial_name": "distribution-search__rEWzzL2",
+    "task_slug": "distribution-search",
+    "trial_dir": "${JOB_ROOT}/distribution-search__rEWzzL2",
+    "task_dir": "${TASK_ROOT}/distribution-search/8787d3004ac4dd9d78f0c14f5b5ef94a4ad3e69d8828d7d35b9fbd7828a69ed1",
+    "trajectory_path": "${JOB_ROOT}/distribution-search__rEWzzL2/agent/trajectory.json",
+    "case_id": "case-0092"
+  },
+  {
+    "trial_name": "distribution-search__ta6SRV6",
+    "task_slug": "distribution-search",
+    "trial_dir": "${JOB_ROOT}/distribution-search__ta6SRV6",
+    "task_dir": "${TASK_ROOT}/distribution-search/8787d3004ac4dd9d78f0c14f5b5ef94a4ad3e69d8828d7d35b9fbd7828a69ed1",
+    "trajectory_path": "${JOB_ROOT}/distribution-search__ta6SRV6/agent/trajectory.json",
+    "case_id": "case-0093"
+  },
+  {
+    "trial_name": "distribution-search__zYdFf4U",
+    "task_slug": "distribution-search",
+    "trial_dir": "${JOB_ROOT}/distribution-search__zYdFf4U",
+    "task_dir": "${TASK_ROOT}/distribution-search/8787d3004ac4dd9d78f0c14f5b5ef94a4ad3e69d8828d7d35b9fbd7828a69ed1",
+    "trajectory_path": "${JOB_ROOT}/distribution-search__zYdFf4U/agent/trajectory.json",
+    "case_id": "case-0094"
+  },
+  {
+    "trial_name": "dna-assembly__G9KnoKW",
+    "task_slug": "dna-assembly",
+    "trial_dir": "${JOB_ROOT}/dna-assembly__G9KnoKW",
+    "task_dir": "${TASK_ROOT}/dna-assembly/e41a8e94d86019949b08d3b5f88a85f6d943ba0fd85d5e1d5ebb95cb8f66223f",
+    "trajectory_path": "${JOB_ROOT}/dna-assembly__G9KnoKW/agent/trajectory.json",
+    "case_id": "case-0095"
+  },
+  {
+    "trial_name": "dna-assembly__J4bNszp",
+    "task_slug": "dna-assembly",
+    "trial_dir": "${JOB_ROOT}/dna-assembly__J4bNszp",
+    "task_dir": "${TASK_ROOT}/dna-assembly/e41a8e94d86019949b08d3b5f88a85f6d943ba0fd85d5e1d5ebb95cb8f66223f",
+    "trajectory_path": "${JOB_ROOT}/dna-assembly__J4bNszp/agent/trajectory.json",
+    "case_id": "case-0096"
+  },
+  {
+    "trial_name": "dna-assembly__KSVKHuX",
+    "task_slug": "dna-assembly",
+    "trial_dir": "${JOB_ROOT}/dna-assembly__KSVKHuX",
+    "task_dir": "${TASK_ROOT}/dna-assembly/e41a8e94d86019949b08d3b5f88a85f6d943ba0fd85d5e1d5ebb95cb8f66223f",
+    "trajectory_path": "${JOB_ROOT}/dna-assembly__KSVKHuX/agent/trajectory.json",
+    "case_id": "case-0097"
+  },
+  {
+    "trial_name": "dna-assembly__QGwQiv8",
+    "task_slug": "dna-assembly",
+    "trial_dir": "${JOB_ROOT}/dna-assembly__QGwQiv8",
+    "task_dir": "${TASK_ROOT}/dna-assembly/e41a8e94d86019949b08d3b5f88a85f6d943ba0fd85d5e1d5ebb95cb8f66223f",
+    "trajectory_path": "${JOB_ROOT}/dna-assembly__QGwQiv8/agent/trajectory.json",
+    "case_id": "case-0098"
+  },
+  {
+    "trial_name": "dna-assembly__mxSGFNU",
+    "task_slug": "dna-assembly",
+    "trial_dir": "${JOB_ROOT}/dna-assembly__mxSGFNU",
+    "task_dir": "${TASK_ROOT}/dna-assembly/e41a8e94d86019949b08d3b5f88a85f6d943ba0fd85d5e1d5ebb95cb8f66223f",
+    "trajectory_path": "${JOB_ROOT}/dna-assembly__mxSGFNU/agent/trajectory.json",
+    "case_id": "case-0099"
+  },
+  {
+    "trial_name": "dna-insert__8wr4whF",
+    "task_slug": "dna-insert",
+    "trial_dir": "${JOB_ROOT}/dna-insert__8wr4whF",
+    "task_dir": "${TASK_ROOT}/dna-insert/37fc023970e3464c1acc31f43e04a0b4b94758130d340788f261f00764d9e530",
+    "trajectory_path": "${JOB_ROOT}/dna-insert__8wr4whF/agent/trajectory.json",
+    "case_id": "case-0100"
+  },
+  {
+    "trial_name": "dna-insert__i7FHMhp",
+    "task_slug": "dna-insert",
+    "trial_dir": "${JOB_ROOT}/dna-insert__i7FHMhp",
+    "task_dir": "${TASK_ROOT}/dna-insert/37fc023970e3464c1acc31f43e04a0b4b94758130d340788f261f00764d9e530",
+    "trajectory_path": "${JOB_ROOT}/dna-insert__i7FHMhp/agent/trajectory.json",
+    "case_id": "case-0101"
+  },
+  {
+    "trial_name": "extract-elf__TkF77bb",
+    "task_slug": "extract-elf",
+    "trial_dir": "${JOB_ROOT}/extract-elf__TkF77bb",
+    "task_dir": "${TASK_ROOT}/extract-elf/1ef31d566be4fe3459d5368621ae7ef7a31b23ef675737e473bbc43c8c7b3fce",
+    "trajectory_path": "${JOB_ROOT}/extract-elf__TkF77bb/agent/trajectory.json",
+    "case_id": "case-0102"
+  },
+  {
+    "trial_name": "extract-moves-from-video__9ncTye5",
+    "task_slug": "extract-moves-from-video",
+    "trial_dir": "${JOB_ROOT}/extract-moves-from-video__9ncTye5",
+    "task_dir": "${TASK_ROOT}/extract-moves-from-video/168e2b9168511b8f8d32b1697f4703b08626203e7949ad396658f4bef7dee66e",
+    "trajectory_path": "${JOB_ROOT}/extract-moves-from-video__9ncTye5/agent/trajectory.json",
+    "case_id": "case-0103"
+  },
+  {
+    "trial_name": "extract-moves-from-video__L45iRJK",
+    "task_slug": "extract-moves-from-video",
+    "trial_dir": "${JOB_ROOT}/extract-moves-from-video__L45iRJK",
+    "task_dir": "${TASK_ROOT}/extract-moves-from-video/168e2b9168511b8f8d32b1697f4703b08626203e7949ad396658f4bef7dee66e",
+    "trajectory_path": "${JOB_ROOT}/extract-moves-from-video__L45iRJK/agent/trajectory.json",
+    "case_id": "case-0104"
+  },
+  {
+    "trial_name": "feal-differential-cryptanalysis__9N3ZQk9",
+    "task_slug": "feal-differential-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-differential-cryptanalysis__9N3ZQk9",
+    "task_dir": "${TASK_ROOT}/feal-differential-cryptanalysis/8ea56995fcc43fb94f0e4e15adb12dd28836bf3e9c766b2cc7ae78a7ce90341f",
+    "trajectory_path": "${JOB_ROOT}/feal-differential-cryptanalysis__9N3ZQk9/agent/trajectory.json",
+    "case_id": "case-0105"
+  },
+  {
+    "trial_name": "feal-differential-cryptanalysis__NvwxVWd",
+    "task_slug": "feal-differential-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-differential-cryptanalysis__NvwxVWd",
+    "task_dir": "${TASK_ROOT}/feal-differential-cryptanalysis/8ea56995fcc43fb94f0e4e15adb12dd28836bf3e9c766b2cc7ae78a7ce90341f",
+    "trajectory_path": "${JOB_ROOT}/feal-differential-cryptanalysis__NvwxVWd/agent/trajectory.json",
+    "case_id": "case-0106"
+  },
+  {
+    "trial_name": "feal-differential-cryptanalysis__TeHfRRJ",
+    "task_slug": "feal-differential-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-differential-cryptanalysis__TeHfRRJ",
+    "task_dir": "${TASK_ROOT}/feal-differential-cryptanalysis/8ea56995fcc43fb94f0e4e15adb12dd28836bf3e9c766b2cc7ae78a7ce90341f",
+    "trajectory_path": "${JOB_ROOT}/feal-differential-cryptanalysis__TeHfRRJ/agent/trajectory.json",
+    "case_id": "case-0107"
+  },
+  {
+    "trial_name": "feal-differential-cryptanalysis__VN5HEiY",
+    "task_slug": "feal-differential-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-differential-cryptanalysis__VN5HEiY",
+    "task_dir": "${TASK_ROOT}/feal-differential-cryptanalysis/8ea56995fcc43fb94f0e4e15adb12dd28836bf3e9c766b2cc7ae78a7ce90341f",
+    "trajectory_path": "${JOB_ROOT}/feal-differential-cryptanalysis__VN5HEiY/agent/trajectory.json",
+    "case_id": "case-0108"
+  },
+  {
+    "trial_name": "feal-differential-cryptanalysis__jhWhVU8",
+    "task_slug": "feal-differential-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-differential-cryptanalysis__jhWhVU8",
+    "task_dir": "${TASK_ROOT}/feal-differential-cryptanalysis/8ea56995fcc43fb94f0e4e15adb12dd28836bf3e9c766b2cc7ae78a7ce90341f",
+    "trajectory_path": "${JOB_ROOT}/feal-differential-cryptanalysis__jhWhVU8/agent/trajectory.json",
+    "case_id": "case-0109"
+  },
+  {
+    "trial_name": "feal-linear-cryptanalysis__3WWUAGA",
+    "task_slug": "feal-linear-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-linear-cryptanalysis__3WWUAGA",
+    "task_dir": "${TASK_ROOT}/feal-linear-cryptanalysis/0f3234c5fde85f9dc610d94cfefd4c892afb75c9e571f21f18fee66972b67332",
+    "trajectory_path": "${JOB_ROOT}/feal-linear-cryptanalysis__3WWUAGA/agent/trajectory.json",
+    "case_id": "case-0110"
+  },
+  {
+    "trial_name": "feal-linear-cryptanalysis__EVXbdHm",
+    "task_slug": "feal-linear-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-linear-cryptanalysis__EVXbdHm",
+    "task_dir": "${TASK_ROOT}/feal-linear-cryptanalysis/0f3234c5fde85f9dc610d94cfefd4c892afb75c9e571f21f18fee66972b67332",
+    "trajectory_path": "${JOB_ROOT}/feal-linear-cryptanalysis__EVXbdHm/agent/trajectory.json",
+    "case_id": "case-0111"
+  },
+  {
+    "trial_name": "feal-linear-cryptanalysis__GKpoLVR",
+    "task_slug": "feal-linear-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-linear-cryptanalysis__GKpoLVR",
+    "task_dir": "${TASK_ROOT}/feal-linear-cryptanalysis/0f3234c5fde85f9dc610d94cfefd4c892afb75c9e571f21f18fee66972b67332",
+    "trajectory_path": "${JOB_ROOT}/feal-linear-cryptanalysis__GKpoLVR/agent/trajectory.json",
+    "case_id": "case-0112"
+  },
+  {
+    "trial_name": "feal-linear-cryptanalysis__aHzzuhq",
+    "task_slug": "feal-linear-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-linear-cryptanalysis__aHzzuhq",
+    "task_dir": "${TASK_ROOT}/feal-linear-cryptanalysis/0f3234c5fde85f9dc610d94cfefd4c892afb75c9e571f21f18fee66972b67332",
+    "trajectory_path": "${JOB_ROOT}/feal-linear-cryptanalysis__aHzzuhq/agent/trajectory.json",
+    "case_id": "case-0113"
+  },
+  {
+    "trial_name": "feal-linear-cryptanalysis__rcp9Jmc",
+    "task_slug": "feal-linear-cryptanalysis",
+    "trial_dir": "${JOB_ROOT}/feal-linear-cryptanalysis__rcp9Jmc",
+    "task_dir": "${TASK_ROOT}/feal-linear-cryptanalysis/0f3234c5fde85f9dc610d94cfefd4c892afb75c9e571f21f18fee66972b67332",
+    "trajectory_path": "${JOB_ROOT}/feal-linear-cryptanalysis__rcp9Jmc/agent/trajectory.json",
+    "case_id": "case-0114"
+  },
+  {
+    "trial_name": "financial-document-processor__SpCQqGm",
+    "task_slug": "financial-document-processor",
+    "trial_dir": "${JOB_ROOT}/financial-document-processor__SpCQqGm",
+    "task_dir": "${TASK_ROOT}/financial-document-processor/63dc43a15d9ec401613016e9114d1a93ec860eea63b2db02abfe8060deea30fb",
+    "trajectory_path": "${JOB_ROOT}/financial-document-processor__SpCQqGm/agent/trajectory.json",
+    "case_id": "case-0115"
+  },
+  {
+    "trial_name": "financial-document-processor__YBWDhvP",
+    "task_slug": "financial-document-processor",
+    "trial_dir": "${JOB_ROOT}/financial-document-processor__YBWDhvP",
+    "task_dir": "${TASK_ROOT}/financial-document-processor/63dc43a15d9ec401613016e9114d1a93ec860eea63b2db02abfe8060deea30fb",
+    "trajectory_path": "${JOB_ROOT}/financial-document-processor__YBWDhvP/agent/trajectory.json",
+    "case_id": "case-0116"
+  },
+  {
+    "trial_name": "financial-document-processor__f2d8bCi",
+    "task_slug": "financial-document-processor",
+    "trial_dir": "${JOB_ROOT}/financial-document-processor__f2d8bCi",
+    "task_dir": "${TASK_ROOT}/financial-document-processor/63dc43a15d9ec401613016e9114d1a93ec860eea63b2db02abfe8060deea30fb",
+    "trajectory_path": "${JOB_ROOT}/financial-document-processor__f2d8bCi/agent/trajectory.json",
+    "case_id": "case-0117"
+  },
+  {
+    "trial_name": "financial-document-processor__hsQj9kc",
+    "task_slug": "financial-document-processor",
+    "trial_dir": "${JOB_ROOT}/financial-document-processor__hsQj9kc",
+    "task_dir": "${TASK_ROOT}/financial-document-processor/63dc43a15d9ec401613016e9114d1a93ec860eea63b2db02abfe8060deea30fb",
+    "trajectory_path": "${JOB_ROOT}/financial-document-processor__hsQj9kc/agent/trajectory.json",
+    "case_id": "case-0118"
+  },
+  {
+    "trial_name": "financial-document-processor__pV3TjiA",
+    "task_slug": "financial-document-processor",
+    "trial_dir": "${JOB_ROOT}/financial-document-processor__pV3TjiA",
+    "task_dir": "${TASK_ROOT}/financial-document-processor/63dc43a15d9ec401613016e9114d1a93ec860eea63b2db02abfe8060deea30fb",
+    "trajectory_path": "${JOB_ROOT}/financial-document-processor__pV3TjiA/agent/trajectory.json",
+    "case_id": "case-0119"
+  },
+  {
+    "trial_name": "fix-code-vulnerability__3fFiBTH",
+    "task_slug": "fix-code-vulnerability",
+    "trial_dir": "${JOB_ROOT}/fix-code-vulnerability__3fFiBTH",
+    "task_dir": "${TASK_ROOT}/fix-code-vulnerability/d31348aa16b533a15f013420e4d9726dc529e6086adc7d6d48067d22cc18fe71",
+    "trajectory_path": "${JOB_ROOT}/fix-code-vulnerability__3fFiBTH/agent/trajectory.json",
+    "case_id": "case-0120"
+  },
+  {
+    "trial_name": "fix-code-vulnerability__HSfjbGG",
+    "task_slug": "fix-code-vulnerability",
+    "trial_dir": "${JOB_ROOT}/fix-code-vulnerability__HSfjbGG",
+    "task_dir": "${TASK_ROOT}/fix-code-vulnerability/d31348aa16b533a15f013420e4d9726dc529e6086adc7d6d48067d22cc18fe71",
+    "trajectory_path": "${JOB_ROOT}/fix-code-vulnerability__HSfjbGG/agent/trajectory.json",
+    "case_id": "case-0121"
+  },
+  {
+    "trial_name": "fix-code-vulnerability__hNVRvat",
+    "task_slug": "fix-code-vulnerability",
+    "trial_dir": "${JOB_ROOT}/fix-code-vulnerability__hNVRvat",
+    "task_dir": "${TASK_ROOT}/fix-code-vulnerability/d31348aa16b533a15f013420e4d9726dc529e6086adc7d6d48067d22cc18fe71",
+    "trajectory_path": "${JOB_ROOT}/fix-code-vulnerability__hNVRvat/agent/trajectory.json",
+    "case_id": "case-0122"
+  },
+  {
+    "trial_name": "fix-code-vulnerability__sLw6Z7B",
+    "task_slug": "fix-code-vulnerability",
+    "trial_dir": "${JOB_ROOT}/fix-code-vulnerability__sLw6Z7B",
+    "task_dir": "${TASK_ROOT}/fix-code-vulnerability/d31348aa16b533a15f013420e4d9726dc529e6086adc7d6d48067d22cc18fe71",
+    "trajectory_path": "${JOB_ROOT}/fix-code-vulnerability__sLw6Z7B/agent/trajectory.json",
+    "case_id": "case-0123"
+  },
+  {
+    "trial_name": "fix-code-vulnerability__uTiPMHC",
+    "task_slug": "fix-code-vulnerability",
+    "trial_dir": "${JOB_ROOT}/fix-code-vulnerability__uTiPMHC",
+    "task_dir": "${TASK_ROOT}/fix-code-vulnerability/d31348aa16b533a15f013420e4d9726dc529e6086adc7d6d48067d22cc18fe71",
+    "trajectory_path": "${JOB_ROOT}/fix-code-vulnerability__uTiPMHC/agent/trajectory.json",
+    "case_id": "case-0124"
+  },
+  {
+    "trial_name": "fix-git__GJtdzLg",
+    "task_slug": "fix-git",
+    "trial_dir": "${JOB_ROOT}/fix-git__GJtdzLg",
+    "task_dir": "${TASK_ROOT}/fix-git/16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e",
+    "trajectory_path": "${JOB_ROOT}/fix-git__GJtdzLg/agent/trajectory.json",
+    "case_id": "case-0125"
+  },
+  {
+    "trial_name": "fix-git__e5ocgCs",
+    "task_slug": "fix-git",
+    "trial_dir": "${JOB_ROOT}/fix-git__e5ocgCs",
+    "task_dir": "${TASK_ROOT}/fix-git/16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e",
+    "trajectory_path": "${JOB_ROOT}/fix-git__e5ocgCs/agent/trajectory.json",
+    "case_id": "case-0126"
+  },
+  {
+    "trial_name": "fix-git__ih2PPPs",
+    "task_slug": "fix-git",
+    "trial_dir": "${JOB_ROOT}/fix-git__ih2PPPs",
+    "task_dir": "${TASK_ROOT}/fix-git/16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e",
+    "trajectory_path": "${JOB_ROOT}/fix-git__ih2PPPs/agent/trajectory.json",
+    "case_id": "case-0127"
+  },
+  {
+    "trial_name": "fix-git__o4uhKFk",
+    "task_slug": "fix-git",
+    "trial_dir": "${JOB_ROOT}/fix-git__o4uhKFk",
+    "task_dir": "${TASK_ROOT}/fix-git/16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e",
+    "trajectory_path": "${JOB_ROOT}/fix-git__o4uhKFk/agent/trajectory.json",
+    "case_id": "case-0128"
+  },
+  {
+    "trial_name": "fix-git__vnanzH9",
+    "task_slug": "fix-git",
+    "trial_dir": "${JOB_ROOT}/fix-git__vnanzH9",
+    "task_dir": "${TASK_ROOT}/fix-git/16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e",
+    "trajectory_path": "${JOB_ROOT}/fix-git__vnanzH9/agent/trajectory.json",
+    "case_id": "case-0129"
+  },
+  {
+    "trial_name": "fix-ocaml-gc__9jwFWRq",
+    "task_slug": "fix-ocaml-gc",
+    "trial_dir": "${JOB_ROOT}/fix-ocaml-gc__9jwFWRq",
+    "task_dir": "${TASK_ROOT}/fix-ocaml-gc/2031f3d5224b891fe443a31526b569eb756be2f88b663cb025448af9c4f97e2c",
+    "trajectory_path": "${JOB_ROOT}/fix-ocaml-gc__9jwFWRq/agent/trajectory.json",
+    "case_id": "case-0130"
+  },
+  {
+    "trial_name": "fix-ocaml-gc__fwmNvcU",
+    "task_slug": "fix-ocaml-gc",
+    "trial_dir": "${JOB_ROOT}/fix-ocaml-gc__fwmNvcU",
+    "task_dir": "${TASK_ROOT}/fix-ocaml-gc/2031f3d5224b891fe443a31526b569eb756be2f88b663cb025448af9c4f97e2c",
+    "trajectory_path": "${JOB_ROOT}/fix-ocaml-gc__fwmNvcU/agent/trajectory.json",
+    "case_id": "case-0131"
+  },
+  {
+    "trial_name": "fix-ocaml-gc__tmK85X5",
+    "task_slug": "fix-ocaml-gc",
+    "trial_dir": "${JOB_ROOT}/fix-ocaml-gc__tmK85X5",
+    "task_dir": "${TASK_ROOT}/fix-ocaml-gc/2031f3d5224b891fe443a31526b569eb756be2f88b663cb025448af9c4f97e2c",
+    "trajectory_path": "${JOB_ROOT}/fix-ocaml-gc__tmK85X5/agent/trajectory.json",
+    "case_id": "case-0132"
+  },
+  {
+    "trial_name": "fix-ocaml-gc__v6JUdp8",
+    "task_slug": "fix-ocaml-gc",
+    "trial_dir": "${JOB_ROOT}/fix-ocaml-gc__v6JUdp8",
+    "task_dir": "${TASK_ROOT}/fix-ocaml-gc/2031f3d5224b891fe443a31526b569eb756be2f88b663cb025448af9c4f97e2c",
+    "trajectory_path": "${JOB_ROOT}/fix-ocaml-gc__v6JUdp8/agent/trajectory.json",
+    "case_id": "case-0133"
+  },
+  {
+    "trial_name": "fix-ocaml-gc__wciX6eu",
+    "task_slug": "fix-ocaml-gc",
+    "trial_dir": "${JOB_ROOT}/fix-ocaml-gc__wciX6eu",
+    "task_dir": "${TASK_ROOT}/fix-ocaml-gc/2031f3d5224b891fe443a31526b569eb756be2f88b663cb025448af9c4f97e2c",
+    "trajectory_path": "${JOB_ROOT}/fix-ocaml-gc__wciX6eu/agent/trajectory.json",
+    "case_id": "case-0134"
+  },
+  {
+    "trial_name": "gcode-to-text__ASCN6xj",
+    "task_slug": "gcode-to-text",
+    "trial_dir": "${JOB_ROOT}/gcode-to-text__ASCN6xj",
+    "task_dir": "${TASK_ROOT}/gcode-to-text/7dd2af04820e71ecaba96bc493cbffa16317e96816c6c8003385c034adf6c23b",
+    "trajectory_path": "${JOB_ROOT}/gcode-to-text__ASCN6xj/agent/trajectory.json",
+    "case_id": "case-0135"
+  },
+  {
+    "trial_name": "gcode-to-text__P2Pj62J",
+    "task_slug": "gcode-to-text",
+    "trial_dir": "${JOB_ROOT}/gcode-to-text__P2Pj62J",
+    "task_dir": "${TASK_ROOT}/gcode-to-text/7dd2af04820e71ecaba96bc493cbffa16317e96816c6c8003385c034adf6c23b",
+    "trajectory_path": "${JOB_ROOT}/gcode-to-text__P2Pj62J/agent/trajectory.json",
+    "case_id": "case-0136"
+  },
+  {
+    "trial_name": "gcode-to-text__ikxT9Sw",
+    "task_slug": "gcode-to-text",
+    "trial_dir": "${JOB_ROOT}/gcode-to-text__ikxT9Sw",
+    "task_dir": "${TASK_ROOT}/gcode-to-text/7dd2af04820e71ecaba96bc493cbffa16317e96816c6c8003385c034adf6c23b",
+    "trajectory_path": "${JOB_ROOT}/gcode-to-text__ikxT9Sw/agent/trajectory.json",
+    "case_id": "case-0137"
+  },
+  {
+    "trial_name": "gcode-to-text__w6QtU7p",
+    "task_slug": "gcode-to-text",
+    "trial_dir": "${JOB_ROOT}/gcode-to-text__w6QtU7p",
+    "task_dir": "${TASK_ROOT}/gcode-to-text/7dd2af04820e71ecaba96bc493cbffa16317e96816c6c8003385c034adf6c23b",
+    "trajectory_path": "${JOB_ROOT}/gcode-to-text__w6QtU7p/agent/trajectory.json",
+    "case_id": "case-0138"
+  },
+  {
+    "trial_name": "gcode-to-text__xFnGBJc",
+    "task_slug": "gcode-to-text",
+    "trial_dir": "${JOB_ROOT}/gcode-to-text__xFnGBJc",
+    "task_dir": "${TASK_ROOT}/gcode-to-text/7dd2af04820e71ecaba96bc493cbffa16317e96816c6c8003385c034adf6c23b",
+    "trajectory_path": "${JOB_ROOT}/gcode-to-text__xFnGBJc/agent/trajectory.json",
+    "case_id": "case-0139"
+  },
+  {
+    "trial_name": "git-leak-recovery__DCTLGR7",
+    "task_slug": "git-leak-recovery",
+    "trial_dir": "${JOB_ROOT}/git-leak-recovery__DCTLGR7",
+    "task_dir": "${TASK_ROOT}/git-leak-recovery/22a9ec10dbd4cd8b99477b70e1944103775ca41de9b9e0025ec4898cd17bd334",
+    "trajectory_path": "${JOB_ROOT}/git-leak-recovery__DCTLGR7/agent/trajectory.json",
+    "case_id": "case-0140"
+  },
+  {
+    "trial_name": "git-leak-recovery__K6FrQxq",
+    "task_slug": "git-leak-recovery",
+    "trial_dir": "${JOB_ROOT}/git-leak-recovery__K6FrQxq",
+    "task_dir": "${TASK_ROOT}/git-leak-recovery/22a9ec10dbd4cd8b99477b70e1944103775ca41de9b9e0025ec4898cd17bd334",
+    "trajectory_path": "${JOB_ROOT}/git-leak-recovery__K6FrQxq/agent/trajectory.json",
+    "case_id": "case-0141"
+  },
+  {
+    "trial_name": "git-leak-recovery__MBfsRPM",
+    "task_slug": "git-leak-recovery",
+    "trial_dir": "${JOB_ROOT}/git-leak-recovery__MBfsRPM",
+    "task_dir": "${TASK_ROOT}/git-leak-recovery/22a9ec10dbd4cd8b99477b70e1944103775ca41de9b9e0025ec4898cd17bd334",
+    "trajectory_path": "${JOB_ROOT}/git-leak-recovery__MBfsRPM/agent/trajectory.json",
+    "case_id": "case-0142"
+  },
+  {
+    "trial_name": "git-leak-recovery__guQhKfP",
+    "task_slug": "git-leak-recovery",
+    "trial_dir": "${JOB_ROOT}/git-leak-recovery__guQhKfP",
+    "task_dir": "${TASK_ROOT}/git-leak-recovery/22a9ec10dbd4cd8b99477b70e1944103775ca41de9b9e0025ec4898cd17bd334",
+    "trajectory_path": "${JOB_ROOT}/git-leak-recovery__guQhKfP/agent/trajectory.json",
+    "case_id": "case-0143"
+  },
+  {
+    "trial_name": "git-leak-recovery__hsGccJ2",
+    "task_slug": "git-leak-recovery",
+    "trial_dir": "${JOB_ROOT}/git-leak-recovery__hsGccJ2",
+    "task_dir": "${TASK_ROOT}/git-leak-recovery/22a9ec10dbd4cd8b99477b70e1944103775ca41de9b9e0025ec4898cd17bd334",
+    "trajectory_path": "${JOB_ROOT}/git-leak-recovery__hsGccJ2/agent/trajectory.json",
+    "case_id": "case-0144"
+  },
+  {
+    "trial_name": "git-multibranch__3JhLjyx",
+    "task_slug": "git-multibranch",
+    "trial_dir": "${JOB_ROOT}/git-multibranch__3JhLjyx",
+    "task_dir": "${TASK_ROOT}/git-multibranch/7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa",
+    "trajectory_path": "${JOB_ROOT}/git-multibranch__3JhLjyx/agent/trajectory.json",
+    "case_id": "case-0145"
+  },
+  {
+    "trial_name": "git-multibranch__D3YCjgQ",
+    "task_slug": "git-multibranch",
+    "trial_dir": "${JOB_ROOT}/git-multibranch__D3YCjgQ",
+    "task_dir": "${TASK_ROOT}/git-multibranch/7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa",
+    "trajectory_path": "${JOB_ROOT}/git-multibranch__D3YCjgQ/agent/trajectory.json",
+    "case_id": "case-0146"
+  },
+  {
+    "trial_name": "git-multibranch__KPJBraQ",
+    "task_slug": "git-multibranch",
+    "trial_dir": "${JOB_ROOT}/git-multibranch__KPJBraQ",
+    "task_dir": "${TASK_ROOT}/git-multibranch/7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa",
+    "trajectory_path": "${JOB_ROOT}/git-multibranch__KPJBraQ/agent/trajectory.json",
+    "case_id": "case-0147"
+  },
+  {
+    "trial_name": "git-multibranch__VxxWwNU",
+    "task_slug": "git-multibranch",
+    "trial_dir": "${JOB_ROOT}/git-multibranch__VxxWwNU",
+    "task_dir": "${TASK_ROOT}/git-multibranch/7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa",
+    "trajectory_path": "${JOB_ROOT}/git-multibranch__VxxWwNU/agent/trajectory.json",
+    "case_id": "case-0148"
+  },
+  {
+    "trial_name": "git-multibranch__YKiZRfv",
+    "task_slug": "git-multibranch",
+    "trial_dir": "${JOB_ROOT}/git-multibranch__YKiZRfv",
+    "task_dir": "${TASK_ROOT}/git-multibranch/7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa",
+    "trajectory_path": "${JOB_ROOT}/git-multibranch__YKiZRfv/agent/trajectory.json",
+    "case_id": "case-0149"
+  },
+  {
+    "trial_name": "gpt2-codegolf__JSMPnKs",
+    "task_slug": "gpt2-codegolf",
+    "trial_dir": "${JOB_ROOT}/gpt2-codegolf__JSMPnKs",
+    "task_dir": "${TASK_ROOT}/gpt2-codegolf/fe42af8e9c5aa927c3b680acd08e43032c84088fa9d770b03ce63dbc66fea4e7",
+    "trajectory_path": "${JOB_ROOT}/gpt2-codegolf__JSMPnKs/agent/trajectory.json",
+    "case_id": "case-0150"
+  },
+  {
+    "trial_name": "gpt2-codegolf__YZJRgqo",
+    "task_slug": "gpt2-codegolf",
+    "trial_dir": "${JOB_ROOT}/gpt2-codegolf__YZJRgqo",
+    "task_dir": "${TASK_ROOT}/gpt2-codegolf/fe42af8e9c5aa927c3b680acd08e43032c84088fa9d770b03ce63dbc66fea4e7",
+    "trajectory_path": "${JOB_ROOT}/gpt2-codegolf__YZJRgqo/agent/trajectory.json",
+    "case_id": "case-0151"
+  },
+  {
+    "trial_name": "gpt2-codegolf__qXJxjbN",
+    "task_slug": "gpt2-codegolf",
+    "trial_dir": "${JOB_ROOT}/gpt2-codegolf__qXJxjbN",
+    "task_dir": "${TASK_ROOT}/gpt2-codegolf/fe42af8e9c5aa927c3b680acd08e43032c84088fa9d770b03ce63dbc66fea4e7",
+    "trajectory_path": "${JOB_ROOT}/gpt2-codegolf__qXJxjbN/agent/trajectory.json",
+    "case_id": "case-0152"
+  },
+  {
+    "trial_name": "gpt2-codegolf__qfqbgUW",
+    "task_slug": "gpt2-codegolf",
+    "trial_dir": "${JOB_ROOT}/gpt2-codegolf__qfqbgUW",
+    "task_dir": "${TASK_ROOT}/gpt2-codegolf/fe42af8e9c5aa927c3b680acd08e43032c84088fa9d770b03ce63dbc66fea4e7",
+    "trajectory_path": "${JOB_ROOT}/gpt2-codegolf__qfqbgUW/agent/trajectory.json",
+    "case_id": "case-0153"
+  },
+  {
+    "trial_name": "gpt2-codegolf__ufNmLus",
+    "task_slug": "gpt2-codegolf",
+    "trial_dir": "${JOB_ROOT}/gpt2-codegolf__ufNmLus",
+    "task_dir": "${TASK_ROOT}/gpt2-codegolf/fe42af8e9c5aa927c3b680acd08e43032c84088fa9d770b03ce63dbc66fea4e7",
+    "trajectory_path": "${JOB_ROOT}/gpt2-codegolf__ufNmLus/agent/trajectory.json",
+    "case_id": "case-0154"
+  },
+  {
+    "trial_name": "headless-terminal__4j59tQH",
+    "task_slug": "headless-terminal",
+    "trial_dir": "${JOB_ROOT}/headless-terminal__4j59tQH",
+    "task_dir": "${TASK_ROOT}/headless-terminal/203953871ebdae4efbf163af9499849368dab5e219b70d447e5ee9701ad382d9",
+    "trajectory_path": "${JOB_ROOT}/headless-terminal__4j59tQH/agent/trajectory.json",
+    "case_id": "case-0155"
+  },
+  {
+    "trial_name": "headless-terminal__CwzarDi",
+    "task_slug": "headless-terminal",
+    "trial_dir": "${JOB_ROOT}/headless-terminal__CwzarDi",
+    "task_dir": "${TASK_ROOT}/headless-terminal/203953871ebdae4efbf163af9499849368dab5e219b70d447e5ee9701ad382d9",
+    "trajectory_path": "${JOB_ROOT}/headless-terminal__CwzarDi/agent/trajectory.json",
+    "case_id": "case-0156"
+  },
+  {
+    "trial_name": "headless-terminal__MeBdU5g",
+    "task_slug": "headless-terminal",
+    "trial_dir": "${JOB_ROOT}/headless-terminal__MeBdU5g",
+    "task_dir": "${TASK_ROOT}/headless-terminal/203953871ebdae4efbf163af9499849368dab5e219b70d447e5ee9701ad382d9",
+    "trajectory_path": "${JOB_ROOT}/headless-terminal__MeBdU5g/agent/trajectory.json",
+    "case_id": "case-0157"
+  },
+  {
+    "trial_name": "headless-terminal__cWKqwRb",
+    "task_slug": "headless-terminal",
+    "trial_dir": "${JOB_ROOT}/headless-terminal__cWKqwRb",
+    "task_dir": "${TASK_ROOT}/headless-terminal/203953871ebdae4efbf163af9499849368dab5e219b70d447e5ee9701ad382d9",
+    "trajectory_path": "${JOB_ROOT}/headless-terminal__cWKqwRb/agent/trajectory.json",
+    "case_id": "case-0158"
+  },
+  {
+    "trial_name": "headless-terminal__sNfJLKS",
+    "task_slug": "headless-terminal",
+    "trial_dir": "${JOB_ROOT}/headless-terminal__sNfJLKS",
+    "task_dir": "${TASK_ROOT}/headless-terminal/203953871ebdae4efbf163af9499849368dab5e219b70d447e5ee9701ad382d9",
+    "trajectory_path": "${JOB_ROOT}/headless-terminal__sNfJLKS/agent/trajectory.json",
+    "case_id": "case-0159"
+  },
+  {
+    "trial_name": "hf-model-inference__9f3G6rP",
+    "task_slug": "hf-model-inference",
+    "trial_dir": "${JOB_ROOT}/hf-model-inference__9f3G6rP",
+    "task_dir": "${TASK_ROOT}/hf-model-inference/01370f37e61286f920dfca1e471496640ebcc8d06e1cc48d874c790715dbd4ad",
+    "trajectory_path": "${JOB_ROOT}/hf-model-inference__9f3G6rP/agent/trajectory.json",
+    "case_id": "case-0160"
+  },
+  {
+    "trial_name": "hf-model-inference__KjqGK3M",
+    "task_slug": "hf-model-inference",
+    "trial_dir": "${JOB_ROOT}/hf-model-inference__KjqGK3M",
+    "task_dir": "${TASK_ROOT}/hf-model-inference/01370f37e61286f920dfca1e471496640ebcc8d06e1cc48d874c790715dbd4ad",
+    "trajectory_path": "${JOB_ROOT}/hf-model-inference__KjqGK3M/agent/trajectory.json",
+    "case_id": "case-0161"
+  },
+  {
+    "trial_name": "hf-model-inference__Q3nHwEF",
+    "task_slug": "hf-model-inference",
+    "trial_dir": "${JOB_ROOT}/hf-model-inference__Q3nHwEF",
+    "task_dir": "${TASK_ROOT}/hf-model-inference/01370f37e61286f920dfca1e471496640ebcc8d06e1cc48d874c790715dbd4ad",
+    "trajectory_path": "${JOB_ROOT}/hf-model-inference__Q3nHwEF/agent/trajectory.json",
+    "case_id": "case-0162"
+  },
+  {
+    "trial_name": "hf-model-inference__wdfyQQJ",
+    "task_slug": "hf-model-inference",
+    "trial_dir": "${JOB_ROOT}/hf-model-inference__wdfyQQJ",
+    "task_dir": "${TASK_ROOT}/hf-model-inference/01370f37e61286f920dfca1e471496640ebcc8d06e1cc48d874c790715dbd4ad",
+    "trajectory_path": "${JOB_ROOT}/hf-model-inference__wdfyQQJ/agent/trajectory.json",
+    "case_id": "case-0163"
+  },
+  {
+    "trial_name": "install-windows-3.11__AXGPpDK",
+    "task_slug": "install-windows-3.11",
+    "trial_dir": "${JOB_ROOT}/install-windows-3.11__AXGPpDK",
+    "task_dir": "${TASK_ROOT}/install-windows-3.11/1f1361b0012e1ad24054e7cfc039829459e8ab0631b3573d9b93499bf6b3563e",
+    "trajectory_path": "${JOB_ROOT}/install-windows-3.11__AXGPpDK/agent/trajectory.json",
+    "case_id": "case-0164"
+  },
+  {
+    "trial_name": "install-windows-3.11__gWFv3Kc",
+    "task_slug": "install-windows-3.11",
+    "trial_dir": "${JOB_ROOT}/install-windows-3.11__gWFv3Kc",
+    "task_dir": "${TASK_ROOT}/install-windows-3.11/1f1361b0012e1ad24054e7cfc039829459e8ab0631b3573d9b93499bf6b3563e",
+    "trajectory_path": "${JOB_ROOT}/install-windows-3.11__gWFv3Kc/agent/trajectory.json",
+    "case_id": "case-0165"
+  },
+  {
+    "trial_name": "install-windows-3.11__qrbLY3w",
+    "task_slug": "install-windows-3.11",
+    "trial_dir": "${JOB_ROOT}/install-windows-3.11__qrbLY3w",
+    "task_dir": "${TASK_ROOT}/install-windows-3.11/1f1361b0012e1ad24054e7cfc039829459e8ab0631b3573d9b93499bf6b3563e",
+    "trajectory_path": "${JOB_ROOT}/install-windows-3.11__qrbLY3w/agent/trajectory.json",
+    "case_id": "case-0166"
+  },
+  {
+    "trial_name": "install-windows-3.11__uzmGf63",
+    "task_slug": "install-windows-3.11",
+    "trial_dir": "${JOB_ROOT}/install-windows-3.11__uzmGf63",
+    "task_dir": "${TASK_ROOT}/install-windows-3.11/1f1361b0012e1ad24054e7cfc039829459e8ab0631b3573d9b93499bf6b3563e",
+    "trajectory_path": "${JOB_ROOT}/install-windows-3.11__uzmGf63/agent/trajectory.json",
+    "case_id": "case-0167"
+  },
+  {
+    "trial_name": "install-windows-3.11__vXSBvBt",
+    "task_slug": "install-windows-3.11",
+    "trial_dir": "${JOB_ROOT}/install-windows-3.11__vXSBvBt",
+    "task_dir": "${TASK_ROOT}/install-windows-3.11/1f1361b0012e1ad24054e7cfc039829459e8ab0631b3573d9b93499bf6b3563e",
+    "trajectory_path": "${JOB_ROOT}/install-windows-3.11__vXSBvBt/agent/trajectory.json",
+    "case_id": "case-0168"
+  },
+  {
+    "trial_name": "kv-store-grpc__6BwaoZw",
+    "task_slug": "kv-store-grpc",
+    "trial_dir": "${JOB_ROOT}/kv-store-grpc__6BwaoZw",
+    "task_dir": "${TASK_ROOT}/kv-store-grpc/973c5d4c111fb61a344457936f1c36400acd2d9e44389e7b319586fe23a7a307",
+    "trajectory_path": "${JOB_ROOT}/kv-store-grpc__6BwaoZw/agent/trajectory.json",
+    "case_id": "case-0169"
+  },
+  {
+    "trial_name": "large-scale-text-editing__5x89nPn",
+    "task_slug": "large-scale-text-editing",
+    "trial_dir": "${JOB_ROOT}/large-scale-text-editing__5x89nPn",
+    "task_dir": "${TASK_ROOT}/large-scale-text-editing/1f1cddc3df15e452fe2d3c6928f6b1e5b5330a7ae67cab373a0d089ea7d334a2",
+    "trajectory_path": "${JOB_ROOT}/large-scale-text-editing__5x89nPn/agent/trajectory.json",
+    "case_id": "case-0170"
+  },
+  {
+    "trial_name": "large-scale-text-editing__E9Zd5TR",
+    "task_slug": "large-scale-text-editing",
+    "trial_dir": "${JOB_ROOT}/large-scale-text-editing__E9Zd5TR",
+    "task_dir": "${TASK_ROOT}/large-scale-text-editing/1f1cddc3df15e452fe2d3c6928f6b1e5b5330a7ae67cab373a0d089ea7d334a2",
+    "trajectory_path": "${JOB_ROOT}/large-scale-text-editing__E9Zd5TR/agent/trajectory.json",
+    "case_id": "case-0171"
+  },
+  {
+    "trial_name": "large-scale-text-editing__G3WiiiW",
+    "task_slug": "large-scale-text-editing",
+    "trial_dir": "${JOB_ROOT}/large-scale-text-editing__G3WiiiW",
+    "task_dir": "${TASK_ROOT}/large-scale-text-editing/1f1cddc3df15e452fe2d3c6928f6b1e5b5330a7ae67cab373a0d089ea7d334a2",
+    "trajectory_path": "${JOB_ROOT}/large-scale-text-editing__G3WiiiW/agent/trajectory.json",
+    "case_id": "case-0172"
+  },
+  {
+    "trial_name": "large-scale-text-editing__PdSg4Q9",
+    "task_slug": "large-scale-text-editing",
+    "trial_dir": "${JOB_ROOT}/large-scale-text-editing__PdSg4Q9",
+    "task_dir": "${TASK_ROOT}/large-scale-text-editing/1f1cddc3df15e452fe2d3c6928f6b1e5b5330a7ae67cab373a0d089ea7d334a2",
+    "trajectory_path": "${JOB_ROOT}/large-scale-text-editing__PdSg4Q9/agent/trajectory.json",
+    "case_id": "case-0173"
+  },
+  {
+    "trial_name": "large-scale-text-editing__hucdi3L",
+    "task_slug": "large-scale-text-editing",
+    "trial_dir": "${JOB_ROOT}/large-scale-text-editing__hucdi3L",
+    "task_dir": "${TASK_ROOT}/large-scale-text-editing/1f1cddc3df15e452fe2d3c6928f6b1e5b5330a7ae67cab373a0d089ea7d334a2",
+    "trajectory_path": "${JOB_ROOT}/large-scale-text-editing__hucdi3L/agent/trajectory.json",
+    "case_id": "case-0174"
+  },
+  {
+    "trial_name": "largest-eigenval__PUBwQR6",
+    "task_slug": "largest-eigenval",
+    "trial_dir": "${JOB_ROOT}/largest-eigenval__PUBwQR6",
+    "task_dir": "${TASK_ROOT}/largest-eigenval/1b6f17c344d23e97435ba3fa93400d141f6bb7763ed2014fab418830983791b3",
+    "trajectory_path": "${JOB_ROOT}/largest-eigenval__PUBwQR6/agent/trajectory.json",
+    "case_id": "case-0175"
+  },
+  {
+    "trial_name": "largest-eigenval__tcVPQV2",
+    "task_slug": "largest-eigenval",
+    "trial_dir": "${JOB_ROOT}/largest-eigenval__tcVPQV2",
+    "task_dir": "${TASK_ROOT}/largest-eigenval/1b6f17c344d23e97435ba3fa93400d141f6bb7763ed2014fab418830983791b3",
+    "trajectory_path": "${JOB_ROOT}/largest-eigenval__tcVPQV2/agent/trajectory.json",
+    "case_id": "case-0176"
+  },
+  {
+    "trial_name": "llm-inference-batching-scheduler__57p4Gih",
+    "task_slug": "llm-inference-batching-scheduler",
+    "trial_dir": "${JOB_ROOT}/llm-inference-batching-scheduler__57p4Gih",
+    "task_dir": "${TASK_ROOT}/llm-inference-batching-scheduler/a3bf47589118daec5124fe3689b4439802c805b2f4ed9d402a48ae73ca2fea67",
+    "trajectory_path": "${JOB_ROOT}/llm-inference-batching-scheduler__57p4Gih/agent/trajectory.json",
+    "case_id": "case-0177"
+  },
+  {
+    "trial_name": "llm-inference-batching-scheduler__ehL8cwJ",
+    "task_slug": "llm-inference-batching-scheduler",
+    "trial_dir": "${JOB_ROOT}/llm-inference-batching-scheduler__ehL8cwJ",
+    "task_dir": "${TASK_ROOT}/llm-inference-batching-scheduler/a3bf47589118daec5124fe3689b4439802c805b2f4ed9d402a48ae73ca2fea67",
+    "trajectory_path": "${JOB_ROOT}/llm-inference-batching-scheduler__ehL8cwJ/agent/trajectory.json",
+    "case_id": "case-0178"
+  },
+  {
+    "trial_name": "llm-inference-batching-scheduler__iBqkiVF",
+    "task_slug": "llm-inference-batching-scheduler",
+    "trial_dir": "${JOB_ROOT}/llm-inference-batching-scheduler__iBqkiVF",
+    "task_dir": "${TASK_ROOT}/llm-inference-batching-scheduler/a3bf47589118daec5124fe3689b4439802c805b2f4ed9d402a48ae73ca2fea67",
+    "trajectory_path": "${JOB_ROOT}/llm-inference-batching-scheduler__iBqkiVF/agent/trajectory.json",
+    "case_id": "case-0179"
+  },
+  {
+    "trial_name": "llm-inference-batching-scheduler__nLa7dVx",
+    "task_slug": "llm-inference-batching-scheduler",
+    "trial_dir": "${JOB_ROOT}/llm-inference-batching-scheduler__nLa7dVx",
+    "task_dir": "${TASK_ROOT}/llm-inference-batching-scheduler/a3bf47589118daec5124fe3689b4439802c805b2f4ed9d402a48ae73ca2fea67",
+    "trajectory_path": "${JOB_ROOT}/llm-inference-batching-scheduler__nLa7dVx/agent/trajectory.json",
+    "case_id": "case-0180"
+  },
+  {
+    "trial_name": "llm-inference-batching-scheduler__z37TUAE",
+    "task_slug": "llm-inference-batching-scheduler",
+    "trial_dir": "${JOB_ROOT}/llm-inference-batching-scheduler__z37TUAE",
+    "task_dir": "${TASK_ROOT}/llm-inference-batching-scheduler/a3bf47589118daec5124fe3689b4439802c805b2f4ed9d402a48ae73ca2fea67",
+    "trajectory_path": "${JOB_ROOT}/llm-inference-batching-scheduler__z37TUAE/agent/trajectory.json",
+    "case_id": "case-0181"
+  },
+  {
+    "trial_name": "log-summary-date-ranges__5Tt2cUg",
+    "task_slug": "log-summary-date-ranges",
+    "trial_dir": "${JOB_ROOT}/log-summary-date-ranges__5Tt2cUg",
+    "task_dir": "${TASK_ROOT}/log-summary-date-ranges/27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6",
+    "trajectory_path": "${JOB_ROOT}/log-summary-date-ranges__5Tt2cUg/agent/trajectory.json",
+    "case_id": "case-0182"
+  },
+  {
+    "trial_name": "log-summary-date-ranges__R4h6oLS",
+    "task_slug": "log-summary-date-ranges",
+    "trial_dir": "${JOB_ROOT}/log-summary-date-ranges__R4h6oLS",
+    "task_dir": "${TASK_ROOT}/log-summary-date-ranges/27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6",
+    "trajectory_path": "${JOB_ROOT}/log-summary-date-ranges__R4h6oLS/agent/trajectory.json",
+    "case_id": "case-0183"
+  },
+  {
+    "trial_name": "log-summary-date-ranges__R753QgU",
+    "task_slug": "log-summary-date-ranges",
+    "trial_dir": "${JOB_ROOT}/log-summary-date-ranges__R753QgU",
+    "task_dir": "${TASK_ROOT}/log-summary-date-ranges/27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6",
+    "trajectory_path": "${JOB_ROOT}/log-summary-date-ranges__R753QgU/agent/trajectory.json",
+    "case_id": "case-0184"
+  },
+  {
+    "trial_name": "log-summary-date-ranges__hhjGz2H",
+    "task_slug": "log-summary-date-ranges",
+    "trial_dir": "${JOB_ROOT}/log-summary-date-ranges__hhjGz2H",
+    "task_dir": "${TASK_ROOT}/log-summary-date-ranges/27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6",
+    "trajectory_path": "${JOB_ROOT}/log-summary-date-ranges__hhjGz2H/agent/trajectory.json",
+    "case_id": "case-0185"
+  },
+  {
+    "trial_name": "log-summary-date-ranges__rd9Ux6e",
+    "task_slug": "log-summary-date-ranges",
+    "trial_dir": "${JOB_ROOT}/log-summary-date-ranges__rd9Ux6e",
+    "task_dir": "${TASK_ROOT}/log-summary-date-ranges/27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6",
+    "trajectory_path": "${JOB_ROOT}/log-summary-date-ranges__rd9Ux6e/agent/trajectory.json",
+    "case_id": "case-0186"
+  },
+  {
+    "trial_name": "mailman__3FmS9bg",
+    "task_slug": "mailman",
+    "trial_dir": "${JOB_ROOT}/mailman__3FmS9bg",
+    "task_dir": "${TASK_ROOT}/mailman/831b3ed00807153963c05f91599443e4839099521d1d56db811c5547ab280dbe",
+    "trajectory_path": "${JOB_ROOT}/mailman__3FmS9bg/agent/trajectory.json",
+    "case_id": "case-0187"
+  },
+  {
+    "trial_name": "mailman__FyfHDBt",
+    "task_slug": "mailman",
+    "trial_dir": "${JOB_ROOT}/mailman__FyfHDBt",
+    "task_dir": "${TASK_ROOT}/mailman/831b3ed00807153963c05f91599443e4839099521d1d56db811c5547ab280dbe",
+    "trajectory_path": "${JOB_ROOT}/mailman__FyfHDBt/agent/trajectory.json",
+    "case_id": "case-0188"
+  },
+  {
+    "trial_name": "mailman__WsoBcJS",
+    "task_slug": "mailman",
+    "trial_dir": "${JOB_ROOT}/mailman__WsoBcJS",
+    "task_dir": "${TASK_ROOT}/mailman/831b3ed00807153963c05f91599443e4839099521d1d56db811c5547ab280dbe",
+    "trajectory_path": "${JOB_ROOT}/mailman__WsoBcJS/agent/trajectory.json",
+    "case_id": "case-0189"
+  },
+  {
+    "trial_name": "mailman__dKbyTKS",
+    "task_slug": "mailman",
+    "trial_dir": "${JOB_ROOT}/mailman__dKbyTKS",
+    "task_dir": "${TASK_ROOT}/mailman/831b3ed00807153963c05f91599443e4839099521d1d56db811c5547ab280dbe",
+    "trajectory_path": "${JOB_ROOT}/mailman__dKbyTKS/agent/trajectory.json",
+    "case_id": "case-0190"
+  },
+  {
+    "trial_name": "mailman__gjP58NP",
+    "task_slug": "mailman",
+    "trial_dir": "${JOB_ROOT}/mailman__gjP58NP",
+    "task_dir": "${TASK_ROOT}/mailman/831b3ed00807153963c05f91599443e4839099521d1d56db811c5547ab280dbe",
+    "trajectory_path": "${JOB_ROOT}/mailman__gjP58NP/agent/trajectory.json",
+    "case_id": "case-0191"
+  },
+  {
+    "trial_name": "make-doom-for-mips__UPRjmM3",
+    "task_slug": "make-doom-for-mips",
+    "trial_dir": "${JOB_ROOT}/make-doom-for-mips__UPRjmM3",
+    "task_dir": "${TASK_ROOT}/make-doom-for-mips/2d83dd3dee8e0f055e09973934cf0d7e3169a9cd90704cba5c8940b170be9498",
+    "trajectory_path": "${JOB_ROOT}/make-doom-for-mips__UPRjmM3/agent/trajectory.json",
+    "case_id": "case-0192"
+  },
+  {
+    "trial_name": "make-doom-for-mips__oyCAXjz",
+    "task_slug": "make-doom-for-mips",
+    "trial_dir": "${JOB_ROOT}/make-doom-for-mips__oyCAXjz",
+    "task_dir": "${TASK_ROOT}/make-doom-for-mips/2d83dd3dee8e0f055e09973934cf0d7e3169a9cd90704cba5c8940b170be9498",
+    "trajectory_path": "${JOB_ROOT}/make-doom-for-mips__oyCAXjz/agent/trajectory.json",
+    "case_id": "case-0193"
+  },
+  {
+    "trial_name": "make-mips-interpreter__PQE2hxY",
+    "task_slug": "make-mips-interpreter",
+    "trial_dir": "${JOB_ROOT}/make-mips-interpreter__PQE2hxY",
+    "task_dir": "${TASK_ROOT}/make-mips-interpreter/41a55da0abec5d7b32a0c2321f8b18e84000ca8074ae62c6874d6ed4a3a1cd3c",
+    "trajectory_path": "${JOB_ROOT}/make-mips-interpreter__PQE2hxY/agent/trajectory.json",
+    "case_id": "case-0194"
+  },
+  {
+    "trial_name": "make-mips-interpreter__VNno6UY",
+    "task_slug": "make-mips-interpreter",
+    "trial_dir": "${JOB_ROOT}/make-mips-interpreter__VNno6UY",
+    "task_dir": "${TASK_ROOT}/make-mips-interpreter/41a55da0abec5d7b32a0c2321f8b18e84000ca8074ae62c6874d6ed4a3a1cd3c",
+    "trajectory_path": "${JOB_ROOT}/make-mips-interpreter__VNno6UY/agent/trajectory.json",
+    "case_id": "case-0195"
+  },
+  {
+    "trial_name": "make-mips-interpreter__a8snrCb",
+    "task_slug": "make-mips-interpreter",
+    "trial_dir": "${JOB_ROOT}/make-mips-interpreter__a8snrCb",
+    "task_dir": "${TASK_ROOT}/make-mips-interpreter/41a55da0abec5d7b32a0c2321f8b18e84000ca8074ae62c6874d6ed4a3a1cd3c",
+    "trajectory_path": "${JOB_ROOT}/make-mips-interpreter__a8snrCb/agent/trajectory.json",
+    "case_id": "case-0196"
+  },
+  {
+    "trial_name": "make-mips-interpreter__u6pRX5L",
+    "task_slug": "make-mips-interpreter",
+    "trial_dir": "${JOB_ROOT}/make-mips-interpreter__u6pRX5L",
+    "task_dir": "${TASK_ROOT}/make-mips-interpreter/41a55da0abec5d7b32a0c2321f8b18e84000ca8074ae62c6874d6ed4a3a1cd3c",
+    "trajectory_path": "${JOB_ROOT}/make-mips-interpreter__u6pRX5L/agent/trajectory.json",
+    "case_id": "case-0197"
+  },
+  {
+    "trial_name": "make-mips-interpreter__xfRc8TC",
+    "task_slug": "make-mips-interpreter",
+    "trial_dir": "${JOB_ROOT}/make-mips-interpreter__xfRc8TC",
+    "task_dir": "${TASK_ROOT}/make-mips-interpreter/41a55da0abec5d7b32a0c2321f8b18e84000ca8074ae62c6874d6ed4a3a1cd3c",
+    "trajectory_path": "${JOB_ROOT}/make-mips-interpreter__xfRc8TC/agent/trajectory.json",
+    "case_id": "case-0198"
+  },
+  {
+    "trial_name": "mcmc-sampling-stan__GfK5uoL",
+    "task_slug": "mcmc-sampling-stan",
+    "trial_dir": "${JOB_ROOT}/mcmc-sampling-stan__GfK5uoL",
+    "task_dir": "${TASK_ROOT}/mcmc-sampling-stan/443cd2b94ed797944793e97a56527a5dc0f8ad40f78ed418fe1b2e367cf22546",
+    "trajectory_path": "${JOB_ROOT}/mcmc-sampling-stan__GfK5uoL/agent/trajectory.json",
+    "case_id": "case-0199"
+  },
+  {
+    "trial_name": "mcmc-sampling-stan__KHkQU3D",
+    "task_slug": "mcmc-sampling-stan",
+    "trial_dir": "${JOB_ROOT}/mcmc-sampling-stan__KHkQU3D",
+    "task_dir": "${TASK_ROOT}/mcmc-sampling-stan/443cd2b94ed797944793e97a56527a5dc0f8ad40f78ed418fe1b2e367cf22546",
+    "trajectory_path": "${JOB_ROOT}/mcmc-sampling-stan__KHkQU3D/agent/trajectory.json",
+    "case_id": "case-0200"
+  },
+  {
+    "trial_name": "mcmc-sampling-stan__bQzz85x",
+    "task_slug": "mcmc-sampling-stan",
+    "trial_dir": "${JOB_ROOT}/mcmc-sampling-stan__bQzz85x",
+    "task_dir": "${TASK_ROOT}/mcmc-sampling-stan/443cd2b94ed797944793e97a56527a5dc0f8ad40f78ed418fe1b2e367cf22546",
+    "trajectory_path": "${JOB_ROOT}/mcmc-sampling-stan__bQzz85x/agent/trajectory.json",
+    "case_id": "case-0201"
+  },
+  {
+    "trial_name": "mcmc-sampling-stan__c4GVjzi",
+    "task_slug": "mcmc-sampling-stan",
+    "trial_dir": "${JOB_ROOT}/mcmc-sampling-stan__c4GVjzi",
+    "task_dir": "${TASK_ROOT}/mcmc-sampling-stan/443cd2b94ed797944793e97a56527a5dc0f8ad40f78ed418fe1b2e367cf22546",
+    "trajectory_path": "${JOB_ROOT}/mcmc-sampling-stan__c4GVjzi/agent/trajectory.json",
+    "case_id": "case-0202"
+  },
+  {
+    "trial_name": "mcmc-sampling-stan__tYqwADP",
+    "task_slug": "mcmc-sampling-stan",
+    "trial_dir": "${JOB_ROOT}/mcmc-sampling-stan__tYqwADP",
+    "task_dir": "${TASK_ROOT}/mcmc-sampling-stan/443cd2b94ed797944793e97a56527a5dc0f8ad40f78ed418fe1b2e367cf22546",
+    "trajectory_path": "${JOB_ROOT}/mcmc-sampling-stan__tYqwADP/agent/trajectory.json",
+    "case_id": "case-0203"
+  },
+  {
+    "trial_name": "merge-diff-arc-agi-task__2MiaLKY",
+    "task_slug": "merge-diff-arc-agi-task",
+    "trial_dir": "${JOB_ROOT}/merge-diff-arc-agi-task__2MiaLKY",
+    "task_dir": "${TASK_ROOT}/merge-diff-arc-agi-task/6aab6511a5344ce87698293bb1ce4cc51d9a45f1ad9f0c075d2a83197b36727d",
+    "trajectory_path": "${JOB_ROOT}/merge-diff-arc-agi-task__2MiaLKY/agent/trajectory.json",
+    "case_id": "case-0204"
+  },
+  {
+    "trial_name": "merge-diff-arc-agi-task__XEnXYcf",
+    "task_slug": "merge-diff-arc-agi-task",
+    "trial_dir": "${JOB_ROOT}/merge-diff-arc-agi-task__XEnXYcf",
+    "task_dir": "${TASK_ROOT}/merge-diff-arc-agi-task/6aab6511a5344ce87698293bb1ce4cc51d9a45f1ad9f0c075d2a83197b36727d",
+    "trajectory_path": "${JOB_ROOT}/merge-diff-arc-agi-task__XEnXYcf/agent/trajectory.json",
+    "case_id": "case-0205"
+  },
+  {
+    "trial_name": "merge-diff-arc-agi-task__YLeJtE9",
+    "task_slug": "merge-diff-arc-agi-task",
+    "trial_dir": "${JOB_ROOT}/merge-diff-arc-agi-task__YLeJtE9",
+    "task_dir": "${TASK_ROOT}/merge-diff-arc-agi-task/6aab6511a5344ce87698293bb1ce4cc51d9a45f1ad9f0c075d2a83197b36727d",
+    "trajectory_path": "${JOB_ROOT}/merge-diff-arc-agi-task__YLeJtE9/agent/trajectory.json",
+    "case_id": "case-0206"
+  },
+  {
+    "trial_name": "merge-diff-arc-agi-task__c2LWWhd",
+    "task_slug": "merge-diff-arc-agi-task",
+    "trial_dir": "${JOB_ROOT}/merge-diff-arc-agi-task__c2LWWhd",
+    "task_dir": "${TASK_ROOT}/merge-diff-arc-agi-task/6aab6511a5344ce87698293bb1ce4cc51d9a45f1ad9f0c075d2a83197b36727d",
+    "trajectory_path": "${JOB_ROOT}/merge-diff-arc-agi-task__c2LWWhd/agent/trajectory.json",
+    "case_id": "case-0207"
+  },
+  {
+    "trial_name": "merge-diff-arc-agi-task__u8heKD2",
+    "task_slug": "merge-diff-arc-agi-task",
+    "trial_dir": "${JOB_ROOT}/merge-diff-arc-agi-task__u8heKD2",
+    "task_dir": "${TASK_ROOT}/merge-diff-arc-agi-task/6aab6511a5344ce87698293bb1ce4cc51d9a45f1ad9f0c075d2a83197b36727d",
+    "trajectory_path": "${JOB_ROOT}/merge-diff-arc-agi-task__u8heKD2/agent/trajectory.json",
+    "case_id": "case-0208"
+  },
+  {
+    "trial_name": "model-extraction-relu-logits__Ehn8hxU",
+    "task_slug": "model-extraction-relu-logits",
+    "trial_dir": "${JOB_ROOT}/model-extraction-relu-logits__Ehn8hxU",
+    "task_dir": "${TASK_ROOT}/model-extraction-relu-logits/1ae5045ad68b5d34c3398b612066a07c4a08b6dc330d28868ec4021e17c94b17",
+    "trajectory_path": "${JOB_ROOT}/model-extraction-relu-logits__Ehn8hxU/agent/trajectory.json",
+    "case_id": "case-0209"
+  },
+  {
+    "trial_name": "model-extraction-relu-logits__LzNZcEM",
+    "task_slug": "model-extraction-relu-logits",
+    "trial_dir": "${JOB_ROOT}/model-extraction-relu-logits__LzNZcEM",
+    "task_dir": "${TASK_ROOT}/model-extraction-relu-logits/1ae5045ad68b5d34c3398b612066a07c4a08b6dc330d28868ec4021e17c94b17",
+    "trajectory_path": "${JOB_ROOT}/model-extraction-relu-logits__LzNZcEM/agent/trajectory.json",
+    "case_id": "case-0210"
+  },
+  {
+    "trial_name": "model-extraction-relu-logits__bcDVdJ5",
+    "task_slug": "model-extraction-relu-logits",
+    "trial_dir": "${JOB_ROOT}/model-extraction-relu-logits__bcDVdJ5",
+    "task_dir": "${TASK_ROOT}/model-extraction-relu-logits/1ae5045ad68b5d34c3398b612066a07c4a08b6dc330d28868ec4021e17c94b17",
+    "trajectory_path": "${JOB_ROOT}/model-extraction-relu-logits__bcDVdJ5/agent/trajectory.json",
+    "case_id": "case-0211"
+  },
+  {
+    "trial_name": "model-extraction-relu-logits__pZRv5KH",
+    "task_slug": "model-extraction-relu-logits",
+    "trial_dir": "${JOB_ROOT}/model-extraction-relu-logits__pZRv5KH",
+    "task_dir": "${TASK_ROOT}/model-extraction-relu-logits/1ae5045ad68b5d34c3398b612066a07c4a08b6dc330d28868ec4021e17c94b17",
+    "trajectory_path": "${JOB_ROOT}/model-extraction-relu-logits__pZRv5KH/agent/trajectory.json",
+    "case_id": "case-0212"
+  },
+  {
+    "trial_name": "modernize-scientific-stack__FwhrQsn",
+    "task_slug": "modernize-scientific-stack",
+    "trial_dir": "${JOB_ROOT}/modernize-scientific-stack__FwhrQsn",
+    "task_dir": "${TASK_ROOT}/modernize-scientific-stack/67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+    "trajectory_path": "${JOB_ROOT}/modernize-scientific-stack__FwhrQsn/agent/trajectory.json",
+    "case_id": "case-0213"
+  },
+  {
+    "trial_name": "modernize-scientific-stack__ZJzE5qQ",
+    "task_slug": "modernize-scientific-stack",
+    "trial_dir": "${JOB_ROOT}/modernize-scientific-stack__ZJzE5qQ",
+    "task_dir": "${TASK_ROOT}/modernize-scientific-stack/67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+    "trajectory_path": "${JOB_ROOT}/modernize-scientific-stack__ZJzE5qQ/agent/trajectory.json",
+    "case_id": "case-0214"
+  },
+  {
+    "trial_name": "modernize-scientific-stack__q9yu7d6",
+    "task_slug": "modernize-scientific-stack",
+    "trial_dir": "${JOB_ROOT}/modernize-scientific-stack__q9yu7d6",
+    "task_dir": "${TASK_ROOT}/modernize-scientific-stack/67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+    "trajectory_path": "${JOB_ROOT}/modernize-scientific-stack__q9yu7d6/agent/trajectory.json",
+    "case_id": "case-0215"
+  },
+  {
+    "trial_name": "modernize-scientific-stack__sTrUNwQ",
+    "task_slug": "modernize-scientific-stack",
+    "trial_dir": "${JOB_ROOT}/modernize-scientific-stack__sTrUNwQ",
+    "task_dir": "${TASK_ROOT}/modernize-scientific-stack/67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+    "trajectory_path": "${JOB_ROOT}/modernize-scientific-stack__sTrUNwQ/agent/trajectory.json",
+    "case_id": "case-0216"
+  },
+  {
+    "trial_name": "modernize-scientific-stack__wzCbm7z",
+    "task_slug": "modernize-scientific-stack",
+    "trial_dir": "${JOB_ROOT}/modernize-scientific-stack__wzCbm7z",
+    "task_dir": "${TASK_ROOT}/modernize-scientific-stack/67a9952aca67df9c70510acf62faea336644a0e9d379f3aaf9df79f14c8fcb12",
+    "trajectory_path": "${JOB_ROOT}/modernize-scientific-stack__wzCbm7z/agent/trajectory.json",
+    "case_id": "case-0217"
+  },
+  {
+    "trial_name": "mteb-leaderboard__5ESQwAK",
+    "task_slug": "mteb-leaderboard",
+    "trial_dir": "${JOB_ROOT}/mteb-leaderboard__5ESQwAK",
+    "task_dir": "${TASK_ROOT}/mteb-leaderboard/484f6d7008a05b5b8640fc6618a384b8c9447cd76f85416c8a595028d29bff9c",
+    "trajectory_path": "${JOB_ROOT}/mteb-leaderboard__5ESQwAK/agent/trajectory.json",
+    "case_id": "case-0218"
+  },
+  {
+    "trial_name": "mteb-leaderboard__McMX8Av",
+    "task_slug": "mteb-leaderboard",
+    "trial_dir": "${JOB_ROOT}/mteb-leaderboard__McMX8Av",
+    "task_dir": "${TASK_ROOT}/mteb-leaderboard/484f6d7008a05b5b8640fc6618a384b8c9447cd76f85416c8a595028d29bff9c",
+    "trajectory_path": "${JOB_ROOT}/mteb-leaderboard__McMX8Av/agent/trajectory.json",
+    "case_id": "case-0219"
+  },
+  {
+    "trial_name": "mteb-leaderboard__PKYTRf8",
+    "task_slug": "mteb-leaderboard",
+    "trial_dir": "${JOB_ROOT}/mteb-leaderboard__PKYTRf8",
+    "task_dir": "${TASK_ROOT}/mteb-leaderboard/484f6d7008a05b5b8640fc6618a384b8c9447cd76f85416c8a595028d29bff9c",
+    "trajectory_path": "${JOB_ROOT}/mteb-leaderboard__PKYTRf8/agent/trajectory.json",
+    "case_id": "case-0220"
+  },
+  {
+    "trial_name": "mteb-leaderboard__WBLpYYW",
+    "task_slug": "mteb-leaderboard",
+    "trial_dir": "${JOB_ROOT}/mteb-leaderboard__WBLpYYW",
+    "task_dir": "${TASK_ROOT}/mteb-leaderboard/484f6d7008a05b5b8640fc6618a384b8c9447cd76f85416c8a595028d29bff9c",
+    "trajectory_path": "${JOB_ROOT}/mteb-leaderboard__WBLpYYW/agent/trajectory.json",
+    "case_id": "case-0221"
+  },
+  {
+    "trial_name": "mteb-leaderboard__YmvhQNh",
+    "task_slug": "mteb-leaderboard",
+    "trial_dir": "${JOB_ROOT}/mteb-leaderboard__YmvhQNh",
+    "task_dir": "${TASK_ROOT}/mteb-leaderboard/484f6d7008a05b5b8640fc6618a384b8c9447cd76f85416c8a595028d29bff9c",
+    "trajectory_path": "${JOB_ROOT}/mteb-leaderboard__YmvhQNh/agent/trajectory.json",
+    "case_id": "case-0222"
+  },
+  {
+    "trial_name": "mteb-retrieve__HtRvqFY",
+    "task_slug": "mteb-retrieve",
+    "trial_dir": "${JOB_ROOT}/mteb-retrieve__HtRvqFY",
+    "task_dir": "${TASK_ROOT}/mteb-retrieve/fa7c777df6ed8987a2bb144b4b73a1200935bbea69da03a2aaa1dc8aa9bd9dc9",
+    "trajectory_path": "${JOB_ROOT}/mteb-retrieve__HtRvqFY/agent/trajectory.json",
+    "case_id": "case-0223"
+  },
+  {
+    "trial_name": "mteb-retrieve__Jx9kSHj",
+    "task_slug": "mteb-retrieve",
+    "trial_dir": "${JOB_ROOT}/mteb-retrieve__Jx9kSHj",
+    "task_dir": "${TASK_ROOT}/mteb-retrieve/fa7c777df6ed8987a2bb144b4b73a1200935bbea69da03a2aaa1dc8aa9bd9dc9",
+    "trajectory_path": "${JOB_ROOT}/mteb-retrieve__Jx9kSHj/agent/trajectory.json",
+    "case_id": "case-0224"
+  },
+  {
+    "trial_name": "mteb-retrieve__SWK9E4Y",
+    "task_slug": "mteb-retrieve",
+    "trial_dir": "${JOB_ROOT}/mteb-retrieve__SWK9E4Y",
+    "task_dir": "${TASK_ROOT}/mteb-retrieve/fa7c777df6ed8987a2bb144b4b73a1200935bbea69da03a2aaa1dc8aa9bd9dc9",
+    "trajectory_path": "${JOB_ROOT}/mteb-retrieve__SWK9E4Y/agent/trajectory.json",
+    "case_id": "case-0225"
+  },
+  {
+    "trial_name": "mteb-retrieve__oyA3KTM",
+    "task_slug": "mteb-retrieve",
+    "trial_dir": "${JOB_ROOT}/mteb-retrieve__oyA3KTM",
+    "task_dir": "${TASK_ROOT}/mteb-retrieve/fa7c777df6ed8987a2bb144b4b73a1200935bbea69da03a2aaa1dc8aa9bd9dc9",
+    "trajectory_path": "${JOB_ROOT}/mteb-retrieve__oyA3KTM/agent/trajectory.json",
+    "case_id": "case-0226"
+  },
+  {
+    "trial_name": "multi-source-data-merger__2NmVSp2",
+    "task_slug": "multi-source-data-merger",
+    "trial_dir": "${JOB_ROOT}/multi-source-data-merger__2NmVSp2",
+    "task_dir": "${TASK_ROOT}/multi-source-data-merger/70367c38732e1beda7b229968a48d60242277c2fa4db91339c3f064c4c230d49",
+    "trajectory_path": "${JOB_ROOT}/multi-source-data-merger__2NmVSp2/agent/trajectory.json",
+    "case_id": "case-0227"
+  },
+  {
+    "trial_name": "multi-source-data-merger__Et4d9dF",
+    "task_slug": "multi-source-data-merger",
+    "trial_dir": "${JOB_ROOT}/multi-source-data-merger__Et4d9dF",
+    "task_dir": "${TASK_ROOT}/multi-source-data-merger/70367c38732e1beda7b229968a48d60242277c2fa4db91339c3f064c4c230d49",
+    "trajectory_path": "${JOB_ROOT}/multi-source-data-merger__Et4d9dF/agent/trajectory.json",
+    "case_id": "case-0228"
+  },
+  {
+    "trial_name": "multi-source-data-merger__W7TjuwP",
+    "task_slug": "multi-source-data-merger",
+    "trial_dir": "${JOB_ROOT}/multi-source-data-merger__W7TjuwP",
+    "task_dir": "${TASK_ROOT}/multi-source-data-merger/70367c38732e1beda7b229968a48d60242277c2fa4db91339c3f064c4c230d49",
+    "trajectory_path": "${JOB_ROOT}/multi-source-data-merger__W7TjuwP/agent/trajectory.json",
+    "case_id": "case-0229"
+  },
+  {
+    "trial_name": "multi-source-data-merger__avDwxQ9",
+    "task_slug": "multi-source-data-merger",
+    "trial_dir": "${JOB_ROOT}/multi-source-data-merger__avDwxQ9",
+    "task_dir": "${TASK_ROOT}/multi-source-data-merger/70367c38732e1beda7b229968a48d60242277c2fa4db91339c3f064c4c230d49",
+    "trajectory_path": "${JOB_ROOT}/multi-source-data-merger__avDwxQ9/agent/trajectory.json",
+    "case_id": "case-0230"
+  },
+  {
+    "trial_name": "multi-source-data-merger__tHNnYJ4",
+    "task_slug": "multi-source-data-merger",
+    "trial_dir": "${JOB_ROOT}/multi-source-data-merger__tHNnYJ4",
+    "task_dir": "${TASK_ROOT}/multi-source-data-merger/70367c38732e1beda7b229968a48d60242277c2fa4db91339c3f064c4c230d49",
+    "trajectory_path": "${JOB_ROOT}/multi-source-data-merger__tHNnYJ4/agent/trajectory.json",
+    "case_id": "case-0231"
+  },
+  {
+    "trial_name": "nginx-request-logging__8HapF8w",
+    "task_slug": "nginx-request-logging",
+    "trial_dir": "${JOB_ROOT}/nginx-request-logging__8HapF8w",
+    "task_dir": "${TASK_ROOT}/nginx-request-logging/9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097",
+    "trajectory_path": "${JOB_ROOT}/nginx-request-logging__8HapF8w/agent/trajectory.json",
+    "case_id": "case-0232"
+  },
+  {
+    "trial_name": "nginx-request-logging__CkHPR27",
+    "task_slug": "nginx-request-logging",
+    "trial_dir": "${JOB_ROOT}/nginx-request-logging__CkHPR27",
+    "task_dir": "${TASK_ROOT}/nginx-request-logging/9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097",
+    "trajectory_path": "${JOB_ROOT}/nginx-request-logging__CkHPR27/agent/trajectory.json",
+    "case_id": "case-0233"
+  },
+  {
+    "trial_name": "nginx-request-logging__JVBQqNz",
+    "task_slug": "nginx-request-logging",
+    "trial_dir": "${JOB_ROOT}/nginx-request-logging__JVBQqNz",
+    "task_dir": "${TASK_ROOT}/nginx-request-logging/9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097",
+    "trajectory_path": "${JOB_ROOT}/nginx-request-logging__JVBQqNz/agent/trajectory.json",
+    "case_id": "case-0234"
+  },
+  {
+    "trial_name": "nginx-request-logging__SjofMq3",
+    "task_slug": "nginx-request-logging",
+    "trial_dir": "${JOB_ROOT}/nginx-request-logging__SjofMq3",
+    "task_dir": "${TASK_ROOT}/nginx-request-logging/9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097",
+    "trajectory_path": "${JOB_ROOT}/nginx-request-logging__SjofMq3/agent/trajectory.json",
+    "case_id": "case-0235"
+  },
+  {
+    "trial_name": "nginx-request-logging__obqvMPz",
+    "task_slug": "nginx-request-logging",
+    "trial_dir": "${JOB_ROOT}/nginx-request-logging__obqvMPz",
+    "task_dir": "${TASK_ROOT}/nginx-request-logging/9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097",
+    "trajectory_path": "${JOB_ROOT}/nginx-request-logging__obqvMPz/agent/trajectory.json",
+    "case_id": "case-0236"
+  },
+  {
+    "trial_name": "openssl-selfsigned-cert__6Khspmt",
+    "task_slug": "openssl-selfsigned-cert",
+    "trial_dir": "${JOB_ROOT}/openssl-selfsigned-cert__6Khspmt",
+    "task_dir": "${TASK_ROOT}/openssl-selfsigned-cert/d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302",
+    "trajectory_path": "${JOB_ROOT}/openssl-selfsigned-cert__6Khspmt/agent/trajectory.json",
+    "case_id": "case-0237"
+  },
+  {
+    "trial_name": "openssl-selfsigned-cert__CdNeLEJ",
+    "task_slug": "openssl-selfsigned-cert",
+    "trial_dir": "${JOB_ROOT}/openssl-selfsigned-cert__CdNeLEJ",
+    "task_dir": "${TASK_ROOT}/openssl-selfsigned-cert/d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302",
+    "trajectory_path": "${JOB_ROOT}/openssl-selfsigned-cert__CdNeLEJ/agent/trajectory.json",
+    "case_id": "case-0238"
+  },
+  {
+    "trial_name": "openssl-selfsigned-cert__RL7aZhA",
+    "task_slug": "openssl-selfsigned-cert",
+    "trial_dir": "${JOB_ROOT}/openssl-selfsigned-cert__RL7aZhA",
+    "task_dir": "${TASK_ROOT}/openssl-selfsigned-cert/d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302",
+    "trajectory_path": "${JOB_ROOT}/openssl-selfsigned-cert__RL7aZhA/agent/trajectory.json",
+    "case_id": "case-0239"
+  },
+  {
+    "trial_name": "openssl-selfsigned-cert__Te2UFkk",
+    "task_slug": "openssl-selfsigned-cert",
+    "trial_dir": "${JOB_ROOT}/openssl-selfsigned-cert__Te2UFkk",
+    "task_dir": "${TASK_ROOT}/openssl-selfsigned-cert/d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302",
+    "trajectory_path": "${JOB_ROOT}/openssl-selfsigned-cert__Te2UFkk/agent/trajectory.json",
+    "case_id": "case-0240"
+  },
+  {
+    "trial_name": "openssl-selfsigned-cert__aJgQxej",
+    "task_slug": "openssl-selfsigned-cert",
+    "trial_dir": "${JOB_ROOT}/openssl-selfsigned-cert__aJgQxej",
+    "task_dir": "${TASK_ROOT}/openssl-selfsigned-cert/d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302",
+    "trajectory_path": "${JOB_ROOT}/openssl-selfsigned-cert__aJgQxej/agent/trajectory.json",
+    "case_id": "case-0241"
+  },
+  {
+    "trial_name": "overfull-hbox__BufD4MM",
+    "task_slug": "overfull-hbox",
+    "trial_dir": "${JOB_ROOT}/overfull-hbox__BufD4MM",
+    "task_dir": "${TASK_ROOT}/overfull-hbox/3c3b16e4b2de5fea90ca98db242b155a6843f9cc4dfd00be3479985a34bab4f7",
+    "trajectory_path": "${JOB_ROOT}/overfull-hbox__BufD4MM/agent/trajectory.json",
+    "case_id": "case-0242"
+  },
+  {
+    "trial_name": "overfull-hbox__TpGCgZM",
+    "task_slug": "overfull-hbox",
+    "trial_dir": "${JOB_ROOT}/overfull-hbox__TpGCgZM",
+    "task_dir": "${TASK_ROOT}/overfull-hbox/3c3b16e4b2de5fea90ca98db242b155a6843f9cc4dfd00be3479985a34bab4f7",
+    "trajectory_path": "${JOB_ROOT}/overfull-hbox__TpGCgZM/agent/trajectory.json",
+    "case_id": "case-0243"
+  },
+  {
+    "trial_name": "overfull-hbox__nUCRSMx",
+    "task_slug": "overfull-hbox",
+    "trial_dir": "${JOB_ROOT}/overfull-hbox__nUCRSMx",
+    "task_dir": "${TASK_ROOT}/overfull-hbox/3c3b16e4b2de5fea90ca98db242b155a6843f9cc4dfd00be3479985a34bab4f7",
+    "trajectory_path": "${JOB_ROOT}/overfull-hbox__nUCRSMx/agent/trajectory.json",
+    "case_id": "case-0244"
+  },
+  {
+    "trial_name": "overfull-hbox__sQvhCpd",
+    "task_slug": "overfull-hbox",
+    "trial_dir": "${JOB_ROOT}/overfull-hbox__sQvhCpd",
+    "task_dir": "${TASK_ROOT}/overfull-hbox/3c3b16e4b2de5fea90ca98db242b155a6843f9cc4dfd00be3479985a34bab4f7",
+    "trajectory_path": "${JOB_ROOT}/overfull-hbox__sQvhCpd/agent/trajectory.json",
+    "case_id": "case-0245"
+  },
+  {
+    "trial_name": "password-recovery__Dx39gzR",
+    "task_slug": "password-recovery",
+    "trial_dir": "${JOB_ROOT}/password-recovery__Dx39gzR",
+    "task_dir": "${TASK_ROOT}/password-recovery/9b5c6bdce0cf03f075b21f6a7af5030b825ce07d7b16b37610f3964217ab84a4",
+    "trajectory_path": "${JOB_ROOT}/password-recovery__Dx39gzR/agent/trajectory.json",
+    "case_id": "case-0246"
+  },
+  {
+    "trial_name": "password-recovery__K6gUY8f",
+    "task_slug": "password-recovery",
+    "trial_dir": "${JOB_ROOT}/password-recovery__K6gUY8f",
+    "task_dir": "${TASK_ROOT}/password-recovery/9b5c6bdce0cf03f075b21f6a7af5030b825ce07d7b16b37610f3964217ab84a4",
+    "trajectory_path": "${JOB_ROOT}/password-recovery__K6gUY8f/agent/trajectory.json",
+    "case_id": "case-0247"
+  },
+  {
+    "trial_name": "password-recovery__NuUeTt3",
+    "task_slug": "password-recovery",
+    "trial_dir": "${JOB_ROOT}/password-recovery__NuUeTt3",
+    "task_dir": "${TASK_ROOT}/password-recovery/9b5c6bdce0cf03f075b21f6a7af5030b825ce07d7b16b37610f3964217ab84a4",
+    "trajectory_path": "${JOB_ROOT}/password-recovery__NuUeTt3/agent/trajectory.json",
+    "case_id": "case-0248"
+  },
+  {
+    "trial_name": "password-recovery__hCwgtar",
+    "task_slug": "password-recovery",
+    "trial_dir": "${JOB_ROOT}/password-recovery__hCwgtar",
+    "task_dir": "${TASK_ROOT}/password-recovery/9b5c6bdce0cf03f075b21f6a7af5030b825ce07d7b16b37610f3964217ab84a4",
+    "trajectory_path": "${JOB_ROOT}/password-recovery__hCwgtar/agent/trajectory.json",
+    "case_id": "case-0249"
+  },
+  {
+    "trial_name": "path-tracing-reverse__7wB2mok",
+    "task_slug": "path-tracing-reverse",
+    "trial_dir": "${JOB_ROOT}/path-tracing-reverse__7wB2mok",
+    "task_dir": "${TASK_ROOT}/path-tracing-reverse/035880d7ef5554b217e53a75ce5e87e43193b7a44c30ad17226a6ab10fc11a6c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing-reverse__7wB2mok/agent/trajectory.json",
+    "case_id": "case-0250"
+  },
+  {
+    "trial_name": "path-tracing-reverse__DgFw5dW",
+    "task_slug": "path-tracing-reverse",
+    "trial_dir": "${JOB_ROOT}/path-tracing-reverse__DgFw5dW",
+    "task_dir": "${TASK_ROOT}/path-tracing-reverse/035880d7ef5554b217e53a75ce5e87e43193b7a44c30ad17226a6ab10fc11a6c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing-reverse__DgFw5dW/agent/trajectory.json",
+    "case_id": "case-0251"
+  },
+  {
+    "trial_name": "path-tracing-reverse__RsRBq88",
+    "task_slug": "path-tracing-reverse",
+    "trial_dir": "${JOB_ROOT}/path-tracing-reverse__RsRBq88",
+    "task_dir": "${TASK_ROOT}/path-tracing-reverse/035880d7ef5554b217e53a75ce5e87e43193b7a44c30ad17226a6ab10fc11a6c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing-reverse__RsRBq88/agent/trajectory.json",
+    "case_id": "case-0252"
+  },
+  {
+    "trial_name": "path-tracing-reverse__U2JUvHE",
+    "task_slug": "path-tracing-reverse",
+    "trial_dir": "${JOB_ROOT}/path-tracing-reverse__U2JUvHE",
+    "task_dir": "${TASK_ROOT}/path-tracing-reverse/035880d7ef5554b217e53a75ce5e87e43193b7a44c30ad17226a6ab10fc11a6c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing-reverse__U2JUvHE/agent/trajectory.json",
+    "case_id": "case-0253"
+  },
+  {
+    "trial_name": "path-tracing-reverse__tfZhEcm",
+    "task_slug": "path-tracing-reverse",
+    "trial_dir": "${JOB_ROOT}/path-tracing-reverse__tfZhEcm",
+    "task_dir": "${TASK_ROOT}/path-tracing-reverse/035880d7ef5554b217e53a75ce5e87e43193b7a44c30ad17226a6ab10fc11a6c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing-reverse__tfZhEcm/agent/trajectory.json",
+    "case_id": "case-0254"
+  },
+  {
+    "trial_name": "path-tracing__4FwFT6y",
+    "task_slug": "path-tracing",
+    "trial_dir": "${JOB_ROOT}/path-tracing__4FwFT6y",
+    "task_dir": "${TASK_ROOT}/path-tracing/cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing__4FwFT6y/agent/trajectory.json",
+    "case_id": "case-0255"
+  },
+  {
+    "trial_name": "path-tracing__9o7kjYn",
+    "task_slug": "path-tracing",
+    "trial_dir": "${JOB_ROOT}/path-tracing__9o7kjYn",
+    "task_dir": "${TASK_ROOT}/path-tracing/cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing__9o7kjYn/agent/trajectory.json",
+    "case_id": "case-0256"
+  },
+  {
+    "trial_name": "path-tracing__kPuxYwq",
+    "task_slug": "path-tracing",
+    "trial_dir": "${JOB_ROOT}/path-tracing__kPuxYwq",
+    "task_dir": "${TASK_ROOT}/path-tracing/cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing__kPuxYwq/agent/trajectory.json",
+    "case_id": "case-0257"
+  },
+  {
+    "trial_name": "path-tracing__o4Lc8wz",
+    "task_slug": "path-tracing",
+    "trial_dir": "${JOB_ROOT}/path-tracing__o4Lc8wz",
+    "task_dir": "${TASK_ROOT}/path-tracing/cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing__o4Lc8wz/agent/trajectory.json",
+    "case_id": "case-0258"
+  },
+  {
+    "trial_name": "path-tracing__pMH8hy8",
+    "task_slug": "path-tracing",
+    "trial_dir": "${JOB_ROOT}/path-tracing__pMH8hy8",
+    "task_dir": "${TASK_ROOT}/path-tracing/cf56094c881a488b27e9f204a638a7e78ed7d55e12dc3064108c93357190314c",
+    "trajectory_path": "${JOB_ROOT}/path-tracing__pMH8hy8/agent/trajectory.json",
+    "case_id": "case-0259"
+  },
+  {
+    "trial_name": "polyglot-c-py__bmaxH4R",
+    "task_slug": "polyglot-c-py",
+    "trial_dir": "${JOB_ROOT}/polyglot-c-py__bmaxH4R",
+    "task_dir": "${TASK_ROOT}/polyglot-c-py/25570ccacf63f573a252eaa2a9c62ee8b55f5aa228cc803b5beb39dd6d8afeb7",
+    "trajectory_path": "${JOB_ROOT}/polyglot-c-py__bmaxH4R/agent/trajectory.json",
+    "case_id": "case-0260"
+  },
+  {
+    "trial_name": "polyglot-c-py__kDBJpSo",
+    "task_slug": "polyglot-c-py",
+    "trial_dir": "${JOB_ROOT}/polyglot-c-py__kDBJpSo",
+    "task_dir": "${TASK_ROOT}/polyglot-c-py/25570ccacf63f573a252eaa2a9c62ee8b55f5aa228cc803b5beb39dd6d8afeb7",
+    "trajectory_path": "${JOB_ROOT}/polyglot-c-py__kDBJpSo/agent/trajectory.json",
+    "case_id": "case-0261"
+  },
+  {
+    "trial_name": "polyglot-c-py__pAw4ZJC",
+    "task_slug": "polyglot-c-py",
+    "trial_dir": "${JOB_ROOT}/polyglot-c-py__pAw4ZJC",
+    "task_dir": "${TASK_ROOT}/polyglot-c-py/25570ccacf63f573a252eaa2a9c62ee8b55f5aa228cc803b5beb39dd6d8afeb7",
+    "trajectory_path": "${JOB_ROOT}/polyglot-c-py__pAw4ZJC/agent/trajectory.json",
+    "case_id": "case-0262"
+  },
+  {
+    "trial_name": "polyglot-c-py__siNep3L",
+    "task_slug": "polyglot-c-py",
+    "trial_dir": "${JOB_ROOT}/polyglot-c-py__siNep3L",
+    "task_dir": "${TASK_ROOT}/polyglot-c-py/25570ccacf63f573a252eaa2a9c62ee8b55f5aa228cc803b5beb39dd6d8afeb7",
+    "trajectory_path": "${JOB_ROOT}/polyglot-c-py__siNep3L/agent/trajectory.json",
+    "case_id": "case-0263"
+  },
+  {
+    "trial_name": "polyglot-c-py__t3Bxyus",
+    "task_slug": "polyglot-c-py",
+    "trial_dir": "${JOB_ROOT}/polyglot-c-py__t3Bxyus",
+    "task_dir": "${TASK_ROOT}/polyglot-c-py/25570ccacf63f573a252eaa2a9c62ee8b55f5aa228cc803b5beb39dd6d8afeb7",
+    "trajectory_path": "${JOB_ROOT}/polyglot-c-py__t3Bxyus/agent/trajectory.json",
+    "case_id": "case-0264"
+  },
+  {
+    "trial_name": "polyglot-rust-c__4tktPu3",
+    "task_slug": "polyglot-rust-c",
+    "trial_dir": "${JOB_ROOT}/polyglot-rust-c__4tktPu3",
+    "task_dir": "${TASK_ROOT}/polyglot-rust-c/a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+    "trajectory_path": "${JOB_ROOT}/polyglot-rust-c__4tktPu3/agent/trajectory.json",
+    "case_id": "case-0265"
+  },
+  {
+    "trial_name": "polyglot-rust-c__MQgZhnN",
+    "task_slug": "polyglot-rust-c",
+    "trial_dir": "${JOB_ROOT}/polyglot-rust-c__MQgZhnN",
+    "task_dir": "${TASK_ROOT}/polyglot-rust-c/a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+    "trajectory_path": "${JOB_ROOT}/polyglot-rust-c__MQgZhnN/agent/trajectory.json",
+    "case_id": "case-0266"
+  },
+  {
+    "trial_name": "polyglot-rust-c__WHKRjsB",
+    "task_slug": "polyglot-rust-c",
+    "trial_dir": "${JOB_ROOT}/polyglot-rust-c__WHKRjsB",
+    "task_dir": "${TASK_ROOT}/polyglot-rust-c/a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+    "trajectory_path": "${JOB_ROOT}/polyglot-rust-c__WHKRjsB/agent/trajectory.json",
+    "case_id": "case-0267"
+  },
+  {
+    "trial_name": "polyglot-rust-c__rnjJasa",
+    "task_slug": "polyglot-rust-c",
+    "trial_dir": "${JOB_ROOT}/polyglot-rust-c__rnjJasa",
+    "task_dir": "${TASK_ROOT}/polyglot-rust-c/a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+    "trajectory_path": "${JOB_ROOT}/polyglot-rust-c__rnjJasa/agent/trajectory.json",
+    "case_id": "case-0268"
+  },
+  {
+    "trial_name": "polyglot-rust-c__wR2B543",
+    "task_slug": "polyglot-rust-c",
+    "trial_dir": "${JOB_ROOT}/polyglot-rust-c__wR2B543",
+    "task_dir": "${TASK_ROOT}/polyglot-rust-c/a33dc72e2278d225513c0724abe2e4539653d5ee7e4c2a90ba2d676586ba9f3d",
+    "trajectory_path": "${JOB_ROOT}/polyglot-rust-c__wR2B543/agent/trajectory.json",
+    "case_id": "case-0269"
+  },
+  {
+    "trial_name": "portfolio-optimization__N5JrqXg",
+    "task_slug": "portfolio-optimization",
+    "trial_dir": "${JOB_ROOT}/portfolio-optimization__N5JrqXg",
+    "task_dir": "${TASK_ROOT}/portfolio-optimization/d112f8945600f18ec47bbbe76935dc05953173cc3d0a375a7aa2712b091584e4",
+    "trajectory_path": "${JOB_ROOT}/portfolio-optimization__N5JrqXg/agent/trajectory.json",
+    "case_id": "case-0270"
+  },
+  {
+    "trial_name": "portfolio-optimization__XBqTF8R",
+    "task_slug": "portfolio-optimization",
+    "trial_dir": "${JOB_ROOT}/portfolio-optimization__XBqTF8R",
+    "task_dir": "${TASK_ROOT}/portfolio-optimization/d112f8945600f18ec47bbbe76935dc05953173cc3d0a375a7aa2712b091584e4",
+    "trajectory_path": "${JOB_ROOT}/portfolio-optimization__XBqTF8R/agent/trajectory.json",
+    "case_id": "case-0271"
+  },
+  {
+    "trial_name": "portfolio-optimization__hPzDx8k",
+    "task_slug": "portfolio-optimization",
+    "trial_dir": "${JOB_ROOT}/portfolio-optimization__hPzDx8k",
+    "task_dir": "${TASK_ROOT}/portfolio-optimization/d112f8945600f18ec47bbbe76935dc05953173cc3d0a375a7aa2712b091584e4",
+    "trajectory_path": "${JOB_ROOT}/portfolio-optimization__hPzDx8k/agent/trajectory.json",
+    "case_id": "case-0272"
+  },
+  {
+    "trial_name": "portfolio-optimization__sQK7poB",
+    "task_slug": "portfolio-optimization",
+    "trial_dir": "${JOB_ROOT}/portfolio-optimization__sQK7poB",
+    "task_dir": "${TASK_ROOT}/portfolio-optimization/d112f8945600f18ec47bbbe76935dc05953173cc3d0a375a7aa2712b091584e4",
+    "trajectory_path": "${JOB_ROOT}/portfolio-optimization__sQK7poB/agent/trajectory.json",
+    "case_id": "case-0273"
+  },
+  {
+    "trial_name": "portfolio-optimization__tCedL3z",
+    "task_slug": "portfolio-optimization",
+    "trial_dir": "${JOB_ROOT}/portfolio-optimization__tCedL3z",
+    "task_dir": "${TASK_ROOT}/portfolio-optimization/d112f8945600f18ec47bbbe76935dc05953173cc3d0a375a7aa2712b091584e4",
+    "trajectory_path": "${JOB_ROOT}/portfolio-optimization__tCedL3z/agent/trajectory.json",
+    "case_id": "case-0274"
+  },
+  {
+    "trial_name": "protein-assembly__3ujXCtj",
+    "task_slug": "protein-assembly",
+    "trial_dir": "${JOB_ROOT}/protein-assembly__3ujXCtj",
+    "task_dir": "${TASK_ROOT}/protein-assembly/c491d45acce234e1aa1d44dcc6778c55fcf875e9eb254b8dd3ae5ef58119621b",
+    "trajectory_path": "${JOB_ROOT}/protein-assembly__3ujXCtj/agent/trajectory.json",
+    "case_id": "case-0275"
+  },
+  {
+    "trial_name": "protein-assembly__4dekRMZ",
+    "task_slug": "protein-assembly",
+    "trial_dir": "${JOB_ROOT}/protein-assembly__4dekRMZ",
+    "task_dir": "${TASK_ROOT}/protein-assembly/c491d45acce234e1aa1d44dcc6778c55fcf875e9eb254b8dd3ae5ef58119621b",
+    "trajectory_path": "${JOB_ROOT}/protein-assembly__4dekRMZ/agent/trajectory.json",
+    "case_id": "case-0276"
+  },
+  {
+    "trial_name": "protein-assembly__Hh9KzRF",
+    "task_slug": "protein-assembly",
+    "trial_dir": "${JOB_ROOT}/protein-assembly__Hh9KzRF",
+    "task_dir": "${TASK_ROOT}/protein-assembly/c491d45acce234e1aa1d44dcc6778c55fcf875e9eb254b8dd3ae5ef58119621b",
+    "trajectory_path": "${JOB_ROOT}/protein-assembly__Hh9KzRF/agent/trajectory.json",
+    "case_id": "case-0277"
+  },
+  {
+    "trial_name": "protein-assembly__buQ3k6Q",
+    "task_slug": "protein-assembly",
+    "trial_dir": "${JOB_ROOT}/protein-assembly__buQ3k6Q",
+    "task_dir": "${TASK_ROOT}/protein-assembly/c491d45acce234e1aa1d44dcc6778c55fcf875e9eb254b8dd3ae5ef58119621b",
+    "trajectory_path": "${JOB_ROOT}/protein-assembly__buQ3k6Q/agent/trajectory.json",
+    "case_id": "case-0278"
+  },
+  {
+    "trial_name": "protein-assembly__hafaTD8",
+    "task_slug": "protein-assembly",
+    "trial_dir": "${JOB_ROOT}/protein-assembly__hafaTD8",
+    "task_dir": "${TASK_ROOT}/protein-assembly/c491d45acce234e1aa1d44dcc6778c55fcf875e9eb254b8dd3ae5ef58119621b",
+    "trajectory_path": "${JOB_ROOT}/protein-assembly__hafaTD8/agent/trajectory.json",
+    "case_id": "case-0279"
+  },
+  {
+    "trial_name": "prove-plus-comm__5YBWFbU",
+    "task_slug": "prove-plus-comm",
+    "trial_dir": "${JOB_ROOT}/prove-plus-comm__5YBWFbU",
+    "task_dir": "${TASK_ROOT}/prove-plus-comm/d5ae25720df1f7cd619ed8408cda4b87b79a3d8b0ff4f1919e2c96e9547339c2",
+    "trajectory_path": "${JOB_ROOT}/prove-plus-comm__5YBWFbU/agent/trajectory.json",
+    "case_id": "case-0280"
+  },
+  {
+    "trial_name": "prove-plus-comm__5ZaeKXW",
+    "task_slug": "prove-plus-comm",
+    "trial_dir": "${JOB_ROOT}/prove-plus-comm__5ZaeKXW",
+    "task_dir": "${TASK_ROOT}/prove-plus-comm/d5ae25720df1f7cd619ed8408cda4b87b79a3d8b0ff4f1919e2c96e9547339c2",
+    "trajectory_path": "${JOB_ROOT}/prove-plus-comm__5ZaeKXW/agent/trajectory.json",
+    "case_id": "case-0281"
+  },
+  {
+    "trial_name": "prove-plus-comm__k5NERLe",
+    "task_slug": "prove-plus-comm",
+    "trial_dir": "${JOB_ROOT}/prove-plus-comm__k5NERLe",
+    "task_dir": "${TASK_ROOT}/prove-plus-comm/d5ae25720df1f7cd619ed8408cda4b87b79a3d8b0ff4f1919e2c96e9547339c2",
+    "trajectory_path": "${JOB_ROOT}/prove-plus-comm__k5NERLe/agent/trajectory.json",
+    "case_id": "case-0282"
+  },
+  {
+    "trial_name": "prove-plus-comm__mP5AyM9",
+    "task_slug": "prove-plus-comm",
+    "trial_dir": "${JOB_ROOT}/prove-plus-comm__mP5AyM9",
+    "task_dir": "${TASK_ROOT}/prove-plus-comm/d5ae25720df1f7cd619ed8408cda4b87b79a3d8b0ff4f1919e2c96e9547339c2",
+    "trajectory_path": "${JOB_ROOT}/prove-plus-comm__mP5AyM9/agent/trajectory.json",
+    "case_id": "case-0283"
+  },
+  {
+    "trial_name": "prove-plus-comm__xMySLqs",
+    "task_slug": "prove-plus-comm",
+    "trial_dir": "${JOB_ROOT}/prove-plus-comm__xMySLqs",
+    "task_dir": "${TASK_ROOT}/prove-plus-comm/d5ae25720df1f7cd619ed8408cda4b87b79a3d8b0ff4f1919e2c96e9547339c2",
+    "trajectory_path": "${JOB_ROOT}/prove-plus-comm__xMySLqs/agent/trajectory.json",
+    "case_id": "case-0284"
+  },
+  {
+    "trial_name": "pypi-server__3okDwSh",
+    "task_slug": "pypi-server",
+    "trial_dir": "${JOB_ROOT}/pypi-server__3okDwSh",
+    "task_dir": "${TASK_ROOT}/pypi-server/1a1e0542f58e2d3362fec17a9bbb98667717d9a4a3e9a4c8413d3150a4fa0ff1",
+    "trajectory_path": "${JOB_ROOT}/pypi-server__3okDwSh/agent/trajectory.json",
+    "case_id": "case-0285"
+  },
+  {
+    "trial_name": "pypi-server__X7LumNc",
+    "task_slug": "pypi-server",
+    "trial_dir": "${JOB_ROOT}/pypi-server__X7LumNc",
+    "task_dir": "${TASK_ROOT}/pypi-server/1a1e0542f58e2d3362fec17a9bbb98667717d9a4a3e9a4c8413d3150a4fa0ff1",
+    "trajectory_path": "${JOB_ROOT}/pypi-server__X7LumNc/agent/trajectory.json",
+    "case_id": "case-0286"
+  },
+  {
+    "trial_name": "pypi-server__j8TPEsK",
+    "task_slug": "pypi-server",
+    "trial_dir": "${JOB_ROOT}/pypi-server__j8TPEsK",
+    "task_dir": "${TASK_ROOT}/pypi-server/1a1e0542f58e2d3362fec17a9bbb98667717d9a4a3e9a4c8413d3150a4fa0ff1",
+    "trajectory_path": "${JOB_ROOT}/pypi-server__j8TPEsK/agent/trajectory.json",
+    "case_id": "case-0287"
+  },
+  {
+    "trial_name": "pypi-server__jxqxqNo",
+    "task_slug": "pypi-server",
+    "trial_dir": "${JOB_ROOT}/pypi-server__jxqxqNo",
+    "task_dir": "${TASK_ROOT}/pypi-server/1a1e0542f58e2d3362fec17a9bbb98667717d9a4a3e9a4c8413d3150a4fa0ff1",
+    "trajectory_path": "${JOB_ROOT}/pypi-server__jxqxqNo/agent/trajectory.json",
+    "case_id": "case-0288"
+  },
+  {
+    "trial_name": "pypi-server__rSymPaL",
+    "task_slug": "pypi-server",
+    "trial_dir": "${JOB_ROOT}/pypi-server__rSymPaL",
+    "task_dir": "${TASK_ROOT}/pypi-server/1a1e0542f58e2d3362fec17a9bbb98667717d9a4a3e9a4c8413d3150a4fa0ff1",
+    "trajectory_path": "${JOB_ROOT}/pypi-server__rSymPaL/agent/trajectory.json",
+    "case_id": "case-0289"
+  },
+  {
+    "trial_name": "pytorch-model-cli__2PpQhkL",
+    "task_slug": "pytorch-model-cli",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-cli__2PpQhkL",
+    "task_dir": "${TASK_ROOT}/pytorch-model-cli/6f11544dcc81a380dc4611902961f5520259c462d9fceb413419d66ab9a96c79",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-cli__2PpQhkL/agent/trajectory.json",
+    "case_id": "case-0290"
+  },
+  {
+    "trial_name": "pytorch-model-cli__SYnUnv9",
+    "task_slug": "pytorch-model-cli",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-cli__SYnUnv9",
+    "task_dir": "${TASK_ROOT}/pytorch-model-cli/6f11544dcc81a380dc4611902961f5520259c462d9fceb413419d66ab9a96c79",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-cli__SYnUnv9/agent/trajectory.json",
+    "case_id": "case-0291"
+  },
+  {
+    "trial_name": "pytorch-model-cli__uNjBULS",
+    "task_slug": "pytorch-model-cli",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-cli__uNjBULS",
+    "task_dir": "${TASK_ROOT}/pytorch-model-cli/6f11544dcc81a380dc4611902961f5520259c462d9fceb413419d66ab9a96c79",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-cli__uNjBULS/agent/trajectory.json",
+    "case_id": "case-0292"
+  },
+  {
+    "trial_name": "pytorch-model-cli__y4MNXof",
+    "task_slug": "pytorch-model-cli",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-cli__y4MNXof",
+    "task_dir": "${TASK_ROOT}/pytorch-model-cli/6f11544dcc81a380dc4611902961f5520259c462d9fceb413419d66ab9a96c79",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-cli__y4MNXof/agent/trajectory.json",
+    "case_id": "case-0293"
+  },
+  {
+    "trial_name": "pytorch-model-recovery__3jscSzU",
+    "task_slug": "pytorch-model-recovery",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-recovery__3jscSzU",
+    "task_dir": "${TASK_ROOT}/pytorch-model-recovery/2e628841cff93290919172398e573e794f34c95d9382b7425adde4364022decc",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-recovery__3jscSzU/agent/trajectory.json",
+    "case_id": "case-0294"
+  },
+  {
+    "trial_name": "pytorch-model-recovery__Wvaoswc",
+    "task_slug": "pytorch-model-recovery",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-recovery__Wvaoswc",
+    "task_dir": "${TASK_ROOT}/pytorch-model-recovery/2e628841cff93290919172398e573e794f34c95d9382b7425adde4364022decc",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-recovery__Wvaoswc/agent/trajectory.json",
+    "case_id": "case-0295"
+  },
+  {
+    "trial_name": "pytorch-model-recovery__t9gFCBU",
+    "task_slug": "pytorch-model-recovery",
+    "trial_dir": "${JOB_ROOT}/pytorch-model-recovery__t9gFCBU",
+    "task_dir": "${TASK_ROOT}/pytorch-model-recovery/2e628841cff93290919172398e573e794f34c95d9382b7425adde4364022decc",
+    "trajectory_path": "${JOB_ROOT}/pytorch-model-recovery__t9gFCBU/agent/trajectory.json",
+    "case_id": "case-0296"
+  },
+  {
+    "trial_name": "qemu-alpine-ssh__2oBtmHM",
+    "task_slug": "qemu-alpine-ssh",
+    "trial_dir": "${JOB_ROOT}/qemu-alpine-ssh__2oBtmHM",
+    "task_dir": "${TASK_ROOT}/qemu-alpine-ssh/60b7050b0e0aa51641208cf65766743d340e59575db2c4d2f8628240846c2a28",
+    "trajectory_path": "${JOB_ROOT}/qemu-alpine-ssh__2oBtmHM/agent/trajectory.json",
+    "case_id": "case-0297"
+  },
+  {
+    "trial_name": "qemu-alpine-ssh__3ufatQU",
+    "task_slug": "qemu-alpine-ssh",
+    "trial_dir": "${JOB_ROOT}/qemu-alpine-ssh__3ufatQU",
+    "task_dir": "${TASK_ROOT}/qemu-alpine-ssh/60b7050b0e0aa51641208cf65766743d340e59575db2c4d2f8628240846c2a28",
+    "trajectory_path": "${JOB_ROOT}/qemu-alpine-ssh__3ufatQU/agent/trajectory.json",
+    "case_id": "case-0298"
+  },
+  {
+    "trial_name": "qemu-alpine-ssh__4NZFKhg",
+    "task_slug": "qemu-alpine-ssh",
+    "trial_dir": "${JOB_ROOT}/qemu-alpine-ssh__4NZFKhg",
+    "task_dir": "${TASK_ROOT}/qemu-alpine-ssh/60b7050b0e0aa51641208cf65766743d340e59575db2c4d2f8628240846c2a28",
+    "trajectory_path": "${JOB_ROOT}/qemu-alpine-ssh__4NZFKhg/agent/trajectory.json",
+    "case_id": "case-0299"
+  },
+  {
+    "trial_name": "qemu-alpine-ssh__CtMJzmn",
+    "task_slug": "qemu-alpine-ssh",
+    "trial_dir": "${JOB_ROOT}/qemu-alpine-ssh__CtMJzmn",
+    "task_dir": "${TASK_ROOT}/qemu-alpine-ssh/60b7050b0e0aa51641208cf65766743d340e59575db2c4d2f8628240846c2a28",
+    "trajectory_path": "${JOB_ROOT}/qemu-alpine-ssh__CtMJzmn/agent/trajectory.json",
+    "case_id": "case-0300"
+  },
+  {
+    "trial_name": "qemu-alpine-ssh__XX74bCu",
+    "task_slug": "qemu-alpine-ssh",
+    "trial_dir": "${JOB_ROOT}/qemu-alpine-ssh__XX74bCu",
+    "task_dir": "${TASK_ROOT}/qemu-alpine-ssh/60b7050b0e0aa51641208cf65766743d340e59575db2c4d2f8628240846c2a28",
+    "trajectory_path": "${JOB_ROOT}/qemu-alpine-ssh__XX74bCu/agent/trajectory.json",
+    "case_id": "case-0301"
+  },
+  {
+    "trial_name": "qemu-startup__2ZFd6MA",
+    "task_slug": "qemu-startup",
+    "trial_dir": "${JOB_ROOT}/qemu-startup__2ZFd6MA",
+    "task_dir": "${TASK_ROOT}/qemu-startup/8e58263747da7dc688ad470688fb72825c4ba2c1c40443fa0f52963645bbd999",
+    "trajectory_path": "${JOB_ROOT}/qemu-startup__2ZFd6MA/agent/trajectory.json",
+    "case_id": "case-0302"
+  },
+  {
+    "trial_name": "qemu-startup__FJxK9NF",
+    "task_slug": "qemu-startup",
+    "trial_dir": "${JOB_ROOT}/qemu-startup__FJxK9NF",
+    "task_dir": "${TASK_ROOT}/qemu-startup/8e58263747da7dc688ad470688fb72825c4ba2c1c40443fa0f52963645bbd999",
+    "trajectory_path": "${JOB_ROOT}/qemu-startup__FJxK9NF/agent/trajectory.json",
+    "case_id": "case-0303"
+  },
+  {
+    "trial_name": "qemu-startup__pLwHtCz",
+    "task_slug": "qemu-startup",
+    "trial_dir": "${JOB_ROOT}/qemu-startup__pLwHtCz",
+    "task_dir": "${TASK_ROOT}/qemu-startup/8e58263747da7dc688ad470688fb72825c4ba2c1c40443fa0f52963645bbd999",
+    "trajectory_path": "${JOB_ROOT}/qemu-startup__pLwHtCz/agent/trajectory.json",
+    "case_id": "case-0304"
+  },
+  {
+    "trial_name": "qemu-startup__sFPUvoV",
+    "task_slug": "qemu-startup",
+    "trial_dir": "${JOB_ROOT}/qemu-startup__sFPUvoV",
+    "task_dir": "${TASK_ROOT}/qemu-startup/8e58263747da7dc688ad470688fb72825c4ba2c1c40443fa0f52963645bbd999",
+    "trajectory_path": "${JOB_ROOT}/qemu-startup__sFPUvoV/agent/trajectory.json",
+    "case_id": "case-0305"
+  },
+  {
+    "trial_name": "qemu-startup__wYktaAt",
+    "task_slug": "qemu-startup",
+    "trial_dir": "${JOB_ROOT}/qemu-startup__wYktaAt",
+    "task_dir": "${TASK_ROOT}/qemu-startup/8e58263747da7dc688ad470688fb72825c4ba2c1c40443fa0f52963645bbd999",
+    "trajectory_path": "${JOB_ROOT}/qemu-startup__wYktaAt/agent/trajectory.json",
+    "case_id": "case-0306"
+  },
+  {
+    "trial_name": "query-optimize__2RMtJTo",
+    "task_slug": "query-optimize",
+    "trial_dir": "${JOB_ROOT}/query-optimize__2RMtJTo",
+    "task_dir": "${TASK_ROOT}/query-optimize/169496ea6843cb403b0860132675baf7aa0df0ac8b86221068e27d86395260f4",
+    "trajectory_path": "${JOB_ROOT}/query-optimize__2RMtJTo/agent/trajectory.json",
+    "case_id": "case-0307"
+  },
+  {
+    "trial_name": "query-optimize__eWnePAC",
+    "task_slug": "query-optimize",
+    "trial_dir": "${JOB_ROOT}/query-optimize__eWnePAC",
+    "task_dir": "${TASK_ROOT}/query-optimize/169496ea6843cb403b0860132675baf7aa0df0ac8b86221068e27d86395260f4",
+    "trajectory_path": "${JOB_ROOT}/query-optimize__eWnePAC/agent/trajectory.json",
+    "case_id": "case-0308"
+  },
+  {
+    "trial_name": "query-optimize__kkMy9hN",
+    "task_slug": "query-optimize",
+    "trial_dir": "${JOB_ROOT}/query-optimize__kkMy9hN",
+    "task_dir": "${TASK_ROOT}/query-optimize/169496ea6843cb403b0860132675baf7aa0df0ac8b86221068e27d86395260f4",
+    "trajectory_path": "${JOB_ROOT}/query-optimize__kkMy9hN/agent/trajectory.json",
+    "case_id": "case-0309"
+  },
+  {
+    "trial_name": "raman-fitting__bdsp6qq",
+    "task_slug": "raman-fitting",
+    "trial_dir": "${JOB_ROOT}/raman-fitting__bdsp6qq",
+    "task_dir": "${TASK_ROOT}/raman-fitting/97ca4025332b20739da553cab0658f2ead925d1b5b3b9b7664dc9eb5e7fbeab7",
+    "trajectory_path": "${JOB_ROOT}/raman-fitting__bdsp6qq/agent/trajectory.json",
+    "case_id": "case-0310"
+  },
+  {
+    "trial_name": "regex-chess__ASfx7Dj",
+    "task_slug": "regex-chess",
+    "trial_dir": "${JOB_ROOT}/regex-chess__ASfx7Dj",
+    "task_dir": "${TASK_ROOT}/regex-chess/e763e0ac1c9759081af0a4a82ba51b8cf9ae5485a93de3bbe42d7d344597bd78",
+    "trajectory_path": "${JOB_ROOT}/regex-chess__ASfx7Dj/agent/trajectory.json",
+    "case_id": "case-0311"
+  },
+  {
+    "trial_name": "regex-chess__D2vB9zw",
+    "task_slug": "regex-chess",
+    "trial_dir": "${JOB_ROOT}/regex-chess__D2vB9zw",
+    "task_dir": "${TASK_ROOT}/regex-chess/e763e0ac1c9759081af0a4a82ba51b8cf9ae5485a93de3bbe42d7d344597bd78",
+    "trajectory_path": "${JOB_ROOT}/regex-chess__D2vB9zw/agent/trajectory.json",
+    "case_id": "case-0312"
+  },
+  {
+    "trial_name": "regex-chess__GAnY37y",
+    "task_slug": "regex-chess",
+    "trial_dir": "${JOB_ROOT}/regex-chess__GAnY37y",
+    "task_dir": "${TASK_ROOT}/regex-chess/e763e0ac1c9759081af0a4a82ba51b8cf9ae5485a93de3bbe42d7d344597bd78",
+    "trajectory_path": "${JOB_ROOT}/regex-chess__GAnY37y/agent/trajectory.json",
+    "case_id": "case-0313"
+  },
+  {
+    "trial_name": "regex-chess__w2uB39p",
+    "task_slug": "regex-chess",
+    "trial_dir": "${JOB_ROOT}/regex-chess__w2uB39p",
+    "task_dir": "${TASK_ROOT}/regex-chess/e763e0ac1c9759081af0a4a82ba51b8cf9ae5485a93de3bbe42d7d344597bd78",
+    "trajectory_path": "${JOB_ROOT}/regex-chess__w2uB39p/agent/trajectory.json",
+    "case_id": "case-0314"
+  },
+  {
+    "trial_name": "regex-chess__xVrKW3P",
+    "task_slug": "regex-chess",
+    "trial_dir": "${JOB_ROOT}/regex-chess__xVrKW3P",
+    "task_dir": "${TASK_ROOT}/regex-chess/e763e0ac1c9759081af0a4a82ba51b8cf9ae5485a93de3bbe42d7d344597bd78",
+    "trajectory_path": "${JOB_ROOT}/regex-chess__xVrKW3P/agent/trajectory.json",
+    "case_id": "case-0315"
+  },
+  {
+    "trial_name": "regex-log__HPrWTPe",
+    "task_slug": "regex-log",
+    "trial_dir": "${JOB_ROOT}/regex-log__HPrWTPe",
+    "task_dir": "${TASK_ROOT}/regex-log/802c16cfd132e6c457529cb864be5a757c1b23b6cadc57f2d01983cb0110292a",
+    "trajectory_path": "${JOB_ROOT}/regex-log__HPrWTPe/agent/trajectory.json",
+    "case_id": "case-0316"
+  },
+  {
+    "trial_name": "regex-log__U8dagnE",
+    "task_slug": "regex-log",
+    "trial_dir": "${JOB_ROOT}/regex-log__U8dagnE",
+    "task_dir": "${TASK_ROOT}/regex-log/802c16cfd132e6c457529cb864be5a757c1b23b6cadc57f2d01983cb0110292a",
+    "trajectory_path": "${JOB_ROOT}/regex-log__U8dagnE/agent/trajectory.json",
+    "case_id": "case-0317"
+  },
+  {
+    "trial_name": "regex-log__jE6Hb2r",
+    "task_slug": "regex-log",
+    "trial_dir": "${JOB_ROOT}/regex-log__jE6Hb2r",
+    "task_dir": "${TASK_ROOT}/regex-log/802c16cfd132e6c457529cb864be5a757c1b23b6cadc57f2d01983cb0110292a",
+    "trajectory_path": "${JOB_ROOT}/regex-log__jE6Hb2r/agent/trajectory.json",
+    "case_id": "case-0318"
+  },
+  {
+    "trial_name": "regex-log__jwxgitf",
+    "task_slug": "regex-log",
+    "trial_dir": "${JOB_ROOT}/regex-log__jwxgitf",
+    "task_dir": "${TASK_ROOT}/regex-log/802c16cfd132e6c457529cb864be5a757c1b23b6cadc57f2d01983cb0110292a",
+    "trajectory_path": "${JOB_ROOT}/regex-log__jwxgitf/agent/trajectory.json",
+    "case_id": "case-0319"
+  },
+  {
+    "trial_name": "regex-log__v5VPrKs",
+    "task_slug": "regex-log",
+    "trial_dir": "${JOB_ROOT}/regex-log__v5VPrKs",
+    "task_dir": "${TASK_ROOT}/regex-log/802c16cfd132e6c457529cb864be5a757c1b23b6cadc57f2d01983cb0110292a",
+    "trajectory_path": "${JOB_ROOT}/regex-log__v5VPrKs/agent/trajectory.json",
+    "case_id": "case-0320"
+  },
+  {
+    "trial_name": "reshard-c4-data__5qqy7HL",
+    "task_slug": "reshard-c4-data",
+    "trial_dir": "${JOB_ROOT}/reshard-c4-data__5qqy7HL",
+    "task_dir": "${TASK_ROOT}/reshard-c4-data/a402bbfede73dd04168d697de9b9146026f69e14c8cd333b6a91fc87e44ecd4b",
+    "trajectory_path": "${JOB_ROOT}/reshard-c4-data__5qqy7HL/agent/trajectory.json",
+    "case_id": "case-0321"
+  },
+  {
+    "trial_name": "reshard-c4-data__7zuNV2N",
+    "task_slug": "reshard-c4-data",
+    "trial_dir": "${JOB_ROOT}/reshard-c4-data__7zuNV2N",
+    "task_dir": "${TASK_ROOT}/reshard-c4-data/a402bbfede73dd04168d697de9b9146026f69e14c8cd333b6a91fc87e44ecd4b",
+    "trajectory_path": "${JOB_ROOT}/reshard-c4-data__7zuNV2N/agent/trajectory.json",
+    "case_id": "case-0322"
+  },
+  {
+    "trial_name": "reshard-c4-data__GxcEBLC",
+    "task_slug": "reshard-c4-data",
+    "trial_dir": "${JOB_ROOT}/reshard-c4-data__GxcEBLC",
+    "task_dir": "${TASK_ROOT}/reshard-c4-data/a402bbfede73dd04168d697de9b9146026f69e14c8cd333b6a91fc87e44ecd4b",
+    "trajectory_path": "${JOB_ROOT}/reshard-c4-data__GxcEBLC/agent/trajectory.json",
+    "case_id": "case-0323"
+  },
+  {
+    "trial_name": "reshard-c4-data__LfCSEcj",
+    "task_slug": "reshard-c4-data",
+    "trial_dir": "${JOB_ROOT}/reshard-c4-data__LfCSEcj",
+    "task_dir": "${TASK_ROOT}/reshard-c4-data/a402bbfede73dd04168d697de9b9146026f69e14c8cd333b6a91fc87e44ecd4b",
+    "trajectory_path": "${JOB_ROOT}/reshard-c4-data__LfCSEcj/agent/trajectory.json",
+    "case_id": "case-0324"
+  },
+  {
+    "trial_name": "reshard-c4-data__wPBgxnu",
+    "task_slug": "reshard-c4-data",
+    "trial_dir": "${JOB_ROOT}/reshard-c4-data__wPBgxnu",
+    "task_dir": "${TASK_ROOT}/reshard-c4-data/a402bbfede73dd04168d697de9b9146026f69e14c8cd333b6a91fc87e44ecd4b",
+    "trajectory_path": "${JOB_ROOT}/reshard-c4-data__wPBgxnu/agent/trajectory.json",
+    "case_id": "case-0325"
+  },
+  {
+    "trial_name": "rstan-to-pystan__9KmNKDP",
+    "task_slug": "rstan-to-pystan",
+    "trial_dir": "${JOB_ROOT}/rstan-to-pystan__9KmNKDP",
+    "task_dir": "${TASK_ROOT}/rstan-to-pystan/592f15f75751f3c4999c3d05087f2f8b2a4dbaaedbfad5a30ae54058b80b925f",
+    "trajectory_path": "${JOB_ROOT}/rstan-to-pystan__9KmNKDP/agent/trajectory.json",
+    "case_id": "case-0326"
+  },
+  {
+    "trial_name": "rstan-to-pystan__cQMWNqE",
+    "task_slug": "rstan-to-pystan",
+    "trial_dir": "${JOB_ROOT}/rstan-to-pystan__cQMWNqE",
+    "task_dir": "${TASK_ROOT}/rstan-to-pystan/592f15f75751f3c4999c3d05087f2f8b2a4dbaaedbfad5a30ae54058b80b925f",
+    "trajectory_path": "${JOB_ROOT}/rstan-to-pystan__cQMWNqE/agent/trajectory.json",
+    "case_id": "case-0327"
+  },
+  {
+    "trial_name": "rstan-to-pystan__kQesd4f",
+    "task_slug": "rstan-to-pystan",
+    "trial_dir": "${JOB_ROOT}/rstan-to-pystan__kQesd4f",
+    "task_dir": "${TASK_ROOT}/rstan-to-pystan/592f15f75751f3c4999c3d05087f2f8b2a4dbaaedbfad5a30ae54058b80b925f",
+    "trajectory_path": "${JOB_ROOT}/rstan-to-pystan__kQesd4f/agent/trajectory.json",
+    "case_id": "case-0328"
+  },
+  {
+    "trial_name": "rstan-to-pystan__o2uS9bV",
+    "task_slug": "rstan-to-pystan",
+    "trial_dir": "${JOB_ROOT}/rstan-to-pystan__o2uS9bV",
+    "task_dir": "${TASK_ROOT}/rstan-to-pystan/592f15f75751f3c4999c3d05087f2f8b2a4dbaaedbfad5a30ae54058b80b925f",
+    "trajectory_path": "${JOB_ROOT}/rstan-to-pystan__o2uS9bV/agent/trajectory.json",
+    "case_id": "case-0329"
+  },
+  {
+    "trial_name": "sam-cell-seg__JcbUesu",
+    "task_slug": "sam-cell-seg",
+    "trial_dir": "${JOB_ROOT}/sam-cell-seg__JcbUesu",
+    "task_dir": "${TASK_ROOT}/sam-cell-seg/37c182b91df18b9c2ea2dceda47430bbd585e7880c56fca2f1975907ce0df8ce",
+    "trajectory_path": "${JOB_ROOT}/sam-cell-seg__JcbUesu/agent/trajectory.json",
+    "case_id": "case-0330"
+  },
+  {
+    "trial_name": "sam-cell-seg__VJwduRd",
+    "task_slug": "sam-cell-seg",
+    "trial_dir": "${JOB_ROOT}/sam-cell-seg__VJwduRd",
+    "task_dir": "${TASK_ROOT}/sam-cell-seg/37c182b91df18b9c2ea2dceda47430bbd585e7880c56fca2f1975907ce0df8ce",
+    "trajectory_path": "${JOB_ROOT}/sam-cell-seg__VJwduRd/agent/trajectory.json",
+    "case_id": "case-0331"
+  },
+  {
+    "trial_name": "sam-cell-seg__bqDeYzn",
+    "task_slug": "sam-cell-seg",
+    "trial_dir": "${JOB_ROOT}/sam-cell-seg__bqDeYzn",
+    "task_dir": "${TASK_ROOT}/sam-cell-seg/37c182b91df18b9c2ea2dceda47430bbd585e7880c56fca2f1975907ce0df8ce",
+    "trajectory_path": "${JOB_ROOT}/sam-cell-seg__bqDeYzn/agent/trajectory.json",
+    "case_id": "case-0332"
+  },
+  {
+    "trial_name": "sam-cell-seg__fmXnitj",
+    "task_slug": "sam-cell-seg",
+    "trial_dir": "${JOB_ROOT}/sam-cell-seg__fmXnitj",
+    "task_dir": "${TASK_ROOT}/sam-cell-seg/37c182b91df18b9c2ea2dceda47430bbd585e7880c56fca2f1975907ce0df8ce",
+    "trajectory_path": "${JOB_ROOT}/sam-cell-seg__fmXnitj/agent/trajectory.json",
+    "case_id": "case-0333"
+  },
+  {
+    "trial_name": "sanitize-git-repo__2tMAsXo",
+    "task_slug": "sanitize-git-repo",
+    "trial_dir": "${JOB_ROOT}/sanitize-git-repo__2tMAsXo",
+    "task_dir": "${TASK_ROOT}/sanitize-git-repo/6e86297715fae62cd499fbdd27013e11a38d05d7e05b7f661cb50b4ecead128f",
+    "trajectory_path": "${JOB_ROOT}/sanitize-git-repo__2tMAsXo/agent/trajectory.json",
+    "case_id": "case-0334"
+  },
+  {
+    "trial_name": "sanitize-git-repo__e4aQiAU",
+    "task_slug": "sanitize-git-repo",
+    "trial_dir": "${JOB_ROOT}/sanitize-git-repo__e4aQiAU",
+    "task_dir": "${TASK_ROOT}/sanitize-git-repo/6e86297715fae62cd499fbdd27013e11a38d05d7e05b7f661cb50b4ecead128f",
+    "trajectory_path": "${JOB_ROOT}/sanitize-git-repo__e4aQiAU/agent/trajectory.json",
+    "case_id": "case-0335"
+  },
+  {
+    "trial_name": "sanitize-git-repo__wkrgRSn",
+    "task_slug": "sanitize-git-repo",
+    "trial_dir": "${JOB_ROOT}/sanitize-git-repo__wkrgRSn",
+    "task_dir": "${TASK_ROOT}/sanitize-git-repo/6e86297715fae62cd499fbdd27013e11a38d05d7e05b7f661cb50b4ecead128f",
+    "trajectory_path": "${JOB_ROOT}/sanitize-git-repo__wkrgRSn/agent/trajectory.json",
+    "case_id": "case-0336"
+  },
+  {
+    "trial_name": "schemelike-metacircular-eval__2n6cFHF",
+    "task_slug": "schemelike-metacircular-eval",
+    "trial_dir": "${JOB_ROOT}/schemelike-metacircular-eval__2n6cFHF",
+    "task_dir": "${TASK_ROOT}/schemelike-metacircular-eval/58130c2166c3115276dc8592f358e326ff2d81ea852e3d88636c82fd1dff57e6",
+    "trajectory_path": "${JOB_ROOT}/schemelike-metacircular-eval__2n6cFHF/agent/trajectory.json",
+    "case_id": "case-0337"
+  },
+  {
+    "trial_name": "schemelike-metacircular-eval__H3P2RGD",
+    "task_slug": "schemelike-metacircular-eval",
+    "trial_dir": "${JOB_ROOT}/schemelike-metacircular-eval__H3P2RGD",
+    "task_dir": "${TASK_ROOT}/schemelike-metacircular-eval/58130c2166c3115276dc8592f358e326ff2d81ea852e3d88636c82fd1dff57e6",
+    "trajectory_path": "${JOB_ROOT}/schemelike-metacircular-eval__H3P2RGD/agent/trajectory.json",
+    "case_id": "case-0338"
+  },
+  {
+    "trial_name": "schemelike-metacircular-eval__uyRQmVS",
+    "task_slug": "schemelike-metacircular-eval",
+    "trial_dir": "${JOB_ROOT}/schemelike-metacircular-eval__uyRQmVS",
+    "task_dir": "${TASK_ROOT}/schemelike-metacircular-eval/58130c2166c3115276dc8592f358e326ff2d81ea852e3d88636c82fd1dff57e6",
+    "trajectory_path": "${JOB_ROOT}/schemelike-metacircular-eval__uyRQmVS/agent/trajectory.json",
+    "case_id": "case-0339"
+  },
+  {
+    "trial_name": "schemelike-metacircular-eval__xAfAxcB",
+    "task_slug": "schemelike-metacircular-eval",
+    "trial_dir": "${JOB_ROOT}/schemelike-metacircular-eval__xAfAxcB",
+    "task_dir": "${TASK_ROOT}/schemelike-metacircular-eval/58130c2166c3115276dc8592f358e326ff2d81ea852e3d88636c82fd1dff57e6",
+    "trajectory_path": "${JOB_ROOT}/schemelike-metacircular-eval__xAfAxcB/agent/trajectory.json",
+    "case_id": "case-0340"
+  },
+  {
+    "trial_name": "schemelike-metacircular-eval__y6yrC7k",
+    "task_slug": "schemelike-metacircular-eval",
+    "trial_dir": "${JOB_ROOT}/schemelike-metacircular-eval__y6yrC7k",
+    "task_dir": "${TASK_ROOT}/schemelike-metacircular-eval/58130c2166c3115276dc8592f358e326ff2d81ea852e3d88636c82fd1dff57e6",
+    "trajectory_path": "${JOB_ROOT}/schemelike-metacircular-eval__y6yrC7k/agent/trajectory.json",
+    "case_id": "case-0341"
+  },
+  {
+    "trial_name": "sparql-university__Wwsccix",
+    "task_slug": "sparql-university",
+    "trial_dir": "${JOB_ROOT}/sparql-university__Wwsccix",
+    "task_dir": "${TASK_ROOT}/sparql-university/02aeca67b6c5b0d2d72c91ab471beb51ded6f42f0dc3dec580e20d489f09a867",
+    "trajectory_path": "${JOB_ROOT}/sparql-university__Wwsccix/agent/trajectory.json",
+    "case_id": "case-0342"
+  },
+  {
+    "trial_name": "sparql-university__XnksQtb",
+    "task_slug": "sparql-university",
+    "trial_dir": "${JOB_ROOT}/sparql-university__XnksQtb",
+    "task_dir": "${TASK_ROOT}/sparql-university/02aeca67b6c5b0d2d72c91ab471beb51ded6f42f0dc3dec580e20d489f09a867",
+    "trajectory_path": "${JOB_ROOT}/sparql-university__XnksQtb/agent/trajectory.json",
+    "case_id": "case-0343"
+  },
+  {
+    "trial_name": "sparql-university__urniLoS",
+    "task_slug": "sparql-university",
+    "trial_dir": "${JOB_ROOT}/sparql-university__urniLoS",
+    "task_dir": "${TASK_ROOT}/sparql-university/02aeca67b6c5b0d2d72c91ab471beb51ded6f42f0dc3dec580e20d489f09a867",
+    "trajectory_path": "${JOB_ROOT}/sparql-university__urniLoS/agent/trajectory.json",
+    "case_id": "case-0344"
+  },
+  {
+    "trial_name": "sparql-university__vo8vfij",
+    "task_slug": "sparql-university",
+    "trial_dir": "${JOB_ROOT}/sparql-university__vo8vfij",
+    "task_dir": "${TASK_ROOT}/sparql-university/02aeca67b6c5b0d2d72c91ab471beb51ded6f42f0dc3dec580e20d489f09a867",
+    "trajectory_path": "${JOB_ROOT}/sparql-university__vo8vfij/agent/trajectory.json",
+    "case_id": "case-0345"
+  },
+  {
+    "trial_name": "sparql-university__xvZERFf",
+    "task_slug": "sparql-university",
+    "trial_dir": "${JOB_ROOT}/sparql-university__xvZERFf",
+    "task_dir": "${TASK_ROOT}/sparql-university/02aeca67b6c5b0d2d72c91ab471beb51ded6f42f0dc3dec580e20d489f09a867",
+    "trajectory_path": "${JOB_ROOT}/sparql-university__xvZERFf/agent/trajectory.json",
+    "case_id": "case-0346"
+  },
+  {
+    "trial_name": "sqlite-db-truncate__ErWC2t7",
+    "task_slug": "sqlite-db-truncate",
+    "trial_dir": "${JOB_ROOT}/sqlite-db-truncate__ErWC2t7",
+    "task_dir": "${TASK_ROOT}/sqlite-db-truncate/956f038b479cc3b9b493553b57a60a8ff4154526386c3914c0b99e93e1ab6e87",
+    "trajectory_path": "${JOB_ROOT}/sqlite-db-truncate__ErWC2t7/agent/trajectory.json",
+    "case_id": "case-0347"
+  },
+  {
+    "trial_name": "sqlite-db-truncate__Ut6eEK6",
+    "task_slug": "sqlite-db-truncate",
+    "trial_dir": "${JOB_ROOT}/sqlite-db-truncate__Ut6eEK6",
+    "task_dir": "${TASK_ROOT}/sqlite-db-truncate/956f038b479cc3b9b493553b57a60a8ff4154526386c3914c0b99e93e1ab6e87",
+    "trajectory_path": "${JOB_ROOT}/sqlite-db-truncate__Ut6eEK6/agent/trajectory.json",
+    "case_id": "case-0348"
+  },
+  {
+    "trial_name": "sqlite-db-truncate__bqAueZN",
+    "task_slug": "sqlite-db-truncate",
+    "trial_dir": "${JOB_ROOT}/sqlite-db-truncate__bqAueZN",
+    "task_dir": "${TASK_ROOT}/sqlite-db-truncate/956f038b479cc3b9b493553b57a60a8ff4154526386c3914c0b99e93e1ab6e87",
+    "trajectory_path": "${JOB_ROOT}/sqlite-db-truncate__bqAueZN/agent/trajectory.json",
+    "case_id": "case-0349"
+  },
+  {
+    "trial_name": "sqlite-db-truncate__hyf87tF",
+    "task_slug": "sqlite-db-truncate",
+    "trial_dir": "${JOB_ROOT}/sqlite-db-truncate__hyf87tF",
+    "task_dir": "${TASK_ROOT}/sqlite-db-truncate/956f038b479cc3b9b493553b57a60a8ff4154526386c3914c0b99e93e1ab6e87",
+    "trajectory_path": "${JOB_ROOT}/sqlite-db-truncate__hyf87tF/agent/trajectory.json",
+    "case_id": "case-0350"
+  },
+  {
+    "trial_name": "sqlite-db-truncate__vJgtAZj",
+    "task_slug": "sqlite-db-truncate",
+    "trial_dir": "${JOB_ROOT}/sqlite-db-truncate__vJgtAZj",
+    "task_dir": "${TASK_ROOT}/sqlite-db-truncate/956f038b479cc3b9b493553b57a60a8ff4154526386c3914c0b99e93e1ab6e87",
+    "trajectory_path": "${JOB_ROOT}/sqlite-db-truncate__vJgtAZj/agent/trajectory.json",
+    "case_id": "case-0351"
+  },
+  {
+    "trial_name": "sqlite-with-gcov__9K9ni99",
+    "task_slug": "sqlite-with-gcov",
+    "trial_dir": "${JOB_ROOT}/sqlite-with-gcov__9K9ni99",
+    "task_dir": "${TASK_ROOT}/sqlite-with-gcov/9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d",
+    "trajectory_path": "${JOB_ROOT}/sqlite-with-gcov__9K9ni99/agent/trajectory.json",
+    "case_id": "case-0352"
+  },
+  {
+    "trial_name": "sqlite-with-gcov__PM5MVEi",
+    "task_slug": "sqlite-with-gcov",
+    "trial_dir": "${JOB_ROOT}/sqlite-with-gcov__PM5MVEi",
+    "task_dir": "${TASK_ROOT}/sqlite-with-gcov/9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d",
+    "trajectory_path": "${JOB_ROOT}/sqlite-with-gcov__PM5MVEi/agent/trajectory.json",
+    "case_id": "case-0353"
+  },
+  {
+    "trial_name": "sqlite-with-gcov__YVRxdEU",
+    "task_slug": "sqlite-with-gcov",
+    "trial_dir": "${JOB_ROOT}/sqlite-with-gcov__YVRxdEU",
+    "task_dir": "${TASK_ROOT}/sqlite-with-gcov/9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d",
+    "trajectory_path": "${JOB_ROOT}/sqlite-with-gcov__YVRxdEU/agent/trajectory.json",
+    "case_id": "case-0354"
+  },
+  {
+    "trial_name": "sqlite-with-gcov__ZfZ3JYv",
+    "task_slug": "sqlite-with-gcov",
+    "trial_dir": "${JOB_ROOT}/sqlite-with-gcov__ZfZ3JYv",
+    "task_dir": "${TASK_ROOT}/sqlite-with-gcov/9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d",
+    "trajectory_path": "${JOB_ROOT}/sqlite-with-gcov__ZfZ3JYv/agent/trajectory.json",
+    "case_id": "case-0355"
+  },
+  {
+    "trial_name": "sqlite-with-gcov__mYbdCty",
+    "task_slug": "sqlite-with-gcov",
+    "trial_dir": "${JOB_ROOT}/sqlite-with-gcov__mYbdCty",
+    "task_dir": "${TASK_ROOT}/sqlite-with-gcov/9f9bd57fbf9f4831e9031755e83aea6b9d60d2b2d54e8a12d48cff4dca3c231d",
+    "trajectory_path": "${JOB_ROOT}/sqlite-with-gcov__mYbdCty/agent/trajectory.json",
+    "case_id": "case-0356"
+  },
+  {
+    "trial_name": "torch-pipeline-parallelism__8V5RmAb",
+    "task_slug": "torch-pipeline-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-pipeline-parallelism__8V5RmAb",
+    "task_dir": "${TASK_ROOT}/torch-pipeline-parallelism/db605337c749a872cea7b5b413429b3915bb4c3efe0f7875f0c46ce81bd8c4fb",
+    "trajectory_path": "${JOB_ROOT}/torch-pipeline-parallelism__8V5RmAb/agent/trajectory.json",
+    "case_id": "case-0357"
+  },
+  {
+    "trial_name": "torch-pipeline-parallelism__QnP9nqm",
+    "task_slug": "torch-pipeline-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-pipeline-parallelism__QnP9nqm",
+    "task_dir": "${TASK_ROOT}/torch-pipeline-parallelism/db605337c749a872cea7b5b413429b3915bb4c3efe0f7875f0c46ce81bd8c4fb",
+    "trajectory_path": "${JOB_ROOT}/torch-pipeline-parallelism__QnP9nqm/agent/trajectory.json",
+    "case_id": "case-0358"
+  },
+  {
+    "trial_name": "torch-pipeline-parallelism__VLJY5Ua",
+    "task_slug": "torch-pipeline-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-pipeline-parallelism__VLJY5Ua",
+    "task_dir": "${TASK_ROOT}/torch-pipeline-parallelism/db605337c749a872cea7b5b413429b3915bb4c3efe0f7875f0c46ce81bd8c4fb",
+    "trajectory_path": "${JOB_ROOT}/torch-pipeline-parallelism__VLJY5Ua/agent/trajectory.json",
+    "case_id": "case-0359"
+  },
+  {
+    "trial_name": "torch-pipeline-parallelism__hDK6Ayg",
+    "task_slug": "torch-pipeline-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-pipeline-parallelism__hDK6Ayg",
+    "task_dir": "${TASK_ROOT}/torch-pipeline-parallelism/db605337c749a872cea7b5b413429b3915bb4c3efe0f7875f0c46ce81bd8c4fb",
+    "trajectory_path": "${JOB_ROOT}/torch-pipeline-parallelism__hDK6Ayg/agent/trajectory.json",
+    "case_id": "case-0360"
+  },
+  {
+    "trial_name": "torch-tensor-parallelism__Qp9kjSj",
+    "task_slug": "torch-tensor-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-tensor-parallelism__Qp9kjSj",
+    "task_dir": "${TASK_ROOT}/torch-tensor-parallelism/f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+    "trajectory_path": "${JOB_ROOT}/torch-tensor-parallelism__Qp9kjSj/agent/trajectory.json",
+    "case_id": "case-0361"
+  },
+  {
+    "trial_name": "torch-tensor-parallelism__UwcqVgy",
+    "task_slug": "torch-tensor-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-tensor-parallelism__UwcqVgy",
+    "task_dir": "${TASK_ROOT}/torch-tensor-parallelism/f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+    "trajectory_path": "${JOB_ROOT}/torch-tensor-parallelism__UwcqVgy/agent/trajectory.json",
+    "case_id": "case-0362"
+  },
+  {
+    "trial_name": "torch-tensor-parallelism__hHDeQEx",
+    "task_slug": "torch-tensor-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-tensor-parallelism__hHDeQEx",
+    "task_dir": "${TASK_ROOT}/torch-tensor-parallelism/f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+    "trajectory_path": "${JOB_ROOT}/torch-tensor-parallelism__hHDeQEx/agent/trajectory.json",
+    "case_id": "case-0363"
+  },
+  {
+    "trial_name": "torch-tensor-parallelism__msPDq9J",
+    "task_slug": "torch-tensor-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-tensor-parallelism__msPDq9J",
+    "task_dir": "${TASK_ROOT}/torch-tensor-parallelism/f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+    "trajectory_path": "${JOB_ROOT}/torch-tensor-parallelism__msPDq9J/agent/trajectory.json",
+    "case_id": "case-0364"
+  },
+  {
+    "trial_name": "torch-tensor-parallelism__pSULEDp",
+    "task_slug": "torch-tensor-parallelism",
+    "trial_dir": "${JOB_ROOT}/torch-tensor-parallelism__pSULEDp",
+    "task_dir": "${TASK_ROOT}/torch-tensor-parallelism/f32ce74a5aeb6638480247ab799fe46127bbee631acdd0921b0f394ec49b3684",
+    "trajectory_path": "${JOB_ROOT}/torch-tensor-parallelism__pSULEDp/agent/trajectory.json",
+    "case_id": "case-0365"
+  },
+  {
+    "trial_name": "train-fasttext__2YPzALZ",
+    "task_slug": "train-fasttext",
+    "trial_dir": "${JOB_ROOT}/train-fasttext__2YPzALZ",
+    "task_dir": "${TASK_ROOT}/train-fasttext/460fc0818971ec83545a76805267b65459128fad52e68c26a199a0d74022badb",
+    "trajectory_path": "${JOB_ROOT}/train-fasttext__2YPzALZ/agent/trajectory.json",
+    "case_id": "case-0366"
+  },
+  {
+    "trial_name": "train-fasttext__7meAdXH",
+    "task_slug": "train-fasttext",
+    "trial_dir": "${JOB_ROOT}/train-fasttext__7meAdXH",
+    "task_dir": "${TASK_ROOT}/train-fasttext/460fc0818971ec83545a76805267b65459128fad52e68c26a199a0d74022badb",
+    "trajectory_path": "${JOB_ROOT}/train-fasttext__7meAdXH/agent/trajectory.json",
+    "case_id": "case-0367"
+  },
+  {
+    "trial_name": "train-fasttext__DkryKF8",
+    "task_slug": "train-fasttext",
+    "trial_dir": "${JOB_ROOT}/train-fasttext__DkryKF8",
+    "task_dir": "${TASK_ROOT}/train-fasttext/460fc0818971ec83545a76805267b65459128fad52e68c26a199a0d74022badb",
+    "trajectory_path": "${JOB_ROOT}/train-fasttext__DkryKF8/agent/trajectory.json",
+    "case_id": "case-0368"
+  },
+  {
+    "trial_name": "train-fasttext__J7cmz52",
+    "task_slug": "train-fasttext",
+    "trial_dir": "${JOB_ROOT}/train-fasttext__J7cmz52",
+    "task_dir": "${TASK_ROOT}/train-fasttext/460fc0818971ec83545a76805267b65459128fad52e68c26a199a0d74022badb",
+    "trajectory_path": "${JOB_ROOT}/train-fasttext__J7cmz52/agent/trajectory.json",
+    "case_id": "case-0369"
+  },
+  {
+    "trial_name": "tune-mjcf__XVUFXmu",
+    "task_slug": "tune-mjcf",
+    "trial_dir": "${JOB_ROOT}/tune-mjcf__XVUFXmu",
+    "task_dir": "${TASK_ROOT}/tune-mjcf/7da0fd3b906624df9eff8829ccd4f19cbb1ba967411b6d64d92b85b2f3fbdfb0",
+    "trajectory_path": "${JOB_ROOT}/tune-mjcf__XVUFXmu/agent/trajectory.json",
+    "case_id": "case-0370"
+  },
+  {
+    "trial_name": "tune-mjcf__fybEXBY",
+    "task_slug": "tune-mjcf",
+    "trial_dir": "${JOB_ROOT}/tune-mjcf__fybEXBY",
+    "task_dir": "${TASK_ROOT}/tune-mjcf/7da0fd3b906624df9eff8829ccd4f19cbb1ba967411b6d64d92b85b2f3fbdfb0",
+    "trajectory_path": "${JOB_ROOT}/tune-mjcf__fybEXBY/agent/trajectory.json",
+    "case_id": "case-0371"
+  },
+  {
+    "trial_name": "tune-mjcf__v3jBoDc",
+    "task_slug": "tune-mjcf",
+    "trial_dir": "${JOB_ROOT}/tune-mjcf__v3jBoDc",
+    "task_dir": "${TASK_ROOT}/tune-mjcf/7da0fd3b906624df9eff8829ccd4f19cbb1ba967411b6d64d92b85b2f3fbdfb0",
+    "trajectory_path": "${JOB_ROOT}/tune-mjcf__v3jBoDc/agent/trajectory.json",
+    "case_id": "case-0372"
+  },
+  {
+    "trial_name": "tune-mjcf__zr2ZrBg",
+    "task_slug": "tune-mjcf",
+    "trial_dir": "${JOB_ROOT}/tune-mjcf__zr2ZrBg",
+    "task_dir": "${TASK_ROOT}/tune-mjcf/7da0fd3b906624df9eff8829ccd4f19cbb1ba967411b6d64d92b85b2f3fbdfb0",
+    "trajectory_path": "${JOB_ROOT}/tune-mjcf__zr2ZrBg/agent/trajectory.json",
+    "case_id": "case-0373"
+  },
+  {
+    "trial_name": "video-processing__NTACdvY",
+    "task_slug": "video-processing",
+    "trial_dir": "${JOB_ROOT}/video-processing__NTACdvY",
+    "task_dir": "${TASK_ROOT}/video-processing/d3f02e177b49e5768b6ce6709fc4ae3ef2ce0cdecb63b09fc9b07f9d3ddb7203",
+    "trajectory_path": "${JOB_ROOT}/video-processing__NTACdvY/agent/trajectory.json",
+    "case_id": "case-0374"
+  },
+  {
+    "trial_name": "video-processing__ptDcmks",
+    "task_slug": "video-processing",
+    "trial_dir": "${JOB_ROOT}/video-processing__ptDcmks",
+    "task_dir": "${TASK_ROOT}/video-processing/d3f02e177b49e5768b6ce6709fc4ae3ef2ce0cdecb63b09fc9b07f9d3ddb7203",
+    "trajectory_path": "${JOB_ROOT}/video-processing__ptDcmks/agent/trajectory.json",
+    "case_id": "case-0375"
+  },
+  {
+    "trial_name": "video-processing__rCnK468",
+    "task_slug": "video-processing",
+    "trial_dir": "${JOB_ROOT}/video-processing__rCnK468",
+    "task_dir": "${TASK_ROOT}/video-processing/d3f02e177b49e5768b6ce6709fc4ae3ef2ce0cdecb63b09fc9b07f9d3ddb7203",
+    "trajectory_path": "${JOB_ROOT}/video-processing__rCnK468/agent/trajectory.json",
+    "case_id": "case-0376"
+  },
+  {
+    "trial_name": "vulnerable-secret__6vmdnYd",
+    "task_slug": "vulnerable-secret",
+    "trial_dir": "${JOB_ROOT}/vulnerable-secret__6vmdnYd",
+    "task_dir": "${TASK_ROOT}/vulnerable-secret/d76dfa9e256487c5542905b892156f694137aeef784e1abf3f41e15a8c946eac",
+    "trajectory_path": "${JOB_ROOT}/vulnerable-secret__6vmdnYd/agent/trajectory.json",
+    "case_id": "case-0377"
+  },
+  {
+    "trial_name": "vulnerable-secret__BWo7Y56",
+    "task_slug": "vulnerable-secret",
+    "trial_dir": "${JOB_ROOT}/vulnerable-secret__BWo7Y56",
+    "task_dir": "${TASK_ROOT}/vulnerable-secret/d76dfa9e256487c5542905b892156f694137aeef784e1abf3f41e15a8c946eac",
+    "trajectory_path": "${JOB_ROOT}/vulnerable-secret__BWo7Y56/agent/trajectory.json",
+    "case_id": "case-0378"
+  },
+  {
+    "trial_name": "vulnerable-secret__CBfAfs8",
+    "task_slug": "vulnerable-secret",
+    "trial_dir": "${JOB_ROOT}/vulnerable-secret__CBfAfs8",
+    "task_dir": "${TASK_ROOT}/vulnerable-secret/d76dfa9e256487c5542905b892156f694137aeef784e1abf3f41e15a8c946eac",
+    "trajectory_path": "${JOB_ROOT}/vulnerable-secret__CBfAfs8/agent/trajectory.json",
+    "case_id": "case-0379"
+  },
+  {
+    "trial_name": "vulnerable-secret__dkDP6bD",
+    "task_slug": "vulnerable-secret",
+    "trial_dir": "${JOB_ROOT}/vulnerable-secret__dkDP6bD",
+    "task_dir": "${TASK_ROOT}/vulnerable-secret/d76dfa9e256487c5542905b892156f694137aeef784e1abf3f41e15a8c946eac",
+    "trajectory_path": "${JOB_ROOT}/vulnerable-secret__dkDP6bD/agent/trajectory.json",
+    "case_id": "case-0380"
+  },
+  {
+    "trial_name": "vulnerable-secret__pvy8GB6",
+    "task_slug": "vulnerable-secret",
+    "trial_dir": "${JOB_ROOT}/vulnerable-secret__pvy8GB6",
+    "task_dir": "${TASK_ROOT}/vulnerable-secret/d76dfa9e256487c5542905b892156f694137aeef784e1abf3f41e15a8c946eac",
+    "trajectory_path": "${JOB_ROOT}/vulnerable-secret__pvy8GB6/agent/trajectory.json",
+    "case_id": "case-0381"
+  },
+  {
+    "trial_name": "winning-avg-corewars__EYEzoVo",
+    "task_slug": "winning-avg-corewars",
+    "trial_dir": "${JOB_ROOT}/winning-avg-corewars__EYEzoVo",
+    "task_dir": "${TASK_ROOT}/winning-avg-corewars/a9f2c630fb7d656e96f3a42ade600a8abcb500631d153d62d5ceb2df073bc256",
+    "trajectory_path": "${JOB_ROOT}/winning-avg-corewars__EYEzoVo/agent/trajectory.json",
+    "case_id": "case-0382"
+  },
+  {
+    "trial_name": "winning-avg-corewars__NJZxsxL",
+    "task_slug": "winning-avg-corewars",
+    "trial_dir": "${JOB_ROOT}/winning-avg-corewars__NJZxsxL",
+    "task_dir": "${TASK_ROOT}/winning-avg-corewars/a9f2c630fb7d656e96f3a42ade600a8abcb500631d153d62d5ceb2df073bc256",
+    "trajectory_path": "${JOB_ROOT}/winning-avg-corewars__NJZxsxL/agent/trajectory.json",
+    "case_id": "case-0383"
+  },
+  {
+    "trial_name": "winning-avg-corewars__SZz4tyV",
+    "task_slug": "winning-avg-corewars",
+    "trial_dir": "${JOB_ROOT}/winning-avg-corewars__SZz4tyV",
+    "task_dir": "${TASK_ROOT}/winning-avg-corewars/a9f2c630fb7d656e96f3a42ade600a8abcb500631d153d62d5ceb2df073bc256",
+    "trajectory_path": "${JOB_ROOT}/winning-avg-corewars__SZz4tyV/agent/trajectory.json",
+    "case_id": "case-0384"
+  },
+  {
+    "trial_name": "winning-avg-corewars__o2SHbLj",
+    "task_slug": "winning-avg-corewars",
+    "trial_dir": "${JOB_ROOT}/winning-avg-corewars__o2SHbLj",
+    "task_dir": "${TASK_ROOT}/winning-avg-corewars/a9f2c630fb7d656e96f3a42ade600a8abcb500631d153d62d5ceb2df073bc256",
+    "trajectory_path": "${JOB_ROOT}/winning-avg-corewars__o2SHbLj/agent/trajectory.json",
+    "case_id": "case-0385"
+  },
+  {
+    "trial_name": "winning-avg-corewars__pfg6fQd",
+    "task_slug": "winning-avg-corewars",
+    "trial_dir": "${JOB_ROOT}/winning-avg-corewars__pfg6fQd",
+    "task_dir": "${TASK_ROOT}/winning-avg-corewars/a9f2c630fb7d656e96f3a42ade600a8abcb500631d153d62d5ceb2df073bc256",
+    "trajectory_path": "${JOB_ROOT}/winning-avg-corewars__pfg6fQd/agent/trajectory.json",
+    "case_id": "case-0386"
+  },
+  {
+    "trial_name": "write-compressor__9Z5o6ab",
+    "task_slug": "write-compressor",
+    "trial_dir": "${JOB_ROOT}/write-compressor__9Z5o6ab",
+    "task_dir": "${TASK_ROOT}/write-compressor/d9ddd9a8e925e2c566b37b2492cbf995afecefe58874e4043ef78d7f3c892c7e",
+    "trajectory_path": "${JOB_ROOT}/write-compressor__9Z5o6ab/agent/trajectory.json",
+    "case_id": "case-0387"
+  },
+  {
+    "trial_name": "write-compressor__QNymtAa",
+    "task_slug": "write-compressor",
+    "trial_dir": "${JOB_ROOT}/write-compressor__QNymtAa",
+    "task_dir": "${TASK_ROOT}/write-compressor/d9ddd9a8e925e2c566b37b2492cbf995afecefe58874e4043ef78d7f3c892c7e",
+    "trajectory_path": "${JOB_ROOT}/write-compressor__QNymtAa/agent/trajectory.json",
+    "case_id": "case-0388"
+  },
+  {
+    "trial_name": "write-compressor__X5tVYBq",
+    "task_slug": "write-compressor",
+    "trial_dir": "${JOB_ROOT}/write-compressor__X5tVYBq",
+    "task_dir": "${TASK_ROOT}/write-compressor/d9ddd9a8e925e2c566b37b2492cbf995afecefe58874e4043ef78d7f3c892c7e",
+    "trajectory_path": "${JOB_ROOT}/write-compressor__X5tVYBq/agent/trajectory.json",
+    "case_id": "case-0389"
+  },
+  {
+    "trial_name": "write-compressor__Z4euYq4",
+    "task_slug": "write-compressor",
+    "trial_dir": "${JOB_ROOT}/write-compressor__Z4euYq4",
+    "task_dir": "${TASK_ROOT}/write-compressor/d9ddd9a8e925e2c566b37b2492cbf995afecefe58874e4043ef78d7f3c892c7e",
+    "trajectory_path": "${JOB_ROOT}/write-compressor__Z4euYq4/agent/trajectory.json",
+    "case_id": "case-0390"
+  },
+  {
+    "trial_name": "write-compressor__v9CywGi",
+    "task_slug": "write-compressor",
+    "trial_dir": "${JOB_ROOT}/write-compressor__v9CywGi",
+    "task_dir": "${TASK_ROOT}/write-compressor/d9ddd9a8e925e2c566b37b2492cbf995afecefe58874e4043ef78d7f3c892c7e",
+    "trajectory_path": "${JOB_ROOT}/write-compressor__v9CywGi/agent/trajectory.json",
+    "case_id": "case-0391"
+  }
+]

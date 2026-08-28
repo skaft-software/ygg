@@ -1,0 +1,42 @@
+{
+  "job_name": "ygg-tb21-sol-max-k5-n20",
+  "jobs_dir": "${JOBS_DIR}",
+  "n_attempts": 5,
+  "n_concurrent_trials": 20,
+  "environment": {
+    "type": "docker",
+    "mounts": [
+      {
+        "type": "bind",
+        "source": "${YGG_BINARY}",
+        "target": "/usr/local/bin/ygg",
+        "read_only": true
+      },
+      {
+        "type": "bind",
+        "source": "${CREDENTIAL_STAGE}/.ygg",
+        "target": "/root/.ygg",
+        "read_only": true
+      }
+    ]
+  },
+  "agents": [
+    {
+      "name": "evaluation.harbor.ygg_agent:Ygg",
+      "model_name": "gpt-5.6-sol",
+      "kwargs": {
+        "reasoning": "max",
+        "ygg_binary_sha256": "16036929493fb12ffc4d8a553cdfcb642c3c983fb469877403808e5aabbd5f07"
+      },
+      "env": {
+        "HOME": "/root"
+      }
+    }
+  ],
+  "datasets": [
+    {
+      "name": "terminal-bench/terminal-bench-2-1",
+      "ref": "sha256:7d7bdc1cbedad549fc1140404bd4dc45e5fd0ea7c4186773687d177ad3a0699a"
+    }
+  ]
+}

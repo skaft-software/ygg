@@ -4,12 +4,15 @@ This directory contains reproducibility artifacts, not product claims.  A result
 is publishable only when its losses, environment, binary identity, raw outputs,
 and any adjudication exclusions are retained.
 
-Current artifacts include the frozen control fingerprint
-([baseline-v0.6.2.md](baseline-v0.6.2.md)), the dated aggregate failure report
+Current artifacts include the compact canonical Terminal-Bench 2.1
+[evidence package](tb21-v0.6.2/README.md), the frozen
+control fingerprint ([baseline-v0.6.2.md](baseline-v0.6.2.md)), the reconciled
+failure report
 ([failure-report-v0.6.2-2026-08-28.md](failure-report-v0.6.2-2026-08-28.md)),
 the complete token-efficiency audit
 ([token-efficiency-v0.6.2-2026-08-28.md](token-efficiency-v0.6.2-2026-08-28.md)),
-and the opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
+the conservative [claims ledger](claims.md), and the opt-in beta protocol
+([beta-protocol.md](beta-protocol.md)).
 
 ## Optional agent telemetry
 

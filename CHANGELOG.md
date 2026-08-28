@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## Unreleased — v0.6.3-next
+## 0.6.3 — 2026-08-28
 
 ### Added
 
@@ -12,24 +12,42 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   provider payloads.
 - Added `ygg doctor` for read-mostly local prerequisite, provider, and model
   visibility diagnostics.
-- Added reproducible systems-benchmark, beta-protocol, claims, and frozen
-  control artifacts under `docs/benchmarks/`.
+- Added reproducible systems-benchmark and Harbor analysis tooling, a
+  four-state claims ledger, and a compact checksummed Terminal-Bench 2.1
+  evidence package with explicit surrogate-adjudication limits.
+
+### Changed
+
+- Reconciled provider, session, telemetry, and Harbor token accounting around
+  disjoint uncached/cache-read/cache-write input buckets. Harbor totals now
+  include every durable usage operation and cache writes without adding the
+  cache-hit detail twice.
+- Gave every physical retry its own request timing/TTFT lifecycle and labeled
+  telemetry usage as request, operation, or cumulative scope.
 
 ### Fixed
 
 - Fail normal terminal responses that contain no visible text, media, or tool
   call instead of silently reporting success.
 - Keep one stable `Working` TUI state for every active run, promote it to
-  `Thinking` only on actual reasoning deltas, and remove the timer-only marker
-  repaint that made long turns flicker.
+  `Thinking` only on actual reasoning deltas, return to `Working` while output
+  or finalization continues, and settle only at the authoritative run boundary.
+- Removed the timer-only marker repaint that made otherwise static long turns
+  flicker.
 - Decode observed Codex Responses error envelopes with a nullable provider code
   while still rejecting a missing or nullable error message.
 - Retire a preferred Responses WebSocket before publishing a provider
   connection-lifetime error, then allow a bounded pre-generation retry through
   the HTTP fallback instead of racing the poisoned socket. Never replay a
-  request after generated output has been observed.
+  request after generated output has been observed, and close the active socket
+  when its owning response is dropped.
 - Keep repeated-call diagnostics out of same-response batches and preserve
   machine-readable JSON tool results.
+- Run Harbor's Docker adapter in an independently cleanable process group,
+  perform TERM→KILL descendant cleanup before artifact conversion/finalization,
+  and fail closed if process death cannot be verified.
+
+## 0.6.2 — 2026-08-27
 
 ### Fixed
 

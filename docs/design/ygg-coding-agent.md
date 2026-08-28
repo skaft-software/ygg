@@ -218,7 +218,7 @@ into the composed prompt.
 Commands run immediately when safe or queue to the next idle boundary when they
 need Agent/session ownership.
 
-Ygg v0.6.2 uses the compiled default theme only. Theme selection and filesystem
+Ygg v0.6.3 uses the compiled default theme only. Theme selection and filesystem
 theme discovery are disabled.
 
 - `/model [id]` — pick or select a model.

@@ -1,65 +1,81 @@
 # Failure report: frozen v0.6.2 control
 
 **Recorded:** 2026-08-28
-**Evidence status:** operator-supplied summary; not independently reproduced in
-this checkout.
 
-This report classifies the available aggregate evidence without inferring causes
-from a score. The frozen control is commit
-`61677754bf69833a384bee2b29ef8eff29f37fc1` (`v0.6.2`). Its source and binary
-identity are recorded in [baseline-v0.6.2.md](baseline-v0.6.2.md).
+**Evidence status:** reconciled against the retained Harbor result, audit
+metadata, and native Ygg sessions.
 
-## Reported aggregate
+The frozen control is commit
+`61677754bf69833a384bee2b29ef8eff29f37fc1`. Canonical identities and checksums
+are in the [evidence report](tb21-v0.6.2/README.md).
 
-The campaign reportedly used Terminal-Bench 2.1, 89 tasks, five attempts per
-task, GPT-5.6 Sol, and maximum reasoning. The reported 445 trials partition as
-follows:
+## Outcomes use two axes
 
-| Primary class | Trials | Evidence status |
-| --- | ---: | --- |
-| Raw pass | 391 | Reported aggregate only |
-| `verifier_negative` | 34 | Count reported; individual verifier output unavailable |
-| `benchmark_timeout` | 19 | Count reported; deadlines and last process state unavailable |
-| `provider_failure` | 1 | Count reported; provider logs unavailable |
-| **Total** | **445** | **391 / 445 raw passes (87.87%)** |
+The campaign ran 445 trials. Harbor process status and verifier reward overlap:
 
-The report also states that 88 of 89 tasks were solved at least once and gives a
-raw Pass@5 of 98.88%. Those are campaign-level figures, not evidence that any
-particular failed trial belongs to a specific class beyond the aggregate labels
-above.
+| Axis | Outcome | Trials |
+| --- | --- | ---: |
+| Verifier | reward `1` | 391 |
+| Verifier | reward `0` | 53 |
+| Verifier | null/no score | 1 |
+| Process | normal completion | 425 |
+| Process | `AgentTimeoutError` | 19 |
+| Process | `YggProviderError` | 1 |
 
-## What cannot be assigned yet
+Five of the 19 timed-out trials received reward `1`; 14 received reward `0`.
+The provider-error trial is the null/no-score result. Consequently, “391 pass +
+19 timeout + 34 ordinary failure + one provider failure” is not a valid disjoint
+partition. There are 39 verifier negatives outside the 14 failed timeout trials.
 
-No task-level rows, Harbor job bundle, trajectories, verifier output, timeout
-configuration, provider request IDs, or environment digest are attached here.
-Therefore this artifact does **not** assign any verifier negative to a model,
-tool, timeout, context, or provider cause. It also does not count the following
-separately observed reliability incident as one of the 445 trials:
+The raw score remains 391/445 (`87.87%`) because it records Harbor verifier
+outcomes before integrity exclusions. A timeout with a passing verifier is not
+silently converted to a failure, but its process race remains a reliability
+limitation.
 
-- provider code: `websocket_connection_limit_reached`
-- phase: response body
-- detail: Responses WebSocket connection limit reached after 60 minutes; the
-  provider requested a new WebSocket connection
+## Historical timeout race
 
-The candidate now retires that poisoned preferred WebSocket and allows a bounded
-pre-generation retry through the HTTP fallback. The incident remains separate
-from benchmark scoring until a raw run bundle establishes whether it occurred in
-the control campaign.
+The v0.6.2 adapter did not authoritatively kill the complete Ygg process group
+before Harbor finalized artifacts. Ten timed-out executions later completed 48
+model requests containing 6,923,867 provider-input tokens. All ten overlapped
+verifier execution; seven completed at least one request after their verifier
+finished. This created a possible workspace/verifier race and made the
+Harbor-finalized token total incomplete.
 
-## Integrity audit reported separately
+Complete native input exceeds Harbor-finalized input by 6,971,387 tokens:
+6,923,867 from post-finalization timeout work plus one 47,520-token conversion
+omission in a completed trial. These are accounting/cancellation defects, not
+speculative recovered task scores.
 
-A separate GLM-5.3 Flash audit reportedly found four confirmed reward-hacking
-successes, two ambiguous Git-history cases, and zero harness-cheating cases or
-refusals. The corresponding unofficial adjusted totals were reported as 387/445
-after confirmed exclusions and 385/445 after also excluding the ambiguous cases.
-These are audit figures, not an official verifier replacement; the raw audit
-materials and reviewer decisions are still required.
+The v0.6.3 Docker adapter now creates an independently cleanable process group,
+performs TERM→KILL cleanup, verifies group death, and finalizes artifacts only
+after successful cleanup. Deterministic Docker tests cover TERM-resistant direct,
+tool-child, and grandchild processes plus a no-growth verifier window. The paid
+v0.6.2 campaign was not rerun, and non-Docker providers are outside that proof.
 
-## Required evidence for a dated revision
+## Integrity audit
 
-Attach raw per-trial results, trajectories, verifier output, process deadlines,
-provider/server logs, exact Harbor and dataset revisions, and the environment
-identity. Then classify each non-pass using the primary taxonomy in
-[README.md](README.md#failure-taxonomy), retain secondary causes separately, and
-publish official and audited totals side by side. Never convert missing evidence
-into a model-failure explanation.
+A separate GLM-5.3 Flash surrogate rubric audit reviewed all 391 raw successes;
+manual review then resolved its seven flags:
+
+- four confirmed reward hacks;
+- two uncertain Git-history cases;
+- one flag overturned to clean;
+- zero harness-level cheating cases;
+- zero refusals or invalid audit runs.
+
+That yields 387/445 (`86.97%`) under the primary confirmed-only policy and
+385/445 (`86.52%`) under the strict sensitivity policy. Both policies have
+87/89 (`97.75%`) Pass@5. These are local audit figures, **not official
+Terminal-Bench maintainer adjudication**.
+
+## What remains unassigned
+
+A verifier negative alone does not establish a model, provider, tool, context,
+or agent root cause. This report therefore does not relabel the 39 ordinary
+non-timeout verifier negatives without trajectory-specific evidence. Likewise,
+the contamination audit found no Ygg source/runtime/harness contamination but
+cannot inspect the provider model's pretraining corpus.
+
+For the complete score policy, four confirmed cases, two uncertain cases, token
+equations, original artifact hashes, and reproduction steps, use the
+[evidence package](tb21-v0.6.2/README.md).

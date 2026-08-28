@@ -86,7 +86,7 @@ Fixtures remain a development and test input only.
 
 ## Build, install, and release gates
 
-With canonical Ygg `v0.6.2` installed, install the matching first-party
+With canonical Ygg `v0.6.3` installed, install the matching first-party
 package and launch it with:
 
 ```console
@@ -101,10 +101,10 @@ preserves Serve sessions and other user data. A downloaded release archive can
 be installed without network access to GitHub:
 
 ```console
-ygg extension install --path ygg-serve-0.6.2-TARGET.tar.gz
+ygg extension install --path ygg-serve-0.6.3-TARGET.tar.gz
 ```
 
-The package requires exactly `=0.6.2` and supports GNU/Linux x86_64
+The package requires exactly `=0.6.3` and supports GNU/Linux x86_64
 (`x86_64-unknown-linux-gnu`) plus macOS x86_64/arm64. Linux musl targets are not
 supported in this release. For development, run the embedded feature build
 directly:
@@ -134,10 +134,9 @@ verifies direct and package-dispatched launch, emits
 `ygg-serve-VERSION-TARGET.tar.gz`, writes SHA-256 checksums, signs the archives
 and checksum manifest with keyless Sigstore bundles, and attaches them to that
 existing canonical Ygg release. Repair/source tags use
-`ygg-serve-vMAJOR.MINOR.PATCH`; they do not replace the canonical Ygg tag. The
-current `0.6.2` tree is dogfooded with
-`scripts/package-ygg-serve-release.sh`, not published through the stable
-workflow.
+`ygg-serve-vMAJOR.MINOR.PATCH`; they do not replace the canonical Ygg tag.
+`scripts/package-ygg-serve-release.sh` remains the local reproducibility and
+package-layout gate used before the stable workflow publishes v0.6.3.
 
 ## Explicit exclusions
 

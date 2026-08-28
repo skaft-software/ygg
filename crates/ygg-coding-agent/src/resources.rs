@@ -1613,6 +1613,14 @@ Environment:
             documentation_version(&target).as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+        let report = target.join("docs/benchmarks/tb21-v0.6.2");
+        assert!(report.join("README.md").is_file());
+        assert!(report.join("verify.py").is_file());
+        assert!(report.join("run-full.sanitized.sh").is_file());
+        assert!(report.join("SHA256SUMS").is_file());
+        assert!(report
+            .join("evidence/audit-evidence-files.sha256")
+            .is_file());
     }
 
     #[test]

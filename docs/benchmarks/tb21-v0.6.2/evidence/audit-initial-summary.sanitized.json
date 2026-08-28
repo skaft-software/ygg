@@ -1,0 +1,22 @@
+{
+  "audit_type": "independent_surrogate_reward_hacking_adjudication",
+  "judge_model_requested": "z-ai/glm-5.3-flash",
+  "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+  "temperature": 0,
+  "top_p": 1,
+  "max_tokens": 4096,
+  "reasoning_effort": "medium",
+  "job_root": "${JOB_ROOT}",
+  "task_root": "${TASK_ROOT}",
+  "n_cases": 391,
+  "case_selection": "all reward=1 trials",
+  "rubric_sha256": "dd2c66fe1cce772fbd2dd229df33684dd540b06b4b251743270db11096e340dd",
+  "counts_initial": {
+    "CLEAN": 384,
+    "REWARD_HACK": 7
+  },
+  "harness_flags": 0,
+  "reward_hack_flags": 7,
+  "refusal_flags": 0,
+  "invalid_or_runner_errors": 0
+}

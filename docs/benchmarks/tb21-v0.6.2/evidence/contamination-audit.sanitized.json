@@ -1,0 +1,39 @@
+{
+  "binary": {
+    "known_task_strings_in_strings_output": 0,
+    "mtime": "2026-08-27T19:49:35Z",
+    "path": "${YGG_BINARY}",
+    "sha256": "16036929493fb12ffc4d8a553cdfcb642c3c983fb469877403808e5aabbd5f07"
+  },
+  "canonical_run_config": {
+    "agent_skills": [],
+    "environment_mounts": [
+      "read-only ${YGG_BINARY} -> /usr/local/bin/ygg",
+      "read-only ${CREDENTIAL_STAGE}/.ygg -> /root/.ygg"
+    ],
+    "extra_instruction_paths": [],
+    "home": "/root",
+    "mcp_servers": [],
+    "no_dataset_or_verifier_mount": true,
+    "no_prior_trajectory_mount": true,
+    "trajectory_skill_catalog_or_activation_matches": 0,
+    "workspace_trusted": true
+  },
+  "chronology": {
+    "binary_built_before_first_trial": true,
+    "first_trial_started": "2026-08-27T21:17:10.560413Z",
+    "frozen_commit_before_first_trial": true,
+    "last_trial_finished": "2026-08-28T00:37:20.128961Z"
+  },
+  "conclusion": "No runtime/source/harness contamination was found. This does not test whether the provider model's pretraining corpus contained public benchmark material.",
+  "frozen_commit": "61677754bf69833a384bee2b29ef8eff29f37fc1",
+  "frozen_commit_timestamp": "2026-08-27T16:19:03Z",
+  "scope": "Ygg benchmark-derived contamination in frozen runtime, adapter configuration, prompts, skills, mounts, and chronology",
+  "source_scan": {
+    "benchmark_specific_solution_or_verifier_strings": 0,
+    "canary_guid_matches_in_frozen_source": 0,
+    "generic_terminal_bench_attribution_matches": "README.md and third-party license/notice files only",
+    "interpretation": "Generic project attribution is not task-derived solution knowledge.",
+    "known_task_ids_or_names_in_frozen_runtime_prompt_skill_paths": 0
+  }
+}

@@ -206,7 +206,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-browse")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.2")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.3")
         self.assertEqual(set(manifest["contributes"]["tools"]), TOOLS)
         self.assertEqual(manifest["contributes"]["commands"], ["browse"])
         self.assertTrue(manifest["contributes"]["confirmations"])
@@ -282,7 +282,7 @@ class PackageTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.6.2",
+                    "ygg_version": "0.6.3",
                     "extension": {
                         "name": "ygg-browse",
                         "version": "0.1.0",
@@ -360,7 +360,7 @@ class PackageTests(unittest.TestCase):
             self.skipTest("generic extension release packager is not present")
         with tempfile.TemporaryDirectory() as output:
             process = subprocess.run(
-                [str(script), "ygg-browse", output, "v0.6.2", str(PACKAGE)],
+                [str(script), "ygg-browse", output, "v0.6.3", str(PACKAGE)],
                 cwd=REPOSITORY,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -368,7 +368,7 @@ class PackageTests(unittest.TestCase):
                 timeout=30,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            archive = Path(output) / "ygg-browse-0.6.2.tar.gz"
+            archive = Path(output) / "ygg-browse-0.6.3.tar.gz"
             self.assertTrue(archive.is_file())
             with tarfile.open(archive, "r:gz") as bundle:
                 names = set(bundle.getnames())

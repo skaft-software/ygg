@@ -79,7 +79,7 @@ class RuntimeProtocolTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.6.2",
+                    "ygg_version": "0.6.3",
                     "extension": {
                         "name": "ygg-mcp",
                         "version": "0.1.0",
