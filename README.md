@@ -484,14 +484,14 @@ ordinary post-send disconnects remain terminal.
 
 ### Reasoning without transcript noise
 
-Reasoning is collapsed by default while remaining available with `Ctrl+O`. During generation, a fixed two-row status uses a blinking, model-colored event-margin dot beside a plain-weight label, with an aligned disclosure elbow below. It shows only the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—and falls back to `Thinking`; ordinary reasoning body text is never promoted into the collapsed label. Expanded reasoning keeps the same inset without an event-margin dot or a synthetic first-line bullet. Completed reasoning disappears again when collapsed.
+Reasoning is collapsed by default while remaining available with `Ctrl+O`. Every accepted run opens with a bold, model-color-adaptive shimmering `Working` row. Visible assistant text then becomes the liveness signal and hides that row while it streams; if the active run continues after the turn, `Working` returns for the next tool or model boundary. During reasoning, a fixed two-row status keeps a shimmering `Thinking` header on the first row. The second row shows the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—followed by a plain, subdued expansion hint; ordinary reasoning body text is never promoted. Without a heading, the second row contains only the hint. Expanded reasoning keeps the same inset without an event-margin dot or a synthetic first-line bullet. Completed reasoning disappears again when collapsed.
 
 ```text
-• Verifying the implementation
-  └ (ctrl+o to expand)
+• Thinking
+  └ Verifying the implementation (ctrl+o to expand)
 ```
 
-Event-margin dots identify active collapsed reasoning, assistant responses, and tool or shell execution. The collapsed-reasoning dot blinks; other active dots pulse through foreground and muted tones without changing glyph size. Successful completed events use green, and failed tools use red.
+Event-margin dots identify active collapsed reasoning, assistant responses, and tool or shell execution. Collapsed-reasoning and assistant-response dots remain solid; active tool and shell dots pulse through foreground and muted tones without changing glyph size. Successful completed events use green, and failed tools use red.
 
 Select a supported level at launch or while the session is running:
 

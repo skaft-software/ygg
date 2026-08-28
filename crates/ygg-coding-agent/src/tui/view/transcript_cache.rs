@@ -53,6 +53,44 @@ pub(super) struct TranscriptCache {
     pub(super) last_update_start: usize,
 }
 
+impl TranscriptCache {
+    /// Drop one tail block without invalidating the complete historic layout.
+    /// A rendered transient status contributes cached rows to truncate; an
+    /// event burst may remove the same status before its first frame, in which
+    /// case the existing shorter cache is already a valid prefix. Rebuilding
+    /// every prior Markdown block in either path stalls animation and input on
+    /// long sessions.
+    pub(super) fn truncate_tail_block(&mut self, index: usize, block_count: usize) -> bool {
+        if index.checked_add(1) != Some(block_count) || self.width.is_none() {
+            return false;
+        }
+        let cached_blocks = self.block_revisions.len();
+        let metadata_aligned = self.block_starts.len() == cached_blocks
+            && self.block_lengths.len() == cached_blocks
+            && self.block_geometries.len() == cached_blocks;
+        if !metadata_aligned || cached_blocks > block_count {
+            return false;
+        }
+
+        if cached_blocks == block_count {
+            let Some(start) = self.block_starts.get(index).copied() else {
+                return false;
+            };
+            if start > self.lines.len() {
+                return false;
+            }
+            self.lines.truncate(start);
+            self.block_starts.truncate(index);
+            self.block_lengths.truncate(index);
+            self.block_geometries.truncate(index);
+            self.block_revisions.truncate(index);
+        }
+        self.dirty_blocks.retain(|dirty| *dirty < index);
+        self.dirty = true;
+        true
+    }
+}
+
 impl Default for TranscriptCache {
     fn default() -> Self {
         Self {
@@ -122,6 +160,7 @@ impl ShellState {
                         width,
                         self.show_tool_details(block),
                         self.event_spinner_frame,
+                        self.status_shimmer_frame,
                     );
                     let start = cache.lines.len();
                     let length = rendered.lines.len();
@@ -147,6 +186,7 @@ impl ShellState {
                         width,
                         self.show_tool_details(&self.transcript[index]),
                         self.event_spinner_frame,
+                        self.status_shimmer_frame,
                     );
                     let start = cache.lines.len();
                     first_changed = first_changed.min(start);
@@ -221,6 +261,7 @@ impl ShellState {
                         width,
                         self.show_tool_details(&self.transcript[index]),
                         self.event_spinner_frame,
+                        self.status_shimmer_frame,
                     );
                     let new_length = rendered.lines.len();
                     cache

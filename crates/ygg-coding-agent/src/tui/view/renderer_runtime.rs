@@ -21,10 +21,9 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(16);
 /// response and active tool or shell dots breathe between foreground and muted
 /// tones without changing size.
 const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(500);
-/// The braille thinking spinner reads as motion only at a fluid cadence; the
-/// shared dot pulse above stays deliberately slow. Themes without
-/// `thinking_spinner` never enter this faster cycle.
-const THINKING_SPINNER_INTERVAL: Duration = Duration::from_millis(80);
+/// The optional braille spinner and model-adaptive status shimmer share one
+/// bounded renderer-thread cadence.
+const STATUS_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -64,6 +63,11 @@ pub(super) fn thinking_spinner_animating(state: &ShellState) -> bool {
     capabilities.animation && capabilities.interactive && state.has_active_thinking_spinner()
 }
 
+pub(super) fn status_shimmer_animating(state: &ShellState) -> bool {
+    let capabilities = state.theme.capabilities();
+    capabilities.animation && capabilities.interactive && state.has_active_status_shimmer()
+}
+
 fn render_wake_requires_frame(
     semantic_command: bool,
     resized: bool,
@@ -77,6 +81,16 @@ fn frame_coalesce_delay(last_render: Option<Instant>, now: Instant) -> Duration 
     last_render
         .map(|last| (last + RENDER_INTERVAL).saturating_duration_since(now))
         .unwrap_or_default()
+}
+
+fn render_poll_interval(welcome: bool, status_animation: bool) -> Duration {
+    if welcome {
+        RENDER_INTERVAL
+    } else if status_animation {
+        STATUS_ANIMATION_INTERVAL
+    } else {
+        RESIZE_POLL_INTERVAL
+    }
 }
 
 /// Reconcile the renderer's shared dimensions with the terminal itself. This
@@ -147,29 +161,27 @@ pub(super) fn render_loop(
 
     let mut last_render: Option<Instant> = None;
     let mut last_event_dot_toggle = Instant::now();
-    let mut last_spinner_toggle = Instant::now();
+    let mut last_status_animation = Instant::now();
     loop {
-        // Only the short-lived welcome card gets a high-frequency wake. Work
-        // itself is event-driven; the transcript pulse owns the sole slow
-        // timer once a run is underway.
-        let (welcome, event_dot, thinking_spinner) = {
+        // The welcome card uses the terminal-frame wake; active status text
+        // sleeps until its own 80 ms frame. Model, tool, and input events still
+        // preempt either timer immediately.
+        let (welcome, event_dot, thinking_spinner, status_shimmer) = {
             let shell = state.borrow();
             let welcome = welcome_animating(&shell, Instant::now());
             let event_dot = event_dot_animating(&shell);
             let thinking_spinner = thinking_spinner_animating(&shell);
-            (welcome, event_dot, thinking_spinner)
+            let status_shimmer = status_shimmer_animating(&shell);
+            (welcome, event_dot, thinking_spinner, status_shimmer)
         };
         if !event_dot {
             last_event_dot_toggle = Instant::now();
         }
-        if !thinking_spinner {
-            last_spinner_toggle = Instant::now();
+        let status_animation = thinking_spinner || status_shimmer;
+        if !status_animation {
+            last_status_animation = Instant::now();
         }
-        let poll = if welcome || thinking_spinner {
-            RENDER_INTERVAL
-        } else {
-            RESIZE_POLL_INTERVAL
-        };
+        let poll = render_poll_interval(welcome, status_animation);
         let command = match rx.recv_timeout(poll) {
             Ok(command) => Some(command),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -186,14 +198,14 @@ pub(super) fn render_loop(
         };
         let advance_event_dot =
             event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
-        let advance_spinner =
-            thinking_spinner && last_spinner_toggle.elapsed() >= THINKING_SPINNER_INTERVAL;
+        let advance_status_animation =
+            status_animation && last_status_animation.elapsed() >= STATUS_ANIMATION_INTERVAL;
         let semantic_command = matches!(command, Some(RenderCommand::Render));
         if !render_wake_requires_frame(
             semantic_command,
             resized,
             welcome,
-            advance_event_dot || advance_spinner,
+            advance_event_dot || advance_status_animation,
         ) {
             continue;
         }
@@ -232,7 +244,7 @@ pub(super) fn render_loop(
             break;
         }
 
-        if welcome || advance_event_dot || advance_spinner {
+        if welcome || advance_event_dot || advance_status_animation {
             let mut shell = state.borrow_mut();
             if welcome {
                 shell.invalidate_transcript_layout();
@@ -241,9 +253,14 @@ pub(super) fn render_loop(
                 shell.advance_event_dot_animation();
                 last_event_dot_toggle = Instant::now();
             }
-            if advance_spinner {
-                shell.advance_thinking_spinner();
-                last_spinner_toggle = Instant::now();
+            if advance_status_animation {
+                if thinking_spinner {
+                    shell.advance_thinking_spinner();
+                }
+                if status_shimmer {
+                    shell.advance_status_shimmer();
+                }
+                last_status_animation = Instant::now();
             }
         }
         tui.request_render();
@@ -257,7 +274,7 @@ pub(super) fn render_loop(
 mod scheduler_tests {
     use std::time::{Duration, Instant};
 
-    use super::{frame_coalesce_delay, render_wake_requires_frame};
+    use super::{frame_coalesce_delay, render_poll_interval, render_wake_requires_frame};
 
     #[test]
     fn active_state_without_a_concrete_wake_never_requests_a_frame() {
@@ -270,6 +287,16 @@ mod scheduler_tests {
         assert!(render_wake_requires_frame(false, true, false, false));
         assert!(render_wake_requires_frame(false, false, true, false));
         assert!(render_wake_requires_frame(false, false, false, true));
+    }
+
+    #[test]
+    fn status_animation_sleeps_until_its_next_frame() {
+        assert_eq!(render_poll_interval(true, true), Duration::from_millis(16));
+        assert_eq!(render_poll_interval(false, true), Duration::from_millis(80));
+        assert_eq!(
+            render_poll_interval(false, false),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]

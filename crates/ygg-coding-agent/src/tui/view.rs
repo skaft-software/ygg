@@ -614,6 +614,9 @@ pub(crate) struct ShellState {
     event_dot_visible: bool,
     /// Current frame in the optional theme-owned animated spinner.
     event_spinner_frame: usize,
+    /// Independent frame for the model-adaptive `Working`/`Thinking` text
+    /// shimmer. Keeping it separate cannot change tool-dot cadence.
+    status_shimmer_frame: usize,
     /// Small set of transcript indices that can currently own the shared
     /// activity pulse. Keeping it explicit makes each tick O(active work)
     /// instead of O(total session history).
@@ -1078,6 +1081,10 @@ impl ShellState {
         if index >= self.transcript.len() {
             return;
         }
+        let cache_truncated = self
+            .transcript_cache
+            .get_mut()
+            .truncate_tail_block(index, self.transcript.len());
         self.unregister_active_event(index);
         self.reindex_subagent_activity_after_removal(index);
         self.transcript.remove(index);
@@ -1118,7 +1125,9 @@ impl ShellState {
         } else if let Some(position) = &mut self.pending_selection_anchor {
             position.block -= usize::from(position.block > index);
         }
-        self.invalidate_transcript_layout();
+        if !cache_truncated {
+            self.invalidate_transcript_layout();
+        }
     }
 
     fn show_tool_details(&self, _block: &TranscriptBlock) -> bool {
@@ -1147,6 +1156,7 @@ impl ShellState {
         let model_lab = self.executing_model_lab();
         self.event_dot_visible = true;
         self.event_spinner_frame = 0;
+        self.status_shimmer_frame = 0;
         let mut status = AssistantBlock::streaming_reasoning("").with_model_lab(model_lab);
         status.reasoning_heading = label.map(str::to_owned);
         status.show_reasoning_hint = show_reasoning_hint;
@@ -1172,9 +1182,9 @@ impl ShellState {
     }
 
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
-        // The first public response delta ends the reasoning phase. Move the
-        // activity row below the response exactly once; later text deltas update
-        // the same block without removing/reinserting `Working` on every token.
+        // The first public response delta ends the reasoning phase. Visible
+        // assistant output is its own liveness signal, so remove the transient
+        // status until the turn ends instead of showing `Working` beneath it.
         if channel == OutputChannel::Text && self.active_text.is_none() {
             if let Some(index) = self.active_reasoning {
                 let transient = matches!(
@@ -1228,9 +1238,6 @@ impl ShellState {
                     self.register_active_event(index);
                 }
                 self.touch_block(index);
-                if channel == OutputChannel::Text && self.run.is_active() {
-                    self.open_working_status();
-                }
                 return;
             }
             match channel {
@@ -1258,6 +1265,7 @@ impl ShellState {
         let model_lab = self.executing_model_lab();
         self.event_dot_visible = true;
         self.event_spinner_frame = 0;
+        self.status_shimmer_frame = 0;
         self.push_block(match channel {
             OutputChannel::Text => TranscriptBlock::Assistant(Box::new(
                 AssistantBlock::streaming(text).with_model_lab(model_lab),
@@ -1270,9 +1278,6 @@ impl ShellState {
             OutputChannel::Text => {
                 self.active_text = Some(index);
                 self.register_active_event(index);
-                if self.run.is_active() {
-                    self.open_working_status();
-                }
             }
             OutputChannel::Reasoning => {
                 self.active_reasoning = Some(index);
@@ -1344,8 +1349,9 @@ impl ShellState {
     }
 
     /// Settle one provider turn without implying that the owning run is done.
-    /// The stable `Working` row survives tool-selection and finalization gaps;
-    /// only an authoritative run outcome removes it.
+    /// Visible assistant text supplies liveness while it streams; once the turn
+    /// ends, restore `Working` for any tool/finalization gap. Only an
+    /// authoritative run outcome removes that final transient row.
     fn finish_turn_streaming_blocks(&mut self) {
         if let Some(index) = self.active_text.take() {
             self.unregister_active_event(index);
@@ -1392,6 +1398,46 @@ impl ShellState {
                 _ => false,
             })
             && (markers_enabled || thinking_spinner)
+    }
+
+    fn status_shimmer_active(&self, reasoning: &AssistantBlock) -> bool {
+        reasoning.is_working_activity()
+            || (!reasoning.text.is_empty()
+                && !self.verbose_tools
+                && !reasoning.finished
+                && !reasoning.reasoning_expanded)
+    }
+
+    pub(crate) fn has_active_status_shimmer(&self) -> bool {
+        self.active_event_blocks.iter().any(|index| {
+            matches!(
+                self.transcript.get(*index),
+                Some(TranscriptBlock::Reasoning(reasoning))
+                    if self.status_shimmer_active(reasoning)
+            )
+        })
+    }
+
+    pub(crate) fn advance_status_shimmer(&mut self) {
+        if !self.has_active_status_shimmer() {
+            return;
+        }
+        self.status_shimmer_frame = self.status_shimmer_frame.wrapping_add(1) % 12;
+        let active = self
+            .active_event_blocks
+            .iter()
+            .copied()
+            .filter(|index| {
+                matches!(
+                    self.transcript.get(*index),
+                    Some(TranscriptBlock::Reasoning(reasoning))
+                        if self.status_shimmer_active(reasoning)
+                )
+            })
+            .collect::<Vec<_>>();
+        for index in active {
+            self.touch_block(index);
+        }
     }
 
     /// Whether any live collapsed reasoning block currently shows the theme's

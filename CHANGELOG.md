@@ -18,6 +18,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
+- Render active `Working` and fixed `Thinking` headers with a bounded,
+  model-adaptive shimmer. The latest explicit reasoning heading and plain
+  `Ctrl+O` hint now stay on the subdued detail row without changing geometry.
 - Reconciled provider, session, telemetry, and Harbor token accounting around
   disjoint uncached/cache-read/cache-write input buckets. Harbor totals now
   include every durable usage operation and cache writes without adding the
@@ -29,11 +32,17 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 - Fail normal terminal responses that contain no visible text, media, or tool
   call instead of silently reporting success.
-- Keep one stable `Working` TUI state for every active run, promote it to
-  `Thinking` only on actual reasoning deltas, return to `Working` while output
-  or finalization continues, and settle only at the authoritative run boundary.
-- Removed the timer-only marker repaint that made otherwise static long turns
-  flicker.
+- Keep a truthful TUI lifecycle for every active run: open with `Working`,
+  promote to `Thinking` only on actual reasoning deltas, use visibly streaming
+  assistant text as the liveness signal, restore `Working` after a completed
+  turn when the run continues, and settle only at the authoritative run
+  boundary.
+- Replace transient tail activity with an incoming tool row without invalidating
+  and reflowing long transcript history, keeping renderer animation and composer
+  input responsive at the reasoning-to-tool boundary.
+- Removed timer-only repaint from otherwise static transcript markers;
+  intentional `Working`/`Thinking` animation invalidates only its active status
+  block and leaves tool/shell dot cadence unchanged.
 - Decode observed Codex Responses error envelopes with a nullable provider code
   while still rejecting a missing or nullable error message.
 - Retire a preferred Responses WebSocket before publishing a provider

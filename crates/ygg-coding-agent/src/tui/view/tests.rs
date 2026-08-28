@@ -3363,13 +3363,16 @@ fn resize_while_overlayed_replays_the_pi_composited_frame() {
         !resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
         "Pi replays the current composited frame, not rows hidden by its overlay: {resize_text:?}"
     );
-    for index in 0..17 {
+    // With visible response text replacing the one-line Working status, the
+    // last two notices remain in the mutable viewport hidden by the overlay.
+    for index in 0..16 {
         let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
         assert!(
             resize_text.contains(&sentinel),
             "{sentinel} was not replayed with the composited overlay:\n{resize_text:?}"
         );
     }
+    assert!(!resize_text.contains("YGG-OVERLAY-RESIZE-16"));
     assert!(!resize_text.contains("YGG-OVERLAY-RESIZE-17"));
 
     process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
@@ -3919,9 +3922,9 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         },
     );
     let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-    // The response adds its durable row while the stable Working row remains
-    // below it until authoritative run settlement.
-    assert_eq!(composer_row(&streamed), initial_composer + 2);
+    // Visible response text replaces the one-line Working status as the
+    // liveness signal, so the composer remains stable.
+    assert_eq!(composer_row(&streamed), initial_composer);
     assert!(streamed.len() < 40);
 
     shell.on_run_event(
@@ -3935,9 +3938,13 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
     let tool = render_shell_at(&shell.state.borrow(), 80, now);
     assert_eq!(
         composer_row(&tool),
-        composer_row(&streamed),
-        "the tool lifecycle replaces Working without moving composer chrome"
+        composer_row(&streamed) + 2,
+        "the tool adds its transition separator and row without a hidden status row"
     );
+    assert!(!tool
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .any(|line| line.contains("Working")));
     assert!(tool.len() < 40);
 
     shell.queue_steering(&ComposedInput::from_text("also inspect tests".into()));
@@ -5307,7 +5314,7 @@ fn active_run_starts_with_working_until_reasoning_is_observed() {
 }
 
 #[test]
-fn collapsed_activity_marker_is_stable_without_periodic_repaints() {
+fn collapsed_activity_shimmer_repaints_only_the_status_style() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     let run_id = shell.begin_run("codex");
@@ -5324,7 +5331,7 @@ fn collapsed_activity_marker_is_stable_without_periodic_repaints() {
             .borrow()
             .rendered_transcript(80)
             .iter()
-            .find(|line| line.contains("Thinking"))
+            .find(|line| strip_terminal_sequences(line).contains("Thinking"))
             .cloned()
             .expect("reasoning status row")
     };
@@ -5333,14 +5340,13 @@ fn collapsed_activity_marker_is_stable_without_periodic_repaints() {
     {
         let mut state = shell.state.borrow_mut();
         assert!(!event_dot_animating(&state));
+        assert!(state.has_active_status_shimmer());
         assert_eq!(state.active_event_blocks, vec![0]);
-        state.advance_event_dot_animation();
+        state.advance_status_shimmer();
     }
-    assert_eq!(
-        raw(&shell),
-        before,
-        "marker-only ticks must not repaint state"
-    );
+    let after = raw(&shell);
+    assert_eq!(strip_terminal_sequences(&after), "• Thinking");
+    assert_ne!(after, before, "the shimmer style must advance");
 }
 
 #[test]
@@ -5432,6 +5438,34 @@ fn collapsed_reasoning_uses_a_margin_dot_without_an_expanded_content_bullet() {
 }
 
 #[test]
+fn reasoning_heading_moves_below_the_fixed_thinking_header() {
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "## Verifying reproducibility of evidence package\n\n".into(),
+        },
+    );
+
+    let rendered = shell
+        .state
+        .borrow()
+        .rendered_transcript(80)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rendered,
+        vec![
+            "• Thinking",
+            "  └ Verifying reproducibility of evidence package (ctrl+o to expand)",
+        ]
+    );
+}
+
+#[test]
 fn reasoning_off_run_uses_a_truthful_non_expandable_working_status() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "off");
@@ -5487,48 +5521,43 @@ fn empty_working_status_leaves_no_ghost_block_when_interrupted() {
 }
 
 #[test]
-fn first_text_delta_moves_working_below_the_stream_without_churn() {
+fn public_text_stream_is_liveness_and_does_not_show_working() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     let run_id = shell.begin_run("codex");
 
-    shell.on_run_event(
-        run_id,
-        &AgentEvent::OutputDelta {
-            channel: OutputChannel::Text,
-            text: "Ready.".into(),
-        },
-    );
-    let working_index = shell
-        .state
-        .borrow()
-        .active_reasoning
-        .expect("working row remains while the run is active");
-
-    shell.on_run_event(
-        run_id,
-        &AgentEvent::OutputDelta {
-            channel: OutputChannel::Text,
-            text: " Still running.".into(),
-        },
-    );
+    for text in ["Ready.", " Still running."] {
+        shell.on_run_event(
+            run_id,
+            &AgentEvent::OutputDelta {
+                channel: OutputChannel::Text,
+                text: text.into(),
+            },
+        );
+    }
 
     let state = shell.state.borrow();
     assert!(matches!(
         state.transcript.first(),
         Some(TranscriptBlock::Assistant(_))
     ));
-    assert_eq!(state.active_reasoning, Some(working_index));
-    let TranscriptBlock::Reasoning(activity) = &state.transcript[working_index] else {
-        panic!("working activity expected")
-    };
-    assert_eq!(activity.reasoning_heading.as_deref(), Some("Working"));
-    assert!(activity.text.is_empty());
-    assert!(!activity.show_reasoning_hint);
+    assert_eq!(state.transcript.len(), 1);
+    assert!(state.active_text.is_some());
+    assert!(state.active_reasoning.is_none());
+    assert!(!state.has_active_status_shimmer());
+    let rendered = state
+        .rendered_transcript(80)
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .collect::<Vec<_>>();
+    assert!(rendered
+        .iter()
+        .any(|line| line.contains("Ready. Still running.")));
+    assert!(rendered.iter().all(|line| !line.contains("Working")));
 }
 
 #[test]
-fn activity_lifecycle_is_working_thinking_working_then_settled() {
+fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
     use ygg_agent::{EntryId, FinishReason};
     use ygg_ai::{AssistantMessage, AssistantPart, ModelId, Protocol, StopReason};
 
@@ -5565,7 +5594,8 @@ fn activity_lifecycle_is_working_thinking_working_then_settled() {
     );
     let responding = rendered(&shell);
     assert!(responding.iter().any(|line| line.contains("Answer")));
-    assert!(responding.iter().any(|line| line == "• Working"));
+    assert!(!responding.iter().any(|line| line == "• Working"));
+    assert!(!shell.state.borrow().has_active_status_shimmer());
 
     shell.on_run_event(
         run_id,
@@ -6711,9 +6741,9 @@ fn streaming_response_dot_stays_solid_light_and_settles_solid() {
     );
     {
         let mut state = shell.state.borrow_mut();
-        // The assistant and stable Working row are tracked, but neither dot
-        // enters the periodic tool/shell pulse.
-        assert_eq!(state.active_event_blocks, vec![0, 1]);
+        // The visible assistant stream is the liveness signal; its solid dot
+        // stays tracked without a second `Working` status row.
+        assert_eq!(state.active_event_blocks, vec![0]);
         assert!(!event_dot_animating(&state));
         state.advance_event_dot_animation();
     }
@@ -6781,6 +6811,137 @@ fn event_dot_tracking_stays_bounded_in_long_sessions() {
         .borrow_mut()
         .unregister_active_event(active_index);
     assert!(shell.state.borrow().active_event_blocks.is_empty());
+}
+
+#[test]
+fn reasoning_to_working_to_tool_reuses_the_cached_tail_in_long_sessions() {
+    let mut shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        for index in 0..4_096 {
+            state.push_block(TranscriptBlock::Notice(format!("history {index}")));
+        }
+    }
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "## Inspecting the repository\n".into(),
+        },
+    );
+    shell.state.borrow_mut().finish_turn_streaming_blocks();
+    let (working_start, history_lines, generation) = {
+        let state = shell.state.borrow();
+        assert!(matches!(
+            state.transcript.last(),
+            Some(TranscriptBlock::Reasoning(reasoning)) if reasoning.is_working_activity()
+        ));
+        assert!(matches!(
+            state.transcript.get(state.transcript.len() - 2),
+            Some(TranscriptBlock::Reasoning(reasoning)) if reasoning.finished
+        ));
+        let lines = state.rendered_transcript(80);
+        let cache = state.transcript_cache.borrow();
+        let working_start = *cache.block_starts.last().expect("Working block start");
+        (
+            working_start,
+            lines[..working_start].to_vec(),
+            cache.generation,
+        )
+    };
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolStarted {
+            id: ToolCallId("responsive-read".into()),
+            name: "read".into(),
+            args: serde_json::json!({"path": "README.md"}),
+        },
+    );
+    {
+        let state = shell.state.borrow();
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(
+            cache.width,
+            Some(80),
+            "tool admission must not force reflow"
+        );
+        assert_eq!(cache.lines, history_lines);
+        assert_eq!(cache.block_revisions.len() + 1, state.transcript.len());
+    }
+
+    shell.apply_edit(EditAction::Char('x'));
+    {
+        let state = shell.state.borrow();
+        let rendered = state.rendered_transcript(80);
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(state.editor, "x");
+        assert_eq!(cache.generation, generation + 1);
+        assert_eq!(cache.last_update_start, working_start);
+        assert_eq!(&rendered[..working_start], history_lines.as_slice());
+    }
+}
+
+#[test]
+fn unrendered_working_handoff_preserves_the_long_session_cache() {
+    let mut shell = InteractiveShell::test_shell();
+    {
+        let mut state = shell.state.borrow_mut();
+        for index in 0..4_096 {
+            state.push_block(TranscriptBlock::Notice(format!("history {index}")));
+        }
+    }
+    let run_id = shell.begin_run("openai");
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Reasoning,
+            text: "## Inspecting the repository\n".into(),
+        },
+    );
+    let (reasoning_start, history_lines, generation, cached_blocks) = {
+        let state = shell.state.borrow();
+        let lines = state.rendered_transcript(80);
+        let cache = state.transcript_cache.borrow();
+        let reasoning_start = *cache.block_starts.last().expect("Thinking block start");
+        (
+            reasoning_start,
+            lines[..reasoning_start].to_vec(),
+            cache.generation,
+            cache.block_revisions.len(),
+        )
+    };
+
+    // Provider settlement and tool admission commonly arrive in one event
+    // burst, before the intermediate Working row receives a frame.
+    shell.state.borrow_mut().finish_turn_streaming_blocks();
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::ToolStarted {
+            id: ToolCallId("immediate-read".into()),
+            name: "read".into(),
+            args: serde_json::json!({"path": "README.md"}),
+        },
+    );
+    {
+        let state = shell.state.borrow();
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(cache.width, Some(80), "the cache width must be retained");
+        assert_eq!(cache.block_revisions.len(), cached_blocks);
+        assert_eq!(cache.block_revisions.len() + 1, state.transcript.len());
+    }
+
+    shell.apply_edit(EditAction::Char('x'));
+    {
+        let state = shell.state.borrow();
+        let rendered = state.rendered_transcript(80);
+        let cache = state.transcript_cache.borrow();
+        assert_eq!(state.editor, "x");
+        assert_eq!(cache.generation, generation + 1);
+        assert_eq!(cache.last_update_start, reasoning_start);
+        assert_eq!(&rendered[..reasoning_start], history_lines.as_slice());
+    }
 }
 
 #[test]
@@ -9386,7 +9547,8 @@ fn card_surface_degrades_to_rail_with_exact_cached_narrow_geometry() {
     assert_eq!(narrow.geometry.leading_rows, 0);
     assert_eq!(narrow.geometry.trailing_rows, 0);
     let renderer = theme.rich_renderer();
-    let rendered = render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false, 0);
+    let rendered =
+        render_block_planned(None, &block, &theme, &renderer, &renderer, 40, false, 0, 0);
     assert_eq!(rendered.geometry, narrow.geometry);
     let plain = rendered
         .lines

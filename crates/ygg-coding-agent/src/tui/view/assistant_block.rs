@@ -159,6 +159,13 @@ impl AssistantBlock {
         self
     }
 
+    pub(super) fn is_working_activity(&self) -> bool {
+        !self.finished
+            && self.text.is_empty()
+            && !self.show_reasoning_hint
+            && self.reasoning_heading.as_deref() == Some("Working")
+    }
+
     pub(super) fn append(&mut self, text: &str) {
         self.text.push_str(text);
         self.markdown.push_str(text);

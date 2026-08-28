@@ -43,7 +43,11 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 The transcript is semantic blocks rather than a terminal framebuffer. Wrapped
 layouts are cached per block and width, and streaming invalidates only changed
 blocks, but the root component presents the complete materialized logical frame
-to `sexy-tui-rs` on every interactive render. The terminal renderer follows Pi's
+to `sexy-tui-rs` on every interactive render. Removing a transient tail
+status truncates only that block's cached rows and metadata when rendered, or
+keeps the existing cache prefix when the status has not received a frame, so
+admitting the next tool does not reconstruct historical Markdown while holding
+the shared shell state. The terminal renderer follows Pi's
 `previousLines`, logical cursor, hardware cursor, maximum working height, and
 previous viewport-top state. It finds the first and last changed physical rows,
 repaints only that range when it remains addressable, and uses bottom-row CRLF
@@ -138,17 +142,23 @@ Fenced Markdown code is borderless and uses the compiled default's terminal-adap
 
 ## Reasoning presentation
 
-Every accepted run opens a stable `Working` row immediately. It becomes
-`Thinking` with a subdued, aligned `└ (ctrl+o to expand)` disclosure only after
-the provider emits an actual reasoning delta, and returns to `Working` while
-public output or finalization continues. The steady model-colored event-margin
-dot does not repaint on a timer. The heading cache advances only from semantic
-ATX headings or paragraphs consisting solely of bold text; it never infers a
-label from body prose and sanitizes provider text before display. Compaction uses
-`Compacting context`, and tool execution may retain its tool-specific lifecycle
+Every accepted run opens a `Working` row immediately. After the provider emits
+an actual reasoning delta, collapsed reasoning uses a fixed bold `Thinking`
+header with the same model-adaptive shimmer as `Working`. The aligned detail row
+contains the latest semantic ATX or standalone-bold heading followed by a plain,
+subdued `Ctrl+O` hint; when no heading exists it contains only the hint. Ordinary
+body prose is never inferred as a label, and provider text is sanitized before
+display. The shimmer advances on the renderer thread at a bounded 80 ms cadence,
+changes style rather than text or geometry, and invalidates only the active
+status block.
+
+Visible assistant text is itself the liveness signal, so its first public delta
+removes the transient status row. `TurnFinished` restores `Working` only when the
+owning run remains active; tool admission replaces any transient tail status,
+and authoritative run settlement removes the final one. Compaction uses
+`Compacting context`, while tool execution retains its tool-specific lifecycle
 row. Expanded reasoning keeps the same inset without an event-margin dot or a
-synthetic first-row bullet. Only authoritative run settlement removes transient
-activity rows.
+synthetic first-row bullet.
 
 ## Run outcomes
 

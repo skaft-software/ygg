@@ -219,6 +219,7 @@ pub(super) fn render_block_planned(
     outer_width: u16,
     verbose_tools: bool,
     spinner_frame: usize,
+    status_shimmer_frame: usize,
 ) -> RenderedTranscriptBlock {
     let plan = compile_surface_plan(previous, block, theme, outer_width);
     let width = plan.geometry.content_width;
@@ -259,6 +260,7 @@ pub(super) fn render_block_planned(
             width,
             verbose_tools,
             content_background,
+            status_shimmer_frame,
         ),
         TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
             finish_transcript_block(render_subagent_activity_panel(panel, theme, width))
@@ -447,6 +449,7 @@ pub(super) fn render_block(
         reasoning_renderer,
         outer_width,
         verbose_tools,
+        0,
         0,
     )
     .lines

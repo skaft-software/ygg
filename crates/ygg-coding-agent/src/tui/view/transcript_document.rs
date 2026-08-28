@@ -110,6 +110,7 @@ pub(crate) fn delegated_session_document(
                 width,
                 verbose_tools,
                 0,
+                0,
             )
             .lines;
             (!rendered.is_empty()).then(|| bounded_rendered_block(rendered, theme, width))
