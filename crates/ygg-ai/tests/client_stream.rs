@@ -337,6 +337,7 @@ fn text_request() -> Request {
 enum WebSocketBehavior {
     Complete,
     CloseBeforeEvents,
+    ConnectionLimit,
     RejectHandshake,
     Stall,
 }
@@ -443,11 +444,35 @@ async fn handle_test_responses_connection(
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 return Ok(());
             }
-            WebSocketBehavior::Complete | WebSocketBehavior::RejectHandshake => {}
+            WebSocketBehavior::Complete
+            | WebSocketBehavior::ConnectionLimit
+            | WebSocketBehavior::RejectHandshake => {}
         }
 
         let prewarm = body.get("generate") == Some(&serde_json::Value::Bool(false));
         let id = if prewarm { "resp-prewarm" } else { "resp-turn" };
+        if matches!(behavior, WebSocketBehavior::ConnectionLimit) && !prewarm {
+            for event in [
+                serde_json::json!({
+                    "type": "response.created",
+                    "response": {"id": id}
+                }),
+                serde_json::json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "websocket_connection_limit_reached",
+                            "message": "Create a new websocket connection to continue."
+                        }
+                    }
+                }),
+            ] {
+                socket
+                    .send(WebSocketMessage::Text(event.to_string().into()))
+                    .await?;
+            }
+            return Ok(());
+        }
         let mut events = vec![serde_json::json!({
             "type": "response.created",
             "response": {"id": id}
@@ -566,6 +591,66 @@ async fn responses_websocket_decodes_events_and_uses_continuation_suffix() {
     assert_eq!(requests[0]["generate"], false);
     assert_eq!(requests[1]["previous_response_id"], "resp-prewarm");
     assert_eq!(requests[1]["input"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn responses_websocket_connection_limit_retires_socket_and_falls_back() {
+    let server = TestResponsesServer::start(
+        WebSocketBehavior::ConnectionLimit,
+        fallback_responses_body(),
+    )
+    .await;
+    let model = websocket_test_model(&server.base_url);
+    let client = AiClient::new();
+    let mut stream = client
+        .stream(
+            &model,
+            responses_request(
+                vec![user_message("connection limit")],
+                Some("session-limit"),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Started { .. }))
+    ));
+    let error = stream
+        .next()
+        .await
+        .expect("provider connection limit must be surfaced")
+        .expect_err("connection limit is a provider error, not a successful response");
+    assert!(matches!(
+        error,
+        AiError::Provider(provider)
+            if provider.code.as_deref() == Some("websocket_connection_limit_reached")
+    ));
+    assert!(stream.next().await.is_none());
+
+    // Let the actor retire the poisoned socket before the next request. The
+    // pool then takes the ordinary HTTP/SSE path for this session key.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut fallback = client
+        .stream(
+            &model,
+            responses_request(vec![user_message("after refresh")], Some("session-limit")),
+        )
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(event) = fallback.next().await {
+        match event.unwrap() {
+            StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            StreamEvent::Finished(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "http");
+    let requests = server.requests().await;
+    assert!(requests
+        .iter()
+        .any(|request| request["transport"] == "http"));
 }
 
 #[tokio::test]

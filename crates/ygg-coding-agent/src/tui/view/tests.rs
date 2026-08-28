@@ -2984,6 +2984,9 @@ fn autonomous_compaction_events_show_work_success_and_failure_inline() {
                 kind: ygg_agent::CompactionKind::Local,
                 summary: "# Automatic summary\n\nauto-summary sentinel".into(),
                 first_kept: ygg_agent::EntryId("kept".into()),
+                usage: ygg_ai::Usage::default(),
+                elapsed: Duration::ZERO,
+                cost_microdollars: None,
             }),
         },
     );
@@ -3013,6 +3016,9 @@ fn autonomous_compaction_events_show_work_success_and_failure_inline() {
                 },
                 summary: String::new(),
                 first_kept: ygg_agent::EntryId("covered".into()),
+                usage: ygg_ai::Usage::default(),
+                elapsed: Duration::ZERO,
+                cost_microdollars: None,
             }),
         },
     );

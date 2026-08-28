@@ -5,6 +5,7 @@ from __future__ import annotations
 import shlex
 import unittest
 
+from evaluation.harbor.config import DEFAULT_REASONING, PINNED_YGG_VERSION
 from evaluation.harbor.command import (
     FailureKind,
     build_ygg_argv,
@@ -21,16 +22,22 @@ class CommandTests(unittest.TestCase):
             "/tmp/ygg",
             instruction,
             model="gpt-5.6-sol",
-            reasoning="medium",
+            reasoning=DEFAULT_REASONING,
             session_dir="/logs/agent/sessions",
             max_turns=8,
             bash_timeout_secs=600,
+            telemetry_path="/logs/agent/ygg-telemetry.jsonl",
         )
 
         self.assertEqual(shlex.split(command.shell), list(command.argv))
         self.assertEqual(command.argv[-1], instruction)
         self.assertIn("--print", command.argv)
         self.assertIn("--workspace-trusted", command.argv)
+        self.assertIn("--telemetry", command.argv)
+        self.assertEqual(
+            command.argv[command.argv.index("--telemetry") + 1],
+            "/logs/agent/ygg-telemetry.jsonl",
+        )
         self.assertEqual(
             command.argv[command.argv.index("--bash-timeout-secs") + 1],
             "600",
@@ -54,6 +61,7 @@ class CommandTests(unittest.TestCase):
             {"max_turns": 0},
             {"bash_timeout_secs": 0},
             {"bash_timeout_secs": 3_601},
+            {"telemetry_path": ""},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 build_ygg_argv(
@@ -66,7 +74,7 @@ class CommandTests(unittest.TestCase):
                 )
 
     def test_version_parser_accepts_ygg_output(self) -> None:
-        self.assertEqual(parse_ygg_version("ygg 0.6.0\n"), "0.6.0")
+        self.assertEqual(parse_ygg_version(f"ygg {PINNED_YGG_VERSION}\n"), PINNED_YGG_VERSION)
         self.assertEqual(parse_ygg_version("ygg version 1.2.3"), "1.2.3")
         self.assertIsNone(parse_ygg_version("not a version"))
 

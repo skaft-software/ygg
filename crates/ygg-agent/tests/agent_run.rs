@@ -12,6 +12,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
@@ -302,6 +306,125 @@ fn tool_turn(calls: &[(&str, &str, serde_json::Value)]) -> String {
         s += &tool_block(i, id, name, args);
     }
     s + &msg_end("tool_use")
+}
+
+struct ResponsesConnectionLimitServer {
+    base_url: String,
+    websocket_requests: Arc<AtomicUsize>,
+    http_requests: Arc<AtomicUsize>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ResponsesConnectionLimitServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let websocket_requests = Arc::new(AtomicUsize::new(0));
+        let http_requests = Arc::new(AtomicUsize::new(0));
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let websocket_count = Arc::clone(&websocket_requests);
+        let http_count = Arc::clone(&http_requests);
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((stream, _)) = accepted else { break };
+                        let websocket_count = Arc::clone(&websocket_count);
+                        let http_count = Arc::clone(&http_count);
+                        tokio::spawn(async move {
+                            let _ = handle_responses_connection_limit(
+                                stream,
+                                websocket_count,
+                                http_count,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            base_url: format!("http://{address}/"),
+            websocket_requests,
+            http_requests,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+}
+
+impl Drop for ResponsesConnectionLimitServer {
+    fn drop(&mut self) {
+        self.shutdown.take();
+        self.task.abort();
+    }
+}
+
+async fn handle_responses_connection_limit(
+    mut stream: TcpStream,
+    websocket_requests: Arc<AtomicUsize>,
+    http_requests: Arc<AtomicUsize>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut peek = [0_u8; 4096];
+    let count = stream.peek(&mut peek).await?;
+    let request_head = String::from_utf8_lossy(&peek[..count]).to_ascii_lowercase();
+    if request_head.contains("upgrade: websocket") {
+        let mut socket = accept_async(stream).await?;
+        let Some(Ok(WebSocketMessage::Text(_))) = socket.next().await else {
+            return Ok(());
+        };
+        websocket_requests.fetch_add(1, Ordering::SeqCst);
+        for event in [
+            serde_json::json!({
+                "type": "response.created",
+                "response": {"id": "limited-response"}
+            }),
+            serde_json::json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": "websocket_connection_limit_reached",
+                        "message": "Create a new websocket connection to continue."
+                    }
+                }
+            }),
+        ] {
+            socket
+                .send(WebSocketMessage::Text(event.to_string().into()))
+                .await?;
+        }
+        return Ok(());
+    }
+
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    http_requests.fetch_add(1, Ordering::SeqCst);
+    let body = concat!(
+        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"http-response\"}}\n\n",
+        "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n",
+        "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"recovered\"}\n\n",
+        "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"http-response\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+    );
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
 }
 
 // ── Scripted server + agent harness ────────────────────────────────────────
@@ -4226,6 +4349,53 @@ async fn batched_tool_results_keep_independent_bounded_outputs() {
 }
 
 #[tokio::test]
+async fn repeated_tool_call_diagnostic_reaches_a_later_model_turn() {
+    let mut h = harness(
+        vec![
+            tool_turn(&[("repeat-1", "read", serde_json::json!({"path": "missing"}))]),
+            tool_turn(&[("repeat-2", "read", serde_json::json!({"path": "missing"}))]),
+            tool_turn(&[("repeat-3", "read", serde_json::json!({"path": "missing"}))]),
+            text_turn("done"),
+        ],
+        Some(8),
+    )
+    .await;
+
+    let output = h.agent.complete("make progress").await.unwrap();
+    assert_eq!(output.text, "done");
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert!(requests[3].to_string().contains("exact call repeated 3x"));
+}
+
+#[tokio::test]
+async fn websocket_connection_limit_is_retried_by_agent() {
+    let server = ResponsesConnectionLimitServer::start().await;
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let workspace = workspace_dir.path().canonicalize().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    let mut model = scripted_responses_model(&server.base_url);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.transport = ygg_ai::EndpointTransport::WebSocketPreferred;
+    model.endpoint = Arc::new(endpoint);
+    let mut agent = build_responses_agent_from_session(
+        model,
+        Session::create(&session_path).unwrap(),
+        &workspace,
+        Some(4),
+        "You are a scripted Responses test agent.",
+    );
+
+    let output = agent
+        .complete("continue after the socket refresh")
+        .await
+        .unwrap();
+    assert_eq!(output.text, "recovered");
+    assert_eq!(server.websocket_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(server.http_requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn tool_progress_events_arrive_between_start_and_finish() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -5459,6 +5629,14 @@ async fn shallow_recon_bash_speculates_while_the_provider_stream_is_open() {
             _ => None,
         })
         .expect("ToolFinished for bash");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolStarted { id, .. } if id.0 == "call_1"))
+            .count(),
+        1,
+        "speculative calls still need one ToolStarted event"
+    );
     let output = finished.as_ref().expect("bash must succeed");
     assert!(output.text.contains("before"), "{}", output.text);
     assert!(!output.text.contains("after"), "{}", output.text);

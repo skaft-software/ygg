@@ -89,6 +89,7 @@ mod shell_safety;
 /// The generic skill substrate containing descriptors, load errors, trust levels, and the registry trait.
 pub mod skills;
 mod speculation;
+pub mod telemetry;
 pub mod tool;
 pub mod tools;
 
@@ -205,6 +206,7 @@ pub use skills::{
     ContentHash, LoadedSkill, SkillActivationId, SkillDescriptor, SkillId, SkillLoadError,
     SkillQuery, SkillRegistry, SkillSearchResult, SkillSource, SkillTrust,
 };
+pub use telemetry::{TelemetryObserver, TELEMETRY_SCHEMA};
 pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
     Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolDescriptor, ToolError,

@@ -45,6 +45,8 @@ pub enum TopLevelCommand {
         #[arg(long)]
         check: bool,
     },
+    /// Check local prerequisites, configured providers, and model visibility.
+    Doctor,
     /// Launch the loopback-only Ygg Serve application.
     ///
     /// Default builds dispatch to the installed extension runtime; builds with
@@ -158,6 +160,9 @@ pub struct Cli {
     /// Print or display the fully expanded named prompt and its content hash.
     #[arg(long)]
     pub debug_prompt: bool,
+    /// Append privacy-preserving run and tool metrics to a JSONL file.
+    #[arg(long, value_name = "PATH")]
+    pub telemetry: Option<PathBuf>,
     /// Explicit prompt-template file or directory (repeatable, Pi compatible).
     #[arg(long = "prompt-template", value_name = "PATH")]
     pub prompt_templates: Vec<PathBuf>,
@@ -284,6 +289,7 @@ struct ConfigLayer {
     context_files: Option<bool>,
     offline: Option<bool>,
     strict_config: Option<bool>,
+    telemetry: Option<PathBuf>,
     enabled_extensions: Option<Vec<String>>,
     trusted_extensions: Option<Vec<String>>,
     system_prompt: Option<String>,
@@ -323,6 +329,7 @@ impl ConfigLayer {
         override_some!(context_files);
         override_some!(offline);
         override_some!(strict_config);
+        override_some!(telemetry);
         override_some!(enabled_extensions);
         override_some!(trusted_extensions);
         override_some!(system_prompt);
@@ -757,6 +764,7 @@ const CONFIG_KEYS: &[&str] = &[
     "context_files",
     "offline",
     "strict_config",
+    "telemetry",
     "enabled_extensions",
     "trusted_extensions",
     "system_prompt",
@@ -1018,6 +1026,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         context_files: env_parse("YGG_CONTEXT_FILES")?,
         offline: env_parse("YGG_OFFLINE")?,
         strict_config: env_parse("YGG_STRICT_CONFIG")?,
+        telemetry: env_value("YGG_TELEMETRY").map(PathBuf::from),
         enabled_extensions: env_value("YGG_EXTENSIONS").map(split_names),
         trusted_extensions: env_value("YGG_TRUSTED_EXTENSIONS").map(split_names),
         system_prompt: env_value("YGG_SYSTEM_PROMPT"),
@@ -1300,7 +1309,7 @@ fn build_config_with_global_path(
 
     Ok(Config {
         workspace,
-        invocation_cwd,
+        invocation_cwd: invocation_cwd.clone(),
         model,
         model_explicit,
         reasoning,
@@ -1347,6 +1356,13 @@ fn build_config_with_global_path(
         trusted_extensions,
         invocation_trusted_extensions,
         tools,
+        telemetry: cli.telemetry.or(values.telemetry).map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                invocation_cwd.join(path)
+            }
+        }),
         context_files: !cli.no_context_files && values.context_files.unwrap_or(true),
         offline,
         workspace_trusted: cli.workspace_trusted,
@@ -1394,6 +1410,7 @@ mod tests {
             session_dir: None,
             prompt_template: None,
             debug_prompt: false,
+            telemetry: None,
             prompt_templates: vec![],
             skill_dirs: vec![],
             extension_dirs: vec![],
@@ -1474,6 +1491,25 @@ mod tests {
             Some(PathBuf::from("/opt/homebrew/bin/bash"))
         );
         assert_eq!(config.sandbox.bash_timeout_secs, 45);
+    }
+
+    #[test]
+    fn telemetry_path_resolves_relative_to_invocation_directory() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.telemetry = Some(PathBuf::from("metrics/run.jsonl"));
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(
+            config.telemetry,
+            Some(
+                directory
+                    .path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("metrics/run.jsonl")
+            )
+        );
     }
 
     #[test]
@@ -1821,6 +1857,39 @@ mod tests {
         assert_eq!(config.theme.as_deref(), Some("project-theme"));
         assert_eq!(config.max_turns, Some(11));
         assert!(!config.sandbox.allow_external_paths);
+    }
+
+    #[test]
+    fn telemetry_uses_cli_then_project_then_global_precedence() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "telemetry = 'global.jsonl'\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "telemetry = 'project.jsonl'\n",
+        )
+        .unwrap();
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        cli.telemetry = Some("cli.jsonl".into());
+        let canonical = directory.path().canonicalize().unwrap();
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.telemetry, Some(canonical.join("cli.jsonl")));
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.telemetry, Some(canonical.join("project.jsonl")));
+
+        std::fs::remove_file(directory.path().join(".ygg/config.toml")).unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.telemetry, Some(canonical.join("global.jsonl")));
     }
 
     #[test]
@@ -2346,6 +2415,14 @@ mod tests {
             parsed.get("model").unwrap().as_str().unwrap(),
             "model\\with\"quotes"
         );
+    }
+
+    #[test]
+    fn doctor_command_parses_without_a_prompt() {
+        let cli = Cli::try_parse_from(["ygg", "--offline", "doctor"]).unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(cli.command, Some(TopLevelCommand::Doctor)));
+        assert!(cli.offline);
     }
 
     #[test]

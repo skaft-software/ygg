@@ -133,6 +133,7 @@ fn config(directory: &std::path::Path, model: Option<&str>) -> Config {
         trusted_extensions: vec![],
         invocation_trusted_extensions: vec![],
         tools: crate::config::ToolPolicy::default(),
+        telemetry: None,
         context_files: true,
         offline: true,
         workspace_trusted: true,
@@ -144,7 +145,9 @@ fn configured_test_extensions(_skills: Arc<dyn SkillRegistry>, config: &Config) 
     let model_id = config.model.as_ref().expect("test model");
     let model = boot.catalog.resolve(model_id).unwrap();
     let session = Session::create(config.workspace.join("tool-policy-test.jsonl")).unwrap();
-    configured_extensions(config, &session, &model, &config.reasoning, &boot.sessions).0
+    configured_extensions(config, &session, &model, &config.reasoning, &boot.sessions)
+        .unwrap()
+        .0
 }
 
 fn append_active_skill(session: &mut Session, id: &str, required_tools: &[&str]) {
@@ -2248,7 +2251,8 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
         &model,
         &default_config.reasoning,
         &boot.sessions,
-    );
+    )
+    .unwrap();
     assert!(extensions.tool_definitions().is_empty());
     validate_explicit_tool_policy(&default_config, &extensions, &model, false).unwrap();
 
@@ -2261,7 +2265,8 @@ fn model_without_tool_capability_gets_no_default_surface_and_rejects_explicit_to
         &model,
         &default_config.reasoning,
         &boot.sessions,
-    );
+    )
+    .unwrap();
     let error =
         validate_explicit_tool_policy(&default_config, &extensions, &model, false).unwrap_err();
     let message = error.to_string();

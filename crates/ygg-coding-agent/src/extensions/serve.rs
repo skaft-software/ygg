@@ -11472,6 +11472,7 @@ mod tests {
             trusted_extensions: Vec::new(),
             invocation_trusted_extensions: Vec::new(),
             tools: crate::config::ToolPolicy::default(),
+            telemetry: None,
             context_files: false,
             offline: true,
             workspace_trusted: true,

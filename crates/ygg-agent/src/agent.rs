@@ -45,9 +45,9 @@ use crate::session::{
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
-    CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
-    ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress, ToolProgressSink,
-    PROGRESS_CHANNEL_CAPACITY,
+    content_hash, CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError,
+    ToolOutput, ToolOutputContentPart, ToolOutputDetails, ToolOutputMediaKind, ToolProgress,
+    ToolProgressSink, PROGRESS_CHANNEL_CAPACITY,
 };
 
 /// Errors surfaced by [`Agent`] APIs.
@@ -875,6 +875,10 @@ const REASONING_ANSWER_RESERVE: u64 = 1024;
 /// Bound actual tool executions emitted in one assistant turn. Every excess
 /// call still receives a compact error result so provider pairing remains valid.
 const MAX_TOOL_CALLS_PER_TURN: usize = 32;
+/// Number of recent identical calls retained for the generic no-progress hint.
+const MAX_RECENT_TOOL_CALLS: usize = 16;
+/// Do not distract the model for the first two legitimate repeated probes.
+const REPEATED_TOOL_CALL_THRESHOLD: usize = 2;
 const FAILED_TURN_CONTEXT_MARKER: &str = "The previous assistant turn failed before completion. Do not continue that request unless the user asks again.";
 const TOOL_TRUNCATION_MARKER: &str = "\n[tool output truncated]\n";
 /// Maximum retries for a transient provider failure. A replacement attempt is
@@ -1458,6 +1462,26 @@ fn add_usage(total: &mut Usage, turn: &Usage) {
     total.total_tokens = total.total_tokens.saturating_add(turn.total_tokens);
 }
 
+fn usage_since(after: Usage, before: Usage) -> Usage {
+    Usage {
+        input_tokens: after.input_tokens.saturating_sub(before.input_tokens),
+        cache_read_tokens: after
+            .cache_read_tokens
+            .saturating_sub(before.cache_read_tokens),
+        cache_write_tokens: after
+            .cache_write_tokens
+            .saturating_sub(before.cache_write_tokens),
+        cache_write_1h_tokens: after
+            .cache_write_1h_tokens
+            .saturating_sub(before.cache_write_1h_tokens),
+        output_tokens: after.output_tokens.saturating_sub(before.output_tokens),
+        reasoning_tokens: after
+            .reasoning_tokens
+            .saturating_sub(before.reasoning_tokens),
+        total_tokens: after.total_tokens.saturating_sub(before.total_tokens),
+    }
+}
+
 #[derive(Default)]
 struct CostAccumulator {
     microdollars: u64,
@@ -1548,6 +1572,46 @@ fn pending_tool_state(session: &Session) -> Option<(Vec<ToolCall>, HashSet<ygg_a
         cursor = entry.parent.as_ref();
     }
     None
+}
+
+fn tool_call_arguments_fingerprint(name: &str, args: &serde_json::Value) -> String {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(0);
+    if serde_json::to_writer(&mut bytes, args).is_err() {
+        bytes.extend_from_slice(b"<invalid-json>");
+    }
+    content_hash(&bytes)
+}
+
+fn repeated_tool_annotation(repeated_recently: usize) -> String {
+    format!(
+        "\n[agent diagnostic: exact call repeated {}x recently; if no progress, change approach or verify state.]",
+        repeated_recently.saturating_add(1)
+    )
+}
+
+fn annotate_repeated_tool_result(
+    result: Result<ToolOutput, ToolError>,
+    repeated_recently: usize,
+) -> Result<ToolOutput, ToolError> {
+    if repeated_recently < REPEATED_TOOL_CALL_THRESHOLD {
+        return result;
+    }
+    let annotation = repeated_tool_annotation(repeated_recently);
+    match result {
+        Ok(output) if serde_json::from_str::<serde_json::Value>(&output.text).is_ok() => {
+            // Keep machine-readable tool contracts valid. A trailing hint
+            // would turn an otherwise valid JSON result into invalid JSON;
+            // the next model turn can still be diagnosed from telemetry.
+            Ok(output)
+        }
+        Ok(output) => Ok(output.with_model_annotation(&annotation)),
+        Err(error) if serde_json::from_str::<serde_json::Value>(&error.message).is_ok() => {
+            Err(error)
+        }
+        Err(error) => Err(ToolError::new(format!("{}{}", error.message, annotation))),
+    }
 }
 
 fn truncate_tool_text(text: &str, limit: usize) -> String {
@@ -1944,7 +2008,22 @@ fn looks_like_context_error(error: &AiError) -> bool {
     .any(|needle| text.contains(needle))
 }
 
+fn provider_requests_connection_refresh(error: &ygg_ai::ProviderError) -> bool {
+    let Some(code) = error.code.as_deref() else {
+        return false;
+    };
+    let code = code.to_ascii_lowercase();
+    code == "websocket_connection_limit_reached"
+        || (code.contains("websocket") && code.contains("connection") && code.contains("limit"))
+}
+
 fn retryable_provider_error(error: &ygg_ai::ProviderError) -> bool {
+    if provider_requests_connection_refresh(error) {
+        // The provider rejected the generation because its long-lived socket
+        // expired. The WebSocket pool retires that socket, so a retry opens a
+        // fresh transport (or the safe HTTP fallback) before any generation.
+        return true;
+    }
     if error
         .code
         .as_deref()
@@ -3281,7 +3360,10 @@ impl CompactionContext<'_> {
         reason: CompactionReason,
     ) -> Result<CompactionInfo, AgentError> {
         let id = self.begin_compaction(system, tools, reason)?;
-        let operation = async {
+        let operation_started = std::time::Instant::now();
+        let usage_before = *self.usage;
+        let cost_before = self.run_cost.microdollars;
+        let mut operation = async {
             if self.model.spec.protocol != Protocol::OpenAiResponses {
                 return Err(AgentError::InvalidCompactionPolicy(
                     "native Responses compaction requires an OpenAI Responses model route"
@@ -3367,9 +3449,22 @@ impl CompactionContext<'_> {
                 },
                 summary: String::new(),
                 first_kept: covered_through,
+                usage: Usage::default(),
+                elapsed: Duration::ZERO,
+                cost_microdollars: None,
             })
         }
         .await;
+        if let Ok(info) = operation.as_mut() {
+            info.usage = usage_since(*self.usage, usage_before);
+            info.elapsed = operation_started.elapsed();
+            info.cost_microdollars = self
+                .model
+                .spec
+                .pricing
+                .as_ref()
+                .map(|_| self.run_cost.microdollars.saturating_sub(cost_before));
+        }
 
         self.finish_compaction(id, system, tools, reason, &operation, self.model);
         operation
@@ -3383,7 +3478,10 @@ impl CompactionContext<'_> {
         reason: CompactionReason,
     ) -> Result<CompactionInfo, AgentError> {
         let id = self.begin_compaction(system, tools, reason)?;
-        let operation = async {
+        let operation_started = std::time::Instant::now();
+        let usage_before = *self.usage;
+        let cost_before = self.run_cost.microdollars;
+        let mut operation = async {
             let preparation = prepare_handoff(self.session, &first_kept)?;
             if preparation.messages.is_empty() && preparation.turn_prefix_messages.is_empty() {
                 return Err(AgentError::ContextExceeded {
@@ -3416,9 +3514,22 @@ impl CompactionContext<'_> {
                 kind: CompactionKind::Local,
                 summary,
                 first_kept,
+                usage: Usage::default(),
+                elapsed: Duration::ZERO,
+                cost_microdollars: None,
             })
         }
         .await;
+        if let Ok(info) = operation.as_mut() {
+            info.usage = usage_since(*self.usage, usage_before);
+            info.elapsed = operation_started.elapsed();
+            info.cost_microdollars = self
+                .compaction_model
+                .spec
+                .pricing
+                .as_ref()
+                .map(|_| self.run_cost.microdollars.saturating_sub(cost_before));
+        }
 
         self.finish_compaction(id, system, tools, reason, &operation, self.compaction_model);
         operation
@@ -4287,6 +4398,7 @@ impl Agent {
             self.max_session_cost_microdollars,
         )?;
         let covered_through = self.session.head().ok_or(SessionError::EmptySession)?;
+        let operation_started = std::time::Instant::now();
         let response = self.client.compact_responses(&self.model, request).await?;
         let cost = self
             .model
@@ -4313,6 +4425,9 @@ impl Agent {
             },
             summary: String::new(),
             first_kept: covered_through,
+            usage: response.usage,
+            elapsed: operation_started.elapsed(),
+            cost_microdollars: cost.map(|cost| cost.total),
         })
     }
 
@@ -4491,9 +4606,20 @@ impl Agent {
             display_text: None,
             ..prompt_metadata.clone()
         };
+        let observer_input = (!self.extensions.observers.is_empty()).then(|| input.clone());
         let first_entry = self
             .session
             .append_with_metadata(user_message(input), Some(prompt_metadata.clone()))?;
+        if let Some(input) = observer_input.as_ref() {
+            for observer in &self.extensions.observers {
+                observer.on_run_started_for_owner(
+                    &first_entry.0,
+                    input,
+                    &self.model,
+                    &self.resource_owner,
+                );
+            }
+        }
         let lifecycle = Arc::new(RunLifecycle {
             finished: AtomicBool::new(false),
             dropped: AtomicBool::new(false),
@@ -4601,6 +4727,8 @@ impl Agent {
             let mut run_usage = Usage::default();
             let mut run_cost = CostAccumulator::default();
             let mut speculative_bash = SpeculativeBash::default();
+            let mut recent_tool_calls: VecDeque<(String, String)> =
+                VecDeque::with_capacity(MAX_RECENT_TOOL_CALLS);
 
             let mut reason: FinishReason = 'run: loop {
                 // Cancel any speculative bash executions left over from a
@@ -4817,7 +4945,9 @@ impl Agent {
                 // Anchor first-token-latency measurement for consumers that
                 // track it per attempt: the first OutputDelta of this stream
                 // measured from this event is the attempt's TTFT.
-                yield AgentEvent::TurnStarted;
+                let ev = AgentEvent::TurnStarted;
+                notify_observers(&observers, &ev);
+                yield ev;
                 let request_for_retry = request;
                 let mut stream_retries = 0usize;
                 let opened = loop {
@@ -4995,7 +5125,9 @@ impl Agent {
                                         // The replacement stream is established:
                                         // a new attempt on the same model turn
                                         // begins.
-                                        yield AgentEvent::TurnStarted;
+                                        let ev = AgentEvent::TurnStarted;
+                                        notify_observers(&observers, &ev);
+                                        yield ev;
                                         attempt_saw_generation = false;
                                         continue 'consume;
                                     }
@@ -5101,7 +5233,9 @@ impl Agent {
                                         // The replacement stream is established:
                                         // a new attempt on the same model turn
                                         // begins.
-                                        yield AgentEvent::TurnStarted;
+                                        let ev = AgentEvent::TurnStarted;
+                                        notify_observers(&observers, &ev);
+                                        yield ev;
                                         attempt_saw_generation = false;
                                         // The retried stream re-emits every
                                         // event; drop shadow state from the
@@ -5613,19 +5747,39 @@ impl Agent {
                     None
                 };
 
+                // Calls in one assistant response form a single batch. Do not
+                // treat parallel or otherwise batched identical calls as a
+                // no-progress loop; only compare against earlier responses.
+                let batch_fingerprints: Vec<(String, String)> = calls
+                    .iter()
+                    .filter_map(|call| {
+                        call.arguments_value().ok().map(|args| {
+                            (
+                                call.name.clone(),
+                                tool_call_arguments_fingerprint(&call.name, &args),
+                            )
+                        })
+                    })
+                    .collect();
+
                 // ── Commit tool results in emitted order ───────────────────
                 for (call_index, call) in calls.into_iter().enumerate() {
                     let parsed = call.arguments_value();
+                    let call_fingerprint = parsed.as_ref().ok().map(|args| {
+                        (
+                            call.name.clone(),
+                            tool_call_arguments_fingerprint(&call.name, args),
+                        )
+                    });
+                    let repeated_recently = call_fingerprint.as_ref().map_or(0, |fingerprint| {
+                        recent_tool_calls
+                            .iter()
+                            .filter(|previous| *previous == fingerprint)
+                            .count()
+                    });
+                    let should_annotate_repetition =
+                        repeated_recently >= REPEATED_TOOL_CALL_THRESHOLD;
                     let mut preexecuted = parallel_results.as_mut().and_then(Iterator::next);
-                    if preexecuted.is_none() {
-                        // Reconcile speculative bash: consume the pre-run
-                        // result only on an exact argument match with the
-                        // authoritative call; otherwise cancel it and fall
-                        // through to normal serial execution.
-                        preexecuted = speculative_bash
-                            .take_matched(&call.id, parsed.as_ref().ok())
-                            .await;
-                    }
                     if preexecuted.is_none() {
                         stream_context.tool_started();
                         let ev = AgentEvent::ToolStarted {
@@ -5638,8 +5792,15 @@ impl Agent {
                         };
                         notify_observers(&observers, &ev);
                         yield ev;
-                    }
 
+                        // Reconcile speculative bash: consume the pre-run
+                        // result only on an exact argument match with the
+                        // authoritative call; otherwise cancel it and fall
+                        // through to normal serial execution.
+                        preexecuted = speculative_bash
+                            .take_matched(&call.id, parsed.as_ref().ok())
+                            .await;
+                    }
                     let CompletedToolExecution {
                         result,
                         duration,
@@ -5832,6 +5993,11 @@ impl Agent {
                             cancellation_won,
                         }
                     };
+                    let result = if should_annotate_repetition {
+                        annotate_repeated_tool_result(result, repeated_recently)
+                    } else {
+                        result
+                    };
 
                     // ── COMMIT BOUNDARY ──────────────────────────────────
                     // Tool::execute resolved (or an immediate error was
@@ -5928,6 +6094,12 @@ impl Agent {
                     notify_observers(&observers, &ev);
                     yield ev;
 
+                }
+                for fingerprint in batch_fingerprints {
+                    recent_tool_calls.push_back(fingerprint);
+                    while recent_tool_calls.len() > MAX_RECENT_TOOL_CALLS {
+                        recent_tool_calls.pop_front();
+                    }
                 }
 
                 // Every emitted call now has a durable result, including calls
@@ -6224,6 +6396,36 @@ mod tests {
 
         resolve_tool_delivery_after_persistence(&result, 32);
         assert_eq!(resolution.load(Ordering::SeqCst), -1);
+    }
+
+    #[test]
+    fn repeated_tool_annotation_is_bounded_and_model_visible() {
+        let result = annotate_repeated_tool_result(Ok(ToolOutput::new("result")), 2).unwrap();
+        assert!(result.text.contains("exact call repeated 3x"));
+        assert_eq!(
+            result
+                .content_parts()
+                .iter()
+                .filter_map(|part| match part {
+                    ToolOutputContentPart::Text(text) => Some(text.as_str()),
+                    ToolOutputContentPart::Media(_) => None,
+                })
+                .collect::<String>(),
+            result.text
+        );
+        assert!(
+            !annotate_repeated_tool_result(Ok(ToolOutput::new("result")), 1)
+                .unwrap()
+                .text
+                .contains("diagnostic")
+        );
+    }
+
+    #[test]
+    fn repeated_tool_annotation_preserves_machine_readable_output() {
+        let original = r#"{"timed_out":false,"messages":[]}"#;
+        let result = annotate_repeated_tool_result(Ok(ToolOutput::new(original)), 2).unwrap();
+        assert_eq!(result.text, original);
     }
 
     #[test]
@@ -6563,6 +6765,27 @@ mod tests {
             progress,
         };
         assert_eq!(ai_error_phase(&canceled), "request cancellation");
+    }
+
+    #[test]
+    fn websocket_connection_limit_is_retried_before_generation() {
+        let error = ygg_ai::ProviderError {
+            code: Some("websocket_connection_limit_reached".into()),
+            kind: None,
+            message: "create a new websocket connection".into(),
+            request_id: None,
+        };
+        assert!(provider_requests_connection_refresh(&error));
+        assert!(retryable_stream_start(&AiError::Provider(error)));
+        assert_eq!(
+            provider_retry_limit(&AiError::Provider(ygg_ai::ProviderError {
+                code: Some("websocket_connection_limit_reached".into()),
+                kind: None,
+                message: "create a new websocket connection".into(),
+                request_id: None,
+            })),
+            MAX_PROVIDER_RETRIES
+        );
     }
 
     #[test]

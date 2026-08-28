@@ -290,6 +290,12 @@ pub struct CompactionInfo {
     /// Oldest entry retained at full fidelity.
     /// For native Responses compaction this is the covered-through head.
     pub first_kept: EntryId,
+    /// Provider usage consumed by the compaction operation(s).
+    pub usage: Usage,
+    /// Wall time spent in the compaction operation(s).
+    pub elapsed: Duration,
+    /// Priced whole-microdollar cost when the compaction route has trusted pricing.
+    pub cost_microdollars: Option<u64>,
 }
 
 /// Durable compaction representation selected by the agent.

@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from evaluation.harbor.config import DEFAULT_MODEL, PINNED_YGG_VERSION
+
 try:
     from harbor.models.agent.context import AgentContext
 
@@ -31,7 +33,7 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             self.assertEqual(
                 Ygg(Path(directory), model_name=None).model_name,
-                "gpt-5.6-sol",
+                DEFAULT_MODEL,
             )
 
     async def test_setup_logs_and_verifies_pinned_version(self) -> None:
@@ -44,9 +46,25 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("install -m 0755", environment.calls[0]["command"])
             self.assertIn("mkdir -p /logs/agent/sessions", environment.calls[0]["command"])
             self.assertEqual(
-                (logs_dir / "setup-stdout.txt").read_text(), "ygg 0.6.0\n"
+                (logs_dir / "setup-stdout.txt").read_text(), f"ygg {PINNED_YGG_VERSION}\n"
             )
-            self.assertEqual(agent.version(), "0.6.0")
+            self.assertEqual(agent.version(), PINNED_YGG_VERSION)
+
+    async def test_telemetry_flag_is_explicit_in_the_recorded_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logs_dir = Path(directory)
+            environment = FakeEnvironment(
+                logs_dir,
+                SimpleNamespace(return_code=0, stdout="completed\n", stderr=""),
+            )
+            agent = Ygg(logs_dir, telemetry=True)
+            await agent.setup(environment)
+            await agent.run("task", environment, AgentContext())
+
+            run_call = environment.calls[-1]
+            self.assertIn("--telemetry /logs/agent/ygg-telemetry.jsonl", run_call["command"])
+            invocation = json.loads((logs_dir / "invocation.json").read_text())
+            self.assertTrue(invocation["telemetry"])
 
     async def test_run_writes_metrics_redacted_output_and_native_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -151,7 +169,7 @@ class FakeEnvironment:
             {"command": command, "env": env, "timeout_sec": timeout_sec}
         )
         if "--version" in command:
-            version = getattr(self.run_result, "version", "0.6.0")
+            version = getattr(self.run_result, "version", PINNED_YGG_VERSION)
             return SimpleNamespace(
                 return_code=0,
                 stdout=f"ygg {version}\n",

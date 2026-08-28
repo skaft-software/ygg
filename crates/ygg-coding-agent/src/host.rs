@@ -1321,6 +1321,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         trusted_extensions: request.trusted_extensions.clone(),
         invocation_trusted_extensions: Vec::new(),
         tools,
+        telemetry: None,
         context_files: request.context_files,
         offline: request.offline,
         workspace_trusted: true,

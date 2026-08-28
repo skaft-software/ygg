@@ -9,9 +9,10 @@ use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 
 use crate::events::AgentEvent;
+use crate::input::UserInput;
 use crate::tool::{Tool, ToolContext, ToolError};
 use tokio::sync::Notify;
-use ygg_ai::ToolDef;
+use ygg_ai::{Model, ToolDef};
 
 type ToolPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -30,6 +31,22 @@ pub trait Extension: Send + Sync {
 /// Observers are invoked synchronously, in registration order, immediately
 /// before each event is delivered to the run's consumer.
 pub trait EventObserver: Send + Sync {
+    /// Called immediately after a user prompt is durably appended and before
+    /// the first provider turn. Implementations should hash or summarize the
+    /// input rather than retaining its contents when collecting diagnostics.
+    ///
+    /// This lifecycle hook is intentionally separate from [`on_event`]: it
+    /// gives optional telemetry a stable run identity and model binding without
+    /// adding a user-visible event to the frontend stream.
+    fn on_run_started_for_owner(
+        &self,
+        _run_id: &str,
+        _input: &UserInput,
+        _model: &Model,
+        _resource_owner: &str,
+    ) {
+    }
+
     /// Called for every [`AgentEvent`] the run emits.
     fn on_event(&self, event: &AgentEvent);
 

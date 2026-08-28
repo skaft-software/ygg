@@ -2071,6 +2071,7 @@ mod tests {
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![],
             tools: crate::config::ToolPolicy::default(),
+            telemetry: None,
             context_files: true,
             offline: true,
             workspace_trusted: true,

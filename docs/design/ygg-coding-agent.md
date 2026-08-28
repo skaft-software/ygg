@@ -240,6 +240,12 @@ theme discovery are disabled.
 - `/help [command]` — show local command help and Ygg self-documentation.
 - `/status`, `/quit` — product status and lifecycle controls.
 
+The top-level `ygg doctor` command performs read-mostly prerequisite, provider,
+and model-visibility checks without constructing an Agent or starting executable
+extensions. `--telemetry PATH` is an explicit opt-in for machine-readable
+request/tool/compaction measurements; it is not part of the durable session
+schema and is not rendered as one transcript row per event.
+
 Checkout appends a durable head record. The subsequent consuming rebuild
 restores configuration on the selected branch and appends current provenance;
 future messages therefore fork without deleting the abandoned branch.

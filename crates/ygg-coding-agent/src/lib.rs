@@ -8,6 +8,7 @@ mod cli;
 mod commands;
 mod compaction;
 mod config;
+mod doctor;
 mod extension_bundle;
 mod extension_package;
 mod extensions;
@@ -103,6 +104,9 @@ async fn run() -> anyhow::Result<()> {
         tui::terminal::install_signal_restore()?;
     }
     let config = cli::build_config(cli, &cwd)?;
+    if matches!(&top_level_command, Some(cli::TopLevelCommand::Doctor)) {
+        return doctor::run(&config);
+    }
     if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
     }

@@ -1071,6 +1071,28 @@ impl ToolOutput {
         &self.media_kinds
     }
 
+    /// Appends a bounded host diagnostic to the model-visible text while
+    /// keeping structured parts and their compact text representation aligned.
+    /// This is used for generic execution diagnostics, never for user content.
+    pub(crate) fn with_model_annotation(mut self, annotation: &str) -> Self {
+        self.text.push_str(annotation);
+        if let Some(text) = self
+            .content_parts
+            .iter_mut()
+            .rev()
+            .find_map(|part| match part {
+                ToolOutputContentPart::Text(text) => Some(text),
+                ToolOutputContentPart::Media(_) => None,
+            })
+        {
+            text.push_str(annotation);
+        } else {
+            self.content_parts
+                .push(ToolOutputContentPart::Text(annotation.to_owned()));
+        }
+        self
+    }
+
     /// Installs internal resolution hooks for work that is acknowledged only
     /// after this output is durably appended to the session. Dropping every
     /// copy without resolution rolls the provisional delivery back.

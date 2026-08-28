@@ -11,12 +11,12 @@ The adapter records its pins in [`config.py`](config.py):
 
 | Input | Pin |
 | --- | --- |
-| Ygg source | `https://github.com/skaft-software/ygg.git` at `3f4bb7c9e2923e5a23736e4baaa0d230a0bba335` (`0.6.0`) |
+| Ygg source | `https://github.com/skaft-software/ygg.git` at `61677754bf69833a384bee2b29ef8eff29f37fc1` (`0.6.2`) |
 | Ygg binary | `linux/amd64` Ygg executable (the SHA-256 is generated and passed to each run) |
 | Harbor source | `https://github.com/harbor-framework/harbor.git` at `6ecebe4ae9910ee0b28a2e6e8fa30934c0b41dfa` |
-| Dataset | `terminal-bench/terminal-bench@3.0.0` |
+| Dataset | `terminal-bench/terminal-bench-2-1@6` |
 | Model | `gpt-5.6-sol` |
-| Reasoning | `medium` |
+| Reasoning | `max` |
 | Provider credential | Local Codex OAuth (`~/.ygg/credentials/codex.json`) or `OPENAI_API_KEY` |
 
 The dataset is consumed as Harbor's published package; this adapter does not
@@ -56,14 +56,14 @@ arm64 Docker Desktop needs an `aarch64` Linux build or a remote amd64 provider:
 
 ```bash
 git clone https://github.com/skaft-software/ygg.git /tmp/ygg-pinned
-git -C /tmp/ygg-pinned checkout 3f4bb7c9e2923e5a23736e4baaa0d230a0bba335
+git -C /tmp/ygg-pinned checkout 61677754bf69833a384bee2b29ef8eff29f37fc1
 rustup toolchain install 1.86.0
 cd /tmp/ygg-pinned
 rustup target add --toolchain 1.86.0 x86_64-unknown-linux-musl
 cargo +1.86.0 build --locked --release --target x86_64-unknown-linux-musl \
   -p ygg-coding-agent --bin ygg
-install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.6.0
-export YGG_BINARY=/tmp/ygg-0.6.0
+install -m 0755 target/x86_64-unknown-linux-musl/release/ygg /tmp/ygg-0.6.2
+export YGG_BINARY=/tmp/ygg-0.6.2
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 "$YGG_BINARY" --version
 ```
@@ -91,11 +91,11 @@ and use that extracted file as `YGG_BINARY`:
 
 ```bash
 cd /tmp/ygg-pinned
-docker build --platform linux/amd64 -f deploy/Dockerfile.ygg -t ygg:0.6.0 .
-container=$(docker create --platform linux/amd64 ygg:0.6.0)
-docker cp "${container}:/usr/local/bin/ygg" /tmp/ygg-0.6.0
+docker build --platform linux/amd64 -f deploy/Dockerfile.ygg -t ygg:0.6.2 .
+container=$(docker create --platform linux/amd64 ygg:0.6.2)
+docker cp "${container}:/usr/local/bin/ygg" /tmp/ygg-0.6.2
 docker rm "$container"
-export YGG_BINARY=/tmp/ygg-0.6.0
+export YGG_BINARY=/tmp/ygg-0.6.2
 export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 ```
 
@@ -163,7 +163,7 @@ credential path without invoking Ygg's provider loop:
 
 ```bash
 PYTHONPATH="$YGG_REPO" uv run harbor run \
-  -d 'terminal-bench/terminal-bench@3.0.0' \
+  -d 'terminal-bench/terminal-bench-2-1@6' \
   --include-task-name terminal-bench/shadow-relay \
   -a evaluation.harbor.ygg_agent:Ygg \
   -e docker \
@@ -172,8 +172,8 @@ PYTHONPATH="$YGG_REPO" uv run harbor run \
   --mounts "$YGG_MOUNTS" \
   --agent-setup-timeout-multiplier 1 \
   --agent-kwarg ygg_binary_sha256="$YGG_SHA256" \
-  --jobs-dir /tmp/ygg-tb3-install-only \
-  --job-name ygg-tb3-install-only \
+  --jobs-dir /tmp/ygg-tb2-1-install-only \
+  --job-name ygg-tb2-1-install-only \
   --delete
 ```
 
@@ -188,7 +188,7 @@ published dataset or the working tree:
 
 ```bash
 cd /tmp/harbor-ygg
-export DATASET='terminal-bench/terminal-bench@3.0.0'
+export DATASET='terminal-bench/terminal-bench-2-1@6'
 export SMOKE_ROOT=$(mktemp -d)
 uv run harbor download "$DATASET" --output-dir "$SMOKE_ROOT"
 export SMOKE_TASK=$(find "$SMOKE_ROOT" -type f -name task.toml -print -quit | xargs -r dirname)
@@ -208,7 +208,7 @@ PYTHONPATH="$YGG_REPO" uv run harbor trial start \
   -m gpt-5.6-sol \
   --mounts "$YGG_MOUNTS" \
   --ae HOME=/root \
-  --agent-kwarg reasoning=medium \
+  --agent-kwarg reasoning=max \
   --agent-kwarg ygg_binary_sha256="$YGG_SHA256"
 ```
 
@@ -225,14 +225,14 @@ Harbor package, not guessed filesystem names:
 
 ```bash
 PYTHONPATH="$YGG_REPO" uv run harbor run \
-  -d 'terminal-bench/terminal-bench@3.0.0' \
+  -d 'terminal-bench/terminal-bench-2-1@6' \
   --include-task-name '<resolved-task-name>' \
   -a evaluation.harbor.ygg_agent:Ygg \
   -m gpt-5.6-sol \
   -n 1 \
   --mounts "$YGG_MOUNTS" \
   --ae HOME=/root \
-  --agent-kwarg reasoning=medium \
+  --agent-kwarg reasoning=max \
   --agent-kwarg ygg_binary_sha256="$YGG_SHA256" \
   --job-name ygg-terminal-bench-subset
 ```
@@ -258,8 +258,8 @@ Use the pinned dataset with `oracle` before comparing model scores:
 
 ```bash
 uv run harbor run \
-  -d 'terminal-bench/terminal-bench@3.0.0' \
-  -a oracle -n 1 --job-name terminal-bench-3-oracle-baseline
+  -d 'terminal-bench/terminal-bench-2-1@6' \
+  -a oracle -n 1 --job-name terminal-bench-2-1-oracle-baseline
 ```
 
 Oracle is an environment/verifier baseline: it should establish that the
@@ -311,7 +311,7 @@ logs or API keys.
 
 - **`YggSetupError: version mismatch`**: check that the mounted executable was
   built from the Ygg commit above and that `--version` reports exactly
-  `0.6.0`.
+  `0.6.2`.
 - **`test -x /usr/local/bin/ygg` fails**: use an absolute Linux executable,
   verify the bind mount target, or build a remote-provider image containing the
   binary.

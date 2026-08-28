@@ -424,6 +424,23 @@ impl ResponsesWsPool {
     }
 }
 
+fn connection_refresh_error(value: &Value) -> bool {
+    let error = value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| value.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("code").and_then(Value::as_str));
+    let Some(code) = code else {
+        return false;
+    };
+    let code = code.to_ascii_lowercase();
+    code == "websocket_connection_limit_reached"
+        || (code.contains("websocket") && code.contains("connection") && code.contains("limit"))
+}
+
 async fn disable_key(state: &Weak<Mutex<PoolState>>, key: Option<&str>) {
     let (Some(state), Some(key)) = (state.upgrade(), key) else {
         return;
@@ -641,7 +658,18 @@ async fn run_connection<S>(
                     if is_terminal {
                         update_continuation(&command.body, &value, &mut continuation);
                     }
+                    let connection_refresh = connection_refresh_error(&value);
                     if command.reply.send(Ok(value)).await.is_err() {
+                        alive.store(false, Ordering::Release);
+                        disable_key(&state, key.as_deref()).await;
+                        break 'actor;
+                    }
+                    if connection_refresh {
+                        // The provider has retired this long-lived socket for
+                        // connection-lifetime reasons. Do not leave a poisoned
+                        // connection in the session pool: the next request
+                        // falls back to HTTP/SSE instead of receiving the same
+                        // terminal error forever.
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
                         break 'actor;
@@ -670,7 +698,18 @@ async fn run_connection<S>(
                     if is_terminal {
                         update_continuation(&command.body, &value, &mut continuation);
                     }
+                    let connection_refresh = connection_refresh_error(&value);
                     if command.reply.send(Ok(value)).await.is_err() {
+                        alive.store(false, Ordering::Release);
+                        disable_key(&state, key.as_deref()).await;
+                        break 'actor;
+                    }
+                    if connection_refresh {
+                        // The provider has retired this long-lived socket for
+                        // connection-lifetime reasons. Do not leave a poisoned
+                        // connection in the session pool: the next request
+                        // falls back to HTTP/SSE instead of receiving the same
+                        // terminal error forever.
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
                         break 'actor;
@@ -781,6 +820,37 @@ mod tests {
             idle_timeout,
         ));
         (connection, actor)
+    }
+
+    #[test]
+    fn detects_provider_connection_lifetime_errors() {
+        assert!(connection_refresh_error(&serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "error": {
+                    "code": "websocket_connection_limit_reached",
+                    "message": "Create a new websocket connection to continue."
+                }
+            }
+        })));
+        assert!(connection_refresh_error(&serde_json::json!({
+            "type": "error",
+            "code": "websocket_connection_limit_reached",
+            "message": "connection limit reached"
+        })));
+        assert!(connection_refresh_error(&serde_json::json!({
+            "type": "error",
+            "error": {
+                "code": "gateway_websocket_connection_limit",
+                "message": "connection limit reached"
+            }
+        })));
+        assert!(!connection_refresh_error(&serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "error": {"code": "invalid_request", "message": "bad request"}
+            }
+        })));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

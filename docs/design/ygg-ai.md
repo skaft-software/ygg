@@ -59,13 +59,17 @@ request send and response headers, and the client defaults to a fifteen-minute
 first-body allowance, a five-minute inter-chunk idle allowance, and a one-hour
 overall body deadline. Optional error snippets use tighter two-second idle and
 five-second overall ceilings after the HTTP status is known. A preferred
-WebSocket falls back to HTTP only when connection establishment fails before a
+WebSocket falls back to HTTP when connection establishment fails before a
 generation frame could have been sent; post-send timeouts, decode failures, and
-disconnects are terminal so provider work is never replayed ambiguously. The
-coding product uses a fifteen-minute response-header default for built-in and
-custom routes; custom providers can override that startup allowance for their
-own cold-start profile. All of these are cancellable bounds, not a requirement
-to wait before cancelling a stalled request.
+disconnects are terminal so provider work is never replayed ambiguously. The one
+explicit exception is a provider error that reports WebSocket connection-lifetime
+exhaustion before any generated output: Ygg retires the socket, and the agent may
+retry the unchanged request through the HTTP fallback. Once generation
+has been observed, that retry path remains disabled. The coding product uses a
+fifteen-minute response-header default for built-in and custom routes; custom
+providers can override that startup allowance for their own cold-start profile.
+All of these are cancellable bounds, not a requirement to wait before cancelling
+a stalled request.
 
 Observed indices use a hash set and are sorted only during final assembly, keeping hostile many-part processing near-linear.
 

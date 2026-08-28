@@ -44,6 +44,7 @@ def build_ygg_argv(
     max_turns: int | None = None,
     bash_timeout_secs: int | None = None,
     workspace_trusted: bool = True,
+    telemetry_path: str | None = None,
 ) -> tuple[str, ...]:
     """Build the explicit headless Ygg argument vector.
 
@@ -66,6 +67,8 @@ def build_ygg_argv(
         and not 1 <= bash_timeout_secs <= _MAX_BASH_TIMEOUT_SECS
     ):
         raise ValueError("bash_timeout_secs must be between 1 and 3,600 seconds")
+    if telemetry_path is not None and not telemetry_path.strip():
+        raise ValueError("telemetry_path must not be empty")
 
     argv: list[str] = [binary, "--print"]
     if model:
@@ -79,6 +82,8 @@ def build_ygg_argv(
         argv.extend(("--max-turns", str(max_turns)))
     if bash_timeout_secs is not None:
         argv.extend(("--bash-timeout-secs", str(bash_timeout_secs)))
+    if telemetry_path is not None:
+        argv.extend(("--telemetry", telemetry_path))
     argv.extend(("--", instruction))
     return tuple(argv)
 
@@ -93,6 +98,7 @@ def build_ygg_command(
     max_turns: int | None = None,
     bash_timeout_secs: int | None = None,
     workspace_trusted: bool = True,
+    telemetry_path: str | None = None,
 ) -> YggCommand:
     """Build a shell-safe Ygg command."""
 
@@ -106,6 +112,7 @@ def build_ygg_command(
             max_turns=max_turns,
             bash_timeout_secs=bash_timeout_secs,
             workspace_trusted=workspace_trusted,
+            telemetry_path=telemetry_path,
         )
     )
 

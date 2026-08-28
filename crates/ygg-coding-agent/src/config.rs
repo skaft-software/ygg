@@ -453,6 +453,8 @@ pub struct Config {
     pub invocation_trusted_extensions: Vec<String>,
     /// One authoritative allowlist used for schema and implementation registration.
     pub tools: ToolPolicy,
+    /// Optional machine-readable agent telemetry output. Disabled by default.
+    pub telemetry: Option<PathBuf>,
     /// Load bounded `AGENTS.md` context files. Workspace files additionally
     /// require `workspace_trusted`.
     pub context_files: bool,

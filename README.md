@@ -474,7 +474,10 @@ ordinary and native compact requests. Ygg sends the Lite header, places tool
 schemas and developer instructions in input items, explicitly disables parallel
 tool calls, requests reasoning context across all turns, and removes only
 unsupported image-detail hints. This behavior is capability-driven rather than
-coupled to an endpoint name or OAuth plan.
+coupled to an endpoint name or OAuth plan. If a provider retires a long-lived
+Responses WebSocket before generation with a connection-lifetime error, Ygg
+retires that socket and retries the unchanged request through the HTTP fallback;
+ordinary post-send disconnects remain terminal.
 
 ### Reasoning without transcript noise
 
@@ -555,6 +558,8 @@ ygg sessions tag SESSION_ID rust local-model
 ygg sessions export SESSION_ID --output ./handoff.ygg-session.json
 ygg sessions delete SESSION_ID
 ygg sessions repair SESSION_ID
+
+ygg doctor
 ```
 
 - Session listing is read-only and uses lightweight bounded metadata scans.
@@ -621,9 +626,10 @@ ygg --mouse app
 ## Terminal theming
 
 Theme selection is disabled in v0.6.2. The TUI and graphical Serve frontend expose
-only Ygg's compiled default theme; legacy theme options are ignored or fall back
-to that theme. The theme schema is retained for a future release in
-[docs/themes.md](docs/themes.md).
+only Ygg's compiled default theme; that does **not** mean a fixed accent hue.
+The selected model's deterministic palette changes the atmosphere while layout,
+interaction grammar, and semantic status colours remain stable. See
+[docs/design/ygg-presentation.md](docs/design/ygg-presentation.md).
 
 ## Interactive command reference
 
@@ -712,6 +718,9 @@ offline = false
 # max_cost_microdollars = 500000
 # cost_warning_microdollars = 50000
 
+# Optional benchmark/debug telemetry. It is disabled unless explicitly set.
+# telemetry = "./artifacts/ygg-telemetry.jsonl"
+
 [compaction]
 mode = "local"
 threshold_fraction = 0.85
@@ -719,7 +728,15 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+
+Telemetry is opt-in and separate from durable sessions. `--telemetry PATH` writes
+owner-only `ygg.telemetry.v1` JSONL records for run boundaries, model request
+latency/TTFT, disjoint input/cache/output usage, retries, tool timings and
+repetition signals, compaction outcomes, and terminal status. It hashes the
+prompt identity and tool arguments instead of recording raw prompts, arguments,
+results, or provider payloads. See [docs/benchmarks/README.md](docs/benchmarks/README.md) for
+the schema and measurement methodology.
 
 For renderer diagnostics, `YGG_TUI_WRITE_LOG=/path/to/ansi.log` captures the
 raw ANSI stream written by the interactive TUI. An existing directory creates a
@@ -743,7 +760,7 @@ warning. New configuration should use `reasoning` alone.
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
-| Limits | `--bash-timeout-secs`, `--max-output-bytes` |
+| Limits | `--bash-timeout-secs`, `--max-output-bytes`, `--telemetry` |
 | Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
 | Pi compatibility | `pi install <PATH>`, `pi list` |
 | Customization | `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
@@ -952,6 +969,10 @@ third_party/              upstream license texts
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |
 | [Product contract](docs/design/ygg-coding-agent.md) | Bootstrap, modes, configuration, resources, and UX. |
 | [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and the compiled default presentation. |
+| [Presentation contract](docs/design/ygg-presentation.md) | Stable Ygg structure, adaptive model atmosphere, and durable/live/diagnostic layers. |
+| [Benchmarking](docs/benchmarks/README.md) | Optional telemetry, systems measurements, failure taxonomy, and shootout methodology. |
+| [Claims matrix](docs/benchmarks/claims.md) | Supported, preliminary, and unsupported product claims. |
+| [Beta protocol](docs/benchmarks/beta-protocol.md) | Opt-in first-ten-user daily-driver validation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |
 
 ## Built by Achu

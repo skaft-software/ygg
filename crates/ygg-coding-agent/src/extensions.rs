@@ -3219,6 +3219,7 @@ command = "does-not-exist"
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![name.to_owned()],
             tools: crate::config::ToolPolicy::default(),
+            telemetry: None,
             context_files: false,
             offline: true,
             workspace_trusted: false,

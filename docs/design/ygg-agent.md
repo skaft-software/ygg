@@ -12,6 +12,10 @@
 4. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
 5. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
 6. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
+7. Optional telemetry is an observer outside the session ledger. When installed,
+   it receives an opaque run-start hook and coarse request/tool/compaction
+   boundaries; it records hashes and bounded measurements, never raw prompts,
+   arguments, results, or provider payloads.
 
 ## Effect admission boundary
 

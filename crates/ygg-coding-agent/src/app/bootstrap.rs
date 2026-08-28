@@ -13,7 +13,7 @@ use sha2::{Digest as _, Sha256};
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
-    EffectBroker, EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry,
+    EffectBroker, EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry, TelemetryObserver,
 };
 use ygg_ai::{
     AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
@@ -3503,7 +3503,7 @@ pub fn model_catalog() -> anyhow::Result<ModelCatalog> {
     model_catalog_with_offline(false)
 }
 
-fn model_catalog_with_offline(offline: bool) -> anyhow::Result<ModelCatalog> {
+pub fn model_catalog_with_offline(offline: bool) -> anyhow::Result<ModelCatalog> {
     let mut catalog = base_model_catalog(offline)?;
     // Unit tests use explicit temporary credential stores and must never inspect
     // the developer's ambient HOME. Runtime offline mode still registers a
@@ -4011,7 +4011,7 @@ fn configured_extensions(
     model: &Model,
     reasoning: &ReasoningConfig,
     sessions: &SessionStore,
-) -> (ExtensionHost, ExecutableExtensions) {
+) -> anyhow::Result<(ExtensionHost, ExecutableExtensions)> {
     let mut extensions = ExtensionHost::new();
     extensions.load(&CoreTools);
     let tool_config = config.clone();
@@ -4019,6 +4019,9 @@ fn configured_extensions(
     extensions
         .set_tool_policy(move |name| model_supports_tools && tool_config.tool_available(name));
     extensions.finalize_tool_surface();
+    if let Some(path) = config.telemetry.as_deref() {
+        extensions.observe(TelemetryObserver::new(path, env!("CARGO_PKG_VERSION"))?);
+    }
     let executable_extensions = ExecutableExtensions::discover_and_start(
         config,
         session,
@@ -4027,7 +4030,7 @@ fn configured_extensions(
         sessions,
         &mut extensions,
     );
-    (extensions, executable_extensions)
+    Ok((extensions, executable_extensions))
 }
 
 fn terminal_goal_store(config: &Config) -> anyhow::Result<Arc<DurableGoalStore>> {
@@ -4171,7 +4174,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         config.workspace_trusted,
     ));
     let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions);
+        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions)?;
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);
@@ -4370,7 +4373,7 @@ pub fn rebuild_app(
         config.workspace_trusted,
     ));
     let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions);
+        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions)?;
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);

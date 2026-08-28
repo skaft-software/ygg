@@ -2,7 +2,26 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## 0.6.2 — 2026-08-27
+## Unreleased — v0.6.3-next
+
+### Added
+
+- Added opt-in owner-only `ygg.telemetry.v1` JSONL measurements for model
+  latency/TTFT, disjoint usage buckets, retries, tool timing, compaction, and
+  bounded run outcomes without recording prompts, arguments, results, or
+  provider payloads.
+- Added `ygg doctor` for read-mostly local prerequisite, provider, and model
+  visibility diagnostics.
+- Added reproducible systems-benchmark, beta-protocol, claims, and frozen
+  control artifacts under `docs/benchmarks/`.
+
+### Fixed
+
+- Retire a preferred Responses WebSocket when the provider reports a
+  connection-lifetime limit, then allow a bounded pre-generation retry through
+  the HTTP fallback instead of reusing the poisoned socket.
+- Keep repeated-call diagnostics out of same-response batches and preserve
+  machine-readable JSON tool results.
 
 ### Fixed
 

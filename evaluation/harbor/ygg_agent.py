@@ -80,6 +80,7 @@ class Ygg(BaseAgent):
         bash_timeout_secs: int | None = None,
         workspace_trusted: bool = True,
         agent_timeout_sec: float | None = None,
+        telemetry: bool = False,
         extra_env: dict[str, str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -101,6 +102,7 @@ class Ygg(BaseAgent):
         self._agent_timeout_sec = (
             max(1, ceil(agent_timeout_sec)) if agent_timeout_sec else None
         )
+        self._telemetry = telemetry
         self._binary = DEFAULT_BINARY_PATH
         self._installed_version: str | None = None
         self._last_conversion: SessionConversion | None = None
@@ -271,6 +273,7 @@ class Ygg(BaseAgent):
                 "max_turns": self._max_turns,
                 "bash_timeout_secs": self._bash_timeout_secs,
                 "workspace_trusted": self._workspace_trusted,
+                "telemetry": self._telemetry,
                 "timeout_sec": self._agent_timeout_sec,
             },
         )
@@ -358,6 +361,15 @@ class Ygg(BaseAgent):
                             "sha256": digest,
                         }
                     )
+        telemetry = self.logs_dir / "ygg-telemetry.jsonl"
+        if self._telemetry and telemetry.is_file():
+            files.append(
+                {
+                    "path": str(telemetry.relative_to(self.logs_dir)),
+                    "bytes": telemetry.stat().st_size,
+                    "sha256": hashlib.sha256(telemetry.read_bytes()).hexdigest(),
+                }
+            )
         self._write_json(
             "native-session-manifest.json",
             {
@@ -450,6 +462,7 @@ class Ygg(BaseAgent):
             max_turns=self._max_turns,
             bash_timeout_secs=self._bash_timeout_secs,
             workspace_trusted=self._workspace_trusted,
+            telemetry_path="/logs/agent/ygg-telemetry.jsonl" if self._telemetry else None,
         )
         self._write_invocation(command, instruction)
         self._last_conversion = None
