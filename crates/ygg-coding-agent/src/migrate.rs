@@ -30,6 +30,7 @@ const MAX_SCAN_HASH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PACKAGE_DIAGNOSTICS: usize = 256;
 const MAX_REPORT_DIAGNOSTICS: usize = 1024;
 const MAX_PACKAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EXTENSION_MANIFEST_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum MigrationCommand {
@@ -70,6 +71,20 @@ struct AnalysisBudget {
     files: usize,
     resources: usize,
     hashed_bytes: usize,
+}
+
+#[derive(Default)]
+struct ResourceTraversal {
+    active_extension_manifests: Vec<PathBuf>,
+    extension_manifest_resolution_stopped: bool,
+}
+
+impl ResourceTraversal {
+    fn extension_manifest_is_active(&self, path: &Path) -> bool {
+        self.active_extension_manifests
+            .iter()
+            .any(|active| active == path)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1224,16 +1239,29 @@ fn collect_package_resources(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ResourceReport> {
     let mut reports = Vec::new();
+    let mut traversal = ResourceTraversal::default();
     for kind in ResourceKind::ALL {
         let mut paths = match manifest {
             Some(manifest) => match manifest.entries(kind) {
-                Some(entries) => collect_manifest_entries(root, entries, kind, diagnostics),
-                None if filter.is_some() => {
-                    collect_resource_path(&root.join(kind.key()), kind, root, diagnostics)
+                Some(entries) => {
+                    collect_manifest_entries(root, entries, kind, &mut traversal, diagnostics)
                 }
+                None if filter.is_some() => collect_resource_path(
+                    &root.join(kind.key()),
+                    kind,
+                    root,
+                    &mut traversal,
+                    diagnostics,
+                ),
                 None => Vec::new(),
             },
-            None => collect_resource_path(&root.join(kind.key()), kind, root, diagnostics),
+            None => collect_resource_path(
+                &root.join(kind.key()),
+                kind,
+                root,
+                &mut traversal,
+                diagnostics,
+            ),
         };
         paths.sort();
         paths.dedup();
@@ -1262,8 +1290,39 @@ fn collect_manifest_entries(
     root: &Path,
     entries: &[String],
     kind: ResourceKind,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
+    let tracks_extension_manifest = kind == ResourceKind::Extension;
+    if tracks_extension_manifest {
+        if traversal.extension_manifest_resolution_stopped {
+            return Vec::new();
+        }
+        if traversal.active_extension_manifests.len() >= MAX_EXTENSION_MANIFEST_DEPTH {
+            traversal.extension_manifest_resolution_stopped = true;
+            diagnostics.push(Diagnostic::warning(
+                "manifest_depth_limit",
+                format!(
+                    "extension manifest resolution stopped at {MAX_EXTENSION_MANIFEST_DEPTH} nested directories"
+                ),
+                Some(root.to_path_buf()),
+            ));
+            return Vec::new();
+        }
+        if traversal.extension_manifest_is_active(root) {
+            traversal.extension_manifest_resolution_stopped = true;
+            diagnostics.push(Diagnostic::warning(
+                "manifest_cycle",
+                "extension manifest resolution revisited an active directory",
+                Some(root.to_path_buf()),
+            ));
+            return Vec::new();
+        }
+        traversal
+            .active_extension_manifests
+            .push(root.to_path_buf());
+    }
+
     let mut paths = Vec::new();
     if entries.len() > MAX_PATTERNS {
         diagnostics.push(Diagnostic::warning(
@@ -1292,12 +1351,24 @@ fn collect_manifest_entries(
             for candidate in walk_regular_files(root, diagnostics) {
                 let relative = relative_slash(root, &candidate);
                 if matcher.is_match(&relative) {
-                    paths.extend(collect_resource_path(&candidate, kind, root, diagnostics));
+                    paths.extend(collect_resource_path(
+                        &candidate,
+                        kind,
+                        root,
+                        traversal,
+                        diagnostics,
+                    ));
                 }
             }
         } else {
             match confined_join(root, entry) {
-                Ok(path) => paths.extend(collect_resource_path(&path, kind, root, diagnostics)),
+                Ok(path) => paths.extend(collect_resource_path(
+                    &path,
+                    kind,
+                    root,
+                    traversal,
+                    diagnostics,
+                )),
                 Err(error) => diagnostics.push(Diagnostic::warning(
                     "manifest_path",
                     error.to_string(),
@@ -1315,7 +1386,12 @@ fn collect_manifest_entries(
             break;
         }
     }
-    apply_manifest_overrides(root, paths, entries, diagnostics)
+    let paths = apply_manifest_overrides(root, paths, entries, diagnostics);
+    if tracks_extension_manifest {
+        let popped = traversal.active_extension_manifests.pop();
+        debug_assert_eq!(popped.as_deref(), Some(root));
+    }
+    paths
 }
 
 fn apply_manifest_overrides(
@@ -1434,8 +1510,15 @@ fn collect_top_level_resources(
     analysis_budget: &mut AnalysisBudget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let mut traversal = ResourceTraversal::default();
     for kind in ResourceKind::ALL {
-        let mut paths = collect_resource_path(&base.join(kind.key()), kind, base, diagnostics);
+        let mut paths = collect_resource_path(
+            &base.join(kind.key()),
+            kind,
+            base,
+            &mut traversal,
+            diagnostics,
+        );
         let resource_remaining = MAX_SCAN_RESOURCES.saturating_sub(analysis_budget.resources);
         if paths.len() > resource_remaining {
             diagnostics.push(Diagnostic::warning(
@@ -1485,8 +1568,12 @@ fn collect_resource_path(
     path: &Path,
     kind: ResourceKind,
     package_root: &Path,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
+    if kind == ResourceKind::Extension && traversal.extension_manifest_resolution_stopped {
+        return Vec::new();
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -1523,7 +1610,7 @@ fn collect_resource_path(
     }
 
     match kind {
-        ResourceKind::Extension => collect_extension_directory(path, diagnostics),
+        ResourceKind::Extension => collect_extension_directory(path, traversal, diagnostics),
         ResourceKind::Skill => collect_skill_directory(path, diagnostics),
         ResourceKind::Prompt | ResourceKind::Theme => walk_regular_files(path, diagnostics)
             .into_iter()
@@ -1536,9 +1623,18 @@ fn collect_resource_path(
     .collect()
 }
 
-fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<PathBuf> {
-    if let Some(entries) = extension_directory_entrypoints(path, diagnostics) {
-        return entries;
+fn collect_extension_directory(
+    path: &Path,
+    traversal: &mut ResourceTraversal,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PathBuf> {
+    if !traversal.extension_manifest_is_active(path) {
+        if let Some(entries) = extension_directory_entrypoints(path, traversal, diagnostics) {
+            return entries;
+        }
+    }
+    if let Some(entrypoint) = extension_index_entrypoint(path) {
+        return vec![entrypoint];
     }
     let mut entries = Vec::new();
     let read_dir = match std::fs::read_dir(path) {
@@ -1588,7 +1684,9 @@ fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -
         if metadata.is_file() && is_resource_file(&candidate, ResourceKind::Extension) {
             entries.push(candidate);
         } else if metadata.is_dir() && entry.file_name() != "node_modules" {
-            if let Some(mut nested) = extension_directory_entrypoints(&candidate, diagnostics) {
+            if let Some(mut nested) =
+                extension_directory_entrypoints(&candidate, traversal, diagnostics)
+            {
                 entries.append(&mut nested);
             }
         }
@@ -1598,6 +1696,7 @@ fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -
 
 fn extension_directory_entrypoints(
     path: &Path,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Vec<PathBuf>> {
     let package_json = read_package_json(&path.join("package.json"), diagnostics);
@@ -1606,26 +1705,33 @@ fn extension_directory_entrypoints(
         .and_then(|package| package.pi.as_ref())
         .and_then(|manifest| manifest.extensions.as_deref())
     {
-        let entries = collect_manifest_entries(path, entries, ResourceKind::Extension, diagnostics);
-        if !entries.is_empty() {
+        let entries = collect_manifest_entries(
+            path,
+            entries,
+            ResourceKind::Extension,
+            traversal,
+            diagnostics,
+        );
+        if traversal.extension_manifest_resolution_stopped || !entries.is_empty() {
             return Some(entries);
         }
     }
-    for name in [
+    extension_index_entrypoint(path).map(|entrypoint| vec![entrypoint])
+}
+
+fn extension_index_entrypoint(path: &Path) -> Option<PathBuf> {
+    [
         "index.ts",
         "index.tsx",
         "index.js",
         "index.mjs",
         "index.cjs",
-    ] {
-        let candidate = path.join(name);
-        if std::fs::symlink_metadata(&candidate)
-            .is_ok_and(|metadata| metadata.file_type().is_file())
-        {
-            return Some(vec![candidate]);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .map(|name| path.join(name))
+    .find(|candidate| {
+        std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_file())
+    })
 }
 
 fn collect_skill_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<PathBuf> {
@@ -2811,6 +2917,82 @@ mod tests {
         );
         let changed = scan_pi(&options);
         assert_ne!(changed.packages[0].source_hash, original_hash);
+    }
+
+    #[test]
+    fn manifest_root_extension_resolves_index_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = options(temp.path());
+        let package = temp.path().join("self-extension");
+        let source = serde_json::to_string(package.to_str().unwrap()).unwrap();
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(r#"{{"packages":[{source}]}}"#),
+        );
+        write(
+            &package.join("package.json"),
+            r#"{"name":"self-extension","version":"1.0.0","pi":{"extensions":["./"]}}"#,
+        );
+        write(
+            &package.join("index.ts"),
+            "export default (pi) => pi.registerTool({ name: 'self' });\n",
+        );
+
+        let report = scan_pi(&options);
+
+        let package_root = fs::canonicalize(&package).unwrap();
+        let package_report = &report.packages[0];
+        assert_eq!(package_report.resources.len(), 1);
+        assert_eq!(
+            package_report.resources[0].path,
+            package_root.join("index.ts")
+        );
+        assert!(package_report.resources[0].enabled);
+        assert_eq!(package_report.extensions.len(), 1);
+        assert!(!package_report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "manifest_cycle"));
+
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(r#"{{"packages":[{{"source":{source},"autoload":false}}]}}"#),
+        );
+        let disabled = scan_pi(&options);
+        assert_eq!(disabled.packages[0].resources.len(), 1);
+        assert!(!disabled.packages[0].resources[0].enabled);
+        assert!(disabled.packages[0].extensions.is_empty());
+    }
+
+    #[test]
+    fn bounds_nested_extension_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("manifest-chain");
+        let mut current = root.clone();
+        for _ in 0..=MAX_EXTENSION_MANIFEST_DEPTH {
+            write(
+                &current.join("package.json"),
+                r#"{"pi":{"extensions":["next"]}}"#,
+            );
+            current = current.join("next");
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let mut traversal = ResourceTraversal::default();
+        let mut diagnostics = Vec::new();
+
+        let paths = collect_resource_path(
+            &root,
+            ResourceKind::Extension,
+            &root,
+            &mut traversal,
+            &mut diagnostics,
+        );
+
+        assert!(paths.is_empty());
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "manifest_depth_limit"));
+        assert!(traversal.active_extension_manifests.is_empty());
     }
 
     #[test]
