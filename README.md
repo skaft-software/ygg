@@ -1,14 +1,14 @@
 <p align="center">
   <a href="https://skaft.org/ygg">
-    <img src="docs/assets/ygg-braille.svg" alt="Yggdrasil braille tree app icon" width="180">
+    <img src="docs/assets/ygg-braille.svg" alt="ygg braille tree app icon" width="180">
   </a>
 </p>
 
-<h1 align="center">yggdrasil</h1>
+<h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>Tiny coding agent. Serious throughput.</strong><br>
-  Run more agents without sacrificing your machine.
+  <strong>Local-first coding agent with durable, inspectable sessions.</strong><br>
+  Model choice, explicit control, and verifiable engineering in one Rust CLI.
 </p>
 
 <p align="center">
@@ -25,15 +25,14 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-Yggdrasil is a small, blazing fast local-first coding agent written in Rust. The `ygg` CLI
-works with local OpenAI-compatible servers and cloud providers, keeps durable
+ygg is a small, local-first coding agent written in Rust. The `ygg` CLI works
+with local OpenAI-compatible servers and cloud providers, keeps durable
 inspectable sessions on disk, and puts optional capabilities outside its minimal
-core so it stays out of the model's way. Ygg is amongst the fastest coding agent harnesses in the world,
-performing tasks at quality-parity while using less tokens to achieve them.
+core so it stays out of the model's way.
 
 ## Install
 
-Yggdrasil supports macOS and GNU/Linux x86-64 and requires
+ygg supports macOS and GNU/Linux x86-64 and requires
 [ripgrep](https://github.com/BurntSushi/ripgrep). The version-pinned installer
 verifies the release archive and installs `ygg` and `ygg-host` under
 `~/.local/bin`:
@@ -60,7 +59,7 @@ maximum reasoning, 89 tasks × 5 trials:
 | Result scope | Score |
 | --- | ---: |
 | Raw Harbor verifier | **87.87% — 391/445** |
-| Primary independent rubric audit | **86.97% — 387/445** |
+| Primary local surrogate/manual audit | **86.97% — 387/445** |
 | Strict audit sensitivity | **86.52% — 385/445** |
 | Audited Pass@5 | **97.75% — 87/89** |
 
@@ -69,13 +68,14 @@ successes, followed by manual review. It is **not official Terminal-Bench
 maintainer adjudication**, and the campaign was not rerun for v0.6.3. Read the
 [methodology, artifact hashes, exclusions, and reproduction guide](docs/benchmarks/tb21-v0.6.2/README.md).
 
-In the matched published GPT-5.6 Sol/max run, Codex scored **83.37% raw**
-(inferred from its published official result plus 32 exclusions); Ygg scored
-**87.87% raw**. This is a raw aggregate comparison across different run
-dates/provider snapshots—not a comparison between Ygg's surrogate audit and
-Codex's official maintainer adjudication.
+In a published run with the same GPT-5.6 Sol/max model and 89-task × 5-trial
+shape, Codex scored **83.37% raw** (inferred from its published official result
+plus 32 exclusions); Ygg scored **87.87% raw**. This preliminary raw aggregate
+comparison spans different run dates and potential provider snapshots. It does
+not compare Ygg's local audit with Codex's official maintainer adjudication or
+establish an official placement.
 
-## Why Yggdrasil
+## Why ygg
 
 - **Minimal native core:** the CLI and host ship as Rust binaries; normal use needs no language runtime.
 - **Local models are first-class:** custom endpoints, offline startup, discovery,
@@ -975,7 +975,6 @@ third_party/              upstream license texts
 | [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and the compiled default presentation. |
 | [Presentation contract](docs/design/ygg-presentation.md) | Stable Ygg structure, adaptive model atmosphere, and durable/live/diagnostic layers. |
 | [Benchmarking](docs/benchmarks/README.md) | Optional telemetry, systems measurements, failure taxonomy, and shootout methodology. |
-| [Claims matrix](docs/benchmarks/claims.md) | Supported, preliminary, and unsupported product claims. |
 | [Beta protocol](docs/benchmarks/beta-protocol.md) | Opt-in first-ten-user daily-driver validation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |
 

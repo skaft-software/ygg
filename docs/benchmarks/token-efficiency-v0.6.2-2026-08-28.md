@@ -267,6 +267,11 @@ This is semantically comparable to Ygg's reported Harbor total, not to fresh inp
 | Cache share of input | 92.72% | 92.80% | 95.53% |
 | Mean duration | 458.2s full / 417.1s agent | same | 431.0s full |
 
+The duration row does **not** support a speed-superiority claim. Ygg's 417.1-second
+agent clock is not comparable to Codex's 431.0-second full-trial clock, while the
+two full-trial aggregates were collected on different dates and potential
+provider snapshots without matched harness/session conditions.
+
 On reported aggregates, Ygg used **16.2% fewer processed tokens per raw success**; including Ygg's post-timeout native usage, it used **15.1% fewer**. Ygg also had a 4.5-point higher raw pass rate.
 
 Do not overstate this. Codex per-trial trajectories/distributions are unavailable, its published run predates Ygg's, exact provider snapshots may differ, missing usage on errored trials would be counted as zero, and Codex received an official 32-trial reward-hack adjudication while Ygg's separate local audit had only four confirmed exclusions and two ambiguous cases. The raw token normalization is apples-to-apples; adjudicated efficiency is not.

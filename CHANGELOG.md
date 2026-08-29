@@ -12,9 +12,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   provider payloads.
 - Added `ygg doctor` for read-mostly local prerequisite, provider, and model
   visibility diagnostics.
-- Added reproducible systems-benchmark and Harbor analysis tooling, a
-  four-state claims ledger, and a compact checksummed Terminal-Bench 2.1
-  evidence package with explicit surrogate-adjudication limits.
+- Added reproducible systems-benchmark and Harbor analysis tooling and a compact
+  checksummed Terminal-Bench 2.1 evidence package with explicit
+  surrogate-adjudication limits.
 
 ### Changed
 
