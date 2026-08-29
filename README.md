@@ -25,10 +25,11 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-Yggdrasil is a small, local-first coding agent written in Rust. The `ygg` CLI
+Yggdrasil is a small, blazing fast local-first coding agent written in Rust. The `ygg` CLI
 works with local OpenAI-compatible servers and cloud providers, keeps durable
 inspectable sessions on disk, and puts optional capabilities outside its minimal
-core so it stays out of the model's way.
+core so it stays out of the model's way. Ygg is amongst the fastest coding agent harnesses in the world,
+performing tasks at quality-parity while using less tokens to achieve them.
 
 ## Install
 
