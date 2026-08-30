@@ -4,6 +4,16 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ## Unreleased
 
+### Fixed
+
+- Correct GPT-5.6 Luna and Terra pricing across the OpenAI, OpenCode, and Codex
+  pricing tables to OpenAI's published standard costs ($0.20/$1.20/$0.02/$0.25
+  and $2/$12/$0.20/$2.50 per million tokens, with matching long-context tiers);
+  previously displayed session costs were about 5x too high for Luna.
+- Preserve GPT-5.4 Pro and GPT-5.5 Pro long-context pricing on Codex routes,
+  exclude OpenAI's rejected base `gpt-5.6` alias, and refresh the checked-in
+  models.dev pricing and display-name snapshots together.
+
 ### Added
 
 - Added `/answer [instruction]` to request an immediate final response from
@@ -18,8 +28,7 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Performance
 
-- Honor the model's advertised parallel-tool-call capability on Responses Lite
-  ordinary and compact requests. Existing host admission still overlaps only
+- Keep the Responses Lite wire contract serial while host admission overlaps
   explicitly parallel-safe pure/workspace-read calls; arbitrary shell and
   mutating effects remain ordered.
 

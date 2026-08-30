@@ -32,8 +32,8 @@ endpoint identity or session-affinity format:
   by the `functions` namespace, rather than top-level `tools`;
 - carry nonempty instructions as a developer message input item rather than
   top-level `instructions`;
-- emit an explicit `parallel_tool_calls` value: use the model's advertised
-  capability when tools are present, and `false` when the request has no tools;
+- emit `parallel_tool_calls: false` explicitly even when model metadata advertises
+  parallel support, as required by the internal Lite route;
 - include `reasoning.context: "all_turns"` alongside any advertised effort; and
 - remove only `detail` from `input_image` parts in messages and function/custom
   tool outputs while retaining every other opaque field.
@@ -87,7 +87,9 @@ Endpoints resolve static, environment, or dynamic credentials immediately before
 
 Normal builds generate display-name aliases and trusted provider pricing only
 from the checked-in `models/models-dev-names.json` and
-`models/models-dev-pricing.json` snapshots. They never contact the network.
+`models/models-dev-pricing.json` snapshots. They never contact the network. The
+explicit maintainer script `scripts/refresh-models-dev-pricing.py` refreshes both
+snapshots together and excludes provider-known dead aliases before writing them.
 Pricing is provider-scoped, represented as integer microdollars per million
 tokens, and is used as a fallback for discovered built-in routes; explicit
 `CatalogConfig` pricing remains authoritative. Runtime discovery is a
