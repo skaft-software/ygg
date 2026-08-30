@@ -188,12 +188,11 @@ model-free.
 ### Compatibility process
 
 The generated `ygg pi install` link hosts a deliberately bounded subset of Pi's
-`ExtensionAPI` through the persistent `ygg-pi-compat` process. The bridge can
-load multiple Pi sources into one real `ExtensionRunner`, preserving their local
-event bus, `globalThis`, and shared registries, although the current install
-command still generates one inert link per selected source. Consolidating an
-entire reviewed Pi setup into one locked runtime remains part of the compatibility
-roadmap.
+`ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated `--with`
+arguments record an ordered, source-fingerprinted set in one aggregate lock and
+load those sources through one real `ExtensionRunner`, preserving their local
+event bus, `globalThis`, and shared registries. Automatically selecting and
+locking an entire reviewed Pi setup remains future migration work.
 
 Unsupported Pi APIs must raise a clear compatibility error. The bridge must not
 silently discard a policy, mutation, lifecycle, or UI call. Static and runtime
@@ -249,9 +248,10 @@ The intended promise is:
 > compatible subset through an explicitly trusted bridge, and identify exactly
 > what still requires a port.
 
-Today the zero-token scanner and an explicitly trusted, pinned compatibility
-link are implemented. The bridge runs a tested subset of Pi 0.84.4 tools,
-commands, dialogs, context, and lifecycle behavior; deterministic resource apply,
-exact replacement recipes, consolidated whole-setup runtime, session/provider
-mutation, and arbitrary Pi component parity remain unfinished and are reported
-rather than silently emulated.
+Today the zero-token scanner and explicitly trusted, pinned compatibility links
+are implemented. The bridge runs a tested subset of Pi 0.84.4 tools, commands,
+dialogs, context, and lifecycle behavior; explicit ordered source sets can share
+one locked runtime. Deterministic resource apply, exact replacement recipes,
+automatic whole-setup selection, session/provider mutation, and arbitrary Pi
+component parity remain unfinished and are reported rather than silently
+emulated.
