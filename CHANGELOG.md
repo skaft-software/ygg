@@ -22,9 +22,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
-- Keep authenticated Codex routes on a 272K active-context working set by
-  default, while retaining the provider's advertised maximum and allowing
-  `compaction.max_active_tokens = 0` to disable the absolute cap.
+- Keep authenticated Codex routes on the provider's full advertised context
+  window by default for in-context learning; `compaction.max_active_tokens`
+  (for example 272000) optionally constrains the active working set.
 
 ### Performance
 

@@ -2851,11 +2851,10 @@ const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
-/// Keep the default active Codex working set in the short-context tier. Live
-/// discovery still advertises the provider's complete capacity; with the
-/// default fractional threshold, users can opt into it with
-/// `compaction.max_active_tokens = 0`.
-const CODEX_DEFAULT_ACTIVE_CONTEXT_TOKENS: u64 = 272_000;
+/// Optional absolute active-context ceiling for Codex routes. There is no
+/// route default: the full provider-advertised window (872K, 1M on Pro) is
+/// available for in-context learning, and users can constrain the working
+/// set with `compaction.max_active_tokens` (for example 272_000).
 const CODEX_MODEL_CACHE_VERSION: u8 = 2;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
@@ -2864,14 +2863,8 @@ const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
 pub(crate) fn effective_compaction_threshold_fraction(config: &Config, model: &Model) -> f64 {
-    let route_default = (model.endpoint.id.0 == crate::auth::codex::ENDPOINT_ID)
-        .then_some(CODEX_DEFAULT_ACTIVE_CONTEXT_TOKENS);
-    let max_active_tokens = match config.compaction.max_active_tokens {
-        Some(0) => None,
-        Some(tokens) => Some(tokens),
-        None => route_default,
-    };
-    let Some(max_active_tokens) = max_active_tokens else {
+    let Some(max_active_tokens) = config.compaction.max_active_tokens.filter(|tokens| *tokens > 0)
+    else {
         return config.compaction.threshold_fraction;
     };
     let context_window = model.spec.limits.context_window.max(1);

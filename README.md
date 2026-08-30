@@ -582,14 +582,14 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the complete next provider-visible request before every model turn. The generic default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer. Authenticated Codex routes additionally keep a 272K active working set by default—even when live discovery advertises a larger provider maximum—so long investigations compact before repeated prompt replay dominates wall time; with the default `threshold_fraction`, set `max_active_tokens = 0` to opt into the full advertised window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
+ygg estimates the complete next provider-visible request before every model turn. The generic default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer. Authenticated Codex routes use the provider's full advertised window (872K, 1M on Pro) for in-context learning; set `max_active_tokens` (for example 272000) to constrain the active working set so long investigations compact before repeated prompt replay dominates wall time. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
 mode = "local" # disabled, local, or native-responses
 threshold_fraction = 1.0
-# Optional absolute active-context threshold. Codex defaults to 272000;
-# zero disables that absolute cap (threshold_fraction still applies).
+# Optional absolute active-context threshold. Codex routes use the full
+# advertised window when unset; zero is equivalent to unsetting.
 # max_active_tokens = 272000
 keep_recent_tokens = 20000
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
@@ -735,8 +735,8 @@ offline = false
 [compaction]
 mode = "local"
 threshold_fraction = 1.0
-# Codex routes default to a 272K active working set. Set zero to disable
-# that absolute cap while retaining threshold_fraction.
+# Codex routes use the full advertised window by default. Set a value to
+# constrain the active working set; zero is equivalent to unsetting.
 # max_active_tokens = 272000
 keep_recent_tokens = 20000
 # compact_model = "provider/model"
