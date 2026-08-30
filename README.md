@@ -51,7 +51,7 @@ No Rust toolchain is needed. Prebuilt binaries cover GNU/Linux x86-64, macOS
 x86-64, and macOS Apple silicon; Linux musl is not included. Use the same binary
 with [cloud providers](#use-a-cloud-model) or [your own local endpoint](#use-custom-openai-compatible-providers).
 
-## Current proof
+## Performance
 
 On the frozen Ygg v0.6.2 Terminal-Bench 2.1 campaign with GPT-5.6 Sol at
 maximum reasoning, 89 tasks × 5 trials:
