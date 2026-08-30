@@ -16,7 +16,7 @@ approval, and terminal-outcome semantics shared by these mechanics.
   screen and saved lines before replaying the complete frame. PageUp transfers
   rendering to the bounded, application-owned semantic viewport for the rest of
   that shell. Explicit `--mouse app` selects that viewport from startup.
-- Ygg v0.6.4 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely. Its model-aware accent palette changes atmosphere without changing layout or semantic status colours.
+- Ygg v0.6.5 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely. Its model-aware accent palette changes atmosphere without changing layout or semantic status colours.
 - Raw mode, bracketed paste, keyboard enhancements, and mouse reporting are
   enabled only when supported and restored idempotently. Matching Pi, every
   interactive frame is bracketed by CSI 2026 synchronized-output markers;
@@ -99,8 +99,9 @@ Slash-command discovery, file mentions, and filesystem completion render inline
 directly below the composer. While matches are visible, the suggestion surface
 temporarily replaces the model and token status row; the status returns as soon
 as completion closes. Matches use compact rows with action hints in a footer;
-the active match and hint keys use Ygg's interaction accent rather than provider
-provenance colour.
+the active match and hint keys use the active model's adaptive accent, matching
+picker focus and the composer without treating the focused item as provider
+provenance.
 Executable-extension status/header/footer contributions never occupy that row.
 Generic presentation snapshots do not create persistent chrome. The first-party
 `ygg-subagents` observation surface is the bounded exception: while an owning
@@ -245,8 +246,9 @@ but cannot be resumed into a differently scoped live App. Responsive picker
 geometry uses the same column-0 marker, column-2 primary text, and column-4
 detail grid as the composer and transcript: narrow terminals use compact rows,
 regular widths stack title and subdued metadata, and widths of at least 112
-columns may return to side-by-side columns. Selection uses the stable Ygg accent
-and preserves focus by semantic item index across filtering and resize.
+columns may return to side-by-side columns. Selection and active scope controls
+use the active model's adaptive accent and preserve focus by semantic item index
+across filtering and resize.
 
 `/fork` opens a bounded active-branch user-message picker, including a
 whole-conversation head row, and restores the selected prompt into the new

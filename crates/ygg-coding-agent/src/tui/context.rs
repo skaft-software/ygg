@@ -2,41 +2,42 @@ use ygg_agent::InputPart;
 
 use crate::app::bootstrap::effective_compaction_threshold_fraction;
 use crate::app::App;
-use crate::compaction::{
-    context_window, estimate_messages_tokens, estimate_next_request_tokens, estimate_pending_tokens,
-};
-use crate::config::CompactionMode;
+use crate::presentation::ModelDisplayMetadata;
 use crate::tui::theme::YggTheme;
 use crate::tui::view::{fit_line, sanitize_for_terminal};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextKind {
-    System,
-    Framing,
-    Tools,
-    Messages,
-    Pending,
-    Adjustment,
-    TokenizerAdjustment,
-    Output,
+    Runtime,
+    Instructions,
+    ToolResults,
+    Conversation,
+    Attachments,
+    Summary,
+    Other,
     Free,
     Buffer,
 }
 
 impl ContextKind {
+    // Keep the existing context palette channels stable while the report moves
+    // from transport-shaped estimates to the agent's semantic breakdown.
     fn role(self) -> &'static str {
         match self {
-            Self::System => "context_system",
-            Self::Framing => "context_framing",
-            Self::Tools => "context_tools",
-            Self::Messages => "context_messages",
-            Self::Pending => "context_pending",
-            Self::Adjustment => "context_adjustment",
-            Self::TokenizerAdjustment => "context_tokenizer_adjustment",
-            Self::Output => "context_output",
+            Self::Runtime => "context_system",
+            Self::Instructions => "context_framing",
+            Self::ToolResults => "context_tools",
+            Self::Conversation => "context_messages",
+            Self::Attachments => "context_pending",
+            Self::Summary => "context_adjustment",
+            Self::Other => "context_tokenizer_adjustment",
             Self::Free => "context_free",
             Self::Buffer => "context_buffer",
         }
+    }
+
+    fn requires_visible_cell(self) -> bool {
+        self != Self::Free
     }
 }
 
@@ -47,129 +48,95 @@ struct ContextSlice {
     tokens: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GridCell {
+    kind: ContextKind,
+    partial: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CellAllocation {
+    cells: usize,
+    minimum: usize,
+    numerator: u128,
+}
+
 /// Request-context estimate captured at the instant `/context` is invoked.
 /// It stores semantic quantities, not rendered rows, so resize and theme
 /// changes can re-render the same report without stale colours or geometry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContextReport {
+    model_display: String,
     model: String,
     context_window: u64,
     estimated_input: u64,
-    output_reserve: u64,
-    compaction_mode: CompactionMode,
-    auto_compact_threshold: u64,
-    keep_recent_tokens: u64,
     slices: Vec<ContextSlice>,
 }
 
 impl ContextReport {
-    pub(crate) fn capture(app: &App, pending: &[InputPart]) -> Self {
-        let session = app.agent.session();
-        let messages = session
-            .context_ref()
-            .map(|messages| estimate_messages_tokens(&messages))
-            .unwrap_or_default();
-        let pending_tokens = estimate_pending_tokens(pending);
-        let structural_fallback = estimate_next_request_tokens(app, &[]);
-        let pending_delta =
-            estimate_next_request_tokens(app, pending).saturating_sub(structural_fallback);
-        let estimate = app.agent.request_context_estimate().ok();
-        let structural_input = estimate
-            .map(|estimate| estimate.structural_tokens)
-            .unwrap_or(structural_fallback)
-            .saturating_add(pending_delta);
-        let estimated_input = estimate
-            .map(|estimate| estimate.input_tokens)
-            .unwrap_or(structural_fallback)
-            .saturating_add(pending_delta);
-        let known_input = app
-            .system_tokens
-            .saturating_add(app.current_tool_schema_tokens())
-            .saturating_add(messages)
-            .saturating_add(pending_tokens);
-        let framing = structural_input.saturating_sub(known_input);
-        let categorized_input = known_input.saturating_add(framing);
-        let provider_adjustment = estimated_input.saturating_sub(categorized_input);
-        let tokenizer_adjustment = categorized_input.saturating_sub(estimated_input);
-        let context_window = context_window(&app.model);
-        let output_reserve = app.agent.compaction_reserve_tokens();
-        let compaction_mode = app.config.compaction.mode;
-        let auto_compact_enabled = compaction_mode.enabled();
+    pub(crate) fn capture(app: &App, _pending: &[InputPart]) -> Self {
+        let breakdown = app
+            .agent
+            .request_context_breakdown()
+            .expect("an active application has a valid context branch");
+        let context_window = breakdown.context_limit;
+        let estimated_input = breakdown.total_tokens;
+        let auto_compact_enabled = app.config.compaction.mode.enabled();
         let threshold_fraction = effective_compaction_threshold_fraction(&app.config, &app.model);
-        let keep_recent_tokens = app.config.compaction.keep_recent_tokens;
         let auto_compact_threshold = if auto_compact_enabled {
             ((context_window as f64) * threshold_fraction).floor() as u64
         } else {
             context_window
         };
-        let free =
-            auto_compact_threshold.saturating_sub(estimated_input.saturating_add(output_reserve));
+        let free = auto_compact_threshold.saturating_sub(estimated_input);
         let buffer = if auto_compact_enabled {
             context_window.saturating_sub(auto_compact_threshold)
         } else {
             0
         };
-        // Semantic prompt order is stable across the three codecs: system and
-        // provider instruction framing, tool-definition metadata, then the
-        // chronological message stream. Active skill bodies are already owned
-        // by either the composed system prompt or their durable user/tool-result
-        // messages, so a standalone skill slice would double-count them and
-        // falsely claim a universal position. Capacity regions at the end are
-        // not yet seen by the model.
+
+        // ContextBreakdown is the single accounting source. The optional
+        // buffer remains product-owned because it marks capacity deliberately
+        // kept beyond the active auto-compaction window.
         let mut slices = vec![
             ContextSlice {
-                kind: ContextKind::System,
-                label: "System prompt".into(),
-                tokens: app.system_tokens,
+                kind: ContextKind::Runtime,
+                label: "Runtime framing and tools".into(),
+                tokens: breakdown.system_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Framing,
-                label: "Provider framing".into(),
-                tokens: framing,
+                kind: ContextKind::Instructions,
+                label: "System instructions".into(),
+                tokens: breakdown.instruction_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Tools,
-                label: "Tool schemas".into(),
-                tokens: app.current_tool_schema_tokens(),
+                kind: ContextKind::ToolResults,
+                label: "Tool calls and results".into(),
+                tokens: breakdown.tool_result_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Messages,
-                // Loaded skill-resource bodies enter provider context through
-                // their durable tool-result messages, so they are counted here
-                // once rather than invented as a second context category.
-                label: "Messages and tool results".into(),
-                tokens: messages,
+                kind: ContextKind::Conversation,
+                label: "Conversation".into(),
+                tokens: breakdown.conversation_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Pending,
-                label: "Pending input".into(),
-                tokens: pending_tokens,
+                kind: ContextKind::Attachments,
+                label: "Attachments".into(),
+                tokens: breakdown.attachment_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Adjustment,
-                // Provider reconciliation is authoritative but does not expose
-                // where the extra tokens land. Keep it at the end of observed
-                // input instead of inventing a position inside the prompt.
-                label: "Provider token delta".into(),
-                tokens: provider_adjustment,
+                kind: ContextKind::Summary,
+                label: "Compaction summary".into(),
+                tokens: breakdown.compaction_summary_tokens,
             },
             ContextSlice {
-                kind: ContextKind::TokenizerAdjustment,
-                label: "Tokenizer adjustment".into(),
-                tokens: tokenizer_adjustment,
-            },
-            ContextSlice {
-                kind: ContextKind::Output,
-                label: "Compaction reserve".into(),
-                tokens: output_reserve,
+                kind: ContextKind::Other,
+                label: "Provider/unattributed".into(),
+                tokens: breakdown.other_tokens,
             },
             ContextSlice {
                 kind: ContextKind::Free,
-                label: if auto_compact_enabled {
-                    "Free before auto-compact".into()
-                } else {
-                    "Free space".into()
-                },
+                label: "Free space".into(),
                 tokens: free,
             },
         ];
@@ -181,136 +148,263 @@ impl ContextReport {
             });
         }
 
+        let model_display = ModelDisplayMetadata::resolve(&app.model.spec).name;
         Self {
+            model_display,
             model: app.model.spec.id.0.clone(),
             context_window,
             estimated_input,
-            output_reserve,
-            compaction_mode,
-            auto_compact_threshold,
-            keep_recent_tokens,
             slices,
         }
     }
 
     pub(crate) fn render(&self, theme: &YggTheme, width: u16) -> Vec<String> {
         let width = width.max(1);
-        let mut lines = vec![fit_line(
-            &theme.bold(&format!("Context · {}", sanitize_for_terminal(&self.model))),
-            width,
-        )];
-        let committed = self.estimated_input.saturating_add(self.output_reserve);
-        lines.push(fit_line(
-            &format!(
-                "~{} input + {} compaction reserve / {}",
-                compact_tokens(self.estimated_input),
-                compact_tokens(self.output_reserve),
-                compact_tokens(self.context_window)
-            ),
-            width,
-        ));
-        let policy = if self.compaction_mode.enabled() {
-            format!(
-                "auto-compact {} at {} ({:.0}%) · keeps ~{} recent tokens",
-                self.compaction_mode.label(),
-                compact_tokens(self.auto_compact_threshold),
-                if self.context_window == 0 {
-                    0.0
-                } else {
-                    self.auto_compact_threshold as f64 * 100.0 / self.context_window as f64
-                },
-                compact_tokens(self.keep_recent_tokens)
-            )
+        let mut lines = vec![fit_line(&theme.bold("Context Usage"), width)];
+        let (columns, _) = grid_dimensions(self.context_window);
+        let spaced_grid = usize::from(width) >= columns.saturating_mul(2);
+        let grid_width = if spaced_grid {
+            columns.saturating_mul(2)
         } else {
-            "auto-compact off".to_owned()
+            columns
         };
-        lines.push(fit_line(&theme.fg("muted", &policy), width));
-        if committed > self.auto_compact_threshold {
-            lines.push(fit_line(
-                &theme.fg(
-                    "warning",
-                    &format!(
-                        "~{} over the current compaction line",
-                        compact_tokens(committed - self.auto_compact_threshold)
-                    ),
+        let gap = 3usize;
+        let side_by_side = usize::from(width) >= grid_width.saturating_add(gap + 52);
+        let detail_width = if side_by_side {
+            usize::from(width).saturating_sub(grid_width + gap).max(1) as u16
+        } else {
+            width
+        };
+        let details = self.render_details(theme, detail_width);
+        let grid = self.render_grid(theme, width, spaced_grid);
+
+        if side_by_side {
+            let row_count = grid.len().max(details.len());
+            for row in 0..row_count {
+                let left = grid.get(row).map(String::as_str).unwrap_or("");
+                let right = details.get(row).map(String::as_str).unwrap_or("");
+                let left = pad_visible(left, grid_width);
+                lines.push(fit_line(
+                    &format!("{left}{}{right}", " ".repeat(gap)),
+                    width,
+                ));
+            }
+        } else {
+            lines.extend(grid.into_iter().map(|line| fit_line(&line, width)));
+            lines.push(String::new());
+            lines.extend(details);
+        }
+        lines
+    }
+
+    fn render_details(&self, theme: &YggTheme, width: u16) -> Vec<String> {
+        let percent = if self.context_window == 0 {
+            0.0
+        } else {
+            self.estimated_input as f64 * 100.0 / self.context_window as f64
+        };
+        let mut lines = vec![
+            fit_line(
+                &theme.bold(&sanitize_for_terminal(&self.model_display)),
+                width,
+            ),
+            fit_line(&sanitize_for_terminal(&self.model), width),
+            fit_line(
+                &format!(
+                    "{}/{} tokens ({percent:.0}%)",
+                    compact_tokens(self.estimated_input),
+                    compact_tokens(self.context_window)
                 ),
                 width,
-            ));
-        }
-        lines.push(String::new());
-        lines.push(self.render_bar(theme, width));
-        lines.push(String::new());
-
-        let visible = self
-            .slices
-            .iter()
-            .filter(|slice| slice.tokens > 0 || slice.kind == ContextKind::Pending)
-            .collect::<Vec<_>>();
-        // Keep the context details as one left-anchored list at every width.
-        // A wide terminal must not turn later rows into a separately anchored
-        // right-hand column.
+            ),
+            String::new(),
+            fit_line(&theme.fg("muted", "Estimated usage by category"), width),
+        ];
         lines.extend(
-            visible
-                .into_iter()
+            self.slices
+                .iter()
+                .filter(|slice| slice.tokens > 0)
                 .map(|slice| render_slice(slice, theme, width, self.context_window)),
         );
         lines
     }
 
-    fn render_bar(&self, theme: &YggTheme, width: u16) -> String {
-        let bar_width = usize::from(width.saturating_sub(2)).clamp(1, 72);
-        let glyph = if theme.unicode() { "━" } else { "=" };
-        let mut used_cells = 0usize;
-        let mut cumulative = 0u64;
-        let mut bar = String::new();
-        for slice in self.bar_slices() {
-            cumulative = cumulative.saturating_add(slice.tokens);
-            let boundary = if self.context_window == 0 {
-                bar_width
-            } else {
-                ((u128::from(cumulative.min(self.context_window)) * bar_width as u128)
-                    / u128::from(self.context_window)) as usize
-            };
-            let cells = boundary.saturating_sub(used_cells);
-            if cells > 0 {
-                bar.push_str(&theme.fg(slice.kind.role(), &glyph.repeat(cells)));
-                used_cells = boundary;
-            }
-            if used_cells == bar_width {
-                break;
-            }
-        }
-        if used_cells < bar_width {
-            bar.push_str(&theme.fg("muted", &glyph.repeat(bar_width - used_cells)));
-        }
-        fit_line(&bar, width)
+    fn render_grid(&self, theme: &YggTheme, width: u16, spaced: bool) -> Vec<String> {
+        let (columns, _) = grid_dimensions(self.context_window);
+        self.grid_cells()
+            .chunks(columns)
+            .map(|row| {
+                let mut line = String::new();
+                for (index, cell) in row.iter().enumerate() {
+                    line.push_str(&render_grid_cell(*cell, theme));
+                    if spaced && (index + 1 < row.len() || usize::from(width) >= columns * 2) {
+                        line.push(' ');
+                    }
+                }
+                line
+            })
+            .collect()
     }
 
-    fn bar_slices(&self) -> impl Iterator<Item = &ContextSlice> {
-        self.slices
+    fn grid_cells(&self) -> Vec<GridCell> {
+        let (columns, rows) = grid_dimensions(self.context_window);
+        let cell_count = columns.saturating_mul(rows).max(1);
+        let slice_total = self
+            .slices
             .iter()
-            .filter(|slice| slice.tokens > 0 && slice.kind != ContextKind::TokenizerAdjustment)
+            .map(|slice| slice.tokens)
+            .fold(0u64, u64::saturating_add);
+        // Ordinarily the slices exactly fill the model window. Over-limit
+        // reports normalize to their displayed total so no semantic category
+        // is dropped merely because the request already crossed the limit.
+        let denominator = u128::from(self.context_window.max(slice_total).max(1));
+        let mut allocations = self
+            .slices
+            .iter()
+            .map(|slice| {
+                let numerator = u128::from(slice.tokens).saturating_mul(cell_count as u128);
+                let proportional = (numerator / denominator) as usize;
+                let minimum = usize::from(slice.tokens > 0 && slice.kind.requires_visible_cell());
+                CellAllocation {
+                    cells: proportional.max(minimum),
+                    minimum,
+                    numerator,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut allocated = allocations.iter().map(|item| item.cells).sum::<usize>();
+        if allocated > cell_count {
+            let mut excess = allocated - cell_count;
+            if let Some((index, _)) = self
+                .slices
+                .iter()
+                .enumerate()
+                .find(|(_, slice)| slice.kind == ContextKind::Free)
+            {
+                let removable = allocations[index]
+                    .cells
+                    .saturating_sub(allocations[index].minimum)
+                    .min(excess);
+                allocations[index].cells -= removable;
+                excess -= removable;
+            }
+            while excess > 0 {
+                let Some(index) = allocations
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, item)| item.cells > item.minimum)
+                    .max_by_key(|(_, item)| {
+                        (item.cells as u128)
+                            .saturating_mul(denominator)
+                            .saturating_sub(item.numerator)
+                    })
+                    .map(|(index, _)| index)
+                else {
+                    break;
+                };
+                allocations[index].cells -= 1;
+                excess -= 1;
+            }
+            allocated = allocations.iter().map(|item| item.cells).sum();
+        }
+
+        while allocated < cell_count {
+            let index = allocations
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, item)| {
+                    item.numerator
+                        .saturating_sub((item.cells as u128).saturating_mul(denominator))
+                })
+                .map(|(index, _)| index)
+                .or_else(|| {
+                    self.slices
+                        .iter()
+                        .position(|slice| slice.kind == ContextKind::Free)
+                })
+                .unwrap_or(0);
+            allocations[index].cells += 1;
+            allocated += 1;
+        }
+
+        let mut cells = Vec::with_capacity(cell_count);
+        for (slice, allocation) in self.slices.iter().zip(allocations) {
+            for index in 0..allocation.cells {
+                let lower = (index as u128).saturating_mul(denominator);
+                let upper = ((index + 1) as u128).saturating_mul(denominator);
+                let partial = allocation.numerator > lower && allocation.numerator < upper;
+                cells.push(GridCell {
+                    kind: slice.kind,
+                    partial,
+                });
+            }
+        }
+        debug_assert_eq!(cells.len(), cell_count);
+        cells
     }
+}
+
+fn grid_dimensions(context_window: u64) -> (usize, usize) {
+    // Physical area communicates model capacity: 128K is 8×8, the common
+    // 200K/272K class is 10×10, and a 1M window expands to 20×10.
+    if context_window <= 131_072 {
+        (8, 8)
+    } else if context_window <= 272_000 {
+        (10, 10)
+    } else if context_window < 1_000_000 {
+        (16, 10)
+    } else {
+        (20, 10)
+    }
+}
+
+fn render_grid_cell(cell: GridCell, theme: &YggTheme) -> String {
+    let glyph = if theme.unicode() {
+        match cell.kind {
+            ContextKind::Free => "⛶",
+            ContextKind::Buffer => "⛝",
+            _ if cell.partial => "⛀",
+            _ => "⛁",
+        }
+    } else {
+        match cell.kind {
+            ContextKind::Free => ".",
+            ContextKind::Buffer => ":",
+            _ if cell.partial => "+",
+            _ => "#",
+        }
+    };
+    theme.fg(cell.kind.role(), glyph)
 }
 
 fn render_slice(slice: &ContextSlice, theme: &YggTheme, width: u16, window: u64) -> String {
     let role = slice.kind.role();
-    let marker = theme.fg(role, if theme.unicode() { "■" } else { "#" });
+    let marker = render_grid_cell(
+        GridCell {
+            kind: slice.kind,
+            partial: false,
+        },
+        theme,
+    );
     let label = theme.fg(role, &sanitize_for_terminal(&slice.label));
     let percent = if window == 0 {
         0.0
     } else {
         slice.tokens as f64 * 100.0 / window as f64
     };
-    let tokens = if slice.kind == ContextKind::TokenizerAdjustment {
-        format!("−{}", compact_tokens(slice.tokens))
-    } else {
-        compact_tokens(slice.tokens)
-    };
     fit_line(
-        &format!("{marker} {label}  {}  {percent:.1}%", tokens),
+        &format!(
+            "{marker} {label}: {} tokens ({percent:.1}%)",
+            compact_tokens(slice.tokens)
+        ),
         width,
     )
+}
+
+fn pad_visible(line: &str, width: usize) -> String {
+    let padding = width.saturating_sub(sexy_tui_rs::visible_width(line));
+    format!("{line}{}", " ".repeat(padding))
 }
 
 fn compact_tokens(tokens: u64) -> String {
@@ -327,55 +421,52 @@ fn compact_tokens(tokens: u64) -> String {
 mod tests {
     use super::*;
 
-    fn report() -> ContextReport {
+    fn report(context_window: u64) -> ContextReport {
         ContextReport {
+            model_display: "Ornith 35B".into(),
             model: "custom/ornith-35b".into(),
-            context_window: 200_000,
+            context_window,
             estimated_input: 133_000,
-            output_reserve: 32_000,
-            compaction_mode: CompactionMode::Local,
-            auto_compact_threshold: 170_000,
-            keep_recent_tokens: 4,
             slices: vec![
                 ContextSlice {
-                    kind: ContextKind::System,
-                    label: "System prompt".into(),
+                    kind: ContextKind::Runtime,
+                    label: "Runtime framing and tools".into(),
                     tokens: 3_000,
                 },
                 ContextSlice {
-                    kind: ContextKind::Framing,
-                    label: "Provider framing".into(),
+                    kind: ContextKind::Instructions,
+                    label: "System instructions".into(),
                     tokens: 100,
                 },
                 ContextSlice {
-                    kind: ContextKind::Tools,
-                    label: "Tool schemas".into(),
+                    kind: ContextKind::ToolResults,
+                    label: "Tool calls and results".into(),
                     tokens: 5_000,
                 },
                 ContextSlice {
-                    kind: ContextKind::Messages,
-                    label: "Messages and tool results".into(),
+                    kind: ContextKind::Conversation,
+                    label: "Conversation".into(),
                     tokens: 47_000,
                 },
                 ContextSlice {
-                    kind: ContextKind::Pending,
-                    label: "Pending input".into(),
+                    kind: ContextKind::Attachments,
+                    label: "Attachments".into(),
                     tokens: 900,
                 },
                 ContextSlice {
-                    kind: ContextKind::Adjustment,
-                    label: "Provider token delta".into(),
-                    tokens: 77_000,
+                    kind: ContextKind::Summary,
+                    label: "Compaction summary".into(),
+                    tokens: 3_000,
                 },
                 ContextSlice {
-                    kind: ContextKind::Output,
-                    label: "Compaction reserve".into(),
-                    tokens: 32_000,
+                    kind: ContextKind::Other,
+                    label: "Provider/unattributed".into(),
+                    tokens: 74_000,
                 },
                 ContextSlice {
                     kind: ContextKind::Free,
-                    label: "Free before auto-compact".into(),
-                    tokens: 5_000,
+                    label: "Free space".into(),
+                    tokens: context_window.saturating_sub(163_000),
                 },
                 ContextSlice {
                     kind: ContextKind::Buffer,
@@ -387,48 +478,92 @@ mod tests {
     }
 
     #[test]
-    fn wide_and_narrow_context_reports_keep_honest_categories_without_overflow() {
-        let report = report();
-        let input_additions = report
-            .slices
-            .iter()
-            .filter(|slice| {
-                matches!(
-                    slice.kind,
-                    ContextKind::System
-                        | ContextKind::Framing
-                        | ContextKind::Tools
-                        | ContextKind::Messages
-                        | ContextKind::Pending
-                        | ContextKind::Adjustment
-                )
-            })
-            .map(|slice| slice.tokens)
-            .sum::<u64>();
-        let tokenizer_adjustment = report
-            .slices
-            .iter()
-            .find(|slice| slice.kind == ContextKind::TokenizerAdjustment)
-            .map_or(0, |slice| slice.tokens);
-        assert!(
-            input_additions.saturating_sub(tokenizer_adjustment) <= report.estimated_input,
-            "input categories exceed the displayed conservative input"
-        );
+    fn context_window_scales_both_grid_dimensions_before_one_million() {
+        let small = grid_dimensions(128_000);
+        let medium = grid_dimensions(200_000);
+        let large = grid_dimensions(1_000_000);
+        assert_eq!(small, (8, 8));
+        assert_eq!(medium, (10, 10));
+        assert_eq!(large, (20, 10));
+        assert!(large.0 > small.0);
+        assert!(large.1 > small.1);
+    }
+
+    #[test]
+    fn every_nonzero_semantic_category_gets_a_partial_cell_at_one_million() {
+        let kinds = [
+            ContextKind::Runtime,
+            ContextKind::Instructions,
+            ContextKind::ToolResults,
+            ContextKind::Conversation,
+            ContextKind::Attachments,
+            ContextKind::Summary,
+            ContextKind::Other,
+            ContextKind::Buffer,
+        ];
+        let mut tiny = ContextReport {
+            model_display: "Large".into(),
+            model: "large".into(),
+            context_window: 1_000_000,
+            estimated_input: kinds.len() as u64,
+            slices: kinds
+                .iter()
+                .map(|kind| ContextSlice {
+                    kind: *kind,
+                    label: format!("{kind:?}"),
+                    tokens: 1,
+                })
+                .collect(),
+        };
+        tiny.slices.push(ContextSlice {
+            kind: ContextKind::Free,
+            label: "Free space".into(),
+            tokens: 1_000_000 - kinds.len() as u64,
+        });
+
+        let cells = tiny.grid_cells();
+        assert_eq!(cells.len(), 200);
+        for kind in kinds {
+            assert!(
+                cells.iter().any(|cell| cell.kind == kind && cell.partial),
+                "{kind:?} did not receive a partial cell"
+            );
+        }
+    }
+
+    #[test]
+    fn context_grid_exactly_fills_its_context_sized_box() {
+        for window in [128_000, 200_000, 872_000, 1_000_000] {
+            let report = report(window);
+            let (columns, rows) = grid_dimensions(window);
+            assert_eq!(report.grid_cells().len(), columns * rows);
+        }
+    }
+
+    #[test]
+    fn wide_and_narrow_context_reports_keep_exact_rows_without_overflow() {
+        let report = report(1_000_000);
         let theme = crate::tui::theme::test_theme();
-        for width in [40, 72, 100] {
+        for width in [40, 72, 80, 100, 140] {
             let rendered = report.render(&theme, width);
             let plain = rendered
                 .iter()
                 .map(|line| sexy_tui_rs::strip_terminal_sequences(line))
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(plain.contains("System prompt"), "{plain}");
-            assert!(plain.contains("Tool schemas"), "{plain}");
-            assert!(plain.contains("Messages and tool results"), "{plain}");
-            assert!(plain.contains("Provider token delta"), "{plain}");
-            assert!(plain.contains("Compaction reserve"), "{plain}");
+            assert!(plain.contains("Context Usage"), "{plain}");
+            assert!(plain.contains("Ornith 35B"), "{plain}");
+            assert!(plain.contains("Runtime framing and tools"), "{plain}");
+            assert!(plain.contains("Tool calls and results"), "{plain}");
+            assert!(plain.contains("Conversation"), "{plain}");
+            assert!(plain.contains("Provider/unattributed"), "{plain}");
             assert!(plain.contains("Auto-compact buffer"), "{plain}");
-            assert!(!plain.contains("MCP"), "{plain}");
+            if width >= 80 {
+                assert!(
+                    plain.contains("Runtime framing and tools: 3.0k tokens (0.3%)"),
+                    "{plain}"
+                );
+            }
             assert!(rendered
                 .iter()
                 .all(|line| sexy_tui_rs::visible_width(line) <= usize::from(width)));
@@ -436,32 +571,10 @@ mod tests {
     }
 
     #[test]
-    fn wide_context_report_keeps_all_detail_rows_left_anchored() {
-        let report = report();
-        let expected_rows = report
-            .slices
-            .iter()
-            .filter(|slice| slice.tokens > 0 || slice.kind == ContextKind::Pending)
-            .count();
-        let rows = report
-            .render(&crate::tui::theme::test_theme(), 120)
-            .into_iter()
-            .map(|line| sexy_tui_rs::strip_terminal_sequences(&line))
-            .filter(|line| line.starts_with("■ "))
-            .collect::<Vec<_>>();
-
-        assert_eq!(rows.len(), expected_rows, "{rows:?}");
-        assert!(
-            rows.iter().all(|line| line.matches('■').count() == 1),
-            "context detail rows were rendered side-by-side: {rows:?}"
-        );
-    }
-
-    #[test]
     fn context_report_restyles_from_semantics_for_each_theme() {
-        let report = report();
+        let report = report(200_000);
         let default = report
-            .render(&crate::tui::theme::test_theme(), 72)
+            .render(&crate::tui::theme::test_theme(), 100)
             .join("\n");
         let named = report
             .render(
@@ -474,7 +587,7 @@ mod tests {
                     ),
                     crate::tui::theme::TerminalBackground::Dark,
                 ),
-                72,
+                100,
             )
             .join("\n");
         assert_eq!(
@@ -485,17 +598,16 @@ mod tests {
     }
 
     #[test]
-    fn context_rows_use_distinct_channels_for_markers_and_labels() {
+    fn context_categories_keep_distinct_colour_channels() {
         let theme = crate::tui::theme::test_theme();
         let kinds = [
-            ContextKind::System,
-            ContextKind::Framing,
-            ContextKind::Tools,
-            ContextKind::Messages,
-            ContextKind::Pending,
-            ContextKind::Adjustment,
-            ContextKind::TokenizerAdjustment,
-            ContextKind::Output,
+            ContextKind::Runtime,
+            ContextKind::Instructions,
+            ContextKind::ToolResults,
+            ContextKind::Conversation,
+            ContextKind::Attachments,
+            ContextKind::Summary,
+            ContextKind::Other,
             ContextKind::Free,
             ContextKind::Buffer,
         ];
@@ -508,58 +620,10 @@ mod tests {
                 assert_ne!(color, other, "context color channel was reused");
             }
         }
-        for kind in [ContextKind::System, ContextKind::Tools, ContextKind::Output] {
-            for status in ["accent", "info", "error"] {
-                assert_ne!(
-                    theme.role_rgb(kind.role()),
-                    theme.role_rgb(status),
-                    "{} reused the {status} status channel",
-                    kind.role()
-                );
-            }
-        }
-
-        let rendered = report().render(&theme, 100);
-        for (kind, label) in [
-            (ContextKind::System, "System prompt"),
-            (ContextKind::Tools, "Tool schemas"),
-            (ContextKind::Output, "Compaction reserve"),
-            (ContextKind::Free, "Free before auto-compact"),
-        ] {
-            assert!(
-                rendered
-                    .iter()
-                    .any(|line| line.contains(&theme.fg(kind.role(), label))),
-                "{label} did not retain its semantic label colour"
-            );
-        }
     }
 
     #[test]
-    fn context_bar_follows_semantic_prompt_then_capacity_order() {
-        let report = report();
-        let order = report
-            .bar_slices()
-            .map(|slice| slice.kind)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            order,
-            vec![
-                ContextKind::System,
-                ContextKind::Framing,
-                ContextKind::Tools,
-                ContextKind::Messages,
-                ContextKind::Pending,
-                ContextKind::Adjustment,
-                ContextKind::Output,
-                ContextKind::Free,
-                ContextKind::Buffer,
-            ]
-        );
-    }
-
-    #[test]
-    fn context_report_uses_provider_measurement_when_structural_estimate_is_low() {
+    fn context_report_uses_agent_context_breakdown() {
         use ygg_agent::EntryValue;
         use ygg_ai::{
             AssistantMessage, AssistantPart, Message, Protocol, Usage, UserMessage, UserPart,
@@ -595,44 +659,30 @@ mod tests {
             )
             .unwrap();
 
-        let estimate = app.agent.request_context_estimate().unwrap();
-        assert!(
-            (57_000..=60_000).contains(&estimate.structural_tokens),
-            "unexpected structural fixture: {estimate:?}"
-        );
-        assert_eq!(estimate.provider_tokens, Some(133_000));
-        assert_eq!(estimate.input_tokens, 133_000);
+        let breakdown = app.agent.request_context_breakdown().unwrap();
+        assert_eq!(breakdown.total_tokens, 133_000);
+        assert!(breakdown.conversation_tokens > 0);
+        assert!(breakdown.other_tokens > 0);
 
         let report = ContextReport::capture(&app, &[]);
-        assert_eq!(report.estimated_input, 133_000);
-        let adjustment = report
-            .slices
-            .iter()
-            .find(|slice| slice.kind == ContextKind::Adjustment)
-            .expect("explicit provider adjustment");
-        let categorized = report
-            .slices
-            .iter()
-            .filter(|slice| {
-                matches!(
-                    slice.kind,
-                    ContextKind::System
-                        | ContextKind::Framing
-                        | ContextKind::Tools
-                        | ContextKind::Messages
-                        | ContextKind::Pending
-                )
-            })
-            .map(|slice| slice.tokens)
-            .sum::<u64>();
-        assert_eq!(adjustment.tokens, 133_000u64.saturating_sub(categorized));
-        let plain = report
-            .render(&crate::tui::theme::test_theme(), 100)
-            .into_iter()
-            .map(|line| sexy_tui_rs::strip_terminal_sequences(&line))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(plain.contains("~133.0k input"), "{plain}");
-        assert!(plain.contains("Provider token delta"), "{plain}");
+        assert_eq!(report.estimated_input, breakdown.total_tokens);
+        for (kind, tokens) in [
+            (ContextKind::Runtime, breakdown.system_tokens),
+            (ContextKind::Instructions, breakdown.instruction_tokens),
+            (ContextKind::ToolResults, breakdown.tool_result_tokens),
+            (ContextKind::Conversation, breakdown.conversation_tokens),
+            (ContextKind::Attachments, breakdown.attachment_tokens),
+            (ContextKind::Summary, breakdown.compaction_summary_tokens),
+            (ContextKind::Other, breakdown.other_tokens),
+        ] {
+            assert_eq!(
+                report
+                    .slices
+                    .iter()
+                    .find(|slice| slice.kind == kind)
+                    .map(|slice| slice.tokens),
+                Some(tokens)
+            );
+        }
     }
 }

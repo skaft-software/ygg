@@ -9,19 +9,21 @@ provider branding.
 ## Stable versus adaptive visual tokens
 
 Stable product tokens include the terminal surface, text hierarchy, layout,
-spacing, tree silhouette, Ygg interaction accent, and semantic
-success/warning/error colours. Adaptive model tokens identify model provenance:
-the startup atmosphere, each persisted prompt card, and the composer for the
-model that will receive the next prompt. Changing models changes provenance and
-ambience, never behavior or authority.
+spacing, tree silhouette, interaction grammar, and semantic
+success/warning/error colours. Adaptive model tokens identify both model
+provenance and the active shell atmosphere: the startup atmosphere, each
+persisted prompt card, the composer for the model that will receive the next
+prompt, and focused controls in picker and completion menus. Changing models
+changes provenance and ambience, never behavior or authority.
 
 Every submitted prompt captures its model-lab colour. That stored colour paints
 the prompt marker and card background for the lifetime of the transcript, so a
 later model switch cannot recolour old prompts. The composer immediately adopts
 the selected next model's colour, including while another model's run is still
-settling. Picker and completion focus use Ygg's UI accent; queued-steering
-chrome follows the selected model's adaptive accent because it previews input
-destined for that model. Contrast is normalized for the detected terminal
+settling. Picker and completion focus consistently use the active model's
+adaptive accent as shell atmosphere, not the focused candidate's provider
+provenance. Queued-steering chrome follows the same accent because it previews
+input destined for that model. Contrast is normalized for the detected terminal
 background, and status is never communicated by hue alone.
 
 ## Information layers
