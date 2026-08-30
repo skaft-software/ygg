@@ -16,7 +16,7 @@ if [[ ! "$package_id" =~ ^[a-z][a-z0-9-]{0,63}$ ]]; then
     exit 2
 fi
 if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-    printf 'version must be a canonical Ygg version tag such as v0.6.3: %s\n' "$version" >&2
+    printf 'version must be a canonical Ygg version tag such as v0.6.4: %s\n' "$version" >&2
     exit 2
 fi
 for command in git python3; do

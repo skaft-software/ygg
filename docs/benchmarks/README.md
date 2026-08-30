@@ -11,7 +11,9 @@ failure report
 ([failure-report-v0.6.2-2026-08-28.md](failure-report-v0.6.2-2026-08-28.md)),
 the complete token-efficiency audit
 ([token-efficiency-v0.6.2-2026-08-28.md](token-efficiency-v0.6.2-2026-08-28.md)),
-and the opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
+the scoped coding-agent
+[runtime-footprint comparison](runtime-footprint-2026-08-29.md), and the opt-in
+beta protocol ([beta-protocol.md](beta-protocol.md)).
 
 ## Optional agent telemetry
 
@@ -82,9 +84,13 @@ python3 scripts/bench-systems.py \
 
 The runner never invokes command strings through a shell. Use `env`, a wrapper
 script, or an absolute executable in the argument vector when setup is needed.
-PSS is reported only where the operating system exposes it; RSS is not a PSS
-substitute. Direct children are measured, so an inference server must be
-reported separately and excluded from the agent-overhead number.
+JSON output retains every startup run, every per-run idle sample and peak, and
+every per-run concurrency sample and peak. `--skip-startup`, `--skip-idle`, and
+`--skip-concurrency` can split a long campaign into raw files without reducing
+the repetition count for the retained cases. PSS is reported only where the
+operating system exposes it; RSS is not a PSS substitute. Direct children are
+measured, so an inference server must be reported separately and excluded from
+the agent-overhead number.
 
 The command adapter deliberately does not pretend to measure UI rendering,
 provider-to-tool scheduling, or resume latency from a generic `--version` case.

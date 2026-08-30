@@ -2521,6 +2521,8 @@ mod tests {
             "./private-extension.ts",
             "--pi-home",
             "./pi/agent",
+            "--pi-package",
+            "./node_modules/@earendil-works/pi-coding-agent",
         ])
         .unwrap();
         assert!(cli.message.is_none());
@@ -2529,10 +2531,45 @@ mod tests {
             Some(TopLevelCommand::Pi {
                 command: PiCommand::Install {
                     pi_home: Some(_),
+                    pi_package: Some(_),
                     ..
                 }
             })
         ));
+    }
+
+    #[test]
+    fn pi_install_preserves_explicit_aggregate_source_order() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "pi",
+            "install",
+            "./first.ts",
+            "--with",
+            "./second.ts",
+            "--with",
+            "./third-package",
+        ])
+        .unwrap();
+        let Some(TopLevelCommand::Pi {
+            command:
+                PiCommand::Install {
+                    source,
+                    additional_sources,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected pi install command");
+        };
+        assert_eq!(source, PathBuf::from("./first.ts"));
+        assert_eq!(
+            additional_sources,
+            [
+                PathBuf::from("./second.ts"),
+                PathBuf::from("./third-package"),
+            ]
+        );
     }
 
     #[test]

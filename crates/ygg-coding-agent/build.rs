@@ -27,6 +27,21 @@ fn sorted_entries(path: &Path) -> io::Result<Vec<fs::DirEntry>> {
     Ok(entries)
 }
 
+fn should_skip_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            ".git"
+                | ".catalog"
+                | ".pytest_cache"
+                | "__pycache__"
+                | "artifacts"
+                | "private"
+                | "target"
+        )
+    )
+}
+
 fn append_header_path(
     builder: &mut Builder<GzEncoder<File>>,
     source: &Path,
@@ -63,6 +78,9 @@ fn append_directory(
         ));
     }
     if metadata.is_dir() {
+        if should_skip_directory(source) {
+            return Ok(());
+        }
         let mut header = Header::new_gnu();
         header.set_path(archive_path)?;
         header.set_mode(0o755);

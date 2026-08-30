@@ -1,5 +1,7 @@
 use sexy_tui_rs::visible_width;
 
+use crate::tui::layout::PresentationLayout;
+use crate::tui::layout::PRIMARY_TEXT_GUTTER;
 use crate::tui::theme::{
     ThemeSurfaceAlign, ThemeSurfaceChrome, ThemeSurfaceHeading, ThemeSurfaceWidth, YggTheme,
 };
@@ -31,6 +33,22 @@ fn transcript_surface_kind(block: &TranscriptBlock) -> &'static str {
         TranscriptBlock::Notice(_) | TranscriptBlock::NoticeStatus { .. } => "notice",
         TranscriptBlock::Compaction(_) => "compaction",
     }
+}
+
+/// Semantic events reserve the shared marker gutter used by prompts and the
+/// composer. Their marker sits at the presentation inset and their primary
+/// text begins two cells later; nested content then begins from that text
+/// column instead of inventing another renderer-specific offset.
+fn uses_event_marker_gutter(block: &TranscriptBlock) -> bool {
+    matches!(
+        block,
+        TranscriptBlock::Assistant(_)
+            | TranscriptBlock::Reasoning(_)
+            | TranscriptBlock::Tool(_)
+            | TranscriptBlock::Shell(_)
+            | TranscriptBlock::Notice(_)
+            | TranscriptBlock::NoticeStatus { .. }
+    )
 }
 
 pub(super) fn surface_roles(kind: &str) -> (&'static str, &'static str, &'static str) {
@@ -102,14 +120,20 @@ pub(super) fn compile_surface_plan<'a>(
     outer_width: u16,
 ) -> SurfacePlan<'a> {
     let layout = theme.layout_for_width(outer_width);
+    let presentation = PresentationLayout::new(theme, outer_width);
     let kind = transcript_surface_kind(block);
     let resolved = theme.surface_for_width(kind, outer_width);
-    let inset = if matches!(block, TranscriptBlock::User { .. }) {
-        0
-    } else {
-        layout.transcript_inset.min(outer_width.saturating_sub(1))
-    };
-    let available = outer_width.saturating_sub(inset).max(1);
+    let event_gutter =
+        if uses_event_marker_gutter(block) && presentation.content_width > PRIMARY_TEXT_GUTTER {
+            PRIMARY_TEXT_GUTTER
+        } else {
+            0
+        };
+    let inset = presentation.inset.saturating_add(event_gutter);
+    let available = presentation
+        .content_width
+        .saturating_sub(event_gutter)
+        .max(1);
     let mut chrome = resolved.chrome;
     let mut heading = if resolved.label.is_some() {
         resolved.heading
@@ -186,9 +210,8 @@ pub(super) fn compile_surface_plan<'a>(
                 ..
             }
         );
-    // A highlighted prompt gets one painted row above and below its content,
-    // matching the breathing room in the active composer. Static prompts can
-    // opt into the same rows, while user cards retain their interior padding.
+    // Model-coloured prompt cards retain their breathing row above and below
+    // the content while sharing the global horizontal grid.
     let vertical_padding_rows = usize::from(
         highlighted_user
             || (kind == "user" && (layout.prompt_padding || chrome == ThemeSurfaceChrome::Card)),

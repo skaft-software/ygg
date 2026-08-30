@@ -3,9 +3,11 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::presentation::{format_duration, RunOutcome};
 
-use super::outcome_render::{bounded_outcome_detail, completion_text};
+use super::outcome_render::{
+    bounded_outcome_detail, completion_text, completion_with_warnings_text,
+};
 use super::terminal_text::sanitize_for_terminal;
-use super::tool_render::looks_like_diff;
+use super::tool_render::{bounded_tool_failure_reason, looks_like_diff};
 use super::{subagent_activity_copy_text, ShellState, TranscriptBlock};
 
 /// Durable transcript coordinate. It deliberately names a semantic block and
@@ -68,7 +70,14 @@ pub(super) fn block_copy_text(block: &TranscriptBlock) -> String {
             } else {
                 format!("{}  {summary}", panel.display.label)
             };
-            sanitize_for_terminal(&text)
+            let mut text = sanitize_for_terminal(&text);
+            if panel.finished && panel.is_error {
+                if let Some(reason) = bounded_tool_failure_reason(panel) {
+                    text.push('\n');
+                    text.push_str(&reason);
+                }
+            }
+            text
         }
         TranscriptBlock::Shell(shell) => {
             let status = if shell.running {
@@ -81,9 +90,11 @@ pub(super) fn block_copy_text(block: &TranscriptBlock) -> String {
             sanitize_for_terminal(&format!("$ {} [{status}]", shell.command))
         }
         TranscriptBlock::Outcome(outcome) => match &outcome.outcome {
-            RunOutcome::Completed { elapsed, .. }
-            | RunOutcome::CompletedWithWarnings { elapsed, .. } => {
+            RunOutcome::Completed { elapsed, .. } => {
                 completion_text(*elapsed, " · ", outcome.tokens_per_second)
+            }
+            RunOutcome::CompletedWithWarnings { elapsed, .. } => {
+                completion_with_warnings_text(*elapsed, " · ", outcome.tokens_per_second)
             }
             RunOutcome::Failed { elapsed, reason } => format!(
                 "failed · {}\n{}",

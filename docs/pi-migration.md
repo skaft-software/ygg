@@ -36,24 +36,42 @@ inert Ygg wrapper without running its code:
 ```console
 ygg pi install ./path/to/extension.ts
 ygg pi install ./path/to/pi-package
+# Preserve Pi load order and shared state in one process:
+ygg pi install ./first.ts --with ./second-package --with ./third.ts \
+  --name pi-compat-0-84-4
 ygg pi list
 ```
 
 The wrapper lives under `~/.ygg/extensions/`, points at the existing source, and
 uses the persistent `ygg-pi-compat` host. It does not install npm dependencies,
 run lifecycle scripts, copy the Pi package, or enable/trust the resulting Ygg
-extension. Start it explicitly after verifying the source:
+extension. Schema-v2 link metadata records the bridge profile, exact Pi and Ygg
+versions, and a bounded source fingerprint; `ygg pi list` marks legacy or changed
+links stale without asserting trust, and a generated bridge rejects a fingerprint
+mismatch before importing extension code. The source digest excludes `.git`,
+`node_modules`, `target`, and recognized cache directories; dependency/runtime
+changes remain part of the separately reviewed Pi installation rather than the
+source-link digest. Start a current link explicitly after
+verifying its source:
 
 ```console
 ygg --enable-extension pi-extension-name --trust-extension pi-extension-name
 ```
 
-The initial bridge supports Pi tools and a generated package-specific command
-route (`/<name> COMMAND ...`),
-notifications, confirmations, text input, basic lifecycle events, and local
-Pi event-bus behavior. It requires a Node runtime and an installed
-`@earendil-works/pi-coding-agent` package; set `YGG_PI_PACKAGE` when the runtime
-cannot be found from `PATH`. Unsupported TUI, provider, session, and mutation
+Bridge profile `0.2.0` targets exactly
+`@earendil-works/pi-coding-agent@0.84.4` and Node 22.19 or newer. The bridge
+validates that profile before importing extension code instead of silently using
+a newer runtime found on `PATH`. Pass `ygg pi install --pi-package DIR ...` when
+the package is not in a conventional location; the generated inert link records
+and forwards that exact path across Ygg's sanitized subprocess environment.
+The exhaustive per-event/API/UI ledger and completion gates are maintained in
+[`extensions/ygg-pi-compat/COMPATIBILITY.md`](../extensions/ygg-pi-compat/COMPATIBILITY.md).
+It supports Pi tools, transformed result details/error/usage, live tool catalogs,
+notifications, confirmations, text input, basic lifecycle/context events, and
+local Pi event-bus behavior. On a Ygg host negotiating `runtime_commands`, Pi's
+initial command catalog is exposed under its native slash names; the generated
+`/<name> COMMAND ...` route remains only as a fallback for older hosts.
+Unsupported TUI, provider, session, compaction, agent-control, and mutation
 surfaces remain explicit migration diagnostics rather than silent no-ops.
 
 The scanner:
@@ -83,10 +101,10 @@ The human and JSON reports use migration-path classifications:
 | --- | --- |
 | `direct` | Pi skill or Markdown prompt content has a deterministic Ygg resource path. The dry run does not copy it. |
 | `replace` | Reserved for an exact package/version/source-hash recipe that selects a Ygg-native replacement. No replacement recipes ship in this first scanner slice. |
-| `bridge` | The extension uses capability-shaped tools, commands, lifecycle events, notifications, or similar surfaces suitable for the compatibility process. The current `ygg pi install` link supports the bounded initial subset documented above. |
-| `native_port` | The extension uses a Pi mutation or registration that needs an explicit Ygg-native port or a future bounded host primitive. |
+| `bridge` | The extension uses only surfaces implemented by the pinned compatibility process. A generated link still needs a successful runtime handshake before it is known compatible. |
+| `native_port` | The extension uses a known Pi 0.84.4 mutation or registration that needs an explicit Ygg-native port or a future bounded host primitive. |
 | `manual` | The extension depends on arbitrary Pi TUI/editor components, custom providers, or deep session/compaction internals; redesign is required. Pi JSON themes are also manual because Ygg themes use a different semantic schema. |
-| `blocked` | The package could not be resolved/read or its source could not be parsed completely enough for a safe classification. |
+| `blocked` | The package could not be resolved/read or parsed completely, or it uses names outside the pinned Pi 0.84.4 public compatibility profile. |
 
 `bridge` describes a migration candidate, not current runtime availability or
 exact behavioral fidelity. The report never silently treats an unsupported call
@@ -170,15 +188,18 @@ model-free.
 ### Compatibility process
 
 The generated `ygg pi install` link hosts a deliberately bounded subset of Pi's
-`ExtensionAPI` through the persistent `ygg-pi-compat` process. Bridged Pi
-extensions that use an in-process event bus, `globalThis`, or shared registries
-live in the same compatibility process; Ygg makes one JSON-RPC call per
-subscribed lifecycle event and fans out locally.
+`ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated `--with`
+arguments record an ordered, source-fingerprinted set in one aggregate lock and
+load those sources through one real `ExtensionRunner`, preserving their local
+event bus, `globalThis`, and shared registries. Automatically selecting and
+locking an entire reviewed Pi setup remains future migration work.
 
 Unsupported Pi APIs must raise a clear compatibility error. The bridge must not
-silently discard a policy, mutation, lifecycle, or UI call. Static tools can be
-placed in a generated `extension.toml`; runtime tools can use API `0.2` live tool
-catalogs. Dynamic Pi commands remain a bounded protocol gap.
+silently discard a policy, mutation, lifecycle, or UI call. Static and runtime
+tools use API `0.2` live tool catalogs. Negotiated `runtime_commands` makes the
+command set discovered during Pi initialization authoritative without requiring
+those names in the generated manifest; command registration after initialization
+still needs a live command-catalog protocol.
 
 ### Exact recipes
 
@@ -227,6 +248,10 @@ The intended promise is:
 > compatible subset through an explicitly trusted bridge, and identify exactly
 > what still requires a port.
 
-Today, only the first inspection and classification stage is implemented. It is
-already useful for measuring real migration demand without executing unknown
-packages or spending model tokens.
+Today the zero-token scanner and explicitly trusted, pinned compatibility links
+are implemented. The bridge runs a tested subset of Pi 0.84.4 tools, commands,
+dialogs, context, and lifecycle behavior; explicit ordered source sets can share
+one locked runtime. Deterministic resource apply, exact replacement recipes,
+automatic whole-setup selection, session/provider mutation, and arbitrary Pi
+component parity remain unfinished and are reported rather than silently
+emulated.

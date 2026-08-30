@@ -1396,13 +1396,18 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
             .and_then(serde_json::Value::as_u64)
             .filter(|value| *value > 0)
             .unwrap_or(131_072);
-        let max_output_tokens = entry
+        let Some(max_output_tokens) = entry
             .get("top_provider")
             .and_then(|provider| provider.get("max_completion_tokens"))
+            .or_else(|| entry.get("max_completion_tokens"))
             .and_then(serde_json::Value::as_u64)
             .filter(|value| *value > 0)
-            .unwrap_or(16_384)
-            .min(context_window);
+            .map(|value| value.min(context_window))
+        else {
+            // Without a provider-advertised completion ceiling, Ygg cannot
+            // distinguish a real model limit from a guessed local cap.
+            continue;
+        };
         // OpenRouter may expose modality metadata under architecture or at
         // the top level (depending on the inventory proxy). Normalize both so
         // attachments are not rejected before the request reaches the API.

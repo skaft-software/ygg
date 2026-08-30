@@ -379,7 +379,7 @@ impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
             mode: CompactionMode::Local,
-            threshold_fraction: 0.85,
+            threshold_fraction: 1.0,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             compact_model: None,
         }
@@ -621,6 +621,11 @@ mod tests {
         assert!(extension_policy.enabled("git_status"));
         assert!(!extension_policy.enabled("another_extension_tool"));
         assert!(ToolPolicy::only(["not a tool".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn default_compaction_uses_only_the_fixed_reserve() {
+        assert_eq!(CompactionPolicy::default().threshold_fraction, 1.0);
     }
 
     #[test]

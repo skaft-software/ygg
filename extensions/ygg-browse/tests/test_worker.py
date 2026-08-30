@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from ygg_browse.paths import BrowsePaths
 from ygg_browse.safety import BrowseError, ResourceOwner
@@ -84,9 +88,15 @@ class FakeContext:
 
 class BrowserActionSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.temporary_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_home.cleanup)
+        environment = patch.dict(os.environ, {"YGG_BROWSE_ALLOW_FORM_SCREENSHOTS": ""})
+        environment.start()
+        self.addCleanup(environment.stop)
+
         # setup/profile are not used by already-open fake-engine actions.
         self.engine = BrowserEngine.__new__(BrowserEngine)
-        self.engine.paths = BrowsePaths.for_home()
+        self.engine.paths = BrowsePaths.for_home(Path(self.temporary_home.name))
         self.engine.setup = None
         self.engine.profiles = None
         self.engine._tab_id_factory = lambda: "tab_fixture"
@@ -146,6 +156,32 @@ class BrowserActionSafetyTests(unittest.TestCase):
         with self.assertRaises(BrowseError) as raised:
             self.engine.screenshot(self.operation(), self.owner, tab_id)
         self.assertEqual(raised.exception.code, "screenshot_form_values")
+
+    def test_screenshot_form_override_preserves_hard_blocks(self) -> None:
+        self.engine.paths.ensure_root()
+        (self.engine.paths.root / "allow-form-screenshots").touch()
+        selector = 'css=input:not([type="hidden"]), textarea, [contenteditable="true"]'
+        page = FakePage()
+        page.selector_elements[selector] = [
+            FakeElement(attrs={"type": "text", "aria-label": "Search"})
+        ]
+        page.screenshot = lambda **_: b"fixture-png"
+        tab_id = self._attach(page)
+
+        result = self.engine.screenshot(self.operation(), self.owner, tab_id)
+        self.assertEqual(result["data"], b"fixture-png")
+
+        page.selector_elements[selector] = [
+            FakeElement(attrs={"type": "password", "aria-label": "Password"})
+        ]
+        with self.assertRaises(BrowseError) as credential:
+            self.engine.screenshot(self.operation(), self.owner, tab_id)
+        self.assertEqual(credential.exception.code, "screenshot_manual_auth")
+
+        self.engine._tabs[tab_id].remember_typed_value("withheld")
+        with self.assertRaises(BrowseError) as typed:
+            self.engine.screenshot(self.operation(), self.owner, tab_id)
+        self.assertEqual(typed.exception.code, "screenshot_typed_values")
 
     def test_screenshot_refuses_visible_manual_auth_fields(self) -> None:
         page = FakePage()

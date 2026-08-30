@@ -1,12 +1,81 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
 import unittest
 
 try:
     from .helpers import BridgeProcess, NODE
 except ImportError:  # unittest discovery imports this file as a top-level module.
     from helpers import BridgeProcess, NODE
+
+
+def single_file_source_fingerprint(path: Path) -> str:
+    content = path.read_bytes()
+    digest = hashlib.sha256()
+    digest.update(b"ygg-pi-source-fingerprint\0")
+    digest.update((1).to_bytes(4, "big"))
+    digest.update(b"f")
+    digest.update(b"f")
+    digest.update((1).to_bytes(8, "big"))
+    digest.update(b".")
+    digest.update(len(content).to_bytes(8, "big"))
+    digest.update(content)
+    return digest.hexdigest()
+
+
+class CompatibilityProfileTests(unittest.TestCase):
+    def test_machine_profiles_pin_the_complete_0_84_4_inventory(self) -> None:
+        compat_root = Path(__file__).resolve().parents[1]
+        repository = compat_root.parents[1]
+        profile = json.loads((compat_root / "profiles/0.84.4.json").read_text())
+        tui_profile = json.loads(
+            (repository / "crates/sexy-tui-rs/upstream/pi-tui-0.84.4.json").read_text()
+        )
+
+        revision = "b79e4cc834970cca69daebffab7df1da7d1e52c4"
+        self.assertEqual(1, profile["schema_version"])
+        self.assertEqual(revision, profile["source"]["revision"])
+        self.assertEqual("0.84.4", profile["packages"]["coding_agent"]["version"])
+        self.assertEqual("0.84.4", profile["packages"]["tui"]["version"])
+        self.assertEqual("22.19.0", profile["node"]["minimum_version"])
+        self.assertEqual(36, len(profile["public_surface"]["events"]))
+        self.assertEqual(27, len(profile["public_surface"]["extension_api"]))
+        self.assertEqual(28, len(profile["public_surface"]["ui_context"]))
+        self.assertEqual(27, len(profile["public_surface"]["context"]))
+        examples = profile["official_extension_examples"]
+        self.assertEqual(78, len(examples))
+        self.assertEqual(78, len(set(examples)))
+        self.assertIn("plan-mode", examples)
+        self.assertNotIn("README.md", examples)
+
+        tests = tui_profile["test_files"]
+        self.assertEqual(revision, tui_profile["source"]["revision"])
+        self.assertEqual(33, len(tests))
+        self.assertEqual(33, len({entry["upstream"] for entry in tests}))
+        upstream_tests = {entry["upstream"] for entry in tests}
+        self.assertIn("test/tui-render.test.ts", upstream_tests)
+        self.assertIn("test/editor-history-keybindings.test.ts", upstream_tests)
+
+    def test_real_pi_example_inventory_matches_profile_when_selected(self) -> None:
+        selected = os.environ.get("YGG_PI_REAL_PACKAGE")
+        if not selected:
+            self.skipTest("YGG_PI_REAL_PACKAGE is not set")
+        package = Path(selected).resolve()
+        manifest = json.loads((package / "package.json").read_text())
+        self.assertEqual("@earendil-works/pi-coding-agent", manifest["name"])
+        self.assertEqual("0.84.4", manifest["version"])
+
+        profile_path = Path(__file__).resolve().parents[1] / "profiles/0.84.4.json"
+        profile = json.loads(profile_path.read_text())
+        examples_root = package / "examples/extensions"
+        actual = sorted(
+            path.name for path in examples_root.iterdir() if path.name != "README.md"
+        )
+        self.assertEqual(profile["official_extension_examples"], actual)
 
 
 @unittest.skipUnless(NODE, "node is required for the Pi compatibility subprocess tests")
@@ -22,6 +91,7 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertNotIn("error", response)
             self.assertEqual([], bridge.protocol_errors)
             self.assertTrue(any("fixture loader wrote" in line for line in bridge.stderr))
+            self.assertTrue(any("directly to stdout" in line for line in bridge.stderr))
             self.assertTrue(any("fixture tool console output safe" in line for line in bridge.stderr))
 
     def test_feature_negotiation_is_exact(self) -> None:
@@ -217,6 +287,43 @@ class BridgeProtocolTests(unittest.TestCase):
                 terminal_events,
             )
 
+    def test_unrepresentable_tool_interception_fails_explicitly(self) -> None:
+        with BridgeProcess() as bridge:
+            bridge.initialize()
+            mutated = bridge.request(
+                "hook/run",
+                {
+                    "hook": "before_tool_call",
+                    "payload": {"name": "bash", "arguments": {"mutateNative": True}},
+                },
+            )
+            self.assertEqual(-32000, mutated["error"]["code"])
+            self.assertIn("input mutation", mutated["error"]["message"])
+
+            terminated = bridge.request(
+                "hook/run",
+                {
+                    "hook": "before_tool_call",
+                    "payload": {"name": "bash", "arguments": {"terminate": True}},
+                },
+            )
+            self.assertEqual(-32000, terminated["error"]["code"])
+            self.assertIn("tool_call.terminate", terminated["error"]["message"])
+
+            transformed = bridge.request(
+                "hook/run",
+                {
+                    "hook": "after_tool_call",
+                    "payload": {
+                        "name": "bash",
+                        "arguments": {"value": "transform"},
+                        "output": "original",
+                    },
+                },
+            )
+            self.assertEqual(-32000, transformed["error"]["code"])
+            self.assertIn("tool_result mutation", transformed["error"]["message"])
+
     def test_session_shutdown_is_emitted_once(self) -> None:
         with BridgeProcess() as bridge:
             bridge.initialize("lifecycle_events")
@@ -251,6 +358,196 @@ class BridgeProtocolTests(unittest.TestCase):
                 {"name": "fixture_dynamic", "arguments": {}, "catalog_revision": 1},
             )
             self.assertEqual("dynamic", response["result"]["content"][0]["text"])
+
+    def test_runtime_commands_are_exposed_without_the_package_mux(self) -> None:
+        with BridgeProcess() as bridge:
+            bridge.handlers["tools/register"] = lambda _message: {
+                "revision": 1,
+                "tools": ["fixture_echo", "fixture_prompt", "fixture_progress", "fixture_dynamic"],
+            }
+            initialized = bridge.initialize("dynamic_tools", "runtime_commands")
+            command_names = {command["name"] for command in initialized["commands"]}
+            self.assertIn("add-tool", command_names)
+            self.assertIn("ui-methods", command_names)
+            self.assertNotIn("pi", command_names)
+
+            response = bridge.request(
+                "command/execute", {"name": "add-tool", "arguments": []}
+            )
+            self.assertNotIn("error", response)
+            bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "tools/register"),
+                    None,
+                ),
+                description="direct-command dynamic tool registration",
+            )
+
+    def test_progress_is_emitted_only_when_negotiated(self) -> None:
+        with BridgeProcess() as bridge:
+            bridge.initialize()
+            response = bridge.request(
+                "tool/call",
+                {"name": "fixture_progress", "arguments": {}, "catalog_revision": 0},
+            )
+            self.assertNotIn("error", response)
+            self.assertFalse(any(message.get("method") == "$/progress" for message in bridge.messages))
+
+        with BridgeProcess() as bridge:
+            bridge.initialize("request_progress")
+            response = bridge.request(
+                "tool/call",
+                {"name": "fixture_progress", "arguments": {}, "catalog_revision": 0},
+            )
+            self.assertNotIn("error", response)
+            self.assertTrue(any(message.get("method") == "$/progress" for message in bridge.messages))
+
+    def test_transformed_tool_result_preserves_details_usage_and_error(self) -> None:
+        with BridgeProcess() as bridge:
+            bridge.initialize()
+            result = bridge.request(
+                "tool/call",
+                {
+                    "name": "fixture_echo",
+                    "arguments": {"value": "transform"},
+                    "catalog_revision": 0,
+                },
+            )["result"]
+            self.assertEqual("transformed", result["content"][0]["text"])
+            self.assertTrue(result["is_error"])
+            self.assertEqual(
+                {
+                    "details": {"transformed": True},
+                    "usage": {"input": 1, "output": 2},
+                },
+                result["metadata"],
+            )
+
+    def test_current_ui_names_fail_explicitly_and_host_state_is_visible(self) -> None:
+        with BridgeProcess() as bridge:
+            bridge.initialize(host={"session_name": "fixture session", "reasoning": "High"})
+            ui = bridge.request(
+                "command/execute", {"name": "pi", "arguments": ["ui-methods"]}
+            )
+            self.assertNotIn("error", ui)
+            self.assertIn("ui-current-methods-explicit", bridge.notifications())
+            state = bridge.request(
+                "command/execute", {"name": "pi", "arguments": ["host-state"]}
+            )
+            self.assertNotIn("error", state)
+
+    def test_explicit_runtime_selector_rejects_an_unpinned_pi_version(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_text(
+                json.dumps(
+                    {
+                        "name": "@earendil-works/pi-coding-agent",
+                        "version": "0.85.0",
+                        "type": "module",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with BridgeProcess(pi_package=root) as bridge:
+                response = bridge.request(
+                    "initialize",
+                    {"workspace": str(root), "host": {}, "protocol": {"optional_features": []}},
+                )
+                self.assertEqual(-32000, response["error"]["code"])
+                self.assertIn("expected exactly 0.84.4", response["error"]["message"])
+
+    def test_explicit_runtime_selector_bounds_package_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "package.json").write_bytes(b" " * (256 * 1024 + 1))
+            with BridgeProcess(pi_package=root) as bridge:
+                response = bridge.request(
+                    "initialize",
+                    {"workspace": str(root), "host": {}, "protocol": {"optional_features": []}},
+                )
+                self.assertEqual(-32000, response["error"]["code"])
+                self.assertIn("262144-byte limit", response["error"]["message"])
+
+    def test_generated_source_fingerprint_is_enforced_before_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            extension = Path(directory).resolve() / "extension.mjs"
+            extension.write_text("export default () => {};\n", encoding="utf-8")
+            fingerprint = single_file_source_fingerprint(extension)
+            with BridgeProcess(
+                extension=extension,
+                source_fingerprint=fingerprint,
+            ) as bridge:
+                initialized = bridge.initialize()
+                self.assertEqual("0.2", initialized["api_version"])
+
+            extension.write_text(
+                "export default () => { throw new Error('changed'); };\n",
+                encoding="utf-8",
+            )
+            with BridgeProcess(
+                extension=extension,
+                source_fingerprint=fingerprint,
+            ) as bridge:
+                response = bridge.request(
+                    "initialize",
+                    {
+                        "workspace": str(extension.parent),
+                        "host": {},
+                        "protocol": {"optional_features": []},
+                    },
+                )
+                self.assertEqual(-32000, response["error"]["code"])
+                self.assertIn(
+                    "source changed after link installation",
+                    response["error"]["message"],
+                )
+
+    @unittest.skipUnless(
+        os.environ.get("YGG_PI_REAL_PACKAGE"),
+        "set YGG_PI_REAL_PACKAGE to run the pinned real-Pi smoke test",
+    )
+    def test_real_pi_0844_hello_extension_smoke(self) -> None:
+        package = Path(os.environ["YGG_PI_REAL_PACKAGE"]).resolve()
+        extension = Path(
+            os.environ.get(
+                "YGG_PI_REAL_EXTENSION",
+                package / "examples/extensions/hello.ts",
+            )
+        ).resolve()
+        with BridgeProcess(pi_package=package, extension=extension) as bridge:
+            initialized = bridge.initialize("runtime_commands")
+            self.assertTrue(any(tool["name"] == "hello" for tool in initialized["tools"]))
+            response = bridge.request(
+                "tool/call",
+                {
+                    "name": "hello",
+                    "arguments": {"name": "Ygg"},
+                    "catalog_revision": 0,
+                },
+            )
+            self.assertEqual("Hello, Ygg!", response["result"]["content"][0]["text"])
+
+    @unittest.skipUnless(
+        os.environ.get("YGG_PI_REAL_PACKAGE"),
+        "set YGG_PI_REAL_PACKAGE to run the pinned real-Pi smoke test",
+    )
+    def test_real_pi_0844_plan_mode_load_smoke(self) -> None:
+        package = Path(os.environ["YGG_PI_REAL_PACKAGE"]).resolve()
+        extension = package / "examples/extensions/plan-mode/index.ts"
+        with BridgeProcess(pi_package=package, extension=extension) as bridge:
+            initialized = bridge.initialize("runtime_commands")
+            self.assertEqual(
+                {"plan", "todos"},
+                {command["name"] for command in initialized["commands"]},
+            )
+            response = bridge.request(
+                "command/execute", {"name": "todos", "arguments": []}
+            )
+            self.assertNotIn("error", response)
+            self.assertTrue(any("No todos" in item for item in bridge.notifications()))
+            self.assertTrue(any("shortcuts is unavailable" in item for item in bridge.stderr))
+            self.assertTrue(any("flags is unavailable" in item for item in bridge.stderr))
 
     def test_unsupported_command_context_is_an_explicit_error(self) -> None:
         with BridgeProcess() as bridge:

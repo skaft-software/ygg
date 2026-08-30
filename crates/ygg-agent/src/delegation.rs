@@ -5078,7 +5078,7 @@ mod tests {
             runtime: RwLock::new(DelegationRuntimeSettings {
                 compaction_model: None,
                 auto_compaction_mode: AgentCompactionMode::Local,
-                auto_compaction_threshold: 0.85,
+                auto_compaction_threshold: 1.0,
                 compaction_keep_recent_tokens: 1_024,
                 completion_policy: CompletionPolicy::Natural,
                 output_modalities: ygg_ai::OutputModalities::Text,

@@ -865,10 +865,9 @@ fn notify_observers(observers: &ObserverDispatch, event: &AgentEvent) {
     }
 }
 
-/// A realistic default output reservation for coding turns. Reserving the
-/// provider's maximum (which may be hundreds of thousands of tokens) makes
-/// proactive context recovery happen far too early.
-const DEFAULT_MAX_OUTPUT_TOKENS: u64 = 16 * 1024;
+/// Minimum context headroom retained for an ordinary coding turn. This is a
+/// compaction policy, not the provider request's output ceiling.
+const DEFAULT_COMPACTION_RESERVE_TOKENS: u64 = 16 * 1024;
 /// Leave room for a visible answer after token-budget reasoning when the model
 /// advertises enough output capacity.
 const REASONING_ANSWER_RESERVE: u64 = 1024;
@@ -1436,14 +1435,22 @@ fn reasoning_token_budget(model: &Model, reasoning: &ReasoningConfig) -> u64 {
     }
 }
 
-fn agent_max_output_tokens(model: &Model, reasoning: &ReasoningConfig) -> u64 {
+fn agent_compaction_reserve_tokens(model: &Model, reasoning: &ReasoningConfig) -> u64 {
     let model_max = model.spec.limits.max_output_tokens.max(1);
     let reasoning_floor = reasoning_token_budget(model, reasoning)
         .saturating_add(REASONING_ANSWER_RESERVE)
         .min(model_max);
-    DEFAULT_MAX_OUTPUT_TOKENS
+    DEFAULT_COMPACTION_RESERVE_TOKENS
         .max(reasoning_floor)
         .min(model_max)
+}
+
+fn resolve_request_max_output_tokens(
+    context_window: u64,
+    input_tokens: u64,
+    provider_output_ceiling: u64,
+) -> u64 {
+    provider_output_ceiling.min(context_window.saturating_sub(input_tokens))
 }
 
 fn add_usage(total: &mut Usage, turn: &Usage) {
@@ -3111,11 +3118,169 @@ struct CompactionContext<'a> {
     keep_recent_tokens: u64,
     events: &'a mpsc::UnboundedSender<AgentEvent>,
     context: &'a ContextTracker,
+    tool_generation: u64,
+    capacity: &'a mut ContextCapacityCache,
 }
 
 struct CapacityEstimate {
     input_tokens: u64,
+    max_output_tokens: u64,
     active_system: String,
+}
+
+/// Total-only context accounting used by the pre-request capacity gate.
+///
+/// The first value is seeded from the exact context observation. For ordinary
+/// canonical-message appends, later values advance from the cached head using
+/// a per-message upper bound instead of serializing the complete history. A
+/// branch checkout, local compaction, tool-surface change, or Responses replay
+/// falls back to the exact estimator. The detailed category breakdown remains
+/// the on-demand telemetry path in [`context_breakdown`].
+struct ContextCapacityCache {
+    head: Option<EntryId>,
+    tool_generation: u64,
+    structural_tokens: u64,
+    provider_tokens: Option<u64>,
+    valid: bool,
+    #[cfg(test)]
+    full_rebuilds: usize,
+}
+
+impl ContextCapacityCache {
+    fn seeded(session: &Session, tool_generation: u64, context: &ContextBreakdown) -> Self {
+        Self {
+            head: session.head(),
+            tool_generation,
+            structural_tokens: context.structural_tokens,
+            provider_tokens: context.provider_tokens,
+            valid: true,
+            #[cfg(test)]
+            full_rebuilds: 0,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    /// Advances over entries appended below the cached head.
+    ///
+    /// Only a local compaction changes the canonical message sequence among
+    /// the entries handled here. All other non-message entries are invisible
+    /// to canonical requests, while each message contributes a conservative
+    /// standalone estimate. The entries are collected and validated before
+    /// mutating the cache so a failed ancestry walk cannot leave a partial
+    /// estimate behind.
+    fn advance_messages(&mut self, session: &Session) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let cached_head = self.head.clone();
+        let mut cursor = session.head_ref();
+        if cursor == cached_head.as_ref() {
+            return true;
+        }
+
+        let mut appended = Vec::new();
+        while cursor != cached_head.as_ref() {
+            let Some(id) = cursor else {
+                return false;
+            };
+            let Some(entry) = session.entry(id) else {
+                return false;
+            };
+            if matches!(entry.value, EntryValue::Compaction { .. }) {
+                return false;
+            }
+            appended.push(entry);
+            cursor = entry.parent.as_ref();
+        }
+
+        for entry in appended.into_iter().rev() {
+            if let EntryValue::Message(message) = &entry.value {
+                let delta = estimate_messages_tokens(std::slice::from_ref(message));
+                self.structural_tokens = self.structural_tokens.saturating_add(delta);
+                if let Some(provider) = self.provider_tokens.as_mut() {
+                    *provider = provider.saturating_add(delta);
+                }
+            }
+        }
+        self.head = session.head();
+        true
+    }
+
+    /// Replaces the cache with a route-accurate full estimate.
+    fn rebuild(
+        &mut self,
+        session: &Session,
+        model: &Model,
+        system: &str,
+        messages: &[Message],
+        tools: &[ToolDef],
+        tool_generation: u64,
+    ) -> RequestContextEstimate {
+        let estimate = reconcile_context_estimate(session, model, system, messages, tools);
+        self.head = session.head();
+        self.tool_generation = tool_generation;
+        self.structural_tokens = estimate.structural_tokens;
+        self.provider_tokens = estimate.provider_tokens;
+        self.valid = true;
+        #[cfg(test)]
+        {
+            self.full_rebuilds = self.full_rebuilds.saturating_add(1);
+        }
+        estimate
+    }
+
+    fn estimate(
+        &mut self,
+        session: &Session,
+        model: &Model,
+        system: &str,
+        tools: &[ToolDef],
+        tool_generation: u64,
+    ) -> Result<RequestContextEstimate, SessionError> {
+        let messages = session.context_ref()?;
+        let can_advance = model.spec.protocol != Protocol::OpenAiResponses
+            && self.valid
+            && self.tool_generation == tool_generation
+            && self.advance_messages(session);
+        if !can_advance {
+            self.rebuild(session, model, system, &messages, tools, tool_generation);
+        }
+        let input_tokens = self
+            .provider_tokens
+            .map_or(self.structural_tokens, |provider| {
+                self.structural_tokens.max(provider)
+            });
+        Ok(RequestContextEstimate {
+            structural_tokens: self.structural_tokens,
+            provider_tokens: self.provider_tokens,
+            input_tokens,
+        })
+    }
+
+    /// Re-anchors provider reconciliation after a completed assistant turn.
+    ///
+    /// Provider usage is authoritative for the prefix through that assistant.
+    /// A zero usage report is left on the incrementally advanced estimate,
+    /// matching `provider_context_estimate`'s behavior of ignoring unusable
+    /// records rather than replacing a usable older measurement with zero.
+    fn observe_assistant_response(&mut self, session: &Session, usage: &Usage) {
+        if !self.advance_messages(session) {
+            self.invalidate();
+            return;
+        }
+        let measured = usage_context_tokens(usage);
+        if measured > 0 {
+            self.provider_tokens = Some(measured);
+        }
+    }
+
+    #[cfg(test)]
+    fn full_rebuilds(&self) -> usize {
+        self.full_rebuilds
+    }
 }
 
 /// An immutable request snapshot assembled only after context capacity has
@@ -3547,34 +3712,38 @@ impl CompactionContext<'_> {
         &mut self,
         system: &str,
         tools: &[ToolDef],
-        max_output_tokens: u64,
+        compaction_reserve_tokens: u64,
+        provider_output_ceiling: u64,
     ) -> Result<CapacityEstimate, AgentError> {
-        let budget = self
-            .model
-            .spec
-            .limits
-            .context_window
-            .saturating_sub(max_output_tokens);
-        let threshold = ((self.model.spec.limits.context_window as f64) * self.threshold_fraction)
-            .floor() as u64;
+        let context_window = self.model.spec.limits.context_window;
+        let budget = context_window.saturating_sub(compaction_reserve_tokens);
+        let threshold = ((context_window as f64) * self.threshold_fraction).floor() as u64;
+        let resolve = |input_tokens, active_system| CapacityEstimate {
+            input_tokens,
+            max_output_tokens: resolve_request_max_output_tokens(
+                context_window,
+                input_tokens,
+                provider_output_ceiling,
+            ),
+            active_system,
+        };
         let mut native_attempted = false;
         loop {
             let active_system = system.to_owned();
-            let estimate = observe_context_tracker(
-                self.context,
-                self.session,
-                self.model,
-                &active_system,
-                tools,
-            )?
-            .total_tokens;
+            let estimate = self
+                .capacity
+                .estimate(
+                    self.session,
+                    self.model,
+                    &active_system,
+                    tools,
+                    self.tool_generation,
+                )?
+                .input_tokens;
             let over_capacity = estimate > budget;
-            let over_threshold = estimate.saturating_add(max_output_tokens) > threshold;
+            let over_threshold = estimate.saturating_add(compaction_reserve_tokens) > threshold;
             if !over_capacity && (self.mode == AgentCompactionMode::Disabled || !over_threshold) {
-                return Ok(CapacityEstimate {
-                    input_tokens: estimate,
-                    active_system,
-                });
+                return Ok(resolve(estimate, active_system));
             }
             if self.mode == AgentCompactionMode::Disabled {
                 return Err(AgentError::ContextExceeded { estimate, budget });
@@ -3592,10 +3761,7 @@ impl CompactionContext<'_> {
                     if over_capacity {
                         return Err(AgentError::ContextExceeded { estimate, budget });
                     }
-                    return Ok(CapacityEstimate {
-                        input_tokens: estimate,
-                        active_system,
-                    });
+                    return Ok(resolve(estimate, active_system));
                 }
                 self.compact_native_responses(&active_system, tools, reason)
                     .await?;
@@ -3614,10 +3780,7 @@ impl CompactionContext<'_> {
                 continue;
             }
             if estimate <= budget {
-                return Ok(CapacityEstimate {
-                    input_tokens: estimate,
-                    active_system,
-                });
+                return Ok(resolve(estimate, active_system));
             }
             return Err(AgentError::ContextExceeded { estimate, budget });
         }
@@ -3627,7 +3790,7 @@ impl CompactionContext<'_> {
         &mut self,
         system: &str,
         tools: &[ToolDef],
-        max_output_tokens: u64,
+        compaction_reserve_tokens: u64,
     ) -> Result<(), AgentError> {
         if self.mode == AgentCompactionMode::NativeResponses {
             let active_system = system.to_owned();
@@ -3646,15 +3809,22 @@ impl CompactionContext<'_> {
                 .await?;
             return Ok(());
         }
-        let estimate =
-            observe_context_tracker(self.context, self.session, self.model, system, tools)?
-                .total_tokens;
+        let estimate = self
+            .capacity
+            .estimate(
+                self.session,
+                self.model,
+                system,
+                tools,
+                self.tool_generation,
+            )?
+            .input_tokens;
         let budget = self
             .model
             .spec
             .limits
             .context_window
-            .saturating_sub(max_output_tokens);
+            .saturating_sub(compaction_reserve_tokens);
         Err(AgentError::ContextExceeded { estimate, budget })
     }
 }
@@ -3775,7 +3945,7 @@ impl Agent {
         config.sandbox.workspace = workspace;
         let resource_owner = config.session.resource_owner_key();
         let session_id = config.session_id.unwrap_or_else(|| resource_owner.clone());
-        let max_output_tokens = agent_max_output_tokens(&config.model, &config.reasoning);
+        let max_output_tokens = config.model.spec.limits.max_output_tokens;
         let tool_scope = next_tool_scope();
         Ok(Self {
             client: config.client,
@@ -3791,7 +3961,7 @@ impl Agent {
             cache_retention: config.cache_retention,
             compaction_model: None,
             auto_compaction_mode: AgentCompactionMode::Local,
-            compaction_threshold_fraction: 0.85,
+            compaction_threshold_fraction: 1.0,
             compaction_keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             session_id,
             resource_owner,
@@ -4214,7 +4384,8 @@ impl Agent {
     /// Configure autonomous context compaction for subsequent runs.
     ///
     /// `threshold_fraction` is the fraction of the complete model context
-    /// window reserved by current input plus the requested output allowance.
+    /// available to current input plus the independently resolved compaction
+    /// reserve. The default `1.0` therefore adds no percentage buffer.
     /// `keep_recent_tokens` is the approximate verbatim tail budget; when the
     /// retained tail alone exceeds the configured threshold or capacity,
     /// recovery advances the boundary until the request fits.
@@ -4292,9 +4463,14 @@ impl Agent {
         self.auto_compaction_mode
     }
 
-    /// Output-token reservation applied to each normal provider request.
+    /// Provider-advertised output ceiling for the active model.
     pub fn max_output_tokens(&self) -> u64 {
         self.max_output_tokens
+    }
+
+    /// Minimum output headroom used by autonomous capacity checks.
+    pub fn compaction_reserve_tokens(&self) -> u64 {
+        agent_compaction_reserve_tokens(&self.model, &self.reasoning)
     }
 
     #[cfg(test)]
@@ -4302,7 +4478,7 @@ impl Agent {
         self.max_session_tokens
     }
 
-    /// Apply the root agent's resolved output reservation to a delegated child.
+    /// Apply the root agent's provider output ceiling to a delegated child.
     pub(crate) fn inherit_max_output_tokens(&mut self, max_output_tokens: u64) {
         self.max_output_tokens = max_output_tokens;
         self.sync_delegation_runtime_settings();
@@ -4655,10 +4831,13 @@ impl Agent {
         let system = self.system.clone();
         let sandbox = self.sandbox.clone();
         let extension_host = self.extensions.clone();
-        let (_, initial_tools) = extension_host.tool_snapshot();
+        let (initial_tool_revision, initial_tools) = extension_host.tool_snapshot();
         let initial_tool_defs: Vec<ToolDef> =
             initial_tools.iter().map(|tool| tool.definition()).collect();
-        observe_context_tracker(&context, &self.session, &model, &system, &initial_tool_defs)?;
+        let initial_context =
+            observe_context_tracker(&context, &self.session, &model, &system, &initial_tool_defs)?;
+        let initial_capacity =
+            ContextCapacityCache::seeded(&self.session, initial_tool_revision, &initial_context);
         if let Some(delegation) = &self.delegation {
             delegation.prepare_owning_run()?;
         }
@@ -4678,7 +4857,8 @@ impl Agent {
         let effect_run_id = format!("run:{}", first_entry.0);
         let completion_policy = self.completion_policy;
         let output_modalities = self.output_modalities.clone();
-        let max_output_tokens = self.max_output_tokens;
+        let provider_output_ceiling = self.max_output_tokens;
+        let compaction_reserve_tokens = self.compaction_reserve_tokens();
         let max_session_tokens = self.max_session_tokens;
         let max_session_cost_microdollars = self.max_session_cost_microdollars;
         let auto_compaction_mode = self.auto_compaction_mode;
@@ -4704,6 +4884,7 @@ impl Agent {
                 lifecycle: stream_lifecycle.clone(),
             };
             let session = &mut *session_guard;
+            let mut context_capacity = initial_capacity;
 
             let (mut tool_revision, tools) = extension_host.tool_snapshot();
             let mut tool_defs: Vec<ToolDef> =
@@ -4850,9 +5031,15 @@ impl Agent {
                         keep_recent_tokens: compaction_keep_recent_tokens,
                         events: &compaction_event_tx,
                         context: &stream_context,
+                        tool_generation: tool_revision,
+                        capacity: &mut context_capacity,
                     };
-                    let operation = compaction
-                        .ensure_capacity(&system, &request_tool_defs, max_output_tokens);
+                    let operation = compaction.ensure_capacity(
+                        &system,
+                        &request_tool_defs,
+                        compaction_reserve_tokens,
+                        provider_output_ceiling,
+                    );
                     tokio::pin!(operation);
                     let result = loop {
                         tokio::select! {
@@ -4881,6 +5068,7 @@ impl Agent {
                     }
                 };
                 let input_tokens = capacity.input_tokens;
+                let request_max_output_tokens = capacity.max_output_tokens;
                 let messages = match session.context() {
                     Ok(m) => m,
                     Err(e) => break 'run FinishReason::Failed(e.into()),
@@ -4901,7 +5089,7 @@ impl Agent {
                     messages,
                     tools: request_tool_defs.clone(),
                     tool_choice: ToolChoice::Auto,
-                    max_output_tokens: Some(max_output_tokens),
+                    max_output_tokens: Some(request_max_output_tokens),
                     temperature: None,
                     stop: vec![],
                     reasoning: reasoning.clone(),
@@ -4933,7 +5121,7 @@ impl Agent {
                 if let Err(error) = reserve_request_tokens(
                     session,
                     input_tokens,
-                    max_output_tokens,
+                    request_max_output_tokens,
                     max_session_tokens,
                 ) {
                     break 'run FinishReason::Failed(error);
@@ -4942,7 +5130,7 @@ impl Agent {
                     session,
                     &model,
                     input_tokens,
-                    max_output_tokens,
+                    request_max_output_tokens,
                     max_session_cost_microdollars,
                 ) {
                     break 'run FinishReason::Failed(error);
@@ -5025,11 +5213,13 @@ impl Agent {
                                 keep_recent_tokens: compaction_keep_recent_tokens,
                                 events: &compaction_event_tx,
                                 context: &stream_context,
+                                tool_generation: tool_revision,
+                                capacity: &mut context_capacity,
                             };
                             let operation = compaction.force_one_boundary(
                                 &system,
                                 &request_tool_defs,
-                                max_output_tokens,
+                                compaction_reserve_tokens,
                             );
                             tokio::pin!(operation);
                             let result = loop {
@@ -5180,11 +5370,13 @@ impl Agent {
                                         keep_recent_tokens: compaction_keep_recent_tokens,
                                         events: &compaction_event_tx,
                                         context: &stream_context,
+                                        tool_generation: tool_revision,
+                                        capacity: &mut context_capacity,
                                     };
                                     let operation = compaction.force_one_boundary(
                                         &system,
                                         &request_tool_defs,
-                                        max_output_tokens,
+                                        compaction_reserve_tokens,
                                     );
                                     tokio::pin!(operation);
                                     let result = loop {
@@ -5421,11 +5613,14 @@ impl Agent {
                 ) {
                     break 'run FinishReason::Failed(error.into());
                 }
+                context_capacity.observe_assistant_response(session, &turn_usage);
                 add_usage(&mut run_usage, &turn_usage);
                 let turn_cost = response.cost;
                 run_cost.add(turn_cost);
                 let normal_end = matches!(stop_reason, StopReason::EndTurn | StopReason::StopSequence);
-                let needs_continuation = matches!(stop_reason, StopReason::MaxTokens | StopReason::PauseTurn)
+                let output_truncated = matches!(stop_reason, StopReason::MaxTokens);
+                let needs_continuation = output_truncated
+                    || matches!(stop_reason, StopReason::PauseTurn)
                     || matches!(&stop_reason, StopReason::Other(reason) if reason == "tool_output_locked");
                 if normal_end && calls.is_empty() && !assistant_has_terminal_content(&assistant) {
                     break 'run FinishReason::Failed(AgentError::IncompleteResponse {
@@ -5689,7 +5884,8 @@ impl Agent {
                     progress: ToolProgressSink::null(),
                     cancellation: CancellationToken::default(),
                 };
-                let parallel_batch = calls.len() > 1
+                let parallel_batch = !output_truncated
+                    && calls.len() > 1
                     && calls.len() <= MAX_TOOL_CALLS_PER_TURN
                     && calls.iter().all(|call| {
                         call.arguments_value().is_ok_and(|arguments| {
@@ -5818,9 +6014,14 @@ impl Agent {
                         // result only on an exact argument match with the
                         // authoritative call; otherwise cancel it and fall
                         // through to normal serial execution.
-                        preexecuted = speculative_bash
-                            .take_matched(&call.id, parsed.as_ref().ok())
-                            .await;
+                        preexecuted = if output_truncated {
+                            let _ = speculative_bash.take_matched(&call.id, None).await;
+                            None
+                        } else {
+                            speculative_bash
+                                .take_matched(&call.id, parsed.as_ref().ok())
+                                .await
+                        };
                     }
                     let CompletedToolExecution {
                         result,
@@ -5842,10 +6043,15 @@ impl Agent {
                         let start = std::time::Instant::now();
                         let started_at = Arc::new(AtomicU64::new(u64::MAX));
                         let started_at_marker = Arc::clone(&started_at);
-                        let result: Result<ToolOutput, ToolError> = if call_index >= MAX_TOOL_CALLS_PER_TURN {
-                        Err(ToolError::new(
-                            "tool call skipped: per-turn tool-call limit reached",
-                        ))
+                        let result: Result<ToolOutput, ToolError> = if output_truncated {
+                            Err(ToolError::new(format!(
+                                "tool call `{}` was not executed: the provider reached its output token limit, so the arguments may be truncated; re-issue the call with complete arguments",
+                                call.name
+                            )))
+                        } else if call_index >= MAX_TOOL_CALLS_PER_TURN {
+                            Err(ToolError::new(
+                                "tool call skipped: per-turn tool-call limit reached",
+                            ))
                     } else if abort.is_set() {
                         cancellation_won = true;
                         Err(cancelled_tool_error())
@@ -6185,6 +6391,10 @@ impl Agent {
                 }
                 delegation.detach_telemetry();
             }
+            // Capacity checks use the incremental total-only cache. Refresh the
+            // detailed snapshot once at the settled boundary so observers retain
+            // an accurate final breakdown without paying for it on every turn.
+            let _ = observe_context_tracker(&stream_context, session, &model, &system, &tool_defs);
             let checkpoint_usage = (completed_turns > 0).then_some(run_usage);
             let checkpoint_cost = model
                 .spec
@@ -6333,6 +6543,18 @@ mod tests {
             .append(user_message(UserInput::from("new durable input")))
             .unwrap();
         assert!(!prepared.is_current(&session, "system", 7));
+    }
+
+    #[test]
+    fn request_output_uses_provider_ceiling_then_clamps_to_remaining_context() {
+        assert_eq!(
+            resolve_request_max_output_tokens(200_000, 20_000, 65_536),
+            65_536
+        );
+        assert_eq!(
+            resolve_request_max_output_tokens(200_000, 170_000, 65_536),
+            30_000
+        );
     }
 
     #[tokio::test]
@@ -6911,6 +7133,165 @@ mod tests {
             estimate < 10_000,
             "inline image bytes were miscounted as text tokens: {estimate}"
         );
+    }
+
+    #[test]
+    fn canonical_capacity_advances_new_messages_without_rebuilding_history() {
+        use ygg_ai::{ModelCatalog, ModelId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("capacity.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let system = "system";
+        session
+            .append(user_message(UserInput::from("first message")))
+            .unwrap();
+        let messages = session.context().unwrap();
+        let baseline = context_breakdown(&session, &model, system, &messages, &[]);
+        let mut cache = ContextCapacityCache::seeded(&session, 1, &baseline);
+
+        session
+            .append(user_message(UserInput::from("second message")))
+            .unwrap();
+        let incremental = cache.estimate(&session, &model, system, &[], 1).unwrap();
+        let full_messages = session.context().unwrap();
+        let full = reconcile_context_estimate(&session, &model, system, &full_messages, &[]);
+
+        assert!(
+            incremental.input_tokens >= full.input_tokens,
+            "incremental capacity undercounted the request: incremental={incremental:?} full={full:?}"
+        );
+        assert_eq!(cache.full_rebuilds(), 0);
+    }
+
+    #[test]
+    fn canonical_capacity_overbounds_coalesced_tool_results_without_a_full_scan() {
+        use ygg_ai::{ModelCatalog, ModelId, ToolResult, ToolResultPart};
+
+        fn tool_result(id: &str, text: &str) -> EntryValue {
+            EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::ToolResult(ToolResult {
+                    tool_call_id: ygg_ai::ToolCallId(id.into()),
+                    content: vec![ToolResultPart::Text(text.into())],
+                    is_error: false,
+                    added_tool_names: None,
+                })],
+            }))
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session =
+            Session::create(directory.path().join("coalesced-capacity.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let system = "system";
+        session.append(tool_result("one", "first result")).unwrap();
+        let messages = session.context().unwrap();
+        let baseline = context_breakdown(&session, &model, system, &messages, &[]);
+        let mut cache = ContextCapacityCache::seeded(&session, 1, &baseline);
+
+        session.append(tool_result("two", "second result")).unwrap();
+        let incremental = cache.estimate(&session, &model, system, &[], 1).unwrap();
+        let full_messages = session.context().unwrap();
+        let full = reconcile_context_estimate(&session, &model, system, &full_messages, &[]);
+
+        assert_eq!(
+            full_messages.len(),
+            1,
+            "tool results should coalesce in context"
+        );
+        assert!(
+            incremental.input_tokens >= full.input_tokens,
+            "coalesced tool result undercounted the request: incremental={incremental:?} full={full:?}"
+        );
+        assert_eq!(cache.full_rebuilds(), 0);
+    }
+
+    #[test]
+    fn canonical_capacity_reanchors_to_authoritative_provider_usage() {
+        use ygg_ai::{AssistantMessage, AssistantPart, ModelCatalog, ModelId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session =
+            Session::create(directory.path().join("provider-capacity.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let system = "system";
+        session
+            .append(user_message(UserInput::from("prompt")))
+            .unwrap();
+        let messages = session.context().unwrap();
+        let baseline = context_breakdown(&session, &model, system, &messages, &[]);
+        let mut cache = ContextCapacityCache::seeded(&session, 1, &baseline);
+        let usage = Usage {
+            input_tokens: 90_000,
+            output_tokens: 10_000,
+            total_tokens: 100_000,
+            ..Usage::default()
+        };
+
+        session
+            .append_assistant_turn(
+                AssistantMessage {
+                    content: vec![AssistantPart::Text("answer".into())],
+                    model: model.spec.id.clone(),
+                    protocol: model.spec.protocol,
+                },
+                model.endpoint.id.clone(),
+                model.spec.id.clone(),
+                usage,
+                None,
+                StopReason::EndTurn,
+                None,
+            )
+            .unwrap();
+        cache.observe_assistant_response(&session, &usage);
+        let incremental = cache.estimate(&session, &model, system, &[], 1).unwrap();
+        let full_messages = session.context().unwrap();
+        let full = reconcile_context_estimate(&session, &model, system, &full_messages, &[]);
+
+        assert_eq!(incremental.provider_tokens, Some(100_000));
+        assert_eq!(incremental.provider_tokens, full.provider_tokens);
+        assert!(incremental.input_tokens >= full.input_tokens);
+        assert_eq!(cache.full_rebuilds(), 0);
+    }
+
+    #[test]
+    fn canonical_capacity_rebuilds_after_a_local_compaction_boundary() {
+        use ygg_ai::{ModelCatalog, ModelId};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut session =
+            Session::create(directory.path().join("compaction-capacity.jsonl")).unwrap();
+        let model = ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let system = "system";
+        session
+            .append(user_message(UserInput::from("old message")))
+            .unwrap();
+        let first_kept = session
+            .append(user_message(UserInput::from("kept message")))
+            .unwrap();
+        let messages = session.context().unwrap();
+        let baseline = context_breakdown(&session, &model, system, &messages, &[]);
+        let mut cache = ContextCapacityCache::seeded(&session, 1, &baseline);
+
+        session.compact("summary", first_kept).unwrap();
+        let incremental = cache.estimate(&session, &model, system, &[], 1).unwrap();
+        let full_messages = session.context().unwrap();
+        let full = reconcile_context_estimate(&session, &model, system, &full_messages, &[]);
+
+        assert_eq!(incremental, full);
+        assert_eq!(cache.full_rebuilds(), 1);
     }
 
     fn tool_media_model(protocol: Protocol, modalities: ygg_ai::ModalitySet) -> Model {

@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.3"><img alt="Release: 0.6.3" src="https://img.shields.io/badge/release-0.6.3-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.4"><img alt="Release: 0.6.4" src="https://img.shields.io/badge/release-0.6.4-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -39,11 +39,11 @@ verifies the release archive and installs `ygg` and `ygg-host` under
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.3/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.4/install-ygg.sh | sh
 ```
 
 ```sh
-ygg --version   # ygg 0.6.3
+ygg --version   # ygg 0.6.4
 ygg --help
 ```
 
@@ -92,7 +92,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.3/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.4/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -103,7 +103,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.3 \
+  --tag v0.6.4 \
   --bins \
   ygg-coding-agent
 ```
@@ -130,7 +130,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.3 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.4 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -228,11 +228,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.3
+scripts/build-ygg-image.sh ygg:0.6.4
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.3 --model claude-sonnet-4-6
+  ygg:0.6.4 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -485,7 +485,7 @@ ordinary post-send disconnects remain terminal.
 
 ### Reasoning without transcript noise
 
-Reasoning is collapsed by default while remaining available with `Ctrl+O`. Every accepted run opens with a bold, model-color-adaptive shimmering `Working` row. Visible assistant text then becomes the liveness signal and hides that row while it streams; if the active run continues after the turn, `Working` returns for the next tool or model boundary. During reasoning, a fixed two-row status keeps a shimmering `Thinking` header on the first row. The second row shows the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—followed by a plain, subdued expansion hint; ordinary reasoning body text is never promoted. Without a heading, the second row contains only the hint. Expanded reasoning keeps the same inset without an event-margin dot or a synthetic first-line bullet. Completed reasoning disappears again when collapsed.
+Reasoning is collapsed by default while remaining available with `Ctrl+O`. Every accepted run opens with a bold, model-color-adaptive shimmering `Working` row. While the owning run remains active, one trailing `Working (<elapsed> • esc to interrupt)` row stays visible even after assistant text; tool admission temporarily replaces it with the tool lifecycle, and authoritative settlement removes it. During reasoning, a fixed two-row status keeps a shimmering `Thinking` header on the first row. The second row shows the latest explicit Markdown heading emitted by the model—an ATX heading or standalone bold-heading paragraph—followed by a plain, subdued expansion hint; ordinary reasoning body text is never promoted. Without a heading, the second row contains only the hint. Expanded reasoning keeps the same inset without an event-margin dot or a synthetic first-line bullet. Completed reasoning disappears again when collapsed.
 
 ```text
 • Thinking
@@ -579,12 +579,12 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the next provider-visible request against the active model's context window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
+ygg estimates the complete next provider-visible request before every model turn. The default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer; local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
 mode = "local" # disabled, local, or native-responses
-threshold_fraction = 0.85
+threshold_fraction = 1.0
 keep_recent_tokens = 20000
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ```
@@ -606,7 +606,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
-- The compiled default theme is the only theme exposed by the v0.6.3 runtime.
+- The compiled default theme is the only theme exposed by the v0.6.4 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -629,7 +629,7 @@ ygg --mouse app
 
 ## Terminal theming
 
-Theme selection is disabled in v0.6.3. The TUI and graphical Serve frontend expose
+Theme selection is disabled in v0.6.4. The TUI and graphical Serve frontend expose
 only Ygg's compiled default theme; that does **not** mean a fixed accent hue.
 The selected model's deterministic palette changes the atmosphere while layout,
 interaction grammar, and semantic status colours remain stable. See
@@ -727,7 +727,7 @@ offline = false
 
 [compaction]
 mode = "local"
-threshold_fraction = 0.85
+threshold_fraction = 1.0
 keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
@@ -793,9 +793,11 @@ code, starts no provider or model, changes no files, and reports an estimated
 model use of zero tokens.
 
 Use `--json` for the versioned machine-readable inventory. This release does
-not yet copy resources, apply package recipes, or start a Pi compatibility
-process; see [docs/pi-migration.md](docs/pi-migration.md) for classifications,
-bounds, and the staged compatibility architecture.
+not yet copy resources or apply package recipes. Reviewed local Pi sources can
+be linked inertly through `ygg pi install`; the pinned bridge remains disabled
+and untrusted until explicitly activated. See
+[docs/pi-migration.md](docs/pi-migration.md) for the exact Pi profile,
+classifications, bounds, and remaining compatibility gaps.
 
 ### Prompt templates
 
@@ -961,13 +963,13 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.6.3.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.4.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | v0.6.3 default-only status and reserved schema. |
+| [Themes](docs/themes.md) | v0.6.4 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |

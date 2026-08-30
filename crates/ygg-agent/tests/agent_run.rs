@@ -308,12 +308,16 @@ fn partial_text_turn(text: &str) -> String {
 }
 
 /// A complete turn that requests the given tool calls.
-fn tool_turn(calls: &[(&str, &str, serde_json::Value)]) -> String {
+fn tool_turn_with_stop(calls: &[(&str, &str, serde_json::Value)], stop_reason: &str) -> String {
     let mut s = msg_start();
     for (i, (id, name, args)) in calls.iter().enumerate() {
         s += &tool_block(i, id, name, args);
     }
-    s + &msg_end("tool_use")
+    s + &msg_end(stop_reason)
+}
+
+fn tool_turn(calls: &[(&str, &str, serde_json::Value)]) -> String {
+    tool_turn_with_stop(calls, "tool_use")
 }
 
 struct ResponsesConnectionLimitServer {
@@ -1986,6 +1990,53 @@ async fn disabled_auto_compaction_allows_below_capacity_request_past_threshold()
 }
 
 #[tokio::test]
+async fn request_output_ceiling_clamps_only_to_remaining_context() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(text_turn("context-aware cap"))
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let session = session_with_authoritative_pressure(
+        &sessions.path().join("request-output-cap.jsonl"),
+        70_000,
+    );
+    let mut extensions = ExtensionHost::new();
+    extensions.load(&CoreTools);
+    let model = scripted_model_with_limits(&server.uri(), 100_000, 65_536);
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model,
+        session,
+        system: "test".into(),
+        sandbox: SandboxConfig::new(workspace.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(1),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+    agent
+        .set_compaction_token_policy(false, 1.0, 4_000)
+        .unwrap();
+
+    agent.complete("new work").await.unwrap();
+    let requests = wire_requests(&server).await;
+    let request_max = requests[0]["max_tokens"].as_u64().unwrap();
+    assert!(request_max < 65_536, "{request_max}");
+    assert!(request_max >= 16_384, "{request_max}");
+}
+
+#[tokio::test]
 async fn hard_cost_reservation_blocks_network_before_a_request_can_overshoot() {
     let server = MockServer::start().await;
     let workspace = tempfile::tempdir().unwrap();
@@ -2588,6 +2639,46 @@ async fn tool_output_locked_causes_a_corrective_openai_turn() {
     assert!(!serialized.contains("tool_output_locked"));
     assert!(serialized.contains("Re-issue that tool call now"));
     assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn max_token_tool_calls_are_failed_without_execution_and_reissued() {
+    let mut h = harness(
+        vec![
+            tool_turn_with_stop(
+                &[(
+                    "truncated_write",
+                    "write",
+                    serde_json::json!({
+                        "path": "must-not-exist.txt",
+                        "content": "unsafe partial output"
+                    }),
+                )],
+                "max_tokens",
+            ),
+            text_turn("recovered without executing the truncated call"),
+        ],
+        Some(8),
+    )
+    .await;
+
+    let output = h.agent.complete("write safely").await.unwrap();
+    assert!(output.text.contains("recovered without executing"));
+    assert!(!h.workspace.join("must-not-exist.txt").exists());
+
+    let context = serde_json::to_string(&h.agent.session().context().unwrap()).unwrap();
+    assert!(context.contains("truncated_write"), "{context}");
+    assert!(context.contains("was not executed"), "{context}");
+    assert!(context.contains("output token limit"), "{context}");
+
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert_eq!(requests.len(), 2);
+    let recovery = requests[1].to_string();
+    assert!(recovery.contains("was not executed"), "{recovery}");
+    assert!(
+        recovery.contains("truncated at the token limit"),
+        "{recovery}"
+    );
 }
 
 #[tokio::test]
@@ -4905,7 +4996,7 @@ async fn non_off_reasoning_reaches_the_provider_request() {
 }
 
 #[tokio::test]
-async fn large_reasoning_budget_raises_the_agent_output_limit() {
+async fn provider_output_ceiling_is_not_replaced_by_reasoning_reserve() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("messages"))
@@ -4946,7 +5037,7 @@ async fn large_reasoning_budget_raises_the_agent_output_limit() {
     agent.complete("hello").await.unwrap();
     let requests = wire_requests(&server).await;
     assert_eq!(requests[0]["thinking"]["budget_tokens"], 32_768);
-    assert_eq!(requests[0]["max_tokens"], 33_792);
+    assert_eq!(requests[0]["max_tokens"], 65_536);
 }
 
 #[tokio::test]

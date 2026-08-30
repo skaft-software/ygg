@@ -43,7 +43,7 @@ inferred from a model name, endpoint label, or authentication plan.
 
 ## Stream contract
 
-A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, malformed tool arguments, and unbalanced parts are errors.
+A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, and unbalanced parts are errors. Malformed tool arguments are also errors unless an authoritative max-token terminal proves the output was truncated; that case retains only the call envelope with empty arguments so the agent can pair a non-executing error result and continue safely.
 
 The response builder enforces absolute limits before appending:
 

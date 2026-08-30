@@ -1,7 +1,9 @@
 use std::cell::Ref;
 use std::time::Instant;
 
-use super::transcript_render::{render_assistant_update_planned, render_block_planned};
+use super::transcript_render::{
+    render_assistant_update_planned, render_block_planned_with_rainbow,
+};
 use super::welcome_card::render_welcome_card;
 use super::ShellState;
 
@@ -131,6 +133,7 @@ impl ShellState {
                 .expect("reasoning renderer initialized above");
             let mut cache = self.transcript_cache.borrow_mut();
             let previous_line_count = cache.lines.len();
+            let rainbow_strength = self.status_rainbow_strength();
             let mut first_changed = cache.lines.len();
             let rebuild =
                 cache.width != Some(width) || cache.block_revisions.len() > self.transcript.len();
@@ -149,7 +152,7 @@ impl ShellState {
                     .extend(render_welcome_card(self, width, 10, Instant::now()));
 
                 for (index, block) in self.transcript.iter().enumerate() {
-                    let rendered = render_block_planned(
+                    let rendered = render_block_planned_with_rainbow(
                         index
                             .checked_sub(1)
                             .and_then(|previous| self.transcript.get(previous)),
@@ -161,6 +164,7 @@ impl ShellState {
                         self.show_tool_details(block),
                         self.event_spinner_frame,
                         self.status_shimmer_frame,
+                        rainbow_strength,
                     );
                     let start = cache.lines.len();
                     let length = rendered.lines.len();
@@ -175,7 +179,7 @@ impl ShellState {
                 // once and leave every existing block's layout untouched.
                 while cache.block_revisions.len() < self.transcript.len() {
                     let index = cache.block_revisions.len();
-                    let rendered = render_block_planned(
+                    let rendered = render_block_planned_with_rainbow(
                         index
                             .checked_sub(1)
                             .and_then(|previous| self.transcript.get(previous)),
@@ -187,6 +191,7 @@ impl ShellState {
                         self.show_tool_details(&self.transcript[index]),
                         self.event_spinner_frame,
                         self.status_shimmer_frame,
+                        rainbow_strength,
                     );
                     let start = cache.lines.len();
                     first_changed = first_changed.min(start);
@@ -252,7 +257,7 @@ impl ShellState {
                     }
 
                     first_changed = first_changed.min(start);
-                    let rendered = render_block_planned(
+                    let rendered = render_block_planned_with_rainbow(
                         previous,
                         &self.transcript[index],
                         &self.theme,
@@ -262,6 +267,7 @@ impl ShellState {
                         self.show_tool_details(&self.transcript[index]),
                         self.event_spinner_frame,
                         self.status_shimmer_frame,
+                        rainbow_strength,
                     );
                     let new_length = rendered.lines.len();
                     cache

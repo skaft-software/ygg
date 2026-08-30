@@ -50,7 +50,7 @@ installation performs no `pip install`, model call, service setup, or other
 arbitrary code. Python 3.9 or newer must be available as `python3`.
 
 Release compatibility is recorded directly in `extension.toml`: bundle
-`0.3.0`, extension API `0.2`, exact Ygg `0.6.3`.
+`0.3.0`, extension API `0.2`, exact Ygg `0.6.4`.
 
 ## Choose a provider
 

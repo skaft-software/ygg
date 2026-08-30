@@ -4,7 +4,9 @@ use sexy_tui_rs::{Block, Inline};
 
 use super::bash_render::render_compact_bash_output;
 use super::surface_layout::compile_surface_plan;
-use super::tool_render::{tool_value_indent, without_redundant_tool_lead};
+use super::tool_render::{
+    tool_grid_label, tool_value_indent, tool_value_indent_width, without_redundant_tool_lead,
+};
 use super::transcript_commit::{
     transcript_commit_cursor, transcript_commit_position, FINAL_COMMIT_SEGMENT,
 };
@@ -211,7 +213,7 @@ fn assert_input_suggestions_replace_status_footer(
             .last()
             .expect("standalone composer should include its status footer")
     )
-    .contains("80/272k"));
+    .contains("context 0%/272K"));
 
     let chrome = shell_chrome(&state, WIDTH, now);
     assert!(!chrome.suggestions.is_empty());
@@ -223,7 +225,7 @@ fn assert_input_suggestions_replace_status_footer(
         chrome
             .composer
             .iter()
-            .all(|line| !strip_terminal_sequences(line).contains("80/272k")),
+            .all(|line| !strip_terminal_sequences(line).contains("context 0%")),
         "autocomplete must replace the model and token status row"
     );
 
@@ -579,16 +581,55 @@ fn session_picker_render_shows_scope_markers_and_fork_metadata() {
         picker: PickerState::new(vec![fork], None),
     });
     let raw = render_panel(&shell.state.borrow(), 100);
-    let rendered = raw
+    let plain = raw
         .iter()
         .map(|line| strip_terminal_sequences(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let rendered = plain.join("\n");
     assert!(rendered.contains("Resume Session (Current Folder)"));
     assert!(rendered.contains("Forked (fork)"));
     assert!(!rendered.contains("(current)"));
     assert!(rendered.contains("^s sort"));
     assert_eq!(raw.join("\n").matches(CURSOR_MARKER).count(), 1);
+    assert!(plain[1].starts_with("Resume Session"), "{plain:?}");
+    assert!(plain[2].starts_with("Filter"), "{plain:?}");
+    let selected = plain
+        .iter()
+        .find(|line| line.contains("Forked (fork)"))
+        .expect("selected session title");
+    assert!(
+        selected.starts_with("› ") || selected.starts_with("> "),
+        "{plain:?}"
+    );
+}
+
+#[test]
+fn wide_session_picker_gives_titles_and_metadata_separate_rows() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(100, 24);
+    let title =
+        "please perform a thorough audit of the resume picker layout without truncating the title";
+    let mut unreadable = picker_session("2026-08-27-session-00ff", "(unreadable session)", 0, 2);
+    unreadable.modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(9);
+    let mut readable = picker_session("readable", title, 12, 1);
+    readable.modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(10);
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(vec![readable, unreadable], None),
+    });
+
+    let lines = render_panel(&shell.state.borrow(), 100)
+        .into_iter()
+        .map(|line| strip_terminal_sequences(&line))
+        .collect::<Vec<_>>();
+    let title_row = lines
+        .iter()
+        .position(|line| line.contains(title))
+        .expect("the wide title should not be truncated");
+    assert!(lines[title_row + 1].contains("12 msgs"));
+    assert!(lines
+        .iter()
+        .any(|line| { line.contains("(unreadable session ·") && line.contains("00ff)") }));
+    assert!(lines.iter().all(|line| visible_width(line) <= 100));
 }
 
 fn plain_composer_surface(shell: &InteractiveShell, width: u16, now: Instant) -> Vec<String> {
@@ -604,8 +645,13 @@ fn plain_footer(shell: &InteractiveShell, width: u16, now: Instant) -> String {
         .expect("composer always has a status row at useful widths")
 }
 
+fn default_composer_rule(width: u16) -> String {
+    let theme = crate::tui::theme::test_theme();
+    theme.glyph("horizontal").repeat(usize::from(width))
+}
+
 #[test]
-fn confirmation_panel_keeps_two_choices_plain_and_unfiltered() {
+fn confirmation_panel_shows_shared_detail_and_unfiltered_actions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
@@ -625,16 +671,86 @@ fn confirmation_panel_keeps_two_choices_plain_and_unfiltered() {
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
     let rendered = lines.join("\n");
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 5);
     assert!(rendered.contains("Approve one exact `bash` tool effect?"));
     assert!(rendered.contains("Deny"));
     assert!(rendered.contains("Approve"));
+    assert!(rendered.contains("Detail"));
+    assert_eq!(rendered.matches("85bc9fe8").count(), 1);
     assert!(!rendered.contains("Filter"));
     assert!(!rendered.contains("1/2"));
-    assert!(!rendered.contains("85bc9fe8"));
 
     shell.panel_input(&panel_key(crossterm::event::KeyCode::Char('x')));
     assert!(panel_state(&shell).2.is_empty());
+}
+
+#[test]
+fn confirmation_requires_its_selected_action_to_be_visible() {
+    for (selected, label) in [(0, "Deny"), (1, "Approve")] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(80, 5);
+        shell.open_panel(Panel::SelectList {
+            title: "Approve?".into(),
+            items: vec!["Deny".into(), "Approve".into()],
+            descriptions: vec![Some("writes src/lib.rs".into()); 2],
+            selected,
+            filter: String::new(),
+            action: PanelAction::Confirmation,
+        });
+
+        let hidden = shell_chrome(&shell.state.borrow(), 80, Instant::now()).panel;
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert_eq!(strip_terminal_sequences(&hidden[0]).trim(), "Approve?");
+        assert!(
+            shell
+                .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+                .is_none(),
+            "Enter must not choose an action that is not rendered"
+        );
+        assert!(shell.has_panel());
+
+        shell.set_size(80, 6);
+        let visible = shell_chrome(&shell.state.borrow(), 80, Instant::now()).panel;
+        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert!(visible.iter().any(|line| line.contains(label)));
+        let (result, action) = shell
+            .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+            .expect("visible selected action can be chosen");
+        assert_eq!(result, PanelResult::Confirm(selected));
+        assert!(matches!(action, PanelAction::Confirmation));
+    }
+}
+
+#[test]
+fn confirmation_allows_a_visible_action_when_the_title_is_clipped() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(46, 8);
+    let title = "Approve one exact workspace mutation with a deliberately long identity?";
+    shell.open_panel(Panel::SelectList {
+        title: title.into(),
+        items: vec!["Deny".into(), "Approve".into()],
+        descriptions: vec![None, None],
+        selected: 1,
+        filter: String::new(),
+        action: PanelAction::Confirmation,
+    });
+
+    let visible = shell_chrome(&shell.state.borrow(), 46, Instant::now()).panel;
+    assert!(
+        visible.iter().any(|line| line.contains("Approve")),
+        "{visible:?}"
+    );
+    assert!(
+        visible
+            .iter()
+            .all(|line| !strip_terminal_sequences(line).contains(title)),
+        "the test requires a clipped title: {visible:?}"
+    );
+    let (result, action) = shell
+        .panel_input(&panel_key(crossterm::event::KeyCode::Enter))
+        .expect("a visible action remains actionable when the title is clipped");
+    assert_eq!(result, PanelResult::Confirm(1));
+    assert!(matches!(action, PanelAction::Confirmation));
 }
 
 #[test]
@@ -857,6 +973,14 @@ fn select_list_has_a_stable_filter_row_and_owns_the_only_cursor() {
 #[test]
 fn composer_keeps_its_cursor_marker_at_extreme_narrow_widths() {
     let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    let model_rgb = shell
+        .state
+        .borrow()
+        .theme
+        .model_rgb(Some(ModelLab::Anthropic))
+        .expect("Anthropic model accent");
+    let encoded_model_rgb = format!("38;2;{};{};{}", model_rgb.0, model_rgb.1, model_rgb.2);
     for width in [1, 2] {
         let rendered = crate::tui::composer_surface::render_composer_surface(
             &shell.state.borrow(),
@@ -868,6 +992,10 @@ fn composer_keeps_its_cursor_marker_at_extreme_narrow_widths() {
             rendered.matches(CURSOR_MARKER).count(),
             1,
             "width {width}: {rendered:?}"
+        );
+        assert!(
+            rendered.contains(&encoded_model_rgb),
+            "width {width} lost next-model provenance: {rendered:?}"
         );
     }
 
@@ -921,7 +1049,7 @@ fn select_list_keeps_a_focused_filter_row_in_a_tiny_busy_terminal() {
 }
 
 #[test]
-fn select_list_aligns_muted_metadata_and_drops_it_before_narrow_labels() {
+fn select_list_separates_model_metadata_and_drops_it_before_narrow_labels() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
@@ -945,6 +1073,8 @@ fn select_list_aligns_muted_metadata_and_drops_it_before_narrow_labels() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
+    assert!(wide[1].starts_with("Select model"), "{wide:?}");
+    assert!(wide[2].starts_with("Filter"), "{wide:?}");
     let description_columns = ["openai", "anthropic", "openrouter"]
         .iter()
         .map(|provider| {
@@ -959,11 +1089,22 @@ fn select_list_aligns_muted_metadata_and_drops_it_before_narrow_labels() {
             .all(|columns| columns[0] == columns[1]),
         "{wide:?}"
     );
+    let gpt_row = wide
+        .iter()
+        .position(|line| line.contains("GPT-5.6"))
+        .expect("model label should render");
+    assert!(wide[gpt_row + 1].contains("openai"), "{wide:?}");
+    assert!(!wide[gpt_row].contains("openai"));
     let selected = wide
         .iter()
         .find(|line| line.contains("Claude Opus"))
         .expect("selected model should render");
     assert!(selected.trim_start().starts_with('›') || selected.trim_start().starts_with('>'));
+    assert!(
+        selected.starts_with("› ") || selected.starts_with("> "),
+        "{wide:?}"
+    );
+    assert!(wide[gpt_row + 1].starts_with("  "), "{wide:?}");
 
     let narrow = render_panel(&shell.state.borrow(), 30)
         .into_iter()
@@ -1213,7 +1354,7 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
     assert!(restored
         .composer
         .iter()
-        .any(|line| strip_terminal_sequences(line).contains("80/272k")));
+        .any(|line| strip_terminal_sequences(line).contains("context 0%/272K")));
 
     shell.drain_editor();
     shell.apply_edit(EditAction::Char('/'));
@@ -1225,7 +1366,7 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
 }
 
 #[test]
-fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
+fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
@@ -1236,12 +1377,17 @@ fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
         crate::tui::theme::apply_model_lab(&mut state.theme, ModelLab::Anthropic);
         state.model_lab = Some(ModelLab::Anthropic);
     }
-    let accent = {
+    let model_accent = {
         let state = shell.state.borrow();
         let (red, green, blue) = state
             .theme
-            .model_rgb(state.model_lab)
-            .expect("model accent");
+            .model_rgb(Some(ModelLab::Anthropic))
+            .expect("Anthropic model accent");
+        format!("\x1b[38;2;{red};{green};{blue}m")
+    };
+    let ui_accent = {
+        let state = shell.state.borrow();
+        let (red, green, blue) = state.theme.role_rgb("accent").expect("UI accent");
         format!("\x1b[38;2;{red};{green};{blue}m")
     };
 
@@ -1250,15 +1396,16 @@ fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
     assert_eq!(slash.len(), 6, "{slash:?}");
     let selected = slash.first().expect("selected slash suggestion");
     assert!(
-        strip_terminal_sequences(selected).starts_with("  › /new"),
+        strip_terminal_sequences(selected).starts_with("› /new"),
         "{slash:?}"
     );
-    assert!(selected.contains(&accent), "{selected:?}");
+    assert!(selected.contains(&ui_accent), "{selected:?}");
+    assert!(!selected.contains(&model_accent), "{selected:?}");
     let unselected = slash
         .iter()
         .find(|line| line.contains("/resume"))
         .expect("unselected slash suggestion");
-    assert!(!unselected.contains(&accent), "{unselected:?}");
+    assert!(!unselected.contains(&model_accent), "{unselected:?}");
     let footer = slash.last().expect("slash suggestion footer");
     let plain_footer = strip_terminal_sequences(footer);
     assert!(
@@ -1266,7 +1413,7 @@ fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
             && plain_footer.contains("↑↓ navigate · ↵ select · esc close"),
         "{plain_footer:?}"
     );
-    assert!(footer.contains(&accent), "{footer:?}");
+    assert!(footer.contains(&ui_accent), "{footer:?}");
 
     shell.drain_editor();
     shell.set_workspace(dir.path().to_path_buf());
@@ -1279,13 +1426,150 @@ fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
         .find(|line| line.contains("src/main.rs"))
         .expect("selected mention suggestion");
     assert_eq!(strip_terminal_sequences(selected).trim(), "› src/main.rs");
-    assert!(selected.contains(&accent), "{selected:?}");
+    assert!(selected.contains(&ui_accent), "{selected:?}");
     let footer = paths.last().expect("mention suggestion footer");
     assert_eq!(
         strip_terminal_sequences(footer).trim(),
         "project files · tab complete"
     );
-    assert!(footer.contains(&accent), "{footer:?}");
+    assert!(footer.contains(&ui_accent), "{footer:?}");
+}
+
+#[test]
+fn slash_palette_shares_the_composer_grid_at_narrow_and_wide_widths() {
+    for width in [32_u16, 80, 120] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, 20);
+        shell.apply_edit(EditAction::Char('/'));
+
+        let state = shell.state.borrow();
+        let plan = crate::tui::layout::PresentationLayout::new(&state.theme, width);
+        let slash = render_slash_suggestions(&state, width, 6);
+        let selected = slash.first().expect("selected slash command");
+        let selected = strip_terminal_sequences(selected);
+        let composer =
+            crate::tui::composer_surface::render_composer_surface(&state, width, Instant::now());
+        let composer_prompt = composer
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .find(|line| line.contains("› /"))
+            .expect("composer prompt row");
+
+        assert_eq!(
+            plan.inset, 0,
+            "default surfaces must reach the terminal edge at width {width}"
+        );
+        assert_eq!(
+            selected.find('›'),
+            Some(usize::from(plan.inset)),
+            "slash palette width {width}: {selected:?}"
+        );
+        assert_eq!(
+            composer_prompt.find('›'),
+            Some(usize::from(plan.inset)),
+            "composer width {width}: {composer_prompt:?}"
+        );
+        let command_byte = selected.find('/').expect("slash command name");
+        assert_eq!(
+            visible_width(&selected[..command_byte]),
+            2,
+            "slash command names belong on the shared primary text column: {selected:?}"
+        );
+        assert!(
+            visible_width(&selected) <= usize::from(plan.inset + plan.content_width),
+            "slash palette exceeded composer right edge at width {width}: {selected:?}"
+        );
+    }
+}
+
+#[test]
+fn composer_always_uses_the_model_selected_for_the_next_prompt() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    let now = Instant::now();
+    let idle =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
+    shell.apply_edit(EditAction::Char('x'));
+    let focused =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
+    let run_id = shell.begin_run("anthropic");
+    let active =
+        crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
+
+    let accent = shell
+        .state
+        .borrow()
+        .theme
+        .model_rgb(Some(ModelLab::Anthropic))
+        .expect("Anthropic model accent");
+    let encoded = format!("38;2;{};{};{}", accent.0, accent.1, accent.2);
+    for surface in [&idle, &focused, &active] {
+        assert!(surface.join("\n").contains(&encoded), "{surface:?}");
+    }
+    assert_eq!(idle[0], focused[0]);
+    assert_eq!(focused[0], active[0]);
+    shell.interrupt_run(run_id);
+}
+
+#[test]
+fn model_switch_recolors_only_the_composer_and_future_prompt() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    shell.on_prompt_submitted("prompt for Claude");
+    shell.set_identity("local", "qwen3.6-27b", "high");
+    shell.on_prompt_submitted("prompt for Qwen");
+
+    let before_switch = shell
+        .state
+        .borrow()
+        .transcript
+        .iter()
+        .filter_map(|block| match block {
+            TranscriptBlock::User {
+                text, prompt_color, ..
+            } => Some((text.clone(), prompt_color.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(before_switch[0].1, before_switch[1].1);
+
+    shell.set_identity("openai", "gpt-5.6", "high");
+    let after_switch = shell
+        .state
+        .borrow()
+        .transcript
+        .iter()
+        .filter_map(|block| match block {
+            TranscriptBlock::User {
+                text, prompt_color, ..
+            } => Some((text.clone(), prompt_color.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(after_switch, before_switch);
+
+    let rendered = shell.state.borrow().rendered_transcript(80).join("\n");
+    for (_, color) in &before_switch {
+        let color = color.as_deref().expect("model prompt colour");
+        let red = u8::from_str_radix(&color[1..3], 16).unwrap();
+        let green = u8::from_str_radix(&color[3..5], 16).unwrap();
+        let blue = u8::from_str_radix(&color[5..7], 16).unwrap();
+        assert!(
+            rendered.contains(&format!("48;2;{red};{green};{blue}")),
+            "stored prompt card lost {color}: {rendered:?}"
+        );
+    }
+
+    let state = shell.state.borrow();
+    assert_eq!(state.model_lab, Some(ModelLab::OpenAi));
+    let openai = state
+        .theme
+        .model_rgb(Some(ModelLab::OpenAi))
+        .expect("OpenAI model accent");
+    let composer =
+        crate::tui::composer_surface::render_composer_surface(&state, 80, Instant::now())
+            .join("\n");
+    assert!(composer.contains(&format!("38;2;{};{};{}", openai.0, openai.1, openai.2)));
 }
 
 #[test]
@@ -1605,7 +1889,7 @@ fn submitted_prompts_render_immediately_with_real_context_budget() {
     let rendered = render_shell(&shell.state.borrow(), 120);
     let footer = rendered.last().expect("single composer footer");
     assert!(
-        strip_terminal_sequences(footer).contains("900.0k/967.2k"),
+        strip_terminal_sequences(footer).contains("context 93%/967K"),
         "footer was {footer:?}"
     );
 }
@@ -1621,14 +1905,28 @@ fn running_local_shell_repaints_the_latest_output_tail_before_exit() {
             .collect::<Vec<_>>()
             .join("\n"),
     );
-    let rendered = shell
+    let rows = shell
         .state
         .borrow()
         .rendered_transcript(80)
         .iter()
         .map(|line| strip_terminal_sequences(line))
-        .collect::<Vec<_>>()
-        .join("\n");
+        .collect::<Vec<_>>();
+    let output = rows
+        .iter()
+        .find(|line| line.contains("LIVE OUTPUT 5"))
+        .expect("first retained local-shell output");
+    let nested = rows
+        .iter()
+        .find(|line| line.contains("4 earlier visual rows hidden"))
+        .expect("local-shell output metadata");
+    let elbow_byte = nested.find('└').expect("local-shell output elbow");
+    let text_byte = output
+        .find("LIVE OUTPUT 5")
+        .expect("local-shell output text");
+    assert_eq!(visible_width(&nested[..elbow_byte]), 2, "{rows:?}");
+    assert_eq!(visible_width(&output[..text_byte]), 4, "{rows:?}");
+    let rendered = rows.join("\n");
     assert!(!rendered.contains("LIVE OUTPUT 1"), "{rendered}");
     assert!(!rendered.contains("LIVE OUTPUT 4"), "{rendered}");
     assert!(rendered.contains("LIVE OUTPUT 5"), "{rendered}");
@@ -1679,15 +1977,13 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
         .collect::<Vec<_>>();
     let queue = plain
         .iter()
-        .position(|line| line.contains("Steering prompts · 2 queued"))
+        .position(|line| line.contains("Steering · 2 queued"))
         .expect("steering queue");
     assert!(queue < prompt);
     assert!(plain
         .iter()
-        .any(|line| line.starts_with("  └ check the docs")));
-    assert!(plain
-        .iter()
-        .any(|line| line.starts_with("  └ then run the tests")));
+        .any(|line| line.starts_with("  └ check the docs") && line.contains("+1 more")));
+    assert!(!plain.iter().any(|line| line.contains("then run the tests")));
 
     shell.on_agent_event(&AgentEvent::SteeringDelivered {
         messages: vec!["check the docs".into(), "then run the tests".into()],
@@ -1697,11 +1993,34 @@ fn steering_messages_are_queued_above_prompt_and_delivered_as_a_batch() {
     assert!(snapshot.contains("then run the tests"));
     assert!(!render_shell(&shell.state.borrow(), 120)
         .iter()
-        .any(|line| line.contains("Steering prompts")));
+        .any(|line| line.contains("Steering ·")));
 }
 
 #[test]
-fn steering_messages_wrap_with_hanging_indents_when_space_permits() {
+fn queued_steering_uses_active_model_color() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    shell.queue_steering(&ComposedInput::from_text("check the docs".into()));
+
+    let state = shell.state.borrow();
+    let model_color = state
+        .theme
+        .model_rgb(state.model_lab)
+        .expect("active model color");
+    let ui_color = state.theme.role_rgb("accent").expect("UI accent");
+    assert_ne!(model_color, ui_color);
+    let model_sequence = format!(
+        "38;2;{};{};{}m",
+        model_color.0, model_color.1, model_color.2
+    );
+
+    let rendered = input_overlays::render_pending_steering(&state, 80, 2);
+    assert!(rendered[0].contains(&model_sequence), "{rendered:?}");
+    assert!(rendered[1].contains(&model_sequence), "{rendered:?}");
+}
+
+#[test]
+fn steering_preview_stays_bounded_to_one_clipped_content_row() {
     let mut shell = InteractiveShell::test_shell();
     shell.queue_steering(&ComposedInput::from_text(
         "i'm sending you a longer steering prompt just because i want to see how ygg's tui handles showing this in the queued prompts area".into(),
@@ -1712,11 +2031,10 @@ fn steering_messages_wrap_with_hanging_indents_when_space_permits() {
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
 
-    assert_eq!(rendered.len(), 3, "{rendered:?}");
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(rendered[1].starts_with("  └ i'm sending"), "{rendered:?}");
-    assert!(rendered[2].starts_with("    "), "{rendered:?}");
-    assert!(rendered[2].contains("ygg's tui"), "{rendered:?}");
-    assert!(!rendered.join("\n").contains("clipped"), "{rendered:?}");
+    assert!(rendered[1].ends_with('…'), "{rendered:?}");
+    assert!(rendered.iter().all(|line| visible_width(line) <= 71));
 }
 
 #[test]
@@ -1731,16 +2049,16 @@ fn steering_messages_preserve_explicit_newlines() {
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
 
-    assert!(rendered[1].contains("first line ↵"), "{rendered:?}");
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(
-        rendered[2].starts_with("    second 👩‍💻 line"),
+        rendered[1].contains("first line ↵ second 👩‍💻 line"),
         "{rendered:?}"
     );
     assert!(rendered.iter().all(|line| visible_width(line) <= 40));
 }
 
 #[test]
-fn steering_overflow_is_fair_and_explicit() {
+fn steering_overflow_previews_first_prompt_and_counts_the_rest() {
     let mut shell = InteractiveShell::test_shell();
     shell.queue_steering(&ComposedInput::from_text(
         "first prompt has enough words to require several wrapped display rows".into(),
@@ -1755,10 +2073,10 @@ fn steering_overflow_is_fair_and_explicit() {
         .collect::<Vec<_>>();
     let joined = rendered.join("\n");
 
-    assert_eq!(rendered.len(), 5, "{rendered:?}");
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(joined.contains("└ first prompt"), "{rendered:?}");
-    assert!(joined.contains("└ second prompt"), "{rendered:?}");
-    assert!(joined.contains("2 prompts clipped"), "{rendered:?}");
+    assert!(!joined.contains("second prompt"), "{rendered:?}");
+    assert!(joined.contains("+1 more"), "{rendered:?}");
     assert!(rendered.iter().all(|line| visible_width(line) <= 30));
 }
 
@@ -1775,10 +2093,10 @@ fn steering_overflow_reports_entirely_hidden_prompts() {
         .collect::<Vec<_>>();
     let joined = rendered.join("\n");
 
-    assert_eq!(rendered.len(), 4, "{rendered:?}");
+    assert_eq!(rendered.len(), 2, "{rendered:?}");
     assert!(joined.contains("└ prompt 1"), "{rendered:?}");
-    assert!(joined.contains("└ prompt 2"), "{rendered:?}");
-    assert!(joined.contains("3 more queued"), "{rendered:?}");
+    assert!(!joined.contains("prompt 2"), "{rendered:?}");
+    assert!(joined.contains("+4 more"), "{rendered:?}");
 }
 
 #[test]
@@ -3153,7 +3471,7 @@ fn compaction_disclosure_preserves_native_presentation() {
         assert!(
             visible
                 .lines()
-                .any(|line| line == "─".repeat(WIDTH as usize)),
+                .any(|line| line == default_composer_rule(WIDTH)),
             "composer disappeared: {visible}"
         );
 
@@ -3176,7 +3494,7 @@ fn compaction_disclosure_preserves_native_presentation() {
         assert!(
             collapsed
                 .lines()
-                .any(|line| line == "─".repeat(WIDTH as usize)),
+                .any(|line| line == default_composer_rule(WIDTH)),
             "composer disappeared: {collapsed}"
         );
 
@@ -3363,17 +3681,19 @@ fn resize_while_overlayed_replays_the_pi_composited_frame() {
         !resize_text.contains("OVERLAY-ACTIVE-STREAM-BEFORE"),
         "Pi replays the current composited frame, not rows hidden by its overlay: {resize_text:?}"
     );
-    // With visible response text replacing the one-line Working status, the
-    // last two notices remain in the mutable viewport hidden by the overlay.
-    for index in 0..16 {
+    // The public response keeps a trailing Working row. The resize still
+    // replays only the composited overlay frame, never its hidden live tail.
+    for index in 0..17 {
         let sentinel = format!("YGG-OVERLAY-RESIZE-{index:02}");
         assert!(
             resize_text.contains(&sentinel),
             "{sentinel} was not replayed with the composited overlay:\n{resize_text:?}"
         );
     }
-    assert!(!resize_text.contains("YGG-OVERLAY-RESIZE-16"));
-    assert!(!resize_text.contains("YGG-OVERLAY-RESIZE-17"));
+    assert!(
+        !resize_text.contains("YGG-OVERLAY-RESIZE-17"),
+        "unexpected mutable notice in resize replay: {resize_text:?}"
+    );
 
     process_vt100_with_saved_line_clear(&mut terminal, &resize, HEIGHT, RESIZED_WIDTH, 512);
     assert!(
@@ -3502,7 +3822,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
         assert!(
             visible
                 .lines()
-                .any(|line| line == "─".repeat(WIDTH as usize)),
+                .any(|line| line == default_composer_rule(WIDTH)),
             "composer disappeared:\n{visible}"
         );
 
@@ -3779,7 +4099,7 @@ fn streamed_table_and_wrapped_lists_survive_shrink_scroll_and_resize() {
     terminal.set_size(256, WIDTH);
     terminal.set_scrollback(usize::MAX);
     let physical = terminal.screen().contents();
-    let rule = "─".repeat(WIDTH as usize);
+    let rule = default_composer_rule(WIDTH);
     assert_eq!(
         physical.lines().filter(|line| line == &rule).count(),
         2,
@@ -3922,9 +4242,10 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         },
     );
     let streamed = render_shell_at(&shell.state.borrow(), 80, now);
-    // Visible response text replaces the one-line Working status as the
-    // liveness signal, so the composer remains stable.
-    assert_eq!(composer_row(&streamed), initial_composer);
+    // The response retains one trailing Working row while the run is active.
+    // The response row plus its transition therefore grow the short frame by
+    // two rows without padding it to the terminal height.
+    assert_eq!(composer_row(&streamed), initial_composer + 2);
     assert!(streamed.len() < 40);
 
     shell.on_run_event(
@@ -3938,8 +4259,8 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
     let tool = render_shell_at(&shell.state.borrow(), 80, now);
     assert_eq!(
         composer_row(&tool),
-        composer_row(&streamed) + 2,
-        "the tool adds its transition separator and row without a hidden status row"
+        composer_row(&streamed),
+        "the active tool should replace, not duplicate, the trailing Working row"
     );
     assert!(!tool
         .iter()
@@ -3956,7 +4277,7 @@ fn short_transcript_chrome_follows_content_without_viewport_padding() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(steering_plain.contains("Steering prompt · queued"));
+    assert!(steering_plain.contains("Steering · queued"));
     assert!(steering_plain.contains("  └ also inspect tests"));
 
     // The native-scrollback renderer retains committed transcript rows and
@@ -4670,10 +4991,11 @@ fn character_accurate_selection_maps_correct_columns() {
         shell.set_theme(theme_with_layout(&format!("transcript_inset = {inset}")));
         shell.on_prompt_submitted("hello world");
 
-        // Establish the cached viewport. Prompts deliberately bypass the
-        // theme transcript inset and begin with their two-cell marker.
+        // Establish the cached viewport. Prompts share the resolved inset;
+        // selection geometry removes both that inset and the marker cells.
         let _ = render_shell(&shell.state.borrow(), 80);
-        let start = 3; // marker (2) + byte/cell index of 'e' (1)
+        let resolved = crate::tui::layout::PresentationLayout::new(&shell.state.borrow().theme, 80);
+        let start = resolved.inset + 3; // marker (2) + cell index of 'e' (1)
         let end = start + 4;
         shell.begin_transcript_selection(0, start, false);
         shell.extend_transcript_selection(0, end);
@@ -4832,7 +5154,7 @@ fn ctrl_o_keeps_width_cache_and_invalidates_only_disclosure_blocks() {
 }
 
 #[test]
-fn tool_output_starts_under_tool_input() {
+fn tool_output_uses_one_compact_nested_elbow() {
     let theme = crate::tui::theme::test_theme();
     let renderer = theme.rich_renderer();
     let args = serde_json::json!({"command": "printf hello"});
@@ -4851,30 +5173,130 @@ fn tool_output_starts_under_tool_input() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
+    let output = lines
+        .iter()
+        .find(|line| line.contains("└ hello"))
+        .expect("tool output should render");
     let command = lines
         .iter()
         .find(|line| line.contains("Bash  printf hello"))
         .expect("tool input should render");
-    let output = lines
-        .iter()
-        .find(|line| line.trim_start().starts_with("hello"))
-        .expect("tool output should render");
-    let input_column = command
-        .find("printf hello")
+    let label_column = command
+        .find("Bash")
         .map(|index| visible_width(&command[..index]))
-        .expect("tool input value should render");
+        .expect("tool label should render");
+    let elbow_column = output
+        .find('└')
+        .map(|index| visible_width(&output[..index]))
+        .expect("tool output elbow should render");
     let output_column = output
         .find("hello")
         .map(|index| visible_width(&output[..index]))
         .expect("tool output value should render");
     assert_eq!(
-        input_column, output_column,
-        "tool output should align with the tool input: {lines:?}"
+        label_column, 2,
+        "tool labels belong on the primary text column"
+    );
+    assert_eq!(elbow_column, label_column, "{lines:?}");
+    assert_eq!(output_column, elbow_column + 2, "{lines:?}");
+    assert_eq!(
+        lines.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "one tool output group needs exactly one elbow: {lines:?}"
     );
 }
 
 #[test]
-fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
+fn transcript_events_prompt_and_composer_share_one_grid() {
+    let theme = crate::tui::theme::test_theme();
+    let renderer = theme.rich_renderer();
+    let prompt = TranscriptBlock::User {
+        text: "prompt".into(),
+        model_lab: Some(ModelLab::OpenAi),
+        prompt_color: Some("#123456".into()),
+        persisted: true,
+    };
+    let assistant =
+        TranscriptBlock::Assistant(Box::new(AssistantBlock::finalized("answer".into())));
+    let mut working =
+        AssistantBlock::streaming_reasoning("").with_model_lab(Some(ModelLab::OpenAi));
+    working.reasoning_heading = Some("Working".into());
+    working.show_reasoning_hint = false;
+    let working = TranscriptBlock::Reasoning(Box::new(working));
+    let args = serde_json::json!({"command": "printf hello"});
+    let tool = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+        ToolCallId("shared-grid".into()),
+        "bash".into(),
+        args.to_string(),
+        summarize_tool("bash", &args),
+        "exit=0 duration=0.2s\nstdout:\nhello\ncomplete_stdout=true".into(),
+        true,
+        false,
+        None,
+        None,
+    )));
+
+    let rendered_row = |block: &TranscriptBlock, needle: &str| {
+        render_block(None, block, &theme, &renderer, &renderer, 80, false)
+            .into_iter()
+            .map(|line| strip_terminal_sequences(&line))
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle:?} transcript row"))
+    };
+    let prompt_row = rendered_row(&prompt, "prompt");
+    let assistant_row = rendered_row(&assistant, "answer");
+    let working_row = rendered_row(&working, "Working");
+    let tool_row = rendered_row(&tool, "Bash");
+    let shell = InteractiveShell::test_shell();
+    shell.state.borrow_mut().editor = "draft".into();
+    let composer_row = plain_composer_surface(&shell, 80, Instant::now())
+        .into_iter()
+        .find(|line| line.contains("draft"))
+        .expect("composer draft row");
+    let column = |line: &str, needle: &str| {
+        let byte = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle:?}: {line:?}"));
+        visible_width(&line[..byte])
+    };
+
+    let marker_column = column(&prompt_row, "›");
+    assert_eq!(marker_column, 0, "prompt marker must own column zero");
+    assert_eq!(
+        column(&composer_row, "›"),
+        marker_column,
+        "{composer_row:?}"
+    );
+    assert_eq!(
+        column(&assistant_row, "•"),
+        marker_column,
+        "{assistant_row:?}"
+    );
+    assert_eq!(column(&working_row, "•"), marker_column, "{working_row:?}");
+    assert_eq!(column(&tool_row, "•"), marker_column, "{tool_row:?}");
+
+    let text_column = column(&prompt_row, "prompt");
+    assert_eq!(text_column, 2, "primary text must begin at column two");
+    assert_eq!(
+        column(&composer_row, "draft"),
+        text_column,
+        "{composer_row:?}"
+    );
+    assert_eq!(
+        column(&assistant_row, "answer"),
+        text_column,
+        "{assistant_row:?}"
+    );
+    assert_eq!(
+        column(&working_row, "Working"),
+        text_column,
+        "{working_row:?}"
+    );
+    assert_eq!(column(&tool_row, "Bash"), text_column, "{tool_row:?}");
+}
+
+#[test]
+fn tool_rendering_shows_concise_failures_but_hides_raw_evidence() {
     use ygg_agent::{ToolError, ToolOutput};
     let mut shell = InteractiveShell::test_shell();
     let run_id = shell.begin_run("openai");
@@ -4903,6 +5325,7 @@ fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
     assert!(!plain.contains("exit=1"), "{plain:?}");
     assert!(!plain.contains("duration=0.2s"), "{plain:?}");
     assert!(!plain.contains("76 passed"), "{plain:?}");
+    assert!(plain.contains("command exited 1"), "{plain:?}");
     let stale = ToolCallId("stale-edit-id".into());
     shell.on_run_event(
         run_id,
@@ -4927,7 +5350,7 @@ fn tool_rendering_hides_failure_evidence_but_keeps_intent() {
     assert!(plain.contains("Edit"), "{plain:?}");
     assert!(plain.contains("src/lib.rs"), "{plain:?}");
     assert!(!plain.contains("· 10 ms"), "{plain:?}");
-    assert!(!plain.contains("The file changed"), "{plain:?}");
+    assert!(plain.contains("The file changed"), "{plain:?}");
     assert!(!plain.contains("hash=aaa"), "{plain:?}");
     assert!(!plain.contains("actual=bbb"), "{plain:?}");
 }
@@ -5178,6 +5601,77 @@ fn edit_status_prefix_does_not_hide_the_unified_diff() {
 }
 
 #[test]
+fn layered_write_diff_reports_one_truthful_remainder_per_disclosure_mode() {
+    let theme = crate::tui::theme::test_theme();
+    let renderer = theme.rich_renderer();
+    let args = serde_json::json!({"path":"large.txt"});
+    let preview = (1..=10)
+        .map(|line| format!("+line-{line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let block = TranscriptBlock::Tool(Box::new(ToolPanel::new(
+        ToolCallId("layered-write-diff".into()),
+        "write".into(),
+        args.to_string(),
+        summarize_tool("write", &args),
+        format!(
+            "ok\nlarge.txt  created hash=abc\n--- /dev/null\n+++ b/large.txt\n@@ -0,0 +1,191 @@\n{preview}\n… 181 more lines\n"
+        ),
+        true,
+        false,
+        None,
+        None,
+    )));
+
+    let collapsed = strip_terminal_sequences(
+        &render_block(None, &block, &theme, &renderer, &renderer, 100, false).join("\n"),
+    );
+    assert!(collapsed.contains("184 lines hidden"), "{collapsed:?}");
+    assert!(!collapsed.contains("181 more lines"), "{collapsed:?}");
+    assert_eq!(
+        collapsed.matches("lines hidden").count(),
+        1,
+        "{collapsed:?}"
+    );
+
+    let expanded = strip_terminal_sequences(
+        &render_block(None, &block, &theme, &renderer, &renderer, 100, true).join("\n"),
+    );
+    assert!(expanded.contains("@@ -0,0 +1,191 @@"), "{expanded:?}");
+    assert!(expanded.contains("+line-10"), "{expanded:?}");
+    assert_eq!(
+        expanded.matches("181 more lines").count(),
+        1,
+        "{expanded:?}"
+    );
+    assert!(!expanded.contains("lines hidden"), "{expanded:?}");
+}
+
+#[test]
+fn tool_values_follow_labels_without_a_wide_dead_column() {
+    for (label, expected_column) in [
+        ("Read", 6),
+        ("Bash", 6),
+        ("Write", 7),
+        ("Explored", 10),
+        ("Delegated", 11),
+    ] {
+        assert_eq!(tool_value_indent_width(label), expected_column, "{label}");
+        assert_eq!(
+            visible_width(&tool_value_indent(label)),
+            expected_column,
+            "{label}"
+        );
+        assert_eq!(
+            expected_column.saturating_sub(visible_width(label)),
+            2,
+            "{label}"
+        );
+    }
+    assert!(visible_width(&tool_grid_label("an_extremely_long_tool_name")) <= 18);
+}
+
+#[test]
 fn recognized_assistant_diffs_use_the_pretty_diff_renderer() {
     let theme = crate::tui::theme::test_theme();
     let assistant = AssistantBlock::finalized(
@@ -5310,7 +5804,40 @@ fn active_run_starts_with_working_until_reasoning_is_observed() {
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
-    assert_eq!(rendered, vec!["• Working"], "{rendered:?}");
+    assert_eq!(rendered.len(), 1, "{rendered:?}");
+    assert!(
+        rendered[0].starts_with("• Working (0s • esc to interrupt)"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
+fn max_and_ultra_working_rainbow_fades_for_two_seconds_only() {
+    assert_eq!(
+        status_rainbow_strength_at(Some("max"), Some(Duration::ZERO)),
+        100
+    );
+    assert_eq!(
+        status_rainbow_strength_at(Some("ultra"), Some(Duration::from_millis(500))),
+        75
+    );
+    assert_eq!(
+        status_rainbow_strength_at(Some("max"), Some(Duration::from_secs(1))),
+        50
+    );
+    assert_eq!(
+        status_rainbow_strength_at(Some("max"), Some(Duration::from_millis(1_500))),
+        25
+    );
+    assert_eq!(
+        status_rainbow_strength_at(Some("max"), Some(Duration::from_secs(2))),
+        0
+    );
+    assert_eq!(
+        status_rainbow_strength_at(Some("high"), Some(Duration::ZERO)),
+        0
+    );
+    assert_eq!(status_rainbow_strength_at(Some("ultra"), None), 0);
 }
 
 #[test]
@@ -5336,7 +5863,14 @@ fn collapsed_activity_shimmer_repaints_only_the_status_style() {
             .expect("reasoning status row")
     };
     let before = raw(&shell);
-    assert_eq!(strip_terminal_sequences(&before), "• Thinking");
+    assert!(
+        strip_terminal_sequences(&before).starts_with("• Thinking ("),
+        "{before:?}"
+    );
+    let marker_prefix = |line: &str| {
+        let marker = line.find('•').expect("reasoning margin marker");
+        line[..marker + '•'.len_utf8()].to_owned()
+    };
     {
         let mut state = shell.state.borrow_mut();
         assert!(!event_dot_animating(&state));
@@ -5345,8 +5879,55 @@ fn collapsed_activity_shimmer_repaints_only_the_status_style() {
         state.advance_status_shimmer();
     }
     let after = raw(&shell);
-    assert_eq!(strip_terminal_sequences(&after), "• Thinking");
+    assert!(
+        strip_terminal_sequences(&after).starts_with("• Thinking ("),
+        "{after:?}"
+    );
     assert_ne!(after, before, "the shimmer style must advance");
+    assert_ne!(
+        marker_prefix(&after),
+        marker_prefix(&before),
+        "the margin dot must share the status shimmer"
+    );
+    assert!(
+        !after.contains("\x1b[48;"),
+        "status shimmer must stay foreground-only"
+    );
+}
+
+#[test]
+fn working_activity_shimmer_repaints_its_margin_dot() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
+    shell.begin_run("codex");
+
+    let raw = |shell: &InteractiveShell| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .find(|line| strip_terminal_sequences(line).contains("Working"))
+            .cloned()
+            .expect("working status row")
+    };
+    let marker_prefix = |line: &str| {
+        let marker = line.find('•').expect("working margin marker");
+        line[..marker + '•'.len_utf8()].to_owned()
+    };
+    let before = raw(&shell);
+    {
+        let mut state = shell.state.borrow_mut();
+        assert!(state.has_active_status_shimmer());
+        state.advance_status_shimmer();
+    }
+    let after = raw(&shell);
+
+    assert_ne!(marker_prefix(&after), marker_prefix(&before));
+    assert!(
+        !after.contains("\x1b[48;"),
+        "status shimmer must stay foreground-only"
+    );
 }
 
 #[test]
@@ -5459,7 +6040,7 @@ fn reasoning_heading_moves_below_the_fixed_thinking_header() {
     assert_eq!(
         rendered,
         vec![
-            "• Thinking",
+            "• Thinking (0s • esc to interrupt)",
             "  └ Verifying reproducibility of evidence package (ctrl+o to expand)",
         ]
     );
@@ -5478,7 +6059,10 @@ fn reasoning_off_run_uses_a_truthful_non_expandable_working_status() {
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
     assert_eq!(rendered.len(), 1, "{rendered:?}");
-    assert_eq!(rendered[0], "• Working", "{rendered:?}");
+    assert!(
+        rendered[0].starts_with("• Working (0s • esc to interrupt)"),
+        "{rendered:?}"
+    );
     assert!(!rendered[0].contains("ctrl+o"), "{rendered:?}");
 
     shell.on_run_event(
@@ -5521,7 +6105,7 @@ fn empty_working_status_leaves_no_ghost_block_when_interrupted() {
 }
 
 #[test]
-fn public_text_stream_is_liveness_and_does_not_show_working() {
+fn public_text_stream_keeps_exactly_one_working_row_while_the_run_is_active() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("codex", "gpt-5.3-codex-spark", "high");
     let run_id = shell.begin_run("codex");
@@ -5541,10 +6125,10 @@ fn public_text_stream_is_liveness_and_does_not_show_working() {
         state.transcript.first(),
         Some(TranscriptBlock::Assistant(_))
     ));
-    assert_eq!(state.transcript.len(), 1);
+    assert_eq!(state.transcript.len(), 2);
     assert!(state.active_text.is_some());
-    assert!(state.active_reasoning.is_none());
-    assert!(!state.has_active_status_shimmer());
+    assert!(state.active_reasoning.is_some());
+    assert!(state.has_active_status_shimmer());
     let rendered = state
         .rendered_transcript(80)
         .iter()
@@ -5553,7 +6137,17 @@ fn public_text_stream_is_liveness_and_does_not_show_working() {
     assert!(rendered
         .iter()
         .any(|line| line.contains("Ready. Still running.")));
-    assert!(rendered.iter().all(|line| !line.contains("Working")));
+    assert_eq!(
+        rendered
+            .iter()
+            .filter(|line| line.starts_with("• Working ("))
+            .count(),
+        1,
+        "{rendered:?}"
+    );
+    assert!(rendered
+        .last()
+        .is_some_and(|line| line.starts_with("• Working (")));
 }
 
 #[test]
@@ -5572,7 +6166,9 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
             .map(|line| strip_terminal_sequences(line))
             .collect::<Vec<_>>()
     };
-    assert!(rendered(&shell).iter().any(|line| line == "• Working"));
+    assert!(rendered(&shell)
+        .iter()
+        .any(|line| line.starts_with("• Working (")));
 
     shell.on_run_event(
         run_id,
@@ -5583,7 +6179,7 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
     );
     let thinking = rendered(&shell);
     assert!(thinking.iter().any(|line| line.contains("Thinking")));
-    assert!(!thinking.iter().any(|line| line == "• Working"));
+    assert!(!thinking.iter().any(|line| line.starts_with("• Working (")));
 
     shell.on_run_event(
         run_id,
@@ -5594,8 +6190,18 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
     );
     let responding = rendered(&shell);
     assert!(responding.iter().any(|line| line.contains("Answer")));
-    assert!(!responding.iter().any(|line| line == "• Working"));
-    assert!(!shell.state.borrow().has_active_status_shimmer());
+    assert_eq!(
+        responding
+            .iter()
+            .filter(|line| line.starts_with("• Working ("))
+            .count(),
+        1,
+        "{responding:?}"
+    );
+    assert!(responding
+        .last()
+        .is_some_and(|line| line.starts_with("• Working (")));
+    assert!(shell.state.borrow().has_active_status_shimmer());
 
     shell.on_run_event(
         run_id,
@@ -5612,9 +6218,14 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
             run_cost_microdollars: 0,
         },
     );
-    assert!(
-        rendered(&shell).iter().any(|line| line == "• Working"),
-        "a completed turn is not an authoritative run terminal"
+    let finalizing = rendered(&shell);
+    assert_eq!(
+        finalizing
+            .iter()
+            .filter(|line| line.starts_with("• Working ("))
+            .count(),
+        1,
+        "a completed turn is not an authoritative run terminal: {finalizing:?}"
     );
 
     shell.on_run_event(
@@ -6064,7 +6675,7 @@ fn reasoning_is_subdued_without_losing_inline_code_colour() {
     );
     assert!(
         strip_terminal_sequences(&prompt).starts_with("› prompt"),
-        "prompts should begin at the primary transcript edge: {prompt:?}"
+        "prompts should share the presentation inset: {prompt:?}"
     );
     assert!(
         !prompt.contains("\x1b[48;"),
@@ -6147,7 +6758,7 @@ fn multiline_prompt_marks_only_the_first_row() {
 }
 
 #[test]
-fn prompt_row_keeps_exact_persisted_color_across_theme_changes() {
+fn prompt_card_keeps_exact_persisted_provenance_across_theme_changes() {
     let mut first_theme = crate::tui::theme::test_theme();
     crate::tui::theme::apply_model_lab(&mut first_theme, ModelLab::OpenAi);
     let block = TranscriptBlock::User {
@@ -6194,7 +6805,7 @@ fn prompt_row_keeps_exact_persisted_color_across_theme_changes() {
 }
 
 #[test]
-fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
+fn persisted_prompt_background_fills_the_shared_grid() {
     const WIDTH: u16 = 24;
     let theme = crate::tui::theme::test_theme();
     let block = TranscriptBlock::User {
@@ -6213,44 +6824,50 @@ fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
         false,
     );
     let terminal = emulate_rows(&rendered, WIDTH);
-    let expected = vt100::Color::Rgb(0x12, 0x34, 0x56);
+    let plan = crate::tui::layout::PresentationLayout::new(&theme, WIDTH);
+    assert_eq!(plan.inset, 0, "prompt cards must reach both terminal edges");
     assert_eq!(
         rendered.len(),
         4,
-        "highlighted prompts need one padding row on each side"
+        "highlighted prompts need one breathing row on each side"
     );
     assert!(
         strip_terminal_sequences(&rendered[0]).trim().is_empty(),
         "leading prompt padding should remain visually blank: {rendered:?}"
     );
     assert!(
-        strip_terminal_sequences(&rendered[1]).starts_with('›'),
-        "prompt should begin after its leading padding: {rendered:?}"
+        strip_terminal_sequences(&rendered[1]).starts_with("› first line"),
+        "{rendered:?}"
     );
     assert!(
         strip_terminal_sequences(&rendered[2]).starts_with("  second line"),
-        "highlighted prompt continuations should use a blank indent: {rendered:?}"
+        "prompt continuations should keep a blank marker indent: {rendered:?}"
     );
     assert!(
-        strip_terminal_sequences(rendered.last().expect("trailing padding row"))
+        strip_terminal_sequences(rendered.last().expect("trailing prompt padding"))
             .trim()
-            .is_empty(),
-        "trailing prompt padding should remain visually blank: {rendered:?}"
+            .is_empty()
     );
+    assert!(rendered[0].contains("48;2;18;52;86m"), "{rendered:?}");
+    let expected = vt100::Color::Rgb(0x12, 0x34, 0x56);
     for row in 0..rendered.len() as u16 {
         for column in 0..WIDTH {
-            let background = terminal
-                .screen()
-                .cell(row, column)
-                .expect("prompt row cell inside terminal bounds")
-                .bgcolor();
+            let inside = column >= plan.inset && column < plan.inset + plan.content_width;
             assert_eq!(
-                background, expected,
-                "prompt background did not reach row {row}, column {column}"
+                terminal
+                    .screen()
+                    .cell(row, column)
+                    .expect("prompt row cell inside terminal bounds")
+                    .bgcolor(),
+                if inside {
+                    expected
+                } else {
+                    vt100::Color::Default
+                },
+                "prompt card grid mismatch at row {row}, column {column}"
             );
         }
     }
-    assert!(rendered[0].contains("48;2;18;52;86m"), "{rendered:?}");
 
     const CARD_WIDTH: u16 = 80;
     let card_theme = crate::tui::theme::test_theme_from_source(SURFACE_TEST_THEME);
@@ -6297,10 +6914,7 @@ fn persisted_prompt_background_fills_the_semantic_row_in_terminal_cells() {
         );
         card_cells += 1;
     }
-    assert!(
-        card_cells > 0,
-        "card prompt should retain a coloured interior"
-    );
+    assert!(card_cells > 0, "card should retain its themed interior");
     assert_eq!(
         card_terminal
             .screen()
@@ -6402,7 +7016,8 @@ fn tool_lifecycle_styles_are_visible_in_terminal_cells() {
     let failed = emulate_rows(&failed, 80);
     assert_ascii_foreground(&failed, "Read", foreground);
     assert_ascii_bold(&failed, "Read");
-    assert!(!failed.screen().contents().contains("permission denied"));
+    assert!(failed.screen().contents().contains("permission denied"));
+    assert_ascii_foreground(&failed, "permission denied", error);
 
     let active_bash_args = serde_json::json!({"command":"echo \"active\""});
     let active_bash = TranscriptBlock::Tool(Box::new(ToolPanel::new(
@@ -6741,9 +7356,9 @@ fn streaming_response_dot_stays_solid_light_and_settles_solid() {
     );
     {
         let mut state = shell.state.borrow_mut();
-        // The visible assistant stream is the liveness signal; its solid dot
-        // stays tracked without a second `Working` status row.
-        assert_eq!(state.active_event_blocks, vec![0]);
+        // The assistant keeps its solid provenance dot while the separate
+        // Working row carries continuing run liveness.
+        assert_eq!(state.active_event_blocks, vec![0, 1]);
         assert!(!event_dot_animating(&state));
         state.advance_event_dot_animation();
     }
@@ -6994,11 +7609,16 @@ fn wrapped_tool_summaries_keep_their_action_indent() {
 
     assert!(lines.len() > 1, "the long summary should wrap: {lines:?}");
     assert!(lines[0].starts_with("• Explored"), "{lines:?}");
+    let value_byte = lines[0]
+        .find("crates/ygg-coding-agent")
+        .expect("tool summary value on first row");
+    let value_column = visible_width(&lines[0][..value_byte]);
+    let continuation_indent = " ".repeat(value_column);
     assert!(
         lines[1..]
             .iter()
             .filter(|line| !line.is_empty())
-            .all(|line| line.starts_with("            ")),
+            .all(|line| line.starts_with(&continuation_indent)),
         "continuations must hang under the summary column: {lines:?}"
     );
     assert!(lines.last().is_some_and(|line| !line.is_empty()));
@@ -7151,8 +7771,8 @@ fn compiled_default_composer_border_is_static_during_work() {
         let state = shell.state.borrow();
         state
             .theme
-            .model_rgb(state.run_model_lab)
-            .expect("captured run model accent")
+            .model_rgb(Some(ModelLab::Anthropic))
+            .expect("Anthropic model accent")
     };
     let active_before =
         crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 80, now);
@@ -7162,7 +7782,7 @@ fn compiled_default_composer_border_is_static_during_work() {
         now + Duration::from_secs(5),
     );
     assert_eq!(active_before[0], active_after[0]);
-    assert_ne!(idle_before[0], active_before[0]);
+    assert_eq!(idle_before[0], active_before[0]);
     assert!(active_before[0].contains(&format!("38;2;{};{};{}", accent.0, accent.1, accent.2)));
     assert!(active_before[..3]
         .iter()
@@ -7282,7 +7902,7 @@ fn active_bash_renders_command_and_latest_output_tail() {
 }
 
 #[test]
-fn bash_wraps_and_indents_output_without_connector_glyphs() {
+fn bash_wraps_command_and_nests_output_under_one_elbow() {
     let theme = crate::tui::theme::test_theme();
     let command = "node --input-type=module --check < ygg/demo.js && git diff --check";
     let args = serde_json::json!({"command":command});
@@ -7318,30 +7938,51 @@ fn bash_wraps_and_indents_output_without_connector_glyphs() {
     assert!(rendered[0].starts_with("• Bash"), "{rendered:?}");
     let command_byte = rendered[0].find("node").expect("command on Bash row");
     let command_column = visible_width(&rendered[0][..command_byte]);
+    assert_eq!(
+        command_column, 8,
+        "Bash input should begin two cells after its label: {rendered:?}"
+    );
+    let output_row = rendered
+        .iter()
+        .position(|line| line.contains("(no output)"))
+        .expect("no-output row index");
     let no_output = rendered
         .iter()
         .find(|line| line.contains("(no output)"))
         .expect("no-output metadata");
+    let elbow_byte = no_output.find('└').expect("nested output elbow");
+    let elbow_column = visible_width(&no_output[..elbow_byte]);
+    let output_byte = no_output.find("(no output)").expect("nested output text");
+    let output_column = visible_width(&no_output[..output_byte]);
+    assert_eq!(elbow_column, 2, "{rendered:?}");
     assert_eq!(
-        no_output.find("(no output)"),
-        Some(command_column),
-        "Bash metadata must share the command content gutter: {rendered:?}"
+        output_column,
+        elbow_column + 2,
+        "Bash metadata must begin one level after the elbow: {rendered:?}"
     );
-    for continuation in rendered
-        .iter()
-        .skip(1)
-        .take_while(|line| !line.contains("(no output)"))
-    {
+    let wrapped_headers = &rendered[1..output_row];
+    assert!(
+        !wrapped_headers.is_empty(),
+        "fixture must wrap the Bash command: {rendered:?}"
+    );
+    for continuation in wrapped_headers {
+        let stem_byte = continuation
+            .find('│')
+            .expect("wrapped tool headers need a vertical output stem");
+        assert_eq!(
+            visible_width(&continuation[..stem_byte]),
+            elbow_column,
+            "tool stem and output elbow must share the tool-label column: {rendered:?}"
+        );
         assert!(
-            continuation.len() - continuation.trim_start().len() >= command_column,
-            "wrapped commands must stay at or beyond their first command cell: {rendered:?}"
+            visible_width(continuation) > command_column,
+            "wrapped commands must retain their label-relative value column: {rendered:?}"
         );
     }
-    assert!(
-        rendered
-            .iter()
-            .all(|line| !line.contains('│') && !line.contains('└')),
-        "tool rows must not contain connector glyphs: {rendered:?}"
+    assert_eq!(
+        rendered.iter().filter(|line| line.contains('└')).count(),
+        1,
+        "tool output needs one connector for the whole nested group: {rendered:?}"
     );
     assert!(
         rendered.iter().all(|line| !line
@@ -7395,8 +8036,8 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
     .into_iter()
     .map(|line| strip_terminal_sequences(&line))
     .collect::<Vec<_>>();
-    let command_byte = rendered[0].find(command).expect("command on Bash row");
-    let command_column = visible_width(&rendered[0][..command_byte]);
+    let label_byte = rendered[0].find("Bash").expect("label on Bash row");
+    let label_column = visible_width(&rendered[0][..label_byte]);
     let hidden = rendered
         .iter()
         .find(|line| line.contains("4 earlier visual rows hidden"))
@@ -7405,17 +8046,15 @@ fn bash_output_and_hidden_metadata_share_a_terminal_content_gutter() {
         .iter()
         .find(|line| line.contains("result line 5"))
         .expect("first retained output row");
+    let elbow_byte = hidden.find('└').expect("nested output elbow");
+    let elbow_column = visible_width(&hidden[..elbow_byte]);
     let hidden_byte = hidden.find('…').expect("hidden metadata marker");
-    assert_eq!(
-        visible_width(&hidden[..hidden_byte]),
-        command_column,
-        "{rendered:?}"
-    );
-    assert_eq!(
-        output.find("result line 5"),
-        Some(command_column),
-        "{rendered:?}"
-    );
+    let hidden_column = visible_width(&hidden[..hidden_byte]);
+    let output_byte = output.find("result line 5").expect("retained output text");
+    let output_column = visible_width(&output[..output_byte]);
+    assert_eq!(elbow_column, label_column, "{rendered:?}");
+    assert_eq!(hidden_column, elbow_column + 2, "{rendered:?}");
+    assert_eq!(output_column, elbow_column + 2, "{rendered:?}");
     let TranscriptBlock::Tool(panel) = &block else {
         unreachable!("fixture is a Bash tool panel");
     };
@@ -7550,9 +8189,9 @@ fn adjacent_bash_cards_do_not_reserve_blank_output_rows() {
         heights.push(card_height(&state));
     }
 
-    assert_eq!(
-        heights[0], waiting_height,
-        "one output row should replace the waiting row without adding whitespace"
+    assert!(
+        heights[0] <= waiting_height,
+        "one output row should replace the waiting row without reserving blank space: waiting={waiting_height}, rendered={heights:?}"
     );
     assert!(
         heights[1] > heights[0],
@@ -7689,19 +8328,27 @@ fn footer_collapses_semantically_and_keeps_one_adjacent_row() {
         state.telemetry_model = Some(state.model.clone());
     }
     let now = Instant::now();
-    assert_eq!(
-        plain_footer(&shell, 100, now),
-        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
-    );
-    assert_eq!(
-        plain_footer(&shell, 68, now),
-        "  Qwen3.6 35B A3B · high   5.6k/246k   ↑26.8k ↓422   $0"
-    );
-    assert_eq!(
-        plain_footer(&shell, 44, now),
-        "  Qwen3.6 35B A3B   5.6k/246k   $0"
-    );
-    assert_eq!(plain_footer(&shell, 30, now), "  Qwen3.6 35B A3B  $0");
+    let wide = plain_footer(&shell, 100, now);
+    assert!(wide.starts_with("  Qwen3.6 35B A3B · high"), "{wide:?}");
+    assert!(wide.contains("context 2%/246K"), "{wide:?}");
+    assert!(wide.ends_with("session $0"), "{wide:?}");
+    assert!(!wide.contains('↑') && !wide.contains('↓'), "{wide:?}");
+
+    let medium = plain_footer(&shell, 68, now);
+    assert!(medium.contains("Qwen3.6 35B A3B · high"), "{medium:?}");
+    assert!(medium.contains("context 2%/246K"), "{medium:?}");
+    assert!(medium.ends_with("session $0"), "{medium:?}");
+
+    let compact = plain_footer(&shell, 44, now);
+    assert!(compact.contains("Qwen3.6 35B A3B"), "{compact:?}");
+    assert!(compact.contains("2%"), "{compact:?}");
+    assert!(compact.ends_with("session $0"), "{compact:?}");
+    assert!(!compact.contains("high"), "{compact:?}");
+
+    let narrow = plain_footer(&shell, 30, now);
+    assert!(narrow.contains("Qwen3.6 35B A3B"), "{narrow:?}");
+    assert!(narrow.contains("2%"), "{narrow:?}");
+    assert!(!narrow.contains("session"), "{narrow:?}");
 
     let surface = plain_composer_surface(&shell, 100, now);
     assert_eq!(surface.len(), 4, "one editor row, two rules, one footer");
@@ -7747,12 +8394,12 @@ fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
         "noisy live throughput leaked into footer: {live:?}"
     );
     assert!(
-        live.contains("~↓630"),
-        "live output estimate missing: {live:?}"
+        !live.contains('↑') && !live.contains('↓'),
+        "token counters leaked into the simplified footer: {live:?}"
     );
     assert!(
-        live.contains("~21.6k/256k"),
-        "live context missing: {live:?}"
+        live.contains("context ~8%/256K"),
+        "live context pressure missing: {live:?}"
     );
     assert!(
         !live.contains("cost"),
@@ -7785,8 +8432,8 @@ fn footer_omits_noisy_throughput_but_keeps_final_rate_in_status() {
         "accumulated session cost should be visible: {paid:?}"
     );
     assert!(
-        !paid.contains("session"),
-        "session cost stays in /status: {paid:?}"
+        paid.contains("session $0.120"),
+        "durable session spend should be labelled: {paid:?}"
     );
     assert!(!paid.contains("Working"), "{paid:?}");
 
@@ -7878,9 +8525,10 @@ fn idle_footer_shows_accumulated_session_cost_without_opt_in() {
     }
 
     let footer = plain_footer(&shell, 120, Instant::now());
-    assert!(footer.contains("102/272k"), "{footer:?}");
-    assert!(footer.contains("cache 92.4%"), "{footer:?}");
-    assert!(!footer.contains("session"), "{footer:?}");
+    assert!(footer.contains("context 0%/272K"), "{footer:?}");
+    assert!(!footer.contains("102/272k"), "{footer:?}");
+    assert!(!footer.contains("cache 92.4%"), "{footer:?}");
+    assert!(footer.contains("session"), "{footer:?}");
     assert!(
         footer.contains("$0.0914"),
         "accumulated session cost missing: {footer:?}"
@@ -8000,6 +8648,24 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
     assert!(block.contains("Subagents"), "{block}");
     assert!(block.contains("Read release history"), "{block}");
     assert!(block.contains("Audit release surface"), "{block}");
+    let heading = block
+        .lines()
+        .find(|line| line.contains("Subagents"))
+        .expect("subagent heading");
+    let child = block
+        .lines()
+        .find(|line| line.contains("Read release history"))
+        .expect("subagent child");
+    let heading_byte = heading.find("Subagents").expect("heading text");
+    let elbow_byte = child
+        .find(['├', '└'])
+        .expect("subagent hierarchy connector");
+    let task_byte = child.find("Read release history").expect("child text");
+    let heading_column = visible_width(&heading[..heading_byte]);
+    let elbow_column = visible_width(&child[..elbow_byte]);
+    let task_column = visible_width(&child[..task_byte]);
+    assert_eq!(elbow_column, heading_column, "{block}");
+    assert_eq!(task_column, elbow_column + 2, "{block}");
     assert!(block.contains("failed"), "{block}");
     // Live tool-call and token/cost telemetry must render in the transcript
     // event, matching the composer chrome strip.
@@ -9016,16 +9682,16 @@ fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
             .collect::<Vec<_>>();
         let top = plain
             .iter()
-            .position(|line| line.starts_with('╭') && line.ends_with('╮'))
+            .position(|line| line.trim_start().starts_with('╭') && line.ends_with('╮'))
             .unwrap_or_else(|| panic!("{name} composer lost its top corners: {plain:?}"));
         assert!(
             plain[top + 1..]
                 .iter()
-                .any(|line| line.starts_with('╰') && line.ends_with('╯')),
+                .any(|line| line.trim_start().starts_with('╰') && line.ends_with('╯')),
             "{name} composer lost its bottom corners"
         );
         assert!(
-            plain[top + 1].starts_with('│') && plain[top + 1].ends_with('│'),
+            plain[top + 1].trim_start().starts_with('│') && plain[top + 1].ends_with('│'),
             "{name} composer content rows lost their side borders: {:?}",
             plain[top + 1]
         );
@@ -9039,7 +9705,9 @@ fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
     assert!(
         clawed
             .iter()
-            .filter(|line| !line.is_empty() && line.chars().all(|character| character == '─'))
+            .filter(|line| {
+                !line.trim().is_empty() && line.trim().chars().all(|character| character == '─')
+            })
             .count()
             >= 2,
         "clawed composer lost its rules: {clawed:?}"
@@ -9085,7 +9753,9 @@ fn transcript_and_composer_have_exactly_one_breathing_row() {
         .collect::<Vec<_>>();
     let composer = lines
         .iter()
-        .position(|line| !line.is_empty() && line.chars().all(|c| c == '─' || c == '-'))
+        .position(|line| {
+            !line.trim().is_empty() && line.trim().chars().all(|c| c == '─' || c == '-')
+        })
         .expect("composer top rule");
     assert!(composer > 0);
     assert!(lines[composer - 1].is_empty());
@@ -9170,7 +9840,7 @@ fn slash_popup_keeps_selection_visible_across_paging_filtering_and_resize() {
 }
 
 #[test]
-fn composer_border_is_restrained_at_rest_and_uses_model_accent_when_focused() {
+fn composer_border_stays_stable_when_draft_content_changes() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_identity("anthropic", "claude-sonnet-4", "high");
     {
@@ -9185,11 +9855,28 @@ fn composer_border_is_restrained_at_rest_and_uses_model_accent_when_focused() {
     let focused =
         crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 60, now);
 
-    assert_ne!(idle[0], focused[0]);
-    assert!(!idle[0].contains("38;2;169;99;76"), "{:?}", idle[0]);
+    assert_eq!(idle[0], focused[0]);
+    let accent = {
+        let state = shell.state.borrow();
+        state
+            .theme
+            .model_rgb(Some(ModelLab::Anthropic))
+            .expect("Anthropic model accent")
+    };
+    let accent = format!("38;2;{};{};{}", accent.0, accent.1, accent.2);
+    assert!(focused[0].contains(&accent), "{:?}", focused[0]);
     assert!(focused[0].contains("38;2;169;99;76"), "{:?}", focused[0]);
-    assert_eq!(visible_width(&idle[0]), 60);
-    assert_eq!(visible_width(&focused[0]), 60);
+    let plain_edge = strip_terminal_sequences(&idle[0]);
+    assert!(
+        !plain_edge.starts_with(' '),
+        "full-width separator must reach the terminal edge: {plain_edge:?}"
+    );
+    assert_eq!(visible_width(&plain_edge), 60);
+    let prompt = strip_terminal_sequences(&idle[1]);
+    assert!(
+        prompt.starts_with('›'),
+        "composer content must use the shared grid: {prompt:?}"
+    );
     let wide =
         crate::tui::composer_surface::render_composer_surface(&shell.state.borrow(), 120, now);
     assert_eq!(wide[0].matches("\x1b[38;2;").count(), 1);
@@ -9223,11 +9910,11 @@ fn explicit_theme_preserves_composer_and_code_chrome() {
     assert!(theme.rich_renderer().options().code_borders);
     let shell = InteractiveShell::test_shell_with_theme(theme);
     let rendered = plain_composer_surface(&shell, 60, Instant::now());
-    let is_rule = |line: &String| line.chars().all(|c| c == '─' || c == '-');
+    let is_rule = |line: &String| line.trim().chars().all(|c| c == '─' || c == '-');
     assert!(rendered.first().is_some_and(is_rule));
-    assert!(rendered
-        .get(1)
-        .is_some_and(|line| line.starts_with('›') || line.starts_with('>')));
+    assert!(rendered.get(1).is_some_and(
+        |line| line.trim_start().starts_with('›') || line.trim_start().starts_with('>')
+    ));
     assert!(
         rendered
             .get(1)
@@ -9281,7 +9968,7 @@ fn theme_density_and_transcript_inset_change_semantic_block_geometry() {
     } else {
         "*"
     };
-    assert!(compact[0].starts_with(&format!("{dot}current")));
+    assert!(compact[0].starts_with(&format!("{dot} current")));
     assert!(comfortable[1].starts_with(&format!("{dot} current")));
     assert!(airy[2].starts_with(&format!("  {dot} current")));
 
@@ -9367,7 +10054,7 @@ fn selection_mapping_excludes_density_rows_and_transcript_inset() {
         let second_start = state.transcript_cache.borrow().block_starts[1];
         second_start
     };
-    assert!(selection_position_for_visual_cell(&shell.state.borrow(), second_start, 4).is_none());
+    assert!(selection_position_for_visual_cell(&shell.state.borrow(), second_start, 2).is_none());
     let start = selection_position_for_visual_cell(&shell.state.borrow(), second_start + 2, 4)
         .expect("first content cell should map");
     assert_eq!(start.block, 1);
@@ -9495,12 +10182,25 @@ fn card_geometry_keeps_prompt_identity_and_decorations_out_of_selection() {
     )
     .expect("second prompt text cell");
     assert_eq!(second.offset, 1);
+    let row_start = selection_position_for_visual_cell(&shell.state.borrow(), body_row, 0)
+        .expect("left card margin should select the row start");
+    let row_end = selection_position_for_visual_cell(&shell.state.borrow(), body_row, 79)
+        .expect("right card margin should select the row end");
+    assert_eq!(row_start.offset, 0);
+    assert_eq!(row_end.offset, "hello surface".len());
 
     let body = &rows[body_row];
-    assert!(body.contains("\x1b[38;2;255;255;255m"), "{body:?}");
+    assert!(
+        strip_terminal_sequences(body).contains("› hello surface"),
+        "{body:?}"
+    );
     assert!(
         body.contains("\x1b[48;2;255;112;24m"),
-        "the prompt should retain its exact persisted provenance: {body:?}"
+        "the prompt card must retain its exact stored model background: {body:?}"
+    );
+    assert!(
+        !body.contains("\x1b[48;2;17;34;51m"),
+        "the neutral surface colour must not replace model provenance: {body:?}"
     );
     assert!(
         body.ends_with("\x1b[0m"),
@@ -9651,8 +10351,11 @@ fn theme_header_footer_status_and_composer_padding_have_narrow_fallbacks() {
     let now = Instant::now();
     let composer = plain_composer_surface(&shell, 80, now);
     assert_eq!(composer.len(), 3, "hidden footer leaves only the frame");
-    assert!(composer[1].starts_with('›'), "{composer:?}");
-    assert!(composer.iter().all(|line| visible_width(line) == 80));
+    assert!(composer[1].trim_start().starts_with('›'), "{composer:?}");
+    assert!(composer[1].starts_with("  "), "{composer:?}");
+    assert_eq!(visible_width(&composer[0]), 80);
+    assert_eq!(visible_width(&composer[1]), 78);
+    assert_eq!(visible_width(&composer[2]), 80);
 
     let wide_header = shell_chrome(&shell.state.borrow(), 80, now).header;
     assert_eq!(wide_header.len(), 1);
@@ -9977,6 +10680,42 @@ fn bundled_theme_pack_shares_safe_transcript_geometry_across_wide_and_narrow_ide
             );
             eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
         }
+    }
+}
+
+#[test]
+fn presentation_contract_renders_short_regular_and_wide_frames() {
+    for (label, width, height) in [("short", 46, 8), ("regular", 80, 24), ("wide", 120, 40)] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, height);
+        populate_theme_fixture(&mut shell);
+
+        let frame = render_shell(&shell.state.borrow(), width);
+        assert!(!frame.is_empty(), "{label} frame is empty");
+        assert!(
+            frame
+                .iter()
+                .all(|line| visible_width(line) <= usize::from(width)),
+            "{label} frame overflowed {width} columns: {frame:?}"
+        );
+        let plain = frame
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>();
+        assert!(
+            plain.iter().any(|line| line.contains("Review src/lib.rs")),
+            "{label} frame lost the durable prompt: {plain:?}"
+        );
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.contains("draft a local patch")),
+            "{label} frame lost the composer draft: {plain:?}"
+        );
+        assert!(
+            plain.iter().any(|line| line.contains("completed")),
+            "{label} frame lost the terminal outcome: {plain:?}"
+        );
     }
 }
 

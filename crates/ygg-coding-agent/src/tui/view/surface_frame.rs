@@ -2,6 +2,7 @@ use sexy_tui_rs::{strip_terminal_sequences, visible_width};
 
 use crate::tui::theme::{ThemeSurfaceChrome, ThemeSurfaceHeading, YggTheme};
 
+use super::reasoning_render::activity_shimmer_marker;
 use super::surface_layout::{surface_roles, SurfacePlan};
 use super::{fit_line, TranscriptBlock};
 
@@ -169,6 +170,8 @@ pub(super) fn event_margin_marker(
         block,
         theme,
         usize::from(!active_dot_visible),
+        None,
+        0,
         collapsed_reasoning,
     )
 }
@@ -177,6 +180,8 @@ pub(super) fn event_margin_marker_with_frame(
     block: &TranscriptBlock,
     theme: &YggTheme,
     spinner_frame: usize,
+    status_shimmer_frame: Option<usize>,
+    rainbow_strength: u16,
     collapsed_reasoning: bool,
 ) -> Option<String> {
     let markers_enabled = theme.resolve::<bool>("margin_markers").unwrap_or(true);
@@ -205,7 +210,12 @@ pub(super) fn event_margin_marker_with_frame(
             Some(theme.fg("accent", spinner))
         }
         TranscriptBlock::Reasoning(reasoning) if collapsed_reasoning && markers_enabled => {
-            Some(theme.model_fg(reasoning.model_lab, event_dot))
+            Some(status_shimmer_frame.map_or_else(
+                || theme.model_fg(reasoning.model_lab, event_dot),
+                |frame| {
+                    activity_shimmer_marker(theme, reasoning, frame, rainbow_strength, event_dot)
+                },
+            ))
         }
         TranscriptBlock::Reasoning(_) => None,
         TranscriptBlock::Assistant(_) if markers_enabled => Some(theme.fg("foreground", event_dot)),

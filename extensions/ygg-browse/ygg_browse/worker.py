@@ -863,12 +863,30 @@ class BrowserEngine:
         if self._selected_tab_id not in self._tabs:
             self._selected_tab_id = next(iter(self._tabs), None)
 
+    def _allow_form_screenshots(self) -> bool:
+        """Opt-in override: screenshots tolerate visible form/editable fields.
+
+        Enabled by either the environment variable
+        ``YGG_BROWSE_ALLOW_FORM_SCREENSHOTS`` or the sentinel file
+        ``~/.ygg/browse/allow-form-screenshots``. Credential-like fields and
+        tool-typed values always stay refused.
+        """
+        value = os.environ.get("YGG_BROWSE_ALLOW_FORM_SCREENSHOTS", "")
+        if value.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+        try:
+            sentinel = self.paths.root / "allow-form-screenshots"
+            return sentinel.is_file() and not sentinel.is_symlink()
+        except OSError:
+            return False
+
     def _require_screenshot_safe(self, tab: TabState) -> None:
         if tab.has_typed_values:
             raise BrowseError(
                 "screenshot_typed_values",
                 "Screenshot refused because this tab contains a value supplied through browser_type.",
             )
+        allow_forms = self._allow_form_screenshots()
         try:
             controls = tab.page.locator(
                 'css=input:not([type="hidden"]), textarea, [contenteditable="true"]'
@@ -883,10 +901,11 @@ class BrowserEngine:
                         "screenshot_manual_auth",
                         "Screenshot refused while a visible credential, OTP, payment, or authentication field is present; inspect the page semantically or finish authentication manually.",
                     )
-                raise BrowseError(
-                    "screenshot_form_values",
-                    "Screenshot refused while a visible form or editable field could contain a manually entered value.",
-                )
+                if not allow_forms:
+                    raise BrowseError(
+                        "screenshot_form_values",
+                        "Screenshot refused while a visible form or editable field could contain a manually entered value.",
+                    )
         except BrowseError:
             raise
         except Exception as error:

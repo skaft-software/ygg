@@ -52,7 +52,7 @@ use self::output_window::bounded_tail_rows;
 pub(crate) use self::panel_render::panel_render_test_hook;
 #[cfg(test)]
 use self::panel_render::render_panel;
-use self::panel_render::{filtered_indices, session_picker_ordering};
+use self::panel_render::{filtered_indices, filtered_indices_for_action, session_picker_ordering};
 use self::reasoning_render::collapsed_reasoning_lines;
 #[cfg(test)]
 use self::renderer_runtime::{
@@ -453,6 +453,13 @@ pub(crate) enum Panel {
 pub(crate) enum PanelAction {
     /// Select a model by id.
     SelectModel(Vec<ModelId>),
+    /// Select a model while rendering non-selectable provider headings. The
+    /// provider vector is aligned one-for-one with `models`; selection remains
+    /// indexed only over models, never over headings.
+    SelectGroupedModel {
+        models: Vec<ModelId>,
+        providers: Vec<String>,
+    },
     /// Select a session by path.
     SelectSession(Vec<std::path::PathBuf>),
     /// Select a thinking level.
@@ -471,6 +478,19 @@ pub(crate) enum PanelAction {
     ReadOnlyDocument,
     /// Confirm or deny a typed tool request.
     Confirmation,
+}
+
+impl PanelAction {
+    pub(crate) fn is_model_picker(&self) -> bool {
+        matches!(self, Self::SelectModel(_) | Self::SelectGroupedModel { .. })
+    }
+
+    pub(crate) fn model_provider_groups(&self) -> Option<&[String]> {
+        match self {
+            Self::SelectGroupedModel { providers, .. } => Some(providers),
+            _ => None,
+        }
+    }
 }
 
 /// Outcome produced by closing a panel.
@@ -792,6 +812,21 @@ pub(crate) struct ShellState {
     cached_layout: RefCell<Option<EditorLayoutCache>>,
 }
 
+const STATUS_RAINBOW_DURATION: Duration = Duration::from_secs(2);
+
+fn status_rainbow_strength_at(reasoning: Option<&str>, elapsed: Option<Duration>) -> u16 {
+    if !matches!(reasoning, Some("max" | "ultra")) {
+        return 0;
+    }
+    let Some(elapsed) = elapsed else {
+        return 0;
+    };
+    let remaining = STATUS_RAINBOW_DURATION.saturating_sub(elapsed);
+    let duration_ms = STATUS_RAINBOW_DURATION.as_millis();
+    let remaining_ms = remaining.as_millis();
+    (remaining_ms.saturating_mul(100) / duration_ms).min(100) as u16
+}
+
 impl ShellState {
     fn invalidate_transcript(&mut self) {
         self.transcript_cache.get_mut().dirty = true;
@@ -1009,18 +1044,6 @@ impl ShellState {
             .filter(|tokens| *tokens > 0)
     }
 
-    pub(crate) fn displayed_output_tokens(&self) -> Option<(u64, bool)> {
-        if let Some(live) = self.live_generated_tokens() {
-            return Some((
-                self.turn_output_tokens_before_generation
-                    .saturating_add(live),
-                true,
-            ));
-        }
-        self.last_turn_usage
-            .map(|usage| (usage.output_tokens, false))
-    }
-
     pub(crate) fn displayed_session_cost_microdollars(&self) -> Option<u64> {
         let live_subagent_cost = self
             .subagent_activity
@@ -1154,10 +1177,13 @@ impl ShellState {
         }
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
+        let activity_started_at = self.run.current().map(|run| run.started_at());
         self.event_dot_visible = true;
         self.event_spinner_frame = 0;
         self.status_shimmer_frame = 0;
-        let mut status = AssistantBlock::streaming_reasoning("").with_model_lab(model_lab);
+        let mut status = AssistantBlock::streaming_reasoning("")
+            .with_model_lab(model_lab)
+            .with_activity_started_at(activity_started_at);
         status.reasoning_heading = label.map(str::to_owned);
         status.show_reasoning_hint = show_reasoning_hint;
         self.push_block(TranscriptBlock::Reasoning(Box::new(status)));
@@ -1182,9 +1208,9 @@ impl ShellState {
     }
 
     fn append_text_block(&mut self, channel: OutputChannel, text: &str) {
-        // The first public response delta ends the reasoning phase. Visible
-        // assistant output is its own liveness signal, so remove the transient
-        // status until the turn ends instead of showing `Working` beneath it.
+        // The first public response delta ends the reasoning phase. Move the
+        // transient row behind the response rather than dropping liveness: a
+        // provider can continue generating invisible tokens after visible text.
         if channel == OutputChannel::Text && self.active_text.is_none() {
             if let Some(index) = self.active_reasoning {
                 let transient = matches!(
@@ -1238,6 +1264,9 @@ impl ShellState {
                     self.register_active_event(index);
                 }
                 self.touch_block(index);
+                if channel == OutputChannel::Text && self.run.is_active() {
+                    self.open_working_status();
+                }
                 return;
             }
             match channel {
@@ -1263,6 +1292,7 @@ impl ShellState {
 
         let index = self.transcript.len();
         let model_lab = self.executing_model_lab();
+        let activity_started_at = self.run.current().map(|run| run.started_at());
         self.event_dot_visible = true;
         self.event_spinner_frame = 0;
         self.status_shimmer_frame = 0;
@@ -1271,13 +1301,18 @@ impl ShellState {
                 AssistantBlock::streaming(text).with_model_lab(model_lab),
             )),
             OutputChannel::Reasoning => TranscriptBlock::Reasoning(Box::new(
-                AssistantBlock::streaming_reasoning(text).with_model_lab(model_lab),
+                AssistantBlock::streaming_reasoning(text)
+                    .with_model_lab(model_lab)
+                    .with_activity_started_at(activity_started_at),
             )),
         });
         match channel {
             OutputChannel::Text => {
                 self.active_text = Some(index);
                 self.register_active_event(index);
+                if self.run.is_active() {
+                    self.open_working_status();
+                }
             }
             OutputChannel::Reasoning => {
                 self.active_reasoning = Some(index);
@@ -1349,9 +1384,9 @@ impl ShellState {
     }
 
     /// Settle one provider turn without implying that the owning run is done.
-    /// Visible assistant text supplies liveness while it streams; once the turn
-    /// ends, restore `Working` for any tool/finalization gap. Only an
-    /// authoritative run outcome removes that final transient row.
+    /// Public text keeps one trailing `Working` row while the provider remains
+    /// active, so this boundary only finalizes the text and repairs a missing
+    /// status. Only an authoritative run outcome removes that transient row.
     fn finish_turn_streaming_blocks(&mut self) {
         if let Some(index) = self.active_text.take() {
             self.unregister_active_event(index);
@@ -1400,6 +1435,16 @@ impl ShellState {
             && (markers_enabled || thinking_spinner)
     }
 
+    fn status_rainbow_strength(&self) -> u16 {
+        if !self.run.is_active() {
+            return 0;
+        }
+        status_rainbow_strength_at(
+            self.run_reasoning.as_deref(),
+            self.run.current().map(|run| run.elapsed_at(Instant::now())),
+        )
+    }
+
     fn status_shimmer_active(&self, reasoning: &AssistantBlock) -> bool {
         reasoning.is_working_activity()
             || (!reasoning.text.is_empty()
@@ -1432,6 +1477,37 @@ impl ShellState {
                     self.transcript.get(*index),
                     Some(TranscriptBlock::Reasoning(reasoning))
                         if self.status_shimmer_active(reasoning)
+                )
+            })
+            .collect::<Vec<_>>();
+        for index in active {
+            self.touch_block(index);
+        }
+    }
+
+    pub(crate) fn has_active_status_timer(&self) -> bool {
+        self.active_event_blocks.iter().any(|index| {
+            matches!(
+                self.transcript.get(*index),
+                Some(TranscriptBlock::Reasoning(reasoning))
+                    if !reasoning.finished && reasoning.activity_started_at.is_some()
+            )
+        })
+    }
+
+    pub(crate) fn advance_status_timer(&mut self) {
+        if !self.has_active_status_timer() {
+            return;
+        }
+        let active = self
+            .active_event_blocks
+            .iter()
+            .copied()
+            .filter(|index| {
+                matches!(
+                    self.transcript.get(*index),
+                    Some(TranscriptBlock::Reasoning(reasoning))
+                        if !reasoning.finished && reasoning.activity_started_at.is_some()
                 )
             })
             .collect::<Vec<_>>();
@@ -1595,66 +1671,42 @@ fn render_user_prompt(
     theme: &YggTheme,
     width: u16,
 ) -> Vec<String> {
-    let inner_width = width.saturating_sub(2).max(1);
-    // User text crosses a system boundary before Markdown parsing. Strip
-    // complete terminal protocols here as well as in the semantic copy path;
-    // otherwise the rich renderer safely exposes an escape sequence as text
-    // while content-width planning measures the shorter stripped projection.
+    let marker_glyph = sanitize_for_terminal(prompt_marker(theme));
+    let marker_width = visible_width(&marker_glyph);
+    let inner_width = width
+        .saturating_sub(u16::try_from(marker_width.saturating_add(1)).unwrap_or(u16::MAX))
+        .max(1);
     let safe_text = sanitize_for_terminal(text);
     let document = parse_markdown(&safe_text);
     let render_result = renderer.render(&document, inner_width);
-    let accent = |glyph: &str| match model_lab.filter(|lab| *lab != ModelLab::Unknown) {
-        Some(lab) => theme.model_fg(Some(lab), glyph),
-        None => theme.fg("muted", glyph),
-    };
-
-    // A persisted prompt colour owns the entire terminal row, including its
-    // trailing cells. Plain text inside the coloured prompt prevents Markdown
-    // resets from punching holes through the provenance background.
-    let marker_glyph = sanitize_for_terminal(prompt_marker(theme));
-    let continuation_prefix = " ".repeat(visible_width(&marker_glyph).saturating_add(1));
-    let cell = |glyph: &str| {
-        let plain = format!("{glyph} ");
-        if prompt_color.is_some() {
-            theme.prompt_color_cell(prompt_color, &plain)
-        } else {
-            format!("{} ", accent(glyph))
+    // New records use their exact persisted source colour. Legacy records may
+    // derive the same small marker from historical model identity, but neither
+    // path paints the prompt text or trailing terminal cells.
+    let marker = if prompt_color.is_some() {
+        theme.prompt_color_marker(prompt_color, &marker_glyph)
+    } else {
+        match model_lab.filter(|lab| *lab != ModelLab::Unknown) {
+            Some(lab) => theme.model_fg(Some(lab), &marker_glyph),
+            None => theme.fg("muted", &marker_glyph),
         }
     };
-    let marker = cell(&marker_glyph);
+    let continuation_prefix = " ".repeat(marker_width.saturating_add(1));
     let mut lines = Vec::new();
     for (index, line) in render_result.lines.into_iter().enumerate() {
         let prefix = if index == 0 {
-            marker.as_str()
+            format!("{marker} ")
         } else {
-            continuation_prefix.as_str()
+            continuation_prefix.clone()
         };
-        if prompt_color.is_some()
-            && theme.capabilities().color != crate::tui::terminal::ColorDepth::None
-        {
-            let mut row = format!(
-                "{}{}",
-                if index == 0 {
-                    format!("{marker_glyph} ")
-                } else {
-                    continuation_prefix.clone()
-                },
-                line.plain
-            );
-            let row_width = visible_width(&row);
-            row.push_str(&" ".repeat(usize::from(width).saturating_sub(row_width)));
-            lines.push(theme.prompt_color_cell(prompt_color, &row));
+        let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
+            line.plain
         } else {
-            let content = if theme.capabilities().color == crate::tui::terminal::ColorDepth::None {
-                line.plain
-            } else {
-                line.styled
-            };
-            lines.push(fit_line(&format!("{prefix}{content}"), width));
-        }
+            line.styled
+        };
+        lines.push(fit_line(&format!("{prefix}{content}"), width));
     }
     if lines.is_empty() {
-        lines.push(fit_line(&marker, width));
+        lines.push(fit_line(&format!("{marker} "), width));
     }
     finish_transcript_block(lines)
 }
@@ -1683,6 +1735,7 @@ fn render_shell_output(
     theme: &YggTheme,
     width: u16,
     verbose: bool,
+    output_indent: &str,
 ) -> Vec<String> {
     let normalized = normalize_carriage_return_progress(&shell.output);
     let safe = sanitize_for_terminal(&normalized);
@@ -1690,8 +1743,8 @@ fn render_shell_output(
     for line in safe.lines().filter(|line| !line.trim().is_empty()) {
         output_rows.extend(wrap_hanging(
             &understated_tool_output(theme, line),
-            "  ",
-            "  ",
+            output_indent,
+            output_indent,
             width,
         ));
     }
@@ -1703,8 +1756,8 @@ fn render_shell_output(
         };
         output_rows.extend(wrap_hanging(
             &understated_tool_output(theme, placeholder),
-            "  ",
-            "  ",
+            output_indent,
+            output_indent,
             width,
         ));
     }
@@ -1722,7 +1775,7 @@ fn render_shell_output(
             let unit = if hidden_rows == 1 { "row" } else { "rows" };
             fit_line(
                 &format!(
-                    "  {}",
+                    "{output_indent}{}",
                     understated_tool_output(
                         theme,
                         &format!("{ellipsis} {hidden_rows} earlier visual {unit} hidden")
@@ -2966,6 +3019,21 @@ impl InteractiveShell {
             state.model_display = display;
             state.prompt_color = (!model.trim().is_empty())
                 .then(|| crate::tui::theme::prompt_color_for_model_id(model));
+
+            // Identity arrives before the full model registry metadata. Apply
+            // the canonical lab immediately so the composer never flashes or
+            // remains on the generic Ygg accent; `set_model_theme` can refine
+            // this from API and endpoint metadata later.
+            let model_lab = (!model.trim().is_empty())
+                .then(|| crate::tui::theme::classify_model_identity(model, model, provider));
+            if state.model_lab != model_lab {
+                crate::tui::theme::apply_model_lab(
+                    &mut state.theme,
+                    model_lab.unwrap_or(crate::tui::theme::ModelLab::Unknown),
+                );
+                state.model_lab = model_lab;
+                state.invalidate_rich_text();
+            }
         }
         state.provider = provider.to_owned();
         state.model = model.to_owned();
@@ -3062,7 +3130,7 @@ impl InteractiveShell {
     /// reflow already laid-out Markdown or tool surfaces.
     pub fn read_only_document_width(&self) -> u16 {
         let width = self.size.lock().expect("terminal size mutex poisoned").0;
-        self::panel_render::document_content_width(width)
+        self::panel_render::document_content_width(&self.state.borrow().theme, width)
     }
 
     pub fn set_runtime_config(&mut self, config: Config) {
@@ -3763,12 +3831,20 @@ impl InteractiveShell {
         .len();
         let viewport_rows =
             self::panel_render::document_body_rows(&state, state.size.0, panel_rows);
-        let old_max =
-            self::panel_render::document_visual_row_count_styled(&old_text, state.size.0, styled)
-                .saturating_sub(viewport_rows);
-        let new_max =
-            self::panel_render::document_visual_row_count_styled(&new_text, state.size.0, styled)
-                .saturating_sub(viewport_rows);
+        let old_max = self::panel_render::document_visual_row_count_styled(
+            &old_text,
+            &state.theme,
+            state.size.0,
+            styled,
+        )
+        .saturating_sub(viewport_rows);
+        let new_max = self::panel_render::document_visual_row_count_styled(
+            &new_text,
+            &state.theme,
+            state.size.0,
+            styled,
+        )
+        .saturating_sub(viewport_rows);
         let old_top = old_max.saturating_sub(old_scroll.min(old_max));
         let new_scroll = if old_scroll == 0 {
             0
@@ -3794,10 +3870,64 @@ impl InteractiveShell {
     ) -> Option<(PanelResult, PanelAction)> {
         let mut state = self.state.borrow_mut();
         let size = state.size;
-        let page_step = usize::from(size.1).saturating_sub(8).max(1);
-        let document_rows = shell_chrome(&state, size.0, Instant::now()).panel.len();
+        let base_page_step = usize::from(size.1).saturating_sub(8).max(1);
+        let picker_layout =
+            crate::tui::layout::PresentationLayout::new(&state.theme, size.0).picker;
+        let stacked_picker = match state.panel.as_ref() {
+            Some(Panel::SessionPicker { .. })
+                if picker_layout == crate::tui::layout::PickerLayout::Stacked =>
+            {
+                true
+            }
+            Some(Panel::SelectList {
+                action,
+                descriptions,
+                ..
+            }) if action.is_model_picker()
+                && picker_layout == crate::tui::layout::PickerLayout::Stacked
+                && descriptions.iter().any(|description| {
+                    description
+                        .as_deref()
+                        .is_some_and(|description| !description.is_empty())
+                }) =>
+            {
+                true
+            }
+            _ => false,
+        };
+        // A stacked row consumes two terminal lines, so a page movement should
+        // advance by the number of visible items rather than twice that amount.
+        let page_step = if stacked_picker {
+            base_page_step.div_ceil(2).max(1)
+        } else {
+            base_page_step
+        };
+        let rendered_panel = shell_chrome(&state, size.0, Instant::now()).panel;
+        let visible_panel_rows = rendered_panel.len();
+        let confirmation_render = match state.panel.as_ref() {
+            Some(Panel::SelectList {
+                action: PanelAction::Confirmation,
+                ..
+            }) => self::panel_render::confirmation_metadata_for_rendered_panel(
+                &state,
+                size.0,
+                &rendered_panel,
+            ),
+            _ => None,
+        };
         let document_page_step =
-            self::panel_render::document_body_rows(&state, size.0, document_rows);
+            self::panel_render::document_body_rows(&state, size.0, visible_panel_rows);
+        let document_visual_rows = match state.panel.as_ref() {
+            Some(Panel::ReadOnlyDocument { text, styled, .. }) => {
+                self::panel_render::document_visual_row_count_styled(
+                    text,
+                    &state.theme,
+                    size.0,
+                    *styled,
+                )
+            }
+            _ => 0,
+        };
         let panel = state.panel.as_mut()?;
         // Snapshot the action before we potentially mutate/drop the panel.
         let action = match panel {
@@ -3827,8 +3957,22 @@ impl InteractiveShell {
                             KeyCode::Enter if key.modifiers.is_empty() => {
                                 // `selected` is a position within the filtered
                                 // list; map it back to the original item index.
-                                let filtered = filtered_indices(items, descriptions, filter);
+                                let filtered = filtered_indices_for_action(
+                                    items,
+                                    descriptions,
+                                    &action,
+                                    filter,
+                                );
                                 if let Some(&index) = filtered.get(*selected) {
+                                    if confirmation
+                                        && !self::panel_render::confirmation_enter_allowed(
+                                            confirmation_render.as_ref(),
+                                            index,
+                                            &items[index],
+                                        )
+                                    {
+                                        return None;
+                                    }
                                     drop(state);
                                     self.close_panel();
                                     return Some((PanelResult::Confirm(index), action));
@@ -3840,7 +3984,13 @@ impl InteractiveShell {
                             }
                             KeyCode::Down if key.modifiers.is_empty() => {
                                 if *selected + 1
-                                    < filtered_indices(items, descriptions, filter).len()
+                                    < filtered_indices_for_action(
+                                        items,
+                                        descriptions,
+                                        &action,
+                                        filter,
+                                    )
+                                    .len()
                                 {
                                     *selected += 1;
                                 }
@@ -3849,17 +3999,27 @@ impl InteractiveShell {
                                 *selected = 0;
                             }
                             KeyCode::End if key.modifiers.is_empty() => {
-                                *selected = filtered_indices(items, descriptions, filter)
-                                    .len()
-                                    .saturating_sub(1);
+                                *selected = filtered_indices_for_action(
+                                    items,
+                                    descriptions,
+                                    &action,
+                                    filter,
+                                )
+                                .len()
+                                .saturating_sub(1);
                             }
                             KeyCode::PageUp if key.modifiers.is_empty() => {
                                 *selected = selected.saturating_sub(page_step);
                             }
                             KeyCode::PageDown if key.modifiers.is_empty() => {
-                                let last = filtered_indices(items, descriptions, filter)
-                                    .len()
-                                    .saturating_sub(1);
+                                let last = filtered_indices_for_action(
+                                    items,
+                                    descriptions,
+                                    &action,
+                                    filter,
+                                )
+                                .len()
+                                .saturating_sub(1);
                                 *selected = selected.saturating_add(page_step).min(last);
                             }
                             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3867,7 +4027,13 @@ impl InteractiveShell {
                             }
                             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 if *selected + 1
-                                    < filtered_indices(items, descriptions, filter).len()
+                                    < filtered_indices_for_action(
+                                        items,
+                                        descriptions,
+                                        &action,
+                                        filter,
+                                    )
+                                    .len()
                                 {
                                     *selected += 1;
                                 }
@@ -4171,15 +4337,11 @@ impl InteractiveShell {
                 None
             }
             Panel::ReadOnlyDocument {
-                text,
-                styled,
-                scroll_from_bottom,
-                ..
+                scroll_from_bottom, ..
             } => {
                 use crossterm::event::{Event, KeyCode};
                 let viewport_rows = document_page_step;
-                let visual_rows =
-                    self::panel_render::document_visual_row_count_styled(text, size.0, *styled);
+                let visual_rows = document_visual_rows;
                 let maximum = visual_rows.saturating_sub(viewport_rows);
                 *scroll_from_bottom = (*scroll_from_bottom).min(maximum);
                 match event {

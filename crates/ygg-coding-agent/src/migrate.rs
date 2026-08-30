@@ -15,7 +15,7 @@ const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 const MAX_PACKAGES: usize = 256;
 const MAX_PATTERNS: usize = 1024;
 const MAX_PACKAGE_JSON_BYTES: usize = 1024 * 1024;
-const MAX_SOURCE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_SOURCE_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LOCK_FILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RESOURCE_FILES: usize = 4096;
 const MAX_WALK_ENTRIES: usize = 16_384;
@@ -30,6 +30,7 @@ const MAX_SCAN_HASH_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PACKAGE_DIAGNOSTICS: usize = 256;
 const MAX_REPORT_DIAGNOSTICS: usize = 1024;
 const MAX_PACKAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_EXTENSION_MANIFEST_DEPTH: usize = 64;
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum MigrationCommand {
@@ -70,6 +71,20 @@ struct AnalysisBudget {
     files: usize,
     resources: usize,
     hashed_bytes: usize,
+}
+
+#[derive(Default)]
+struct ResourceTraversal {
+    active_extension_manifests: Vec<PathBuf>,
+    extension_manifest_resolution_stopped: bool,
+}
+
+impl ResourceTraversal {
+    fn extension_manifest_is_active(&self, path: &Path) -> bool {
+        self.active_extension_manifests
+            .iter()
+            .any(|active| active == path)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -519,8 +534,15 @@ fn print_human_report(report: &MigrationReport, summary_only: bool) {
         crate::output::stdout_line("Packages:");
         for package in &report.packages {
             let version = package.version.as_deref().unwrap_or("version unknown");
+            let disabled = if !package.resources.is_empty()
+                && package.resources.iter().all(|resource| !resource.enabled)
+            {
+                " [all resources disabled]"
+            } else {
+                ""
+            };
             crate::output::stdout_line(format!(
-                "  {} ({version}) -> {}",
+                "  {} ({version}) -> {}{disabled}",
                 package.source,
                 package.migration.label()
             ));
@@ -1224,16 +1246,29 @@ fn collect_package_resources(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<ResourceReport> {
     let mut reports = Vec::new();
+    let mut traversal = ResourceTraversal::default();
     for kind in ResourceKind::ALL {
         let mut paths = match manifest {
             Some(manifest) => match manifest.entries(kind) {
-                Some(entries) => collect_manifest_entries(root, entries, kind, diagnostics),
-                None if filter.is_some() => {
-                    collect_resource_path(&root.join(kind.key()), kind, root, diagnostics)
+                Some(entries) => {
+                    collect_manifest_entries(root, entries, kind, &mut traversal, diagnostics)
                 }
+                None if filter.is_some() => collect_resource_path(
+                    &root.join(kind.key()),
+                    kind,
+                    root,
+                    &mut traversal,
+                    diagnostics,
+                ),
                 None => Vec::new(),
             },
-            None => collect_resource_path(&root.join(kind.key()), kind, root, diagnostics),
+            None => collect_resource_path(
+                &root.join(kind.key()),
+                kind,
+                root,
+                &mut traversal,
+                diagnostics,
+            ),
         };
         paths.sort();
         paths.dedup();
@@ -1262,8 +1297,39 @@ fn collect_manifest_entries(
     root: &Path,
     entries: &[String],
     kind: ResourceKind,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
+    let tracks_extension_manifest = kind == ResourceKind::Extension;
+    if tracks_extension_manifest {
+        if traversal.extension_manifest_resolution_stopped {
+            return Vec::new();
+        }
+        if traversal.active_extension_manifests.len() >= MAX_EXTENSION_MANIFEST_DEPTH {
+            traversal.extension_manifest_resolution_stopped = true;
+            diagnostics.push(Diagnostic::warning(
+                "manifest_depth_limit",
+                format!(
+                    "extension manifest resolution stopped at {MAX_EXTENSION_MANIFEST_DEPTH} nested directories"
+                ),
+                Some(root.to_path_buf()),
+            ));
+            return Vec::new();
+        }
+        if traversal.extension_manifest_is_active(root) {
+            traversal.extension_manifest_resolution_stopped = true;
+            diagnostics.push(Diagnostic::warning(
+                "manifest_cycle",
+                "extension manifest resolution revisited an active directory",
+                Some(root.to_path_buf()),
+            ));
+            return Vec::new();
+        }
+        traversal
+            .active_extension_manifests
+            .push(root.to_path_buf());
+    }
+
     let mut paths = Vec::new();
     if entries.len() > MAX_PATTERNS {
         diagnostics.push(Diagnostic::warning(
@@ -1292,12 +1358,24 @@ fn collect_manifest_entries(
             for candidate in walk_regular_files(root, diagnostics) {
                 let relative = relative_slash(root, &candidate);
                 if matcher.is_match(&relative) {
-                    paths.extend(collect_resource_path(&candidate, kind, root, diagnostics));
+                    paths.extend(collect_resource_path(
+                        &candidate,
+                        kind,
+                        root,
+                        traversal,
+                        diagnostics,
+                    ));
                 }
             }
         } else {
             match confined_join(root, entry) {
-                Ok(path) => paths.extend(collect_resource_path(&path, kind, root, diagnostics)),
+                Ok(path) => paths.extend(collect_resource_path(
+                    &path,
+                    kind,
+                    root,
+                    traversal,
+                    diagnostics,
+                )),
                 Err(error) => diagnostics.push(Diagnostic::warning(
                     "manifest_path",
                     error.to_string(),
@@ -1315,7 +1393,12 @@ fn collect_manifest_entries(
             break;
         }
     }
-    apply_manifest_overrides(root, paths, entries, diagnostics)
+    let paths = apply_manifest_overrides(root, paths, entries, diagnostics);
+    if tracks_extension_manifest {
+        let popped = traversal.active_extension_manifests.pop();
+        debug_assert_eq!(popped.as_deref(), Some(root));
+    }
+    paths
 }
 
 fn apply_manifest_overrides(
@@ -1434,8 +1517,15 @@ fn collect_top_level_resources(
     analysis_budget: &mut AnalysisBudget,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let mut traversal = ResourceTraversal::default();
     for kind in ResourceKind::ALL {
-        let mut paths = collect_resource_path(&base.join(kind.key()), kind, base, diagnostics);
+        let mut paths = collect_resource_path(
+            &base.join(kind.key()),
+            kind,
+            base,
+            &mut traversal,
+            diagnostics,
+        );
         let resource_remaining = MAX_SCAN_RESOURCES.saturating_sub(analysis_budget.resources);
         if paths.len() > resource_remaining {
             diagnostics.push(Diagnostic::warning(
@@ -1485,8 +1575,12 @@ fn collect_resource_path(
     path: &Path,
     kind: ResourceKind,
     package_root: &Path,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<PathBuf> {
+    if kind == ResourceKind::Extension && traversal.extension_manifest_resolution_stopped {
+        return Vec::new();
+    }
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -1523,7 +1617,7 @@ fn collect_resource_path(
     }
 
     match kind {
-        ResourceKind::Extension => collect_extension_directory(path, diagnostics),
+        ResourceKind::Extension => collect_extension_directory(path, traversal, diagnostics),
         ResourceKind::Skill => collect_skill_directory(path, diagnostics),
         ResourceKind::Prompt | ResourceKind::Theme => walk_regular_files(path, diagnostics)
             .into_iter()
@@ -1536,9 +1630,18 @@ fn collect_resource_path(
     .collect()
 }
 
-fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<PathBuf> {
-    if let Some(entries) = extension_directory_entrypoints(path, diagnostics) {
-        return entries;
+fn collect_extension_directory(
+    path: &Path,
+    traversal: &mut ResourceTraversal,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Vec<PathBuf> {
+    if !traversal.extension_manifest_is_active(path) {
+        if let Some(entries) = extension_directory_entrypoints(path, traversal, diagnostics) {
+            return entries;
+        }
+    }
+    if let Some(entrypoint) = extension_index_entrypoint(path) {
+        return vec![entrypoint];
     }
     let mut entries = Vec::new();
     let read_dir = match std::fs::read_dir(path) {
@@ -1588,7 +1691,9 @@ fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -
         if metadata.is_file() && is_resource_file(&candidate, ResourceKind::Extension) {
             entries.push(candidate);
         } else if metadata.is_dir() && entry.file_name() != "node_modules" {
-            if let Some(mut nested) = extension_directory_entrypoints(&candidate, diagnostics) {
+            if let Some(mut nested) =
+                extension_directory_entrypoints(&candidate, traversal, diagnostics)
+            {
                 entries.append(&mut nested);
             }
         }
@@ -1598,6 +1703,7 @@ fn collect_extension_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -
 
 fn extension_directory_entrypoints(
     path: &Path,
+    traversal: &mut ResourceTraversal,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<Vec<PathBuf>> {
     let package_json = read_package_json(&path.join("package.json"), diagnostics);
@@ -1606,26 +1712,33 @@ fn extension_directory_entrypoints(
         .and_then(|package| package.pi.as_ref())
         .and_then(|manifest| manifest.extensions.as_deref())
     {
-        let entries = collect_manifest_entries(path, entries, ResourceKind::Extension, diagnostics);
-        if !entries.is_empty() {
+        let entries = collect_manifest_entries(
+            path,
+            entries,
+            ResourceKind::Extension,
+            traversal,
+            diagnostics,
+        );
+        if traversal.extension_manifest_resolution_stopped || !entries.is_empty() {
             return Some(entries);
         }
     }
-    for name in [
+    extension_index_entrypoint(path).map(|entrypoint| vec![entrypoint])
+}
+
+fn extension_index_entrypoint(path: &Path) -> Option<PathBuf> {
+    [
         "index.ts",
         "index.tsx",
         "index.js",
         "index.mjs",
         "index.cjs",
-    ] {
-        let candidate = path.join(name);
-        if std::fs::symlink_metadata(&candidate)
-            .is_ok_and(|metadata| metadata.file_type().is_file())
-        {
-            return Some(vec![candidate]);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .map(|name| path.join(name))
+    .find(|candidate| {
+        std::fs::symlink_metadata(candidate).is_ok_and(|metadata| metadata.file_type().is_file())
+    })
 }
 
 fn collect_skill_directory(path: &Path, diagnostics: &mut Vec<Diagnostic>) -> Vec<PathBuf> {
@@ -1912,6 +2025,135 @@ fn analyze_extension_with_budget(
     }
 }
 
+fn first_factory_api_binding(function: Node<'_>, source: &[u8]) -> Option<String> {
+    if !matches!(
+        function.kind(),
+        "arrow_function" | "function_expression" | "function_declaration"
+    ) {
+        return None;
+    }
+    let parameters = function.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let parameter = parameters.named_children(&mut cursor).next()?;
+    let pattern = parameter
+        .child_by_field_name("pattern")
+        .unwrap_or(parameter);
+    (pattern.kind() == "identifier")
+        .then(|| node_text(pattern, source).map(str::to_owned))
+        .flatten()
+}
+
+fn extension_api_bindings(root: Node<'_>, source: &[u8]) -> BTreeSet<String> {
+    let mut bindings = BTreeSet::new();
+    let mut exported_names = BTreeSet::new();
+    let mut cursor = root.walk();
+    let top_level = root.named_children(&mut cursor).collect::<Vec<_>>();
+
+    for statement in &top_level {
+        if statement.kind() == "export_statement" {
+            if let Some(value) = statement.child_by_field_name("value") {
+                if let Some(binding) = first_factory_api_binding(value, source) {
+                    bindings.insert(binding);
+                } else if value.kind() == "identifier" {
+                    if let Some(name) = node_text(value, source) {
+                        exported_names.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+        let expression = if statement.kind() == "expression_statement" {
+            statement.named_child(0)
+        } else {
+            Some(*statement)
+        };
+        let Some(assignment) = expression.filter(|node| node.kind() == "assignment_expression")
+        else {
+            continue;
+        };
+        let Some(left) = assignment.child_by_field_name("left") else {
+            continue;
+        };
+        let Some(chain) = member_chain(left, source) else {
+            continue;
+        };
+        if matches!(chain.as_str(), "module.exports" | "exports.default") {
+            if let Some(value) = assignment.child_by_field_name("right") {
+                if let Some(binding) = first_factory_api_binding(value, source) {
+                    bindings.insert(binding);
+                }
+            }
+        }
+    }
+
+    if !exported_names.is_empty() {
+        for statement in top_level {
+            if statement.kind() == "function_declaration" {
+                let exported = statement
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(name, source))
+                    .is_some_and(|name| exported_names.contains(name));
+                if exported {
+                    if let Some(binding) = first_factory_api_binding(statement, source) {
+                        bindings.insert(binding);
+                    }
+                }
+                continue;
+            }
+            if !matches!(
+                statement.kind(),
+                "lexical_declaration" | "variable_declaration"
+            ) {
+                continue;
+            }
+            let mut cursor = statement.walk();
+            for declarator in statement.named_children(&mut cursor) {
+                if declarator.kind() != "variable_declarator" {
+                    continue;
+                }
+                let Some(name) = declarator
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(name, source))
+                else {
+                    continue;
+                };
+                if !exported_names.contains(name) {
+                    continue;
+                }
+                if let Some(value) = declarator.child_by_field_name("value") {
+                    if let Some(binding) = first_factory_api_binding(value, source) {
+                        bindings.insert(binding);
+                    }
+                }
+            }
+        }
+    }
+    bindings
+}
+
+fn is_extension_api_direct_method(
+    chain: &str,
+    method: &str,
+    api_bindings: &BTreeSet<String>,
+) -> bool {
+    let Some((binding, suffix)) = chain.split_once('.') else {
+        return false;
+    };
+    suffix == method && api_bindings.contains(binding)
+}
+
+fn extension_api_event_bus_method<'a>(
+    chain: &'a str,
+    api_bindings: &BTreeSet<String>,
+) -> Option<&'a str> {
+    let mut parts = chain.split('.');
+    let binding = parts.next()?;
+    if parts.next()? != "events" || !api_bindings.contains(binding) {
+        return None;
+    }
+    let method = parts.next()?;
+    parts.next().is_none().then_some(method)
+}
+
 fn analyze_source_ast(
     source: &str,
     path: &Path,
@@ -1947,9 +2189,11 @@ fn analyze_source_ast(
         accumulator.parse_errors += 1;
     }
     let mut local_imports = Vec::new();
+    let api_bindings = extension_api_bindings(tree.root_node(), source.as_bytes());
     if !visit_ast(
         tree.root_node(),
         source.as_bytes(),
+        &api_bindings,
         accumulator,
         analysis_budget,
         &mut local_imports,
@@ -1967,6 +2211,7 @@ fn analyze_source_ast(
 fn visit_ast(
     root: Node<'_>,
     source: &[u8],
+    api_bindings: &BTreeSet<String>,
     accumulator: &mut AnalysisAccumulator,
     analysis_budget: &mut AnalysisBudget,
     local_imports: &mut Vec<String>,
@@ -1990,7 +2235,9 @@ fn visit_ast(
                     local_imports.push(module);
                 }
             }
-            "call_expression" => inspect_call(node, source, accumulator, local_imports),
+            "call_expression" => {
+                inspect_call(node, source, api_bindings, accumulator, local_imports)
+            }
             "new_expression" => inspect_new(node, source, accumulator),
             "member_expression" | "subscript_expression" => {
                 if let Some(chain) = member_chain(node, source) {
@@ -2005,7 +2252,7 @@ fn visit_ast(
                     inspect_mutation(left, accumulator);
                 }
             }
-            "pair" => inspect_object_pair(node, source, accumulator),
+            "pair" => inspect_object_pair(node, source, api_bindings, accumulator),
             _ => {}
         }
 
@@ -2016,7 +2263,12 @@ fn visit_ast(
     true
 }
 
-fn inspect_object_pair(node: Node<'_>, source: &[u8], accumulator: &mut AnalysisAccumulator) {
+fn inspect_object_pair(
+    node: Node<'_>,
+    source: &[u8],
+    api_bindings: &BTreeSet<String>,
+    accumulator: &mut AnalysisAccumulator,
+) {
     let Some(key) = node
         .child_by_field_name("key")
         .and_then(|key| node_text(key, source))
@@ -2030,13 +2282,17 @@ fn inspect_object_pair(node: Node<'_>, source: &[u8], accumulator: &mut Analysis
     if matches!(
         key,
         "systemPrompt" | "input" | "arguments" | "args" | "result" | "content" | "isError"
-    ) && enclosing_pi_event(node, source).is_some()
+    ) && enclosing_pi_event(node, source, api_bindings).is_some()
     {
         accumulator.mutations.insert(key.to_owned());
     }
 }
 
-fn enclosing_pi_event(mut node: Node<'_>, source: &[u8]) -> Option<String> {
+fn enclosing_pi_event(
+    mut node: Node<'_>,
+    source: &[u8],
+    api_bindings: &BTreeSet<String>,
+) -> Option<String> {
     for _ in 0..64 {
         node = node.parent()?;
         if node.kind() != "call_expression" {
@@ -2044,9 +2300,7 @@ fn enclosing_pi_event(mut node: Node<'_>, source: &[u8]) -> Option<String> {
         }
         let function = node.child_by_field_name("function")?;
         let chain = member_chain(function, source)?;
-        if chain.rsplit('.').next() == Some("on")
-            && (chain.starts_with("pi.") || chain.ends_with(".events.on"))
-        {
+        if is_extension_api_direct_method(&chain, "on", api_bindings) {
             return first_string_argument(node, source);
         }
     }
@@ -2056,6 +2310,7 @@ fn enclosing_pi_event(mut node: Node<'_>, source: &[u8]) -> Option<String> {
 fn inspect_call(
     node: Node<'_>,
     source: &[u8],
+    api_bindings: &BTreeSet<String>,
     accumulator: &mut AnalysisAccumulator,
     local_imports: &mut Vec<String>,
 ) {
@@ -2087,9 +2342,18 @@ fn inspect_call(
         return;
     };
     let method = chain.rsplit('.').next().unwrap_or(&chain);
-    if method == "on" && (chain.starts_with("pi.") || chain.ends_with(".events.on")) {
+    if is_extension_api_direct_method(&chain, "on", api_bindings) {
         if let Some(event) = first_string_argument(node, source) {
             accumulator.events.insert(event);
+        }
+    }
+    if let Some(event_bus_method) = extension_api_event_bus_method(&chain, api_bindings) {
+        if matches!(event_bus_method, "on" | "emit") {
+            accumulator.actions.insert("eventBus".to_owned());
+        } else {
+            accumulator
+                .actions
+                .insert(format!("unknown:events.{event_bus_method}"));
         }
     }
     if matches!(
@@ -2099,7 +2363,10 @@ fn inspect_call(
             | "registerShortcut"
             | "registerFlag"
             | "registerProvider"
+            | "unregisterProvider"
             | "registerMessageRenderer"
+            | "registerMarkdownTransformer"
+            | "registerEntryRenderer"
     ) {
         accumulator.registrations.insert(method.to_owned());
     }
@@ -2110,17 +2377,78 @@ fn inspect_call(
         method,
         "exec"
             | "appendEntry"
+            | "setSessionName"
+            | "getSessionName"
+            | "setLabel"
             | "getActiveTools"
             | "setActiveTools"
             | "getAllTools"
+            | "getCommands"
+            | "getFlag"
+            | "refreshTools"
             | "sendMessage"
             | "sendUserMessage"
             | "getModel"
             | "setModel"
             | "getThinkingLevel"
             | "setThinkingLevel"
+            | "newSession"
+            | "fork"
+            | "navigateTree"
+            | "switchSession"
+            | "reload"
+            | "compact"
+            | "getSystemPrompt"
+            | "getSystemPromptOptions"
+            | "getContextUsage"
+            | "waitForIdle"
+            | "hasPendingMessages"
+            | "shutdown"
     ) {
         accumulator.actions.insert(method.to_owned());
+    }
+    let direct_pi_method = is_extension_api_direct_method(&chain, method, api_bindings);
+    if direct_pi_method
+        && !matches!(
+            method,
+            "on" | "registerTool"
+                | "registerCommand"
+                | "registerShortcut"
+                | "registerFlag"
+                | "registerProvider"
+                | "unregisterProvider"
+                | "registerMessageRenderer"
+                | "registerMarkdownTransformer"
+                | "registerEntryRenderer"
+                | "exec"
+                | "appendEntry"
+                | "setSessionName"
+                | "getSessionName"
+                | "setLabel"
+                | "getActiveTools"
+                | "setActiveTools"
+                | "getAllTools"
+                | "getCommands"
+                | "getFlag"
+                | "sendMessage"
+                | "sendUserMessage"
+                | "setModel"
+                | "getThinkingLevel"
+                | "setThinkingLevel"
+        )
+    {
+        accumulator.actions.insert(format!("unknown:{method}"));
+    }
+    if let Some((owner, ui_suffix)) = chain.split_once(".ui.") {
+        if !ui_suffix.contains('.') {
+            if !owner.contains('.') && api_bindings.contains(owner) {
+                accumulator
+                    .actions
+                    .insert(format!("unknown:ui.{ui_suffix}"));
+            } else {
+                accumulator.ui.insert(ui_suffix.to_owned());
+            }
+        }
     }
     inspect_member_chain(&chain, accumulator);
 }
@@ -2156,11 +2484,6 @@ fn inspect_member_chain(chain: &str, accumulator: &mut AnalysisAccumulator) {
     }
     if chain.starts_with("Deno.Command") || chain.starts_with("Bun.spawn") {
         accumulator.security.process = true;
-    }
-    if chain.contains(".ui.") {
-        if let Some(method) = chain.rsplit('.').next() {
-            accumulator.ui.insert(method.to_owned());
-        }
     }
     if chain.contains("sessionManager")
         || chain.contains("modelRegistry")
@@ -2215,10 +2538,176 @@ fn record_import(module: &str, accumulator: &mut AnalysisAccumulator) {
     }
 }
 
+fn is_private_pi_import(module: &str) -> bool {
+    module.starts_with("@earendil-works/pi-coding-agent/dist/")
+        || module.starts_with("@earendil-works/pi-coding-agent/src/")
+        || module.starts_with("@earendil-works/pi-tui/dist/")
+        || module.starts_with("@earendil-works/pi-tui/src/")
+}
+
+const PI_0_84_4_EVENTS: &[&str] = &[
+    "project_trust",
+    "resources_discover",
+    "session_start",
+    "session_info_changed",
+    "session_before_switch",
+    "session_before_fork",
+    "session_before_compact",
+    "session_compact",
+    "session_compact_failed",
+    "session_shutdown",
+    "session_before_tree",
+    "session_tree",
+    "context",
+    "before_provider_request",
+    "before_provider_headers",
+    "after_provider_response",
+    "before_agent_start",
+    "agent_start",
+    "agent_end",
+    "agent_settled",
+    "ui_prompt_start",
+    "ui_prompt_end",
+    "turn_start",
+    "turn_end",
+    "message_start",
+    "message_update",
+    "message_end",
+    "tool_execution_start",
+    "tool_execution_update",
+    "tool_execution_end",
+    "model_select",
+    "thinking_level_select",
+    "user_bash",
+    "input",
+    "tool_call",
+    "tool_result",
+];
+
+const PI_0_84_4_UI_METHODS: &[&str] = &[
+    "select",
+    "confirm",
+    "input",
+    "editor",
+    "notify",
+    "onTerminalInput",
+    "setStatus",
+    "setWorkingMessage",
+    "setWorkingVisible",
+    "setWorkingIndicator",
+    "setHiddenThinkingLabel",
+    "setWidget",
+    "setFooter",
+    "setHeader",
+    "setTitle",
+    "custom",
+    "pasteToEditor",
+    "setEditorText",
+    "getEditorText",
+    "addAutocompleteProvider",
+    "setEditorComponent",
+    "getEditorComponent",
+    "getAllThemes",
+    "getTheme",
+    "setTheme",
+    "getToolsExpanded",
+    "setToolsExpanded",
+];
+
+const PI_0_84_4_RENDERER_FIELDS: &[&str] = &["renderCall", "renderResult", "renderMessage"];
+
+const PI_0_84_4_REGISTRATIONS: &[&str] = &[
+    "registerTool",
+    "registerCommand",
+    "registerShortcut",
+    "registerFlag",
+    "registerProvider",
+    "unregisterProvider",
+    "registerMessageRenderer",
+    "registerMarkdownTransformer",
+    "registerEntryRenderer",
+];
+
 fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<String>) {
     let mut reasons = Vec::new();
     let parse_incomplete =
         accumulator.parse_errors > 0 || !accumulator.unresolved_imports.is_empty();
+    let private_pi_imports = accumulator
+        .imports
+        .iter()
+        .filter(|module| is_private_pi_import(module))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !private_pi_imports.is_empty() {
+        reasons.push(format!(
+            "imports Pi private/internal modules outside the public 0.84.4 compatibility profile: {}",
+            private_pi_imports.join(", ")
+        ));
+        return (MigrationPath::Blocked, reasons);
+    }
+    let unknown_events = accumulator
+        .events
+        .iter()
+        .filter(|event| !PI_0_84_4_EVENTS.contains(&event.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unknown_ui = accumulator
+        .ui
+        .iter()
+        .filter(|method| {
+            !PI_0_84_4_UI_METHODS.contains(&method.as_str())
+                && !PI_0_84_4_RENDERER_FIELDS.contains(&method.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let unknown_registrations = accumulator
+        .registrations
+        .iter()
+        .filter(|method| !PI_0_84_4_REGISTRATIONS.contains(&method.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unknown_actions = accumulator
+        .actions
+        .iter()
+        .filter_map(|action| action.strip_prefix("unknown:").map(str::to_owned))
+        .collect::<Vec<_>>();
+    if !unknown_events.is_empty()
+        || !unknown_ui.is_empty()
+        || !unknown_registrations.is_empty()
+        || !unknown_actions.is_empty()
+    {
+        if !unknown_events.is_empty() {
+            reasons.push(format!(
+                "uses event names outside the pinned Pi 0.84.4 compatibility profile: {}",
+                unknown_events.join(", ")
+            ));
+        }
+        if !unknown_ui.is_empty() {
+            reasons.push(format!(
+                "uses UI methods outside the pinned Pi 0.84.4 compatibility profile: {}",
+                unknown_ui.join(", ")
+            ));
+        }
+        if !unknown_registrations.is_empty() {
+            reasons.push(format!(
+                "uses registrations outside the pinned Pi 0.84.4 compatibility profile: {}",
+                unknown_registrations.join(", ")
+            ));
+        }
+        if !unknown_actions.is_empty() {
+            reasons.push(format!(
+                "uses ExtensionAPI methods outside the pinned Pi 0.84.4 compatibility profile: {}",
+                unknown_actions.join(", ")
+            ));
+        }
+        if parse_incomplete {
+            reasons.push(
+                "the source graph was only partially analyzed; review parse diagnostics and unresolved imports"
+                    .to_owned(),
+            );
+        }
+        return (MigrationPath::Blocked, reasons);
+    }
     let imports_tui = accumulator
         .imports
         .iter()
@@ -2232,19 +2721,56 @@ fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<
                 | "setFooter"
                 | "setHeader"
                 | "setWidget"
+                | "custom"
                 | "overlay"
+                | "addAutocompleteProvider"
                 | "setAutocompleteProvider"
                 | "onTerminalInput"
         )
     });
-    let provider = accumulator.registrations.contains("registerProvider");
-    let message_renderer = accumulator
-        .registrations
-        .contains("registerMessageRenderer");
-    let deep_session = accumulator
-        .actions
-        .iter()
-        .any(|action| action.contains("sessionManager") || action == "appendEntry");
+    let provider = accumulator.registrations.iter().any(|registration| {
+        matches!(
+            registration.as_str(),
+            "registerProvider" | "unregisterProvider"
+        )
+    }) || accumulator.events.iter().any(|event| {
+        matches!(
+            event.as_str(),
+            "before_provider_request" | "before_provider_headers" | "after_provider_response"
+        )
+    });
+    let message_renderer = accumulator.registrations.iter().any(|registration| {
+        matches!(
+            registration.as_str(),
+            "registerMessageRenderer" | "registerMarkdownTransformer" | "registerEntryRenderer"
+        )
+    });
+    let deep_session = accumulator.actions.iter().any(|action| {
+        action.contains("sessionManager")
+            || matches!(
+                action.as_str(),
+                "appendEntry"
+                    | "setSessionName"
+                    | "setLabel"
+                    | "newSession"
+                    | "fork"
+                    | "navigateTree"
+                    | "switchSession"
+                    | "compact"
+            )
+    }) || accumulator.events.iter().any(|event| {
+        matches!(
+            event.as_str(),
+            "session_info_changed"
+                | "session_before_switch"
+                | "session_before_fork"
+                | "session_before_compact"
+                | "session_compact"
+                | "session_compact_failed"
+                | "session_before_tree"
+                | "session_tree"
+        )
+    });
     if arbitrary_ui || provider || deep_session {
         if arbitrary_ui {
             reasons.push("depends on Pi's arbitrary TUI/editor component surface".to_owned());
@@ -2271,10 +2797,18 @@ fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<
     let unsupported_event = accumulator.events.iter().any(|event| {
         matches!(
             event.as_str(),
-            "input"
+            "project_trust"
+                | "resources_discover"
+                | "input"
                 | "before_agent_start"
                 | "tool_result"
                 | "context"
+                | "message_start"
+                | "message_update"
+                | "message_end"
+                | "model_select"
+                | "thinking_level_select"
+                | "user_bash"
                 | "session_before_switch"
                 | "session_before_fork"
                 | "session_before_compact"
@@ -2285,6 +2819,24 @@ fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<
         .actions
         .iter()
         .any(|action| matches!(action.as_str(), "getActiveTools" | "setActiveTools"));
+    let unsupported_action = accumulator.actions.iter().any(|action| {
+        matches!(
+            action.as_str(),
+            "getFlag"
+                | "sendMessage"
+                | "sendUserMessage"
+                | "getModel"
+                | "setModel"
+                | "setThinkingLevel"
+                | "reload"
+                | "getSystemPrompt"
+                | "getSystemPromptOptions"
+                | "getContextUsage"
+                | "waitForIdle"
+                | "hasPendingMessages"
+                | "shutdown"
+        )
+    });
     let custom_tool_renderer = accumulator
         .ui
         .iter()
@@ -2298,6 +2850,7 @@ fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<
     if unsupported_registration
         || unsupported_event
         || active_tools
+        || unsupported_action
         || custom_tool_renderer
         || semantic_ui_port
         || !accumulator.mutations.is_empty()
@@ -2314,6 +2867,12 @@ fn classify_extension(accumulator: &AnalysisAccumulator) -> (MigrationPath, Vec<
         if active_tools {
             reasons.push(
                 "mutates Pi's active tool set instead of a bounded Ygg policy overlay".to_owned(),
+            );
+        }
+        if unsupported_action {
+            reasons.push(
+                "uses Pi host-state or agent-control actions without an equivalent Ygg bridge service"
+                    .to_owned(),
             );
         }
         if custom_tool_renderer {
@@ -2814,6 +3373,98 @@ mod tests {
     }
 
     #[test]
+    fn manifest_root_extension_resolves_index_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = options(temp.path());
+        let package = temp.path().join("self-extension");
+        let source = serde_json::to_string(package.to_str().unwrap()).unwrap();
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(r#"{{"packages":[{source}]}}"#),
+        );
+        write(
+            &package.join("package.json"),
+            r#"{"name":"self-extension","version":"1.0.0","pi":{"extensions":["./"]}}"#,
+        );
+        write(
+            &package.join("index.ts"),
+            "export default (pi) => pi.registerTool({ name: 'self' });\n",
+        );
+
+        let report = scan_pi(&options);
+
+        let package_root = fs::canonicalize(&package).unwrap();
+        let package_report = &report.packages[0];
+        assert_eq!(package_report.resources.len(), 1);
+        assert_eq!(
+            package_report.resources[0].path,
+            package_root.join("index.ts")
+        );
+        assert!(package_report.resources[0].enabled);
+        assert_eq!(package_report.extensions.len(), 1);
+        assert!(!package_report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "manifest_cycle"));
+
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(r#"{{"packages":[{{"source":{source},"autoload":false}}]}}"#),
+        );
+        let disabled = scan_pi(&options);
+        assert_eq!(disabled.packages[0].resources.len(), 1);
+        assert!(!disabled.packages[0].resources[0].enabled);
+        assert!(disabled.packages[0].extensions.is_empty());
+    }
+
+    #[test]
+    fn analyzes_bundled_extension_files_above_the_legacy_two_mib_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension = temp.path().join("bundle.js");
+        let mut source = vec![b' '; 3 * 1024 * 1024];
+        source.extend_from_slice(
+            b"\nexport default (api) => api.registerCommand('ok', { handler() {} });\n",
+        );
+        fs::write(&extension, source).unwrap();
+        let mut diagnostics = Vec::new();
+        let report = analyze_extension(&extension, temp.path(), &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Bridge);
+        assert!(report.analyzed_source_bytes > 2 * 1024 * 1024);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn bounds_nested_extension_manifests() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("manifest-chain");
+        let mut current = root.clone();
+        for _ in 0..=MAX_EXTENSION_MANIFEST_DEPTH {
+            write(
+                &current.join("package.json"),
+                r#"{"pi":{"extensions":["next"]}}"#,
+            );
+            current = current.join("next");
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let mut traversal = ResourceTraversal::default();
+        let mut diagnostics = Vec::new();
+
+        let paths = collect_resource_path(
+            &root,
+            ResourceKind::Extension,
+            &root,
+            &mut traversal,
+            &mut diagnostics,
+        );
+
+        assert!(paths.is_empty());
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "manifest_depth_limit"));
+        assert!(traversal.active_extension_manifests.is_empty());
+    }
+
+    #[test]
     fn single_file_package_hash_excludes_unrelated_siblings() {
         let temp = tempfile::tempdir().unwrap();
         let options = options(temp.path());
@@ -2940,8 +3591,10 @@ mod tests {
             &bridge,
             r#"export default (pi) => {
                  pi.registerTool({ name: "search", execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
-                 pi.on("session_start", () => pi.events.emit("ready"));
-                 pi.ui.notify("ready");
+                 pi.on("session_start", (_event, ctx) => {
+                   pi.events.emit("ready");
+                   ctx.ui.notify("ready");
+                 });
                };"#,
         );
         let mut diagnostics = Vec::new();
@@ -2957,6 +3610,148 @@ mod tests {
         );
         let report = analyze_extension(&manual, root, &mut diagnostics);
         assert_eq!(report.migration, MigrationPath::Manual);
+    }
+
+    #[test]
+    fn classifies_pi_0844_surfaces_and_fails_closed_on_unknown_apis() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut diagnostics = Vec::new();
+
+        let provider = root.join("provider.ts");
+        write(
+            &provider,
+            r#"export default (pi) => {
+                 pi.on("before_provider_headers", () => {});
+                 pi.registerProvider("custom", {});
+               };"#,
+        );
+        let report = analyze_extension(&provider, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Manual);
+
+        let autocomplete = root.join("autocomplete.ts");
+        write(
+            &autocomplete,
+            r#"export default (pi) => pi.on("session_start", (_event, ctx) => {
+                 ctx.ui.addAutocompleteProvider((current) => current);
+               });"#,
+        );
+        let report = analyze_extension(&autocomplete, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Manual);
+
+        let input = root.join("input.ts");
+        write(
+            &input,
+            r#"export default (pi) => pi.on("input", (event) => ({
+                 action: "transform", text: event.text.trim()
+               }));"#,
+        );
+        let report = analyze_extension(&input, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::NativePort);
+
+        let renderer = root.join("renderer.ts");
+        write(
+            &renderer,
+            r#"export default (api) => api.registerTool({
+                 name: "rendered",
+                 execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+                 renderCall: () => null,
+                 renderResult: () => null
+               });"#,
+        );
+        let report = analyze_extension(&renderer, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::NativePort);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("component renderer")));
+
+        let ordinary_pi = root.join("ordinary-pi.ts");
+        write(
+            &ordinary_pi,
+            r#"import { normalize } from "./ordinary-helper.js";
+               export default (api) => api.registerTool({
+                 name: "ordinary",
+                 execute: async () => ({ content: [{ type: "text", text: normalize(" pi ") }] })
+               });"#,
+        );
+        write(
+            &root.join("ordinary-helper.ts"),
+            r#"export function normalize(pi: string): string { return pi.trim(); }"#,
+        );
+        let report = analyze_extension(&ordinary_pi, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Bridge);
+        assert!(!report
+            .surfaces
+            .actions
+            .iter()
+            .any(|action| action == "unknown:trim"));
+
+        let private_import = root.join("private-import.ts");
+        write(
+            &private_import,
+            r#"import { ExtensionRunner } from "@earendil-works/pi-coding-agent/dist/core/extensions/runner.js";
+               export default (_api) => void ExtensionRunner;"#,
+        );
+        let report = analyze_extension(&private_import, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Blocked);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("private/internal")));
+
+        let event_bus = root.join("event-bus.ts");
+        write(
+            &event_bus,
+            r#"export default (extensionApi) => {
+                 extensionApi.events.on("acme:ready", () => {});
+                 extensionApi.events.emit("acme:ready", { ok: true });
+               };"#,
+        );
+        let report = analyze_extension(&event_bus, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Bridge);
+        assert!(report.surfaces.events.is_empty());
+        assert_eq!(report.surfaces.actions, ["eventBus"]);
+
+        let unknown = root.join("unknown.ts");
+        write(
+            &unknown,
+            r#"function extension(api) {
+                 api.on("future_event", () => {});
+                 api.futureCapability();
+                 api.events.future();
+               }
+               export default extension;"#,
+        );
+        let report = analyze_extension(&unknown, root, &mut diagnostics);
+        assert_eq!(report.migration, MigrationPath::Blocked);
+        assert!(report
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("outside the pinned Pi 0.84.4 compatibility profile")));
+    }
+
+    #[test]
+    fn nested_pi_theme_methods_are_not_mistaken_for_unknown_ui_apis() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let extension = root.join("theme.ts");
+        write(
+            &extension,
+            r#"export default (pi) => {
+                 pi.registerCommand("status", {
+                   handler: async (_args, ctx) => ctx.ui.notify(ctx.ui.theme.fg("accent", "ok"))
+                 });
+               };"#,
+        );
+        let mut diagnostics = Vec::new();
+        let report = analyze_extension(&extension, root, &mut diagnostics);
+        assert_eq!(
+            report.migration,
+            MigrationPath::Bridge,
+            "{:?}",
+            report.reasons
+        );
     }
 
     #[test]

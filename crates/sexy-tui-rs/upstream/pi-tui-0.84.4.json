@@ -1,0 +1,220 @@
+{
+  "schema_version": 1,
+  "profile": "pi-tui-0.84.4",
+  "release_status": "in_progress",
+  "source": {
+    "repository": "https://github.com/earendil-works/pi.git",
+    "revision": "b79e4cc834970cca69daebffab7df1da7d1e52c4",
+    "tag": "v0.84.4",
+    "root": "packages/tui"
+  },
+  "package": {
+    "name": "@earendil-works/pi-tui",
+    "version": "0.84.4",
+    "npm_integrity": "sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w=="
+  },
+  "test_files": [
+    {
+      "upstream": "test/autocomplete.test.ts",
+      "area": "autocomplete",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/bug-regression-isimageline-startswith-bug.test.ts",
+      "area": "terminal-image",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/editor-history-keybindings.test.ts",
+      "area": "editor",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/editor.test.ts",
+      "area": "editor",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/fuzzy.test.ts",
+      "area": "autocomplete",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/input.test.ts",
+      "area": "input",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/keybindings.test.ts",
+      "area": "keybindings",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/keys.test.ts",
+      "area": "keys",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/latex.test.ts",
+      "area": "markdown",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/layout.test.ts",
+      "area": "layout",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/markdown.test.ts",
+      "area": "markdown",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/native-module-path.test.ts",
+      "area": "native-module",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/overlay-non-capturing.test.ts",
+      "area": "overlay",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/overlay-options.test.ts",
+      "area": "overlay",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/overlay-short-content.test.ts",
+      "area": "overlay",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/regression-overlay-cjk-boundary.test.ts",
+      "area": "overlay",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/regression-regional-indicator-width.test.ts",
+      "area": "width",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/select-list.test.ts",
+      "area": "widgets",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/settings-list.test.ts",
+      "area": "widgets",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/stdin-buffer.test.ts",
+      "area": "stdin-buffer",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/tab-width.test.ts",
+      "area": "width",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/terminal-colors.test.ts",
+      "area": "terminal",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/terminal-image.test.ts",
+      "area": "terminal-image",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/terminal.test.ts",
+      "area": "terminal",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/truncate-to-width.test.ts",
+      "area": "width",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/truncated-text.test.ts",
+      "area": "widgets",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/tui-alt-screen.test.ts",
+      "area": "tui",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/tui-cell-size-input.test.ts",
+      "area": "tui",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/tui-overlay-style-leak.test.ts",
+      "area": "overlay",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/tui-render.test.ts",
+      "area": "tui",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ]
+    },
+    {
+      "upstream": "test/tui-shrink.test.ts",
+      "area": "tui",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ]
+    },
+    {
+      "upstream": "test/word-navigation.test.ts",
+      "area": "editor",
+      "status": "requires_0.84.4_port",
+      "rust_equivalents": []
+    },
+    {
+      "upstream": "test/wrap-ansi.test.ts",
+      "area": "width",
+      "status": "requires_0.84.4_audit",
+      "rust_equivalents": []
+    }
+  ]
+}

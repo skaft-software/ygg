@@ -2,6 +2,57 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.6.4 — 2026-08-30
+
+### Added
+
+- Added the optional extension `runtime_commands` negotiation feature so a
+  compatibility process can expose its bounded initialization-time slash-command
+  catalog without duplicating those names in a generated manifest.
+- Added source-fingerprinted, version-pinned Pi compatibility links for the
+  supported Pi 0.84.4 profile. Generated links remain disabled and untrusted
+  until explicitly activated, reject changed source before import, and report
+  unsupported compatibility surfaces instead of silently accepting them.
+
+### Changed
+
+- Estimate the complete next provider request before each model turn. The default
+  compaction threshold now uses the context window with a fixed 16K coding-turn
+  reserve (or larger advertised reasoning floor), while the provider's advertised
+  output maximum remains the request ceiling and is reduced only by actual
+  remaining context capacity.
+- Reworked the default terminal presentation around one responsive horizontal
+  grid for transcript blocks, prompt cards, composer, footer, and pickers.
+  Submitted prompts retain their original model provenance colour, queued
+  steering stays bounded, and narrow approval and picker layouts preserve the
+  action or identity needed to use them safely.
+- Keep one authoritative `Working` activity row until the owning run settles,
+  including after public assistant text, and distinguish normal completion,
+  completion with warnings, interruption, and failure after animation stops.
+
+### Performance
+
+- Advance context-capacity estimates incrementally across appended session
+  messages and re-anchor them to authoritative provider usage, avoiding repeated
+  whole-history reconstruction during ordinary multi-turn and tool-heavy runs.
+- Reduced avoidable transcript reflow and kept active status invalidation local
+  while preserving the complete retained-frame renderer contract.
+
+### Fixed
+
+- Never execute a tool call whose arguments may have been cut off by the
+  provider's output-token limit. Ygg retains the call envelope, discards partial
+  arguments, persists a paired failure result, and asks the model to reissue the
+  complete call.
+- Serialize durable goal-store transactions across independent handles and
+  revalidate the lock identity before publication so concurrent goal turns and
+  revisions cannot overwrite one another.
+- Keep bounded actionable reasons visible for collapsed run and tool failures,
+  preserve warning outcomes instead of painting them as success, and prevent an
+  approval from being confirmed when its selected action is not visible.
+- Bound nested Pi extension-manifest traversal and fail closed on incomplete or
+  replaced migration inputs.
+
 ## 0.6.3 — 2026-08-28
 
 ### Added

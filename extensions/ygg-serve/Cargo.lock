@@ -2189,7 +2189,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "ygg-agent"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2220,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "ygg-ai"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "async-stream",
  "async-trait",

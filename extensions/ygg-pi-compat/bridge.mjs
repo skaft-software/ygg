@@ -12,19 +12,47 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Console } from "node:console";
 import { createHash } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  opendirSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, relative as relativePath, resolve, sep } from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const API_VERSION = "0.2";
+const SUPPORTED_PI_PACKAGE = "@earendil-works/pi-coding-agent";
+const SUPPORTED_PI_VERSION = "0.84.4";
+const MINIMUM_NODE_VERSION = [22, 19, 0];
+const MAX_PI_PACKAGE_MANIFEST_BYTES = 256 * 1024;
+const SOURCE_FINGERPRINT_FORMAT = 1;
+const MAX_SOURCE_FILES = 4096;
+const MAX_SOURCE_ENTRIES = 8192;
+const MAX_SOURCE_DEPTH = 64;
+const MAX_SOURCE_PATH_BYTES = 4096;
+const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
+const SKIPPED_SOURCE_DIRECTORIES = new Set([
+  ".git",
+  ".pytest_cache",
+  "__pycache__",
+  "node_modules",
+  "target",
+]);
 const REQUIRED_FEATURES = ["request_cancellation", "content_parts"];
 const OPTIONAL_FEATURES = [
   "request_progress",
   "artifacts",
   "lifecycle_events",
   "dynamic_tools",
+  "runtime_commands",
 ];
 const LIFECYCLE_EVENTS = [
   "session/started",
@@ -36,6 +64,7 @@ const LIFECYCLE_EVENTS = [
 ];
 
 const args = parseArgs(process.argv.slice(2));
+const protocolWrite = process.stdout.write.bind(process.stdout);
 const scopes = new AsyncLocalStorage();
 const pendingHostRequests = new Map();
 const inflight = new Map();
@@ -53,6 +82,9 @@ class CancellationError extends Error {
 }
 
 function installProtocolSafeConsole() {
+  // Reserve fd 1 for JSON-RPC even when unchanged Pi extensions write to the
+  // Node stdout stream directly instead of using console.log.
+  process.stdout.write = process.stderr.write.bind(process.stderr);
   globalThis.console = new Console({
     stdout: process.stderr,
     stderr: process.stderr,
@@ -62,26 +94,65 @@ function installProtocolSafeConsole() {
 
 installProtocolSafeConsole();
 
+function parseVersionTuple(value, label) {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(String(value));
+  if (!match) throw new Error(`${label} has invalid semantic version ${JSON.stringify(value)}`);
+  return match.slice(1).map((part) => Number.parseInt(part, 10));
+}
+
+function compareVersionTuple(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] - right[index];
+  }
+  return 0;
+}
+
+function validateNodeRuntime() {
+  const observed = parseVersionTuple(process.versions.node, "Node runtime");
+  if (compareVersionTuple(observed, MINIMUM_NODE_VERSION) < 0) {
+    throw new Error(
+      `Pi ${SUPPORTED_PI_VERSION} compatibility requires Node >=${MINIMUM_NODE_VERSION.join(".")}; found ${process.versions.node}`,
+    );
+  }
+}
+
 function parseArgs(argv) {
-  const result = { extensions: [], agentDir: null, cwd: null, commandName: "pi" };
+  const result = {
+    extensions: [],
+    sourceFingerprints: [],
+    agentDir: null,
+    cwd: null,
+    commandName: "pi",
+    piPackage: null,
+  };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--extension" || value === "-e") {
       const extension = argv[++index];
       if (!extension) throw new Error("--extension requires a path");
       result.extensions.push(extension);
+    } else if (value === "--source-fingerprint") {
+      const fingerprint = argv[++index];
+      if (!fingerprint) throw new Error("--source-fingerprint requires a SHA-256 digest");
+      if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
+        throw new Error("--source-fingerprint requires a lowercase SHA-256 digest");
+      }
+      result.sourceFingerprints.push(fingerprint);
     } else if (value === "--agent-dir") {
       result.agentDir = argv[++index];
       if (!result.agentDir) throw new Error("--agent-dir requires a path");
     } else if (value === "--cwd") {
       result.cwd = argv[++index];
       if (!result.cwd) throw new Error("--cwd requires a path");
+    } else if (value === "--pi-package") {
+      result.piPackage = argv[++index];
+      if (!result.piPackage) throw new Error("--pi-package requires a path");
     } else if (value === "--command") {
       result.commandName = argv[++index];
       if (!result.commandName) throw new Error("--command requires a name");
     } else if (value === "--help" || value === "-h") {
       process.stdout.write(
-        "Usage: bridge.mjs --extension PATH [--extension PATH ...] [--agent-dir DIR]\n",
+        "Usage: bridge.mjs --extension PATH [--source-fingerprint SHA256] [--extension PATH ...] [--agent-dir DIR] [--pi-package DIR]\n",
       );
       process.exit(0);
     } else {
@@ -93,6 +164,12 @@ function parseArgs(argv) {
   }
   if (result.extensions.length === 0) {
     throw new Error("at least one --extension path is required");
+  }
+  if (
+    result.sourceFingerprints.length !== 0
+    && result.sourceFingerprints.length !== result.extensions.length
+  ) {
+    throw new Error("provide exactly one --source-fingerprint for each --extension");
   }
   return result;
 }
@@ -114,7 +191,7 @@ function send(message) {
   outputChain = outputChain.then(
     () =>
       new Promise((resolveWrite, rejectWrite) => {
-        process.stdout.write(line, (error) =>
+        protocolWrite(line, (error) =>
           error ? rejectWrite(error) : resolveWrite(),
         );
       }),
@@ -193,6 +270,7 @@ function notify(level, title, message) {
 }
 
 function progress(message, current, total) {
+  if (!bridge?.features?.has("request_progress")) return Promise.resolve();
   const scope = currentScope();
   scope.progressSequence += 1;
   return send({
@@ -216,8 +294,23 @@ function unsupported(name) {
   throw new Error(`Pi compatibility API is not supported by Ygg: ${name}`);
 }
 
+function makeCompatibilityTheme() {
+  const text = (...values) => String(values.at(-1) ?? "");
+  return makeThrowingProxy("ctx.ui.theme", {
+    fg: text,
+    bg: text,
+    bold: text,
+    dim: text,
+    italic: text,
+    underline: text,
+    strikethrough: text,
+    inverse: text,
+  });
+}
+
 function makeUi() {
   return {
+    theme: makeCompatibilityTheme(),
     async select(title, options) {
       const prompt = `${title}\n${options.map((value, i) => `${i + 1}. ${value}`).join("\n")}\nSelect an option by name or number:`;
       const value = await this.input(prompt);
@@ -225,7 +318,7 @@ function makeUi() {
       const index = Number.parseInt(value, 10);
       return Number.isInteger(index) && index >= 1 && index <= options.length
         ? options[index - 1]
-        : options.find((option) => option === value) ?? value;
+        : options.find((option) => option === value);
     },
     async confirm(title, message) {
       const response = await requestHost("confirmation/request", {
@@ -237,13 +330,17 @@ function makeUi() {
       });
       return response?.confirmed === true;
     },
-    async input(title) {
+    async input(title, placeholder) {
+      const prompt = placeholder ? `${String(title)} (${String(placeholder)})` : String(title);
       const response = await requestHost("input/request", {
         parent_request_id: parentRequestId(),
-        prompt: String(title),
+        prompt,
         secret: false,
       });
       return response?.value ?? undefined;
+    },
+    async editor() {
+      return unsupported("ctx.ui.editor");
     },
     notify(message, type = "info") {
       void notify(type, "Pi extension", message);
@@ -299,11 +396,32 @@ function makeUi() {
     getEditorText() {
       return unsupported("ctx.ui.getEditorText");
     },
-    setEditorComponent() {
-      return unsupported("ctx.ui.setEditorComponent");
+    addAutocompleteProvider() {
+      return unsupported("ctx.ui.addAutocompleteProvider");
     },
     setAutocompleteProvider() {
       return unsupported("ctx.ui.setAutocompleteProvider");
+    },
+    setEditorComponent() {
+      return unsupported("ctx.ui.setEditorComponent");
+    },
+    getEditorComponent() {
+      return unsupported("ctx.ui.getEditorComponent");
+    },
+    getAllThemes() {
+      return unsupported("ctx.ui.getAllThemes");
+    },
+    getTheme() {
+      return unsupported("ctx.ui.getTheme");
+    },
+    setTheme() {
+      return unsupported("ctx.ui.setTheme");
+    },
+    getToolsExpanded() {
+      return unsupported("ctx.ui.getToolsExpanded");
+    },
+    setToolsExpanded() {
+      return unsupported("ctx.ui.setToolsExpanded");
     },
   };
 }
@@ -317,19 +435,34 @@ function makeThrowingProxy(label, values = {}) {
   });
 }
 
+function updateHostStateFromMessage(message) {
+  const state = message?.params?.context?.host;
+  if (state && typeof state === "object" && !Array.isArray(state)) {
+    bridge.hostState = { ...bridge.hostState, ...state };
+  }
+}
+
+function thinkingLevelFromHost() {
+  const serialized = JSON.stringify(bridge.hostState?.reasoning ?? "off").toLowerCase();
+  for (const level of ["ultra", "max", "xhigh", "high", "medium", "low", "minimal"]) {
+    if (serialized.includes(level)) return level;
+  }
+  return "off";
+}
+
 function makeExtensionContextActions() {
   return {
     getModel: () => undefined,
     getScopedModels: () => [],
-    isIdle: () => true,
-    isProjectTrusted: () => true,
+    isIdle: () => bridge.agentActive !== true,
+    isProjectTrusted: () => false,
     getSignal: () => scopes.getStore()?.signal,
     abort: () => currentScope().controller.abort(),
-    hasPendingMessages: () => false,
+    hasPendingMessages: () => unsupported("ctx.hasPendingMessages"),
     shutdown: () => unsupported("ctx.shutdown"),
     getContextUsage: () => undefined,
     compact: () => unsupported("ctx.compact"),
-    getSystemPrompt: () => "",
+    getSystemPrompt: () => unsupported("ctx.getSystemPrompt"),
     getSystemPromptOptions: () => ({ cwd: bridge.cwd }),
   };
 }
@@ -340,7 +473,7 @@ function makeExtensionActions() {
     sendUserMessage: () => unsupported("pi.sendUserMessage"),
     appendEntry: () => unsupported("pi.appendEntry"),
     setSessionName: () => unsupported("pi.setSessionName"),
-    getSessionName: () => undefined,
+    getSessionName: () => bridge.hostState?.session_name,
     setLabel: () => unsupported("pi.setLabel"),
     getActiveTools: () => bridge.toolNames,
     getAllTools: () => bridge.toolInfos,
@@ -348,36 +481,287 @@ function makeExtensionActions() {
     refreshTools: () => scheduleToolRefresh(),
     getCommands: () => bridge.runner?.getRegisteredCommands?.() ?? [],
     setModel: () => Promise.reject(new Error("Pi compatibility API is not supported by Ygg: pi.setModel")),
-    getThinkingLevel: () => "off",
+    getThinkingLevel: () => thinkingLevelFromHost(),
     setThinkingLevel: () => unsupported("pi.setThinkingLevel"),
   };
 }
 
 function makeModelRegistry() {
-  return makeThrowingProxy("ctx.modelRegistry", {
-    getAll: () => [],
-    getAvailable: () => [],
-    find: () => undefined,
-    hasConfiguredAuth: () => false,
-  });
+  return makeThrowingProxy("ctx.modelRegistry");
 }
 
 function makeSessionManager() {
-  return makeThrowingProxy("ctx.sessionManager", {
-    getEntries: () => [],
-    getLeafId: () => undefined,
+  return makeThrowingProxy("ctx.sessionManager");
+}
+
+function unsignedBigEndian(value, bytes) {
+  const buffer = Buffer.alloc(bytes);
+  if (bytes === 4) buffer.writeUInt32BE(value);
+  else buffer.writeBigUInt64BE(BigInt(value));
+  return buffer;
+}
+
+function sourceRelativePath(root, path) {
+  const relative = relativePath(root, path);
+  const components = relative.split(sep);
+  if (
+    !relative
+    || components.length > MAX_SOURCE_DEPTH
+    || components.some((component) => !component || component === "." || component === "..")
+  ) {
+    throw new Error(`Pi source entry has an unsupported relative path: ${path}`);
+  }
+  const stable = components.join("/");
+  if (Buffer.byteLength(stable) > MAX_SOURCE_PATH_BYTES) {
+    throw new Error(`Pi source relative path exceeds ${MAX_SOURCE_PATH_BYTES} bytes`);
+  }
+  return stable;
+}
+
+function collectSourceEntries(root) {
+  const entries = [];
+  const directories = [root];
+  let files = 0;
+  while (directories.length) {
+    const directory = directories.pop();
+    const directoryHandle = opendirSync(directory);
+    try {
+      while (true) {
+        const child = directoryHandle.readSync();
+        if (child === null) break;
+        const name = child.name;
+        const path = join(directory, name);
+        const metadata = lstatSync(path);
+        if (metadata.isSymbolicLink()) {
+          throw new Error(`Pi extension source fingerprint rejects symbolic link ${path}`);
+        }
+        if (entries.length >= MAX_SOURCE_ENTRIES) {
+          throw new Error(`Pi extension source exceeds the ${MAX_SOURCE_ENTRIES}-entry fingerprint limit`);
+        }
+        const relative = sourceRelativePath(root, path);
+        if (metadata.isDirectory()) {
+          if (SKIPPED_SOURCE_DIRECTORIES.has(name)) continue;
+          entries.push({ tag: "d", relative, path });
+          directories.push(path);
+        } else if (metadata.isFile()) {
+          if (files >= MAX_SOURCE_FILES) {
+            throw new Error(`Pi extension source exceeds the ${MAX_SOURCE_FILES}-file fingerprint limit`);
+          }
+          files += 1;
+          entries.push({ tag: "f", relative, path });
+        } else {
+          throw new Error(`Pi extension source fingerprint rejects non-regular entry ${path}`);
+        }
+      }
+    } finally {
+      directoryHandle.closeSync();
+    }
+  }
+  return entries;
+}
+
+function sortedSourceEntries(entries) {
+  return entries.sort((left, right) => {
+    const pathOrder = Buffer.compare(Buffer.from(left.relative), Buffer.from(right.relative));
+    return pathOrder || left.tag.charCodeAt(0) - right.tag.charCodeAt(0);
   });
 }
 
-function findPiPackageRoot(extensionPaths) {
-  const candidates = [];
-  for (const value of [
-    process.env.YGG_PI_PACKAGE,
-    process.env.PI_CODING_AGENT_PACKAGE,
-  ]) {
-    if (value) candidates.push(resolve(value));
+function hashSourceFile(hash, path, remaining) {
+  let file;
+  try {
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    file = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const before = fstatSync(file);
+    if (!before.isFile()) throw new Error(`Pi source entry is not a regular file: ${path}`);
+    if (before.size > remaining) {
+      throw new Error(`Pi extension source exceeds the ${MAX_SOURCE_BYTES}-byte fingerprint limit at ${path}`);
+    }
+    hash.update(unsignedBigEndian(before.size, 8));
+    let total = 0;
+    while (true) {
+      const allowed = remaining - total;
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, allowed + 1));
+      const count = readSync(file, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      if (count > allowed) {
+        throw new Error(`Pi extension source exceeds the ${MAX_SOURCE_BYTES}-byte fingerprint limit at ${path}`);
+      }
+      hash.update(buffer.subarray(0, count));
+      total += count;
+    }
+    const after = fstatSync(file);
+    if (total !== before.size || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+      throw new Error(`Pi source file changed while being fingerprinted: ${path}`);
+    }
+    return total;
+  } finally {
+    if (file !== undefined) closeSync(file);
+  }
+}
+
+function fingerprintSource(source) {
+  const absolute = resolve(source);
+  const metadata = lstatSync(absolute);
+  if (metadata.isSymbolicLink()) {
+    throw new Error(`Pi extension source fingerprint rejects symbolic link ${absolute}`);
+  }
+  const canonical = realpathSync(absolute);
+  if (canonical !== absolute) {
+    throw new Error(`Pi extension source fingerprint requires a canonical path: ${absolute}`);
+  }
+  let rootTag;
+  let entries;
+  if (metadata.isFile()) {
+    rootTag = "f";
+    entries = [{ tag: "f", relative: ".", path: absolute }];
+  } else if (metadata.isDirectory()) {
+    rootTag = "d";
+    entries = collectSourceEntries(absolute);
+  } else {
+    throw new Error(`Pi extension source fingerprint accepts only files or directories: ${absolute}`);
+  }
+  sortedSourceEntries(entries);
+
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-source-fingerprint\0"));
+  hash.update(unsignedBigEndian(SOURCE_FINGERPRINT_FORMAT, 4));
+  hash.update(Buffer.from(rootTag));
+  let total = 0;
+  for (const entry of entries) {
+    hash.update(Buffer.from(entry.tag));
+    const relative = Buffer.from(entry.relative);
+    hash.update(unsignedBigEndian(relative.length, 8));
+    hash.update(relative);
+    if (entry.tag === "f") {
+      total += hashSourceFile(hash, entry.path, MAX_SOURCE_BYTES - total);
+    }
   }
 
+  if (metadata.isDirectory()) {
+    const after = sortedSourceEntries(collectSourceEntries(absolute));
+    const beforeShape = entries.map((entry) => `${entry.tag}\0${entry.relative}`);
+    const afterShape = after.map((entry) => `${entry.tag}\0${entry.relative}`);
+    if (JSON.stringify(beforeShape) !== JSON.stringify(afterShape)) {
+      throw new Error("Pi extension source tree changed while it was being fingerprinted");
+    }
+  }
+  return hash.digest("hex");
+}
+
+function verifySourceFingerprints() {
+  if (!args.sourceFingerprints.length) return;
+  for (let index = 0; index < args.extensions.length; index += 1) {
+    const actual = fingerprintSource(args.extensions[index]);
+    const expected = args.sourceFingerprints[index];
+    if (actual !== expected) {
+      throw new Error(
+        `Pi extension source changed after link installation: ${args.extensions[index]} (expected ${expected}, found ${actual})`,
+      );
+    }
+  }
+}
+
+function readRegularUtf8Bounded(path, maxBytes) {
+  const pathMetadata = lstatSync(path);
+  if (pathMetadata.isSymbolicLink() || !pathMetadata.isFile()) {
+    throw new Error("is not a regular non-symlink file");
+  }
+  let file;
+  try {
+    const noFollow = fsConstants.O_NOFOLLOW ?? 0;
+    file = openSync(path, fsConstants.O_RDONLY | noFollow);
+    const before = fstatSync(file);
+    if (!before.isFile()) throw new Error("is not a regular file");
+    if (before.size > maxBytes) throw new Error(`exceeds the ${maxBytes}-byte limit`);
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes + 1 - total));
+      const count = readSync(file, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      total += count;
+      if (total > maxBytes) throw new Error(`exceeds the ${maxBytes}-byte limit`);
+      chunks.push(buffer.subarray(0, count));
+    }
+    const after = fstatSync(file);
+    if (
+      before.dev !== after.dev ||
+      before.ino !== after.ino ||
+      before.size !== after.size ||
+      before.mtimeMs !== after.mtimeMs ||
+      total !== before.size
+    ) {
+      throw new Error("changed while it was being read");
+    }
+    return Buffer.concat(chunks, total).toString("utf8");
+  } finally {
+    if (file !== undefined) closeSync(file);
+  }
+}
+
+function inspectPiPackage(candidate) {
+  let root;
+  try {
+    root = realpathSync(resolve(candidate));
+  } catch {
+    return null;
+  }
+  const manifestPath = join(root, "package.json");
+  if (!existsSync(manifestPath)) return null;
+  let manifest;
+  try {
+    manifest = JSON.parse(readRegularUtf8Bounded(manifestPath, MAX_PI_PACKAGE_MANIFEST_BYTES));
+  } catch (error) {
+    return { root, error: `cannot read package.json: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  if (manifest?.name !== SUPPORTED_PI_PACKAGE) {
+    return { root, error: `package name is ${JSON.stringify(manifest?.name)}, expected ${SUPPORTED_PI_PACKAGE}` };
+  }
+  if (manifest.version !== SUPPORTED_PI_VERSION) {
+    return { root, error: `Pi version ${JSON.stringify(manifest.version)} is unsupported; expected exactly ${SUPPORTED_PI_VERSION}` };
+  }
+  const entrypoint = join(root, "dist/index.js");
+  try {
+    const metadata = lstatSync(entrypoint);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      return { root, error: "dist/index.js is not a regular non-symlink file" };
+    }
+    if (realpathSync(entrypoint) !== entrypoint) {
+      return { root, error: "dist/index.js escapes the canonical package root" };
+    }
+  } catch (error) {
+    return {
+      root,
+      error: `cannot validate dist/index.js: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return { root, version: manifest.version };
+}
+
+function findPiPackageRoot(extensionPaths, selectedPackage) {
+  if (selectedPackage) {
+    const inspected = inspectPiPackage(selectedPackage);
+    if (!inspected || inspected.error) {
+      throw new Error(
+        `--pi-package does not select a compatible Pi runtime: ${inspected?.error ?? "package.json is missing"}`,
+      );
+    }
+    return inspected;
+  }
+  for (const [name, value] of [
+    ["YGG_PI_PACKAGE", process.env.YGG_PI_PACKAGE],
+    ["PI_CODING_AGENT_PACKAGE", process.env.PI_CODING_AGENT_PACKAGE],
+  ]) {
+    if (!value) continue;
+    const inspected = inspectPiPackage(value);
+    if (!inspected || inspected.error) {
+      throw new Error(`${name} does not select a compatible Pi runtime: ${inspected?.error ?? "package.json is missing"}`);
+    }
+    return inspected;
+  }
+
+  const candidates = [];
   for (const pathEntry of (process.env.PATH ?? "").split(delimiter)) {
     if (!pathEntry) continue;
     const executable = join(pathEntry, "pi");
@@ -389,7 +773,7 @@ function findPiPackageRoot(extensionPaths) {
         current = dirname(current);
       }
     } catch {
-      // Continue with conventional locations.
+      // Continue with extension-local and conventional locations.
     }
   }
 
@@ -409,15 +793,29 @@ function findPiPackageRoot(extensionPaths) {
   );
 
   const seen = new Set();
+  const incompatible = [];
   for (const candidate of candidates) {
     const root = resolve(candidate);
     if (seen.has(root)) continue;
     seen.add(root);
-    if (existsSync(join(root, "dist/index.js"))) return root;
+    const inspected = inspectPiPackage(root);
+    if (!inspected) continue;
+    if (!inspected.error) return inspected;
+    incompatible.push(inspected.error);
   }
+  const suffix = incompatible.length ? ` Incompatible candidates: ${[...new Set(incompatible)].join("; ")}` : "";
   throw new Error(
-    "could not locate @earendil-works/pi-coding-agent; set YGG_PI_PACKAGE to its package root",
+    `could not locate ${SUPPORTED_PI_PACKAGE}@${SUPPORTED_PI_VERSION}; set YGG_PI_PACKAGE to its package root.${suffix}`,
   );
+}
+
+function commandDefinitionToYgg(command) {
+  const name = command.invocationName ?? command.name;
+  return {
+    name,
+    description: command.description || `Run Pi command /${name}`,
+    usage: `/${name}`,
+  };
 }
 
 function toolDefinitionToYgg(definition) {
@@ -588,11 +986,15 @@ async function collectBeforePromptContext(prompt) {
 }
 
 async function loadBridge(params) {
+  validateNodeRuntime();
+  verifySourceFingerprints();
   bridge = {
     cwd: resolve(params.workspace ?? args.cwd ?? process.cwd()),
     agentDir: resolve(args.agentDir ?? process.env.YGG_PI_AGENT_DIR ?? join(homedir(), ".pi/agent")),
     extensionPaths: args.extensions.map((path) => resolve(path)),
     commandName: args.commandName,
+    hostState: params.host && typeof params.host === "object" ? { ...params.host } : {},
+    agentActive: false,
     toolNames: [],
     toolInfos: [],
     toolSnapshots: new Map(),
@@ -616,8 +1018,9 @@ async function loadBridge(params) {
     if (offeredOptionalFeatures.has(feature)) bridge.features.add(feature);
   }
 
-  const packageRoot = findPiPackageRoot(bridge.extensionPaths);
-  const pi = await import(pathToFileURL(join(packageRoot, "dist/index.js")).href);
+  const piRuntime = findPiPackageRoot(bridge.extensionPaths, args.piPackage);
+  bridge.piRuntimeVersion = piRuntime.version;
+  const pi = await import(pathToFileURL(join(piRuntime.root, "dist/index.js")).href);
   if (typeof pi.discoverAndLoadExtensions !== "function") {
     throw new Error("installed Pi runtime does not expose discoverAndLoadExtensions");
   }
@@ -628,6 +1031,7 @@ async function loadBridge(params) {
     bridge.agentDir,
     eventBus,
   );
+  verifySourceFingerprints();
   for (const error of loaded.errors ?? []) {
     diagnostic(`Pi extension load failed at ${error.path}: ${error.error}`);
   }
@@ -642,6 +1046,11 @@ async function loadBridge(params) {
     makeSessionManager(),
     makeModelRegistry(),
   );
+  bridge.runner.onError((error) => {
+    const location = error?.extensionPath ? ` in ${error.extensionPath}` : "";
+    const event = error?.event ? ` during ${error.event}` : "";
+    boundedDiagnostic(`Pi extension handler failed${location}${event}: ${error?.error ?? error}`);
+  });
   bridge.runner.bindCore(makeExtensionActions(), makeExtensionContextActions(), {
     registerProvider: () => unsupported("pi.registerProvider"),
     registerNativeProvider: () => unsupported("pi.registerProvider"),
@@ -656,11 +1065,6 @@ async function loadBridge(params) {
     reload: async () => unsupported("ctx.reload"),
   });
   bridge.runner.setUIContext(makeUi(), "rpc");
-  bridge.runner.onError((error) => {
-    const location = error?.extensionPath ? ` in ${error.extensionPath}` : "";
-    const event = error?.event ? ` during ${error.event}` : "";
-    boundedDiagnostic(`Pi extension handler failed${location}${event}: ${error?.error ?? error}`);
-  });
 
   const initialTools = bridge.runner.getAllRegisteredTools();
   setCurrentTools(initialTools, 0);
@@ -683,17 +1087,21 @@ async function handleInitialize(message) {
     setImmediate(() => scheduleToolRefresh());
   }
   const tools = bridge.tools.map((tool) => toolDefinitionToYgg(tool.definition));
+  const commands = bridge.features.has("runtime_commands")
+    ? bridge.commands.map(commandDefinitionToYgg)
+    : [
+        {
+          name: bridge.commandName,
+          description: `Run bridged Pi command(s): /${bridge.commandName} COMMAND [arguments]`,
+          usage: `/${bridge.commandName} COMMAND [arguments]`,
+        },
+      ];
   for (const warning of bridge.unsupported) diagnostic(`Pi compatibility: ${warning} is unavailable in Ygg`);
+  diagnostic(`Pi compatibility profile ${bridge.piRuntimeVersion} initialized`);
   return {
     api_version: API_VERSION,
     tools,
-    commands: [
-      {
-        name: bridge.commandName,
-        description: `Run bridged Pi command(s): /${bridge.commandName} COMMAND [arguments]`,
-        usage: `/${bridge.commandName} COMMAND [arguments]`,
-      },
-    ],
+    commands,
     protocol: {
       version: API_VERSION,
       features: [...bridge.features],
@@ -788,24 +1196,38 @@ async function callPiTool(message) {
     details: result?.details,
     isError: result?.isError === true,
   };
-  const transformed = await bridge.runner.emitToolResult(toolResultEvent);
-  const finalContent = await lowerContent(transformed?.content ?? result?.content);
+  const transformed = (await bridge.runner.emitToolResult(toolResultEvent)) ?? toolResultEvent;
+  const finalContent = await lowerContent(transformed.content ?? result?.content);
+  let metadata = transformed.details;
+  if (transformed.usage !== undefined) {
+    metadata = { details: transformed.details ?? null, usage: transformed.usage };
+  }
   return {
     content: finalContent,
-    is_error: transformed?.isError ?? result?.isError === true,
-    ...(result?.details === undefined ? {} : { metadata: result.details }),
+    is_error: transformed.isError === true,
+    ...(metadata === undefined ? {} : { metadata }),
   };
 }
 
 async function executePiCommand(message) {
-  if (message.params?.name !== bridge.commandName) {
-    throw new Error(`unknown bridged Pi command ${message.params?.name}`);
+  let command;
+  let argumentsList;
+  if (bridge.features.has("runtime_commands")) {
+    command = message.params?.name;
+    argumentsList = message.params?.arguments ?? [];
+  } else {
+    if (message.params?.name !== bridge.commandName) {
+      throw new Error(`unknown bridged Pi command ${message.params?.name}`);
+    }
+    command = message.params?.arguments?.[0];
+    if (!command) throw new Error(`/${bridge.commandName} requires the bridged Pi command name`);
+    argumentsList = message.params.arguments.slice(1) ?? [];
   }
-  const command = message.params?.arguments?.[0];
-  if (!command) throw new Error(`/${bridge.commandName} requires the bridged Pi command name`);
-  const registered = bridge.commands.find((candidate) => candidate.name === command);
+  const registered = bridge.commands.find(
+    (candidate) => (candidate.invocationName ?? candidate.name) === command,
+  );
   if (!registered) throw new Error(`unknown bridged Pi command ${command}`);
-  await registered.handler((message.params.arguments.slice(1) ?? []).join(" "), bridge.runner.createCommandContext());
+  await registered.handler(argumentsList.join(" "), bridge.runner.createCommandContext());
   return {
     text: `Pi command ${command} completed.`,
     notifications: [],
@@ -829,7 +1251,17 @@ async function runHook(message) {
       toolName: payload.name,
       input,
     };
+    const inputBeforeHandlers = JSON.stringify(event.input);
     const result = await bridge.runner.emitToolCall(event);
+    if (result?.terminate) {
+      return unsupported("tool_call.terminate");
+    }
+    if (
+      !registered
+      && JSON.stringify(event.input) !== inputBeforeHandlers
+    ) {
+      return unsupported("tool_call input mutation for Ygg-native tools");
+    }
     if (!result?.block && bridge.toolNames.includes(payload.name)) {
       enqueueByName(bridge.pendingPiToolCalls, payload.name, { id: toolCallId, input });
     }
@@ -843,7 +1275,7 @@ async function runHook(message) {
   }
   if (hook === "after_tool_call") {
     if (!bridge.toolNames.includes(payload.name)) {
-      await bridge.runner.emitToolResult({
+      const transformed = await bridge.runner.emitToolResult({
         type: "tool_result",
         toolCallId: `pi-ygg-hook-${String(message.id)}`,
         toolName: payload.name,
@@ -851,6 +1283,9 @@ async function runHook(message) {
         content: [{ type: "text", text: String(payload.output ?? "") }],
         isError: payload.is_error === true,
       });
+      if (transformed !== undefined) {
+        return unsupported("tool_result mutation for Ygg-native tools");
+      }
     }
     return { disposition: { action: "continue" }, context: [], notifications: [] };
   }
@@ -887,6 +1322,7 @@ async function collectContext(message) {
 }
 
 async function finishTurn(messages) {
+  bridge.agentActive = false;
   await bridge.runner.emit({
     type: "turn_end",
     turnIndex: 0,
@@ -914,6 +1350,7 @@ async function handleLifecycle(method, params) {
   } else if (method === "session/settled") {
     await emitSessionShutdown();
   } else if (method === "turn/started") {
+    bridge.agentActive = true;
     bridge.terminal.pendingCompletedTurn = null;
     bridge.terminal.pendingAgentMessages = null;
     await bridge.runner.emit({ type: "turn_start", turnIndex: 0, timestamp: Date.now() });
@@ -961,6 +1398,7 @@ async function handleLifecycle(method, params) {
 async function handleRequest(message) {
   if (message.method === "initialize") return handleInitialize(message);
   if (!bridge?.initialized) throw new Error("Pi compatibility host is not initialized");
+  updateHostStateFromMessage(message);
   if (LIFECYCLE_EVENTS.includes(message.method)) {
     await handleLifecycle(message.method, message.params ?? {});
     return null;

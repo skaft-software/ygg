@@ -8,14 +8,16 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fs2::FileExt as _;
 use serde::{Deserialize, Serialize};
 
 use crate::goal_driver::{GoalState, GoalStatus, GoalStore};
 
 const STORE_VERSION: u16 = 1;
+const GOAL_LOCK_FILE_NAME: &str = ".goal.lock";
 const MAX_GOAL_FILE_BYTES: u64 = 16 * 1024;
 const MAX_CREATED_AT_BYTES: usize = 64;
 const MAX_TURN_BUDGET: u32 = 100_000;
@@ -78,7 +80,48 @@ struct StoredGoal {
 
 struct DurableGoalStoreInner {
     root: PathBuf,
+    lock_path: PathBuf,
+    lock_file: File,
     lock: Mutex<()>,
+}
+
+struct GoalStoreLock<'a> {
+    _process: MutexGuard<'a, ()>,
+    file: &'a File,
+    path: &'a Path,
+    identity: crate::secure_fs::PrivateLockIdentity,
+    unlocked: bool,
+}
+
+impl GoalStoreLock<'_> {
+    fn revalidate(&self) -> Result<(), DurableGoalStoreError> {
+        crate::secure_fs::revalidate_private_lock_before_release(
+            self.path,
+            self.file,
+            &self.identity,
+        )
+        .map_err(map_lock_error)
+    }
+
+    fn finish(mut self) -> Result<(), DurableGoalStoreError> {
+        // Revalidate before releasing the OS lock, and attempt the release even
+        // when revalidation fails. Keep the first error because a replaced lock
+        // object is the transaction's primary safety failure.
+        let revalidation = self.revalidate();
+        let unlock = fs2::FileExt::unlock(self.file).map_err(DurableGoalStoreError::Storage);
+        self.unlocked = unlock.is_ok();
+        revalidation.and(unlock)
+    }
+}
+
+impl Drop for GoalStoreLock<'_> {
+    fn drop(&mut self) {
+        // Transaction completion is explicit and fallible. Drop only provides
+        // best-effort cleanup for errors and unwinding.
+        if !self.unlocked {
+            let _ = fs2::FileExt::unlock(self.file);
+        }
+    }
 }
 
 /// Cloneable, file-backed goal store keyed by session IDs.
@@ -98,9 +141,14 @@ impl DurableGoalStore {
             return Err(DurableGoalStoreError::UnsafePath);
         }
         ensure_private_directory(root)?;
+        let lock_path = root.join(GOAL_LOCK_FILE_NAME);
+        let lock_file =
+            crate::secure_fs::open_private_lock_file(&lock_path).map_err(map_lock_error)?;
         Ok(Self {
             inner: Arc::new(DurableGoalStoreInner {
                 root: root.to_owned(),
+                lock_path,
+                lock_file,
                 lock: Mutex::new(()),
             }),
         })
@@ -108,15 +156,13 @@ impl DurableGoalStore {
 
     /// Returns the current goal, if one exists.
     pub fn get(&self, session_id: &str) -> Result<Option<GoalState>, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        self.read_locked(session_id)
+        self.transaction(|_| self.read_locked(session_id))
     }
 
     /// Returns the latest durable revision, including a cleared goal's
     /// tombstone revision.
     pub fn revision(&self, session_id: &str) -> Result<u64, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        self.revision_locked(session_id)
+        self.transaction(|_| self.revision_locked(session_id))
     }
 
     /// Returns the current goal and its durable revision from one locked read.
@@ -124,20 +170,21 @@ impl DurableGoalStore {
         &self,
         session_id: &str,
     ) -> Result<(Option<GoalState>, u64), DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        let stored = self.read_record_locked(session_id)?;
-        let revision = stored
-            .as_ref()
-            .map(|stored| {
-                stored
-                    .state
-                    .as_ref()
-                    .map(|state| state.revision)
-                    .unwrap_or(stored.revision)
-            })
-            .unwrap_or(0);
-        let goal = stored.and_then(|stored| stored.state);
-        Ok((goal, revision))
+        self.transaction(|_| {
+            let stored = self.read_record_locked(session_id)?;
+            let revision = stored
+                .as_ref()
+                .map(|stored| {
+                    stored
+                        .state
+                        .as_ref()
+                        .map(|state| state.revision)
+                        .unwrap_or(stored.revision)
+                })
+                .unwrap_or(0);
+            let goal = stored.and_then(|stored| stored.state);
+            Ok((goal, revision))
+        })
     }
 
     /// Creates or replaces a goal and resets its lifecycle counters.
@@ -147,24 +194,25 @@ impl DurableGoalStore {
         objective: &str,
         turn_budget: Option<u32>,
     ) -> Result<GoalState, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        validate_session_id(session_id)?;
-        validate_objective(objective)?;
-        validate_turn_budget(turn_budget)?;
-        let revision = self
-            .revision_locked(session_id)?
-            .checked_add(1)
-            .ok_or(DurableGoalStoreError::InvalidTransition)?;
-        let state = GoalState {
-            revision,
-            objective: objective.trim().to_owned(),
-            status: GoalStatus::Active,
-            turn_budget,
-            turns_used: 0,
-            created_at: now_rfc3339(),
-        };
-        self.write_locked(session_id, &state)?;
-        Ok(state)
+        self.transaction(|lock| {
+            validate_session_id(session_id)?;
+            validate_objective(objective)?;
+            validate_turn_budget(turn_budget)?;
+            let revision = self
+                .revision_locked(session_id)?
+                .checked_add(1)
+                .ok_or(DurableGoalStoreError::InvalidTransition)?;
+            let state = GoalState {
+                revision,
+                objective: objective.trim().to_owned(),
+                status: GoalStatus::Active,
+                turn_budget,
+                turns_used: 0,
+                created_at: now_rfc3339(),
+            };
+            self.write_locked(session_id, &state, lock)?;
+            Ok(state)
+        })
     }
 
     /// Applies a pause, resume, or clear operation.
@@ -173,96 +221,102 @@ impl DurableGoalStore {
         session_id: &str,
         action: GoalAction,
     ) -> Result<Option<GoalState>, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        validate_session_id(session_id)?;
-        if action == GoalAction::Clear {
-            let Some(stored) = self.read_record_locked(session_id)? else {
-                return Ok(None);
-            };
-            if stored.state.is_none() {
-                // Clearing an already-cleared goal is idempotent and must not
-                // advance the tombstone revision.
-                return Ok(None);
-            }
-            let revision = stored
-                .state
-                .as_ref()
-                .map(|state| state.revision)
-                .unwrap_or(stored.revision)
-                .checked_add(1)
-                .ok_or(DurableGoalStoreError::InvalidTransition)?;
-            self.write_record_locked(
-                session_id,
-                &StoredGoal {
-                    version: STORE_VERSION,
-                    state: None,
-                    revision,
-                },
-            )?;
-            return Ok(None);
-        }
-        let mut state = self
-            .read_locked(session_id)?
-            .ok_or(DurableGoalStoreError::NotFound)?;
-        let previous_status = state.status;
-        match (action, state.status) {
-            (GoalAction::Pause, GoalStatus::Active)
-            | (GoalAction::Pause, GoalStatus::Paused)
-            | (GoalAction::Pause, GoalStatus::BudgetLimited) => state.status = GoalStatus::Paused,
-            (GoalAction::Resume, GoalStatus::Paused) => {
-                state.status = if state
-                    .turn_budget
-                    .is_some_and(|budget| state.turns_used >= budget)
-                {
-                    GoalStatus::BudgetLimited
-                } else {
-                    GoalStatus::Active
+        self.transaction(|lock| {
+            validate_session_id(session_id)?;
+            if action == GoalAction::Clear {
+                let Some(stored) = self.read_record_locked(session_id)? else {
+                    return Ok(None);
                 };
+                if stored.state.is_none() {
+                    // Clearing an already-cleared goal is idempotent and must not
+                    // advance the tombstone revision.
+                    return Ok(None);
+                }
+                let revision = stored
+                    .state
+                    .as_ref()
+                    .map(|state| state.revision)
+                    .unwrap_or(stored.revision)
+                    .checked_add(1)
+                    .ok_or(DurableGoalStoreError::InvalidTransition)?;
+                self.write_record_locked(
+                    session_id,
+                    &StoredGoal {
+                        version: STORE_VERSION,
+                        state: None,
+                        revision,
+                    },
+                    lock,
+                )?;
+                return Ok(None);
             }
-            (GoalAction::Resume, GoalStatus::Active) => state.status = GoalStatus::Active,
-            _ => return Err(DurableGoalStoreError::InvalidTransition),
-        }
-        if state.status != previous_status || state.revision == 0 {
-            bump_revision(&mut state)?;
-        }
-        self.write_locked(session_id, &state)?;
-        Ok(Some(state))
+            let mut state = self
+                .read_locked(session_id)?
+                .ok_or(DurableGoalStoreError::NotFound)?;
+            let previous_status = state.status;
+            match (action, state.status) {
+                (GoalAction::Pause, GoalStatus::Active)
+                | (GoalAction::Pause, GoalStatus::Paused)
+                | (GoalAction::Pause, GoalStatus::BudgetLimited) => {
+                    state.status = GoalStatus::Paused;
+                }
+                (GoalAction::Resume, GoalStatus::Paused) => {
+                    state.status = if state
+                        .turn_budget
+                        .is_some_and(|budget| state.turns_used >= budget)
+                    {
+                        GoalStatus::BudgetLimited
+                    } else {
+                        GoalStatus::Active
+                    };
+                }
+                (GoalAction::Resume, GoalStatus::Active) => state.status = GoalStatus::Active,
+                _ => return Err(DurableGoalStoreError::InvalidTransition),
+            }
+            if state.status != previous_status || state.revision == 0 {
+                bump_revision(&mut state)?;
+            }
+            self.write_locked(session_id, &state, lock)?;
+            Ok(Some(state))
+        })
     }
 
     /// Removes a goal for a deleted session. Missing goals are ignored.
     pub fn delete_session(&self, session_id: &str) -> Result<(), DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        validate_session_id(session_id)?;
-        self.remove_locked(session_id)
+        self.transaction(|lock| {
+            validate_session_id(session_id)?;
+            self.remove_locked(session_id, lock)
+        })
     }
 
     /// Records one continuation turn and enforces the configured budget.
     pub fn record_turn(&self, session_id: &str) -> Result<GoalState, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        validate_session_id(session_id)?;
-        let mut state = self
-            .read_locked(session_id)?
-            .ok_or(DurableGoalStoreError::NotFound)?;
-        if state.status != GoalStatus::Active
-            || state
+        self.transaction(|lock| {
+            validate_session_id(session_id)?;
+            let mut state = self
+                .read_locked(session_id)?
+                .ok_or(DurableGoalStoreError::NotFound)?;
+            if state.status != GoalStatus::Active
+                || state
+                    .turn_budget
+                    .is_some_and(|budget| state.turns_used >= budget)
+            {
+                return Err(DurableGoalStoreError::InvalidTransition);
+            }
+            state.turns_used = state
+                .turns_used
+                .checked_add(1)
+                .ok_or(DurableGoalStoreError::InvalidTransition)?;
+            if state
                 .turn_budget
                 .is_some_and(|budget| state.turns_used >= budget)
-        {
-            return Err(DurableGoalStoreError::InvalidTransition);
-        }
-        state.turns_used = state
-            .turns_used
-            .checked_add(1)
-            .ok_or(DurableGoalStoreError::InvalidTransition)?;
-        if state
-            .turn_budget
-            .is_some_and(|budget| state.turns_used >= budget)
-        {
-            state.status = GoalStatus::BudgetLimited;
-        }
-        bump_revision(&mut state)?;
-        self.write_locked(session_id, &state)?;
-        Ok(state)
+            {
+                state.status = GoalStatus::BudgetLimited;
+            }
+            bump_revision(&mut state)?;
+            self.write_locked(session_id, &state, lock)?;
+            Ok(state)
+        })
     }
 
     /// Marks a goal complete.
@@ -286,22 +340,58 @@ impl DurableGoalStore {
         session_id: &str,
         status: GoalStatus,
     ) -> Result<GoalState, DurableGoalStoreError> {
-        let _guard = self.lock()?;
-        validate_session_id(session_id)?;
-        let mut state = self
-            .read_locked(session_id)?
-            .ok_or(DurableGoalStoreError::NotFound)?;
-        if state.status != status || state.revision == 0 {
-            state.status = status;
-            bump_revision(&mut state)?;
-            self.write_locked(session_id, &state)?;
-        }
-        Ok(state)
+        self.transaction(|lock| {
+            validate_session_id(session_id)?;
+            let mut state = self
+                .read_locked(session_id)?
+                .ok_or(DurableGoalStoreError::NotFound)?;
+            if state.status != status || state.revision == 0 {
+                state.status = status;
+                bump_revision(&mut state)?;
+                self.write_locked(session_id, &state, lock)?;
+            }
+            Ok(state)
+        })
     }
 
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, ()>, DurableGoalStoreError> {
-        self.inner.lock.lock().map_err(|_| {
+    fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&GoalStoreLock<'_>) -> Result<T, DurableGoalStoreError>,
+    ) -> Result<T, DurableGoalStoreError> {
+        let lock = self.lock()?;
+        let result = operation(&lock);
+        match (result, lock.finish()) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) | (Err(error), _) => Err(error),
+        }
+    }
+
+    fn lock(&self) -> Result<GoalStoreLock<'_>, DurableGoalStoreError> {
+        // Keep the existing mutex for clones of one store and add the OS lock
+        // for stores opened independently by another handle or process. Both
+        // locks must cover the whole read/validate/mutate/publish operation.
+        let process_guard = self.inner.lock.lock().map_err(|_| {
             DurableGoalStoreError::Storage(std::io::Error::other("goal store lock poisoned"))
+        })?;
+        let file = &self.inner.lock_file;
+        file.lock_exclusive()
+            .map_err(DurableGoalStoreError::Storage)?;
+        let identity = match crate::secure_fs::validate_private_lock_after_acquire(
+            &self.inner.lock_path,
+            file,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = fs2::FileExt::unlock(file);
+                return Err(map_lock_error(error));
+            }
+        };
+        Ok(GoalStoreLock {
+            _process: process_guard,
+            file,
+            path: &self.inner.lock_path,
+            identity,
+            unlocked: false,
         })
     }
 
@@ -373,6 +463,7 @@ impl DurableGoalStore {
         &self,
         session_id: &str,
         state: &GoalState,
+        lock: &GoalStoreLock<'_>,
     ) -> Result<(), DurableGoalStoreError> {
         validate_state(state)?;
         self.write_record_locked(
@@ -382,6 +473,7 @@ impl DurableGoalStore {
                 state: Some(state.clone()),
                 revision: state.revision,
             },
+            lock,
         )
     }
 
@@ -389,6 +481,7 @@ impl DurableGoalStore {
         &self,
         session_id: &str,
         stored: &StoredGoal,
+        lock: &GoalStoreLock<'_>,
     ) -> Result<(), DurableGoalStoreError> {
         validate_session_id(session_id)?;
         if let Some(state) = &stored.state {
@@ -427,6 +520,10 @@ impl DurableGoalStore {
             let _ = std::fs::remove_file(&temp_path);
             return Err(DurableGoalStoreError::Storage(error));
         }
+        if let Err(error) = lock.revalidate() {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(error);
+        }
         if let Err(error) = std::fs::rename(&temp_path, self.goal_path(session_id)) {
             let _ = std::fs::remove_file(&temp_path);
             return Err(DurableGoalStoreError::Storage(error));
@@ -434,13 +531,18 @@ impl DurableGoalStore {
         sync_directory(&self.inner.root)
     }
 
-    fn remove_locked(&self, session_id: &str) -> Result<(), DurableGoalStoreError> {
+    fn remove_locked(
+        &self,
+        session_id: &str,
+        lock: &GoalStoreLock<'_>,
+    ) -> Result<(), DurableGoalStoreError> {
         let path = self.goal_path(session_id);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => {
                 if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                     return Err(DurableGoalStoreError::UnsafePath);
                 }
+                lock.revalidate()?;
                 std::fs::remove_file(path).map_err(DurableGoalStoreError::Storage)?;
                 sync_directory(&self.inner.root)
             }
@@ -548,6 +650,17 @@ fn ensure_private_directory(path: &Path) -> Result<(), DurableGoalStoreError> {
     Ok(())
 }
 
+fn map_lock_error(error: crate::secure_fs::SecureFileError) -> DurableGoalStoreError {
+    match error {
+        crate::secure_fs::SecureFileError::InvalidPath(_)
+        | crate::secure_fs::SecureFileError::NotRegular
+        | crate::secure_fs::SecureFileError::InsecurePrivateObject(_)
+        | crate::secure_fs::SecureFileError::Changed => DurableGoalStoreError::UnsafePath,
+        crate::secure_fs::SecureFileError::Io(error) => DurableGoalStoreError::Storage(error),
+        error => DurableGoalStoreError::Storage(std::io::Error::other(error.to_string())),
+    }
+}
+
 fn sync_directory(path: &Path) -> Result<(), DurableGoalStoreError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -603,6 +716,54 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
+    fn assert_waits_for_other_handle<F>(root: &Path, operation: F)
+    where
+        F: FnOnce(DurableGoalStore) -> Result<(), DurableGoalStoreError> + Send + 'static,
+    {
+        let holder = DurableGoalStore::open(root).unwrap();
+        let contender = DurableGoalStore::open(root).unwrap();
+        let held = holder.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (done_tx, done_rx) = mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(operation(contender).map_err(|error| error.to_string()))
+                .unwrap();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(())
+        );
+        worker.join().unwrap();
+    }
+
+    fn replace_lock_while_held(store: &DurableGoalStore) -> File {
+        let old_lock = crate::secure_fs::open_private_lock_file(&store.inner.lock_path).unwrap();
+        let error = fs2::FileExt::try_lock_exclusive(&old_lock).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+
+        std::fs::remove_file(&store.inner.lock_path).unwrap();
+        let replacement = crate::secure_fs::open_private_lock_file(&store.inner.lock_path).unwrap();
+        drop(replacement);
+        old_lock
+    }
+
+    fn assert_lock_released(lock: File) {
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        fs2::FileExt::unlock(&lock).unwrap();
+    }
 
     #[test]
     fn stores_and_reopens_goal_state() {
@@ -644,6 +805,7 @@ mod tests {
             3
         );
     }
+
     #[test]
     fn clear_is_idempotent_and_budget_is_durable() {
         let directory = tempfile::tempdir().unwrap();
@@ -655,5 +817,274 @@ mod tests {
         );
         assert_eq!(store.apply("session", GoalAction::Clear).unwrap(), None);
         assert_eq!(store.apply("session", GoalAction::Clear).unwrap(), None);
+    }
+
+    #[test]
+    fn successful_transaction_reports_replaced_lock_and_releases_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableGoalStore::open(directory.path()).unwrap();
+        let mut old_lock = None;
+
+        let result: Result<(), DurableGoalStoreError> = store.transaction(|_| {
+            old_lock = Some(replace_lock_while_held(&store));
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(DurableGoalStoreError::UnsafePath)));
+        assert_lock_released(old_lock.unwrap());
+    }
+
+    #[test]
+    fn replaced_lock_prevents_goal_publication_and_releases_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableGoalStore::open(directory.path()).unwrap();
+        let goal_path = store.goal_path("session");
+        let mut old_lock = None;
+
+        let result = store.transaction(|lock| {
+            old_lock = Some(replace_lock_while_held(&store));
+            let state = GoalState {
+                revision: 1,
+                objective: "Do not publish".to_owned(),
+                status: GoalStatus::Active,
+                turn_budget: None,
+                turns_used: 0,
+                created_at: now_rfc3339(),
+            };
+            store.write_locked("session", &state, lock)
+        });
+
+        assert!(matches!(result, Err(DurableGoalStoreError::UnsafePath)));
+        assert!(!goal_path.exists());
+        assert_lock_released(old_lock.unwrap());
+    }
+
+    #[test]
+    fn replaced_lock_prevents_goal_removal_and_releases_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableGoalStore::open(directory.path()).unwrap();
+        store.set("session", "Keep this goal", None).unwrap();
+        let goal_path = store.goal_path("session");
+        let original = std::fs::read(&goal_path).unwrap();
+        let mut old_lock = None;
+
+        let result = store.transaction(|lock| {
+            old_lock = Some(replace_lock_while_held(&store));
+            store.remove_locked("session", lock)
+        });
+
+        assert!(matches!(result, Err(DurableGoalStoreError::UnsafePath)));
+        assert_eq!(std::fs::read(goal_path).unwrap(), original);
+        assert_lock_released(old_lock.unwrap());
+    }
+
+    #[test]
+    fn independent_handles_serialize_each_goal_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.set("set", "set objective", None)?;
+            assert_eq!(state.revision, 1);
+            Ok(())
+        });
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("apply", "apply objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.apply("apply", GoalAction::Pause)?.unwrap();
+            assert_eq!(state.status, GoalStatus::Paused);
+            assert_eq!(state.revision, 2);
+            Ok(())
+        });
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.apply("apply", GoalAction::Resume)?.unwrap();
+            assert_eq!(state.status, GoalStatus::Active);
+            assert_eq!(state.revision, 3);
+            Ok(())
+        });
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("turn", "turn objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.record_turn("turn")?;
+            assert_eq!(state.turns_used, 1);
+            assert_eq!(state.revision, 2);
+            Ok(())
+        });
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("complete", "complete objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.mark_complete("complete")?;
+            assert_eq!(state.status, GoalStatus::Complete);
+            assert_eq!(state.revision, 2);
+            Ok(())
+        });
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("blocked", "blocked objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            let state = store.mark_blocked("blocked")?;
+            assert_eq!(state.status, GoalStatus::Blocked);
+            assert_eq!(state.revision, 2);
+            Ok(())
+        });
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("clear", "clear objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            assert_eq!(store.apply("clear", GoalAction::Clear)?, None);
+            Ok(())
+        });
+        assert_eq!(
+            DurableGoalStore::open(root)
+                .unwrap()
+                .snapshot("clear")
+                .unwrap(),
+            (None, 2)
+        );
+
+        let store = DurableGoalStore::open(root).unwrap();
+        store.set("delete", "delete objective", None).unwrap();
+        drop(store);
+        assert_waits_for_other_handle(root, |store| {
+            store.delete_session("delete")?;
+            Ok(())
+        });
+        let store = DurableGoalStore::open(root).unwrap();
+        assert_eq!(store.get("delete").unwrap(), None);
+        assert_eq!(store.revision("delete").unwrap(), 0);
+    }
+
+    #[test]
+    fn independent_handles_do_not_lose_turns_or_revisions() {
+        const TURN_COUNT: usize = 16;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = DurableGoalStore::open(root).unwrap();
+        store
+            .set("turns", "record all turns", Some(TURN_COUNT as u32))
+            .unwrap();
+        drop(store);
+
+        let barrier = Arc::new(Barrier::new(TURN_COUNT));
+        let mut workers = Vec::with_capacity(TURN_COUNT);
+        for _ in 0..TURN_COUNT {
+            let store = DurableGoalStore::open(root).unwrap();
+            let barrier = Arc::clone(&barrier);
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                store.record_turn("turns")
+            }));
+        }
+
+        let mut states = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        states.sort_by_key(|state| state.revision);
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state.revision)
+                .collect::<Vec<_>>(),
+            (2..=(TURN_COUNT as u64 + 1)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state.turns_used)
+                .collect::<Vec<_>>(),
+            (1..=TURN_COUNT as u32).collect::<Vec<_>>()
+        );
+
+        let state = DurableGoalStore::open(root)
+            .unwrap()
+            .get("turns")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.turns_used, TURN_COUNT as u32);
+        assert_eq!(state.revision, TURN_COUNT as u64 + 1);
+        assert_eq!(state.status, GoalStatus::BudgetLimited);
+    }
+
+    #[test]
+    fn independent_handles_preserve_set_and_status_revision_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let barrier = Arc::new(Barrier::new(2));
+        let first = DurableGoalStore::open(root).unwrap();
+        let second = DurableGoalStore::open(root).unwrap();
+        let first_barrier = Arc::clone(&barrier);
+        let first_worker = thread::spawn(move || {
+            first_barrier.wait();
+            first.set("set-race", "first", None)
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_worker = thread::spawn(move || {
+            second_barrier.wait();
+            second.set("set-race", "second", None)
+        });
+        let mut set_states = vec![first_worker.join().unwrap().unwrap()];
+        set_states.push(second_worker.join().unwrap().unwrap());
+        set_states.sort_by_key(|state| state.revision);
+        assert_eq!(
+            set_states
+                .iter()
+                .map(|state| state.revision)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let state = DurableGoalStore::open(root)
+            .unwrap()
+            .get("set-race")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.revision, 2);
+        assert!(matches!(state.objective.as_str(), "first" | "second"));
+
+        DurableGoalStore::open(root)
+            .unwrap()
+            .set("status-race", "status", None)
+            .unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let first = DurableGoalStore::open(root).unwrap();
+        let second = DurableGoalStore::open(root).unwrap();
+        let first_barrier = Arc::clone(&barrier);
+        let first_worker = thread::spawn(move || {
+            first_barrier.wait();
+            first.mark_complete("status-race")
+        });
+        let second_barrier = Arc::clone(&barrier);
+        let second_worker = thread::spawn(move || {
+            second_barrier.wait();
+            second.mark_blocked("status-race")
+        });
+        let mut status_states = vec![first_worker.join().unwrap().unwrap()];
+        status_states.push(second_worker.join().unwrap().unwrap());
+        status_states.sort_by_key(|state| state.revision);
+        assert_eq!(
+            status_states
+                .iter()
+                .map(|state| state.revision)
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        let state = DurableGoalStore::open(root)
+            .unwrap()
+            .get("status-race")
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.revision, 3);
+        assert!(matches!(
+            state.status,
+            GoalStatus::Complete | GoalStatus::Blocked
+        ));
     }
 }

@@ -100,8 +100,13 @@ export YGG_SHA256=$(sha256sum "$YGG_BINARY" | awk '{print $1}')
 ```
 
 The binary must be made available inside each task container at
-`/usr/local/bin/ygg`. For Codex OAuth, stage a disposable copy before building
-`YGG_MOUNTS`; for API mode, omit `CODEX_STAGE`:
+`/usr/local/bin/ygg`. For Codex OAuth, stage disposable copies before building
+`YGG_MOUNTS`; for API mode, omit `CODEX_STAGE`. Mount the staged `.ygg`
+directory **read-only**: Harbor's Docker environment normalizes writable mount
+ownership/permissions, while Ygg's credential reader intentionally requires
+owner-only files. Ygg stores sessions under the mounted `/logs/agent` path, not
+under this credential mount. A fresh Codex model cache is staged when present so
+startup does not need live discovery on every trial:
 
 ```bash
 # Use this block only for Codex OAuth; omit it for API mode.
@@ -109,6 +114,9 @@ The binary must be made available inside each task container at
 export CODEX_STAGE=$(mktemp -d)
 mkdir -p "$CODEX_STAGE/.ygg/credentials"
 cp "$HOME/.ygg/credentials/codex.json" "$CODEX_STAGE/.ygg/credentials/codex.json"
+if [ -f "$HOME/.ygg/credentials/codex-models.json" ]; then
+  cp "$HOME/.ygg/credentials/codex-models.json" "$CODEX_STAGE/.ygg/credentials/codex-models.json"
+fi
 chmod -R go-rwx "$CODEX_STAGE"
 
 export YGG_MOUNTS="$(python3 - <<'PY'
@@ -126,7 +134,7 @@ if stage:
         "type": "bind",
         "source": os.path.join(stage, ".ygg"),
         "target": "/root/.ygg",
-        "read_only": False,
+        "read_only": True,
     })
 print(json.dumps(mounts))
 PY
@@ -174,7 +182,7 @@ credential path without invoking Ygg's provider loop:
 ```bash
 PYTHONPATH="$YGG_REPO" uv run harbor run \
   -d 'terminal-bench/terminal-bench-2-1@6' \
-  --include-task-name terminal-bench/shadow-relay \
+  --include-task-name terminal-bench/headless-terminal \
   -a evaluation.harbor.ygg_agent:Ygg \
   -e docker \
   --install-only \

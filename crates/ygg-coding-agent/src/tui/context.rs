@@ -2,8 +2,7 @@ use ygg_agent::InputPart;
 
 use crate::app::App;
 use crate::compaction::{
-    context_window, estimate_messages_tokens, estimate_next_request_tokens,
-    estimate_pending_tokens, estimate_text_tokens,
+    context_window, estimate_messages_tokens, estimate_next_request_tokens, estimate_pending_tokens,
 };
 use crate::config::CompactionMode;
 use crate::tui::theme::YggTheme;
@@ -12,11 +11,10 @@ use crate::tui::view::{fit_line, sanitize_for_terminal};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ContextKind {
     System,
-    Skills,
+    Framing,
     Tools,
     Messages,
     Pending,
-    Framing,
     Adjustment,
     TokenizerAdjustment,
     Output,
@@ -27,15 +25,16 @@ enum ContextKind {
 impl ContextKind {
     fn role(self) -> &'static str {
         match self {
-            Self::System => "model_accent",
-            Self::Skills => "warning",
-            Self::Tools => "success",
-            Self::Messages => "foreground",
-            Self::Pending => "warning",
-            Self::Framing | Self::Buffer => "muted",
-            Self::Adjustment | Self::TokenizerAdjustment => "warning",
-            Self::Output => "error",
-            Self::Free => "success",
+            Self::System => "context_system",
+            Self::Framing => "context_framing",
+            Self::Tools => "context_tools",
+            Self::Messages => "context_messages",
+            Self::Pending => "context_pending",
+            Self::Adjustment => "context_adjustment",
+            Self::TokenizerAdjustment => "context_tokenizer_adjustment",
+            Self::Output => "context_output",
+            Self::Free => "context_free",
+            Self::Buffer => "context_buffer",
         }
     }
 }
@@ -69,15 +68,6 @@ impl ContextReport {
             .context_ref()
             .map(|messages| estimate_messages_tokens(&messages))
             .unwrap_or_default();
-        let active = session
-            .head_ref()
-            .and_then(|head| session.resolve_active_skills(head).ok())
-            .unwrap_or_default();
-        let skills = active
-            .active_skills
-            .iter()
-            .map(|skill| estimate_text_tokens(&skill.instructions))
-            .sum::<u64>();
         let pending_tokens = estimate_pending_tokens(pending);
         let structural_fallback = estimate_next_request_tokens(app, &[]);
         let pending_delta =
@@ -93,7 +83,6 @@ impl ContextReport {
             .saturating_add(pending_delta);
         let known_input = app
             .system_tokens
-            .saturating_add(skills)
             .saturating_add(app.current_tool_schema_tokens())
             .saturating_add(messages)
             .saturating_add(pending_tokens);
@@ -102,7 +91,7 @@ impl ContextReport {
         let provider_adjustment = estimated_input.saturating_sub(categorized_input);
         let tokenizer_adjustment = categorized_input.saturating_sub(estimated_input);
         let context_window = context_window(&app.model);
-        let output_reserve = app.agent.max_output_tokens();
+        let output_reserve = app.agent.compaction_reserve_tokens();
         let compaction_mode = app.config.compaction.mode;
         let auto_compact_enabled = compaction_mode.enabled();
         let threshold_fraction = app.config.compaction.threshold_fraction;
@@ -119,11 +108,13 @@ impl ContextReport {
         } else {
             0
         };
-        let skill_label = match (active.active_skills.len(), active.skill_resources.len()) {
-            (0, 0) => "Active skills/resources".to_owned(),
-            (skills, resources) => format!("Skills/resources ({skills}/{resources})"),
-        };
-
+        // Semantic prompt order is stable across the three codecs: system and
+        // provider instruction framing, tool-definition metadata, then the
+        // chronological message stream. Active skill bodies are already owned
+        // by either the composed system prompt or their durable user/tool-result
+        // messages, so a standalone skill slice would double-count them and
+        // falsely claim a universal position. Capacity regions at the end are
+        // not yet seen by the model.
         let mut slices = vec![
             ContextSlice {
                 kind: ContextKind::System,
@@ -131,9 +122,9 @@ impl ContextReport {
                 tokens: app.system_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Skills,
-                label: skill_label,
-                tokens: skills,
+                kind: ContextKind::Framing,
+                label: "Provider framing".into(),
+                tokens: framing,
             },
             ContextSlice {
                 kind: ContextKind::Tools,
@@ -154,13 +145,11 @@ impl ContextReport {
                 tokens: pending_tokens,
             },
             ContextSlice {
-                kind: ContextKind::Framing,
-                label: "Provider framing".into(),
-                tokens: framing,
-            },
-            ContextSlice {
                 kind: ContextKind::Adjustment,
-                label: "Provider-measured adjustment".into(),
+                // Provider reconciliation is authoritative but does not expose
+                // where the extra tokens land. Keep it at the end of observed
+                // input instead of inventing a position inside the prompt.
+                label: "Provider token delta".into(),
                 tokens: provider_adjustment,
             },
             ContextSlice {
@@ -170,7 +159,7 @@ impl ContextReport {
             },
             ContextSlice {
                 kind: ContextKind::Output,
-                label: "Output reserve".into(),
+                label: "Compaction reserve".into(),
                 tokens: output_reserve,
             },
             ContextSlice {
@@ -212,7 +201,7 @@ impl ContextReport {
         let committed = self.estimated_input.saturating_add(self.output_reserve);
         lines.push(fit_line(
             &format!(
-                "~{} input + {} output reserve / {}",
+                "~{} input + {} compaction reserve / {}",
                 compact_tokens(self.estimated_input),
                 compact_tokens(self.output_reserve),
                 compact_tokens(self.context_window)
@@ -256,29 +245,14 @@ impl ContextReport {
             .iter()
             .filter(|slice| slice.tokens > 0 || slice.kind == ContextKind::Pending)
             .collect::<Vec<_>>();
-        if width >= 86 {
-            let cell_width = width.saturating_sub(3) / 2;
-            for pair in visible.chunks(2) {
-                let left = render_slice(pair[0], theme, cell_width, self.context_window);
-                let right = pair
-                    .get(1)
-                    .map(|slice| render_slice(slice, theme, cell_width, self.context_window))
-                    .unwrap_or_default();
-                let gap = usize::from(width).saturating_sub(
-                    sexy_tui_rs::visible_width(&left) + sexy_tui_rs::visible_width(&right),
-                );
-                lines.push(fit_line(
-                    &format!("{left}{}{right}", " ".repeat(gap)),
-                    width,
-                ));
-            }
-        } else {
-            lines.extend(
-                visible
-                    .into_iter()
-                    .map(|slice| render_slice(slice, theme, width, self.context_window)),
-            );
-        }
+        // Keep the context details as one left-anchored list at every width.
+        // A wide terminal must not turn later rows into a separately anchored
+        // right-hand column.
+        lines.extend(
+            visible
+                .into_iter()
+                .map(|slice| render_slice(slice, theme, width, self.context_window)),
+        );
         lines
     }
 
@@ -288,11 +262,7 @@ impl ContextReport {
         let mut used_cells = 0usize;
         let mut cumulative = 0u64;
         let mut bar = String::new();
-        for slice in self
-            .slices
-            .iter()
-            .filter(|slice| slice.tokens > 0 && slice.kind != ContextKind::TokenizerAdjustment)
-        {
+        for slice in self.bar_slices() {
             cumulative = cumulative.saturating_add(slice.tokens);
             let boundary = if self.context_window == 0 {
                 bar_width
@@ -314,10 +284,18 @@ impl ContextReport {
         }
         fit_line(&bar, width)
     }
+
+    fn bar_slices(&self) -> impl Iterator<Item = &ContextSlice> {
+        self.slices
+            .iter()
+            .filter(|slice| slice.tokens > 0 && slice.kind != ContextKind::TokenizerAdjustment)
+    }
 }
 
 fn render_slice(slice: &ContextSlice, theme: &YggTheme, width: u16, window: u64) -> String {
-    let marker = theme.fg(slice.kind.role(), if theme.unicode() { "■" } else { "#" });
+    let role = slice.kind.role();
+    let marker = theme.fg(role, if theme.unicode() { "■" } else { "#" });
+    let label = theme.fg(role, &sanitize_for_terminal(&slice.label));
     let percent = if window == 0 {
         0.0
     } else {
@@ -329,7 +307,7 @@ fn render_slice(slice: &ContextSlice, theme: &YggTheme, width: u16, window: u64)
         compact_tokens(slice.tokens)
     };
     fit_line(
-        &format!("{marker} {}  {}  {percent:.1}%", slice.label, tokens),
+        &format!("{marker} {label}  {}  {percent:.1}%", tokens),
         width,
     )
 }
@@ -364,9 +342,9 @@ mod tests {
                     tokens: 3_000,
                 },
                 ContextSlice {
-                    kind: ContextKind::Skills,
-                    label: "Skills/resources (2/1)".into(),
-                    tokens: 2_000,
+                    kind: ContextKind::Framing,
+                    label: "Provider framing".into(),
+                    tokens: 100,
                 },
                 ContextSlice {
                     kind: ContextKind::Tools,
@@ -384,18 +362,13 @@ mod tests {
                     tokens: 900,
                 },
                 ContextSlice {
-                    kind: ContextKind::Framing,
-                    label: "Provider framing".into(),
-                    tokens: 100,
-                },
-                ContextSlice {
                     kind: ContextKind::Adjustment,
-                    label: "Provider-measured adjustment".into(),
-                    tokens: 75_000,
+                    label: "Provider token delta".into(),
+                    tokens: 77_000,
                 },
                 ContextSlice {
                     kind: ContextKind::Output,
-                    label: "Output reserve".into(),
+                    label: "Compaction reserve".into(),
                     tokens: 32_000,
                 },
                 ContextSlice {
@@ -422,11 +395,10 @@ mod tests {
                 matches!(
                     slice.kind,
                     ContextKind::System
-                        | ContextKind::Skills
+                        | ContextKind::Framing
                         | ContextKind::Tools
                         | ContextKind::Messages
                         | ContextKind::Pending
-                        | ContextKind::Framing
                         | ContextKind::Adjustment
                 )
             })
@@ -450,17 +422,38 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(plain.contains("System prompt"), "{plain}");
-            assert!(plain.contains("Skills/resources"), "{plain}");
             assert!(plain.contains("Tool schemas"), "{plain}");
             assert!(plain.contains("Messages and tool results"), "{plain}");
-            assert!(plain.contains("Provider-measured adjustment"), "{plain}");
-            assert!(plain.contains("Output reserve"), "{plain}");
+            assert!(plain.contains("Provider token delta"), "{plain}");
+            assert!(plain.contains("Compaction reserve"), "{plain}");
             assert!(plain.contains("Auto-compact buffer"), "{plain}");
             assert!(!plain.contains("MCP"), "{plain}");
             assert!(rendered
                 .iter()
                 .all(|line| sexy_tui_rs::visible_width(line) <= usize::from(width)));
         }
+    }
+
+    #[test]
+    fn wide_context_report_keeps_all_detail_rows_left_anchored() {
+        let report = report();
+        let expected_rows = report
+            .slices
+            .iter()
+            .filter(|slice| slice.tokens > 0 || slice.kind == ContextKind::Pending)
+            .count();
+        let rows = report
+            .render(&crate::tui::theme::test_theme(), 120)
+            .into_iter()
+            .map(|line| sexy_tui_rs::strip_terminal_sequences(&line))
+            .filter(|line| line.starts_with("■ "))
+            .collect::<Vec<_>>();
+
+        assert_eq!(rows.len(), expected_rows, "{rows:?}");
+        assert!(
+            rows.iter().all(|line| line.matches('■').count() == 1),
+            "context detail rows were rendered side-by-side: {rows:?}"
+        );
     }
 
     #[test]
@@ -488,6 +481,80 @@ mod tests {
             sexy_tui_rs::strip_terminal_sequences(&named)
         );
         assert_ne!(default, named, "theme semantics did not restyle the report");
+    }
+
+    #[test]
+    fn context_rows_use_distinct_channels_for_markers_and_labels() {
+        let theme = crate::tui::theme::test_theme();
+        let kinds = [
+            ContextKind::System,
+            ContextKind::Framing,
+            ContextKind::Tools,
+            ContextKind::Messages,
+            ContextKind::Pending,
+            ContextKind::Adjustment,
+            ContextKind::TokenizerAdjustment,
+            ContextKind::Output,
+            ContextKind::Free,
+            ContextKind::Buffer,
+        ];
+        let colors = kinds
+            .iter()
+            .map(|kind| theme.role_rgb(kind.role()))
+            .collect::<Vec<_>>();
+        for (index, color) in colors.iter().enumerate() {
+            for other in colors.iter().skip(index + 1) {
+                assert_ne!(color, other, "context color channel was reused");
+            }
+        }
+        for kind in [ContextKind::System, ContextKind::Tools, ContextKind::Output] {
+            for status in ["accent", "info", "error"] {
+                assert_ne!(
+                    theme.role_rgb(kind.role()),
+                    theme.role_rgb(status),
+                    "{} reused the {status} status channel",
+                    kind.role()
+                );
+            }
+        }
+
+        let rendered = report().render(&theme, 100);
+        for (kind, label) in [
+            (ContextKind::System, "System prompt"),
+            (ContextKind::Tools, "Tool schemas"),
+            (ContextKind::Output, "Compaction reserve"),
+            (ContextKind::Free, "Free before auto-compact"),
+        ] {
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.contains(&theme.fg(kind.role(), label))),
+                "{label} did not retain its semantic label colour"
+            );
+        }
+    }
+
+    #[test]
+    fn context_bar_follows_semantic_prompt_then_capacity_order() {
+        let report = report();
+        let order = report
+            .bar_slices()
+            .map(|slice| slice.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                ContextKind::System,
+                ContextKind::Framing,
+                ContextKind::Tools,
+                ContextKind::Messages,
+                ContextKind::Pending,
+                ContextKind::Adjustment,
+                ContextKind::Output,
+                ContextKind::Free,
+                ContextKind::Buffer,
+            ]
+        );
     }
 
     #[test]
@@ -549,11 +616,10 @@ mod tests {
                 matches!(
                     slice.kind,
                     ContextKind::System
-                        | ContextKind::Skills
+                        | ContextKind::Framing
                         | ContextKind::Tools
                         | ContextKind::Messages
                         | ContextKind::Pending
-                        | ContextKind::Framing
                 )
             })
             .map(|slice| slice.tokens)
@@ -566,6 +632,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(plain.contains("~133.0k input"), "{plain}");
-        assert!(plain.contains("Provider-measured adjustment"), "{plain}");
+        assert!(plain.contains("Provider token delta"), "{plain}");
     }
 }
