@@ -1,5 +1,6 @@
 use ygg_agent::InputPart;
 
+use crate::app::bootstrap::effective_compaction_threshold_fraction;
 use crate::app::App;
 use crate::compaction::{
     context_window, estimate_messages_tokens, estimate_next_request_tokens, estimate_pending_tokens,
@@ -94,7 +95,7 @@ impl ContextReport {
         let output_reserve = app.agent.compaction_reserve_tokens();
         let compaction_mode = app.config.compaction.mode;
         let auto_compact_enabled = compaction_mode.enabled();
-        let threshold_fraction = app.config.compaction.threshold_fraction;
+        let threshold_fraction = effective_compaction_threshold_fraction(&app.config, &app.model);
         let keep_recent_tokens = app.config.compaction.keep_recent_tokens;
         let auto_compact_threshold = if auto_compact_enabled {
             ((context_window as f64) * threshold_fraction).floor() as u64

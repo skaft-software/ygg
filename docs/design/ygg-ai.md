@@ -32,8 +32,8 @@ endpoint identity or session-affinity format:
   by the `functions` namespace, rather than top-level `tools`;
 - carry nonempty instructions as a developer message input item rather than
   top-level `instructions`;
-- emit `parallel_tool_calls: false` explicitly, including when there are no
-  tools;
+- emit an explicit `parallel_tool_calls` value: use the model's advertised
+  capability when tools are present, and `false` when the request has no tools;
 - include `reasoning.context: "all_turns"` alongside any advertised effort; and
 - remove only `detail` from `input_image` parts in messages and function/custom
   tool outputs while retaining every other opaque field.

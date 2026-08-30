@@ -26,7 +26,10 @@ use ygg_ai::{
     Protocol, StopReason, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
 
-use crate::app::bootstrap::{build_app, rebuild_app, resolve_launch_print, Bootstrap};
+use crate::app::bootstrap::{
+    build_app, effective_compaction_threshold_fraction, rebuild_app, resolve_launch_print,
+    Bootstrap,
+};
 use crate::app::{
     apply_reconfig, reasoning_label, supported_levels_with_subagents,
     thinking_to_reasoning_with_subagents, App, Reconfig,
@@ -2264,13 +2267,15 @@ async fn handle_idle_command(
             } else {
                 CompactionMode::Disabled
             };
+            let effective_threshold =
+                effective_compaction_threshold_fraction(&app.config, &app.model);
             app.agent.set_compaction_token_mode(
                 if enabled {
                     AgentCompactionMode::Local
                 } else {
                     AgentCompactionMode::Disabled
                 },
-                app.config.compaction.threshold_fraction,
+                effective_threshold,
                 app.config.compaction.keep_recent_tokens,
             )?;
             output.success(id.as_deref(), &kind, None)?;

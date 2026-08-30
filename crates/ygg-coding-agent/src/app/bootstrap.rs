@@ -2846,12 +2846,34 @@ const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
+/// Keep the default active Codex working set in the short-context tier. Live
+/// discovery still advertises the provider's complete capacity; with the
+/// default fractional threshold, users can opt into it with
+/// `compaction.max_active_tokens = 0`.
+const CODEX_DEFAULT_ACTIVE_CONTEXT_TOKENS: u64 = 272_000;
 const CODEX_MODEL_CACHE_VERSION: u8 = 2;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
 // not Ygg's package version. Sending `0.1.0` causes the backend to filter out
 // models that require a contemporary Codex client.
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+
+pub(crate) fn effective_compaction_threshold_fraction(config: &Config, model: &Model) -> f64 {
+    let route_default = (model.endpoint.id.0 == crate::auth::codex::ENDPOINT_ID)
+        .then_some(CODEX_DEFAULT_ACTIVE_CONTEXT_TOKENS);
+    let max_active_tokens = match config.compaction.max_active_tokens {
+        Some(0) => None,
+        Some(tokens) => Some(tokens),
+        None => route_default,
+    };
+    let Some(max_active_tokens) = max_active_tokens else {
+        return config.compaction.threshold_fraction;
+    };
+    let context_window = model.spec.limits.context_window.max(1);
+    let absolute_fraction =
+        (max_active_tokens.min(context_window) as f64) / (context_window as f64);
+    config.compaction.threshold_fraction.min(absolute_fraction)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DiscoveredCodexModel {
@@ -4225,7 +4247,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     agent.set_compaction_model(compact_model);
     agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
-        config.compaction.threshold_fraction,
+        effective_compaction_threshold_fraction(&config, &model),
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
@@ -4421,7 +4443,7 @@ pub fn rebuild_app(
     agent.set_compaction_model(compact_model);
     agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
-        config.compaction.threshold_fraction,
+        effective_compaction_threshold_fraction(&config, &model),
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);

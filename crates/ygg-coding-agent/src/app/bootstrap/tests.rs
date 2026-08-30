@@ -21,6 +21,56 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
+fn codex_compaction_defaults_to_short_active_context_and_allows_overrides() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = config(directory.path(), None);
+    let catalog = base_model_catalog(true).unwrap();
+    let mut model = catalog
+        .resolve(&ModelId("gpt-4o-mini".to_owned()))
+        .unwrap()
+        .clone();
+    Arc::make_mut(&mut model.endpoint).id = EndpointId(crate::auth::codex::ENDPOINT_ID.into());
+    Arc::make_mut(&mut model.spec).limits.context_window = 872_000;
+
+    let expected = 272_000.0 / 872_000.0;
+    assert!(
+        (effective_compaction_threshold_fraction(&config, &model) - expected).abs() < f64::EPSILON
+    );
+
+    config.compaction.threshold_fraction = 0.25;
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        0.25
+    );
+
+    config.compaction.threshold_fraction = 1.0;
+    config.compaction.max_active_tokens = Some(200_000);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        200_000.0 / 872_000.0
+    );
+
+    config.compaction.max_active_tokens = Some(900_000);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+
+    config.compaction.max_active_tokens = Some(0);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+
+    config.compaction.max_active_tokens = None;
+    Arc::make_mut(&mut model.endpoint).id = EndpointId("openai".into());
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+}
+
+#[test]
 fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
     assert_eq!(
         resolve_custom_startup_timeout(None, None).unwrap(),

@@ -12,9 +12,10 @@ lifecycle events, `TurnFinished`, and `RunFinished` to the caller.
 
 Included:
 
-- Typed `UserInput` / `InputPart` boundary for `prompt`, `steer`, and
-  `follow_up`: ordered text and media parts (`ygg_ai::Media`) pass through
-  the agent to the model unchanged; text-only callers remain compatible via
+- Typed `UserInput` / `InputPart` boundary for `prompt`,
+  `prompt_without_tools`, `steer`, `finish_now`, and `follow_up`: ordered text
+  and media parts (`ygg_ai::Media`) pass through the agent to the model
+  unchanged; text-only callers remain compatible via
   `From<String>` / `From<&str>`.
 - Configurable generated output modalities. Completed clips arrive as
   `AgentEvent::OutputMedia`; `Agent::complete` retains committed clips in
@@ -30,8 +31,8 @@ Included:
   on other platforms). Neither path mode is an OS sandbox: spawned processes
   run with the current user's full access. Ygg is a trusted local agent — see
   the repository-root `SECURITY.md`.
-- `Run` + clonable `RunControl` with steering, follow-up, and abort — built
-  for `tokio::select!` alongside user input.
+- `Run` + clonable `RunControl` with steering, follow-up, answer-now, and
+  abort controls — built for `tokio::select!` alongside user input.
 - Session checkout/branching, manual compaction, locked and synced writes, and
   torn-tail crash recovery. Read-only tools may explicitly opt into replay;
   unresolved mutating calls become durable indeterminate errors and are never

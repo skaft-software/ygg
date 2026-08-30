@@ -354,6 +354,10 @@ pub enum Control {
     /// turn without tool calls). The run then continues with this input
     /// instead of finishing.
     FollowUp(crate::input::UserInput),
+    /// Request a final answer from the evidence already gathered. The input is
+    /// delivered at the next safe turn boundary and all subsequent requests in
+    /// this run expose no tools.
+    FinishNow(crate::input::UserInput),
     /// Change how pending steering messages are delivered.
     SetSteeringMode(QueueDeliveryMode),
     /// Change how pending follow-up messages are delivered.

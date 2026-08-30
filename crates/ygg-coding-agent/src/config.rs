@@ -368,6 +368,9 @@ impl CompactionMode {
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
     pub threshold_fraction: f64,
+    /// Optional absolute active-context threshold. `Some(0)` disables the
+    /// route-specific absolute default; `threshold_fraction` still applies.
+    pub max_active_tokens: Option<u64>,
     pub keep_recent_tokens: u64,
     /// Optional model override for summary calls. When absent, bootstrap uses
     /// the active model; when present, bootstrap resolves this ID in the model
@@ -380,6 +383,7 @@ impl Default for CompactionPolicy {
         Self {
             mode: CompactionMode::Local,
             threshold_fraction: 1.0,
+            max_active_tokens: None,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             compact_model: None,
         }
@@ -626,6 +630,7 @@ mod tests {
     #[test]
     fn default_compaction_uses_only_the_fixed_reserve() {
         assert_eq!(CompactionPolicy::default().threshold_fraction, 1.0);
+        assert_eq!(CompactionPolicy::default().max_active_tokens, None);
     }
 
     #[test]
