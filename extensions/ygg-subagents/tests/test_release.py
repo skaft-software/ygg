@@ -27,7 +27,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-subagents")
         self.assertEqual(manifest["version"], "0.2.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.3")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.4")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-subagents")
         self.assertEqual(manifest["capabilities"]["filesystem"], "none")
         self.assertFalse(manifest["capabilities"]["process"])
@@ -170,6 +170,8 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("8 concurrent", skill)
         self.assertIn("32 total per owner", skill)
         self.assertIn("shared filesystem is not isolation", skill)
+        self.assertIn("exclusive path ownership until settlement", skill)
+        self.assertIn("repository-wide Git state remains parent-owned", skill)
         self.assertIn("Do not use this skill to create team chat", skill)
 
     def test_release_smoke_reports_quality_resource_duplicates_and_failures(self):

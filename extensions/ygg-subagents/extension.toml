@@ -1,7 +1,7 @@
 name = "ygg-subagents"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.3"
+requires_ygg = "=0.6.4"
 description = "Claude Code-like background workers over host-owned Ygg agent sessions, with per-spawn mutation grants and continue/resume"
 
 [entrypoint]

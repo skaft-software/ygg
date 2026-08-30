@@ -5,20 +5,21 @@ use sexy_tui_rs::{visible_width, Color, RichRenderer};
 use super::assistant_block::AssistantBlock;
 use super::bash_render::{render_bash_row, render_compact_bash_output};
 use super::outcome_render::render_outcome;
-use super::reasoning_render::render_reasoning_on_surface;
+use super::reasoning_render::render_reasoning_on_surface_with_rainbow;
 use super::surface_frame::{
     decorate_surface_content_suffix, decorate_surface_with_frame, event_margin_marker_with_frame,
 };
 use super::surface_layout::{compile_surface_plan, surface_roles};
 use super::terminal_text::sanitize_for_terminal;
 use super::tool_render::{
-    render_compact_tool_output, render_diff_only, tool_diff, tool_display_label, tool_value_indent,
-    tool_value_indent_width, without_redundant_tool_lead,
+    render_compact_tool_output, render_diff_only, render_tool_failure_reason, tool_diff,
+    tool_display_label, tool_grid_label, tool_value_indent, tool_value_indent_width,
+    without_redundant_tool_lead,
 };
 use super::transcript_cache::{RenderedTranscriptBlock, SurfaceGeometry};
 use super::{
-    finish_transcript_block, fit_line, render_shell_output, render_user_prompt, wrap_hanging,
-    ToolPanel, TranscriptBlock,
+    activity_elbow, finish_transcript_block, fit_line, render_shell_output, render_user_prompt,
+    subdued_text, wrap_hanging, ToolPanel, TranscriptBlock, ACTIVITY_DETAIL_INDENT,
 };
 use crate::tui::theme::{ThemeSurfaceChrome, YggTheme};
 
@@ -36,6 +37,46 @@ fn extension_activity_state_label(state: ygg_agent::ExtensionPresentationState) 
         ygg_agent::ExtensionPresentationState::Unavailable => "unavailable",
         ygg_agent::ExtensionPresentationState::Empty => "empty",
     }
+}
+
+fn nest_tool_output(rows: Vec<String>, theme: &YggTheme, width: u16) -> Vec<String> {
+    let mut first_content_row = true;
+    rows.into_iter()
+        .map(|row| {
+            if row.is_empty() {
+                return row;
+            }
+            let prefix = if first_content_row {
+                first_content_row = false;
+                format!("{} ", subdued_text(theme, activity_elbow(theme)))
+            } else {
+                ACTIVITY_DETAIL_INDENT.to_owned()
+            };
+            fit_line(&format!("{prefix}{row}"), width)
+        })
+        .collect()
+}
+
+/// Connect a wrapped tool header to its nested output. The tool label, every
+/// vertical stem cell, and the final elbow share one column; replacing one
+/// leading continuation space preserves that header's command-value column.
+fn append_nested_tool_output(
+    header: &mut Vec<String>,
+    rows: Vec<String>,
+    theme: &YggTheme,
+    width: u16,
+) {
+    if !rows.iter().any(|row| !row.is_empty()) {
+        return;
+    }
+
+    let stem = subdued_text(theme, theme.glyph("vertical"));
+    for continuation in header.iter_mut().skip(1) {
+        if let Some(rest) = continuation.strip_prefix(' ') {
+            *continuation = fit_line(&format!("{stem}{rest}"), width);
+        }
+    }
+    header.extend(nest_tool_output(rows, theme, width));
 }
 
 fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u16) -> Vec<String> {
@@ -109,7 +150,7 @@ fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u1
             }
             lines.push(fit_line(
                 &format!(
-                    "  {} {} {}",
+                    "{} {} {}",
                     theme.fg("muted", elbow),
                     theme.fg("foreground", &task),
                     theme.fg("muted", &detail),
@@ -142,7 +183,7 @@ fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u1
             );
             lines.push(fit_line(
                 &format!(
-                    "  {} {} {}",
+                    "{} {} {}",
                     theme.fg("muted", elbow),
                     theme.fg("foreground", &summary),
                     theme.fg("muted", &detail),
@@ -156,7 +197,7 @@ fn render_subagent_activity_panel(panel: &ToolPanel, theme: &YggTheme, width: u1
         if let Some(reason) = view.failure_reason.as_deref() {
             lines.push(fit_line(
                 &format!(
-                    "  {} {}",
+                    "{} {}",
                     theme.fg("muted", if unicode { "└" } else { "`-" }),
                     theme.fg(
                         "muted",
@@ -221,6 +262,33 @@ pub(super) fn render_block_planned(
     spinner_frame: usize,
     status_shimmer_frame: usize,
 ) -> RenderedTranscriptBlock {
+    render_block_planned_with_rainbow(
+        previous,
+        block,
+        theme,
+        rich_renderer,
+        reasoning_renderer,
+        outer_width,
+        verbose_tools,
+        spinner_frame,
+        status_shimmer_frame,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_block_planned_with_rainbow(
+    previous: Option<&TranscriptBlock>,
+    block: &TranscriptBlock,
+    theme: &YggTheme,
+    rich_renderer: &RichRenderer,
+    reasoning_renderer: &RichRenderer,
+    outer_width: u16,
+    verbose_tools: bool,
+    spinner_frame: usize,
+    status_shimmer_frame: usize,
+    rainbow_strength: u16,
+) -> RenderedTranscriptBlock {
     let plan = compile_surface_plan(previous, block, theme, outer_width);
     let width = plan.geometry.content_width;
     let content_background = matches!(
@@ -253,7 +321,7 @@ pub(super) fn render_block_planned(
         TranscriptBlock::Assistant(assistant) => finish_transcript_block(
             assistant.render_on_surface(rich_renderer, theme, width, content_background),
         ),
-        TranscriptBlock::Reasoning(reasoning) => render_reasoning_on_surface(
+        TranscriptBlock::Reasoning(reasoning) => render_reasoning_on_surface_with_rainbow(
             reasoning,
             reasoning_renderer,
             theme,
@@ -261,6 +329,7 @@ pub(super) fn render_block_planned(
             verbose_tools,
             content_background,
             status_shimmer_frame,
+            rainbow_strength,
         ),
         TranscriptBlock::Tool(panel) if panel.subagent_activity.is_some() => {
             finish_transcript_block(render_subagent_activity_panel(panel, theme, width))
@@ -268,12 +337,6 @@ pub(super) fn render_block_planned(
         TranscriptBlock::Tool(panel) => {
             let compact_bash = matches!(panel.name.as_str(), "bash" | "exec")
                 && panel.display.shell_command.is_some();
-            let tool = if panel.display.shell_command.is_some() {
-                "Bash".to_string()
-            } else {
-                tool_display_label(&panel.name)
-            };
-            let output_indent = tool_value_indent(&tool);
             let mut lines = if let Some(command) = panel.display.shell_command.as_deref() {
                 render_bash_row(command, rich_renderer, theme, width)
             } else {
@@ -295,7 +358,7 @@ pub(super) fn render_block_planned(
                 } else {
                     &panel.display.success
                 };
-                let tool = tool_display_label(&panel.name);
+                let tool = tool_grid_label(&tool_display_label(&panel.name));
                 let label = theme.bold(&theme.fg("foreground", &tool));
                 let label_width = visible_width(&tool);
                 let text = match panel.display.value.as_deref() {
@@ -307,37 +370,43 @@ pub(super) fn render_block_planned(
                 let text = theme.fg("muted", &text);
                 let gap = tool_value_indent_width(&tool).saturating_sub(label_width);
                 let label_prefix = format!("{label}{}", " ".repeat(gap));
-                let continuation = " ".repeat(visible_width(&label_prefix));
+                let continuation = tool_value_indent(&tool);
                 wrap_hanging(&text, &label_prefix, &continuation, width)
             };
+            let nested_width = width.saturating_sub(2).max(1);
+            let mut output_lines = Vec::new();
+
+            if panel.finished && panel.is_error {
+                output_lines.extend(render_tool_failure_reason(panel, theme, nested_width, ""));
+            }
 
             match panel.name.as_str() {
-                "bash" | "exec" if compact_bash => lines.extend(render_compact_bash_output(
+                "bash" | "exec" if compact_bash => output_lines.extend(render_compact_bash_output(
                     panel,
                     theme,
-                    width,
+                    nested_width,
                     verbose_tools,
-                    &output_indent,
+                    "",
                 )),
-                "search" if !panel.is_error => lines.extend(render_compact_tool_output(
+                "search" if !panel.is_error => output_lines.extend(render_compact_tool_output(
                     panel,
                     theme,
-                    width,
+                    nested_width,
                     verbose_tools,
-                    &output_indent,
+                    "",
                 )),
-                "edit" | "write" if !panel.is_error && tool_diff(panel).is_some() => {
-                    lines.extend(render_diff_only(
+                "edit" | "write" if !panel.is_error && tool_diff(panel).is_some() => output_lines
+                    .extend(render_diff_only(
                         panel,
                         rich_renderer,
                         theme,
-                        width,
+                        nested_width,
                         verbose_tools,
-                        &output_indent,
-                    ))
-                }
+                        "",
+                    )),
                 _ => {}
             }
+            append_nested_tool_output(&mut lines, output_lines, theme, width);
             finish_transcript_block(lines)
         }
         TranscriptBlock::Outcome(outcome) => render_outcome(outcome, theme, width),
@@ -398,7 +467,9 @@ pub(super) fn render_block_planned(
                 ),
                 width,
             )];
-            lines.extend(render_shell_output(shell, theme, width, verbose_tools));
+            let nested_width = width.saturating_sub(2).max(1);
+            let output = render_shell_output(shell, theme, nested_width, verbose_tools, "");
+            append_nested_tool_output(&mut lines, output, theme, width);
             finish_transcript_block(lines)
         }
     };
@@ -415,7 +486,14 @@ pub(super) fn render_block_planned(
             .filter(|_| theme.uses_model_lab_color()),
         _ => None,
     };
-    let marker = event_margin_marker_with_frame(block, theme, spinner_frame, collapsed_reasoning);
+    let marker = event_margin_marker_with_frame(
+        block,
+        theme,
+        spinner_frame,
+        Some(status_shimmer_frame),
+        rainbow_strength,
+        collapsed_reasoning,
+    );
     let lines = decorate_surface_with_frame(
         lines,
         &plan,

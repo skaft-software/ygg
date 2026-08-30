@@ -485,15 +485,56 @@ impl ResponseBuilder {
         self.reasoning_states.insert(index, state);
     }
 
+    /// Normalize provider-generated tool arguments before consuming the builder.
+    ///
+    /// A max-token terminal may cut a tool argument string in the middle. Keep
+    /// the call envelope so the agent can pair it with a synthetic error result,
+    /// but never expose guessed partial arguments for execution. Other malformed
+    /// completions remain decode failures. Performing this pass before
+    /// [`Self::finish_mut`] replaces the builder also preserves stream-progress
+    /// counters when strict normalization fails.
+    fn normalize_tool_arguments(&mut self) -> Result<(), AiError> {
+        let output_truncated = matches!(self.stop_reason, Some(StopReason::MaxTokens));
+        let mut discarded_truncated_arguments = false;
+        for builder in self.tool_call_builders.values_mut() {
+            let raw_arguments = if builder.arguments_json.trim().is_empty() {
+                "{}"
+            } else {
+                &builder.arguments_json
+            };
+            match crate::json_repair::normalize_json_object(raw_arguments) {
+                Ok(arguments_json) => builder.arguments_json = arguments_json,
+                Err(_) if output_truncated => {
+                    builder.arguments_json = "{}".to_owned();
+                    discarded_truncated_arguments = true;
+                }
+                Err(error) => return Err(AiError::Decode(error)),
+            }
+        }
+        if discarded_truncated_arguments {
+            self.add_diagnostic(Diagnostic {
+                code: "discarded_truncated_tool_arguments".to_owned(),
+                message: "Tool arguments truncated at the provider output limit were replaced with an empty object and must not be executed".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Assembles the final Response by replacing the builder with an empty one.
     pub(crate) fn finish_mut(&mut self) -> Result<Response, AiError> {
+        self.normalize_tool_arguments()?;
         let dummy = Self::new(self.model.clone(), self.protocol, self.pricing.clone());
         let owned = std::mem::replace(self, dummy);
-        owned.finish()
+        owned.finish_normalized()
     }
 
     /// Assembles the final Response.
     pub(crate) fn finish(mut self) -> Result<Response, AiError> {
+        self.normalize_tool_arguments()?;
+        self.finish_normalized()
+    }
+
+    fn finish_normalized(mut self) -> Result<Response, AiError> {
         let mut content = Vec::new();
 
         // Sort indices based on first-observation order
@@ -515,22 +556,10 @@ impl ResponseBuilder {
                     state: self.reasoning_states.remove(&index),
                 }));
             } else if let Some(builder) = self.tool_call_builders.remove(&index) {
-                // Local/open-compatible providers frequently emit otherwise
-                // complete arguments with raw controls, invalid path escapes,
-                // Python literals, or trailing commas. Repair those lexical
-                // mistakes, but never synthesize missing values or delimiters.
-                let raw_arguments = if builder.arguments_json.trim().is_empty() {
-                    "{}"
-                } else {
-                    &builder.arguments_json
-                };
-                let arguments_json = crate::json_repair::normalize_json_object(raw_arguments)
-                    .map_err(AiError::Decode)?;
-
                 content.push(AssistantPart::ToolCall(ToolCall {
                     id: builder.id,
                     name: builder.name,
-                    arguments_json,
+                    arguments_json: builder.arguments_json,
                 }));
             } else if let Some(media) = self.media_parts.remove(&index) {
                 content.push(AssistantPart::Media(media));
@@ -846,6 +875,73 @@ mod tests {
             .unwrap();
 
         assert!(builder.finish().is_err());
+    }
+
+    #[test]
+    fn max_token_response_retains_call_envelope_without_guessing_truncated_arguments() {
+        let mut builder = ResponseBuilder::new(
+            ModelId("test-model".to_string()),
+            Protocol::OpenAiChat,
+            None,
+        );
+        builder
+            .on_event(&StreamEvent::ToolCallStart {
+                index: 0,
+                id: ToolCallId("call_truncated".to_string()),
+                name: "write".to_string(),
+            })
+            .unwrap();
+        builder
+            .on_event(&StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                delta: r#"{"path":"src/main.rs","content":"unterminated"#.to_string(),
+            })
+            .unwrap();
+        builder
+            .on_event(&StreamEvent::ToolCallEnd { index: 0 })
+            .unwrap();
+        builder.set_stop_reason(StopReason::MaxTokens);
+
+        let response = builder.finish().unwrap();
+        assert_eq!(response.stop_reason, StopReason::MaxTokens);
+        let AssistantPart::ToolCall(call) = &response.message.content[0] else {
+            panic!("expected retained tool call");
+        };
+        assert_eq!(call.id.0, "call_truncated");
+        assert_eq!(call.name, "write");
+        assert_eq!(call.arguments_json, "{}");
+        assert!(response
+            .diagnostics
+            .iter()
+            .any(|diagnostic| { diagnostic.code == "discarded_truncated_tool_arguments" }));
+    }
+
+    #[test]
+    fn finish_mut_keeps_progress_when_strict_tool_argument_decode_fails() {
+        let mut builder = ResponseBuilder::new(
+            ModelId("test-model".to_string()),
+            Protocol::OpenAiChat,
+            None,
+        );
+        builder.observe_provider_stream_event().unwrap();
+        builder
+            .on_event(&StreamEvent::ToolCallStart {
+                index: 0,
+                id: ToolCallId("call_bad".to_string()),
+                name: "write".to_string(),
+            })
+            .unwrap();
+        builder
+            .on_event(&StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                delta: r#"{"content":"unterminated"#.to_string(),
+            })
+            .unwrap();
+
+        assert!(builder.finish_mut().is_err());
+        assert_eq!(builder.provider_event_count, 1);
+        assert!(builder.event_count >= 2);
+        assert!(builder.aggregate_content_bytes > 0);
     }
 
     #[tokio::test]

@@ -134,7 +134,7 @@ def read_memory(pid: int) -> dict[str, float | int | None]:
             return {
                 "rss_bytes": int(float(fields[0]) * 1024),
                 "pss_bytes": None,
-                "cpu_percent": read_cpu_percent(pid),
+                "cpu_percent": finite_number(float(fields[1])),
             }
     except (FileNotFoundError, OSError, subprocess.SubprocessError, ValueError):
         pass
@@ -144,6 +144,13 @@ def read_memory(pid: int) -> dict[str, float | int | None]:
 def terminate_process(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
+    try:
+        if process.stdin is not None:
+            process.stdin.close()
+        process.wait(timeout=1)
+        return
+    except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
+        pass
     try:
         if os.name == "posix":
             os.killpg(process.pid, signal.SIGTERM)
@@ -190,6 +197,7 @@ def benchmark_startup(
     durations: list[float] = []
     return_codes: list[int | None] = []
     errors: list[str] = []
+    runs: list[dict[str, Any]] = []
     for _ in range(repetitions):
         started = time.perf_counter_ns()
         try:
@@ -199,12 +207,28 @@ def benchmark_startup(
                 timeout=timeout_seconds,
                 check=False,
             )
+            elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
             return_codes.append(result.returncode)
+            runs.append(
+                {
+                    "duration_ms": elapsed_ms,
+                    "return_code": result.returncode,
+                    "error": None,
+                }
+            )
             if result.returncode == 0:
-                durations.append((time.perf_counter_ns() - started) / 1_000_000)
+                durations.append(elapsed_ms)
         except (OSError, subprocess.TimeoutExpired) as error:
+            error_name = type(error).__name__
             return_codes.append(None)
-            errors.append(type(error).__name__)
+            errors.append(error_name)
+            runs.append(
+                {
+                    "duration_ms": (time.perf_counter_ns() - started) / 1_000_000,
+                    "return_code": None,
+                    "error": error_name,
+                }
+            )
     return {
         "kind": "startup",
         "name": name,
@@ -214,6 +238,7 @@ def benchmark_startup(
         "duration_ms": summarize(durations),
         "return_codes": return_codes,
         "errors": errors,
+        "runs": runs,
     }
 
 
@@ -229,29 +254,69 @@ def benchmark_idle(
     startup_ms: list[float] = []
     exit_codes: list[int | None] = []
     errors: list[str] = []
+    runs: list[dict[str, Any]] = []
     for _ in range(repetitions):
         started = time.perf_counter_ns()
+        run_errors: list[str] = []
+        run_samples: list[dict[str, float | int | None]] = []
         try:
             process = subprocess.Popen(argv, **idle_launch_kwargs())
         except OSError as error:
-            errors.append(type(error).__name__)
+            error_name = type(error).__name__
+            errors.append(error_name)
+            runs.append({"error": error_name, "samples": []})
             continue
-        startup_ms.append((time.perf_counter_ns() - started) / 1_000_000)
+        launch_ms = (time.perf_counter_ns() - started) / 1_000_000
+        startup_ms.append(launch_ms)
         time.sleep(max(0.0, settle_seconds))
         deadline = time.monotonic() + max(0.0, idle_seconds)
         while time.monotonic() < deadline and process.poll() is None:
-            sample = read_memory(process.pid)
+            sample = {
+                "elapsed_ms": (time.perf_counter_ns() - started) / 1_000_000,
+                **read_memory(process.pid),
+            }
+            run_samples.append(sample)
             if sample["rss_bytes"] is not None:
                 samples.append(sample)
             time.sleep(0.05)
-        exit_codes.append(process.poll())
-        if process.poll() is None:
+        exit_code = process.poll()
+        exit_codes.append(exit_code)
+        if exit_code is None:
             terminate_process(process)
-        elif process.returncode != 0:
-            errors.append(f"exit:{process.returncode}")
+        elif exit_code != 0:
+            run_errors.append(f"exit:{exit_code}")
         if time.monotonic() - started > timeout_seconds:
-            errors.append("measurement_timeout")
+            run_errors.append("measurement_timeout")
             terminate_process(process)
+        errors.extend(run_errors)
+
+        run_rss = [
+            float(sample["rss_bytes"]) / 1024
+            for sample in run_samples
+            if sample["rss_bytes"] is not None
+        ]
+        run_pss = [
+            float(sample["pss_bytes"]) / 1024
+            for sample in run_samples
+            if sample["pss_bytes"] is not None
+        ]
+        run_cpu = [
+            float(sample["cpu_percent"])
+            for sample in run_samples
+            if sample["cpu_percent"] is not None
+        ]
+        runs.append(
+            {
+                "launch_ms": launch_ms,
+                "sample_count": len(run_samples),
+                "rss_peak_kib": max(run_rss) if run_rss else None,
+                "pss_peak_kib": max(run_pss) if run_pss else None,
+                "cpu_peak_percent": max(run_cpu) if run_cpu else None,
+                "exit_code_before_cleanup": exit_code,
+                "errors": run_errors,
+                "samples": run_samples,
+            }
+        )
 
     rss = [float(sample["rss_bytes"]) / 1024 for sample in samples if sample["rss_bytes"] is not None]
     pss = [float(sample["pss_bytes"]) / 1024 for sample in samples if sample["pss_bytes"] is not None]
@@ -266,9 +331,19 @@ def benchmark_idle(
         "rss_kib": summarize(rss),
         "pss_kib": summarize(pss),
         "cpu_percent": summarize(cpu),
+        "rss_peak_kib": summarize(
+            [float(run["rss_peak_kib"]) for run in runs if run.get("rss_peak_kib") is not None]
+        ),
+        "pss_peak_kib": summarize(
+            [float(run["pss_peak_kib"]) for run in runs if run.get("pss_peak_kib") is not None]
+        ),
+        "cpu_peak_percent": summarize(
+            [float(run["cpu_peak_percent"]) for run in runs if run.get("cpu_peak_percent") is not None]
+        ),
         "exit_codes": exit_codes,
         "errors": errors,
-        "memory_metric_notes": "RSS is resident bytes; PSS is Linux smaps_rollup when available; direct child only.",
+        "runs": runs,
+        "memory_metric_notes": "RSS is resident bytes; PSS is Linux smaps_rollup when available; direct child only. Peak summaries are computed over per-run peaks.",
     }
 
 
@@ -287,52 +362,79 @@ def benchmark_concurrency(
             processes: list[subprocess.Popen[bytes]] = []
             started = time.perf_counter_ns()
             errors: list[str] = []
+            launch_ms: float | None = None
+            raw_samples: list[dict[str, float | int | None]] = []
+            rss_samples: list[float] = []
+            pss_samples: list[float] = []
+            cpu_samples: list[float] = []
             try:
                 for _ in range(level):
                     processes.append(subprocess.Popen(argv, **idle_launch_kwargs()))
                 launch_ms = (time.perf_counter_ns() - started) / 1_000_000
                 time.sleep(max(0.0, settle_seconds))
                 deadline = time.monotonic() + max(0.0, idle_seconds)
-                rss_samples: list[float] = []
-                pss_samples: list[float] = []
                 while time.monotonic() < deadline:
                     rss_total = 0.0
                     pss_total = 0.0
+                    cpu_total = 0.0
+                    rss_complete = True
                     pss_complete = True
+                    cpu_complete = True
                     for process in processes:
                         sample = read_memory(process.pid)
-                        if sample["rss_bytes"] is not None:
+                        if sample["rss_bytes"] is None:
+                            rss_complete = False
+                        else:
                             rss_total += float(sample["rss_bytes"]) / 1024
                         if sample["pss_bytes"] is None:
                             pss_complete = False
                         else:
                             pss_total += float(sample["pss_bytes"]) / 1024
-                    if rss_total:
-                        rss_samples.append(rss_total)
-                    if pss_complete and pss_total:
-                        pss_samples.append(pss_total)
+                        if sample["cpu_percent"] is None:
+                            cpu_complete = False
+                        else:
+                            cpu_total += float(sample["cpu_percent"])
+                    rss_value = rss_total if rss_complete else None
+                    pss_value = pss_total if pss_complete else None
+                    cpu_value = cpu_total if cpu_complete else None
+                    raw_samples.append(
+                        {
+                            "elapsed_ms": (time.perf_counter_ns() - started) / 1_000_000,
+                            "rss_total_kib": rss_value,
+                            "pss_total_kib": pss_value,
+                            "cpu_total_percent": cpu_value,
+                        }
+                    )
+                    if rss_value is not None:
+                        rss_samples.append(rss_value)
+                    if pss_value is not None:
+                        pss_samples.append(pss_value)
+                    if cpu_value is not None:
+                        cpu_samples.append(cpu_value)
                     time.sleep(0.05)
-                runs.append(
-                    {
-                        "launch_ms": launch_ms,
-                        "rss_peak_kib": max(rss_samples) if rss_samples else None,
-                        "pss_peak_kib": max(pss_samples) if pss_samples else None,
-                    }
-                )
             except OSError as error:
                 errors.append(type(error).__name__)
             finally:
                 for process in processes:
                     terminate_process(process)
-            if errors:
-                runs.append({"errors": errors})
+            runs.append(
+                {
+                    "launch_ms": launch_ms,
+                    "rss_peak_kib": max(rss_samples) if rss_samples else None,
+                    "pss_peak_kib": max(pss_samples) if pss_samples else None,
+                    "cpu_peak_percent": max(cpu_samples) if cpu_samples else None,
+                    "errors": errors,
+                    "samples": raw_samples,
+                }
+            )
         measurements.append(
             {
                 "sessions": level,
                 "repetitions": repetitions,
-                "launch_ms": summarize([float(run["launch_ms"]) for run in runs if "launch_ms" in run]),
+                "launch_ms": summarize([float(run["launch_ms"]) for run in runs if run.get("launch_ms") is not None]),
                 "rss_peak_kib": summarize([float(run["rss_peak_kib"]) for run in runs if run.get("rss_peak_kib") is not None]),
                 "pss_peak_kib": summarize([float(run["pss_peak_kib"]) for run in runs if run.get("pss_peak_kib") is not None]),
+                "cpu_peak_percent": summarize([float(run["cpu_peak_percent"]) for run in runs if run.get("cpu_peak_percent") is not None]),
                 "runs": runs,
             }
         )
@@ -341,7 +443,7 @@ def benchmark_concurrency(
         "name": name,
         "argv": argv,
         "levels": measurements,
-        "memory_metric_notes": "Totals cover the directly launched processes, not descendants; PSS is best effort.",
+        "memory_metric_notes": "Totals cover the directly launched processes, not descendants; incomplete RSS/PSS/CPU samples are unavailable rather than partial.",
     }
 
 
@@ -392,10 +494,18 @@ def print_summary(report: dict[str, Any]) -> None:
         if measurement["kind"] == "startup":
             print(f"  {measurement['name']}: median {measurement['duration_ms']['median']} ms, p95 {measurement['duration_ms']['p95']} ms")
         elif measurement["kind"] == "idle_memory":
-            print(f"  {measurement['name']}: RSS median {measurement['rss_kib']['median']} KiB, peak {measurement['rss_kib']['max']} KiB")
+            print(
+                f"  {measurement['name']}: RSS peak median "
+                f"{measurement['rss_peak_kib']['median']} KiB, "
+                f"p95 {measurement['rss_peak_kib']['p95']} KiB"
+            )
         elif measurement["kind"] == "concurrency_memory":
             for level in measurement["levels"]:
-                print(f"  {measurement['name']} x{level['sessions']}: RSS peak median {level['rss_peak_kib']['median']} KiB")
+                print(
+                    f"  {measurement['name']} x{level['sessions']}: RSS peak median "
+                    f"{level['rss_peak_kib']['median']} KiB, "
+                    f"p95 {level['rss_peak_kib']['p95']} KiB"
+                )
         elif measurement["kind"] == "agent_telemetry":
             print(f"  telemetry: {measurement['runs']} runs, {measurement['model_requests']} model requests, {measurement['tool_calls']} tool calls")
 
@@ -410,6 +520,9 @@ def main() -> int:
     parser.add_argument("--command", action="append", type=parse_named_command, default=[], metavar="NAME=ARGV")
     parser.add_argument("--idle-command", type=parse_named_command, metavar="NAME=ARGV")
     parser.add_argument("--concurrency", default="1,2,4", help="comma-separated process counts for --idle-command")
+    parser.add_argument("--skip-startup", action="store_true", help="skip startup command measurements")
+    parser.add_argument("--skip-idle", action="store_true", help="skip the single-process idle measurement")
+    parser.add_argument("--skip-concurrency", action="store_true", help="skip concurrency measurements")
     parser.add_argument("--telemetry", action="append", default=[], metavar="PATH_OR_GLOB")
     parser.add_argument("--output", type=Path, help="write the complete JSON report to this path")
     args = parser.parse_args()
@@ -419,38 +532,41 @@ def main() -> int:
         parser.error("timeouts and durations must be non-negative; command timeout must be positive")
 
     measurements: list[dict[str, Any]] = []
-    command_cases = [("cold_launch", [args.binary, "--version"]), *args.command]
-    for name, argv in command_cases:
-        measurements.append(benchmark_startup(name, argv, args.repetitions, args.timeout_seconds))
+    if not args.skip_startup:
+        command_cases = [("cold_launch", [args.binary, "--version"]), *args.command]
+        for name, argv in command_cases:
+            measurements.append(benchmark_startup(name, argv, args.repetitions, args.timeout_seconds))
 
     if args.idle_command:
         name, argv = args.idle_command
-        measurements.append(
-            benchmark_idle(
-                name,
-                argv,
-                args.repetitions,
-                args.idle_seconds,
-                args.settle_seconds,
-                args.timeout_seconds,
+        if not args.skip_idle:
+            measurements.append(
+                benchmark_idle(
+                    name,
+                    argv,
+                    args.repetitions,
+                    args.idle_seconds,
+                    args.settle_seconds,
+                    args.timeout_seconds,
+                )
             )
-        )
-        try:
-            levels = [int(value) for value in args.concurrency.split(",") if value.strip()]
-        except ValueError as error:
-            parser.error(f"invalid --concurrency: {error}")
-        if any(level < 1 for level in levels):
-            parser.error("--concurrency values must be positive")
-        measurements.append(
-            benchmark_concurrency(
-                name,
-                argv,
-                levels,
-                args.repetitions,
-                args.idle_seconds,
-                args.settle_seconds,
+        if not args.skip_concurrency:
+            try:
+                levels = [int(value) for value in args.concurrency.split(",") if value.strip()]
+            except ValueError as error:
+                parser.error(f"invalid --concurrency: {error}")
+            if not levels or any(level < 1 for level in levels):
+                parser.error("--concurrency values must be positive")
+            measurements.append(
+                benchmark_concurrency(
+                    name,
+                    argv,
+                    levels,
+                    args.repetitions,
+                    args.idle_seconds,
+                    args.settle_seconds,
+                )
             )
-        )
 
     if args.telemetry:
         measurements.append(telemetry_summary(args.telemetry))
@@ -460,6 +576,9 @@ def main() -> int:
         "created_unix_ms": int(time.time() * 1000),
         "environment": {
             "platform": platform.platform(),
+            "system": platform.system(),
+            "os_release": platform.release(),
+            "kernel_version": platform.version(),
             "machine": platform.machine(),
             "python": platform.python_version(),
             "cpu_count": os.cpu_count(),
@@ -467,9 +586,10 @@ def main() -> int:
         },
         "measurements": measurements,
         "methodology": {
-            "startup": "wall time around subprocess creation and exit; child stdout/stderr discarded",
-            "memory": "sampled after a settle interval; RSS and best-effort Linux PSS; no inference server included",
-            "concurrency": "sum of directly launched agent processes at each level",
+            "startup": "wall time around subprocess creation and exit; child stdout/stderr discarded; raw duration retained per run",
+            "memory": "sampled after a settle interval; RSS and best-effort Linux PSS; no inference server included; summaries over per-run peaks",
+            "cpu": "OS-reported process CPU percentage sampled with memory; summaries over per-run peaks",
+            "concurrency": "complete sums of directly launched agent processes at each level; raw samples and per-run peaks retained",
             "telemetry": "reads ygg.telemetry.v1 without raw prompts, arguments, or provider payloads",
         },
     }

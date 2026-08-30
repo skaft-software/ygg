@@ -161,8 +161,7 @@ pub(super) fn bash_output_changes_when_expanded(panel: &ToolPanel) -> bool {
 }
 
 fn bash_content_gutter() -> usize {
-    let action = "Bash";
-    visible_width(action) + 6usize.saturating_sub(visible_width(action)).max(2)
+    tool_value_indent_width("Bash")
 }
 
 fn capture_loss_details(compact: &CompactBashOutput) -> Vec<String> {

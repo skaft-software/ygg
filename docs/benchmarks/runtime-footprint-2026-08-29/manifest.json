@@ -1,0 +1,99 @@
+{
+  "campaign": {
+    "concurrency_levels": [
+      1,
+      2,
+      4
+    ],
+    "inference_server": "none started; no inference-server metric reported; excluded",
+    "preconditioning": "isolated config roots initialized by unrecorded shakedown/probe and preliminary runs; no per-run cache reset",
+    "process_scope": "directly launched processes only; descendants excluded",
+    "repetitions": 9,
+    "sample_window_seconds": 2.0,
+    "settle_seconds": 5.0,
+    "workspace": "repository root"
+  },
+  "date": "2026-08-29",
+  "environment": {
+    "architecture": "arm64",
+    "cpu": "Apple M3",
+    "kernel": "Darwin 27.0.0; Darwin Kernel Version 27.0.0: Tue Aug 11 22:06:24 PDT 2026; root:xnu-13432.1.9~3/RELEASE_ARM64_T8122",
+    "logical_cpus": 8,
+    "memory_bytes": 17179869184,
+    "os": "macOS 27.0 (build 26A5416b)",
+    "physical_cpus": 8
+  },
+  "harnesses": {
+    "codex": {
+      "launcher": "/opt/homebrew/bin/codex",
+      "name": "Codex CLI",
+      "resolved_executable": "/opt/homebrew/Caskroom/codex/0.149.0/bin/codex",
+      "sha256": "f4a74117b8142cda581c95ff753abf4508b5636d89682c1ed77e4a9249af8963",
+      "version": "0.149.0",
+      "version_output": "codex-cli 0.149.0"
+    },
+    "opencode": {
+      "launcher": "/opt/homebrew/bin/opencode",
+      "name": "OpenCode",
+      "resolved_executable": "/opt/homebrew/Cellar/opencode/1.18.20/libexec/lib/node_modules/opencode-ai/bin/opencode.exe",
+      "sha256": "9598c27bda0e2d88ce4db5f853e25504c20ac6152e10205785a1cf8f45559952",
+      "version": "1.18.20",
+      "version_output": "1.18.20"
+    },
+    "pi": {
+      "launcher": "/Users/achumukundan/.local/bin/pi",
+      "name": "Pi",
+      "package": "@earendil-works/pi-coding-agent",
+      "resolved_script": "/Users/achumukundan/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      "runtime": {
+        "name": "Node.js",
+        "resolved_executable": "/opt/homebrew/Cellar/node/26.7.0/bin/node",
+        "sha256": "1ef99ea25fe70c9b67e7efe768ef8ee22148d3cabc703db6131b57aeb617d040",
+        "version": "v26.7.0"
+      },
+      "sha256": "5406c369954516fb56879d685e082ff9095cd6e06e41af406f394942377fd4bf",
+      "version": "0.84.4",
+      "version_output": "0.84.4"
+    },
+    "ygg": {
+      "launcher": "/Users/achumukundan/.local/bin/ygg",
+      "name": "Ygg",
+      "resolved_executable": "/Users/achumukundan/.local/bin/ygg",
+      "sha256": "55bb257792a7e13782ca016a7432ee9c6dbe5787665ad8885b0ba4abd4c09cf9",
+      "version": "0.6.3",
+      "version_output": "ygg 0.6.3"
+    }
+  },
+  "notes": [
+    "PSS is unavailable on this macOS host and is never replaced with RSS.",
+    "Startup is only wall time for the generic --version case.",
+    "Runtime commands use isolated configuration roots and stdin-open headless protocol modes; exact argv is retained in every raw report."
+  ],
+  "raw_reports": [
+    "codex-runtime.json",
+    "opencode-runtime.json",
+    "pi-runtime.json",
+    "ygg-runtime.json",
+    "codex-concurrency-1.json",
+    "codex-concurrency-2.json",
+    "codex-concurrency-4.json",
+    "opencode-concurrency-1.json",
+    "opencode-concurrency-2.json",
+    "opencode-concurrency-4.json",
+    "pi-concurrency-1.json",
+    "pi-concurrency-2.json",
+    "pi-concurrency-4.json",
+    "ygg-concurrency-1.json",
+    "ygg-concurrency-2.json",
+    "ygg-concurrency-4.json"
+  ],
+  "runner": {
+    "path": "scripts/bench-systems.py",
+    "python_version": "3.14.7",
+    "schema": "ygg.systems-benchmark.v1",
+    "sha256": "726711574d778bd493cc2ff43bff0657a70f80a5ab1acf90a5fe660d568735b2"
+  },
+  "schema": "ygg.runtime-footprint-manifest.v1",
+  "workspace": "/Users/achumukundan/github/skaft-software/ygg",
+  "workspace_head": "a161941442b0fa6e3ad335e9eb90549cc1661c54"
+}

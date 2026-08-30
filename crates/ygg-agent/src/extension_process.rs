@@ -67,6 +67,14 @@ pub const EXTENSION_FEATURE_LIFECYCLE_EVENTS: &str = "lifecycle_events";
 pub const EXTENSION_FEATURE_POLICY_INTENTS: &str = "policy_intents";
 /// API `0.2` live extension-owned tool catalog feature.
 pub const EXTENSION_FEATURE_DYNAMIC_TOOLS: &str = "dynamic_tools";
+/// API `0.2` initialization-time command discovery feature.
+///
+/// Compatibility hosts may not know their complete command set until they load
+/// the foreign runtime during initialization. Negotiating this feature lets the
+/// initialize response define that generation's fixed command catalog without
+/// duplicating those names in the static manifest. It does not permit command
+/// mutations after initialization.
+pub const EXTENSION_FEATURE_RUNTIME_COMMANDS: &str = "runtime_commands";
 /// API `0.2` host-owned child model-session service.
 pub const EXTENSION_FEATURE_AGENT_SESSIONS: &str = "agent_sessions";
 /// API `0.2` first-party delegation telemetry contract.
@@ -89,6 +97,7 @@ const API_0_2_OPTIONAL_FEATURES: &[&str] = &[
     EXTENSION_FEATURE_LIFECYCLE_EVENTS,
     EXTENSION_FEATURE_POLICY_INTENTS,
     EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_FEATURE_RUNTIME_COMMANDS,
 ];
 
 const MAX_EXTENSION_AGENT_WAIT_MS: u64 = 60_000;
@@ -119,6 +128,7 @@ const MAX_TOMBSTONES: usize = 512;
 const MAX_CHILD_REQUESTS: usize = 128;
 const MAX_CHILD_WORKERS: usize = 8;
 const MAX_DYNAMIC_EXTENSION_TOOLS: usize = 256;
+const MAX_EXTENSION_COMMANDS: usize = 256;
 const DYNAMIC_CATALOG_QUEUE_CAPACITY: usize = 32;
 const SUPERVISOR_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -7190,8 +7200,23 @@ fn negotiate_contributions_with_host_services(
         .iter()
         .map(|command| command.name.clone())
         .collect::<Vec<_>>();
-    ensure_same_contributions("commands", &manifest.contributes.commands, &command_names)?;
+    if !protocol.supports(EXTENSION_FEATURE_RUNTIME_COMMANDS) {
+        ensure_same_contributions("commands", &manifest.contributes.commands, &command_names)?;
+    }
+    if response.commands.len() > MAX_EXTENSION_COMMANDS {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "command catalog contains {} commands; limit is {MAX_EXTENSION_COMMANDS}",
+            response.commands.len()
+        )));
+    }
+    let mut unique_commands = BTreeSet::new();
     for command in &response.commands {
+        if !unique_commands.insert(command.name.as_str()) {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "duplicate command definition `{}`",
+                command.name
+            )));
+        }
         validate_identifier("command", &command.name, true)?;
         if command.description.trim().is_empty() {
             return Err(ExtensionRuntimeError::Protocol(format!(
@@ -11424,6 +11449,65 @@ confirmations = true
     }
 
     #[test]
+    fn runtime_command_catalog_is_duplicate_free_and_bounded() {
+        let manifest = ExtensionManifest::parse(
+            r#"name = "runtime-command-validation"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "runtime-command-validation"
+"#,
+        )
+        .unwrap();
+        let response = |commands: Vec<CommandDefinition>| InitializeResponse {
+            api_version: EXTENSION_API_VERSION_0_2.into(),
+            tools: Vec::new(),
+            commands,
+            protocol: Some(ExtensionProtocolResponse {
+                version: EXTENSION_API_VERSION_0_2.into(),
+                features: API_0_2_REQUIRED_FEATURES
+                    .iter()
+                    .copied()
+                    .chain([EXTENSION_FEATURE_RUNTIME_COMMANDS])
+                    .map(str::to_owned)
+                    .collect(),
+                limits: ExtensionProtocolLimits {
+                    max_concurrent_requests: 1,
+                },
+                lifecycle_events: Vec::new(),
+            }),
+        };
+        let command = |name: String| CommandDefinition {
+            name,
+            description: "Runtime command".into(),
+            usage: None,
+        };
+        let duplicate = vec![command("same".into()), command("same".into())];
+        assert!(matches!(
+            negotiate_contributions_with_host_services(
+                &manifest,
+                response(duplicate),
+                DEFAULT_PENDING_REQUESTS,
+                OfferedHostServices::default(),
+            ),
+            Err(ExtensionRuntimeError::Protocol(message)) if message.contains("duplicate command")
+        ));
+
+        let oversized = (0..=MAX_EXTENSION_COMMANDS)
+            .map(|index| command(format!("command-{index}")))
+            .collect();
+        assert!(matches!(
+            negotiate_contributions_with_host_services(
+                &manifest,
+                response(oversized),
+                DEFAULT_PENDING_REQUESTS,
+                OfferedHostServices::default(),
+            ),
+            Err(ExtensionRuntimeError::Protocol(message)) if message.contains("limit is 256")
+        ));
+    }
+
+    #[test]
     fn agent_sessions_must_be_explicitly_offered_by_the_host() {
         let manifest = ExtensionManifest::parse(
             r#"name = "agent-service"
@@ -12685,6 +12769,105 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{}}'
             process.health_snapshot().state,
             ExtensionHealthState::Stopped
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_commands_may_be_discovered_during_initialization() {
+        let temp = TempDir::new().unwrap();
+        let script_path = temp.path().join("runtime-commands.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(90)
+    return json.loads(line)
+
+
+def send(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+
+initialize = receive()
+assert "runtime_commands" in initialize["params"]["protocol"]["optional_features"], initialize
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "api_version": "0.2",
+        "tools": [],
+        "commands": [{
+            "name": "runtime-hello",
+            "description": "Discovered after loading a compatibility runtime",
+            "usage": "/runtime-hello [name]",
+        }],
+        "protocol": {
+            "version": "0.2",
+            "features": ["request_cancellation", "content_parts", "runtime_commands"],
+            "limits": {"max_concurrent_requests": 1},
+        },
+    },
+})
+
+command = receive()
+assert command["method"] == "command/execute", command
+assert command["params"]["name"] == "runtime-hello", command
+assert command["params"]["arguments"] == ["Ygg"], command
+send({
+    "jsonrpc": "2.0",
+    "id": command["id"],
+    "result": {
+        "text": "hello Ygg",
+        "notifications": [],
+        "context": [],
+    },
+})
+
+shutdown = receive()
+assert shutdown["method"] == "shutdown", shutdown
+send({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "runtime-commands"
+version = "0.2.0"
+api_version = "0.2"
+[entrypoint]
+command = "runtime-commands.py"
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            process.contributions().commands,
+            vec![CommandDefinition {
+                name: "runtime-hello".into(),
+                description: "Discovered after loading a compatibility runtime".into(),
+                usage: Some("/runtime-hello [name]".into()),
+            }]
+        );
+        let output = process
+            .execute_command(
+                "runtime-hello",
+                vec!["Ygg".into()],
+                process.current_context(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.text, "hello Ygg");
+        assert!(process.shutdown().await);
     }
 
     #[cfg(unix)]

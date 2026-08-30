@@ -101,6 +101,9 @@ pub(super) struct AssistantBlock {
     pub(super) reasoning_started_at: Option<Instant>,
     /// Frozen reasoning duration after the block closes.
     pub(super) reasoning_elapsed: Option<Duration>,
+    /// Start of the owning root run. Unlike reasoning timing, this survives
+    /// steering, provider turns, and status-row replacement.
+    pub(super) activity_started_at: Option<Instant>,
     /// Latest explicit ATX or standalone-bold heading emitted by the model.
     pub(super) reasoning_heading: Option<String>,
     /// Committed semantic blocks already inspected for reasoning headings.
@@ -123,6 +126,7 @@ impl AssistantBlock {
             reasoning_expanded: false,
             reasoning_started_at: None,
             reasoning_elapsed: None,
+            activity_started_at: None,
             reasoning_heading: None,
             reasoning_heading_committed_blocks: 0,
             show_reasoning_hint: true,
@@ -156,6 +160,11 @@ impl AssistantBlock {
 
     pub(super) fn with_model_lab(mut self, lab: Option<crate::tui::theme::ModelLab>) -> Self {
         self.model_lab = lab;
+        self
+    }
+
+    pub(super) fn with_activity_started_at(mut self, started_at: Option<Instant>) -> Self {
+        self.activity_started_at = started_at;
         self
     }
 

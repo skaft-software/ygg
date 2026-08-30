@@ -697,6 +697,28 @@ fn openrouter_discovery_uses_live_ids_limits_and_capabilities() {
 }
 
 #[test]
+fn openrouter_discovery_requires_an_advertised_completion_ceiling() {
+    let response = serde_json::json!({
+        "data": [
+            {
+                "id": "missing/limit",
+                "context_length": 64_000
+            },
+            {
+                "id": "top-level/limit",
+                "context_length": 64_000,
+                "max_completion_tokens": 12_000
+            }
+        ]
+    });
+
+    let models = openrouter_models_from_response(&response).unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].api_name, "top-level/limit");
+    assert_eq!(models[0].limits.max_output_tokens, 12_000);
+}
+
+#[test]
 fn openrouter_anthropic_routes_enable_anthropic_cache_markers() {
     let response = serde_json::json!({
         "data": [{

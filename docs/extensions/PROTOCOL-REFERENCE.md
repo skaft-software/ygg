@@ -78,7 +78,7 @@ The **first** host request, sent immediately after the child process starts.
   "method": "initialize",
   "params": {
     "api_version": "0.1",
-    "ygg_version": "0.6.3",
+    "ygg_version": "0.6.4",
     "extension": {
       "name": "hello-world",
       "version": "0.1.0",
@@ -149,9 +149,13 @@ The **first** host request, sent immediately after the child process starts.
 
 - `api_version` in the response must exactly match the manifest-selected
   version, or the child is rejected.
-- The duplicate-free sets of `tools` and `commands` returned must exactly equal
-  the corresponding names declared in `contributes`. Order does not matter;
-  omissions, additions, and duplicate names all reject initialization.
+- Without negotiated discovery features, the duplicate-free sets of `tools` and
+  `commands` returned must exactly equal the corresponding names declared in
+  `contributes`. Negotiated `dynamic_tools` makes initialize's tool list
+  authoritative epoch `0`; negotiated `runtime_commands` makes initialize's
+  command list authoritative for that fixed process generation. Duplicate names
+  always reject initialization, and an initialize response may contain at most
+  256 command definitions.
 - Each tool must have a non-empty `description` and `parameters` must be a
   JSON Schema object.
 - `source` is one of `"project"`, `"global"`, or `"explicit"`.
@@ -173,7 +177,8 @@ API `0.2` retains every top-level initialization field, may set
       "artifacts",
       "lifecycle_events",
       "policy_intents",
-      "dynamic_tools"
+      "dynamic_tools",
+      "runtime_commands"
     ],
     "limits": {"max_concurrent_requests": 64}
   }
@@ -193,7 +198,8 @@ add:
       "request_progress",
       "artifacts",
       "lifecycle_events",
-      "dynamic_tools"
+      "dynamic_tools",
+      "runtime_commands"
     ],
     "limits": {"max_concurrent_requests": 4},
     "lifecycle_events": [
@@ -212,6 +218,12 @@ add:
 any subset of the advertised optional features, but missing required,
 unknown, or duplicate feature names reject initialization. The accepted
 `max_concurrent_requests` must be greater than zero and is capped by the host.
+`runtime_commands` is initialization-only: the returned command list is fixed
+for the generation, there are no `commands/register` or `commands/unregister`
+methods, and reload still requires an identical command catalog. It exists for
+compatibility runtimes that cannot know foreign command names before loading
+that runtime.
+
 If `lifecycle_events` is negotiated and the subscription list is omitted or
 empty, all six events are subscribed. Otherwise it must be an exact subset of
 the six names above. A non-empty subscription without the feature is invalid.
@@ -1632,6 +1644,7 @@ reference, safety, parentage, and bound rules.
 | `lifecycle_events` | no | Subscribed session/turn/tool observations |
 | `policy_intents` | no | Correlated `policy/evaluate` requests |
 | `dynamic_tools` | no | Transactional `tools/register`, `tools/unregister`, and revision-pinned `tool/call` |
+| `runtime_commands` | no | Initialize-time authoritative fixed command catalog for compatibility runtimes; no live mutations |
 | `agent_sessions` | conditional | Principal/owner-scoped `agent/*` child model-session service |
 | `delegation_telemetry_v1` | conditional first-party requirement | Native owner-run `AgentEvent::DelegationUpdated` child telemetry; required by `ygg-subagents` when `agent_sessions` is offered |
 | `approvals` | conditional | Original-intent/active-owner-bound single-use `policy/evaluate` retry tokens; also requires `policy_intents` |

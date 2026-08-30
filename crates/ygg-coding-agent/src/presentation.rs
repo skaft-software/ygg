@@ -45,6 +45,22 @@ pub fn format_token_rate_value(rate: TokenRate) -> String {
     }
 }
 
+/// Compact context-window size for status and model-selection surfaces.
+pub fn compact_context_limit(value: u64) -> String {
+    if value >= 1_000_000 {
+        let tenths = (u128::from(value) * 10 + 500_000) / 1_000_000;
+        if tenths % 10 == 0 {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{}.{:01}M", tenths / 10, tenths % 10)
+        }
+    } else if value >= 1_000 {
+        format!("{}K", value / 1_000)
+    } else {
+        value.to_string()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RunId(u64);
 
@@ -497,6 +513,10 @@ impl RunPresentation {
 
     pub fn is_active(&self) -> bool {
         self.phase.is_active()
+    }
+
+    pub fn started_at(&self) -> Instant {
+        self.started_at
     }
 
     pub fn phase_elapsed_at(&self, now: Instant) -> Duration {
@@ -1287,6 +1307,14 @@ mod tests {
         assert_eq!(format_token_rate_value(TokenRate(50_000)), "$0.05");
         assert_eq!(format_token_rate_value(TokenRate(2_800)), "$0.0028");
     }
+
+    #[test]
+    fn context_limits_use_compact_uppercase_units() {
+        assert_eq!(compact_context_limit(128_000), "128K");
+        assert_eq!(compact_context_limit(1_000_000), "1M");
+        assert_eq!(compact_context_limit(1_500_000), "1.5M");
+    }
+
     use ygg_agent::{AgentError, EntryId, FinishReason, OutputChannel};
     use ygg_ai::{AiError, AssistantMessage, ModelId, Protocol, ToolCall, ToolCallId, Usage};
 

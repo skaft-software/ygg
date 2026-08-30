@@ -160,7 +160,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.3"
+requires_ygg = "=0.6.4"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -232,8 +232,12 @@ The initial host request is always `initialize`. Its parameters include API and
 Ygg versions, extension identity and source, the workspace, capability and
 contribution declarations, and inspectable session/model/reasoning/active-skill
 state. The response must use the same API version and provide complete schemas
-for exactly the tools and commands declared in the manifest. API `0.2` adds
-this exact negotiation while keeping those top-level fields:
+for the manifest-declared tools and commands. Negotiated `dynamic_tools` makes
+the initialize tool list authoritative epoch zero; negotiated
+`runtime_commands` likewise lets a compatibility host discover that generation's
+fixed command catalog while loading its foreign runtime. Without those features,
+initialize names must exactly match the manifest. API `0.2` adds this negotiation
+while keeping those top-level fields:
 
 ```json
 {
@@ -257,7 +261,8 @@ this exact negotiation while keeping those top-level fields:
       "request_progress",
       "artifacts",
       "lifecycle_events",
-      "dynamic_tools"
+      "dynamic_tools",
+      "runtime_commands"
     ],
     "limits": {"max_concurrent_requests": 4},
     "lifecycle_events": ["turn/started", "turn/settled"]
@@ -267,7 +272,10 @@ this exact negotiation while keeping those top-level fields:
 
 The host request names required `request_cancellation` and `content_parts` and
 optional `request_progress`, `artifacts`, `lifecycle_events`, `policy_intents`,
-and `dynamic_tools`. For the enabled first-party `ygg-subagents` process, the
+`dynamic_tools`, and `runtime_commands`. `runtime_commands` affects only the
+initialize catalog: it does not authorize post-initialize command registration,
+and a reload must return the same command definitions or require a product
+rebuild. For the enabled first-party `ygg-subagents` process, the
 host additionally requires `delegation_telemetry_v1` whenever it offers
 `agent_sessions`; an older bundle is rejected during initialization with an
 actionable reinstall diagnostic instead of silently losing metrics. The native
@@ -874,7 +882,7 @@ compatibility alongside its independent extension version:
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.3"
+requires_ygg = "=0.6.4"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present
@@ -960,7 +968,7 @@ Official installs download the matching target archive and shared release
 `SHA256SUMS`; local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.6.3-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.6.4-TARGET.tar.gz
 ```
 
 The application archive keeps its existing strict two-file payload contract and

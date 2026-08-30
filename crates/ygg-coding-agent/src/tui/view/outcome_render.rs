@@ -17,7 +17,29 @@ pub(super) fn completion_text(
     separator: &str,
     tokens_per_second: Option<f64>,
 ) -> String {
-    let mut text = format!("completed{separator}{}", format_duration(elapsed));
+    completion_status_text("completed", elapsed, separator, tokens_per_second)
+}
+
+pub(super) fn completion_with_warnings_text(
+    elapsed: Duration,
+    separator: &str,
+    tokens_per_second: Option<f64>,
+) -> String {
+    completion_status_text(
+        "completed with warnings",
+        elapsed,
+        separator,
+        tokens_per_second,
+    )
+}
+
+fn completion_status_text(
+    status: &str,
+    elapsed: Duration,
+    separator: &str,
+    tokens_per_second: Option<f64>,
+) -> String {
+    let mut text = format!("{status}{separator}{}", format_duration(elapsed));
     if let Some(rate) = tokens_per_second.filter(|rate| rate.is_finite() && *rate > 0.0) {
         text.push_str(&format!("{separator}{rate:.0} tok/s"));
     }
@@ -37,9 +59,9 @@ fn outcome_line(outcome: &RunOutcome, tokens_per_second: Option<f64>, theme: &Yg
         RunOutcome::CompletedWithWarnings { elapsed, .. } => {
             let text = subdued_text(
                 theme,
-                &completion_text(*elapsed, separator, tokens_per_second),
+                &completion_with_warnings_text(*elapsed, separator, tokens_per_second),
             );
-            format!("{} {text}", theme.fg("warning", theme.glyph("success")))
+            format!("{} {text}", theme.fg("warning", theme.glyph("warning")))
         }
         RunOutcome::Failed { elapsed, .. } => format!(
             "{} {}",
@@ -145,7 +167,7 @@ mod tests {
                         ..summary.clone()
                     },
                 },
-                "completed · 18.2s",
+                "completed with warnings · 18.2s",
             ),
             (
                 RunOutcome::Failed {
@@ -172,8 +194,8 @@ mod tests {
             assert!(rendered.contains(expected), "{rendered:?}");
             if matches!(outcome, RunOutcome::CompletedWithWarnings { .. }) {
                 assert!(
-                    strip_terminal_sequences(&rendered).starts_with('✓'),
-                    "completed-with-warnings should use a checkmark: {rendered:?}"
+                    strip_terminal_sequences(&rendered).starts_with('◇'),
+                    "completed-with-warnings should retain a warning signal: {rendered:?}"
                 );
             }
             assert!(
@@ -186,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_outcome_shows_final_throughput_without_warning_count() {
+    fn warning_outcome_keeps_warning_status_and_final_throughput() {
         let theme = crate::tui::theme::test_theme();
         let outcome = RunOutcome::CompletedWithWarnings {
             elapsed: Duration::from_secs(25 * 60 + 31),
@@ -200,14 +222,14 @@ mod tests {
 
         assert_eq!(
             strip_terminal_sequences(&outcome_line(&outcome, Some(104.0), &theme)),
-            "✓ completed · 25m31s · 104 tok/s"
+            "◇ completed with warnings · 25m31s · 104 tok/s"
         );
         assert_eq!(
             block_copy_text(&TranscriptBlock::Outcome(OutcomeBlock::new(
                 outcome,
                 Some(104.0),
             ))),
-            "completed · 25m31s · 104 tok/s"
+            "completed with warnings · 25m31s · 104 tok/s"
         );
     }
 

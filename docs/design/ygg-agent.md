@@ -37,6 +37,8 @@ The broker is a deterministic admission reference monitor, not an OS sandbox. Co
 
 Sessions are append-only JSONL records containing entries, head updates, provider usage, and checkpoints. Entries form a parent-linked tree and the latest durable head selects the active branch. Compaction adds a Pi-structured summary, `first_kept` boundary, active-skill snapshot, and cumulative `readFiles`/`modifiedFiles` details without deleting ancestry. Both product-triggered and autonomous compaction use the same serialized handoff contract.
 
+Before every provider turn, the agent estimates the complete request and retains a fixed 16K output reserve (or a larger explicit reasoning floor). The provider-advertised maximum completion size remains the model ceiling; the individual request is clamped only to the context space remaining after input. The default compaction threshold is the full context window, so the fixed reserve is not combined with an additional percentage buffer. If a provider nevertheless ends at the output limit while emitting tools, the assistant envelope is persisted, every call is paired with a synthetic error without execution, and a corrective continuation asks the model to reissue complete arguments.
+
 Writes use an advisory exclusive lock, compare the observed file length under that lock, append complete record buffers, and call `sync_data` before updating in-memory state. Read-only inspection uses a shared lock and never repairs or truncates. Writable open performs explicit torn-tail recovery while exclusively locked. Files are `0600` on Unix and parsing is bounded by bytes and record count.
 
 ## V2 task delegation

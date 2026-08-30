@@ -371,6 +371,14 @@ impl YggTheme {
         background: TerminalBackground,
     ) -> Self {
         inner.set_capabilities(rich_capabilities(capabilities));
+        for &(token, source) in CONTEXT_COLOR_DEFAULTS {
+            let value = if source.starts_with('#') {
+                balance_foreground(source, background)
+            } else {
+                source.to_owned()
+            };
+            inner.override_token(token, &value);
+        }
         Self {
             inner,
             capabilities,
@@ -605,6 +613,19 @@ impl YggTheme {
         self.color_text(Rgb { red, green, blue }, text)
     }
 
+    /// Render the small provenance marker of a historical prompt from the exact
+    /// stored source colour. The source remains durable; display contrast is
+    /// adapted to the current terminal.
+    pub(crate) fn prompt_color_marker(&self, color: Option<&str>, text: &str) -> String {
+        let Some(source) = color.filter(|source| parse_hex_color(source).is_some()) else {
+            return text.to_owned();
+        };
+        let Some(color) = parse_hex_color(&balance_foreground(source, self.background)) else {
+            return text.to_owned();
+        };
+        self.color_text(color, text)
+    }
+
     /// Render a historical prompt cell using the exact model colour stored
     /// with that turn and a readable foreground chosen for that colour.
     pub(crate) fn prompt_color_cell(&self, color: Option<&str>, text: &str) -> String {
@@ -631,9 +652,9 @@ impl YggTheme {
             .map(|color| (color.red, color.green, color.blue))
     }
 
-    /// Resting composer chrome is a background-adjacent form of the model
-    /// accent. Moving toward white on light profiles and black on dark ones
-    /// keeps the outline quiet until focus or active work uses full accent.
+    /// Resting composer chrome is a background-adjacent form of the UI accent.
+    /// Moving toward white on light profiles and black on dark ones keeps the
+    /// outline quiet until the composer regains focus.
     pub(crate) fn composer_idle_rgb(&self, accent: (u8, u8, u8)) -> (u8, u8, u8) {
         let source = Rgb {
             red: accent.0,
@@ -1053,6 +1074,28 @@ fn nearest_ansi256(color: Rgb) -> u8 {
 }
 
 const DEFAULT_ACCENT: &str = "#16876d";
+
+// Context reports are a legend, not a status list. Keep each category on its
+// own visual channel so adjacent slices remain distinguishable even when two
+// categories happen to carry the same semantic status (for example free space
+// and tool schemas both used to resolve to the terminal foreground).
+//
+// Hex values are balanced in `YggTheme::new`; aliases continue to follow the
+// active theme and can be overridden by a theme's `[colors]` table.
+const CONTEXT_COLOR_DEFAULTS: &[(&str, &str)] = &[
+    ("context_system", "#4aa8c7"),
+    ("context_skills", "#d19a35"),
+    ("context_tools", "#7f9fd4"),
+    ("context_messages", "#d8dee8"),
+    ("context_pending", "#d47d3f"),
+    ("context_framing", "#73808f"),
+    ("context_adjustment", "#a978c5"),
+    ("context_tokenizer_adjustment", "#c36f99"),
+    ("context_output", "#df6f7c"),
+    ("context_free", "#52c878"),
+    ("context_buffer", "#8678ba"),
+];
+
 // 0.27 gives ~5.6:1 against the test-dark reference (and ~5:1 against a
 // typical #1e1e1e terminal).  We stay well below the old AAA target of
 // 0.32 so foreground colours keep their saturation instead of washing out.
@@ -1940,7 +1983,7 @@ pub(crate) fn classify_model_text(text: &str) -> Option<ModelLab> {
     }
 }
 
-fn classify_model_identity(id: &str, api_name: &str, endpoint: &str) -> ModelLab {
+pub(crate) fn classify_model_identity(id: &str, api_name: &str, endpoint: &str) -> ModelLab {
     let model_text = format!(
         "{} {}",
         id.to_ascii_lowercase(),
@@ -2906,30 +2949,31 @@ mod tests {
     }
 
     #[test]
-    fn exact_prompt_background_degrades_without_emitting_unsafe_data() {
+    fn exact_prompt_marker_degrades_without_painting_or_emitting_unsafe_data() {
         let plain = test_theme_with(TerminalCapabilities::test(false, false, ColorDepth::None));
-        assert_eq!(plain.prompt_color_cell(Some("#123456"), "> "), "> ");
+        assert_eq!(plain.prompt_color_marker(Some("#123456"), "> "), "> ");
 
         let ansi16 = test_theme_with(TerminalCapabilities::test(true, true, ColorDepth::Ansi16));
-        let rendered = ansi16.prompt_color_cell(Some("#123456"), "> ");
+        let rendered = ansi16.prompt_color_marker(Some("#123456"), "> ");
         assert!(rendered.contains("> "));
         assert!(rendered.contains("\x1b["));
-        assert!(!rendered.contains("48;2;") && !rendered.contains("48;5;"));
+        assert!(!rendered.contains("48;"));
 
         let ansi256 = test_theme_with(TerminalCapabilities::test(true, true, ColorDepth::Ansi256));
-        assert!(ansi256
-            .prompt_color_cell(Some("#123456"), "> ")
-            .contains("48;5;"));
+        let rendered = ansi256.prompt_color_marker(Some("#123456"), "> ");
+        assert!(rendered.contains("38;5;"), "{rendered:?}");
+        assert!(!rendered.contains("48;"));
 
         let truecolor = test_theme_with(TerminalCapabilities::test(
             true,
             true,
             ColorDepth::TrueColor,
         ));
-        let rendered = truecolor.prompt_color_cell(Some("#123456"), "> ");
-        assert!(rendered.contains("48;2;18;52;86m"), "{rendered:?}");
+        let rendered = truecolor.prompt_color_marker(Some("#123456"), "> ");
+        assert!(rendered.contains("38;2;"), "{rendered:?}");
+        assert!(!rendered.contains("48;"));
         assert_eq!(
-            truecolor.prompt_color_cell(Some("#12\u{1b}3456"), "> "),
+            truecolor.prompt_color_marker(Some("#12\u{1b}3456"), "> "),
             "> "
         );
     }

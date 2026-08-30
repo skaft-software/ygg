@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from evaluation.harbor.config import PINNED_YGG_VERSION
 from evaluation.harbor.session import convert_session_file
 
 
@@ -98,7 +99,7 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.6.0",
+                agent_version=PINNED_YGG_VERSION,
                 model_name="gpt-5.6-sol",
                 reasoning="medium",
             )
@@ -158,7 +159,7 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.6.0",
+                agent_version=PINNED_YGG_VERSION,
                 model_name=None,
                 reasoning=None,
             )
@@ -229,7 +230,7 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.6.3",
+                agent_version="0.6.4",
                 model_name="m",
                 reasoning=None,
             )

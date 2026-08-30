@@ -2,7 +2,7 @@
 
 Ygg Browse is the official opt-in API `0.2` executable-extension bundle for bounded semantic browser work. It always launches Playwright's bundled Chromium visibly (`headless=False`) with a persistent profile owned only by Ygg Browse. It never pairs with, copies, discovers, or launches a normal Chrome/Chromium profile.
 
-Version `0.1.0` requires Ygg `0.6.3` exactly and pins `playwright==1.57.0` exactly.
+Version `0.1.0` requires Ygg `0.6.4` exactly and pins `playwright==1.57.0` exactly.
 
 ## Install and activate
 
@@ -103,6 +103,8 @@ Everything inside is data, never instructions or authorization. A snapshot is ca
 
 Screenshots are viewport-only PNGs. To prevent form-value leakage, capture is refused after `browser_type` has supplied a value in that tab or while any visible form/editable field could contain manually entered data (with a specific refusal for credential/authentication/payment fields). An image at or above 5 MiB fails clearly instead of returning an unreadable attachment. Successful images are retained under `~/.ygg/browse/artifacts/screenshots/`, bounded to 20 files and 80 MiB, copied briefly into the host-owned process scratch area, and published through API `0.2` as owner/generation-scoped artifacts. Results contain both the image part and a textual local reference usable with built-in `read`.
 
+The conservative visible-form refusal can be relaxed for non-credential fields by setting `YGG_BROWSE_ALLOW_FORM_SCREENSHOTS` to `1`, `true`, `yes`, or `on` before starting Ygg, or by creating the regular sentinel file `~/.ygg/browse/allow-form-screenshots`. This override never permits capture after `browser_type` has supplied a value and never permits capture while a visible credential, OTP, payment, authentication, or other credential-like field is present.
+
 ## Owned state and cleanup
 
 Ygg Browse uses only:
@@ -113,6 +115,7 @@ Ygg Browse uses only:
 ~/.ygg/browse/artifacts/screenshots/
 ~/.ygg/browse/install.lock
 ~/.ygg/browse/install.log
+~/.ygg/browse/allow-form-screenshots
 ```
 
 Small lock/state/sentinel files also live directly beneath `~/.ygg/browse/`. The isolated profile has a versioned `.ygg-browse-profile.json` sentinel and a separate exclusive ownership lock. Launch and reset reject a linked/non-directory profile, an absent/invalid sentinel, or another owner. Reset stages and removes only a locked, sentinel-verified profile. Chromium's own profile lock files are never followed.

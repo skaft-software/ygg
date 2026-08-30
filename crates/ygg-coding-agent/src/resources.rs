@@ -361,6 +361,9 @@ fn xml_attribute(value: &str) -> String {
 }
 
 fn base_prompt(config: &Config) -> String {
+    // Delegated workers deliberately share one worktree. Per-file hash guards
+    // catch stale writes, but Git state changes affect every worker at once, so
+    // the root prompt must reserve those operations and respect path ownership.
     let mut prompt = format!(
         r#"{BASE_PERSONA}
 
@@ -372,6 +375,7 @@ Working style:
 - Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
+- Treat dirty worktrees as shared. While workers are active, respect path ownership and never switch branches, reset, rebase, stash, or clean. Unexpected changes or stale hashes mean another writer: preserve them and stop touching that path.
 
 Scope:
 - Treat the user's requested scope as the deliverable: do not silently narrow or widen it. If one part is blocked, complete independent parts and report exactly what remains.
@@ -1513,6 +1517,7 @@ Working style:
 - Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
+- Treat dirty worktrees as shared. While workers are active, respect path ownership and never switch branches, reset, rebase, stash, or clean. Unexpected changes or stale hashes mean another writer: preserve them and stop touching that path.
 
 Scope:
 - Treat the user's requested scope as the deliverable: do not silently narrow or widen it. If one part is blocked, complete independent parts and report exactly what remains.

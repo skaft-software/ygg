@@ -13,7 +13,9 @@ use ygg_ai::{ModelCatalog, ModelId};
 
 use crate::config::ThinkingLevel;
 use crate::modes::interactive::run_blocking_lifecycle;
-use crate::presentation::{format_token_rate_value, ModelDisplayMetadata};
+use crate::presentation::{
+    compact_context_limit, format_token_rate_value, provider_status_name, ModelDisplayMetadata,
+};
 use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
 use crate::tui::view::{
     ForkMessage, InteractiveShell, MessagePicker, Panel, PanelAction, PanelRequest, PanelResult,
@@ -951,7 +953,7 @@ async fn confirmation_prompt_picker<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
     prompt: &str,
-    _detail: Option<&str>,
+    detail: Option<&str>,
     destructive: bool,
     default: bool,
 ) -> anyhow::Result<bool>
@@ -963,10 +965,11 @@ where
     } else {
         (vec!["Deny".to_owned(), "Approve".to_owned()], [false, true])
     };
-    // The prompt already explains the requested effect. Keep hashes and other
-    // wire-level detail out of the two-choice picker; they belong in logs and
-    // diagnostics, not beside both answers.
-    let descriptions = vec![None, None];
+    // The detail is shared approval evidence, not per-choice metadata. The
+    // panel renderer displays one bounded copy while keeping the two actions
+    // independently selectable.
+    let shared_detail = detail.map(str::to_owned);
+    let descriptions = vec![shared_detail.clone(), shared_detail];
     let title = if destructive {
         format!("Action requires approval · {prompt}")
     } else {
@@ -985,63 +988,177 @@ where
     Ok(selected.map(|index| decisions[index]).unwrap_or(false))
 }
 
-/// Build a concise human-facing label from the same cached metadata boundary
-/// used by the footer. Canonical and wire-level IDs remain available in
-/// `/status`; the endpoint label disambiguates models from different custom
-/// providers.
+/// Build a human-facing label from the same cached metadata boundary used by
+/// the footer. Provider identity is rendered once as a non-selectable group
+/// heading, never repeated in each model row.
 fn model_label(model: &ygg_ai::ModelSpec) -> String {
     ModelDisplayMetadata::resolve(model).name
 }
 
-fn model_label_with_endpoint(catalog: &ModelCatalog, model: &ygg_ai::ModelSpec) -> String {
-    let model_name = model_label(model);
-    catalog
-        .endpoint_label(&model.endpoint)
-        .map(|label| format!("{label} · {model_name}"))
-        .unwrap_or(model_name)
-}
-
-#[cfg(test)]
-fn model_description(model: &ygg_ai::ModelSpec) -> String {
-    model_description_with_endpoint(model, None)
-}
-
-fn model_description_with_endpoint(
-    model: &ygg_ai::ModelSpec,
-    endpoint_label: Option<&str>,
-) -> String {
-    let context = match model.limits.context_window {
-        value if value >= 1_000_000 => format!("{}M", value / 1_000_000),
-        value if value >= 1_000 => format!("{}k", value / 1_000),
-        value => value.to_string(),
+fn compact_rate_value(rate: ygg_ai::TokenRate) -> String {
+    let value = format_token_rate_value(rate);
+    let Some((whole, fraction)) = value
+        .strip_prefix('$')
+        .and_then(|value| value.split_once('.'))
+    else {
+        return value;
     };
-    let pricing = model
-        .pricing
-        .as_ref()
-        .map(|pricing| {
-            format!(
-                "{}/{} per M · cache-read {} per M",
-                format_token_rate_value(pricing.input),
-                format_token_rate_value(pricing.output),
-                format_token_rate_value(pricing.cache_read),
-            )
-        })
-        .unwrap_or_else(|| "pricing unavailable ($?)".to_owned());
-    let mut details = vec![format!(
-        "{} · {pricing} · {context} context",
-        endpoint_label.unwrap_or(&model.endpoint.0)
-    )];
-    if model.capabilities.tools {
-        details.push("tools".into());
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        format!("${whole}")
+    } else {
+        format!("${whole}.{fraction}")
     }
-    if model
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelPickerMetadata {
+    input_cost: String,
+    output_cost: String,
+    context: String,
+    media: String,
+}
+
+fn model_picker_metadata(model: &ygg_ai::ModelSpec) -> ModelPickerMetadata {
+    let (input_cost, output_cost) = model.pricing.as_ref().map_or_else(
+        || ("—".to_owned(), "—".to_owned()),
+        |pricing| {
+            (
+                format!("{}/M", compact_rate_value(pricing.input)),
+                format!("{}/M", compact_rate_value(pricing.output)),
+            )
+        },
+    );
+    let vision = model
         .capabilities
         .input_modalities
         .contains(ygg_ai::Modality::Image)
-    {
-        details.push("vision".into());
+        || model
+            .capabilities
+            .output_modalities
+            .contains(ygg_ai::Modality::Image);
+    let audio = model
+        .capabilities
+        .input_modalities
+        .contains(ygg_ai::Modality::Audio)
+        || model
+            .capabilities
+            .output_modalities
+            .contains(ygg_ai::Modality::Audio);
+    let media = match (vision, audio) {
+        (true, true) => "vision + audio",
+        (true, false) => "vision",
+        (false, true) => "audio",
+        // Text is the baseline, not a capability badge. Repeating it on most
+        // rows would recreate the same visual noise provider grouping removes.
+        (false, false) => "",
     }
-    details.join(" · ")
+    .to_owned();
+    ModelPickerMetadata {
+        input_cost,
+        output_cost,
+        context: compact_context_limit(model.limits.context_window),
+        media,
+    }
+}
+
+fn model_provider_heading(catalog: &ModelCatalog, model: &ygg_ai::ModelSpec) -> String {
+    let heading = catalog
+        .endpoint_label(&model.endpoint)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| provider_status_name(&model.endpoint.0));
+    if heading == "local endpoint" {
+        "Local Endpoint".to_owned()
+    } else {
+        heading
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ModelPickerPresentation {
+    ids: Vec<ModelId>,
+    providers: Vec<String>,
+    labels: Vec<String>,
+    descriptions: Vec<Option<String>>,
+}
+
+fn pad_visible_right(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(sexy_tui_rs::visible_width(value)))
+    )
+}
+
+fn pad_visible_left(value: &str, width: usize) -> String {
+    format!(
+        "{}{value}",
+        " ".repeat(width.saturating_sub(sexy_tui_rs::visible_width(value)))
+    )
+}
+
+fn model_picker_presentation(catalog: &ModelCatalog) -> ModelPickerPresentation {
+    let mut rows = catalog
+        .models()
+        .map(|model| {
+            (
+                model_provider_heading(catalog, model),
+                model_label(model),
+                model.id.clone(),
+                model_picker_metadata(model),
+            )
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.0
+            .to_lowercase()
+            .cmp(&right.0.to_lowercase())
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2 .0.cmp(&right.2 .0))
+    });
+
+    let input_width = rows
+        .iter()
+        .map(|row| sexy_tui_rs::visible_width(&row.3.input_cost))
+        .max()
+        .unwrap_or(1);
+    let output_width = rows
+        .iter()
+        .map(|row| sexy_tui_rs::visible_width(&row.3.output_cost))
+        .max()
+        .unwrap_or(1);
+    let context_width = rows
+        .iter()
+        .map(|row| sexy_tui_rs::visible_width(&row.3.context))
+        .max()
+        .unwrap_or(1);
+
+    let mut presentation = ModelPickerPresentation {
+        ids: Vec::with_capacity(rows.len()),
+        providers: Vec::with_capacity(rows.len()),
+        labels: Vec::with_capacity(rows.len()),
+        descriptions: Vec::with_capacity(rows.len()),
+    };
+    for (provider, label, id, metadata) in rows {
+        let media = if metadata.media.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", metadata.media)
+        };
+        presentation.ids.push(id);
+        presentation.providers.push(provider);
+        presentation.labels.push(label);
+        presentation.descriptions.push(Some(format!(
+            "in {}  out {}  {} ctx{media}",
+            pad_visible_right(&metadata.input_cost, input_width),
+            pad_visible_right(&metadata.output_cost, output_width),
+            pad_visible_left(&metadata.context, context_width),
+        )));
+    }
+    presentation
 }
 
 /// Ask the user to select one model, preserving cancellation for workflows
@@ -1052,37 +1169,25 @@ pub async fn optional_model_picker(
     input: &mut EventStream,
     catalog: &ModelCatalog,
 ) -> anyhow::Result<Option<ModelId>> {
-    let mut models = catalog.models().collect::<Vec<_>>();
-    models.sort_by(|left, right| left.id.0.cmp(&right.id.0));
-    let model_ids: Vec<ModelId> = models.iter().map(|m| m.id.clone()).collect();
-    let items: Vec<String> = models
-        .iter()
-        .map(|model| model_label_with_endpoint(catalog, model))
-        .collect();
-    let descs: Vec<Option<String>> = models
-        .iter()
-        .map(|model| {
-            Some(model_description_with_endpoint(
-                model,
-                catalog.endpoint_label(&model.endpoint),
-            ))
-        })
-        .collect();
+    let presentation = model_picker_presentation(catalog);
 
     let Some(index) = pick_list(
         shell,
         input,
         "Select model",
-        items,
-        descs,
+        presentation.labels,
+        presentation.descriptions,
         0,
-        PanelAction::SelectModel(model_ids),
+        PanelAction::SelectGroupedModel {
+            models: presentation.ids.clone(),
+            providers: presentation.providers,
+        },
     )
     .await?
     else {
         return Ok(None);
     };
-    let selected_id = models[index].id.0.clone();
+    let selected_id = presentation.ids[index].0.clone();
     if let Err(e) = crate::cli::persist_model(&selected_id) {
         shell.error(format!("failed to save model preference: {e}"));
     }
@@ -1137,7 +1242,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(widths.lock().unwrap().contains(&40));
+        assert!(widths.lock().unwrap().contains(&44));
         assert!(!shell.has_panel());
     }
 
@@ -1298,7 +1403,7 @@ mod tests {
             cache: ygg_ai::CacheCompatibility::default(),
         };
         assert_eq!(model_label(&spec), "Llama 3.1 8B");
-        assert!(model_description(&spec).contains("$?"));
+        assert_eq!(model_picker_metadata(&spec).input_cost, "—");
 
         let mut priced = spec.clone();
         priced.pricing = Some(ygg_ai::Pricing {
@@ -1310,14 +1415,19 @@ mod tests {
             reasoning: None,
             tiers: Vec::new(),
         });
-        let description = model_description(&priced);
-        assert!(description.contains("$1.00/$6.00"), "{description}");
-        assert!(description.contains("cache-read $0.1"), "{description}");
+        assert_eq!(compact_rate_value(ygg_ai::TokenRate(0)), "$0");
+        assert_eq!(compact_rate_value(ygg_ai::TokenRate(100_000_000)), "$100");
+        assert_eq!(compact_context_limit(1_500_000), "1.5M");
+        let metadata = model_picker_metadata(&priced);
+        assert_eq!(metadata.input_cost, "$1/M");
+        assert_eq!(metadata.output_cost, "$6/M");
+        assert_eq!(metadata.context, "131K");
+        assert_eq!(metadata.media, "");
     }
 
     #[test]
     fn custom_model_label_removes_provider_repository_and_quantization_noise() {
-        let spec = ygg_ai::ModelSpec {
+        let mut spec = ygg_ai::ModelSpec {
             id: ModelId("custom/Intel/Qwen3.6-27B-int4-AutoRound".into()),
             endpoint: ygg_ai::EndpointId("custom-openai".into()),
             api_name: "Intel/Qwen3.6-27B-int4-AutoRound".into(),
@@ -1343,24 +1453,78 @@ mod tests {
         };
         assert_eq!(model_label(&spec), "Qwen3.6 27B");
 
-        let mut catalog = ModelCatalog::default();
-        let endpoint_id = ygg_ai::EndpointId("custom-openai".into());
-        catalog
-            .register_endpoint(ygg_ai::Endpoint {
-                id: endpoint_id.clone(),
-                base_url: url::Url::parse("http://127.0.0.1:1234/v1/").unwrap(),
-                auth: ygg_ai::Auth::None,
-                default_headers: http::HeaderMap::new(),
-                transport: ygg_ai::EndpointTransport::Http,
-                timeout: std::time::Duration::from_secs(300),
+        spec.capabilities.input_modalities = ygg_ai::ModalitySet::none()
+            .with(ygg_ai::Modality::Image)
+            .with(ygg_ai::Modality::Audio);
+
+        let metadata = model_picker_metadata(&spec);
+        assert_eq!(metadata.media, "vision + audio");
+    }
+
+    #[test]
+    fn model_picker_groups_and_sorts_models_with_stable_metadata_columns() {
+        let catalog = ModelCatalog::builtin().unwrap();
+        let presentation = model_picker_presentation(&catalog);
+        let groups =
+            presentation
+                .providers
+                .iter()
+                .fold(Vec::<&str>::new(), |mut groups, provider| {
+                    if groups.last().copied() != Some(provider.as_str()) {
+                        groups.push(provider);
+                    }
+                    groups
+                });
+        assert_eq!(groups, vec!["Anthropic", "OpenAI"]);
+
+        for provider in &groups {
+            let labels = presentation
+                .labels
+                .iter()
+                .zip(&presentation.providers)
+                .filter(|(_, row_provider)| row_provider.as_str() == *provider)
+                .map(|(label, _)| label.to_lowercase())
+                .collect::<Vec<_>>();
+            assert!(
+                labels.windows(2).all(|pair| pair[0] <= pair[1]),
+                "{provider} models were not alphabetized: {labels:?}"
+            );
+        }
+
+        let descriptions = presentation
+            .descriptions
+            .iter()
+            .map(|description| description.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        let out_columns = descriptions
+            .iter()
+            .map(|description| {
+                sexy_tui_rs::visible_width(&description[..description.find("out ").unwrap()])
             })
-            .unwrap();
-        catalog
-            .set_endpoint_label(endpoint_id, "Apple Foundation Models")
-            .unwrap();
+            .collect::<std::collections::BTreeSet<_>>();
+        let context_columns = descriptions
+            .iter()
+            .map(|description| {
+                sexy_tui_rs::visible_width(&description[..description.find(" ctx").unwrap()])
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(out_columns.len(), 1, "input costs are not one fixed column");
         assert_eq!(
-            model_label_with_endpoint(&catalog, &spec),
-            "Apple Foundation Models · Qwen3.6 27B"
+            context_columns.len(),
+            1,
+            "context windows are not one fixed column"
         );
+        assert!(descriptions
+            .iter()
+            .any(|description| description.contains("audio")));
+        assert!(descriptions
+            .iter()
+            .any(|description| description.contains("vision")));
+        assert!(descriptions.iter().all(|description| {
+            !description.contains("tools")
+                && !description.contains("reasoning")
+                && !description.contains("Anthropic")
+                && !description.contains("OpenAI")
+        }));
     }
 }

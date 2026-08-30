@@ -24,53 +24,71 @@ pub(crate) fn delete_all_kitty_images() -> String {
 const KITTY_SEQUENCE_PREFIX: &str = "\x1b_G";
 const PI_LINE_RESET: &str = "\x1b[0m\x1b]8;;\x07";
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug)]
 struct KittyImageHeader {
     ids: Vec<u32>,
     rows: usize,
 }
 
-fn parse_kitty_image_header(line: &str) -> Option<KittyImageHeader> {
-    let sequence_start = line.find(KITTY_SEQUENCE_PREFIX)?;
-    let params_start = sequence_start.saturating_add(KITTY_SEQUENCE_PREFIX.len());
-    let params_end = line[params_start..].find(';')?.saturating_add(params_start);
-    let mut header = KittyImageHeader {
-        ids: Vec::new(),
-        rows: 1,
-    };
-    for parameter in line[params_start..params_end].split(',') {
-        let Some((key, value)) = parameter.split_once('=') else {
-            continue;
+fn parse_kitty_image_headers(line: &str) -> Vec<KittyImageHeader> {
+    let mut headers = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative_start) = line[search_from..].find(KITTY_SEQUENCE_PREFIX) {
+        let sequence_start = search_from.saturating_add(relative_start);
+        let params_start = sequence_start.saturating_add(KITTY_SEQUENCE_PREFIX.len());
+        let Some(relative_end) = line[params_start..].find(';') else {
+            break;
         };
-        let Ok(value) = value.parse::<u32>() else {
-            continue;
+        let params_end = params_start.saturating_add(relative_end);
+        let mut header = KittyImageHeader {
+            ids: Vec::new(),
+            rows: 1,
         };
-        if value == 0 {
-            continue;
+        for parameter in line[params_start..params_end].split(',') {
+            let Some((key, value)) = parameter.split_once('=') else {
+                continue;
+            };
+            let Ok(value) = value.parse::<u32>() else {
+                continue;
+            };
+            if value == 0 {
+                continue;
+            }
+            match key {
+                "i" => header.ids.push(value),
+                "r" => header.rows = value as usize,
+                _ => {}
+            }
         }
-        match key {
-            "i" => header.ids.push(value),
-            "r" => header.rows = value as usize,
-            _ => {}
-        }
+        headers.push(header);
+        search_from = params_end.saturating_add(1);
     }
-    Some(header)
+    headers
 }
 
 fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
-    parse_kitty_image_header(line)
-        .map(|header| header.ids)
-        .unwrap_or_default()
+    parse_kitty_image_headers(line)
+        .into_iter()
+        .flat_map(|header| header.ids)
+        .collect()
 }
 
 fn extract_kitty_image_rows(line: &str) -> usize {
-    parse_kitty_image_header(line)
+    parse_kitty_image_headers(line)
+        .into_iter()
         .map(|header| header.rows)
+        .max()
         .unwrap_or(1)
 }
 
 fn delete_kitty_image(image_id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LogicalCursorPosition {
+    row: usize,
+    column: usize,
 }
 
 fn is_termux_session() -> bool {
@@ -270,6 +288,10 @@ pub struct TUI<'a> {
     running: bool,
     capabilities: crate::capabilities::TerminalCapabilities,
     input_listeners: Vec<InputListener<'a>>,
+    /// Absolute marker position retained independently of the prepared frame.
+    /// Lazy replacements can therefore reuse a cursor owned by their stable
+    /// prefix and remap it when the viewport moves.
+    logical_cursor_position: Option<LogicalCursorPosition>,
     /// Pi-compatible logical row containing the end of rendered content.
     cursor_row: usize,
     /// Pi-compatible logical row containing the physical terminal cursor.
@@ -285,6 +307,12 @@ pub struct TUI<'a> {
     /// Pi tracks Kitty placements by image ID so redraws delete only affected
     /// images before retransmitting their rows.
     previous_kitty_image_ids: BTreeSet<u32>,
+    /// O(1) guard for Pi lazy updates. Frames containing any Kitty command use
+    /// the established full-component path so image reservations and duplicate
+    /// IDs never cross an uninspected stable-prefix seam.
+    previous_frame_has_kitty: bool,
+    #[cfg(test)]
+    last_pi_lazy_inspected_rows: usize,
     /// Pi positions the hardware cursor for IME but hides it by default because
     /// editor components render their own visual cursor.
     show_hardware_cursor: bool,
@@ -339,6 +367,7 @@ impl<'a> TUI<'a> {
             running: false,
             capabilities,
             input_listeners: Vec::new(),
+            logical_cursor_position: None,
             cursor_row: 0,
             hardware_cursor_row: 0,
             max_lines_rendered: 0,
@@ -347,6 +376,9 @@ impl<'a> TUI<'a> {
             clear_on_shrink: std::env::var_os("PI_CLEAR_ON_SHRINK")
                 .is_some_and(|value| value == "1"),
             previous_kitty_image_ids: BTreeSet::new(),
+            previous_frame_has_kitty: false,
+            #[cfg(test)]
+            last_pi_lazy_inspected_rows: 0,
             show_hardware_cursor: std::env::var_os("PI_HARDWARE_CURSOR")
                 .is_some_and(|value| value == "1"),
             inline_scrollback: false,
@@ -446,6 +478,7 @@ impl<'a> TUI<'a> {
         if force {
             self.previous_frame.clear();
             self.previous_size = Some((u16::MAX, u16::MAX));
+            self.logical_cursor_position = None;
             self.cursor_row = 0;
             self.hardware_cursor_row = 0;
             self.max_lines_rendered = 0;
@@ -616,21 +649,102 @@ impl<'a> TUI<'a> {
         let mut viewport_top = previous_viewport_top;
         let mut hardware_cursor_row = self.hardware_cursor_row;
 
-        let mut new_lines = self.root_render(width_u16);
-        let cursor_position = extract_pi_cursor_position(&mut new_lines, height);
-        for line in &mut new_lines {
-            if !is_image_line(line) {
-                *line = format!(
-                    "{}{}",
-                    crate::utils::normalize_terminal_output(line),
-                    PI_LINE_RESET
-                );
-            }
+        let previous_len = self.previous_frame.len();
+        let mut lazy_stable_prefix = None;
+        let mut lazy_previous_tail = None;
+        #[cfg(test)]
+        {
+            self.last_pi_lazy_inspected_rows = 0;
         }
-
+        let (new_lines, logical_cursor_position) =
+            if !self.first_render && !width_changed && !height_changed {
+                let update = self.root_render_update(width_u16, None).filter(|update| {
+                    update.stable_prefix <= previous_len
+                        // The normal Pi renderer owns its own scrollback ledger;
+                        // these flags describe the extended/pinned renderer's
+                        // physical reanchor contract and are not safe to reuse as
+                        // a partial Pi frame.
+                        && !update.reanchor_viewport
+                        && !update.rebuild_scrollback
+                        && update.resize_replay.is_none()
+                        // Kitty row reservations and delete-by-ID semantics are
+                        // already covered by the full-component Pi path. Until
+                        // a seam-aware metadata algorithm has equivalent
+                        // coverage, keep image-bearing frames on that path.
+                        && !self.previous_frame_has_kitty
+                        && !update.replacement.iter().any(|line| is_image_line(line))
+                });
+                if let Some(update) = update {
+                    let stable_prefix = update.stable_prefix;
+                    let mut replacement = update.replacement;
+                    let replacement_cursor =
+                        extract_logical_cursor_position_from(&mut replacement, stable_prefix);
+                    let retained_cursor = self
+                        .logical_cursor_position
+                        .filter(|cursor| cursor.row < stable_prefix);
+                    let logical_cursor_position = replacement_cursor.or(retained_cursor);
+                    #[cfg(test)]
+                    {
+                        self.last_pi_lazy_inspected_rows = replacement.len();
+                    }
+                    let replacement = replacement
+                        .into_iter()
+                        .map(|line| {
+                            if is_image_line(&line) {
+                                line
+                            } else {
+                                format!(
+                                    "{}{}",
+                                    crate::utils::normalize_terminal_output(&line),
+                                    PI_LINE_RESET
+                                )
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    // Move the old frame's strings into two owned vectors rather
+                    // than cloning the stable history. The old tail is retained
+                    // only for bounded comparisons.
+                    let mut previous = std::mem::take(&mut self.previous_frame);
+                    let previous_tail = previous.split_off(stable_prefix);
+                    previous.extend(replacement);
+                    lazy_stable_prefix = Some(stable_prefix);
+                    lazy_previous_tail = Some(previous_tail);
+                    (previous, logical_cursor_position)
+                } else {
+                    let mut rendered = self.root_render(width_u16);
+                    let logical_cursor_position =
+                        extract_logical_cursor_position_from(&mut rendered, 0);
+                    for line in &mut rendered {
+                        if !is_image_line(line) {
+                            *line = format!(
+                                "{}{}",
+                                crate::utils::normalize_terminal_output(line),
+                                PI_LINE_RESET
+                            );
+                        }
+                    }
+                    (rendered, logical_cursor_position)
+                }
+            } else {
+                let mut rendered = self.root_render(width_u16);
+                let logical_cursor_position =
+                    extract_logical_cursor_position_from(&mut rendered, 0);
+                for line in &mut rendered {
+                    if !is_image_line(line) {
+                        *line = format!(
+                            "{}{}",
+                            crate::utils::normalize_terminal_output(line),
+                            PI_LINE_RESET
+                        );
+                    }
+                }
+                (rendered, logical_cursor_position)
+            };
+        self.logical_cursor_position = logical_cursor_position;
+        let cursor_position = pi_cursor_position(logical_cursor_position, new_lines.len(), height);
         // Pi's first render writes the complete frame without touching saved
         // lines. Subsequent structural fallbacks clear and replay it.
-        if self.previous_frame.is_empty() && !width_changed && !height_changed {
+        if self.first_render && !width_changed && !height_changed {
             self.pi_full_render(new_lines, width_u16, height_u16, false, cursor_position);
             return;
         }
@@ -649,32 +763,68 @@ impl<'a> TUI<'a> {
 
         let mut first_changed = None;
         let mut last_changed = None;
-        let max_lines = new_lines.len().max(self.previous_frame.len());
-        for index in 0..max_lines {
-            let old_line = self.previous_frame.get(index).map_or("", String::as_str);
+        let max_lines = new_lines.len().max(previous_len);
+        // A lazy component has already proven that rows before this boundary
+        // are unchanged. Avoid walking every retained historical String just to
+        // rediscover that fact on every animation frame.
+        let stable_prefix = lazy_stable_prefix.unwrap_or(0);
+        let compare_start = stable_prefix.min(max_lines);
+        #[cfg(test)]
+        if lazy_stable_prefix.is_some() {
+            self.last_pi_lazy_inspected_rows = self
+                .last_pi_lazy_inspected_rows
+                .saturating_add(max_lines.saturating_sub(compare_start));
+        }
+        for index in compare_start..max_lines {
+            let old_line = if let Some(previous_tail) = lazy_previous_tail.as_deref() {
+                previous_tail
+                    .get(index.saturating_sub(stable_prefix))
+                    .map_or("", String::as_str)
+            } else {
+                self.previous_frame.get(index).map_or("", String::as_str)
+            };
             let new_line = new_lines.get(index).map_or("", String::as_str);
             if old_line != new_line {
                 first_changed.get_or_insert(index);
                 last_changed = Some(index);
             }
         }
-        let appended_lines = new_lines.len() > self.previous_frame.len();
+        let appended_lines = new_lines.len() > previous_len;
         if appended_lines {
-            first_changed.get_or_insert(self.previous_frame.len());
+            first_changed.get_or_insert(previous_len);
             last_changed = new_lines.len().checked_sub(1);
         }
         if let (Some(first), Some(last)) = (first_changed, last_changed) {
-            let (expanded_first, expanded_last) =
-                self.pi_expand_changed_range_for_kitty_images(first, last, &new_lines);
+            let (expanded_first, expanded_last) = if lazy_stable_prefix.is_some() {
+                (first, last)
+            } else if let Some(previous_tail) = lazy_previous_tail.as_deref() {
+                self.pi_expand_changed_range_for_kitty_images(
+                    first,
+                    last,
+                    &new_lines,
+                    previous_tail,
+                    stable_prefix,
+                )
+            } else {
+                self.pi_expand_changed_range_for_kitty_images(
+                    first,
+                    last,
+                    &new_lines,
+                    &self.previous_frame,
+                    0,
+                )
+            };
             first_changed = Some(expanded_first);
             last_changed = Some(expanded_last);
         }
         let append_start = appended_lines
-            && first_changed == Some(self.previous_frame.len())
+            && first_changed == Some(previous_len)
             && first_changed.is_some_and(|index| index > 0);
 
         if first_changed.is_none() {
             self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+            self.pi_record_kitty_state(&new_lines, lazy_stable_prefix.is_some());
+            self.previous_frame = new_lines;
             self.previous_viewport_top = previous_viewport_top;
             self.previous_size = Some((width_u16, height_u16));
             self.first_render = false;
@@ -686,20 +836,43 @@ impl<'a> TUI<'a> {
         // All changes are deleted rows. Clear those cells without scrolling
         // unless the target moved above the old viewport, where Pi rebuilds.
         if first_changed >= new_lines.len() {
-            if self.previous_frame.len() > new_lines.len() {
+            if previous_len > new_lines.len() {
                 let target_row = new_lines.len().saturating_sub(1);
                 if target_row < previous_viewport_top {
                     self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
                     return;
                 }
-                let extra_lines = self.previous_frame.len().saturating_sub(new_lines.len());
+                let extra_lines = previous_len.saturating_sub(new_lines.len());
                 if extra_lines > height {
                     self.pi_full_render(new_lines, width_u16, height_u16, true, cursor_position);
                     return;
                 }
 
                 let mut buffer = String::from("\x1b[?2026h");
-                buffer.push_str(&self.pi_delete_changed_kitty_images(first_changed, last_changed));
+                let deleted_images = if lazy_stable_prefix.is_some() {
+                    String::new()
+                } else {
+                    let previous_tail = lazy_previous_tail.as_deref();
+                    previous_tail.map_or_else(
+                        || {
+                            self.pi_delete_changed_kitty_images(
+                                first_changed,
+                                last_changed,
+                                &self.previous_frame,
+                                0,
+                            )
+                        },
+                        |tail| {
+                            self.pi_delete_changed_kitty_images(
+                                first_changed,
+                                last_changed,
+                                tail,
+                                stable_prefix,
+                            )
+                        },
+                    )
+                };
+                buffer.push_str(&deleted_images);
                 push_vertical_move(
                     &mut buffer,
                     pi_line_difference(
@@ -732,8 +905,8 @@ impl<'a> TUI<'a> {
                 self.hardware_cursor_row = target_row;
             }
             self.pi_position_hardware_cursor(cursor_position, new_lines.len());
+            self.pi_record_kitty_state(&new_lines, lazy_stable_prefix.is_some());
             self.previous_frame = new_lines;
-            self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&self.previous_frame);
             self.previous_size = Some((width_u16, height_u16));
             self.previous_viewport_top = previous_viewport_top;
             self.first_render = false;
@@ -746,7 +919,29 @@ impl<'a> TUI<'a> {
         }
 
         let mut buffer = String::from("\x1b[?2026h");
-        buffer.push_str(&self.pi_delete_changed_kitty_images(first_changed, last_changed));
+        let deleted_images = if lazy_stable_prefix.is_some() {
+            String::new()
+        } else {
+            lazy_previous_tail.as_deref().map_or_else(
+                || {
+                    self.pi_delete_changed_kitty_images(
+                        first_changed,
+                        last_changed,
+                        &self.previous_frame,
+                        0,
+                    )
+                },
+                |tail| {
+                    self.pi_delete_changed_kitty_images(
+                        first_changed,
+                        last_changed,
+                        tail,
+                        stable_prefix,
+                    )
+                },
+            )
+        };
+        buffer.push_str(&deleted_images);
         let previous_viewport_bottom = previous_viewport_top.saturating_add(height - 1);
         let move_target_row = if append_start {
             first_changed.saturating_sub(1)
@@ -824,14 +1019,14 @@ impl<'a> TUI<'a> {
         }
 
         let mut final_cursor_row = render_end;
-        if self.previous_frame.len() > new_lines.len() {
+        if previous_len > new_lines.len() {
             if render_end < new_lines.len().saturating_sub(1) {
                 let move_down = new_lines.len() - 1 - render_end;
                 push_cursor_down(&mut buffer, move_down);
                 final_cursor_row = new_lines.len() - 1;
             }
-            let extra_lines = self.previous_frame.len().saturating_sub(new_lines.len());
-            for _ in new_lines.len()..self.previous_frame.len() {
+            let extra_lines = previous_len.saturating_sub(new_lines.len());
+            for _ in new_lines.len()..previous_len {
                 buffer.push_str("\r\n\x1b[2K");
             }
             push_cursor_up(&mut buffer, extra_lines);
@@ -845,7 +1040,7 @@ impl<'a> TUI<'a> {
         self.previous_viewport_top =
             previous_viewport_top.max(final_cursor_row.saturating_sub(height.saturating_sub(1)));
         self.pi_position_hardware_cursor(cursor_position, new_lines.len());
-        self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&new_lines);
+        self.pi_record_kitty_state(&new_lines, lazy_stable_prefix.is_some());
         self.previous_frame = new_lines;
         self.previous_size = Some((width_u16, height_u16));
         self.first_render = false;
@@ -905,7 +1100,7 @@ impl<'a> TUI<'a> {
         let buffer_length = height_rows.max(new_lines.len());
         self.previous_viewport_top = buffer_length.saturating_sub(height_rows);
         self.pi_position_hardware_cursor(cursor_position, new_lines.len());
-        self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(&new_lines);
+        self.pi_record_kitty_state(&new_lines, false);
         self.previous_frame = new_lines;
         self.previous_size = Some((width, height));
         self.first_render = false;
@@ -941,6 +1136,16 @@ impl<'a> TUI<'a> {
             .iter()
             .flat_map(|line| extract_kitty_image_ids(line))
             .collect()
+    }
+
+    fn pi_record_kitty_state(&mut self, lines: &[String], known_image_free: bool) {
+        if known_image_free {
+            self.previous_frame_has_kitty = false;
+            self.previous_kitty_image_ids.clear();
+            return;
+        }
+        self.previous_frame_has_kitty = lines.iter().any(|line| is_image_line(line));
+        self.previous_kitty_image_ids = Self::pi_collect_kitty_image_ids(lines);
     }
 
     fn pi_delete_kitty_images(&self, ids: &BTreeSet<u32>) -> String {
@@ -982,45 +1187,72 @@ impl<'a> TUI<'a> {
         first_changed: usize,
         last_changed: usize,
         new_lines: &[String],
+        previous_lines: &[String],
+        previous_offset: usize,
     ) -> (usize, usize) {
         let mut expanded_first = first_changed;
         let mut expanded_last = last_changed;
-        for lines in [&self.previous_frame, new_lines] {
-            for index in 0..lines.len() {
-                if extract_kitty_image_ids(&lines[index]).is_empty() {
-                    continue;
-                }
-                let block_end = index
-                    .saturating_add(self.pi_kitty_image_reserved_rows(
-                        lines,
-                        index,
-                        lines.len() - 1,
-                    ))
-                    .saturating_sub(1);
-                if index >= first_changed || (index <= last_changed && block_end >= first_changed) {
-                    expanded_first = expanded_first.min(index);
-                    expanded_last = expanded_last.max(block_end);
-                }
+        for (index, line) in previous_lines.iter().enumerate() {
+            if extract_kitty_image_ids(line).is_empty() {
+                continue;
+            }
+            let block_end = previous_offset
+                .saturating_add(index)
+                .saturating_add(self.pi_kitty_image_reserved_rows(
+                    previous_lines,
+                    index,
+                    previous_lines.len().saturating_sub(1),
+                ))
+                .saturating_sub(1);
+            let absolute_index = previous_offset.saturating_add(index);
+            if absolute_index >= first_changed
+                || (absolute_index <= last_changed && block_end >= first_changed)
+            {
+                expanded_first = expanded_first.min(absolute_index);
+                expanded_last = expanded_last.max(block_end);
+            }
+        }
+        for index in 0..new_lines.len() {
+            if extract_kitty_image_ids(&new_lines[index]).is_empty() {
+                continue;
+            }
+            let block_end = index
+                .saturating_add(self.pi_kitty_image_reserved_rows(
+                    new_lines,
+                    index,
+                    new_lines.len().saturating_sub(1),
+                ))
+                .saturating_sub(1);
+            if index >= first_changed || (index <= last_changed && block_end >= first_changed) {
+                expanded_first = expanded_first.min(index);
+                expanded_last = expanded_last.max(block_end);
             }
         }
         (expanded_first, expanded_last)
     }
 
-    fn pi_delete_changed_kitty_images(&self, first_changed: usize, last_changed: usize) -> String {
-        if last_changed < first_changed {
+    fn pi_delete_changed_kitty_images(
+        &self,
+        first_changed: usize,
+        last_changed: usize,
+        previous_lines: &[String],
+        previous_offset: usize,
+    ) -> String {
+        if last_changed < first_changed || previous_lines.is_empty() {
+            return String::new();
+        }
+        let first = first_changed
+            .max(previous_offset)
+            .saturating_sub(previous_offset);
+        let last = last_changed
+            .saturating_sub(previous_offset)
+            .min(previous_lines.len().saturating_sub(1));
+        if first > last {
             return String::new();
         }
         let mut ids = BTreeSet::new();
-        let Some(max_line) = self
-            .previous_frame
-            .len()
-            .checked_sub(1)
-            .map(|last| last.min(last_changed))
-        else {
-            return String::new();
-        };
-        for index in first_changed..=max_line {
-            ids.extend(extract_kitty_image_ids(&self.previous_frame[index]));
+        for line in &previous_lines[first..=last] {
+            ids.extend(extract_kitty_image_ids(line));
         }
         self.pi_delete_kitty_images(&ids)
     }
@@ -2104,17 +2336,50 @@ impl<'a> TUI<'a> {
     }
 }
 
-fn extract_pi_cursor_position(lines: &mut [String], height: usize) -> Option<(usize, usize)> {
-    let viewport_top = lines.len().saturating_sub(height);
-    for row in (viewport_top..lines.len()).rev() {
-        let Some(marker) = lines[row].find(CURSOR_MARKER) else {
-            continue;
-        };
-        let column = visible_width(&lines[row][..marker]);
-        lines[row].replace_range(marker..marker + CURSOR_MARKER.len(), "");
-        return Some((row, column));
+fn extract_logical_cursor_position_from(
+    lines: &mut [String],
+    row_offset: usize,
+) -> Option<LogicalCursorPosition> {
+    let mut cursor = None;
+    for (local_row, line) in lines.iter_mut().enumerate() {
+        while let Some(marker) = line.find(CURSOR_MARKER) {
+            cursor = Some(LogicalCursorPosition {
+                row: row_offset.saturating_add(local_row),
+                column: visible_width(&line[..marker]),
+            });
+            line.replace_range(marker..marker + CURSOR_MARKER.len(), "");
+        }
     }
-    None
+    cursor
+}
+
+fn pi_cursor_position(
+    cursor: Option<LogicalCursorPosition>,
+    total_lines: usize,
+    height: usize,
+) -> Option<(usize, usize)> {
+    let viewport_top = total_lines.saturating_sub(height);
+    cursor
+        .filter(|cursor| cursor.row >= viewport_top && cursor.row < total_lines)
+        .map(|cursor| (cursor.row, cursor.column))
+}
+
+fn extended_cursor_position(
+    cursor: Option<LogicalCursorPosition>,
+    total_lines: usize,
+    width: u16,
+    height: u16,
+) -> Option<(u16, u16)> {
+    let viewport_start = total_lines.saturating_sub(usize::from(height));
+    let max_column = usize::from(width.saturating_sub(1));
+    cursor
+        .filter(|cursor| cursor.row >= viewport_start && cursor.row < total_lines)
+        .map(|cursor| {
+            (
+                (cursor.row - viewport_start) as u16,
+                cursor.column.min(max_column) as u16,
+            )
+        })
 }
 
 fn signed_difference(left: usize, right: usize) -> i64 {
@@ -2210,7 +2475,8 @@ fn ensure_plain_line(line: &str, width: u16) -> String {
 
 fn extract_cursor_position(lines: &mut [String], width: u16, height: u16) -> Option<(u16, u16)> {
     let total_lines = lines.len();
-    extract_cursor_position_from(lines, 0, total_lines, width, height)
+    let cursor = extract_logical_cursor_position_from(lines, 0);
+    extended_cursor_position(cursor, total_lines, width, height)
 }
 
 fn extract_cursor_position_from(
@@ -2220,20 +2486,8 @@ fn extract_cursor_position_from(
     width: u16,
     height: u16,
 ) -> Option<(u16, u16)> {
-    let viewport_start = total_lines.saturating_sub(usize::from(height));
-    let max_column = usize::from(width.saturating_sub(1));
-    let mut cursor = None;
-    for (local_row, line) in lines.iter_mut().enumerate() {
-        let row = row_offset.saturating_add(local_row);
-        while let Some(offset) = line.find(CURSOR_MARKER) {
-            let column = visible_width(&line[..offset]).min(max_column) as u16;
-            line.replace_range(offset..offset + CURSOR_MARKER.len(), "");
-            if row >= viewport_start {
-                cursor = Some(((row - viewport_start) as u16, column));
-            }
-        }
-    }
-    cursor
+    let cursor = extract_logical_cursor_position_from(lines, row_offset);
+    extended_cursor_position(cursor, total_lines, width, height)
 }
 
 #[cfg(test)]
@@ -2394,6 +2648,31 @@ mod tests {
             Some(FrameUpdate {
                 stable_prefix: self.stable_prefix,
                 replacement: vec![self.tail.borrow().clone()],
+                pinned: None,
+                resize_replay: None,
+                reanchor_viewport: false,
+                rebuild_scrollback: false,
+            })
+        }
+
+        fn invalidate(&mut self) {}
+    }
+
+    struct LazyFallbackLines {
+        lines: Rc<RefCell<Vec<String>>>,
+        full_renders: Rc<Cell<usize>>,
+    }
+
+    impl Component for LazyFallbackLines {
+        fn render(&self, _width: u16) -> Vec<String> {
+            self.full_renders.set(self.full_renders.get() + 1);
+            self.lines.borrow().clone()
+        }
+
+        fn render_update(&self, _width: u16) -> Option<FrameUpdate> {
+            Some(FrameUpdate {
+                stable_prefix: 0,
+                replacement: self.lines.borrow().clone(),
                 pinned: None,
                 resize_replay: None,
                 reanchor_viewport: false,
@@ -3000,6 +3279,96 @@ mod tests {
         assert_eq!(tui.inline_committed_rows, 2);
         assert_eq!(tui.inline_window_top, 4);
         assert_eq!(tui.inline_bottom_row, 3);
+    }
+
+    #[test]
+    fn pi_lazy_update_does_not_render_or_compare_stable_history() {
+        const HISTORY: usize = 100_000;
+        const RESET: &str = "\x1b[0m\x1b]8;;\x07";
+        let size = Rc::new(Cell::new((80, 24)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let tail = Rc::new(RefCell::new("new mutable tail".to_owned()));
+        let full_renders = Rc::new(Cell::new(0));
+        let replacement_rows = Rc::new(Cell::new(0));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.add_child(Box::new(LazyTail {
+            stable_prefix: HISTORY,
+            tail,
+            full_renders: full_renders.clone(),
+            replacement_rows,
+        }));
+        tui.previous_frame = (0..HISTORY)
+            .map(|index| format!("historic row {index}{RESET}"))
+            .chain(std::iter::once(format!("old mutable tail{RESET}")))
+            .collect();
+        tui.previous_size = Some((80, 24));
+        tui.previous_viewport_top = HISTORY + 1 - 24;
+        tui.hardware_cursor_row = HISTORY;
+        tui.first_render = false;
+        tui.running = true;
+
+        tui.request_render();
+
+        let output = writes.borrow().join("");
+        assert_eq!(full_renders.get(), 0, "the full component renderer ran");
+        assert_eq!(
+            tui.last_pi_lazy_inspected_rows, 2,
+            "stable history was inspected"
+        );
+        assert!(output.contains("new mutable tail"), "{output:?}");
+        assert!(
+            !output.contains("historic row"),
+            "stable history was emitted"
+        );
+    }
+
+    #[test]
+    fn pi_lazy_updates_with_kitty_use_the_full_component_path() {
+        const KITTY_IMAGE: &str = "\x1b_Ga=T,f=100,i=9,s=1,v=1,c=1,r=2;AAAA\x1b\\";
+        let size = Rc::new(Cell::new((40, 8)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::TrueColor,
+            true,
+        );
+        let (terminal, _, _, _, _, writes) = recording_terminal(size, capabilities);
+        let lines = Rc::new(RefCell::new(vec!["before".to_owned()]));
+        let full_renders = Rc::new(Cell::new(0));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.add_child(Box::new(LazyFallbackLines {
+            lines: lines.clone(),
+            full_renders: full_renders.clone(),
+        }));
+
+        tui.start();
+        assert_eq!(full_renders.get(), 1);
+        writes.borrow_mut().clear();
+
+        *lines.borrow_mut() = vec![KITTY_IMAGE.to_owned(), String::new()];
+        tui.request_render();
+        assert_eq!(
+            full_renders.get(),
+            2,
+            "new images must reject the lazy seam"
+        );
+        assert!(writes.borrow().join("").contains(KITTY_IMAGE));
+        assert!(tui.previous_frame_has_kitty);
+        writes.borrow_mut().clear();
+
+        *lines.borrow_mut() = vec!["after".to_owned()];
+        tui.request_render();
+        assert_eq!(
+            full_renders.get(),
+            3,
+            "old images must reject the lazy seam"
+        );
+        let output = writes.borrow().join("");
+        assert!(output.contains(&delete_kitty_image(9)), "{output:?}");
+        assert!(output.contains("after"), "{output:?}");
+        assert!(!tui.previous_frame_has_kitty);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Composer-adjacent slash, mention, and queued-steering overlays.
 
-use sexy_tui_rs::{truncate_to_width, visible_width, wrap_text_with_ansi};
+use sexy_tui_rs::{truncate_to_width, visible_width};
 
 use super::{activity_elbow, fit_line, semantic_separator, ShellState, ACTIVITY_DETAIL_INDENT};
 use crate::commands;
@@ -90,9 +90,7 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
 fn suggestion_key_hint(state: &ShellState, key: &str, label: &str) -> String {
     format!(
         "{} {}",
-        state
-            .theme
-            .bold(&state.theme.model_fg(state.model_lab, key)),
+        state.theme.bold(&state.theme.fg("accent", key)),
         state.theme.fg("muted", label)
     )
 }
@@ -149,6 +147,10 @@ pub(super) fn render_slash_suggestions(
         return Vec::new();
     }
 
+    let layout = crate::tui::layout::PresentationLayout::new(&state.theme, width);
+    let popup_width = layout.content_width;
+    let popup_prefix = " ".repeat(usize::from(layout.inset));
+
     // Keep one compact hint row below the choices. Moving the metadata to the
     // footer makes autocomplete read as an inline continuation of the composer
     // rather than a second panel with its own heading.
@@ -185,8 +187,8 @@ pub(super) fn render_slash_suggestions(
         .unwrap_or(1)
         .min(30)
         .min(
-            usize::from(width)
-                .saturating_sub(2 + marker_width + 1)
+            usize::from(popup_width)
+                .saturating_sub(marker_width + 1)
                 .max(1),
         );
     let mut lines = Vec::with_capacity(end.saturating_sub(start) + 1);
@@ -218,34 +220,30 @@ pub(super) fn render_slash_suggestions(
         );
         let choice = format!("{prefix} {label}");
         let choice = if selected_row {
-            state
-                .theme
-                .bold(&state.theme.model_fg(state.model_lab, &choice))
+            state.theme.bold(&state.theme.fg("accent", &choice))
         } else {
             state.theme.fg("foreground", &choice)
         };
-        let fixed_width = 2 + marker_width + 1 + label_width;
-        let description_width = usize::from(width).saturating_sub(fixed_width + 2);
+        let fixed_width = marker_width + 1 + label_width;
+        let description_width = usize::from(popup_width).saturating_sub(fixed_width + 2);
         let description = sexy_tui_rs::truncate_to_width(
             &command.description,
             description_width,
             Some(if state.theme.unicode() { "…" } else { "..." }),
         );
         let row = if description.is_empty() {
-            format!("  {choice}")
+            choice
         } else {
-            format!("  {choice}  {}", state.theme.fg("muted", &description))
+            format!("{choice}  {}", state.theme.fg("muted", &description))
         };
-        lines.push(fit_line(&row, width));
+        lines.push(fit_line(
+            &format!("{popup_prefix}{}", fit_line(&row, popup_width)),
+            width,
+        ));
     }
-    lines.push(slash_suggestion_footer(
-        state,
-        width,
-        start,
-        end,
-        suggestions.len(),
-        item_rows,
-    ));
+    let footer =
+        slash_suggestion_footer(state, popup_width, start, end, suggestions.len(), item_rows);
+    lines.push(fit_line(&format!("{popup_prefix}{footer}"), width));
     lines
 }
 
@@ -308,9 +306,7 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
         };
         let choice = format!("{prefix} {path}");
         let choice = if index == 0 {
-            state
-                .theme
-                .bold(&state.theme.model_fg(state.model_lab, &choice))
+            state.theme.bold(&state.theme.fg("accent", &choice))
         } else {
             state.theme.fg("muted", &choice)
         };
@@ -342,14 +338,13 @@ pub(super) fn render_input_suggestions(
     }
 }
 
-fn steering_message_rows(state: &ShellState, message: &str, content_width: usize) -> Vec<String> {
-    let safe = super::sanitize_for_terminal(message);
-    let newline_marker = if state.theme.unicode() {
-        " ↵\n"
+fn steering_preview_text(state: &ShellState, message: &str) -> String {
+    let marker = if state.theme.unicode() {
+        " ↵ "
     } else {
-        " /\n"
+        " / "
     };
-    wrap_text_with_ansi(&safe.replace('\n', newline_marker), content_width.max(1))
+    super::sanitize_for_terminal(message).replace('\n', marker)
 }
 
 fn clipped_steering_content(state: &ShellState, content: &str, width: usize) -> String {
@@ -375,12 +370,13 @@ pub(super) fn render_pending_steering(
         return Vec::new();
     }
 
+    let max_rows = max_rows.min(crate::tui::layout::MAX_STEERING_PREVIEW_ROWS);
     let count = state.steering_queue.len();
     let heading = if count == 1 {
-        format!("Steering prompt{}queued", semantic_separator(&state.theme))
+        format!("Steering{}queued", semantic_separator(&state.theme))
     } else {
         format!(
-            "Steering prompts{}{} queued",
+            "Steering{}{} queued",
             semantic_separator(&state.theme),
             count
         )
@@ -388,105 +384,45 @@ pub(super) fn render_pending_steering(
     let mut lines = vec![fit_line(
         &format!(
             "{ACTIVITY_DETAIL_INDENT}{}",
-            state.theme.bold(&state.theme.fg("model_accent", &heading))
+            state
+                .theme
+                .bold(&state.theme.model_fg(state.model_lab, &heading))
         ),
         width,
     )];
-    let item_rows = max_rows.saturating_sub(1);
-    if item_rows == 0 {
+    if max_rows == 1 {
         return lines;
     }
 
     let elbow = activity_elbow(&state.theme);
     let plain_prefix = format!("{ACTIVITY_DETAIL_INDENT}{elbow} ");
-    let prefix_width = visible_width(&plain_prefix);
-    let content_width = usize::from(width).saturating_sub(prefix_width).max(1);
-    let first_prefix = format!(
+    let prefix = format!(
         "{ACTIVITY_DETAIL_INDENT}{} ",
-        state.theme.fg("model_accent", elbow)
+        state.theme.model_fg(state.model_lab, elbow)
     );
-    let continuation = " ".repeat(prefix_width);
-    let wrapped = state
-        .steering_queue
-        .iter()
-        .map(|message| steering_message_rows(state, &message.display, content_width))
-        .collect::<Vec<_>>();
-    let total_message_rows = wrapped.iter().map(Vec::len).sum::<usize>();
-
-    let needs_overflow = total_message_rows > item_rows;
-    // On a severely constrained viewport, showing one useful preview is better
-    // than spending the only item row restating the count already in the heading.
-    let summary_rows = usize::from(needs_overflow && item_rows > 1);
-    let content_budget = item_rows.saturating_sub(summary_rows);
-    let visible_messages = wrapped.len().min(content_budget);
-    let mut allocations = vec![0usize; visible_messages];
-
-    // Every visible prompt gets a preview before any one prompt claims a second
-    // row. Extra rows are then shared round-robin in queue order.
-    allocations.fill(1);
-    let mut unallocated = content_budget.saturating_sub(visible_messages);
-    while unallocated > 0 {
-        let mut made_progress = false;
-        for (index, allocation) in allocations.iter_mut().enumerate() {
-            if *allocation < wrapped[index].len() {
-                *allocation += 1;
-                unallocated -= 1;
-                made_progress = true;
-                if unallocated == 0 {
-                    break;
-                }
-            }
-        }
-        if !made_progress {
-            break;
-        }
-    }
-
-    let mut clipped_messages = 0usize;
-    for (message_index, allocation) in allocations.iter().copied().enumerate() {
-        let message_rows = &wrapped[message_index];
-        let clipped = allocation < message_rows.len();
-        clipped_messages += usize::from(clipped);
-        for (row_index, content) in message_rows.iter().take(allocation).enumerate() {
-            let content = if clipped && row_index + 1 == allocation {
-                clipped_steering_content(state, content, content_width)
-            } else {
-                content.clone()
-            };
-            let prefix = if row_index == 0 {
-                first_prefix.as_str()
-            } else {
-                continuation.as_str()
-            };
-            lines.push(fit_line(
-                &format!("{prefix}{}", state.theme.fg("muted", &content)),
-                width,
-            ));
-        }
-    }
-
-    let hidden_messages = wrapped.len().saturating_sub(visible_messages);
-    if summary_rows > 0 {
-        let mut details = Vec::with_capacity(2);
-        if clipped_messages > 0 {
-            details.push(format!(
-                "{clipped_messages} prompt{} clipped",
-                if clipped_messages == 1 { "" } else { "s" }
-            ));
-        }
-        if hidden_messages > 0 {
-            details.push(format!("{hidden_messages} more queued"));
-        }
-        let ellipsis = if state.theme.unicode() { "…" } else { "..." };
-        lines.push(fit_line(
-            &state.theme.dim(&format!(
-                "{ACTIVITY_DETAIL_INDENT}{ellipsis} {}",
-                details.join(semantic_separator(&state.theme))
-            )),
-            width,
-        ));
-    }
-
-    debug_assert!(lines.len() <= max_rows);
+    let hidden = count.saturating_sub(1);
+    let hidden_suffix = if hidden == 0 {
+        String::new()
+    } else {
+        format!("{}+{hidden} more", semantic_separator(&state.theme))
+    };
+    let available = usize::from(width)
+        .saturating_sub(visible_width(&plain_prefix))
+        .max(1);
+    let preview_budget = available.saturating_sub(visible_width(&hidden_suffix));
+    let preview = steering_preview_text(state, &state.steering_queue[0].display);
+    let preview = if visible_width(&preview) > preview_budget {
+        clipped_steering_content(state, &preview, preview_budget)
+    } else {
+        preview
+    };
+    lines.push(fit_line(
+        &format!(
+            "{prefix}{}{}",
+            state.theme.fg("muted", &preview),
+            state.theme.fg("muted", &hidden_suffix),
+        ),
+        width,
+    ));
     lines
 }

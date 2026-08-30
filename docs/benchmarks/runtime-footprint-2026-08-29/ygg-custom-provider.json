@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "providers": {
+    "benchmark": {
+      "label": "Benchmark placeholder",
+      "base_url": "http://127.0.0.1:9/v1/",
+      "auth": { "kind": "none" },
+      "auto_discover": false,
+      "models": [
+        {
+          "api_name": "idle",
+          "context_window": 8192,
+          "max_output_tokens": 1024,
+          "tools": false,
+          "parallel_tool_calls": false,
+          "vision": false,
+          "structured_output": false,
+          "reasoning": false
+        }
+      ]
+    }
+  }
+}

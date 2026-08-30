@@ -24,6 +24,8 @@ const EVENT_DOT_TOGGLE_INTERVAL: Duration = Duration::from_millis(500);
 /// The optional braille spinner and model-adaptive status shimmer share one
 /// bounded renderer-thread cadence.
 const STATUS_ANIMATION_INTERVAL: Duration = Duration::from_millis(80);
+/// Root-run elapsed status changes only at whole-second boundaries.
+const STATUS_TIMER_INTERVAL: Duration = Duration::from_secs(1);
 /// Resize events are normally delivered by crossterm, but polling while idle
 /// also catches terminal-manager resizes that do not emit an event.
 const RESIZE_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -66,6 +68,10 @@ pub(super) fn thinking_spinner_animating(state: &ShellState) -> bool {
 pub(super) fn status_shimmer_animating(state: &ShellState) -> bool {
     let capabilities = state.theme.capabilities();
     capabilities.animation && capabilities.interactive && state.has_active_status_shimmer()
+}
+
+pub(super) fn status_timer_active(state: &ShellState) -> bool {
+    state.theme.capabilities().interactive && state.has_active_status_timer()
 }
 
 fn render_wake_requires_frame(
@@ -162,17 +168,25 @@ pub(super) fn render_loop(
     let mut last_render: Option<Instant> = None;
     let mut last_event_dot_toggle = Instant::now();
     let mut last_status_animation = Instant::now();
+    let mut last_status_timer_update = Instant::now();
     loop {
         // The welcome card uses the terminal-frame wake; active status text
         // sleeps until its own 80 ms frame. Model, tool, and input events still
         // preempt either timer immediately.
-        let (welcome, event_dot, thinking_spinner, status_shimmer) = {
+        let (welcome, event_dot, thinking_spinner, status_shimmer, status_timer) = {
             let shell = state.borrow();
             let welcome = welcome_animating(&shell, Instant::now());
             let event_dot = event_dot_animating(&shell);
             let thinking_spinner = thinking_spinner_animating(&shell);
             let status_shimmer = status_shimmer_animating(&shell);
-            (welcome, event_dot, thinking_spinner, status_shimmer)
+            let status_timer = status_timer_active(&shell);
+            (
+                welcome,
+                event_dot,
+                thinking_spinner,
+                status_shimmer,
+                status_timer,
+            )
         };
         if !event_dot {
             last_event_dot_toggle = Instant::now();
@@ -180,6 +194,9 @@ pub(super) fn render_loop(
         let status_animation = thinking_spinner || status_shimmer;
         if !status_animation {
             last_status_animation = Instant::now();
+        }
+        if !status_timer {
+            last_status_timer_update = Instant::now();
         }
         let poll = render_poll_interval(welcome, status_animation);
         let command = match rx.recv_timeout(poll) {
@@ -200,12 +217,14 @@ pub(super) fn render_loop(
             event_dot && last_event_dot_toggle.elapsed() >= EVENT_DOT_TOGGLE_INTERVAL;
         let advance_status_animation =
             status_animation && last_status_animation.elapsed() >= STATUS_ANIMATION_INTERVAL;
+        let advance_status_timer =
+            status_timer && last_status_timer_update.elapsed() >= STATUS_TIMER_INTERVAL;
         let semantic_command = matches!(command, Some(RenderCommand::Render));
         if !render_wake_requires_frame(
             semantic_command,
             resized,
             welcome,
-            advance_event_dot || advance_status_animation,
+            advance_event_dot || advance_status_animation || advance_status_timer,
         ) {
             continue;
         }
@@ -244,7 +263,7 @@ pub(super) fn render_loop(
             break;
         }
 
-        if welcome || advance_event_dot || advance_status_animation {
+        if welcome || advance_event_dot || advance_status_animation || advance_status_timer {
             let mut shell = state.borrow_mut();
             if welcome {
                 shell.invalidate_transcript_layout();
@@ -261,6 +280,10 @@ pub(super) fn render_loop(
                     shell.advance_status_shimmer();
                 }
                 last_status_animation = Instant::now();
+            }
+            if advance_status_timer {
+                shell.advance_status_timer();
+                last_status_timer_update = Instant::now();
             }
         }
         tui.request_render();

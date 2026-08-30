@@ -1,0 +1,433 @@
+{
+  "agents": {
+    "codex": {
+      "concurrency": {
+        "1": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 39.296875,
+            "median": 39.203125,
+            "min": 39.0625,
+            "p95": 39.290625
+          }
+        },
+        "2": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 78.484375,
+            "median": 78.453125,
+            "min": 56.375,
+            "p95": 78.484375
+          }
+        },
+        "4": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 157.046875,
+            "median": 156.90625,
+            "min": 156.453125,
+            "p95": 157.021875
+          }
+        }
+      },
+      "label": "Codex CLI",
+      "runtime": {
+        "cpu_peak_percent": {
+          "count": 9,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "p95": 0.0
+        },
+        "pss_peak_mib": {
+          "count": 0,
+          "max": null,
+          "median": null,
+          "min": null,
+          "p95": null
+        },
+        "rss_peak_mib": {
+          "count": 9,
+          "max": 39.296875,
+          "median": 39.21875,
+          "min": 38.859375,
+          "p95": 39.284375
+        }
+      },
+      "runtime_mode": "codex_app_server",
+      "startup_version_case_ms": {
+        "count": 9,
+        "max": 49.565458,
+        "median": 12.170625,
+        "min": 11.695583,
+        "p95": 34.64724159999999
+      }
+    },
+    "opencode": {
+      "concurrency": {
+        "1": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 39.0,
+            "median": 35.0,
+            "min": 23.7,
+            "p95": 38.48
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 413.140625,
+            "median": 384.6875,
+            "min": 383.65625,
+            "p95": 403.653125
+          }
+        },
+        "2": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 42.7,
+            "median": 27.2,
+            "min": 3.1,
+            "p95": 40.18
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 789.890625,
+            "median": 774.421875,
+            "min": 384.609375,
+            "p95": 788.328125
+          }
+        },
+        "4": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 40.0,
+            "median": 20.2,
+            "min": 17.099999999999998,
+            "p95": 38.519999999999996
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 1565.6875,
+            "median": 1554.6875,
+            "min": 1526.703125,
+            "p95": 1565.1875
+          }
+        }
+      },
+      "label": "OpenCode",
+      "runtime": {
+        "cpu_peak_percent": {
+          "count": 9,
+          "max": 43.2,
+          "median": 36.2,
+          "min": 3.2,
+          "p95": 41.64
+        },
+        "pss_peak_mib": {
+          "count": 0,
+          "max": null,
+          "median": null,
+          "min": null,
+          "p95": null
+        },
+        "rss_peak_mib": {
+          "count": 9,
+          "max": 412.78125,
+          "median": 385.15625,
+          "min": 383.734375,
+          "p95": 403.39374999999995
+        }
+      },
+      "runtime_mode": "opencode_acp",
+      "startup_version_case_ms": {
+        "count": 9,
+        "max": 398.135875,
+        "median": 239.141375,
+        "min": 232.678875,
+        "p95": 354.0424918
+      }
+    },
+    "pi": {
+      "concurrency": {
+        "1": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 124.84375,
+            "median": 123.609375,
+            "min": 123.40625,
+            "p95": 124.5
+          }
+        },
+        "2": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 255.796875,
+            "median": 254.421875,
+            "min": 247.203125,
+            "p95": 255.65312500000002
+          }
+        },
+        "4": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 516.765625,
+            "median": 505.359375,
+            "min": 492.953125,
+            "p95": 516.615625
+          }
+        }
+      },
+      "label": "Pi",
+      "runtime": {
+        "cpu_peak_percent": {
+          "count": 9,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "p95": 0.0
+        },
+        "pss_peak_mib": {
+          "count": 0,
+          "max": null,
+          "median": null,
+          "min": null,
+          "p95": null
+        },
+        "rss_peak_mib": {
+          "count": 9,
+          "max": 123.90625,
+          "median": 123.703125,
+          "min": 123.46875,
+          "p95": 123.89375000000001
+        }
+      },
+      "runtime_mode": "pi_rpc",
+      "startup_version_case_ms": {
+        "count": 9,
+        "max": 314.979167,
+        "median": 199.0045,
+        "min": 190.202584,
+        "p95": 270.8769834
+      }
+    },
+    "ygg": {
+      "concurrency": {
+        "1": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 7.53125,
+            "median": 7.5,
+            "min": 7.46875,
+            "p95": 7.51875
+          }
+        },
+        "2": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 15.109375,
+            "median": 15.0625,
+            "min": 15.03125,
+            "p95": 15.103125
+          }
+        },
+        "4": {
+          "cpu_peak_percent": {
+            "count": 9,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "p95": 0.0
+          },
+          "pss_peak_mib": {
+            "count": 0,
+            "max": null,
+            "median": null,
+            "min": null,
+            "p95": null
+          },
+          "rss_peak_mib": {
+            "count": 9,
+            "max": 30.328125,
+            "median": 30.1875,
+            "min": 30.125,
+            "p95": 30.290625
+          }
+        }
+      },
+      "label": "Ygg",
+      "runtime": {
+        "cpu_peak_percent": {
+          "count": 9,
+          "max": 0.0,
+          "median": 0.0,
+          "min": 0.0,
+          "p95": 0.0
+        },
+        "pss_peak_mib": {
+          "count": 0,
+          "max": null,
+          "median": null,
+          "min": null,
+          "p95": null
+        },
+        "rss_peak_mib": {
+          "count": 9,
+          "max": 7.53125,
+          "median": 7.515625,
+          "min": 5.265625,
+          "p95": 7.53125
+        }
+      },
+      "runtime_mode": "ygg_rpc",
+      "startup_version_case_ms": {
+        "count": 9,
+        "max": 5.193542,
+        "median": 4.83125,
+        "min": 4.678916,
+        "p95": 5.127392
+      }
+    }
+  },
+  "date": "2026-08-29",
+  "schema": "ygg.runtime-footprint-summary.v1",
+  "statistics": "median and linearly interpolated p95 across 9 per-run values",
+  "units": {
+    "cpu": "percent",
+    "pss": "MiB",
+    "rss": "MiB",
+    "startup": "ms"
+  }
+}

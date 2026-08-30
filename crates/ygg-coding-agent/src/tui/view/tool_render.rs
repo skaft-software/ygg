@@ -1,6 +1,8 @@
 //! Shared tool-output classification, alignment, and compact terminal rendering.
 
-use sexy_tui_rs::{visible_width, DiffRenderOptions, RichRenderer, UnifiedDiff};
+use sexy_tui_rs::{
+    truncate_to_width, visible_width, DiffLineKind, DiffRenderOptions, RichRenderer, UnifiedDiff,
+};
 
 use super::terminal_text::sanitize_for_terminal;
 use super::{
@@ -67,8 +69,14 @@ fn compute_tool_diff(panel: &ToolPanel) -> Option<String> {
     None
 }
 
-/// Minimum width reserved for the tool label before its value/output column.
+/// Minimum content width reserved for a tool label. Short labels retain the
+/// compact release rhythm; longer labels expand only enough to keep a two-cell
+/// separation from their value.
 const TOOL_VALUE_MIN_WIDTH: usize = 6;
+
+/// Keep extension-defined labels useful without allowing an arbitrary tool
+/// name to consume the entire row before its value begins.
+const TOOL_LABEL_MAX_WIDTH: usize = 18;
 
 pub(crate) fn tool_display_label(name: &str) -> String {
     match name {
@@ -89,6 +97,10 @@ pub(crate) fn tool_display_label(name: &str) -> String {
     }
 }
 
+pub(super) fn tool_grid_label(label: &str) -> String {
+    truncate_to_width(label, TOOL_LABEL_MAX_WIDTH, Some("…"))
+}
+
 pub(super) fn tool_value_indent_width(label: &str) -> usize {
     TOOL_VALUE_MIN_WIDTH.max(visible_width(label).saturating_add(2))
 }
@@ -97,8 +109,81 @@ pub(super) fn tool_value_indent(label: &str) -> String {
     " ".repeat(tool_value_indent_width(label))
 }
 
+pub(super) fn bounded_tool_failure_reason(panel: &ToolPanel) -> Option<String> {
+    panel
+        .failure_reason
+        .as_deref()
+        .map(sanitize_for_terminal)
+        .map(|reason| crate::presentation::concise_line(&reason))
+}
+
+pub(super) fn render_tool_failure_reason(
+    panel: &ToolPanel,
+    theme: &YggTheme,
+    width: u16,
+    output_indent: &str,
+) -> Vec<String> {
+    let Some(reason) = bounded_tool_failure_reason(panel) else {
+        return Vec::new();
+    };
+    wrap_hanging(
+        &theme.fg("error", &reason),
+        output_indent,
+        output_indent,
+        width,
+    )
+}
+
 /// Max diff lines to show in terse mode before truncating.
 const COMPACT_DIFF_LINES: usize = 10;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum DiffRemainder {
+    #[default]
+    None,
+    Lines(usize),
+    Unknown,
+}
+
+fn diff_remainder(diff: &UnifiedDiff) -> (DiffRemainder, UnifiedDiff) {
+    let mut remainder = DiffRemainder::None;
+    let mut retained = Vec::with_capacity(diff.lines.len());
+    for line in &diff.lines {
+        if line.kind != DiffLineKind::Metadata {
+            retained.push(line.clone());
+            continue;
+        }
+
+        let text = line.text.trim();
+        let numeric = text
+            .strip_prefix('…')
+            .or_else(|| text.strip_prefix("..."))
+            .map(str::trim_start)
+            .and_then(|text| {
+                let mut words = text.split_whitespace();
+                let count = words.next()?.parse::<usize>().ok()?;
+                (words.next()? == "more").then_some(())?;
+                matches!(words.next()?, "line" | "lines").then_some(())?;
+                words.next().is_none().then_some(count)
+            });
+        if let Some(count) = numeric {
+            remainder = match remainder {
+                DiffRemainder::None => DiffRemainder::Lines(count),
+                DiffRemainder::Lines(existing) => {
+                    DiffRemainder::Lines(existing.saturating_add(count))
+                }
+                DiffRemainder::Unknown => DiffRemainder::Unknown,
+            };
+            continue;
+        }
+        if text.contains("unified diff truncated; remaining content omitted") {
+            remainder = DiffRemainder::Unknown;
+            continue;
+        }
+        retained.push(line.clone());
+    }
+    (remainder, UnifiedDiff { lines: retained })
+}
 
 /// Render an edit/write diff. Long diffs are truncated in terse mode.
 pub(super) fn render_diff_only(
@@ -121,21 +206,38 @@ pub(super) fn render_diff_only(
     let Some(ref diff) = tool_diff(panel) else {
         return Vec::new();
     };
-    let rendered = renderer.render_diff(
-        &UnifiedDiff::parse(diff),
-        width.saturating_sub(output_indent_width),
-        DiffRenderOptions {
-            line_numbers: width >= 70,
-            wrap: true,
-        },
-    );
+    let parsed = UnifiedDiff::parse(diff);
+    let render_width = width.saturating_sub(output_indent_width);
+    let options = DiffRenderOptions {
+        line_numbers: width >= 70,
+        wrap: true,
+    };
+    let rendered = renderer.render_diff(&parsed, render_width, options);
     let mut lines: Vec<String> = rendered.lines.into_iter().map(display_line).collect();
     if !expanded && lines.len() > COMPACT_DIFF_LINES + 1 {
-        let remaining = lines.len() - COMPACT_DIFF_LINES;
+        let (source_remainder, retained) = diff_remainder(&parsed);
+        let hint = match source_remainder {
+            DiffRemainder::None => {
+                let remaining = lines.len() - COMPACT_DIFF_LINES;
+                let unit = if remaining == 1 { "line" } else { "lines" };
+                format!("{remaining} {unit} hidden")
+            }
+            DiffRemainder::Lines(omitted) => {
+                // The tool already summarized part of the source diff. Remove
+                // that summary row before counting the TUI's retained rows,
+                // then fold both layers into one truthful remainder.
+                let retained_rows = renderer.render_diff(&retained, render_width, options).lines;
+                let remaining = retained_rows
+                    .len()
+                    .saturating_sub(COMPACT_DIFF_LINES)
+                    .saturating_add(omitted);
+                let unit = if remaining == 1 { "line" } else { "lines" };
+                format!("{remaining} {unit} hidden")
+            }
+            DiffRemainder::Unknown => "more diff content hidden".to_owned(),
+        };
         lines.truncate(COMPACT_DIFF_LINES);
-        let unit = if remaining == 1 { "line" } else { "lines" };
-        let hint = format!("{output_indent}{remaining} {unit} hidden");
-        lines.push(subdued_text(theme, &hint));
+        lines.push(subdued_text(theme, &format!("{output_indent}{hint}")));
     }
     lines
 }
