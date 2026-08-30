@@ -11,6 +11,9 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+/// Default maximum bytes retained for each model-visible tool result.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+
 /// Capability gates and resource limits enforced by the agent's tools.
 ///
 /// `workspace` is canonicalized once by [`Agent::new`](crate::Agent::new) and
@@ -57,7 +60,7 @@ pub struct SandboxConfig {
 impl SandboxConfig {
     /// Creates a conservative library configuration rooted at `workspace`:
     /// workspace-only paths, no edits, no process, shell, or remote-read
-    /// authority, a 120s execution timeout, and a 16 KiB per-tool output cap.
+    /// authority, a 120s execution timeout, and a 50 KiB per-tool output cap.
     /// Hosts may enable capabilities or trusted-local path access through the
     /// public fields.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
@@ -71,7 +74,7 @@ impl SandboxConfig {
             allow_remote_read: false,
             shell_path: None,
             bash_timeout: Duration::from_secs(120),
-            max_output_bytes: 16 * 1024,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -246,6 +249,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         (dir, canonical)
+    }
+
+    #[test]
+    fn default_tool_output_limit_is_50_kib() {
+        let (_dir, ws) = workspace();
+        assert_eq!(SandboxConfig::new(ws).max_output_bytes, 50 * 1024);
     }
 
     #[test]

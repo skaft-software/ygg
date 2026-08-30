@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ygg_agent::{EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS};
+use ygg_agent::{
+    EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
+};
 
 pub use crate::tui::terminal::ColorMode;
 use ygg_ai::{
@@ -107,7 +109,7 @@ impl Default for SandboxPolicy {
             allow_remote_read: false,
             shell_path: None,
             bash_timeout_secs: 120,
-            max_output_bytes: 16 * 1024,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -606,9 +608,11 @@ mod tests {
         assert!(policy.allow_process);
         assert!(policy.allow_shell);
         assert!(!policy.allow_remote_read);
+        assert_eq!(policy.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         let sandbox = policy.to_sandbox_config(directory.path());
         assert!(sandbox.allow_external_paths);
         assert!(!sandbox.allow_remote_read);
+        assert_eq!(sandbox.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
 
     #[test]
