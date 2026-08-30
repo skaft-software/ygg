@@ -7,7 +7,7 @@
 <h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>Local-first coding agent with durable, inspectable sessions.</strong><br>
+  <strong>A tiny, precise and fast coding agent.</strong><br>
   Model choice, explicit control, and verifiable engineering in one Rust CLI.
 </p>
 
