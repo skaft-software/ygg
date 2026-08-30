@@ -1,0 +1,14 @@
+# Direct runtime dependencies for Python 3.12.
+# The evaluator implementation itself is pinned by its immutable Git commit.
+docker==7.2.0
+pyarrow==25.0.1
+datasets==5.0.1
+python-dotenv==1.2.3
+unidiff==1.0.0
+requests==2.34.2
+GitPython==3.1.61
+rich==15.0.0
+tqdm==4.70.0
+# Install the evaluator checkout at EVALUATOR_COMMIT separately when a local
+# checkout is preferred; this URL is the immutable fallback.
+swebench @ git+https://github.com/microsoft/SWE-bench-Live.git@ad79b850f15e33992e96f03f6e97f05ddf9aa0be

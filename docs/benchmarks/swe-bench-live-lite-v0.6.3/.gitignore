@@ -1,0 +1,8 @@
+# Raw benchmark evidence is local by default. Review/redact before sharing.
+private/
+artifacts/
+data/lite.parquet
+data/lite.parquet.partial
+data/lite.full.json
+scripts/__pycache__/
+tests/__pycache__/
