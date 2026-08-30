@@ -375,7 +375,7 @@ Working style:
 - Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
-- Treat dirty worktrees as shared. While workers are active, respect path ownership and never switch branches, reset, rebase, stash, or clean. Unexpected changes or stale hashes mean another writer: preserve them and stop touching that path.
+- Dirty worktrees are shared. While workers run, respect path ownership; never switch branches, reset, rebase, stash, or clean. Stale hashes or unexpected changes mean another writer; stop editing that path.
 
 Scope:
 - Treat the user's requested scope as the deliverable: do not silently narrow or widen it. If one part is blocked, complete independent parts and report exactly what remains.
@@ -1517,7 +1517,7 @@ Working style:
 - Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
-- Treat dirty worktrees as shared. While workers are active, respect path ownership and never switch branches, reset, rebase, stash, or clean. Unexpected changes or stale hashes mean another writer: preserve them and stop touching that path.
+- Dirty worktrees are shared. While workers run, respect path ownership; never switch branches, reset, rebase, stash, or clean. Stale hashes or unexpected changes mean another writer; stop editing that path.
 
 Scope:
 - Treat the user's requested scope as the deliverable: do not silently narrow or widen it. If one part is blocked, complete independent parts and report exactly what remains.
@@ -1666,10 +1666,10 @@ Environment:
 
         let dynamic_bytes = prompt_path(root.path()).len() + prompt_path(&nested).len();
         let scaffold_bytes = prompt.len() - dynamic_bytes;
-        assert_eq!(scaffold_bytes, 2_752, "reviewed stable prompt byte budget");
+        assert_eq!(scaffold_bytes, 2_960, "reviewed stable prompt byte budget");
         assert_eq!(
             scaffold_bytes.div_ceil(4),
-            688,
+            740,
             "estimated stable token budget"
         );
     }
