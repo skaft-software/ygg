@@ -344,11 +344,9 @@ pub(crate) fn build_compact_request(
             })
     };
     let parallel_tool_calls = if responses_lite {
-        Some(
-            !tools.is_empty()
-                && model.spec.capabilities.tools
-                && model.spec.capabilities.parallel_tool_calls,
-        )
+        // The internal Responses Lite route requires an explicit false even
+        // when the model otherwise advertises parallel tool-call support.
+        Some(false)
     } else {
         mapped_tools
             .as_ref()
@@ -853,15 +851,10 @@ pub(crate) fn build_request(
             .and_then(|options| options.context_management.clone()),
         tools: tools_opt,
         tool_choice: tool_choice_opt,
-        // Responses Lite requires an explicit value. Honor the advertised
-        // capability when tools are exposed; otherwise send false rather than
-        // relying on a provider default.
+        // The internal Responses Lite route requires an explicit false even
+        // when the model otherwise advertises parallel tool-call support.
         parallel_tool_calls: if responses_lite {
-            Some(
-                !req.tools.is_empty()
-                    && model.spec.capabilities.tools
-                    && model.spec.capabilities.parallel_tool_calls,
-            )
+            Some(false)
         } else {
             (!req.tools.is_empty() && model.spec.capabilities.tools)
                 .then_some(model.spec.capabilities.parallel_tool_calls)
@@ -1786,6 +1779,7 @@ mod tests {
         spec.capabilities.reasoning.as_mut().unwrap().max_effort =
             crate::types::ReasoningEffort::Ultra;
         model.spec = Arc::new(spec);
+        assert!(model.spec.capabilities.parallel_tool_calls);
 
         let mut req = user_req(
             vec![UserPart::Text("Hello".to_owned())],
@@ -1825,7 +1819,7 @@ mod tests {
             "System instructions"
         );
         assert_eq!(body["input"][2]["role"], "user");
-        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["effort"], "max");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert!(body["reasoning"].get("mode").is_none());
