@@ -23,13 +23,27 @@ NODE = shutil.which("node")
 class BridgeProcess:
     """Line-oriented JSON-RPC peer which drains both subprocess pipes."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pi_package: Path = FAKE_PI,
+        extension: Path = FIXTURE_EXTENSION,
+        source_fingerprint: str | None = None,
+    ) -> None:
         if NODE is None:
             raise RuntimeError("node is unavailable")
         environment = os.environ.copy()
-        environment["YGG_PI_PACKAGE"] = str(FAKE_PI)
+        command = [
+            NODE,
+            str(BRIDGE),
+            "--extension",
+            str(extension),
+        ]
+        if source_fingerprint is not None:
+            command.extend(["--source-fingerprint", source_fingerprint])
+        command.extend(["--pi-package", str(pi_package)])
         self.process = subprocess.Popen(
-            [NODE, str(BRIDGE), "--extension", str(FIXTURE_EXTENSION)],
+            command,
             cwd=ROOT,
             env=environment,
             stdin=subprocess.PIPE,
@@ -43,6 +57,7 @@ class BridgeProcess:
         self.stderr: list[str] = []
         self.protocol_errors: list[str] = []
         self.handlers: dict[str, Callable[[dict[str, Any]], Any]] = {}
+        self.initialized = False
         self._condition = threading.Condition()
         self._write_lock = threading.Lock()
         self._next_id = 1
@@ -148,16 +163,22 @@ class BridgeProcess:
                     )
                 self._condition.wait(min(remaining, 0.05))
 
-    def initialize(self, *optional_features: str) -> dict[str, Any]:
+    def initialize(
+        self,
+        *optional_features: str,
+        host: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         response = self.request(
             "initialize",
             {
                 "workspace": str(ROOT),
+                "host": host or {},
                 "protocol": {"optional_features": list(optional_features)},
             },
         )
         if "error" in response:
             raise AssertionError(f"initialize failed: {response}")
+        self.initialized = True
         return response["result"]
 
     def notifications(self) -> list[str]:
@@ -168,11 +189,13 @@ class BridgeProcess:
         ]
 
     def close(self) -> None:
-        if self.process.poll() is None:
+        if self.process.poll() is None and self.initialized:
             try:
                 self.request("shutdown", timeout=1.0)
             except (AssertionError, BrokenPipeError):
                 self.process.terminate()
+        elif self.process.poll() is None:
+            self.process.terminate()
         try:
             self.process.wait(timeout=2.0)
         except subprocess.TimeoutExpired:

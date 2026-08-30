@@ -26,6 +26,7 @@ export function createEventBus() {
 
 export async function discoverAndLoadExtensions(paths) {
   console.log("fixture loader wrote to console.log");
+  process.stdout.write("fixture loader wrote directly to stdout\n");
   const extension = {
     path: paths[0],
     shortcuts: new Map(),
@@ -60,11 +61,16 @@ export class ExtensionRunner {
         if (signal.aborted) throw new Error("aborted fixture prompt");
         return { content: [{ type: "text", text: value ?? "missing" }] };
       }),
+      makeTool("fixture_progress", async (_id, _input, _signal, onUpdate) => {
+        await onUpdate?.({ content: [{ type: "text", text: "halfway" }] });
+        return { content: [{ type: "text", text: "complete" }] };
+      }),
     ];
   }
 
-  bindCore(actions) {
+  bindCore(actions, contextActions) {
     this.actions = actions;
+    this.contextActions = contextActions;
   }
 
   bindCommandContext(context) {
@@ -87,6 +93,7 @@ export class ExtensionRunner {
     return [
       {
         name: "add-tool",
+        description: "Add a dynamic fixture tool",
         handler: async () => {
           this.tools.push(makeTool("fixture_dynamic", async () => ({
             content: [{ type: "text", text: "dynamic" }],
@@ -95,7 +102,48 @@ export class ExtensionRunner {
         },
       },
       {
+        name: "ui-methods",
+        description: "Validate current Pi UI method names",
+        handler: async () => {
+          for (const name of [
+            "editor",
+            "addAutocompleteProvider",
+            "getEditorComponent",
+            "getAllThemes",
+            "getTheme",
+            "setTheme",
+            "getToolsExpanded",
+            "setToolsExpanded",
+          ]) {
+            if (typeof this.ui[name] !== "function") throw new Error(`missing UI method ${name}`);
+          }
+          if (this.ui.theme.fg("accent", "plain") !== "plain") {
+            throw new Error("compatibility theme did not preserve text");
+          }
+          try {
+            this.ui.getEditorComponent();
+            throw new Error("unsupported UI method unexpectedly succeeded");
+          } catch (error) {
+            if (!String(error).includes("Pi compatibility API is not supported by Ygg")) throw error;
+          }
+          this.ui.notify("ui-current-methods-explicit");
+        },
+      },
+      {
+        name: "host-state",
+        description: "Validate host state bindings",
+        handler: async () => {
+          if (this.actions.getSessionName() !== "fixture session") {
+            throw new Error(`unexpected session name ${this.actions.getSessionName()}`);
+          }
+          if (this.actions.getThinkingLevel() !== "high") {
+            throw new Error(`unexpected thinking level ${this.actions.getThinkingLevel()}`);
+          }
+        },
+      },
+      {
         name: "unsupported",
+        description: "Exercise an unsupported session action",
         handler: async (_arguments, context) => context.newSession(),
       },
     ];
@@ -120,13 +168,26 @@ export class ExtensionRunner {
     return [...messages, { role: "user", content: "context event contribution" }];
   }
 
-  async emitToolCall() {
-    return { block: false };
+  async emitToolCall(event) {
+    if (event.input?.mutateNative) event.input.value = "mutated";
+    return {
+      block: false,
+      ...(event.input?.terminate ? { terminate: true } : {}),
+    };
   }
 
   async emitToolResult(event) {
     this.ui.notify(`terminal:tool_result:${event.toolCallId}`);
-    return event;
+    if (event.input?.value === "transform") {
+      return {
+        ...event,
+        content: [{ type: "text", text: "transformed" }],
+        details: { transformed: true },
+        isError: true,
+        usage: { input: 1, output: 2 },
+      };
+    }
+    return undefined;
   }
 
   async emit(event) {
