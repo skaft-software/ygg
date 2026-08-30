@@ -22,6 +22,8 @@ pub enum Command {
     Model(Option<String>),
     Thinking(Option<String>),
     Verbose(Option<bool>),
+    /// Request an immediate final answer without exposing tools.
+    Answer(Option<String>),
     Compact,
     AutoCompact(Option<AutoCompactSetting>),
     Reload,
@@ -148,6 +150,12 @@ const SLASH_COMMANDS: &[SlashCommandSuggestion] = &[
         "thinking",
         "/thinking [level]",
         "set reasoning effort",
+        true
+    ),
+    slash!(
+        "answer",
+        "/answer [instruction]",
+        "answer now from current evidence without tools",
         true
     ),
     slash!("compact", "/compact", "compact conversation context", false),
@@ -369,6 +377,11 @@ pub fn parse(input: &str) -> Command {
     if full_name == "prompt" {
         let argument = body[name.len()..].trim();
         return Command::Prompt((!argument.is_empty()).then(|| argument.to_owned()));
+    }
+
+    if full_name == "answer" {
+        let argument = body[name.len()..].trim();
+        return Command::Answer((!argument.is_empty()).then(|| argument.to_owned()));
     }
 
     if full_name == "name" || full_name == "export" {
@@ -958,6 +971,11 @@ mod tests {
         assert_eq!(parse("/thinking"), Command::Thinking(None));
         assert_eq!(parse("/verbose on"), Command::Verbose(Some(true)));
         assert_eq!(parse("/verbose off"), Command::Verbose(Some(false)));
+        assert_eq!(parse("/answer"), Command::Answer(None));
+        assert_eq!(
+            parse("/answer summarize the verified findings concisely"),
+            Command::Answer(Some("summarize the verified findings concisely".into()))
+        );
         assert_eq!(parse("/compact"), Command::Compact);
         assert_eq!(parse("/auto-compact"), Command::AutoCompact(None));
         assert_eq!(

@@ -68,8 +68,11 @@ without reopening it. The catalog is never a prerequisite for resume.
 
 The stable, model-agnostic base contract gives both local and cloud models an
 explicit completion trajectory: honor answer/investigate/review/plan/implement
-mode; use tools rather than guess; inspect before editing; continue until done
-or concretely blocked; proceed autonomously with local, reversible work while
+mode and treat the latest explicit process constraint as authoritative—an instruction
+to answer now or stop using tools ends further investigation; use tools rather than
+guess when tools remain permitted; inspect before editing; continue while additional
+work can materially improve the requested result; proceed autonomously with local,
+reversible work while
 confirming destructive, hard-to-reverse, outward-facing, or remote/shared-state
 actions that were not explicitly authorized; preserve unrelated work; deliver
 the requested scope without silently narrowing or widening it; make the
@@ -111,6 +114,15 @@ and are wrapped in path-labelled `<project_instructions>` blocks. Active skill
 instructions use labelled blocks with stable IDs and hashes.
 
 ## Compaction and handoff summaries
+
+Before installing the agent policy, bootstrap combines the generic fractional
+threshold with an optional absolute active-context ceiling. Authenticated Codex
+routes default that ceiling to 272,000 tokens even when live discovery advertises
+a larger window; an explicit `compaction.max_active_tokens` replaces the route
+default, and zero disables the absolute cap while leaving
+`threshold_fraction` authoritative. The lower effective threshold is applied on
+initial construction, rebuild, interactive reconfiguration, and RPC toggles, and
+`/context` reports that same effective capacity.
 
 The product pre-request gate and `ygg-agent` overflow recovery share one
 Pi-compatible summarization implementation. Conversation messages are first
@@ -223,6 +235,10 @@ theme discovery are disabled.
 
 - `/model [id]` — pick or select a model.
 - `/thinking [level]` — select a capability-gated reasoning level.
+- `/answer [instruction]` — persist an answer-now steering message and switch the
+  active run to tool-free requests at its next safe boundary; when idle, begin a
+  tool-free run directly. Both paths set `ToolChoice::None` and expose no tool
+  schemas while preserving ordinary session and cancellation semantics.
 - `/verbose [on|off]` — expand/collapse every tool panel.
 - `/compact` — force a compaction attempt.
 - `/reload` — reload AGENTS instructions, prompts, skills, and extensions.
@@ -292,9 +308,10 @@ explicit effort selection likewise supersedes and clears any restored legacy
 Pro bit unless the caller explicitly selected a mode.
 
 Routes advertising Responses Lite use the transport contract implemented by
-`ygg-ai`, including its ordinary and compact request shapes. This product layer
-only discovers and propagates the capability; it does not reconstruct the wire
-format or infer support from the endpoint identity.
+`ygg-ai`, including its ordinary and compact request shapes and advertised
+parallel-tool-call bit. This product layer only discovers and propagates the
+capability; it does not reconstruct the wire format or infer support from the
+endpoint identity.
 
 ## Authentication
 

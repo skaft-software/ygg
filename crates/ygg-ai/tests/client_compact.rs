@@ -303,11 +303,11 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "output": [{"type": "compaction", "encrypted_content": "opaque"}]
         })))
-        .expect(1)
+        .expect(2)
         .mount(&server)
         .await;
 
-    let model = responses_lite_model(&format!("{}/", server.uri()));
+    let mut model = responses_lite_model(&format!("{}/", server.uri()));
     let input = ResponsesInput::new(vec![input_item(serde_json::json!({
         "type": "message",
         "role": "user",
@@ -317,15 +317,16 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
             "detail": "high"
         }]
     }))]);
+    let tools = [ToolDef {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
     let request = ResponsesCompactRequest::for_model(
         &model,
-        input,
+        input.clone(),
         Some("current instructions".into()),
-        &[ToolDef {
-            name: "read".into(),
-            description: "Read a file".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        }],
+        &tools,
         &ReasoningConfig::Effort(ReasoningEffort::Ultra),
         ReasoningMode::Standard,
         &OutputFormat::Text,
@@ -333,6 +334,25 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
         None,
     );
 
+    AiClient::new()
+        .compact_responses(&model, request)
+        .await
+        .unwrap();
+
+    Arc::make_mut(&mut model.spec)
+        .capabilities
+        .parallel_tool_calls = false;
+    let request = ResponsesCompactRequest::for_model(
+        &model,
+        input,
+        Some("current instructions".into()),
+        &tools,
+        &ReasoningConfig::Effort(ReasoningEffort::Ultra),
+        ReasoningMode::Standard,
+        &OutputFormat::Text,
+        CacheRetention::Short,
+        None,
+    );
     AiClient::new()
         .compact_responses(&model, request)
         .await
@@ -347,7 +367,7 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
     let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
     assert!(body.get("instructions").is_none());
     assert!(body.get("tools").is_none());
-    assert_eq!(body["parallel_tool_calls"], false);
+    assert_eq!(body["parallel_tool_calls"], true);
     assert_eq!(body["reasoning"]["effort"], "max");
     assert_eq!(body["reasoning"]["context"], "all_turns");
     assert_eq!(body["input"][0]["type"], "additional_tools");
@@ -362,6 +382,49 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
     );
     assert_eq!(body["input"][2]["role"], "user");
     assert!(body["input"][2]["content"][0].get("detail").is_none());
+
+    let disabled_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(disabled_body["parallel_tool_calls"], false);
+}
+
+#[tokio::test]
+async fn compact_responses_lite_explicitly_disables_parallel_calls_without_tools() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "compaction", "encrypted_content": "opaque"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let model = responses_lite_model(&format!("{}/", server.uri()));
+    let input = ResponsesInput::new(vec![input_item(serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "compact me"}]
+    }))]);
+    let request = ResponsesCompactRequest::for_model(
+        &model,
+        input,
+        None,
+        &[],
+        &ReasoningConfig::Off,
+        ReasoningMode::Standard,
+        &OutputFormat::Text,
+        CacheRetention::Short,
+        None,
+    );
+
+    AiClient::new()
+        .compact_responses(&model, request)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["parallel_tool_calls"], false);
 }
 
 #[tokio::test]

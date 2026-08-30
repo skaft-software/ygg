@@ -2,6 +2,27 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## Unreleased
+
+### Added
+
+- Added `/answer [instruction]` to request an immediate final response from
+  gathered evidence. Idle runs begin without tools; active runs persist the
+  directive at the next safe boundary and expose no tools thereafter.
+
+### Changed
+
+- Keep authenticated Codex routes on a 272K active-context working set by
+  default, while retaining the provider's advertised maximum and allowing
+  `compaction.max_active_tokens = 0` to disable the absolute cap.
+
+### Performance
+
+- Honor the model's advertised parallel-tool-call capability on Responses Lite
+  ordinary and compact requests. Existing host admission still overlaps only
+  explicitly parallel-safe pure/workspace-read calls; arbitrary shell and
+  mutating effects remain ordered.
+
 ## 0.6.4 — 2026-08-30
 
 ### Added

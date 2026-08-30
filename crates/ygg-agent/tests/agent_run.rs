@@ -21,8 +21,8 @@ use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EffectBroker, EffectPolicy,
     EntryId, EntryValue, ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream,
-    ReplaySafety, RunControl, SandboxConfig, Session, Tool, ToolCallHook, ToolConcurrency,
-    ToolContext, ToolEffect, ToolError, ToolOutput, UsageRecordKind, UserInput,
+    QueueDeliveryMode, ReplaySafety, RunControl, SandboxConfig, Session, Tool, ToolCallHook,
+    ToolConcurrency, ToolContext, ToolEffect, ToolError, ToolOutput, UsageRecordKind, UserInput,
 };
 use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
@@ -3386,6 +3386,164 @@ async fn steering_enters_at_the_next_turn_boundary() {
         })
         .collect::<Vec<_>>();
     assert_eq!(display_texts, vec![Some("start"), None, None]);
+}
+
+#[tokio::test]
+async fn prompt_without_tools_exposes_no_tool_schema() {
+    let mut h = harness(vec![text_turn("final answer")], Some(4)).await;
+
+    let mut run = h
+        .agent
+        .prompt_without_tools("answer from existing evidence")
+        .await
+        .unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+}
+
+#[tokio::test]
+async fn finish_now_rejects_calls_from_an_already_open_provider_turn() {
+    let mut h = harness(
+        vec![
+            tool_turn(&[("call_1", "read", serde_json::json!({"path": "f.txt"}))]),
+            text_turn("final answer"),
+        ],
+        Some(4),
+    )
+    .await;
+    std::fs::write(h.workspace.join("f.txt"), "data\n").unwrap();
+
+    let mut run = h.agent.prompt("investigate").await.unwrap();
+    let control = run.control();
+    let mut events = Vec::new();
+    let mut requested = false;
+    while let Some(event) = run.next().await {
+        if !requested && matches!(&event, AgentEvent::TurnStarted) {
+            control
+                .finish_now("answer now without more tools")
+                .await
+                .unwrap();
+            requested = true;
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+    assert!(requests[1]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+    assert!(requests[1]
+        .to_string()
+        .contains("was not executed: the user requested an immediate final answer"));
+}
+
+#[tokio::test]
+async fn finish_now_delivers_all_pending_steering_at_the_next_boundary() {
+    let mut h = harness(
+        vec![text_turn("interim"), text_turn("final answer")],
+        Some(4),
+    )
+    .await;
+
+    let mut run = h.agent.prompt("investigate").await.unwrap();
+    let control = run.control();
+    let mut events = Vec::new();
+    let mut requested = false;
+    while let Some(event) = run.next().await {
+        if !requested && matches!(&event, AgentEvent::TurnStarted) {
+            control
+                .set_steering_mode(QueueDeliveryMode::OneAtATime)
+                .await
+                .unwrap();
+            control.steer("first correction").await.unwrap();
+            control.steer("second correction").await.unwrap();
+            control.finish_now("answer now").await.unwrap();
+            requested = true;
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let delivered = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::SteeringDelivered { messages } => Some(messages),
+            _ => None,
+        })
+        .expect("steering delivery event");
+    assert_eq!(delivered.len(), 3);
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert_eq!(requests.len(), 2);
+    let final_request = requests[1].to_string();
+    assert!(final_request.contains("first correction"));
+    assert!(final_request.contains("second correction"));
+    assert!(final_request.contains("answer now"));
+    assert!(requests[1]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
+}
+
+#[tokio::test]
+async fn finish_now_disables_tools_after_the_current_safe_boundary() {
+    let mut h = harness(
+        vec![
+            tool_turn(&[("call_1", "read", serde_json::json!({"path": "f.txt"}))]),
+            text_turn("final answer"),
+        ],
+        Some(4),
+    )
+    .await;
+    std::fs::write(h.workspace.join("f.txt"), "data\n").unwrap();
+
+    let mut run = h.agent.prompt("investigate").await.unwrap();
+    let control = run.control();
+    let mut events = Vec::new();
+    while let Some(event) = run.next().await {
+        if matches!(&event, AgentEvent::ToolFinished { .. }) {
+            control
+                .finish_now("answer now without more tools")
+                .await
+                .unwrap();
+        }
+        events.push(event);
+    }
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let requests = wire_requests(h.server.as_ref().unwrap()).await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]
+        .to_string()
+        .contains("answer now without more tools"));
+    assert!(requests[1]
+        .get("tools")
+        .is_none_or(|tools| tools.as_array().is_some_and(Vec::is_empty)));
 }
 
 #[tokio::test]

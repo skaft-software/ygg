@@ -475,13 +475,16 @@ Capability handling is model-specific. ygg validates modalities, tool use, struc
 
 Codex routes that advertise Responses Lite use that transport contract for both
 ordinary and native compact requests. Ygg sends the Lite header, places tool
-schemas and developer instructions in input items, explicitly disables parallel
-tool calls, requests reasoning context across all turns, and removes only
-unsupported image-detail hints. This behavior is capability-driven rather than
-coupled to an endpoint name or OAuth plan. If a provider retires a long-lived
-Responses WebSocket before generation with a connection-lifetime error, Ygg
+schemas and developer instructions in input items, enables parallel tool calls
+when the model advertises them, requests reasoning context across all turns,
+and removes only unsupported image-detail hints. This behavior is
+capability-driven rather than coupled to an endpoint name or OAuth plan. If a
+provider retires a long-lived Responses WebSocket before generation with a
+connection-lifetime error, Ygg
 retires that socket and retries the unchanged request through the HTTP fallback;
-ordinary post-send disconnects remain terminal.
+ordinary post-send disconnects remain terminal. Model-side batching does not relax
+host effect ordering: only explicitly parallel-safe pure or workspace-read calls
+overlap; shell and mutation effects remain serialized.
 
 ### Reasoning without transcript noise
 
@@ -579,12 +582,15 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the complete next provider-visible request before every model turn. The default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer; local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
+ygg estimates the complete next provider-visible request before every model turn. The generic default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer. Authenticated Codex routes additionally keep a 272K active working set by default—even when live discovery advertises a larger provider maximum—so long investigations compact before repeated prompt replay dominates wall time; with the default `threshold_fraction`, set `max_active_tokens = 0` to opt into the full advertised window. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
 mode = "local" # disabled, local, or native-responses
 threshold_fraction = 1.0
+# Optional absolute active-context threshold. Codex defaults to 272000;
+# zero disables that absolute cap (threshold_fraction still applies).
+# max_active_tokens = 272000
 keep_recent_tokens = 20000
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ```
@@ -649,6 +655,7 @@ Type `/` in the composer to open live command discovery.
 | `/checkout <id>` | Move the durable head to another entry and branch from it. |
 | `/model [id]` | Open the model picker or select a model. |
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
+| `/answer [instruction]` | Stop tool use at the next safe boundary and answer from evidence already gathered. |
 | `/compact` | Compact at the next safe boundary. |
 | `/verbose [on\|off]` | Expand or collapse retained reasoning and bounded tool-output projections. |
 | `/reload` | Reload instructions, prompts, skills, and enabled extensions. |
@@ -728,11 +735,14 @@ offline = false
 [compaction]
 mode = "local"
 threshold_fraction = 1.0
+# Codex routes default to a 272K active working set. Set zero to disable
+# that absolute cap while retaining threshold_fraction.
+# max_active_tokens = 272000
 keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 Telemetry is opt-in and separate from durable sessions. `--telemetry PATH` writes
 owner-only `ygg.telemetry.v1` JSONL records for run boundaries, model request
