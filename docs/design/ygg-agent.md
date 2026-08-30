@@ -16,6 +16,13 @@
    it receives an opaque run-start hook and coarse request/tool/compaction
    boundaries; it records hashes and bounded measurements, never raw prompts,
    arguments, results, or provider payloads.
+8. `Agent::prompt_without_tools` starts with a sticky tool-free policy.
+   `RunControl::finish_now` persists its input at the next safe turn boundary and
+   makes that policy sticky for the remainder of the run. Subsequent provider
+   requests contain no tool schemas and set `ToolChoice::None`; calls emitted by
+   an already-open provider request are paired with synthetic errors rather than
+   executed. Effects already admitted at the time of the control settle under
+   the ordinary cancellation and commit rules.
 
 ## Effect admission boundary
 
@@ -140,7 +147,7 @@ The path guard applies to explicit built-in paths. It is not process containment
 
 - Local file read/edit/preview: 32 MiB per file.
 - Tool calls per assistant turn: 32.
-- Model-visible aggregate tool results per turn: 16 KiB.
+- Default model-visible text per tool result: 50 KiB (host-configurable).
 - Delegation provenance text per task/message/status payload: 128 KiB; configurable teams remain capped at 32 concurrent, depth 8, and 256 total agents.
 - Progress: bounded messages and chunks.
 - Session replay: 256 MiB and 1,000,000 records.

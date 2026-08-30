@@ -21,6 +21,57 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
+fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = config(directory.path(), None);
+    let catalog = base_model_catalog(true).unwrap();
+    let mut model = catalog
+        .resolve(&ModelId("gpt-4o-mini".to_owned()))
+        .unwrap()
+        .clone();
+    Arc::make_mut(&mut model.endpoint).id = EndpointId(crate::auth::codex::ENDPOINT_ID.into());
+    Arc::make_mut(&mut model.spec).limits.context_window = 872_000;
+
+    // No route default: the full provider-advertised window is available.
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+
+    config.compaction.threshold_fraction = 0.25;
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        0.25
+    );
+
+    config.compaction.threshold_fraction = 1.0;
+    config.compaction.max_active_tokens = Some(200_000);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        200_000.0 / 872_000.0
+    );
+
+    config.compaction.max_active_tokens = Some(900_000);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+
+    config.compaction.max_active_tokens = Some(0);
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+
+    config.compaction.max_active_tokens = None;
+    Arc::make_mut(&mut model.endpoint).id = EndpointId("openai".into());
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
+    );
+}
+
+#[test]
 fn custom_endpoint_startup_timeout_is_cold_start_safe_and_configurable() {
     assert_eq!(
         resolve_custom_startup_timeout(None, None).unwrap(),
@@ -282,6 +333,16 @@ fn opencode_discovery_infers_supported_protocols_and_skips_gemini() {
     assert_eq!(
         discovered_preset_binding(preset, "kimi-future"),
         Some(("opencode", Protocol::OpenAiChat))
+    );
+}
+
+#[test]
+fn openai_discovery_skips_the_rejected_gpt_5_6_alias() {
+    let preset = &crate::providers::OPENAI;
+    assert_eq!(discovered_preset_binding(preset, "gpt-5.6"), None);
+    assert_eq!(
+        discovered_preset_binding(preset, "gpt-5.6-sol"),
+        Some(("openai", Protocol::OpenAiResponses))
     );
 }
 
@@ -876,6 +937,34 @@ fn offline_codex_registration_uses_cached_inventory_without_dynamic_capabilities
         .resolve(&ModelId("gpt-5.6-sol".into()))
         .unwrap();
     assert_eq!(fallback.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
+    // GPT-5.6 uses OpenAI's published standard costs on the Codex route too.
+    let luna = fallback_catalog
+        .resolve(&ModelId("gpt-5.6-luna".into()))
+        .unwrap();
+    let luna_pricing = luna.spec.pricing.as_ref().expect("codex luna pricing");
+    assert_eq!(luna_pricing.input, ygg_ai::TokenRate(200_000));
+    assert_eq!(luna_pricing.output, ygg_ai::TokenRate(1_200_000));
+    assert_eq!(luna_pricing.cache_read, ygg_ai::TokenRate(20_000));
+    assert_eq!(luna_pricing.cache_write_5m, ygg_ai::TokenRate(250_000));
+    assert_eq!(luna_pricing.tiers.len(), 1);
+    assert_eq!(
+        luna_pricing.tiers[0].input,
+        Some(ygg_ai::TokenRate(400_000))
+    );
+}
+
+#[test]
+fn codex_pro_pricing_keeps_long_context_tiers() {
+    for model_id in ["gpt-5.4-pro", "gpt-5.5-pro"] {
+        let pricing = codex_pricing(model_id).expect("codex pro pricing");
+        assert_eq!(pricing.input, ygg_ai::TokenRate(30_000_000));
+        assert_eq!(pricing.output, ygg_ai::TokenRate(180_000_000));
+        assert_eq!(pricing.tiers.len(), 1);
+        let tier = &pricing.tiers[0];
+        assert_eq!(tier.min_input_tokens, 272_001);
+        assert_eq!(tier.input, Some(ygg_ai::TokenRate(60_000_000)));
+        assert_eq!(tier.output, Some(ygg_ai::TokenRate(270_000_000)));
+    }
 }
 
 #[test]

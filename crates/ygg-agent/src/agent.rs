@@ -783,6 +783,16 @@ impl RunControl {
             .map_err(|_| AgentError::RunEnded)
     }
 
+    /// Requests a final answer at the next safe turn boundary. The supplied
+    /// input is persisted like steering, but subsequent requests in this run
+    /// expose no tools.
+    pub async fn finish_now(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
+        self.tx
+            .send(Control::FinishNow(input.into()))
+            .await
+            .map_err(|_| AgentError::RunEnded)
+    }
+
     /// Attempts to enqueue a follow-up without allowing a producer to wait
     /// behind the run's bounded control queue.
     pub(crate) fn try_follow_up(&self, input: impl Into<UserInput>) -> Result<(), AgentError> {
@@ -4499,6 +4509,20 @@ impl Agent {
         ))
     }
 
+    /// Build the detailed, provider-reconciled context categories on demand.
+    pub fn request_context_breakdown(&self) -> Result<ContextBreakdown, SessionError> {
+        let messages = self.session.context_ref()?;
+        let system = self.system.clone();
+        let tools = self.extensions.tool_definitions();
+        Ok(context_breakdown(
+            &self.session,
+            &self.model,
+            &system,
+            &messages,
+            &tools,
+        ))
+    }
+
     /// Complete route-affine Responses replay input for the active branch.
     ///
     /// `None` means the active route is not Responses or a legacy/crash gap
@@ -4753,6 +4777,23 @@ impl Agent {
     /// failed, or max-turns — is reported by exactly one
     /// [`AgentEvent::RunFinished`].
     pub async fn prompt(&mut self, input: impl Into<UserInput>) -> Result<Run<'_>, AgentError> {
+        self.prompt_with_tools(input.into(), true).await
+    }
+
+    /// Begins a run whose provider requests expose no tools. This is used for
+    /// explicit answer-now flows that must synthesize from existing evidence.
+    pub async fn prompt_without_tools(
+        &mut self,
+        input: impl Into<UserInput>,
+    ) -> Result<Run<'_>, AgentError> {
+        self.prompt_with_tools(input.into(), false).await
+    }
+
+    async fn prompt_with_tools(
+        &mut self,
+        input: UserInput,
+        tools_enabled: bool,
+    ) -> Result<Run<'_>, AgentError> {
         if self.reasoning == ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
             && self.delegation.is_none()
             && !self.ultra_observation_managed
@@ -4774,7 +4815,6 @@ impl Agent {
             .take()
             .is_some_and(|lifecycle| lifecycle.dropped.load(Ordering::Acquire));
         self.recover_pending_tools(previous_run_was_dropped).await?;
-        let input = input.into();
         let terminal_gate_prior_context =
             if self.completion_policy == CompletionPolicy::TerminalGate {
                 recent_conversational_context(&self.session.context()?)
@@ -4832,8 +4872,11 @@ impl Agent {
         let sandbox = self.sandbox.clone();
         let extension_host = self.extensions.clone();
         let (initial_tool_revision, initial_tools) = extension_host.tool_snapshot();
-        let initial_tool_defs: Vec<ToolDef> =
-            initial_tools.iter().map(|tool| tool.definition()).collect();
+        let initial_tool_defs: Vec<ToolDef> = if tools_enabled {
+            initial_tools.iter().map(|tool| tool.definition()).collect()
+        } else {
+            Vec::new()
+        };
         let initial_context =
             observe_context_tracker(&context, &self.session, &model, &system, &initial_tool_defs)?;
         let initial_capacity =
@@ -4887,13 +4930,18 @@ impl Agent {
             let mut context_capacity = initial_capacity;
 
             let (mut tool_revision, tools) = extension_host.tool_snapshot();
-            let mut tool_defs: Vec<ToolDef> =
-                tools.iter().map(|tool| tool.definition()).collect();
+            let mut tool_defs: Vec<ToolDef> = if tools_enabled {
+                tools.iter().map(|tool| tool.definition()).collect()
+            } else {
+                Vec::new()
+            };
             let mut tool_map: HashMap<String, Arc<dyn Tool>> =
-                HashMap::with_capacity(tools.len());
-            for tool in &tools {
-                let definition = tool.definition();
-                tool_map.insert(definition.name, Arc::clone(tool));
+                HashMap::with_capacity(if tools_enabled { tools.len() } else { 0 });
+            if tools_enabled {
+                for tool in &tools {
+                    let definition = tool.definition();
+                    tool_map.insert(definition.name, Arc::clone(tool));
+                }
             }
             let mut registered_tools = tool_map.keys().cloned().collect::<Vec<_>>();
             registered_tools.sort();
@@ -4909,6 +4957,8 @@ impl Agent {
             let mut steering_mode = QueueDeliveryMode::All;
             let mut follow_up_mode = QueueDeliveryMode::OneAtATime;
             let mut control_open = true;
+            let mut answer_only = !tools_enabled;
+            let mut finish_pending = false;
             let mut completed_turns: u64 = 0;
             let mut terminal_gate_requests = vec![initial_request];
             let mut terminal_action_receipts = Vec::<TerminalActionReceipt>::new();
@@ -4929,6 +4979,12 @@ impl Agent {
                     match control_rx.try_recv() {
                         Ok(Control::Steer(input)) => pending_steer.push(input),
                         Ok(Control::FollowUp(input)) => followups.push_back(input),
+                        Ok(Control::FinishNow(input)) => {
+                            pending_steer.push(input);
+                            answer_only = true;
+                            finish_pending = true;
+                            context_capacity.invalidate();
+                        }
                         Ok(Control::SetSteeringMode(mode)) => steering_mode = mode,
                         Ok(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                         Ok(Control::Abort) => break 'run FinishReason::Aborted,
@@ -4942,15 +4998,24 @@ impl Agent {
 
                 // ── Steering enters here, at the model-turn boundary ───────
                 if !pending_steer.is_empty() {
-                    let queued = match steering_mode {
-                        QueueDeliveryMode::All => std::mem::take(&mut pending_steer),
-                        QueueDeliveryMode::OneAtATime => vec![pending_steer.remove(0)],
+                    let queued = if std::mem::take(&mut finish_pending) {
+                        std::mem::take(&mut pending_steer)
+                    } else {
+                        match steering_mode {
+                            QueueDeliveryMode::All => std::mem::take(&mut pending_steer),
+                            QueueDeliveryMode::OneAtATime => vec![pending_steer.remove(0)],
+                        }
+                    };
+                    let visible_tools = if answer_only {
+                        &[][..]
+                    } else {
+                        tool_defs.as_slice()
                     };
                     let observation = ContextObservation {
                         tracker: &stream_context,
                         model: &model,
                         system: &system,
-                        tools: &tool_defs,
+                        tools: visible_tools,
                     };
                     match deliver_control_inputs(
                         queued,
@@ -4990,21 +5055,27 @@ impl Agent {
                 let (current_revision, current_tools) = extension_host.tool_snapshot();
                 if current_revision != tool_revision {
                     tool_revision = current_revision;
-                    tool_defs = current_tools
-                        .iter()
-                        .map(|tool| tool.definition())
-                        .collect();
-                    tool_map.clear();
-                    tool_map.reserve(current_tools.len());
-                    for tool in &current_tools {
-                        let definition = tool.definition();
-                        tool_map.insert(definition.name, Arc::clone(tool));
+                    if tools_enabled && !answer_only {
+                        tool_defs = current_tools
+                            .iter()
+                            .map(|tool| tool.definition())
+                            .collect();
+                        tool_map.clear();
+                        tool_map.reserve(current_tools.len());
+                        for tool in &current_tools {
+                            let definition = tool.definition();
+                            tool_map.insert(definition.name, Arc::clone(tool));
+                        }
+                        registered_tools = tool_map.keys().cloned().collect();
+                        registered_tools.sort();
+                        announced_tools.extend(registered_tools.iter().cloned());
                     }
-                    registered_tools = tool_map.keys().cloned().collect();
-                    registered_tools.sort();
-                    announced_tools.extend(registered_tools.iter().cloned());
                 }
-                let request_tool_defs = tool_defs.clone();
+                let request_tool_defs = if answer_only {
+                    Vec::new()
+                } else {
+                    tool_defs.clone()
+                };
 
                 // ── Reconstruct and size context for this exact turn ───────
                 // This gate is inside the autonomous loop, after every tool
@@ -5088,7 +5159,11 @@ impl Agent {
                     system: if active_system.is_empty() { None } else { Some(active_system.clone()) },
                     messages,
                     tools: request_tool_defs.clone(),
-                    tool_choice: ToolChoice::Auto,
+                    tool_choice: if answer_only {
+                        ToolChoice::None
+                    } else {
+                        ToolChoice::Auto
+                    },
                     max_output_tokens: Some(request_max_output_tokens),
                     temperature: None,
                     stop: vec![],
@@ -5283,6 +5358,12 @@ impl Agent {
                         }
                         Next::Ctl(Some(Control::Steer(input))) => pending_steer.push(input),
                         Next::Ctl(Some(Control::FollowUp(input))) => followups.push_back(input),
+                        Next::Ctl(Some(Control::FinishNow(input))) => {
+                            pending_steer.push(input);
+                            answer_only = true;
+                            finish_pending = true;
+                            context_capacity.invalidate();
+                        }
                         Next::Ctl(Some(Control::SetSteeringMode(mode))) => steering_mode = mode,
                         Next::Ctl(Some(Control::SetFollowUpMode(mode))) => follow_up_mode = mode,
                         Next::Ctl(None) => control_open = false,
@@ -5655,6 +5736,12 @@ impl Agent {
                     match control_rx.try_recv() {
                         Ok(Control::Steer(input)) => pending_steer.push(input),
                         Ok(Control::FollowUp(input)) => followups.push_back(input),
+                        Ok(Control::FinishNow(input)) => {
+                            pending_steer.push(input);
+                            answer_only = true;
+                            finish_pending = true;
+                            context_capacity.invalidate();
+                        }
                         Ok(Control::SetSteeringMode(mode)) => steering_mode = mode,
                         Ok(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                         Ok(Control::Abort) => {
@@ -5748,11 +5835,16 @@ impl Agent {
                                 vec![followups.pop_front().expect("follow-up queue is non-empty")]
                             }
                         };
+                        let visible_tools = if answer_only {
+                            &[][..]
+                        } else {
+                            tool_defs.as_slice()
+                        };
                         let observation = ContextObservation {
                             tracker: &stream_context,
                             model: &model,
                             system: &system,
-                            tools: &tool_defs,
+                            tools: visible_tools,
                         };
                         match deliver_control_inputs(
                             queued,
@@ -5884,7 +5976,8 @@ impl Agent {
                     progress: ToolProgressSink::null(),
                     cancellation: CancellationToken::default(),
                 };
-                let parallel_batch = !output_truncated
+                let parallel_batch = !answer_only
+                    && !output_truncated
                     && calls.len() > 1
                     && calls.len() <= MAX_TOOL_CALLS_PER_TURN
                     && calls.iter().all(|call| {
@@ -5949,6 +6042,12 @@ impl Agent {
                             control = control_rx.recv(), if control_open => match control {
                                 Some(Control::Steer(input)) => pending_steer.push(input),
                                 Some(Control::FollowUp(input)) => followups.push_back(input),
+                                Some(Control::FinishNow(input)) => {
+                                    pending_steer.push(input);
+                                    answer_only = true;
+                                    finish_pending = true;
+                                    context_capacity.invalidate();
+                                }
                                 Some(Control::SetSteeringMode(mode)) => steering_mode = mode,
                                 Some(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                                 Some(Control::Abort) => {
@@ -6043,7 +6142,12 @@ impl Agent {
                         let start = std::time::Instant::now();
                         let started_at = Arc::new(AtomicU64::new(u64::MAX));
                         let started_at_marker = Arc::clone(&started_at);
-                        let result: Result<ToolOutput, ToolError> = if output_truncated {
+                        let result: Result<ToolOutput, ToolError> = if answer_only {
+                            Err(ToolError::new(format!(
+                                "tool call `{}` was not executed: the user requested an immediate final answer without tools",
+                                call.name
+                            )))
+                        } else if output_truncated {
                             Err(ToolError::new(format!(
                                 "tool call `{}` was not executed: the provider reached its output token limit, so the arguments may be truncated; re-issue the call with complete arguments",
                                 call.name
@@ -6126,6 +6230,12 @@ impl Agent {
                                         c = control_rx.recv(), if control_open => match c {
                                             Some(Control::Steer(input)) => pending_steer.push(input),
                                             Some(Control::FollowUp(input)) => followups.push_back(input),
+                                            Some(Control::FinishNow(input)) => {
+                                                pending_steer.push(input);
+                                                answer_only = true;
+                                                finish_pending = true;
+                                                context_capacity.invalidate();
+                                            }
                                             Some(Control::SetSteeringMode(mode)) => steering_mode = mode,
                                             Some(Control::SetFollowUpMode(mode)) => follow_up_mode = mode,
                                             Some(Control::Abort) => {

@@ -372,7 +372,7 @@ fn base_prompt(config: &Config) -> String {
 Working style:
 - Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
 - Use tools instead of guessing or merely describing actions. Inspect relevant code and context before editing.
-- Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
+- Work autonomously until complete or blocked. If the latest user asks for an answer now or forbids tools, answer from gathered evidence without tools and state uncertainty. Ask only when undiscoverable information matters.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
 - Dirty worktrees are shared. While workers run, respect path ownership; never switch branches, reset, rebase, stash, or clean. Stale hashes or unexpected changes mean another writer; stop editing that path.
@@ -1514,7 +1514,7 @@ Tool preference:
 Working style:
 - Match the user's requested mode. Answer, investigate, review, or plan without editing unless a change or implementation is requested. When implementation is requested, do not stop at analysis.
 - Use tools instead of guessing or merely describing actions. Inspect relevant code and context before editing.
-- Work autonomously until the task is complete or concretely blocked. Ask only when information that cannot be discovered materially affects the result.
+- Work autonomously until complete or blocked. If the latest user asks for an answer now or forbids tools, answer from gathered evidence without tools and state uncertainty. Ask only when undiscoverable information matters.
 - Proceed without confirmation for local, reversible work. Confirm before destructive, hard-to-reverse, outward-facing, or remote/shared-state actions unless the user explicitly authorized that action and scope.
 - Preserve existing conventions and unrelated user changes. Never revert or overwrite unrelated work. Do not commit unless asked.
 - Dirty worktrees are shared. While workers run, respect path ownership; never switch branches, reset, rebase, stash, or clean. Stale hashes or unexpected changes mean another writer; stop editing that path.
@@ -1666,10 +1666,10 @@ Environment:
 
         let dynamic_bytes = prompt_path(root.path()).len() + prompt_path(&nested).len();
         let scaffold_bytes = prompt.len() - dynamic_bytes;
-        assert_eq!(scaffold_bytes, 2_960, "reviewed stable prompt byte budget");
+        assert_eq!(scaffold_bytes, 3_031, "reviewed stable prompt byte budget");
         assert_eq!(
             scaffold_bytes.div_ceil(4),
-            740,
+            758,
             "estimated stable token budget"
         );
     }

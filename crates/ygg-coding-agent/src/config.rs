@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ygg_agent::{EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS};
+use ygg_agent::{
+    EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
+};
 
 pub use crate::tui::terminal::ColorMode;
 use ygg_ai::{
@@ -107,7 +109,7 @@ impl Default for SandboxPolicy {
             allow_remote_read: false,
             shell_path: None,
             bash_timeout_secs: 120,
-            max_output_bytes: 16 * 1024,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
 }
@@ -368,6 +370,10 @@ impl CompactionMode {
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
     pub threshold_fraction: f64,
+    /// Optional absolute active-context threshold. Unset uses the provider's
+    /// full advertised window; `Some(0)` is equivalent to unset.
+    /// `threshold_fraction` still applies.
+    pub max_active_tokens: Option<u64>,
     pub keep_recent_tokens: u64,
     /// Optional model override for summary calls. When absent, bootstrap uses
     /// the active model; when present, bootstrap resolves this ID in the model
@@ -380,6 +386,7 @@ impl Default for CompactionPolicy {
         Self {
             mode: CompactionMode::Local,
             threshold_fraction: 1.0,
+            max_active_tokens: None,
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             compact_model: None,
         }
@@ -601,9 +608,11 @@ mod tests {
         assert!(policy.allow_process);
         assert!(policy.allow_shell);
         assert!(!policy.allow_remote_read);
+        assert_eq!(policy.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
         let sandbox = policy.to_sandbox_config(directory.path());
         assert!(sandbox.allow_external_paths);
         assert!(!sandbox.allow_remote_read);
+        assert_eq!(sandbox.max_output_bytes, DEFAULT_MAX_OUTPUT_BYTES);
     }
 
     #[test]
@@ -626,6 +635,7 @@ mod tests {
     #[test]
     fn default_compaction_uses_only_the_fixed_reserve() {
         assert_eq!(CompactionPolicy::default().threshold_fraction, 1.0);
+        assert_eq!(CompactionPolicy::default().max_active_tokens, None);
     }
 
     #[test]

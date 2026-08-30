@@ -527,6 +527,8 @@ pub struct ComposedInput {
     pub transcript_text: String,
     pub parts: Vec<InputPart>,
     pub attachments: Vec<Attachment>,
+    /// When true, the owning provider run must expose no tools.
+    pub answer_only: bool,
 }
 
 impl ComposedInput {
@@ -536,7 +538,16 @@ impl ComposedInput {
             display_text: text.clone(),
             transcript_text: text,
             attachments: Vec::new(),
+            answer_only: false,
         }
+    }
+
+    pub fn for_answer(display_text: String, model_text: String) -> Self {
+        let mut input = Self::from_text(model_text);
+        input.display_text = display_text.clone();
+        input.transcript_text = display_text;
+        input.answer_only = true;
+        input
     }
 
     pub fn is_empty(&self) -> bool {
@@ -623,6 +634,7 @@ pub fn compose(display_text: String, ledger: &mut AttachmentLedger) -> ComposedI
         transcript_text,
         parts,
         attachments: matched,
+        answer_only: false,
     }
 }
 
@@ -1124,6 +1136,20 @@ mod tests {
             [InputPart::Text(text)] if text == "body"
         ));
         assert!(!composed.is_empty());
+    }
+
+    #[test]
+    fn answer_input_marks_only_the_tool_free_submission() {
+        assert!(!ComposedInput::from_text("ordinary".to_owned()).answer_only);
+        let answer =
+            ComposedInput::for_answer("/answer be concise".to_owned(), "finish now".to_owned());
+        assert!(answer.answer_only);
+        assert_eq!(answer.display_text, "/answer be concise");
+        assert_eq!(answer.transcript_text, "/answer be concise");
+        assert!(matches!(
+            answer.parts.as_slice(),
+            [InputPart::Text(text)] if text == "finish now"
+        ));
     }
 
     #[test]

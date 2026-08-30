@@ -308,6 +308,7 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
         .await;
 
     let model = responses_lite_model(&format!("{}/", server.uri()));
+    assert!(model.spec.capabilities.parallel_tool_calls);
     let input = ResponsesInput::new(vec![input_item(serde_json::json!({
         "type": "message",
         "role": "user",
@@ -317,15 +318,16 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
             "detail": "high"
         }]
     }))]);
+    let tools = [ToolDef {
+        name: "read".into(),
+        description: "Read a file".into(),
+        parameters: serde_json::json!({"type": "object"}),
+    }];
     let request = ResponsesCompactRequest::for_model(
         &model,
         input,
         Some("current instructions".into()),
-        &[ToolDef {
-            name: "read".into(),
-            description: "Read a file".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        }],
+        &tools,
         &ReasoningConfig::Effort(ReasoningEffort::Ultra),
         ReasoningMode::Standard,
         &OutputFormat::Text,
@@ -362,6 +364,46 @@ async fn compact_responses_lite_uses_advertised_transport_contract() {
     );
     assert_eq!(body["input"][2]["role"], "user");
     assert!(body["input"][2]["content"][0].get("detail").is_none());
+}
+
+#[tokio::test]
+async fn compact_responses_lite_explicitly_disables_parallel_calls_without_tools() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/responses/compact"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "output": [{"type": "compaction", "encrypted_content": "opaque"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let model = responses_lite_model(&format!("{}/", server.uri()));
+    let input = ResponsesInput::new(vec![input_item(serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "compact me"}]
+    }))]);
+    let request = ResponsesCompactRequest::for_model(
+        &model,
+        input,
+        None,
+        &[],
+        &ReasoningConfig::Off,
+        ReasoningMode::Standard,
+        &OutputFormat::Text,
+        CacheRetention::Short,
+        None,
+    );
+
+    AiClient::new()
+        .compact_responses(&model, request)
+        .await
+        .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["parallel_tool_calls"], false);
 }
 
 #[tokio::test]

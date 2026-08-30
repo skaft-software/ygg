@@ -256,6 +256,7 @@ struct CompactionLayer {
     /// Deprecated boolean spelling retained for existing configuration.
     enabled: Option<bool>,
     threshold_fraction: Option<f64>,
+    max_active_tokens: Option<u64>,
     keep_recent_tokens: Option<u64>,
     /// Deprecated turn-count retention, mapped to 1,000 tokens per turn.
     keep_recent_turns: Option<usize>,
@@ -344,6 +345,9 @@ impl ConfigLayer {
                 }
                 if newer.threshold_fraction.is_some() {
                     current.threshold_fraction = newer.threshold_fraction;
+                }
+                if newer.max_active_tokens.is_some() {
+                    current.max_active_tokens = newer.max_active_tokens;
                 }
                 if newer.keep_recent_tokens.is_some() {
                     current.keep_recent_tokens = newer.keep_recent_tokens;
@@ -781,6 +785,7 @@ const COMPACTION_KEYS: &[&str] = &[
     "policy",
     "enabled",
     "threshold_fraction",
+    "max_active_tokens",
     "keep_recent_tokens",
     "keep_recent_turns",
     "compact_model",
@@ -821,6 +826,7 @@ fn config_key_suggestion(key: &str) -> Option<&'static str> {
                 "policy" => "compaction.policy",
                 "enabled" => "compaction.enabled",
                 "threshold_fraction" => "compaction.threshold_fraction",
+                "max_active_tokens" => "compaction.max_active_tokens",
                 "keep_recent_tokens" => "compaction.keep_recent_tokens",
                 "keep_recent_turns" => "compaction.keep_recent_turns",
                 "compact_model" => "compaction.compact_model",
@@ -996,6 +1002,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     let compaction_mode = env_value("YGG_COMPACTION_MODE");
     let compaction_enabled = env_parse("YGG_AUTO_COMPACT")?;
     let threshold_fraction = env_parse("YGG_COMPACTION_THRESHOLD_FRACTION")?;
+    let max_active_tokens = env_parse("YGG_COMPACTION_MAX_ACTIVE_TOKENS")?;
     let keep_recent_tokens = env_parse("YGG_COMPACTION_KEEP_RECENT_TOKENS")?;
     let keep_recent_turns = env_parse("YGG_COMPACTION_KEEP_RECENT_TURNS")?;
     let compact_model = env_value("YGG_COMPACT_MODEL");
@@ -1033,6 +1040,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         compaction: (compaction_mode.is_some()
             || compaction_enabled.is_some()
             || threshold_fraction.is_some()
+            || max_active_tokens.is_some()
             || keep_recent_tokens.is_some()
             || keep_recent_turns.is_some()
             || compact_model.is_some())
@@ -1040,6 +1048,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
             mode: compaction_mode,
             enabled: compaction_enabled,
             threshold_fraction,
+            max_active_tokens,
             keep_recent_tokens,
             keep_recent_turns,
             compact_model,
@@ -1250,6 +1259,9 @@ fn build_config_with_global_path(
                 anyhow::bail!("compaction.threshold_fraction must be greater than 0 and at most 1");
             }
             compaction.threshold_fraction = value;
+        }
+        if let Some(value) = layer.max_active_tokens {
+            compaction.max_active_tokens = Some(value);
         }
         if let Some(value) = layer.keep_recent_tokens {
             compaction.keep_recent_tokens = value.max(1);
@@ -2130,12 +2142,13 @@ mod tests {
     #[test]
     fn cost_and_compaction_settings_merge_from_layered_toml() {
         let global: ConfigLayer = toml::from_str(
-            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\n[compaction]\nenabled = false\ncompact_model = 'cheap'",
+            "max_cost_microdollars = 100\ncost_warning_microdollars = 25\n[compaction]\nenabled = false\nmax_active_tokens = 272000\ncompact_model = 'cheap'",
         )
         .unwrap();
-        let project: ConfigLayer =
-            toml::from_str("cost_warning_microdollars = 40\n[compaction]\nkeep_recent_tokens = 2")
-                .unwrap();
+        let project: ConfigLayer = toml::from_str(
+            "cost_warning_microdollars = 40\n[compaction]\nmax_active_tokens = 200000\nkeep_recent_tokens = 2",
+        )
+        .unwrap();
         let mut merged = global;
         merged.merge(project);
         assert_eq!(merged.max_cost_microdollars, Some(100));
@@ -2143,6 +2156,7 @@ mod tests {
         let compaction = merged.compaction.unwrap();
         assert_eq!(compaction.enabled, Some(false));
         assert_eq!(compaction.compact_model.as_deref(), Some("cheap"));
+        assert_eq!(compaction.max_active_tokens, Some(200_000));
         assert_eq!(compaction.keep_recent_tokens, Some(2));
     }
 
@@ -2150,11 +2164,16 @@ mod tests {
     fn explicit_compaction_mode_and_legacy_enabled_map_without_silent_fallback() {
         let directory = cwd();
         let global = directory.path().join("global.toml");
-        std::fs::write(&global, "[compaction]\nmode = 'native-responses'\n").unwrap();
+        std::fs::write(
+            &global,
+            "[compaction]\nmode = 'native-responses'\nmax_active_tokens = 0\n",
+        )
+        .unwrap();
         let mut cli = base();
         cli.workspace = Some(directory.path().into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.compaction.mode, CompactionMode::NativeResponses);
+        assert_eq!(config.compaction.max_active_tokens, Some(0));
 
         std::fs::write(&global, "[compaction]\nenabled = true\n").unwrap();
         let mut cli = base();

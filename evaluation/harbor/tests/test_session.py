@@ -230,7 +230,7 @@ class SessionConversionTests(unittest.TestCase):
             conversion = convert_session_file(
                 path,
                 agent_name="ygg",
-                agent_version="0.6.4",
+                agent_version="0.6.5",
                 model_name="m",
                 reasoning=None,
             )

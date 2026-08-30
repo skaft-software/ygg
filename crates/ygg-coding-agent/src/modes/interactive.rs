@@ -19,7 +19,8 @@ use ygg_agent::{
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
-    build_app, estimate_text_tokens, rebuild_app, resolve_launch_interactive, Bootstrap,
+    build_app, effective_compaction_threshold_fraction, estimate_text_tokens, rebuild_app,
+    resolve_launch_interactive, Bootstrap,
 };
 use crate::app::{
     apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
@@ -52,6 +53,7 @@ use crate::tui::view::InteractiveShell;
 #[derive(Debug)]
 enum ControlIntent {
     Steer(ygg_agent::UserInput),
+    FinishNow(ygg_agent::UserInput),
 }
 
 type ControlFuture = Pin<Box<dyn Future<Output = Result<(), AgentError>>>>;
@@ -543,6 +545,24 @@ fn settle_goal(
     }
 }
 
+fn answer_now_prompt(instruction: Option<String>) -> String {
+    const DIRECTIVE: &str =
+        "Answer now using only the evidence already gathered. Do not call tools. State any remaining uncertainty.";
+    instruction
+        .map(|instruction| format!("{}\n\n{DIRECTIVE}", instruction.trim()))
+        .unwrap_or_else(|| DIRECTIVE.to_owned())
+}
+
+fn answer_now_input(instruction: Option<String>) -> ComposedInput {
+    let display = instruction
+        .as_deref()
+        .map(str::trim)
+        .filter(|instruction| !instruction.is_empty())
+        .map(|instruction| format!("/answer {instruction}"))
+        .unwrap_or_else(|| "/answer".to_owned());
+    ComposedInput::for_answer(display, answer_now_prompt(instruction))
+}
+
 fn queue_command(command: Command, queue: &mut VecDeque<PendingIdleAction>) -> anyhow::Result<()> {
     let action = match command {
         Command::Login(provider) => PendingIdleAction::Login(provider),
@@ -1025,6 +1045,7 @@ where
                 in_flight = Some(Box::pin(async move {
                     match intent {
                         ControlIntent::Steer(text) => control.steer(text).await,
+                        ControlIntent::FinishNow(text) => control.finish_now(text).await,
                     }
                 }));
             }
@@ -1180,6 +1201,20 @@ where
                     InputAction::Command(_) => {
                         let command = commands::parse(&shell.drain_editor());
                         let was_quit = matches!(command, Command::Quit);
+                        if let Command::Answer(instruction) = &command {
+                            if !aborting {
+                                let composed = answer_now_input(instruction.clone());
+                                shell.queue_steering(&composed);
+                                intents.push_back(ControlIntent::FinishNow(
+                                    composed.into_user_input(),
+                                ));
+                                shell.notice(
+                                    "answer requested · tools disabled at the next safe boundary",
+                                );
+                            }
+                            shell.render();
+                            continue;
+                        }
                         // The live subagents view only reads extension
                         // presentation state, so it is safe to open while the
                         // run keeps going. Run events buffer until the panel
@@ -1681,9 +1716,14 @@ fn configure_auto_compaction(
         CompactionMode::Local => AgentCompactionMode::Local,
         CompactionMode::NativeResponses => AgentCompactionMode::NativeResponses,
     };
+    let mut candidate_config = app.config.clone();
+    candidate_config.compaction.mode = candidate_mode;
+    candidate_config.compaction.threshold_fraction = candidate_threshold;
+    let effective_threshold =
+        effective_compaction_threshold_fraction(&candidate_config, &app.model);
     if let Err(error) = app.agent.set_compaction_token_mode(
         agent_mode,
-        candidate_threshold,
+        effective_threshold,
         app.config.compaction.keep_recent_tokens,
     ) {
         shell.error(format!("auto-compaction was not changed: {error}"));
@@ -1694,10 +1734,18 @@ fn configure_auto_compaction(
     // while the Agent safely remains in its previous mode.
     app.config.compaction.mode = candidate_mode;
     app.config.compaction.threshold_fraction = candidate_threshold;
+    let threshold_detail = if (effective_threshold - candidate_threshold).abs() < f64::EPSILON {
+        format!("{:.0}%", effective_threshold * 100.0)
+    } else {
+        format!(
+            "{:.0}% effective (configured {:.0}%)",
+            effective_threshold * 100.0,
+            candidate_threshold * 100.0
+        )
+    };
     shell.notice(format!(
-        "auto-compaction {} at {:.0}% · keep ~{} recent tokens · this process",
+        "auto-compaction {} at {threshold_detail} · keep ~{} recent tokens · this process",
         candidate_mode.label(),
-        candidate_threshold * 100.0,
         app.config.compaction.keep_recent_tokens,
     ));
     Ok(())
@@ -3130,7 +3178,7 @@ async fn execute_skills_command(
 
 enum IdleCommandOutcome {
     Continue(Box<App>),
-    Submit { app: Box<App>, prompt: String },
+    Submit { app: Box<App>, input: ComposedInput },
     Quit(Box<App>),
 }
 
@@ -3295,6 +3343,12 @@ async fn run_idle_command(
             ));
         }
         Command::Prompt(None) => shell.show_overlay_text(prompt_templates_text(&app)),
+        Command::Answer(instruction) => {
+            return Ok(IdleCommandOutcome::Submit {
+                app: Box::new(app),
+                input: answer_now_input(instruction),
+            });
+        }
         Command::Prompt(Some(invocation)) => {
             let selection = shell.selected_plain_text();
             match expand_prompt_invocation(&mut app, &invocation, false, selection.as_deref()) {
@@ -3304,7 +3358,7 @@ async fn run_idle_command(
                     }
                     return Ok(IdleCommandOutcome::Submit {
                         app: Box::new(app),
-                        prompt: rendered.text,
+                        input: ComposedInput::from_text(rendered.text),
                     });
                 }
                 Ok(None) => shell.error("usage: /prompt <name> [arguments]".into()),
@@ -3528,7 +3582,7 @@ async fn run_idle_command(
             } else {
                 return Ok(IdleCommandOutcome::Submit {
                     app: Box::new(app),
-                    prompt: format!("/skill:{id}"),
+                    input: ComposedInput::from_text(format!("/skill:{id}")),
                 });
             }
         }
@@ -3598,7 +3652,7 @@ async fn run_idle_command(
                             }
                             return Ok(IdleCommandOutcome::Submit {
                                 app: Box::new(app),
-                                prompt: rendered.text,
+                                input: ComposedInput::from_text(rendered.text),
                             });
                         }
                         Ok(None) => {
@@ -4019,6 +4073,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
         }
         startup_prompt = Some(rendered.text);
     }
+    let mut startup_input = startup_prompt.map(ComposedInput::from_text);
     shell.hydrate(app.agent.session())?;
     update_status(&mut shell, &app);
     request_extension_ui(&mut shell, &mut app);
@@ -4033,8 +4088,8 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             shutdown_for_exit(&mut app).await;
             break;
         }
-        let idle = match startup_prompt.take() {
-            Some(prompt) if !prompt.is_empty() => Idle::Submit(ComposedInput::from_text(prompt)),
+        let idle = match startup_input.take() {
+            Some(input) if !input.is_empty() => Idle::Submit(input),
             _ => {
                 wait_for_prompt(
                     &mut shell,
@@ -4057,7 +4112,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 match app.goal_driver.fire_continuation() {
                     Ok(Some(continuation)) => {
                         next_prompt_source = GoalTurnSource::Continuation;
-                        startup_prompt = Some(continuation.prompt);
+                        startup_input = Some(ComposedInput::from_text(continuation.prompt));
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -4085,7 +4140,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             }
             Idle::Command(command_input) => {
                 if command_input.trim_start().starts_with("/skill:") {
-                    startup_prompt = Some(command_input);
+                    startup_input = Some(ComposedInput::from_text(command_input));
                     continue;
                 }
                 match run_idle_command(
@@ -4101,10 +4156,10 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         app = *next;
                         schedule_responses_prewarm(&app);
                     }
-                    IdleCommandOutcome::Submit { app: next, prompt } => {
+                    IdleCommandOutcome::Submit { app: next, input } => {
                         app = *next;
                         schedule_responses_prewarm(&app);
-                        startup_prompt = Some(prompt);
+                        startup_input = Some(input);
                     }
                     IdleCommandOutcome::Quit(next) => {
                         app = *next;
@@ -4428,6 +4483,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     shell.notice(notification);
                 }
                 app.agent.set_system_prompt(composition.system);
+                let answer_only = composed.answer_only;
                 let retry_composed = composed.clone();
                 composed.replace_model_text(composition.prompt);
                 // Keep extension context in the replayable model message, but
@@ -4443,21 +4499,29 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     context_window(&app.model),
                 );
 
-                let mut run = match app.agent.prompt(composed.into_user_input()).await {
-                    Ok(run) => run,
-                    Err(error) => {
-                        // No context commit occurred. The restored draft's next
-                        // attempt recomposes from `app.system` and overwrites
-                        // this transient composed Agent system before append.
-                        shell.restore_composed(retry_composed);
-                        let error = ygg_agent::public_error_diagnostic(
-                            &error,
-                            &app.model.endpoint.id.0,
-                            &app.model.spec.id.0,
-                        );
-                        shell.error(format!("prompt was not saved: {error}"));
-                        shell.render();
-                        continue;
+                let mut run = {
+                    let user_input = composed.into_user_input();
+                    let run_result = if answer_only {
+                        app.agent.prompt_without_tools(user_input).await
+                    } else {
+                        app.agent.prompt(user_input).await
+                    };
+                    match run_result {
+                        Ok(run) => run,
+                        Err(error) => {
+                            // No context commit occurred. The restored draft's next
+                            // attempt recomposes from `app.system` and overwrites
+                            // this transient composed Agent system before append.
+                            shell.restore_composed(retry_composed);
+                            let error = ygg_agent::public_error_diagnostic(
+                                &error,
+                                &app.model.endpoint.id.0,
+                                &app.model.spec.id.0,
+                            );
+                            shell.error(format!("prompt was not saved: {error}"));
+                            shell.render();
+                            continue;
+                        }
                     }
                 };
                 let extension_turn = app.executable_extensions.begin_turn().await;
@@ -4585,6 +4649,25 @@ mod tests {
 
     fn test_theme() -> crate::tui::theme::YggTheme {
         crate::tui::theme::test_theme()
+    }
+
+    #[test]
+    fn answer_now_prompt_preserves_optional_instruction_and_enforces_tool_free_synthesis() {
+        let bare = answer_now_prompt(None);
+        assert!(bare.contains("evidence already gathered"));
+        assert!(bare.contains("Do not call tools"));
+
+        let instructed = answer_now_prompt(Some("Be concise".into()));
+        assert!(instructed.starts_with("Be concise\n\n"));
+        assert!(instructed.contains("Do not call tools"));
+
+        let input = answer_now_input(Some("Be concise".into()));
+        assert!(input.answer_only);
+        assert_eq!(input.display_text, "/answer Be concise");
+        assert!(matches!(
+            input.parts.as_slice(),
+            [ygg_agent::InputPart::Text(text)] if text.contains("Do not call tools")
+        ));
     }
 
     #[test]

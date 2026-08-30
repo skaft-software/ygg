@@ -197,7 +197,7 @@ pub use goal_store::{
     MAX_GOAL_TURN_BUDGET,
 };
 pub use input::{InputPart, UserInput};
-pub use sandbox::SandboxConfig;
+pub use sandbox::{SandboxConfig, DEFAULT_MAX_OUTPUT_BYTES};
 pub use session::{
     Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRecord,
     SessionRunOutcome, SessionRunOutcomeStatus, UsageRecord, UsageRecordKind,

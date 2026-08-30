@@ -39,30 +39,41 @@ fn should_skip_directory(path: &Path) -> bool {
                 | "private"
                 | "target"
         )
-    )
+    ) || path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
 }
 
-fn append_header_path(
+fn append_path_entry(
     builder: &mut Builder<GzEncoder<File>>,
     source: &Path,
     archive_path: &Path,
     metadata: &Metadata,
 ) -> io::Result<()> {
     let mut header = Header::new_gnu();
-    header.set_path(archive_path)?;
-    header.set_mode(if metadata.permissions().readonly() {
-        0o444
+    if metadata.is_dir() {
+        header.set_mode(0o755);
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_size(0);
     } else {
-        0o644
-    });
+        header.set_mode(if metadata.permissions().readonly() {
+            0o444
+        } else {
+            0o644
+        });
+        header.set_size(metadata.len());
+    }
     header.set_uid(0);
     header.set_gid(0);
     header.set_mtime(0);
-    header.set_size(metadata.len());
-    header.set_cksum();
 
-    let mut file = File::open(source)?;
-    builder.append(&header, &mut file)
+    if metadata.is_dir() {
+        builder.append_data(&mut header, archive_path, io::empty())
+    } else {
+        let mut file = File::open(source)?;
+        builder.append_data(&mut header, archive_path, &mut file)
+    }
 }
 
 fn append_directory(
@@ -81,16 +92,7 @@ fn append_directory(
         if should_skip_directory(source) {
             return Ok(());
         }
-        let mut header = Header::new_gnu();
-        header.set_path(archive_path)?;
-        header.set_mode(0o755);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(0);
-        header.set_size(0);
-        header.set_entry_type(tar::EntryType::Directory);
-        header.set_cksum();
-        builder.append(&header, io::empty())?;
+        append_path_entry(builder, source, archive_path, &metadata)?;
 
         for entry in sorted_entries(source)? {
             let child = entry.path();
@@ -104,12 +106,12 @@ fn append_directory(
                     format!("documentation asset is a symlink: {}", child.display()),
                 ));
             } else if child_metadata.is_file() && should_include(&child) {
-                append_header_path(builder, &child, &child_archive_path, &child_metadata)?;
+                append_path_entry(builder, &child, &child_archive_path, &child_metadata)?;
             }
         }
         Ok(())
     } else if metadata.is_file() && should_include(source) {
-        append_header_path(builder, source, archive_path, &metadata)
+        append_path_entry(builder, source, archive_path, &metadata)
     } else {
         Ok(())
     }

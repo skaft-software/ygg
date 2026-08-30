@@ -345,17 +345,20 @@ fn openai_pricing(model_id: &str) -> Option<Pricing> {
             (5_000_000, 30_000_000, 500_000, 0),
             Some((10_000_000, 45_000_000, 1_000_000, 0)),
         ),
+        // GPT-5.6 uses OpenAI's published standard costs (Pi 0.84.4
+        // correction); the checked-in models.dev snapshot already agrees
+        // with these rates.
         "gpt-5.6-luna" => (
-            (1_000_000, 6_000_000, 100_000, 1_250_000),
-            Some((2_000_000, 9_000_000, 200_000, 2_500_000)),
+            (200_000, 1_200_000, 20_000, 250_000),
+            Some((400_000, 1_800_000, 40_000, 500_000)),
         ),
         "gpt-5.6-sol" => (
             (5_000_000, 30_000_000, 500_000, 6_250_000),
             Some((10_000_000, 45_000_000, 1_000_000, 12_500_000)),
         ),
         "gpt-5.6-terra" => (
-            (2_500_000, 15_000_000, 250_000, 3_125_000),
-            Some((5_000_000, 22_500_000, 500_000, 6_250_000)),
+            (2_000_000, 12_000_000, 200_000, 2_500_000),
+            Some((4_000_000, 18_000_000, 400_000, 5_000_000)),
         ),
         _ => return None,
     };
@@ -374,9 +377,9 @@ fn opencode_openai_pricing(model_id: &str) -> Option<Pricing> {
         "gpt-5.4-nano" => (200_000, 1_250_000, 20_000, 0),
         "gpt-5.4-pro" | "gpt-5.5-pro" => (30_000_000, 180_000_000, 30_000_000, 0),
         "gpt-5.5" => (5_000_000, 30_000_000, 500_000, 0),
-        "gpt-5.6-luna" => (1_000_000, 6_000_000, 100_000, 1_250_000),
+        "gpt-5.6-luna" => (200_000, 1_200_000, 20_000, 250_000),
         "gpt-5.6-sol" => (5_000_000, 30_000_000, 500_000, 6_250_000),
-        "gpt-5.6-terra" => (2_500_000, 15_000_000, 250_000, 3_125_000),
+        "gpt-5.6-terra" => (2_000_000, 12_000_000, 200_000, 2_500_000),
         _ => return None,
     };
     Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
@@ -1266,6 +1269,18 @@ mod tests {
         let opencode_gpt = model_pricing(OPENCODE.id, "gpt-5").unwrap();
         assert_eq!(direct_gpt.input, TokenRate(1_250_000));
         assert_eq!(opencode_gpt.input, TokenRate(1_070_000));
+        assert!(model_pricing(OPENAI.id, "gpt-5.6").is_none());
+        // GPT-5.6 uses OpenAI's published standard costs, not the older
+        // catalog estimates.
+        let luna = model_pricing(OPENAI.id, "gpt-5.6-luna").unwrap();
+        assert_eq!(luna.input, TokenRate(200_000));
+        assert_eq!(luna.output, TokenRate(1_200_000));
+        assert_eq!(luna.cache_read, TokenRate(20_000));
+        assert_eq!(luna.cache_write_5m, TokenRate(250_000));
+        assert_eq!(
+            model_pricing(OPENCODE.id, "gpt-5.6-luna").unwrap().input,
+            TokenRate(200_000)
+        );
         assert_eq!(model_pricing(OPENAI.id, "gpt-5.4").unwrap().tiers.len(), 1);
         assert!(model_pricing(OPENCODE.id, "gpt-5.4")
             .unwrap()
@@ -1273,7 +1288,7 @@ mod tests {
             .is_empty());
         let openrouter = model_pricing(OPENROUTER.id, "deepseek/deepseek-v4-pro")
             .expect("models.dev fallback pricing");
-        assert_eq!(openrouter.input, TokenRate(1_600_000));
+        assert_eq!(openrouter.input, TokenRate(417_252));
     }
 
     #[test]

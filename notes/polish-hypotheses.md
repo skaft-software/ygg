@@ -18,3 +18,15 @@ Options to evaluate:
 
 Evaluate alongside the collapsed-thinking fix (model-authored headings promoted into the
 collapsed thinking indicator can change too often and feel like random status text).
+
+## Open provider-compatibility bug (recorded 2026-08-27)
+
+- OpenAI Responses error events can fail during response decoding when a field in
+  the nested `error` object is JSON `null` even though the decoder expects a
+  string. Observed: `provider=openai-codex model=gpt-5.6-luna phase=response
+  decoding detail=JSON decode error: invalid OpenAI Responses error event
+  (error,sequence_number,type; error=code,message,param,type): invalid type:
+  null, expected a string`.
+- Follow-up: identify the nullable field (likely `error.param`), make the wire
+  fixture/parser accept the provider's null shape, and add malformed-event
+  regression coverage.

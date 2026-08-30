@@ -899,6 +899,11 @@ fn discovered_preset_binding(
     preset: &ProviderPreset,
     model_id: &str,
 ) -> Option<(&'static str, Protocol)> {
+    // models.dev and some stale inventories expose this unsupported alias,
+    // but OpenAI's APIs reject it. Keep the provider-specific variants.
+    if preset.id == crate::providers::OPENAI.id && model_id == "gpt-5.6" {
+        return None;
+    }
     if preset.id != crate::providers::OPENCODE.id {
         return Some((
             preset.id,
@@ -2846,12 +2851,30 @@ const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
+/// Optional absolute active-context ceiling for Codex routes. There is no
+/// route default: the full provider-advertised window (872K, 1M on Pro) is
+/// available for in-context learning, and users can constrain the working
+/// set with `compaction.max_active_tokens` (for example 272_000).
 const CODEX_MODEL_CACHE_VERSION: u8 = 2;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
 // not Ygg's package version. Sending `0.1.0` causes the backend to filter out
 // models that require a contemporary Codex client.
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+
+pub(crate) fn effective_compaction_threshold_fraction(config: &Config, model: &Model) -> f64 {
+    let Some(max_active_tokens) = config
+        .compaction
+        .max_active_tokens
+        .filter(|tokens| *tokens > 0)
+    else {
+        return config.compaction.threshold_fraction;
+    };
+    let context_window = model.spec.limits.context_window.max(1);
+    let absolute_fraction =
+        (max_active_tokens.min(context_window) as f64) / (context_window as f64);
+    config.compaction.threshold_fraction.min(absolute_fraction)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DiscoveredCodexModel {
@@ -3095,6 +3118,13 @@ fn codex_pricing(model_id: &str) -> Option<Pricing> {
             Some((5_000_000, 22_500_000, 500_000, 0)),
         ),
         "gpt-5.4-mini" => (750_000, 4_500_000, 75_000, 0, None),
+        "gpt-5.4-pro" | "gpt-5.5-pro" => (
+            30_000_000,
+            180_000_000,
+            0,
+            0,
+            Some((60_000_000, 270_000_000, 0, 0)),
+        ),
         "gpt-5.5" => (
             5_000_000,
             30_000_000,
@@ -3102,12 +3132,14 @@ fn codex_pricing(model_id: &str) -> Option<Pricing> {
             0,
             Some((10_000_000, 45_000_000, 1_000_000, 0)),
         ),
+        // GPT-5.6 uses OpenAI's published standard costs, which are well below
+        // the older catalog estimates (Pi 0.84.4 pinned these as authoritative).
         "gpt-5.6-luna" => (
-            1_000_000,
-            6_000_000,
-            100_000,
-            1_250_000,
-            Some((2_000_000, 9_000_000, 200_000, 2_500_000)),
+            200_000,
+            1_200_000,
+            20_000,
+            250_000,
+            Some((400_000, 1_800_000, 40_000, 500_000)),
         ),
         "gpt-5.6-sol" => (
             5_000_000,
@@ -3117,11 +3149,11 @@ fn codex_pricing(model_id: &str) -> Option<Pricing> {
             Some((10_000_000, 45_000_000, 1_000_000, 12_500_000)),
         ),
         "gpt-5.6-terra" => (
+            2_000_000,
+            12_000_000,
+            200_000,
             2_500_000,
-            15_000_000,
-            250_000,
-            3_125_000,
-            Some((5_000_000, 22_500_000, 500_000, 6_250_000)),
+            Some((4_000_000, 18_000_000, 400_000, 5_000_000)),
         ),
         _ => return None,
     };
@@ -4225,7 +4257,7 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
     agent.set_compaction_model(compact_model);
     agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
-        config.compaction.threshold_fraction,
+        effective_compaction_threshold_fraction(&config, &model),
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);
@@ -4421,7 +4453,7 @@ pub fn rebuild_app(
     agent.set_compaction_model(compact_model);
     agent.set_compaction_token_mode(
         agent_compaction_mode(config.compaction.mode),
-        config.compaction.threshold_fraction,
+        effective_compaction_threshold_fraction(&config, &model),
         config.compaction.keep_recent_tokens,
     )?;
     agent.set_max_session_cost_microdollars(config.max_cost_microdollars);

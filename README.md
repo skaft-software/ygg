@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.4"><img alt="Release: 0.6.4" src="https://img.shields.io/badge/release-0.6.4-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.5"><img alt="Release: 0.6.5" src="https://img.shields.io/badge/release-0.6.5-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -39,11 +39,11 @@ verifies the release archive and installs `ygg` and `ygg-host` under
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.4/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.5/install-ygg.sh | sh
 ```
 
 ```sh
-ygg --version   # ygg 0.6.4
+ygg --version   # ygg 0.6.5
 ygg --help
 ```
 
@@ -92,7 +92,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.4/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.5/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -103,7 +103,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.4 \
+  --tag v0.6.5 \
   --bins \
   ygg-coding-agent
 ```
@@ -130,7 +130,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.4 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.5 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -228,11 +228,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.4
+scripts/build-ygg-image.sh ygg:0.6.5
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.4 --model claude-sonnet-4-6
+  ygg:0.6.5 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -475,13 +475,16 @@ Capability handling is model-specific. ygg validates modalities, tool use, struc
 
 Codex routes that advertise Responses Lite use that transport contract for both
 ordinary and native compact requests. Ygg sends the Lite header, places tool
-schemas and developer instructions in input items, explicitly disables parallel
-tool calls, requests reasoning context across all turns, and removes only
-unsupported image-detail hints. This behavior is capability-driven rather than
-coupled to an endpoint name or OAuth plan. If a provider retires a long-lived
-Responses WebSocket before generation with a connection-lifetime error, Ygg
+schemas and developer instructions in input items, enables parallel tool calls
+when the model advertises them, requests reasoning context across all turns,
+and removes only unsupported image-detail hints. This behavior is
+capability-driven rather than coupled to an endpoint name or OAuth plan. If a
+provider retires a long-lived Responses WebSocket before generation with a
+connection-lifetime error, Ygg
 retires that socket and retries the unchanged request through the HTTP fallback;
-ordinary post-send disconnects remain terminal.
+ordinary post-send disconnects remain terminal. Model-side batching does not relax
+host effect ordering: only explicitly parallel-safe pure or workspace-read calls
+overlap; shell and mutation effects remain serialized.
 
 ### Reasoning without transcript noise
 
@@ -579,12 +582,15 @@ See [docs/sessions.md](docs/sessions.md) for the record schema, branch semantics
 
 ### Context and compaction
 
-ygg estimates the complete next provider-visible request before every model turn. The default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer; local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
+ygg estimates the complete next provider-visible request before every model turn. The generic default `threshold_fraction = 1.0` keeps a fixed 16K coding-turn reserve (or the larger advertised reasoning floor) instead of adding a percentage buffer. Authenticated Codex routes use the provider's full advertised window (872K, 1M on Pro) for in-context learning; set `max_active_tokens` (for example 272000) to constrain the active working set so long investigations compact before repeated prompt replay dominates wall time. Local compaction creates a bounded summary at a safe completed-turn boundary, preserves an approximately token-bounded recent tail, and keeps active skill state. The model's advertised maximum output remains the request ceiling and is reduced only when the current input leaves less room in the context window. OpenAI Responses routes can instead use provider-native opaque compaction without exposing that payload in the transcript.
 
 ```toml
 [compaction]
 mode = "local" # disabled, local, or native-responses
 threshold_fraction = 1.0
+# Optional absolute active-context threshold. Codex routes use the full
+# advertised window when unset; zero is equivalent to unsetting.
+# max_active_tokens = 272000
 keep_recent_tokens = 20000
 compact_model = "openrouter/anthropic/claude-haiku-4.5"
 ```
@@ -606,7 +612,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
-- The compiled default theme is the only theme exposed by the v0.6.4 runtime.
+- The compiled default theme is the only theme exposed by the v0.6.5 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -629,7 +635,7 @@ ygg --mouse app
 
 ## Terminal theming
 
-Theme selection is disabled in v0.6.4. The TUI and graphical Serve frontend expose
+Theme selection is disabled in v0.6.5. The TUI and graphical Serve frontend expose
 only Ygg's compiled default theme; that does **not** mean a fixed accent hue.
 The selected model's deterministic palette changes the atmosphere while layout,
 interaction grammar, and semantic status colours remain stable. See
@@ -649,6 +655,7 @@ Type `/` in the composer to open live command discovery.
 | `/checkout <id>` | Move the durable head to another entry and branch from it. |
 | `/model [id]` | Open the model picker or select a model. |
 | `/thinking [level]` | Inspect or change model-supported reasoning. |
+| `/answer [instruction]` | Stop tool use at the next safe boundary and answer from evidence already gathered. |
 | `/compact` | Compact at the next safe boundary. |
 | `/verbose [on\|off]` | Expand or collapse retained reasoning and bounded tool-output projections. |
 | `/reload` | Reload instructions, prompts, skills, and enabled extensions. |
@@ -728,11 +735,14 @@ offline = false
 [compaction]
 mode = "local"
 threshold_fraction = 1.0
+# Codex routes use the full advertised window by default. Set a value to
+# constrain the active working set; zero is equivalent to unsetting.
+# max_active_tokens = 272000
 keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 Telemetry is opt-in and separate from durable sessions. `--telemetry PATH` writes
 owner-only `ygg.telemetry.v1` JSONL records for run boundaries, model request
@@ -963,13 +973,13 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
-| [Release notes](docs/releases/v0.6.4.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.5.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | v0.6.4 default-only status and reserved schema. |
+| [Themes](docs/themes.md) | v0.6.5 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |

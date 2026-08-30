@@ -344,6 +344,8 @@ pub(crate) fn build_compact_request(
             })
     };
     let parallel_tool_calls = if responses_lite {
+        // The internal Responses Lite route requires an explicit false even
+        // when the model otherwise advertises parallel tool-call support.
         Some(false)
     } else {
         mapped_tools
@@ -849,9 +851,8 @@ pub(crate) fn build_request(
             .and_then(|options| options.context_management.clone()),
         tools: tools_opt,
         tool_choice: tool_choice_opt,
-        // Responses Lite requires an explicit `false`. Otherwise, do not rely
-        // on a provider default when tools are exposed, and omit the field when
-        // there are no tools.
+        // The internal Responses Lite route requires an explicit false even
+        // when the model otherwise advertises parallel tool-call support.
         parallel_tool_calls: if responses_lite {
             Some(false)
         } else {
@@ -1778,6 +1779,7 @@ mod tests {
         spec.capabilities.reasoning.as_mut().unwrap().max_effort =
             crate::types::ReasoningEffort::Ultra;
         model.spec = Arc::new(spec);
+        assert!(model.spec.capabilities.parallel_tool_calls);
 
         let mut req = user_req(
             vec![UserPart::Text("Hello".to_owned())],
@@ -1821,6 +1823,29 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "max");
         assert_eq!(body["reasoning"]["context"], "all_turns");
         assert!(body["reasoning"].get("mode").is_none());
+    }
+
+    #[test]
+    fn responses_lite_honors_disabled_parallel_tool_capability() {
+        let mut model = make_test_model(true);
+        let mut spec = (*model.spec).clone();
+        spec.capabilities.responses_lite = true;
+        spec.capabilities.parallel_tool_calls = false;
+        model.spec = Arc::new(spec);
+
+        let mut req = user_req(
+            vec![UserPart::Text("Hello".to_owned())],
+            CompatibilityMode::Strict,
+        );
+        req.tools.push(ToolDef {
+            name: "read".to_owned(),
+            description: "Read a file".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["parallel_tool_calls"], false);
     }
 
     #[test]

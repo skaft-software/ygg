@@ -604,6 +604,51 @@ fn session_picker_render_shows_scope_markers_and_fork_metadata() {
 }
 
 #[test]
+fn model_and_resume_pickers_use_the_active_model_accent() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_identity("anthropic", "claude-sonnet-4", "high");
+    let (model_accent, ui_accent) = {
+        let state = shell.state.borrow();
+        let sequence = |role| {
+            let (red, green, blue) = state
+                .theme
+                .role_rgb(role)
+                .unwrap_or_else(|| panic!("missing {role} colour"));
+            format!("\x1b[38;2;{red};{green};{blue}m")
+        };
+        (sequence("model_accent"), sequence("accent"))
+    };
+    assert_ne!(model_accent, ui_accent);
+
+    open_select_panel(&mut shell, &["Claude Sonnet 4", "GPT-5"]);
+    let model_rows = render_panel(&shell.state.borrow(), 80);
+    let selected_model = model_rows
+        .iter()
+        .find(|line| strip_terminal_sequences(line).contains("Claude Sonnet 4"))
+        .expect("selected model row");
+    assert!(selected_model.contains(&model_accent), "{model_rows:?}");
+    assert!(!selected_model.contains(&ui_accent), "{model_rows:?}");
+
+    shell.close_panel();
+    shell.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(vec![picker_session("one", "First session", 1, 1)], None),
+    });
+    let resume_rows = render_panel(&shell.state.borrow(), 100);
+    let selected_session = resume_rows
+        .iter()
+        .find(|line| strip_terminal_sequences(line).contains("First session"))
+        .expect("selected resume row");
+    assert!(selected_session.contains(&model_accent), "{resume_rows:?}");
+    assert!(!selected_session.contains(&ui_accent), "{resume_rows:?}");
+    let active_scope = resume_rows
+        .iter()
+        .find(|line| strip_terminal_sequences(line).contains("Current Folder"))
+        .expect("active resume scope");
+    assert!(active_scope.contains(&model_accent), "{resume_rows:?}");
+    assert!(!active_scope.contains(&ui_accent), "{resume_rows:?}");
+}
+
+#[test]
 fn wide_session_picker_gives_titles_and_metadata_separate_rows() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
@@ -1366,7 +1411,7 @@ fn slash_command_menu_lists_commands_and_tab_completes_a_unique_prefix() {
 }
 
 #[test]
-fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
+fn inline_autocomplete_uses_compact_footers_and_the_model_accent() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/main.rs"), b"x").unwrap();
@@ -1381,8 +1426,8 @@ fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
         let state = shell.state.borrow();
         let (red, green, blue) = state
             .theme
-            .model_rgb(Some(ModelLab::Anthropic))
-            .expect("Anthropic model accent");
+            .role_rgb("model_accent")
+            .expect("active model accent");
         format!("\x1b[38;2;{red};{green};{blue}m")
     };
     let ui_accent = {
@@ -1390,6 +1435,7 @@ fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
         let (red, green, blue) = state.theme.role_rgb("accent").expect("UI accent");
         format!("\x1b[38;2;{red};{green};{blue}m")
     };
+    assert_ne!(model_accent, ui_accent);
 
     shell.apply_edit(EditAction::Char('/'));
     let slash = render_slash_suggestions(&shell.state.borrow(), 120, 6);
@@ -1399,8 +1445,8 @@ fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
         strip_terminal_sequences(selected).starts_with("› /new"),
         "{slash:?}"
     );
-    assert!(selected.contains(&ui_accent), "{selected:?}");
-    assert!(!selected.contains(&model_accent), "{selected:?}");
+    assert!(selected.contains(&model_accent), "{selected:?}");
+    assert!(!selected.contains(&ui_accent), "{selected:?}");
     let unselected = slash
         .iter()
         .find(|line| line.contains("/resume"))
@@ -1413,7 +1459,8 @@ fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
             && plain_footer.contains("↑↓ navigate · ↵ select · esc close"),
         "{plain_footer:?}"
     );
-    assert!(footer.contains(&ui_accent), "{footer:?}");
+    assert!(footer.contains(&model_accent), "{footer:?}");
+    assert!(!footer.contains(&ui_accent), "{footer:?}");
 
     shell.drain_editor();
     shell.set_workspace(dir.path().to_path_buf());
@@ -1426,13 +1473,15 @@ fn inline_autocomplete_uses_compact_footers_and_the_ui_accent() {
         .find(|line| line.contains("src/main.rs"))
         .expect("selected mention suggestion");
     assert_eq!(strip_terminal_sequences(selected).trim(), "› src/main.rs");
-    assert!(selected.contains(&ui_accent), "{selected:?}");
+    assert!(selected.contains(&model_accent), "{selected:?}");
+    assert!(!selected.contains(&ui_accent), "{selected:?}");
     let footer = paths.last().expect("mention suggestion footer");
     assert_eq!(
         strip_terminal_sequences(footer).trim(),
         "project files · tab complete"
     );
-    assert!(footer.contains(&ui_accent), "{footer:?}");
+    assert!(footer.contains(&model_accent), "{footer:?}");
+    assert!(!footer.contains(&ui_accent), "{footer:?}");
 }
 
 #[test]
@@ -3812,13 +3861,17 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
             visible
                 .lines()
                 .next()
-                .is_some_and(|line| line.contains("Context ·")),
+                .is_some_and(|line| line.contains("Context Usage")),
             "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
         );
-        assert!(visible.contains(" input + "), "{visible}");
-        assert!(visible.contains("auto-compact"), "{visible}");
-        assert!(visible.contains('━'), "context bar was clipped:\n{visible}");
-        assert!(visible.contains("System prompt"), "{visible}");
+        assert!(visible.contains("Estimated usage by category"), "{visible}");
+        assert!(visible.contains("Runtime framing and tools"), "{visible}");
+        assert!(visible.contains("System instructions"), "{visible}");
+        assert!(visible.contains("tokens"), "{visible}");
+        assert!(
+            visible.contains('⛀'),
+            "context grid was clipped:\n{visible}"
+        );
         assert!(
             visible
                 .lines()
@@ -3840,7 +3893,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert!(
-            !physical.contains("Context ·"),
+            !physical.contains("Context Usage"),
             "overlay entered history:\n{physical}"
         );
         for index in 0..40 {

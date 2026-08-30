@@ -5,7 +5,9 @@ use ygg_ai::{Media, UserPart};
 /// A user-authored input: ordered text and media parts.
 ///
 /// This is the type accepted by [`Agent::prompt`](crate::Agent::prompt),
-/// [`RunControl::steer`](crate::RunControl::steer) and
+/// [`Agent::prompt_without_tools`](crate::Agent::prompt_without_tools),
+/// [`RunControl::steer`](crate::RunControl::steer),
+/// [`RunControl::finish_now`](crate::RunControl::finish_now), and
 /// [`RunControl::follow_up`](crate::RunControl::follow_up). Plain strings
 /// convert via `From`, so text-only callers pass `&str`/`String` unchanged.
 #[derive(Clone, Debug)]

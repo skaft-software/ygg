@@ -381,8 +381,12 @@ impl ResponsesWsPool {
                 if let Some(key) = key {
                     self.remove(key, &connection).await;
                 }
+                // The actor owns `started` and only acknowledges it immediately
+                // after `socket.send` succeeds. If the sender disappears first,
+                // the queued command was dropped without reaching the socket, so
+                // replaying through HTTP is safe.
                 Err(transport_error(
-                    TransportPhase::ResponseHeaders,
+                    TransportPhase::Connect,
                     "Responses WebSocket actor stopped before request start was acknowledged",
                 ))
             }
@@ -911,6 +915,56 @@ mod tests {
 
         let _ = release.send(());
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn actor_exit_before_start_is_a_replay_safe_open_failure() {
+        let pool = ResponsesWsPool::default();
+        let (sender, mut commands) = mpsc::channel(1);
+        let connection = Connection {
+            sender,
+            alive: Arc::new(AtomicBool::new(true)),
+        };
+        pool.state
+            .lock()
+            .await
+            .sessions
+            .insert("stale".to_owned(), connection.clone());
+
+        let request = tokio::spawn({
+            let pool = pool.clone();
+            async move {
+                pool.request(
+                    Some("stale"),
+                    Url::parse("ws://127.0.0.1:1/").unwrap(),
+                    http::HeaderMap::new(),
+                    serde_json::json!({"model": "gpt", "input": []}),
+                )
+                .await
+            }
+        });
+
+        // Simulate an idle actor selecting shutdown after the command entered
+        // its queue but before it attempted the WebSocket send.
+        drop(
+            commands
+                .recv()
+                .await
+                .expect("request command was not queued"),
+        );
+        let error = request
+            .await
+            .unwrap()
+            .expect_err("request unexpectedly started");
+        assert!(matches!(
+            error,
+            AiError::Transport(TransportError {
+                phase: TransportPhase::Connect,
+                ..
+            })
+        ));
+        assert!(!connection.alive.load(Ordering::Acquire));
+        assert!(!pool.state.lock().await.sessions.contains_key("stale"));
     }
 
     #[tokio::test]

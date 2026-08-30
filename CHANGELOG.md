@@ -2,6 +2,47 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.6.5 — 2026-08-30
+
+### Added
+
+- Added `/answer [instruction]` to request an immediate final response from
+  gathered evidence. Idle runs begin without tools; active runs persist the
+  directive at the next safe boundary and expose no tools thereafter.
+
+### Changed
+
+- Keep authenticated Codex routes on the provider's full advertised context
+  window by default for in-context learning; `compaction.max_active_tokens`
+  (for example 272000) optionally constrains the active working set.
+- Reconcile `/context` with the agent's provider-reconciled semantic context
+  breakdown, including adaptive capacity grids for large model windows.
+- Raise the default model-visible tool-result cap from 16 KiB to 50 KiB while
+  retaining bounded output capture and policy enforcement.
+
+### Performance
+
+- Keep the Responses Lite wire contract serial while host admission overlaps
+  explicitly parallel-safe pure/workspace-read calls; arbitrary shell and
+  mutating effects remain ordered.
+- Reduce Codex tool-loop latency by enabling provider-advertised tool-call
+  batching without relaxing host-side effect ordering.
+
+### Fixed
+
+- Correct GPT-5.6 Luna and Terra pricing across the OpenAI, OpenCode, and Codex
+  pricing tables to OpenAI's published standard costs ($0.20/$1.20/$0.02/$0.25
+  and $2/$12/$0.20/$2.50 per million tokens, with matching long-context tiers);
+  previously displayed session costs were about 5x too high for Luna.
+- Preserve GPT-5.4 Pro and GPT-5.5 Pro long-context pricing on Codex routes,
+  exclude OpenAI's rejected base `gpt-5.6` alias, and refresh the checked-in
+  models.dev pricing and display-name snapshots together.
+- Retire a preferred Responses WebSocket before publishing a pre-generation
+  connection-lifetime failure and retry that request through the HTTP fallback;
+  post-generation disconnects remain terminal.
+- Use the active model's adaptive accent consistently for slash completion,
+  model selection, session resume, and other picker focus controls.
+
 ## 0.6.4 — 2026-08-30
 
 ### Added

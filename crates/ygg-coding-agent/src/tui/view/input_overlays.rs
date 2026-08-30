@@ -90,7 +90,7 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
 fn suggestion_key_hint(state: &ShellState, key: &str, label: &str) -> String {
     format!(
         "{} {}",
-        state.theme.bold(&state.theme.fg("accent", key)),
+        state.theme.bold(&state.theme.fg("model_accent", key)),
         state.theme.fg("muted", label)
     )
 }
@@ -220,7 +220,7 @@ pub(super) fn render_slash_suggestions(
         );
         let choice = format!("{prefix} {label}");
         let choice = if selected_row {
-            state.theme.bold(&state.theme.fg("accent", &choice))
+            state.theme.bold(&state.theme.fg("model_accent", &choice))
         } else {
             state.theme.fg("foreground", &choice)
         };
@@ -306,7 +306,7 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
         };
         let choice = format!("{prefix} {path}");
         let choice = if index == 0 {
-            state.theme.bold(&state.theme.fg("accent", &choice))
+            state.theme.bold(&state.theme.fg("model_accent", &choice))
         } else {
             state.theme.fg("muted", &choice)
         };
