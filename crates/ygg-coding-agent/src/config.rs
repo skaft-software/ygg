@@ -368,8 +368,9 @@ impl CompactionMode {
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
     pub threshold_fraction: f64,
-    /// Optional absolute active-context threshold. `Some(0)` disables the
-    /// route-specific absolute default; `threshold_fraction` still applies.
+    /// Optional absolute active-context threshold. Unset uses the provider's
+    /// full advertised window; `Some(0)` is equivalent to unset.
+    /// `threshold_fraction` still applies.
     pub max_active_tokens: Option<u64>,
     pub keep_recent_tokens: u64,
     /// Optional model override for summary calls. When absent, bootstrap uses

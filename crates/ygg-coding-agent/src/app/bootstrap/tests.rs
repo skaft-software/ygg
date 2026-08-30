@@ -21,7 +21,7 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
-fn codex_compaction_defaults_to_short_active_context_and_allows_overrides() {
+fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = config(directory.path(), None);
     let catalog = base_model_catalog(true).unwrap();
@@ -32,9 +32,10 @@ fn codex_compaction_defaults_to_short_active_context_and_allows_overrides() {
     Arc::make_mut(&mut model.endpoint).id = EndpointId(crate::auth::codex::ENDPOINT_ID.into());
     Arc::make_mut(&mut model.spec).limits.context_window = 872_000;
 
-    let expected = 272_000.0 / 872_000.0;
-    assert!(
-        (effective_compaction_threshold_fraction(&config, &model) - expected).abs() < f64::EPSILON
+    // No route default: the full provider-advertised window is available.
+    assert_eq!(
+        effective_compaction_threshold_fraction(&config, &model),
+        1.0
     );
 
     config.compaction.threshold_fraction = 0.25;
