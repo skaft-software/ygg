@@ -20,7 +20,7 @@
 
 <p align="center">
   <a href="#install"><strong>Install</strong></a> ·
-  <a href="docs/benchmarks/tb21-v0.6.2/README.md"><strong>Evidence</strong></a> ·
+  <a href="docs/benchmarks/tb21-v0.6.2/README.md"><strong>Performance</strong></a> ·
   <a href="https://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
