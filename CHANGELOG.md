@@ -42,6 +42,7 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   post-generation disconnects remain terminal.
 - Use the active model's adaptive accent consistently for slash completion,
   model selection, session resume, and other picker focus controls.
+
 ## 0.6.4 — 2026-08-30
 
 ### Added
