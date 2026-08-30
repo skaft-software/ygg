@@ -636,7 +636,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         .iter()
         .filter(|segment| segment.visible && segment.kind != FooterKind::Identity)
         .collect::<Vec<_>>();
-    let identity_text = identity.map(&style_segment).unwrap_or_default();
+    let identity_text = identity.map(style_segment).unwrap_or_default();
     let identity_width = identity.map_or(0, |segment| visible_width(segment.text()));
     let metrics_width = metrics
         .iter()
