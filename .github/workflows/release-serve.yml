@@ -396,6 +396,8 @@ jobs:
     name: Sign and attach extension artifacts
     needs: [resolve, build, build-bundles]
     runs-on: ubuntu-24.04
+    # Gate the only job that can sign or mutate a canonical release.
+    environment: stable-release-publish
     permissions:
       actions: read
       contents: write

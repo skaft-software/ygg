@@ -358,6 +358,9 @@ jobs:
     needs: [resolve, build]
     if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ubuntu-24.04
+    # Human approval is required only when the immutable artifacts are ready to
+    # receive write/OIDC privileges, not while unprivileged validation runs.
+    environment: stable-release-publish
     outputs:
       release_tag: ${{ needs.resolve.outputs.tag }}
       version: ${{ needs.resolve.outputs.version }}
@@ -618,6 +621,7 @@ jobs:
     needs: resolve
     if: needs.resolve.outputs.mode == 'installer'
     runs-on: ubuntu-24.04
+    environment: stable-release-publish
     permissions:
       contents: write
       id-token: write
