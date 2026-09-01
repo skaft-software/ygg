@@ -1,0 +1,4 @@
+subject= /O=DevOps Team/CN=dev-internal.company.local
+notBefore=Aug 30 17:10:04 2026 GMT
+notAfter=Aug 30 17:10:04 2027 GMT
+SHA-256 Fingerprint=F2:98:5E:44:3B:2E:25:52:40:6C:23:B0:EC:3F:B0:7A:52:2B:21:51:FB:D3:50:5A:7E:DB:01:07:DE:08:36:4F

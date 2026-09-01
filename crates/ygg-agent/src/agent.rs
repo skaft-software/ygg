@@ -4509,6 +4509,20 @@ impl Agent {
         ))
     }
 
+    /// Build the detailed, provider-reconciled context categories on demand.
+    pub fn request_context_breakdown(&self) -> Result<ContextBreakdown, SessionError> {
+        let messages = self.session.context_ref()?;
+        let system = self.system.clone();
+        let tools = self.extensions.tool_definitions();
+        Ok(context_breakdown(
+            &self.session,
+            &self.model,
+            &system,
+            &messages,
+            &tools,
+        ))
+    }
+
     /// Complete route-affine Responses replay input for the active branch.
     ///
     /// `None` means the active route is not Responses or a legacy/crash gap

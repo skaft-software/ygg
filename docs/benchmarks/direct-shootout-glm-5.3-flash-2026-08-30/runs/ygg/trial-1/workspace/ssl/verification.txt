@@ -1,0 +1,6 @@
+Certificate Verification Report
+===============================
+subject=O=DevOps Team, CN=dev-internal.company.local
+notBefore=Aug 30 17:07:55 2026 GMT
+notAfter=Aug 30 17:07:55 2027 GMT
+sha256 Fingerprint=43:04:7F:C9:3E:96:CE:BA:FF:4C:8A:67:DE:15:E3:15:73:0F:AA:F2:8D:10:EA:2B:B9:28:E5:5C:84:C3:8B:C3

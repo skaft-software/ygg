@@ -1,0 +1,16 @@
+All cert files created with correct permissions and a 365-day validity window (2026-08-30 → 2027-08-30). Now the Python verifier:Now a final end-to-end verification pass covering all six requirements, including a failure-path sanity check:All requirements are complete and verified.
+
+**Artifacts created:**
+1. `ssl/` directory with all certificate files
+2. `ssl/server.key` — 2048-bit RSA private key, permissions `600` (verified `-rw-------`)
+3. `ssl/server.crt` — self-signed (subject = issuer = `O=DevOps Team, CN=dev-internal.company.local`), validity exactly **365 days** (2026-08-30 → 2027-08-30), `openssl verify -CAfile` returns OK
+4. `ssl/server.pem` — contains both `BEGIN PRIVATE KEY` and `BEGIN CERTIFICATE` blocks
+5. `ssl/verification.txt` — subject, `notBefore`/`notAfter`, and SHA-256 fingerprint `43:04:7F:...:8B:C3`
+6. `check_cert.py` — stdlib only (`datetime`, `re`, `subprocess`, `sys`, `pathlib`) plus OpenSSL subprocesses
+
+**check_cert.py behavior** (verified by running it):
+- Loads/parses the cert, chain-verifies it against itself, checks key↔cert modulus match, Common Name, and exact 365-day currently-valid window
+- Prints `Common Name: dev-internal.company.local`, `Expiration Date: 2027-08-30`, per-check OK lines, then `Certificate verification successful` with exit 0
+- Failure path tested: with the cert temporarily removed it exits non-zero and never prints the success line
+
+Paths in the script resolve relative to the script's own location, so it works unchanged when the workspace is mounted as `/app`.

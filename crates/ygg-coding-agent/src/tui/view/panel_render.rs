@@ -256,12 +256,12 @@ fn picker_scope_text(theme: &YggTheme, picker: &PickerState) -> String {
         ("[*] Current Folder", "[ ] All")
     };
     let current = if picker.scope == PickerScope::Current {
-        theme.fg("accent", current)
+        theme.fg("model_accent", current)
     } else {
         subdued_text(theme, current)
     };
     let all = if picker.scope == PickerScope::All {
-        theme.fg("accent", all)
+        theme.fg("model_accent", all)
     } else {
         subdued_text(theme, all)
     };
@@ -487,7 +487,7 @@ fn render_picker_row(
         PresentationLayout::new(&state.theme, width).inset,
     ));
     let cursor = if selected {
-        format!("{inset}{}", state.theme.fg("accent", "› "))
+        format!("{inset}{}", state.theme.fg("model_accent", "› "))
     } else {
         format!("{inset}  ")
     };
@@ -495,7 +495,7 @@ fn render_picker_row(
     let label = if confirming {
         state.theme.fg("error", &label)
     } else if is_current {
-        state.theme.fg("accent", &label)
+        state.theme.fg("model_accent", &label)
     } else if meta.name.is_some() {
         state.theme.fg("warning", &label)
     } else {
@@ -575,7 +575,7 @@ fn render_message_item(
     let display = panel_cell(&display);
     let prefix = tree_prefix(index, total, state.theme.unicode());
     let cursor = if selected {
-        state.theme.fg("accent", "› ")
+        state.theme.fg("model_accent", "› ")
     } else {
         "  ".to_owned()
     };
@@ -1214,10 +1214,10 @@ fn render_panel_item(
         PresentationLayout::new(&state.theme, width).inset,
     ));
     let prefix = if is_selected {
-        // Picker focus is UI state, not the currently selected model's lab
-        // colour. The global accent stays legible even when a provider's
-        // brand colour is intentionally subdued (for example OpenAI black).
-        format!("{inset}{} ", state.theme.fg("accent", marker))
+        // Every picker follows the active model's adaptive shell accent. In a
+        // model picker this is the active model, not the focused candidate's
+        // provider colour; choosing the candidate updates the shell afterward.
+        format!("{inset}{} ", state.theme.fg("model_accent", marker))
     } else {
         format!("{inset}  ")
     };
@@ -1227,7 +1227,7 @@ fn render_panel_item(
     if stacked {
         let label = sexy_tui_rs::truncate_to_width(&item, available, Some(ellipsis));
         let label = if is_selected {
-            state.theme.bold(&state.theme.fg("accent", &label))
+            state.theme.bold(&state.theme.fg("model_accent", &label))
         } else {
             label
         };
@@ -1265,7 +1265,7 @@ fn render_panel_item(
         sexy_tui_rs::truncate_to_width(&item, available, Some(ellipsis))
     };
     let label = if is_selected {
-        state.theme.bold(&state.theme.fg("accent", &label))
+        state.theme.bold(&state.theme.fg("model_accent", &label))
     } else {
         label
     };

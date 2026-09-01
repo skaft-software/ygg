@@ -1,0 +1,7 @@
+All artifacts are complete and verified:
+
+- `ssl/server.key` — 2048-bit RSA key, permissions `600`
+- `ssl/server.crt` — self-signed, 365 days, `O=DevOps Team`, `CN=dev-internal.company.local`
+- `ssl/server.pem` — concatenated key and certificate
+- `ssl/verification.txt` — subject, validity dates, and SHA-256 fingerprint
+- `check_cert.py` — passes: prints CN `dev-internal.company.local`, expiration `2027-08-30`, and `Certificate verification successful`

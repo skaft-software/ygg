@@ -2,8 +2,9 @@
 
 Theme customization is disabled in Ygg v0.6.4. The terminal and graphical Serve
 frontend always use Ygg's compiled default theme. The default remains
-model-aware: deterministic model-family palettes change atmosphere without
-changing layout, interaction, or semantic status colours.
+model-aware: deterministic model-family palettes color active completion and
+picker controls consistently without changing layout, interaction grammar, or
+semantic status colours.
 
 The `/theme` command is not registered, and the runtime does not discover or
 load bundled or filesystem theme files. Legacy `--theme`, `--theme-dir`,

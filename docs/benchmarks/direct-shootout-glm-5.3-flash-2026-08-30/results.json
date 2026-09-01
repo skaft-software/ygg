@@ -1,0 +1,143 @@
+{
+  "schema": "ygg.direct-shootout.v1",
+  "status": "running",
+  "generated_at": "2026-08-30T17:10:39.575866+00:00",
+  "model": "openrouter/z-ai/glm-5.3-flash",
+  "task": "terminal-bench/openssl-selfsigned-cert",
+  "repetitions": 3,
+  "host": {
+    "platform": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.14.7"
+  },
+  "versions": {
+    "ygg": {
+      "path": "/Users/achumukundan/.local/bin/ygg",
+      "version": "ygg 0.6.4-dev",
+      "sha256": "4f4191c5a7262907c433b4a08b21d3ae896d4e5ddaf54462695f03f9aa74fe71"
+    },
+    "codex": {
+      "path": "/opt/homebrew/bin/codex",
+      "version": "codex-cli 0.149.0",
+      "sha256": "f4a74117b8142cda581c95ff753abf4508b5636d89682c1ed77e4a9249af8963"
+    },
+    "pi": {
+      "path": "/Users/achumukundan/.local/bin/pi",
+      "version": "0.84.4",
+      "sha256": "5406c369954516fb56879d685e082ff9095cd6e06e41af406f394942377fd4bf"
+    },
+    "opencode": {
+      "path": "/opt/homebrew/bin/opencode",
+      "version": "1.18.20",
+      "sha256": "9598c27bda0e2d88ce4db5f853e25504c20ac6152e10205785a1cf8f45559952"
+    }
+  },
+  "measurement": {
+    "rss_source": "macOS ps rss, KiB",
+    "root": "directly launched CLI process",
+    "process_tree": "direct process plus all descendants observed in the same sample",
+    "sample_interval_seconds": 0.1,
+    "remote_inference_server_excluded": true,
+    "codex_route": "existing ox profile with its model overridden to z-ai/glm-5.3-flash; direct OpenRouter Responses API"
+  },
+  "records": [
+    {
+      "harness": "ygg",
+      "trial": 1,
+      "started_at": "2026-08-30T17:07:40.524358+00:00",
+      "wall_seconds": 120.845,
+      "return_code": 0,
+      "timed_out": false,
+      "samples": 918,
+      "sample_interval_seconds": 0.1,
+      "peak_root_rss_kib": 21696,
+      "peak_process_tree_rss_kib": 45424,
+      "quality_pass": false,
+      "certificate_bytes": 1220,
+      "certificate_sha256": "561f46353c7f035ba401a47536772aedd5808648734b0deed87d2937d2da10d6",
+      "argv": [
+        "/Users/achumukundan/.local/bin/ygg",
+        "--print",
+        "--model",
+        "custom/openrouter-chat/z-ai/glm-5.3-flash",
+        "--offline",
+        "--session-dir",
+        "/Users/achumukundan/github/skaft-software/ygg/docs/benchmarks/direct-shootout-glm-5.3-flash-2026-08-30/runs/ygg/trial-1/sessions",
+        "--no-context-files",
+        "--tools=bash",
+        "<TASK_INSTRUCTION>"
+      ],
+      "artifact_dir": "runs/ygg/trial-1"
+    },
+    {
+      "harness": "codex",
+      "trial": 1,
+      "started_at": "2026-08-30T17:09:41.545859+00:00",
+      "wall_seconds": 57.918,
+      "return_code": 0,
+      "timed_out": false,
+      "samples": 447,
+      "sample_interval_seconds": 0.1,
+      "peak_root_rss_kib": 267552,
+      "peak_process_tree_rss_kib": 1065968,
+      "quality_pass": false,
+      "certificate_bytes": 1082,
+      "certificate_sha256": "928ba4915dff7d152391d32d64e2194601d80ba221a6dc3b25d936a87cce9674",
+      "argv": [
+        "/opt/homebrew/bin/codex",
+        "exec",
+        "--ignore-rules",
+        "--ephemeral",
+        "--approve-for-me",
+        "--cd",
+        "/Users/achumukundan/github/skaft-software/ygg/docs/benchmarks/direct-shootout-glm-5.3-flash-2026-08-30/runs/codex/trial-1/workspace",
+        "--profile",
+        "ox",
+        "--model",
+        "z-ai/glm-5.3-flash",
+        "--config",
+        "model_reasoning_effort=\"medium\"",
+        "<TASK_INSTRUCTION>"
+      ],
+      "artifact_dir": "runs/codex/trial-1"
+    }
+  ],
+  "summary": {
+    "ygg": {
+      "trials": 1,
+      "quality_passes": 0,
+      "median_wall_seconds": 120.845,
+      "median_peak_root_rss_mib": 21.1875,
+      "max_peak_root_rss_mib": 21.1875,
+      "median_peak_process_tree_rss_mib": 44.359375,
+      "max_peak_process_tree_rss_mib": 44.359375
+    },
+    "codex": {
+      "trials": 1,
+      "quality_passes": 0,
+      "median_wall_seconds": 57.918,
+      "median_peak_root_rss_mib": 261.28125,
+      "max_peak_root_rss_mib": 261.28125,
+      "median_peak_process_tree_rss_mib": 1040.984375,
+      "max_peak_process_tree_rss_mib": 1040.984375
+    },
+    "pi": {
+      "trials": 0,
+      "quality_passes": 0,
+      "median_wall_seconds": null,
+      "median_peak_root_rss_mib": null,
+      "max_peak_root_rss_mib": null,
+      "median_peak_process_tree_rss_mib": null,
+      "max_peak_process_tree_rss_mib": null
+    },
+    "opencode": {
+      "trials": 0,
+      "quality_passes": 0,
+      "median_wall_seconds": null,
+      "median_peak_root_rss_mib": null,
+      "max_peak_root_rss_mib": null,
+      "median_peak_process_tree_rss_mib": null,
+      "max_peak_process_tree_rss_mib": null
+    }
+  }
+}

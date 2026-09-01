@@ -13,6 +13,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Preserve GPT-5.4 Pro and GPT-5.5 Pro long-context pricing on Codex routes,
   exclude OpenAI's rejected base `gpt-5.6` alias, and refresh the checked-in
   models.dev pricing and display-name snapshots together.
+- Use the active model's adaptive accent consistently for slash completion,
+  model selection, session resume, and other picker focus controls.
 
 ### Added
 
