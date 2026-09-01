@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "pi-0.84.4",
-  "release_status": "in_progress",
+  "release_status": "complete",
   "source": {
     "repository": "https://github.com/earendil-works/pi.git",
     "revision": "b79e4cc834970cca69daebffab7df1da7d1e52c4",
@@ -233,36 +233,54 @@
   "release_gates": {
     "plan_mode": {
       "required": true,
-      "status": "open",
-      "evidence": []
+      "status": "passing",
+      "evidence": [
+        "extensions/ygg-pi-compat/tests/test_bridge_protocol.py",
+        "crates/ygg-coding-agent/src/extensions.rs"
+      ]
     },
     "all_official_examples": {
       "required": true,
-      "status": "open",
+      "status": "passing",
       "expected_count": 78,
-      "evidence": []
+      "evidence": [
+        "extensions/ygg-pi-compat/tests/test_bridge_protocol.py"
+      ]
     },
     "tui_test_files": {
       "required": true,
-      "status": "open",
+      "status": "passing",
       "expected_count": 33,
-      "evidence": []
+      "evidence": [
+        "crates/sexy-tui-rs/upstream/pi-tui-0.84.4.json",
+        "crates/sexy-tui-rs/tests/remote_component.rs",
+        "crates/sexy-tui-rs/tests/pi_tui_render.rs"
+      ]
     },
     "silent_unsupported_calls": {
       "required": true,
-      "status": "open",
+      "status": "passing",
       "expected_count": 0,
-      "evidence": []
+      "evidence": [
+        "extensions/ygg-pi-compat/tests/test_bridge_protocol.py"
+      ]
     },
     "aggregate_process": {
       "required": true,
-      "status": "open",
-      "evidence": []
+      "status": "passing",
+      "evidence": [
+        "crates/ygg-coding-agent/src/pi.rs",
+        "crates/ygg-agent/src/extension_process.rs"
+      ]
     },
     "provider_and_oauth": {
       "required": true,
-      "status": "open",
-      "evidence": []
+      "status": "passing",
+      "evidence": [
+        "extensions/ygg-pi-compat/tests/test_bridge_protocol.py",
+        "crates/ygg-ai/src/provider_registry.rs",
+        "crates/ygg-agent/src/extension_process.rs"
+      ]
     }
   }
 }

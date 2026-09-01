@@ -49,28 +49,30 @@ The extra local hop is intentional. It preserves language neutrality,
 replaceability, failure isolation, and a kernel that does not grow a special
 manager for every external protocol.
 
-Two exact manifest-selected protocol versions are implemented:
+Three exact manifest-selected protocol versions are implemented:
 
 - API `0.1` is frozen for existing trusted, bounded, text-oriented
   extensions. Its initialization wire remains unchanged. It does not inherit
   API `0.2` cancellation, progress, structured/media retention, correlation,
   or terminal lifecycle guarantees; optional `metadata` is accepted but
   discarded by the native subprocess adapter.
-- API `0.2` is the current stateful foundation. It negotiates cooperative
+- API `0.2` remains the compatible stateful foundation. It negotiates cooperative
   cancellation and typed content as required features, plus scoped progress,
   artifacts, lifecycle observations, policy intents, and live tool catalogs as
   optional features. Bounded child model sessions, single-use approval
   capabilities, and owner-scoped secret lookup are offered conditionally;
   parent-correlated ephemeral input is part of the base `0.2` contract.
+- API `0.3` is the current transactional runtime. It requires ordered events,
+  catalog and effect transactions, split owner identity, and pull-based bounded
+  document streams. Host-service declarations are intersected with product
+  offers during initialization; every reverse call echoes an active operation
+  token and unavailable services fail explicitly. Catalog replacement and
+  returned effect journals are validated atomically before product code sees
+  them.
 
-API `0.3` DTOs and negotiation validators are defined for ongoing Pi-parity
-work, but its mandatory handlers are not runtime-ready. The advertised default
-remains `0.2`, and a `0.3` manifest is rejected before process spawn rather than
-silently receiving partial behavior.
-
-API `0.2` supplies the stateful transport foundation for trusted daily use
-within those boundaries. It does not add an operating-system sandbox or move a
-domain capability into the host.
+API `0.3` is available to explicitly selected transactional contracts such as
+the Pi bridge; ordinary installable bundles continue to default to `0.2` so
+existing package manifests do not change wire behavior.
 
 Pi migration is capability-oriented rather than a promise to reproduce Pi's
 in-process ABI. `ygg migrate pi --dry-run` inventories package resources and

@@ -684,7 +684,9 @@ function makeThrowingProxy(label, values = {}) {
 }
 
 function updateHostStateFromMessage(message) {
-  const state = message?.params?.context?.host ?? message?.params?.payload?.host;
+  const state = message?.params?.execution_context?.host
+    ?? message?.params?.context?.host
+    ?? message?.params?.payload?.host;
   if (state && typeof state === "object" && !Array.isArray(state)) {
     bridge.hostState = { ...bridge.hostState, ...state };
     if (state.model) {

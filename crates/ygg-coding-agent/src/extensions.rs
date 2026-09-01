@@ -30,12 +30,12 @@ use ygg_agent::extension_process::{
     DiscoveredExtension, ExtensionEffect, ExtensionEffectJournal, ExtensionEvent,
     ExtensionHealthSnapshot, ExtensionHealthState, ExtensionHook, ExtensionHookDisposition,
     ExtensionHostServiceDescriptor, ExtensionHostServiceLimits, ExtensionHostServiceRequest,
-    ExtensionHostServiceResponse, ExtensionHostState, ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
-    ExtensionLifecycleOutcome, ExtensionManifest, ExtensionMessageDelivery, ExtensionPolicy,
-    ExtensionPolicyEvaluationResponse, ExtensionPrincipal, ExtensionProcess, ExtensionRequestId,
-    ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust,
-    ExtensionUiSurface, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
-    EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
+    ExtensionHostServiceResponse, ExtensionHostState, ExtensionInputRequest,
+    ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
+    ExtensionMessageDelivery, ExtensionPolicy, ExtensionPolicyEvaluationResponse,
+    ExtensionPrincipal, ExtensionProcess, ExtensionRequestId, ExtensionRuntimeConfig,
+    ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest, ToolRenderSegment,
+    DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
     EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_MANIFEST_FILENAME,
 };
@@ -418,9 +418,11 @@ pub trait ExtensionConfirmationHandler {
             request.version.as_u16(),
             request.scope.as_str()
         );
-        Box::pin(std::future::ready(Ok(ExtensionHostServiceResponse::Error {
-            message: format!("host service {service} is unavailable in this product mode"),
-        })))
+        Box::pin(std::future::ready(Ok(
+            ExtensionHostServiceResponse::Error {
+                message: format!("host service {service} is unavailable in this product mode"),
+            },
+        )))
     }
 }
 
@@ -2216,9 +2218,7 @@ impl ExecutableExtensions {
                             .host_service(&extension_name, &request)
                             .await
                             .with_context(|| {
-                                format!(
-                                    "host-service UI failed for extension {extension_name:?}"
-                                )
+                                format!("host-service UI failed for extension {extension_name:?}")
                             })?;
                         process
                             .respond_to_host_service(request_id, generation, response)
@@ -2714,15 +2714,13 @@ impl ExecutableExtensions {
                         content,
                         display,
                         details,
-                    } => extension_entries.push(
-                        ygg_agent::EntryValue::ExtensionCustomMessage {
-                            extension: pending.extension.clone(),
-                            custom_type: custom_type.clone(),
-                            content: content.clone(),
-                            display: display.clone(),
-                            details: details.clone(),
-                        },
-                    ),
+                    } => extension_entries.push(ygg_agent::EntryValue::ExtensionCustomMessage {
+                        extension: pending.extension.clone(),
+                        custom_type: custom_type.clone(),
+                        content: content.clone(),
+                        display: display.clone(),
+                        details: details.clone(),
+                    }),
                     ExtensionEffect::SetSessionName { name } => {
                         if self.session_id.is_none() {
                             journal_error = Some("session has no stable catalog id".to_owned());
@@ -2730,13 +2728,13 @@ impl ExecutableExtensions {
                         }
                         selected_name = Some(name.clone());
                     }
-                    ExtensionEffect::SetEntryLabel { entry_id, label } => extension_entries.push(
-                        ygg_agent::EntryValue::ExtensionLabel {
+                    ExtensionEffect::SetEntryLabel { entry_id, label } => {
+                        extension_entries.push(ygg_agent::EntryValue::ExtensionLabel {
                             extension: pending.extension.clone(),
                             target: ygg_agent::EntryId(entry_id.clone()),
                             label: label.clone(),
-                        },
-                    ),
+                        })
+                    }
                     ExtensionEffect::SetActiveTools { tools } => {
                         let Some(configured) = configured_tools.as_ref() else {
                             journal_error = Some("tool-policy adapter is unavailable".to_owned());
@@ -2831,7 +2829,9 @@ impl ExecutableExtensions {
                 match effect {
                     ExtensionEffect::EnqueueMessage { delivery, content } => {
                         applied.messaging.push(match delivery {
-                            ExtensionMessageDelivery::Steer => ExtensionMessageAction::Steer(content),
+                            ExtensionMessageDelivery::Steer => {
+                                ExtensionMessageAction::Steer(content)
+                            }
                             ExtensionMessageDelivery::FollowUp => {
                                 ExtensionMessageAction::FollowUp(content)
                             }
@@ -2871,8 +2871,7 @@ impl ExecutableExtensions {
             }
             applied.messages.push(format!(
                 "[{}] committed {} extension effect(s)",
-                pending.extension,
-                effect_count
+                pending.extension, effect_count
             ));
             self.applied_effect_operations.insert(operation_key);
         }
@@ -2971,11 +2970,8 @@ impl ExecutableExtensions {
                                     .as_ref()
                                     .is_some_and(|health| health.generation == generation)
                         }) {
-                            summary.tools = catalog
-                                .tools
-                                .iter()
-                                .map(|tool| tool.name.clone())
-                                .collect();
+                            summary.tools =
+                                catalog.tools.iter().map(|tool| tool.name.clone()).collect();
                             summary.commands = catalog
                                 .commands
                                 .iter()
@@ -3022,7 +3018,12 @@ impl ExecutableExtensions {
                             continue;
                         }
                         self.host_service_tasks.retain(|task| !task.is_finished());
-                        let service = format!("{}@{}:{}", request.service, request.version.as_u16(), request.scope.as_str());
+                        let service = format!(
+                            "{}@{}:{}",
+                            request.service,
+                            request.version.as_u16(),
+                            request.scope.as_str()
+                        );
                         messages.push(format!(
                             "[{name}] host service {service} rejected: no product adapter is bound"
                         ));
@@ -3671,10 +3672,7 @@ fn pi_session_entry(entry: &ygg_agent::Entry) -> Value {
         ygg_agent::EntryValue::Config {
             model: Some(model), ..
         } => {
-            base.insert(
-                "type".to_owned(),
-                Value::String("model_change".to_owned()),
-            );
+            base.insert("type".to_owned(), Value::String("model_change".to_owned()));
             base.insert("provider".to_owned(), Value::String("ygg".to_owned()));
             base.insert("modelId".to_owned(), Value::String(model.clone()));
         }
@@ -3686,10 +3684,7 @@ fn pi_session_entry(entry: &ygg_agent::Entry) -> Value {
                 "type".to_owned(),
                 Value::String("thinking_level_change".to_owned()),
             );
-            base.insert(
-                "thinkingLevel".to_owned(),
-                Value::String(reasoning.clone()),
-            );
+            base.insert("thinkingLevel".to_owned(), Value::String(reasoning.clone()));
         }
         ygg_agent::EntryValue::Compaction {
             summary,
@@ -3898,6 +3893,103 @@ mod tests {
         }
         ExtensionPrincipal::derive(&manifest.name, manifest_path)
             .expect("derive extension principal")
+    }
+
+    #[test]
+    fn api_v03_effect_adapter_commits_plan_mode_state_tools_and_ui_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::for_directory(temp.path(), temp.path());
+        let path = temp.path().join("plan-session.jsonl");
+        let mut session = Session::create(&path).unwrap();
+        let mut host = ExtensionHost::new();
+        host.load(&ygg_agent::tools::CoreTools);
+        host.finalize_tool_surface();
+
+        let process = ygg_agent::extension_process::ProcessFence {
+            instance_id: "pi-plan-test".into(),
+            generation: 1,
+        };
+        let operation = ygg_agent::extension_process::OperationToken {
+            process,
+            request_id: 7,
+            kind: ygg_agent::extension_process::ExtensionOperationKind::Command,
+            run_id: None,
+            turn_id: None,
+            tool_call_id: None,
+            command_id: Some("plan".into()),
+            mode: ygg_agent::extension_process::ExtensionOperationMode::Tui,
+            deadline_unix_ms: 4_000_000_000_000,
+            cancellation_owner: "pi-plan-test-7".into(),
+        };
+        let effects = vec![
+            ExtensionEffect::SetActiveTools {
+                tools: vec![
+                    "read".into(),
+                    "bash".into(),
+                    "grep".into(),
+                    "find".into(),
+                    "ls".into(),
+                    "questionnaire".into(),
+                ],
+            },
+            ExtensionEffect::SetUiState {
+                key: "status".into(),
+                value: serde_json::json!({"key": "plan-mode", "text": "plan"}),
+            },
+            ExtensionEffect::SetUiState {
+                key: "widget".into(),
+                value: serde_json::json!({"key": "plan-todos", "frame": null}),
+            },
+            ExtensionEffect::AppendCustom {
+                custom_type: "plan-mode".into(),
+                details: serde_json::json!({"enabled": true}),
+            },
+        ];
+        let mut extensions = ExecutableExtensions::default();
+        extensions.session_id = Some("plan-session".into());
+        extensions.extension_host = Some(host.clone());
+        extensions
+            .pending_effects
+            .push_back(PendingExtensionEffects {
+                extension: "pi-plan".into(),
+                journal: ExtensionEffectJournal {
+                    operation_token: operation.clone(),
+                    effects: effects.clone(),
+                },
+            });
+        // Duplicate delivery of one operation is settled exactly once.
+        extensions
+            .pending_effects
+            .push_back(PendingExtensionEffects {
+                extension: "pi-plan".into(),
+                journal: ExtensionEffectJournal {
+                    operation_token: operation,
+                    effects,
+                },
+            });
+
+        let applied = extensions.apply_pending_effects(&mut session, &store);
+        assert_eq!(applied.ui.len(), 2);
+        assert_eq!(
+            host.tool_catalog_snapshot()
+                .active
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect::<Vec<_>>(),
+            ["read", "bash"]
+        );
+        assert_eq!(
+            session
+                .entries()
+                .iter()
+                .filter(|entry| matches!(
+                    entry.value,
+                    ygg_agent::EntryValue::ExtensionCustom { .. }
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(extensions.applied_effect_operations.len(), 1);
     }
 
     #[test]
@@ -4816,13 +4908,7 @@ hooks = ["before_prompt", "after_response"]
         let context = serde_json::json!({
             "workspace": temp.path(),
             "execution_scope": null,
-            "host": {
-                "session_id": null,
-                "session_name": null,
-                "model": null,
-                "reasoning": null,
-                "active_skills": [],
-            },
+            "host": serde_json::to_value(ExtensionHostState::default()).unwrap(),
         });
         assert_eq!(
             frames[1],

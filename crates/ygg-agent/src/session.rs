@@ -4721,6 +4721,65 @@ mod tests {
         assert_eq!(output.items()[0].as_json()["id"], "old_raw");
     }
 
+    #[test]
+    fn extension_entry_batches_are_atomic_durable_and_model_visible_only_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_path(&dir);
+        let mut session = Session::create(&path).unwrap();
+        let ids = session
+            .append_extension_entries(vec![
+                EntryValue::ExtensionCustom {
+                    extension: "pi".into(),
+                    custom_type: "state".into(),
+                    details: serde_json::json!({"enabled": true}),
+                },
+                EntryValue::ExtensionCustomMessage {
+                    extension: "pi".into(),
+                    custom_type: "context".into(),
+                    content: "extension context".into(),
+                    display: Some(String::new()),
+                    details: serde_json::json!({"source": "test"}),
+                },
+                EntryValue::ExtensionLabel {
+                    extension: "pi".into(),
+                    target: EntryId("001".into()),
+                    label: Some("checkpoint".into()),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            ids,
+            [
+                EntryId("001".into()),
+                EntryId("002".into()),
+                EntryId("003".into())
+            ]
+        );
+        assert_eq!(session.head(), Some(EntryId("003".into())));
+        assert_eq!(session.context().unwrap().len(), 1);
+        let Message::User(message) = &session.context().unwrap()[0] else {
+            panic!("extension custom message must lower to a user message")
+        };
+        assert!(
+            matches!(&message.content[..], [UserPart::Text(text)] if text == "extension context")
+        );
+
+        let before = session.head();
+        assert!(session
+            .append_extension_entries(vec![EntryValue::Config {
+                model: None,
+                reasoning: None,
+                reasoning_mode: None,
+            }])
+            .is_err());
+        assert_eq!(session.head(), before);
+        drop(session);
+
+        let reopened = Session::open(&path).unwrap();
+        assert_eq!(reopened.head(), Some(EntryId("003".into())));
+        assert_eq!(reopened.context().unwrap().len(), 1);
+    }
+
     fn replay_debug_json(
         replay: &[ygg_ai::responses::ResponsesReplayItem],
     ) -> Vec<serde_json::Value> {

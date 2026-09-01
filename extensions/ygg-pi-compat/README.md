@@ -26,26 +26,32 @@ remain bound by the separately reviewed pinned runtime installation. The same
 aggregate output can be produced from a reviewed scanner result through the
 separate `ygg migrate pi --plan-out` and `--apply` flow.
 
-## Current supported surface
+## Supported API `0.3` surface
 
-- Pi tools with text/image output, cancellation, bounded progress, argument
-  preparation, transformed result details/error/usage, and live tool catalogs;
-- initialization-time Pi command discovery as native Ygg slash commands when
-  the host negotiates `runtime_commands`, with the generated multiplexed route
-  retained only as a compatibility fallback;
-- notifications, confirmations, text input, and a plain-text compatibility
-  theme;
-- basic lifecycle events, prompt/context contributions, and local Pi event-bus
-  behavior; and
-- host session-name and reasoning snapshots where Ygg already supplies them.
+The bridge negotiates the complete mandatory API `0.3` feature set. It publishes
+one revisioned catalog for tools, commands, flags, shortcuts, all 36 events,
+renderers, providers, and roles; later registration changes use atomic
+`catalog/replace`.
 
-Unsupported APIs fail explicitly. The bridge does not silently emulate provider
-registration, session/tree mutation, compaction control, root-agent messaging,
-active-tool policy mutation, arbitrary Pi components/editors/widgets, terminal
-input, or provider payload hooks.
+Pi tools and commands return operation-bound effect journals. Ygg validates and
+commits session custom entries/messages/labels, session names, active-tool
+policy, model/reasoning requests, owner-scoped messaging, and semantic UI state
+at product boundaries. Large ordered-event payloads use immutable pull-based
+documents. Session/model/tool snapshots and reverse host calls remain bounded by
+the host-issued operation token.
 
-The scanner is pinned to Pi 0.84.4's public event, registration, action, and UI
-names. Unknown APIs fail closed instead of being labeled bridge-compatible.
+The pinned Pi UI implementation continues to construct editors, autocomplete,
+widgets, headers, footers, overlays, renderers, themes, and custom components.
+Only validated semantic rows cross into Ygg's terminal owner. Provider catalogs
+include public model configuration and opaque callback handles; custom streams,
+refresh, OAuth login/refresh/key projection, and provider interception execute
+inside the supervised bridge while credentials and user prompts remain
+host-mediated.
+
+Calls that cannot be represented in a product mode return an explicit error.
+They are never accepted and silently discarded. Reviewed differences from Pi's
+in-process host are recorded as `approved safe divergence` in
+[COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Tests
 
@@ -60,10 +66,11 @@ YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
   pi::tests::generated_link_runs_the_pinned_real_pi_hello_example_when_selected --lib
 ```
 
-The real-Pi suite covers the official hello example and an unchanged
-`plan-mode` load plus `/todos` smoke. It does not claim plan-mode behavioral
-parity: flags, shortcuts, active-tool overlays, widgets, and durable custom
-entries remain release blockers.
+The real-Pi suite executes all 78 official examples unchanged, runs the real
+`hello.ts` tool, and verifies unchanged plan-mode effects plus destructive-bash
+blocking. The hermetic suite covers catalog replacement, effect identity,
+ordered events/documents, remote UI state, custom provider streaming, and the
+complete OAuth login/refresh/key callback cycle.
 
 The bridge uses the selected Pi package's own loader and does not install npm
 dependencies. `ygg pi install --pi-package DIR` validates, records, and forwards

@@ -21,6 +21,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Added `/answer [instruction]` to request an immediate final response from
   gathered evidence. Idle runs begin without tools; active runs persist the
   directive at the next safe boundary and expose no tools thereafter.
+- Completed the transactional extension API `0.3` runtime and pinned Pi 0.84.4
+  bridge: ordered events/documents, atomic catalogs/effects, host services,
+  session/tool/model/UI projections, provider streams and OAuth, all 78 official
+  examples, and the 33-file TUI parity audit.
 
 ### Changed
 

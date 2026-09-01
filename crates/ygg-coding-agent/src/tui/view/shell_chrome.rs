@@ -364,9 +364,8 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     } else {
         Vec::new()
     };
-    let subagent_limit = rows.saturating_sub(
-        header.len() + error.len() + extensions.len() + composer.len() + 1,
-    );
+    let subagent_limit =
+        rows.saturating_sub(header.len() + error.len() + extensions.len() + composer.len() + 1);
     // The roster is bounded by the host's eight-concurrent-children cap, but
     // each child renders several rows, so only the viewport bounds how much
     // of the strip shows.

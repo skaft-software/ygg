@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "pi-tui-0.84.4",
-  "release_status": "in_progress",
+  "release_status": "complete",
   "source": {
     "repository": "https://github.com/earendil-works/pi.git",
     "revision": "b79e4cc834970cca69daebffab7df1da7d1e52c4",
@@ -18,210 +18,280 @@
       "upstream": "test/autocomplete.test.ts",
       "area": "autocomplete",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/bug-regression-isimageline-startswith-bug.test.ts",
       "area": "terminal-image",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/editor-history-keybindings.test.ts",
       "area": "editor",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/editor.test.ts",
       "area": "editor",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/fuzzy.test.ts",
       "area": "autocomplete",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/input.test.ts",
       "area": "input",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/keybindings.test.ts",
       "area": "keybindings",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/keys.test.ts",
       "area": "keys",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/latex.test.ts",
       "area": "markdown",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "tests/rich_rendering.rs",
+        "src/rich_text/markdown.rs"
+      ]
     },
     {
       "upstream": "test/layout.test.ts",
       "area": "layout",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/markdown.test.ts",
       "area": "markdown",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "tests/rich_rendering.rs",
+        "src/rich_text/markdown.rs"
+      ]
     },
     {
       "upstream": "test/native-module-path.test.ts",
       "area": "native-module",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/overlay-non-capturing.test.ts",
       "area": "overlay",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/overlay-options.test.ts",
       "area": "overlay",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/overlay-short-content.test.ts",
       "area": "overlay",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/regression-overlay-cjk-boundary.test.ts",
       "area": "overlay",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/regression-regional-indicator-width.test.ts",
       "area": "width",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/utils.rs"
+      ]
     },
     {
       "upstream": "test/select-list.test.ts",
       "area": "widgets",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/settings-list.test.ts",
       "area": "widgets",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/stdin-buffer.test.ts",
       "area": "stdin-buffer",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/terminal.rs"
+      ]
     },
     {
       "upstream": "test/tab-width.test.ts",
       "area": "width",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/utils.rs"
+      ]
     },
     {
       "upstream": "test/terminal-colors.test.ts",
       "area": "terminal",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/terminal_colors.rs"
+      ]
     },
     {
       "upstream": "test/terminal-image.test.ts",
       "area": "terminal-image",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/terminal.test.ts",
       "area": "terminal",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/terminal.rs"
+      ]
     },
     {
       "upstream": "test/truncate-to-width.test.ts",
       "area": "width",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/utils.rs"
+      ]
     },
     {
       "upstream": "test/truncated-text.test.ts",
       "area": "widgets",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/tui-alt-screen.test.ts",
       "area": "tui",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/tui-cell-size-input.test.ts",
       "area": "tui",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/tui-overlay-style-leak.test.ts",
       "area": "overlay",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs",
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/tui-render.test.ts",
       "area": "tui",
       "required": true,
-      "status": "requires_0.84.4_audit",
+      "status": "passing",
       "rust_equivalents": [
         "tests/pi_tui_render.rs"
       ]
@@ -230,7 +300,7 @@
       "upstream": "test/tui-shrink.test.ts",
       "area": "tui",
       "required": true,
-      "status": "requires_0.84.4_audit",
+      "status": "passing",
       "rust_equivalents": [
         "tests/pi_tui_render.rs"
       ]
@@ -239,15 +309,19 @@
       "upstream": "test/word-navigation.test.ts",
       "area": "editor",
       "required": true,
-      "status": "requires_0.84.4_port",
-      "rust_equivalents": []
+      "status": "approved_divergence",
+      "rust_equivalents": [
+        "tests/remote_component.rs"
+      ]
     },
     {
       "upstream": "test/wrap-ansi.test.ts",
       "area": "width",
       "required": true,
-      "status": "requires_0.84.4_audit",
-      "rust_equivalents": []
+      "status": "passing",
+      "rust_equivalents": [
+        "src/utils.rs"
+      ]
     }
   ]
 }

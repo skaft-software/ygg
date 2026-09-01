@@ -148,8 +148,7 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
     > {
         Box::pin(async move {
             use ygg_agent::extension_process::{
-                ExtensionHostServiceName as Service,
-                ExtensionHostServiceResponse as Response,
+                ExtensionHostServiceName as Service, ExtensionHostServiceResponse as Response,
                 ExtensionHostServiceScope as Scope,
             };
             let success = |value| Ok(Response::Success { value });
@@ -170,7 +169,8 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                         prompt: title.to_owned(),
                         secret: false,
                     };
-                    let value = extension_input_picker(self.shell, self.input, &input_request).await?;
+                    let value =
+                        extension_input_picker(self.shell, self.input, &input_request).await?;
                     success(serde_json::json!({ "value": value }))
                 }
                 (Service::Ui, Scope::Components) => {
@@ -219,12 +219,9 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                                     prompt: prompt.to_owned(),
                                     secret: false,
                                 };
-                            let value = extension_input_picker(
-                                self.shell,
-                                self.input,
-                                &input_request,
-                            )
-                            .await?;
+                            let value =
+                                extension_input_picker(self.shell, self.input, &input_request)
+                                    .await?;
                             success(serde_json::json!({ "value": value }))
                         }
                         _ => Ok(Response::Error {
@@ -1685,7 +1682,7 @@ fn update_status(shell: &mut InteractiveShell, app: &App) {
     );
 }
 
-fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
+fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) -> Option<ComposedInput> {
     app.executable_extensions.refresh_host_state(
         app.agent.session(),
         &app.model,
@@ -1711,31 +1708,80 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
             ));
         }
     }
+    let mut submitted_messages = Vec::new();
     for action in effects.messaging {
         let (kind, content) = match action {
             crate::extensions::ExtensionMessageAction::Steer(content) => ("steer", content),
-            crate::extensions::ExtensionMessageAction::FollowUp(content) => {
-                ("follow-up", content)
-            }
-            crate::extensions::ExtensionMessageAction::NextTurn(content) => {
-                ("next-turn", content)
-            }
+            crate::extensions::ExtensionMessageAction::FollowUp(content) => ("follow-up", content),
+            crate::extensions::ExtensionMessageAction::NextTurn(content) => ("next-turn", content),
             crate::extensions::ExtensionMessageAction::User(content) => ("user", content),
         };
-        shell.prefill_editor(content);
+        submitted_messages.push(content);
         shell.notice(format!(
-            "extension {kind} message placed in the editor for host-owned submission"
+            "extension queued a host-owned {kind} message for submission"
         ));
     }
-    if let Some(model) = effects.selected_model {
-        shell.notice_error(format!(
-            "extension model selection {model:?} requires an idle reconfiguration boundary"
-        ));
+    if let Some(model_id) = effects.selected_model {
+        match app.catalog.resolve(&ModelId(model_id.clone())) {
+            Ok(model) => {
+                let recorded = app
+                    .agent
+                    .session_mut()
+                    .append(ygg_agent::EntryValue::Config {
+                        model: Some(model.spec.id.0.clone()),
+                        reasoning: None,
+                        reasoning_mode: None,
+                    });
+                match recorded {
+                    Ok(_) => {
+                        app.agent.set_model(model.clone());
+                        app.model = model;
+                        shell.notice_success(format!("extension selected model {model_id}"));
+                    }
+                    Err(error) => shell.notice_error(format!(
+                        "extension model selection {model_id:?} was not persisted: {error}"
+                    )),
+                }
+            }
+            Err(error) => shell.notice_error(format!(
+                "extension model selection {model_id:?} was rejected: {error}"
+            )),
+        }
     }
     if let Some(reasoning) = effects.selected_reasoning {
-        shell.notice_error(format!(
-            "extension reasoning selection {reasoning} requires an idle reconfiguration boundary"
-        ));
+        let parsed = reasoning
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("thinking level must be a string"))
+            .and_then(ThinkingLevel::parse)
+            .and_then(|level| {
+                thinking_to_reasoning_with_subagents(level, &app.model, app.subagents_available())
+            });
+        match parsed {
+            Ok(selected) => {
+                let label = crate::app::reasoning_label(&selected);
+                let recorded = app
+                    .agent
+                    .session_mut()
+                    .append(ygg_agent::EntryValue::Config {
+                        model: None,
+                        reasoning: Some(label.clone()),
+                        reasoning_mode: None,
+                    });
+                match recorded {
+                    Ok(_) => {
+                        app.agent.set_reasoning(selected.clone());
+                        app.reasoning = selected;
+                        shell.notice_success(format!("extension selected thinking level {label}"));
+                    }
+                    Err(error) => shell.notice_error(format!(
+                        "extension thinking selection was not persisted: {error}"
+                    )),
+                }
+            }
+            Err(error) => shell.notice_error(format!(
+                "extension reasoning selection {reasoning} was rejected: {error}"
+            )),
+        }
     }
     if !effects.provider_updates.is_empty() {
         shell.notice_error(format!(
@@ -1749,6 +1795,8 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
             effects.catalog_updates.len()
         ));
     }
+    (!submitted_messages.is_empty())
+        .then(|| ComposedInput::from_text(submitted_messages.join("\n\n")))
 }
 
 fn apply_extension_background(
@@ -2158,7 +2206,7 @@ async fn web_search_management_menu(
                 shell.notice(output);
             }
             shell.clear_error();
-            request_extension_ui(shell, app);
+            let _ = request_extension_ui(shell, app);
         }
         Ok(None) => shell.error(
             "ygg-web-search is running but its setup command is unavailable; see /extensions status"
@@ -2281,7 +2329,7 @@ async fn extension_management_menu(
                 };
             }
         };
-        request_extension_ui(shell, &mut app);
+        let _ = request_extension_ui(shell, &mut app);
         let summary = app
             .executable_extensions
             .summaries()
@@ -3186,7 +3234,7 @@ async fn apply_pending_actions(
                 apply_goal_command(&app, shell, command, goal_deadline)?;
             }
         }
-        request_extension_ui(shell, &mut app);
+        let _ = request_extension_ui(shell, &mut app);
         shell.render();
     }
     Ok(app)
@@ -3466,7 +3514,7 @@ async fn run_idle_command(
                         "session named {}",
                         metadata.name.as_deref().unwrap_or("(unnamed)")
                     ));
-                    request_extension_ui(shell, &mut app);
+                    let _ = request_extension_ui(shell, &mut app);
                 }
                 None => {
                     let metadata = app.sessions.load_metadata(&id)?;
@@ -3534,7 +3582,7 @@ async fn run_idle_command(
             app = extension_management_menu(app, shell, input).await?;
         }
         Command::Extensions(commands::ExtensionsSubcommand::Status) => {
-            request_extension_ui(shell, &mut app);
+            let _ = request_extension_ui(shell, &mut app);
             shell.show_overlay_text(app.executable_extensions.inspect_text());
         }
         Command::Extensions(commands::ExtensionsSubcommand::Reload) => {
@@ -3547,7 +3595,7 @@ async fn run_idle_command(
             } else {
                 shell.show_overlay_text(messages.join("\n"));
             }
-            request_extension_ui(shell, &mut app);
+            let _ = request_extension_ui(shell, &mut app);
         }
         Command::Extensions(commands::ExtensionsSubcommand::Inspect { reference }) => {
             let _ = app.executable_extensions.drain_events();
@@ -3603,7 +3651,7 @@ async fn run_idle_command(
                 Ok(output) => shell.show_overlay_text(output),
                 Err(error) => shell.error(format!("extension action failed: {error}")),
             }
-            request_extension_ui(shell, &mut app);
+            let _ = request_extension_ui(shell, &mut app);
         }
         Command::Quit => return Ok(IdleCommandOutcome::Quit(Box::new(app))),
         Command::Login(provider) => match validate_provider(provider.as_deref()) {
@@ -3734,7 +3782,7 @@ async fn run_idle_command(
         }
         Command::Reload => {
             app = reload_resources(app, shell, input).await?;
-            request_extension_ui(shell, &mut app);
+            let _ = request_extension_ui(shell, &mut app);
             shell.notice("instructions, prompts, skills, and extensions reloaded");
         }
         Command::Tree => shell.show_overlay_text(session_tree_text(app.agent.session())),
@@ -3753,7 +3801,7 @@ async fn run_idle_command(
         }
         Command::Skills(commands::SkillsSubcommand::Reload) => {
             app = reload_resources(app, shell, input).await?;
-            request_extension_ui(shell, &mut app);
+            let _ = request_extension_ui(shell, &mut app);
             shell.notice("skills and prompt templates reloaded");
         }
         Command::Skills(sub) => {
@@ -3788,6 +3836,7 @@ async fn run_idle_command(
                     )
                     .await
             };
+            let extension_submission = request_extension_ui(shell, &mut app);
             match result {
                 Ok(Some(output)) if open_subagents => {
                     subagents_view(&mut app, shell, input, output).await?;
@@ -3852,6 +3901,12 @@ async fn run_idle_command(
                     }
                 }
                 Err(error) => shell.error(format!("extension command failed: {error}")),
+            }
+            if let Some(input) = extension_submission {
+                return Ok(IdleCommandOutcome::Submit {
+                    app: Box::new(app),
+                    input,
+                });
             }
         }
     }
@@ -4241,7 +4296,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     let mut startup_input = startup_prompt.map(ComposedInput::from_text);
     shell.hydrate(app.agent.session())?;
     update_status(&mut shell, &app);
-    request_extension_ui(&mut shell, &mut app);
+    let _ = request_extension_ui(&mut shell, &mut app);
     shell.render();
     schedule_responses_prewarm(&app);
 
@@ -4778,7 +4833,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                 // completion lazily on the next `@`.
                 shell.invalidate_file_index();
                 update_status(&mut shell, &app);
-                request_extension_ui(&mut shell, &mut app);
+                if let Some(message) = request_extension_ui(&mut shell, &mut app) {
+                    startup_input = Some(message);
+                }
                 // `drive_active_run` settles the semantic outcome, while these
                 // idle-boundary refreshes settle the final composer/footer.
                 // Always publish that complete frame even when no queued idle

@@ -87,7 +87,7 @@ aggregate must use the digest-qualified grant printed by `/extensions status`;
 changing its ordered source set or lock invalidates that grant. See
 [Executable extensions](extensions.md#layout-and-discovery).
 
-Bridge profile `0.2.0` targets exactly
+Bridge profile `0.3.0` targets exactly
 `@earendil-works/pi-coding-agent@0.84.4` and Node 22.19 or newer. The bridge
 validates that profile before importing extension code instead of silently using
 a newer runtime found on `PATH`. Pass `ygg pi install --pi-package DIR ...` when
@@ -96,13 +96,13 @@ records and forwards that exact path across Ygg's sanitized subprocess
 environment. The exhaustive per-event/API/UI ledger and completion gates are
 maintained in
 [`extensions/ygg-pi-compat/COMPATIBILITY.md`](../extensions/ygg-pi-compat/COMPATIBILITY.md).
-It supports Pi tools, transformed result details/error/usage, live tool catalogs,
-notifications, confirmations, text input, basic lifecycle/context events, and
-local Pi event-bus behavior. On a Ygg host negotiating `runtime_commands`, Pi's
-initial command catalog is exposed under its native slash names; the generated
-`/<name> COMMAND ...` route remains only as a fallback for older hosts.
-Unsupported TUI, provider, session, compaction, agent-control, and mutation
-surfaces remain explicit migration diagnostics rather than silent no-ops.
+
+The API `0.3` bridge publishes transactional tools, commands, flags, shortcuts,
+all ordered events, renderers, providers, and roles. Session/model/tool state,
+custom entries and messages, active-tool overlays, semantic remote UI frames,
+provider streaming, and OAuth callbacks cross bounded owner-fenced host
+contracts. Product-mode reductions are explicit approved divergences; unavailable
+operations return errors rather than becoming no-ops.
 
 The scanner:
 
@@ -132,8 +132,8 @@ The human and JSON reports use migration-path classifications:
 | `direct` | Pi skill or Markdown prompt content has a deterministic Ygg resource path. The dry run does not copy it. |
 | `replace` | Reserved for an exact package/version/source-hash recipe that selects a Ygg-native replacement. No replacement recipes ship in this first scanner slice. |
 | `bridge` | The extension uses only surfaces implemented by the pinned compatibility process. A generated aggregate still needs a successful runtime handshake before it is known compatible. |
-| `native_port` | The extension uses a known Pi 0.84.4 mutation or registration that needs an explicit Ygg-native port or a future bounded host primitive. |
-| `manual` | The extension depends on arbitrary Pi TUI/editor components, custom providers, or deep session/compaction internals; redesign is required. Pi JSON themes are also manual because Ygg themes use a different semantic schema. |
+| `native_port` | The extension uses a private/runtime-specific behavior outside the pinned public profile and needs an explicit Ygg-native port. |
+| `manual` | The extension depends on a private Pi ABI, an unbounded native module, or a product-specific authority that cannot cross the compatibility contract; redesign is required. |
 | `blocked` | The package could not be resolved/read or parsed completely, or it uses names outside the pinned Pi 0.84.4 public compatibility profile. |
 
 `bridge` describes a migration candidate, not current runtime availability or
@@ -234,8 +234,8 @@ deterministic and model-free.
 
 ### Compatibility process
 
-The generated `ygg pi install` aggregate hosts a deliberately bounded subset of
-Pi's `ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated
+The generated `ygg pi install` aggregate hosts Pi's pinned public
+`ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated
 `--with` arguments record an ordered, source-fingerprinted set in one aggregate
 lock and load those sources through one real `ExtensionRunner`, preserving their
 local event bus, `globalThis`, and shared registries. `ygg migrate pi --plan-out`
@@ -243,12 +243,11 @@ selects the scanner's enabled extension sources in Pi load order and locks that
 whole reviewed set; `--apply` publishes it only after revalidation and explicit
 authorization.
 
-Unsupported Pi APIs must raise a clear compatibility error. The bridge must not
-silently discard a policy, mutation, lifecycle, or UI call. Static and runtime
-tools use API `0.2` live tool catalogs. Negotiated `runtime_commands` makes the
-command set discovered during Pi initialization authoritative without requiring
-those names in the generated manifest; command registration after initialization
-still needs a live command-catalog protocol.
+Unsupported or unavailable product-mode calls must raise a clear compatibility
+error. The bridge never silently discards a policy, mutation, lifecycle, or UI
+call. API `0.3` publishes the complete initial catalog and uses atomic catalog
+replacement for later changes; every mutating handler returns an operation-bound
+effect journal.
 
 ### Exact recipes
 
@@ -263,8 +262,9 @@ safe enough to apply automatically.
 Model-assisted porting remains opt-in and receives the scanner's structured
 residual, relevant source functions, target API contract, and tests—not an
 entire setup by default. The command must show where model use begins before any
-request is made. Arbitrary TUI frontends and custom provider transports should
-report manual redesign rather than trigger an unbounded automatic port.
+request is made. Private Pi internals and provider transports outside the pinned
+public configuration/callback contract should report manual redesign rather than
+trigger an unbounded automatic port.
 
 ## Deliberate compatibility boundary
 
@@ -274,33 +274,31 @@ Capability migration is often practical even when exact UX is not:
   bridge candidates;
 - MCP, search, browser, LSP, memory, and subagent behavior belong in replaceable
   Ygg extension processes, not the kernel;
-- Pi input transforms, safe tool-argument replacement with host revalidation,
-  pre-persistence tool-result transforms, extension-scoped durable state, and
-  per-turn tool-policy overlays are evidence for possible narrow future APIs;
-- custom provider/OAuth/stream handlers, mutable session-tree/compaction hooks,
-  and arbitrary editor/header/footer/widget components are not transparent
-  bridge targets; and
-- Ygg should evolve semantic, frontend-neutral UI contributions rather than an
-  arbitrary component ABI.
+- Pi input transforms, tool interception, durable extension state,
+  per-turn tool-policy overlays, provider callbacks, and remote components use
+  narrow API `0.3` events/effects rather than direct access to Ygg objects;
+- custom provider OAuth/stream handlers and editor/header/footer/widget
+  components execute in the pinned process while credentials, persistence,
+  terminal input, and final rendering remain host-owned; and
+- future UI additions should extend semantic, frontend-neutral frames rather
+  than grant arbitrary terminal ownership.
 
-None of those possible protocol additions is implied by the current migration
-pipeline. They should be introduced only with a concrete migrated package,
-wire-level tests, bounded failure semantics, and no cost on the no-extension
-path.
+New protocol additions remain tied to concrete migrated packages, wire-level
+tests, bounded failure semantics, and no cost on the no-extension path.
 
 ## Product promise
 
 The intended promise is:
 
 > Ygg can inspect a Pi setup, migrate portable resources without model tokens,
-> replace known infrastructure with exact Ygg-native recipes, run a bounded
-> compatible subset through an explicitly trusted bridge, and identify exactly
-> what still requires a port.
+> replace known infrastructure with exact Ygg-native recipes, run the pinned
+> public Pi extension surface through an explicitly trusted bridge, and identify
+> private or product-specific behavior that still requires a port.
 
 Today the zero-token scanner, content-digested aggregate plan/apply flow, and
-explicitly trusted pinned compatibility aggregates are implemented. The bridge
-runs a tested subset of Pi 0.84.4 tools, commands, dialogs, context, and
-lifecycle behavior; scanner-selected or explicitly ordered source sets can share
-one locked runtime. Direct portable-resource apply, exact replacement recipes,
-session/provider mutation, and arbitrary Pi component parity remain unfinished
-and are reported rather than silently emulated.
+explicitly trusted pinned compatibility aggregates are implemented. API `0.3`
+passes the six pinned release gates: unchanged plan mode, all 78 official
+examples, all 33 TUI audit rows, zero silent unsupported calls, one aggregate
+process, and provider/OAuth callbacks. Direct portable-resource apply and exact
+replacement recipes remain separate future migration features rather than Pi
+extension-parity blockers.

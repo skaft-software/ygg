@@ -110,10 +110,22 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.19.0
+      - name: Install the exact pinned Pi runtime and official-example dependencies
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/pi-runtime"
+          npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund \
+            @earendil-works/pi-coding-agent@0.84.4
+          package="$prefix/node_modules/@earendil-works/pi-coding-agent"
+          test "$(node -p "require('$package/package.json').version")" = 0.84.4
+          for example in gondolin sandbox; do
+            npm install --prefix "$package/examples/extensions/$example" \
+              --ignore-scripts --no-audit --no-fund
+          done
+          echo "YGG_PI_REAL_PACKAGE=$package" >> "$GITHUB_ENV"
       - name: Verify pinned ledgers and compatibility bridge fixtures
         env:
           PYTHONDONTWRITEBYTECODE: "1"
-          YGG_PI_REAL_PACKAGE: ""
         run: |
           set -euo pipefail
           node_version="$(node --version)"

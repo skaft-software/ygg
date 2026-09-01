@@ -54,6 +54,15 @@ API_V02_FEATURES = (
     "approvals",
     "secrets",
 )
+API_V03_FEATURES = (
+    "request_cancellation",
+    "content_parts",
+    "owner_context",
+    "ordered_events",
+    "catalog_transactions",
+    "effect_transactions",
+    "document_streams",
+)
 LIFECYCLE_METHODS = (
     "session/started",
     "session/settled",
@@ -406,10 +415,18 @@ class Extension:
         self.writer_queue_size = writer_queue_size
         self.shutdown_timeout = shutdown_timeout
         self.cancellation_grace = cancellation_grace
-        selected_features = API_V02_FEATURES if supported_features is None else supported_features
+        if supported_features is None:
+            selected_features = (
+                API_V03_FEATURES + API_V02_FEATURES
+                if self.api_version == "0.3"
+                else API_V02_FEATURES
+            )
+        else:
+            selected_features = supported_features
         if not all(isinstance(feature, str) and feature for feature in selected_features):
             raise ValueError("supported_features must contain non-empty strings")
-        unknown_features = set(selected_features) - set(API_V02_FEATURES)
+        allowed_features = set(API_V02_FEATURES) | set(API_V03_FEATURES)
+        unknown_features = set(selected_features) - allowed_features
         if unknown_features:
             raise ValueError(f"unknown supported_features: {sorted(unknown_features)}")
         self._supported_features = tuple(dict.fromkeys(selected_features))
@@ -524,8 +541,8 @@ class Extension:
             raise ValueError("tool description must be non-empty")
         schema = dict(parameters) if parameters is not None else {"type": "object"}
         result_schema = dict(output_schema) if output_schema is not None else None
-        if result_schema is not None and self.api_version != "0.2":
-            raise ValueError("output_schema requires extension API 0.2")
+        if result_schema is not None and self.api_version not in {"0.2", "0.3"}:
+            raise ValueError("output_schema requires extension API 0.2 or 0.3")
 
         def decorate(handler: Handler) -> Handler:
             if name in self._tools:
@@ -1790,12 +1807,7 @@ class Extension:
             raise RpcError(-32600, "initialize must be the first request")
         if not isinstance(params, Mapping):
             raise RpcError(-32602, "initialize params must be an object")
-        if self.api_version == "0.3":
-            raise RpcError(
-                -32000,
-                "extension API 0.3 is defined but not runtime-ready in this SDK build",
-            )
-        if self.api_version not in {"0.1", "0.2"}:
+        if self.api_version not in {"0.1", "0.2", "0.3"}:
             raise RpcError(-32000, f"unsupported extension API version: {self.api_version!r}")
         host_version = params.get("api_version")
         if host_version != self.api_version:
@@ -1850,6 +1862,67 @@ class Extension:
             }
             if "lifecycle_events" in self._features:
                 protocol_response["lifecycle_events"] = sorted(self._lifecycle_handlers)
+        elif self.api_version == "0.3":
+            protocol = params.get("protocol")
+            if not isinstance(protocol, Mapping):
+                raise RpcError(-32602, "API 0.3 initialize requires a protocol object")
+            if protocol.get("version") != "0.3":
+                raise RpcError(-32000, "unsupported executable-extension protocol version")
+            required = self._feature_list(protocol.get("required_features", []), "required_features")
+            optional = self._feature_list(protocol.get("optional_features", []), "optional_features")
+            missing = [feature for feature in API_V03_FEATURES if feature not in required]
+            unsupported = [feature for feature in required if feature not in API_V03_FEATURES]
+            if missing or unsupported:
+                raise RpcError(
+                    -32000,
+                    "API 0.3 requires the exact mandatory feature set",
+                    {"missing_features": missing, "unsupported_features": unsupported},
+                )
+            features = list(dict.fromkeys(required + optional))
+            features = [feature for feature in features if feature in self._supported_features]
+            limits = protocol.get("limits", {})
+            if not isinstance(limits, Mapping):
+                raise RpcError(-32602, "protocol.limits must be an object")
+            requested = limits.get("max_concurrent_requests", 1)
+            if not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0:
+                raise RpcError(
+                    -32602,
+                    "protocol.limits.max_concurrent_requests must be a positive integer",
+                )
+            host_services = protocol.get("host_services", [])
+            if not isinstance(host_services, list):
+                raise RpcError(-32602, "protocol.host_services must be an array")
+            self._features = frozenset(features)
+            self._negotiated_concurrency = min(requested, self.max_concurrent_requests)
+            with self._tool_catalog_lock:
+                self._tool_catalogs[0] = dict(self._tools)
+            protocol_response = {
+                "version": "0.3",
+                "features": features,
+                "limits": {"max_concurrent_requests": self._negotiated_concurrency},
+                "host_services": [],
+                "catalog": {
+                    "revision": 0,
+                    "tools": [self._tool_definition(tool) for tool in self._tools.values()],
+                    "commands": [
+                        {
+                            "name": command.name,
+                            "description": command.description,
+                            **({"usage": command.usage} if command.usage is not None else {}),
+                        }
+                        for command in self._commands.values()
+                    ],
+                    "flags": [],
+                    "shortcuts": [],
+                    "events": [],
+                    "tool_renderers": [],
+                    "message_renderers": [],
+                    "entry_renderers": [],
+                    "markdown_transformers": [],
+                    "providers": [],
+                    "roles": [],
+                },
+            }
         else:
             self._features = frozenset()
             self._negotiated_concurrency = 1
@@ -1862,8 +1935,12 @@ class Extension:
         )
         result: dict[str, Any] = {
             "api_version": self.api_version,
-            "tools": [self._tool_definition(tool) for tool in self._tools.values()],
-            "commands": [
+            "tools": []
+            if self.api_version == "0.3"
+            else [self._tool_definition(tool) for tool in self._tools.values()],
+            "commands": []
+            if self.api_version == "0.3"
+            else [
                 {
                     "name": command.name,
                     "description": command.description,
@@ -1907,7 +1984,10 @@ class Extension:
             if catalog_revision is _MISSING:
                 catalog = self._tools
             else:
-                if self.api_version != "0.2" or "dynamic_tools" not in self._features:
+                if not (
+                    (self.api_version == "0.2" and "dynamic_tools" in self._features)
+                    or (self.api_version == "0.3" and "catalog_transactions" in self._features)
+                ):
                     raise RpcError(
                         -32602,
                         "tool/call catalog_revision requires negotiated dynamic_tools",
@@ -1946,13 +2026,19 @@ class Extension:
             raise
         except Exception as error:
             self.logger.error("tool handler failed", tool=name, error=str(error))
-            if self.api_version == "0.2":
-                return self._tool_result(
+            if self.api_version in {"0.2", "0.3"}:
+                result = self._tool_result(
                     tool_result(text_content(str(error)), is_error=True),
                     tool,
                 )
+                if self.api_version == "0.3":
+                    result["effects"] = self._empty_effect_journal(request)
+                return result
             return {"content": str(error), "is_error": True, "metadata": {}}
-        return self._tool_result(value, tool)
+        result = self._tool_result(value, tool)
+        if self.api_version == "0.3":
+            result["effects"] = self._empty_effect_journal(request)
+        return result
 
     def _execute_command(self, params: Any) -> dict[str, Any]:
         request = self._object_params(params, "command/execute")
@@ -1970,7 +2056,10 @@ class Extension:
         except Exception as error:
             self.logger.error("command handler failed", command=name, error=str(error))
             raise RpcError(-32603, "internal error") from error
-        return self._command_result(value)
+        result = self._command_result(value)
+        if self.api_version == "0.3":
+            result["effects"] = self._empty_effect_journal(request)
+        return result
 
     def _run_hook(self, params: Any) -> dict[str, Any]:
         request = self._object_params(params, "hook/run")
@@ -1980,7 +2069,10 @@ class Extension:
         self._require_declared_name("hooks", name)
         handler = self._hooks.get(name)
         if handler is None:
-            return {"disposition": {"action": "continue"}, "context": [], "notifications": []}
+            result = {"disposition": {"action": "continue"}, "context": [], "notifications": []}
+            if self.api_version == "0.3":
+                result["effects"] = self._empty_effect_journal(request)
+            return result
         try:
             value = self._invoke(handler, request.get("payload", {}), self._context_from(request))
         except (CancelledError, RpcError):
@@ -1988,7 +2080,10 @@ class Extension:
         except Exception as error:
             self.logger.error("hook handler failed", hook=name, error=str(error))
             raise RpcError(-32603, "internal error") from error
-        return self._hook_result(value)
+        result = self._hook_result(value)
+        if self.api_version == "0.3":
+            result["effects"] = self._empty_effect_journal(request)
+        return result
 
     def _collect_context(self, params: Any) -> list[Any]:
         request = self._object_params(params, "context/collect")
@@ -2175,6 +2270,16 @@ class Extension:
     def _discard_staged_tool_catalog(self) -> None:
         self._staged_tool_catalog = None
         self._staged_tool_catalog_revision = None
+
+    @staticmethod
+    def _empty_effect_journal(request: Mapping[str, Any]) -> dict[str, Any]:
+        invocation = request.get("invocation")
+        if not isinstance(invocation, Mapping):
+            raise RpcError(-32602, "API 0.3 invocation is required")
+        operation = invocation.get("operation")
+        if not isinstance(operation, Mapping):
+            raise RpcError(-32602, "API 0.3 operation token is required")
+        return {"operation_token": dict(operation), "effects": []}
 
     @staticmethod
     def _command_result(value: Any) -> dict[str, Any]:

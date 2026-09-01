@@ -4649,6 +4649,20 @@ impl Agent {
         })
     }
 
+    /// Replaces the selected provider route for subsequent turns at an idle
+    /// product boundary. Existing runs retain their frozen request/model.
+    pub fn set_model(&mut self, model: Model) {
+        self.max_output_tokens = model.spec.limits.max_output_tokens;
+        self.model = model;
+        self.sync_delegation_runtime_settings();
+    }
+
+    /// Replaces reasoning for subsequent turns at an idle product boundary.
+    pub fn set_reasoning(&mut self, reasoning: ReasoningConfig) {
+        self.reasoning = reasoning;
+        self.sync_delegation_runtime_settings();
+    }
+
     /// Mutable access to the session for history operations between runs
     /// (checkout, manual compaction, config entries).
     pub fn session_mut(&mut self) -> &mut Session {

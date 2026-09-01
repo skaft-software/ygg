@@ -1,8 +1,10 @@
 # Ygg Extension Protocol Reference
 
-> **API versions:** `0.1` (frozen compatibility) and `0.2` (current,
-> `EXTENSION_API_VERSION`). API `0.3` contract types are defined in Rust but
-> runtime launch is intentionally rejected until its mandatory handlers ship.
+> **API versions:** `0.1` (frozen compatibility), `0.2` (default installable
+> bundle contract, `EXTENSION_API_VERSION`), and `0.3` (transactional opt-in).
+> API `0.3` launches only after exact mandatory-feature negotiation and carries
+> ordered events, catalog/effect transactions, split identity, bounded document
+> streams, and operation-fenced host services.
 >
 > Every request and response uses the standard JSON-RPC 2.0 envelope with
 > exactly one JSON object per line on **stdout**. Human diagnostics belong on
@@ -21,7 +23,13 @@ stateful guarantees through explicit initialization negotiation; support is
 never inferred from the extension package version. Installable bundles also
 carry an exact `requires_ygg` requirement in `extension.toml`; it is validated
 before a process can start and is packaging metadata, not an initialization
-field or protocol-version substitute.
+field or protocol-version substitute. API `0.3` keeps those guarantees and
+adds a revision-zero complete contribution catalog, atomic `catalog/replace`,
+required empty-or-populated effect journals on mutating handlers, monotonically
+sequenced `event/handle` barriers, pull-only `document/read`, and reverse
+`host/call` requests whose service/scope and operation token were admitted by
+the host. A missing feature, stale token, stale catalog revision, invalid
+journal, or unavailable service fails the operation explicitly.
 
 This protocol is the bus of a deliberately small agent kernel. Ygg hosts model
 conversations, session/result persistence, permissions and approvals, process

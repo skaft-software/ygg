@@ -3852,9 +3852,7 @@ impl InteractiveShell {
                 }
             }
             "working_message" => {
-                state.extension_working_message = value
-                    .as_str()
-                    .map(sanitize_for_terminal);
+                state.extension_working_message = value.as_str().map(sanitize_for_terminal);
             }
             "working_visible" => {
                 state.extension_working_visible = value.as_bool();
@@ -3872,8 +3870,7 @@ impl InteractiveShell {
                     });
             }
             "hidden_thinking_label" => {
-                state.extension_hidden_thinking_label =
-                    value.as_str().map(sanitize_for_terminal);
+                state.extension_hidden_thinking_label = value.as_str().map(sanitize_for_terminal);
             }
             "title" => {
                 state.extension_title = value.as_str().map(sanitize_for_terminal);

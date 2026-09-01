@@ -43,7 +43,7 @@ use crate::tool::{
     ToolOutputContentPart, ToolProgress, ToolProgressSink,
 };
 
-/// The newest executable-extension API implemented by this Ygg release.
+/// Default executable-extension API for ordinary installable bundles.
 pub const EXTENSION_API_VERSION: &str = EXTENSION_API_VERSION_0_2;
 
 /// Frozen compatibility version for simple, trusted text extensions.
@@ -52,7 +52,7 @@ pub const EXTENSION_API_VERSION_0_1: &str = "0.1";
 /// Stateful extension protocol with cancellation, progress, and lifecycle.
 pub const EXTENSION_API_VERSION_0_2: &str = "0.2";
 
-/// Selected parity-contract version. Its runtime is intentionally not ready.
+/// Transactional extension protocol with ordered events and host services.
 pub const EXTENSION_API_VERSION_0_3: &str = "0.3";
 
 /// API `0.2` cooperative request cancellation feature.
@@ -4271,10 +4271,7 @@ impl ExtensionLifecycleEvent {
         ExtensionRuntimeError,
     > {
         let (name, session_owner, run_id, turn_id, tool_call_id) = match self {
-            Self::SessionStarted {
-                session_id,
-                run_id,
-            } => (
+            Self::SessionStarted { session_id, run_id } => (
                 ExtensionOrderedEventName::SessionStart,
                 session_id,
                 run_id.clone(),
@@ -4282,9 +4279,7 @@ impl ExtensionLifecycleEvent {
                 None,
             ),
             Self::SessionSettled {
-                session_id,
-                run_id,
-                ..
+                session_id, run_id, ..
             } => (
                 ExtensionOrderedEventName::SessionShutdown,
                 session_id,
@@ -5651,12 +5646,6 @@ pub enum ExtensionRuntimeError {
         /// Host API version.
         host: String,
     },
-    /// The selected contract is defined but its process runtime is not yet enabled.
-    #[error("extension API {version} is defined but not runtime-ready in this build")]
-    ApiNotReady {
-        /// Manifest-selected API version.
-        version: String,
-    },
     /// The extension has not been explicitly enabled.
     #[error("extension `{0}` is not enabled")]
     Disabled(String),
@@ -6375,25 +6364,25 @@ impl ExtensionProcess {
         )?;
         let encoded_payload = serde_json::to_vec(&payload)
             .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
-        let (_document_lease, payload) =
-            if encoded_payload.len() > MAX_EXTENSION_INLINE_SEMANTIC_BYTES {
-                validate_v03_json(
-                    &payload,
-                    MAX_EXTENSION_DOCUMENT_BYTES as usize,
-                    "ordered-event document payload",
-                )?;
-                let (reference, lease) =
-                    connection.stage_v03_document(&invocation, encoded_payload)?;
-                (
-                    Some(lease),
-                    serde_json::json!({
-                        "document": reference,
-                        "encoding": "json",
-                    }),
-                )
-            } else {
-                (None, payload)
-            };
+        let (_document_lease, payload) = if encoded_payload.len()
+            > MAX_EXTENSION_INLINE_SEMANTIC_BYTES
+        {
+            validate_v03_json(
+                &payload,
+                MAX_EXTENSION_DOCUMENT_BYTES as usize,
+                "ordered-event document payload",
+            )?;
+            let (reference, lease) = connection.stage_v03_document(&invocation, encoded_payload)?;
+            (
+                Some(lease),
+                serde_json::json!({
+                    "document": reference,
+                    "encoding": "json",
+                }),
+            )
+        } else {
+            (None, payload)
+        };
         let dispatch = ExtensionOrderedEvent {
             sequence,
             event,
@@ -6412,12 +6401,13 @@ impl ExtensionProcess {
                 dispatch.invocation.operation.clone(),
             )
             .await?;
-        let result: ExtensionOrderedEventResult = serde_json::from_value(result).map_err(|error| {
-            ExtensionRuntimeError::Protocol(format!(
-                "invalid `{}` response: {error}",
-                methods::EVENT_HANDLE
-            ))
-        })?;
+        let result: ExtensionOrderedEventResult =
+            serde_json::from_value(result).map_err(|error| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "invalid `{}` response: {error}",
+                    methods::EVENT_HANDLE
+                ))
+            })?;
         result.validate()?;
         if result.sequence != dispatch.sequence
             || result.effects.operation_token != dispatch.invocation.operation
@@ -6480,9 +6470,11 @@ impl ExtensionProcess {
                 )
             })?;
         let mut params = payload.as_object().cloned().ok_or_else(|| {
-            ExtensionRuntimeError::Protocol("provider callback payload must be an object".to_owned())
+            ExtensionRuntimeError::Protocol(
+                "provider callback payload must be an object".to_owned(),
+            )
         })?;
-        for reserved in ["provider", "action", "invocation", "context"] {
+        for reserved in ["provider", "action", "invocation", "execution_context"] {
             if params.contains_key(reserved) {
                 return Err(ExtensionRuntimeError::Protocol(format!(
                     "provider callback payload contains reserved field `{reserved}`"
@@ -6497,7 +6489,7 @@ impl ExtensionProcess {
                 .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
         );
         params.insert(
-            "context".to_owned(),
+            "execution_context".to_owned(),
             serde_json::to_value(&context)
                 .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
         );
@@ -6961,12 +6953,8 @@ impl ExtensionProcess {
                 ExtensionOperationKind::Event
             }
         };
-        let invocation = self.invocation_for_execution(
-            &connection,
-            operation_kind,
-            &context,
-            None,
-        )?;
+        let invocation =
+            self.invocation_for_execution(&connection, operation_kind, &context, None)?;
         let params = serde_json::to_value(HookRequest {
             hook,
             payload,
@@ -7356,17 +7344,15 @@ impl ExtensionProcess {
             request_id: request_id.clone(),
             committed: false,
         };
-        connection.send_child_response(request_id, &response).await?;
+        connection
+            .send_child_response(request_id, &response)
+            .await?;
         reservation.commit();
         Ok(())
     }
 
     /// Whether a product owner already answered this reverse service request.
-    pub fn host_service_answered(
-        &self,
-        request_id: &ExtensionRequestId,
-        generation: u64,
-    ) -> bool {
+    pub fn host_service_answered(&self, request_id: &ExtensionRequestId, generation: u64) -> bool {
         lock_std_mutex(&self.inner.answered_host_services).contains(generation, request_id)
     }
 
@@ -8738,111 +8724,106 @@ async fn run_catalog_updates(
         };
         let mut committed_catalog = None;
         let mut committed_v03_catalog = None;
-        let result: Result<serde_json::Value, String> =
-            match wait_for_dynamic_registration(&inner).await {
-                Err(message) => Err(message),
-                Ok(registration) => {
-                    let _reload = inner.reload_guard.lock().await;
-                    let process = ExtensionProcess {
-                        inner: Arc::clone(&inner),
-                    };
-                    let active = read_std_lock(&inner.connection).clone();
-                    let active_request = active.generation == update.generation
-                        && Arc::ptr_eq(&active.tool_catalog, &update.catalog)
-                        && Arc::ptr_eq(&active.v03_catalog, &update.v03_catalog)
-                        && !active.draining.load(Ordering::Acquire);
-                    if !active_request {
-                        Err(
-                            "catalog request belongs to an inactive extension generation"
-                                .to_owned(),
-                        )
-                    } else {
-                        let mut next = read_std_lock(&update.catalog).clone();
-                        let mut replacement_catalog = None;
-                        match update.mutation {
-                            CatalogMutation::Register(definitions) => {
-                                for definition in definitions {
-                                    if let Some(existing) = next
-                                        .iter_mut()
-                                        .find(|existing| existing.name == definition.name)
-                                    {
-                                        *existing = definition;
-                                    } else {
-                                        next.push(definition);
-                                    }
+        let result: Result<serde_json::Value, String> = match wait_for_dynamic_registration(&inner)
+            .await
+        {
+            Err(message) => Err(message),
+            Ok(registration) => {
+                let _reload = inner.reload_guard.lock().await;
+                let process = ExtensionProcess {
+                    inner: Arc::clone(&inner),
+                };
+                let active = read_std_lock(&inner.connection).clone();
+                let active_request = active.generation == update.generation
+                    && Arc::ptr_eq(&active.tool_catalog, &update.catalog)
+                    && Arc::ptr_eq(&active.v03_catalog, &update.v03_catalog)
+                    && !active.draining.load(Ordering::Acquire);
+                if !active_request {
+                    Err("catalog request belongs to an inactive extension generation".to_owned())
+                } else {
+                    let mut next = read_std_lock(&update.catalog).clone();
+                    let mut replacement_catalog = None;
+                    match update.mutation {
+                        CatalogMutation::Register(definitions) => {
+                            for definition in definitions {
+                                if let Some(existing) = next
+                                    .iter_mut()
+                                    .find(|existing| existing.name == definition.name)
+                                {
+                                    *existing = definition;
+                                } else {
+                                    next.push(definition);
                                 }
-                            }
-                            CatalogMutation::Unregister(names) => {
-                                let removed = names.into_iter().collect::<BTreeSet<_>>();
-                                next.retain(|definition| !removed.contains(&definition.name));
-                            }
-                            CatalogMutation::ReplaceV03(request) => {
-                                next = request.catalog.tools.clone();
-                                replacement_catalog = Some(request.catalog);
                             }
                         }
-                        let validation = if let Some(catalog) = &replacement_catalog {
-                            catalog
-                                .validate_revision(catalog.revision)
+                        CatalogMutation::Unregister(names) => {
+                            let removed = names.into_iter().collect::<BTreeSet<_>>();
+                            next.retain(|definition| !removed.contains(&definition.name));
+                        }
+                        CatalogMutation::ReplaceV03(request) => {
+                            next = request.catalog.tools.clone();
+                            replacement_catalog = Some(request.catalog);
+                        }
+                    }
+                    let validation = if let Some(catalog) = &replacement_catalog {
+                        catalog
+                            .validate_revision(catalog.revision)
+                            .map_err(|error| error.to_string())
+                    } else {
+                        validate_tool_definitions(&next, EXTENSION_API_VERSION_0_2)
+                            .map_err(|error| error.to_string())
+                    };
+                    validation.and_then(|()| {
+                        let process_tools = process.process_tools(Arc::clone(&active), &next);
+                        let revision_stamp = Arc::clone(&process_tools.revision);
+                        let reservation = registration.reserve(process_tools.tools)?;
+                        let revision = replacement_catalog.as_ref().map_or_else(
+                            || {
+                                active
+                                    .catalog_revision
+                                    .load(Ordering::Acquire)
+                                    .saturating_add(1)
+                            },
+                            |catalog| catalog.revision,
+                        );
+                        let replacement_for_commit = replacement_catalog.clone();
+                        let accepted_v03 = Arc::new(StdMutex::new(None));
+                        let accepted_v03_for_commit = Arc::clone(&accepted_v03);
+                        let (_, published) = reservation.commit_with(|_, published| {
+                            revision_stamp.store(revision, Ordering::Release);
+                            let _catalog = write_std_lock(&active.catalog_guard);
+                            let accepted_tools = next
+                                .iter()
+                                .filter(|definition| published.contains(&definition.name))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            *write_std_lock(&update.catalog) = accepted_tools.clone();
+                            if let Some(mut catalog) = replacement_for_commit {
+                                catalog.tools = accepted_tools;
+                                *write_std_lock(&update.v03_catalog) = Some(catalog.clone());
+                                *lock_std_mutex(&accepted_v03_for_commit) = Some(catalog);
+                            }
+                            active.catalog_revision.store(revision, Ordering::Release);
+                        })?;
+                        next.retain(|definition| published.contains(&definition.name));
+                        *write_std_lock(&update.catalog) = next.clone();
+                        committed_catalog = Some((registration.clone(), Arc::clone(&active)));
+                        let accepted_v03 = lock_std_mutex(&accepted_v03).clone();
+                        if let Some(catalog) = accepted_v03 {
+                            committed_v03_catalog = Some(catalog.clone());
+                            serde_json::to_value(ExtensionCatalogReplaceResponse { catalog })
                                 .map_err(|error| error.to_string())
                         } else {
-                            validate_tool_definitions(&next, EXTENSION_API_VERSION_0_2)
-                                .map_err(|error| error.to_string())
-                        };
-                        validation.and_then(|()| {
-                            let process_tools = process.process_tools(Arc::clone(&active), &next);
-                            let revision_stamp = Arc::clone(&process_tools.revision);
-                            let reservation = registration.reserve(process_tools.tools)?;
-                            let revision = replacement_catalog.as_ref().map_or_else(
-                                || {
-                                    active
-                                        .catalog_revision
-                                        .load(Ordering::Acquire)
-                                        .saturating_add(1)
-                                },
-                                |catalog| catalog.revision,
-                            );
-                            let replacement_for_commit = replacement_catalog.clone();
-                            let accepted_v03 = Arc::new(StdMutex::new(None));
-                            let accepted_v03_for_commit = Arc::clone(&accepted_v03);
-                            let (_, published) = reservation.commit_with(|_, published| {
-                                revision_stamp.store(revision, Ordering::Release);
-                                let _catalog = write_std_lock(&active.catalog_guard);
-                                let accepted_tools = next
-                                    .iter()
-                                    .filter(|definition| published.contains(&definition.name))
-                                    .cloned()
-                                    .collect::<Vec<_>>();
-                                *write_std_lock(&update.catalog) = accepted_tools.clone();
-                                if let Some(mut catalog) = replacement_for_commit {
-                                    catalog.tools = accepted_tools;
-                                    *write_std_lock(&update.v03_catalog) = Some(catalog.clone());
-                                    *lock_std_mutex(&accepted_v03_for_commit) = Some(catalog);
-                                }
-                                active.catalog_revision.store(revision, Ordering::Release);
-                            })?;
-                            next.retain(|definition| published.contains(&definition.name));
-                            *write_std_lock(&update.catalog) = next.clone();
-                            committed_catalog = Some((registration.clone(), Arc::clone(&active)));
-                            let accepted_v03 = lock_std_mutex(&accepted_v03).clone();
-                            if let Some(catalog) = accepted_v03 {
-                                committed_v03_catalog = Some(catalog.clone());
-                                serde_json::to_value(ExtensionCatalogReplaceResponse { catalog })
-                                    .map_err(|error| error.to_string())
-                            } else {
-                                serde_json::to_value(ToolCatalogUpdateResponse {
-                                    revision,
-                                    tools: next
-                                        .into_iter()
-                                        .map(|definition| definition.name)
-                                        .collect(),
-                                })
-                                .map_err(|error| error.to_string())
-                            }
-                        })
-                    }
+                            serde_json::to_value(ToolCatalogUpdateResponse {
+                                revision,
+                                tools: next.into_iter().map(|definition| definition.name).collect(),
+                            })
+                            .map_err(|error| error.to_string())
+                        }
+                    })
                 }
-            };
+            }
+        };
         let response = match result {
             Ok(result) => serde_json::json!({
                 "jsonrpc":"2.0",
@@ -9780,9 +9761,9 @@ impl ProcessConnection {
                     "API 0.3 operation identity space is exhausted".into(),
                 )
             })?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ExtensionRuntimeError::Protocol("system clock precedes Unix epoch".into()))?;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| {
+            ExtensionRuntimeError::Protocol("system clock precedes Unix epoch".into())
+        })?;
         let deadline_unix_ms = u64::try_from(now.as_millis())
             .unwrap_or(u64::MAX)
             .saturating_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX));
@@ -9834,7 +9815,9 @@ impl ProcessConnection {
         }
         let sequence = self
             .ordered_sequence
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                next.checked_add(1)
+            })
             .map_err(|_| {
                 ExtensionRuntimeError::Protocol(
                     "ordered-event sequence space is exhausted".to_owned(),
@@ -9880,12 +9863,13 @@ impl ProcessConnection {
                 dispatch.invocation.operation.clone(),
             )
             .await?;
-        let result: ExtensionOrderedEventResult = serde_json::from_value(result).map_err(|error| {
-            ExtensionRuntimeError::Protocol(format!(
-                "invalid `{}` response: {error}",
-                methods::EVENT_HANDLE
-            ))
-        })?;
+        let result: ExtensionOrderedEventResult =
+            serde_json::from_value(result).map_err(|error| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "invalid `{}` response: {error}",
+                    methods::EVENT_HANDLE
+                ))
+            })?;
         result.validate()?;
         if result.sequence != dispatch.sequence
             || result.effects.operation_token != dispatch.invocation.operation
@@ -13299,12 +13283,13 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         "host service request has a stale process fence or deadline",
                     );
                 }
-                let parent_request_id = lock_std_mutex(&state.pending)
-                    .iter()
-                    .find_map(|(parent, pending)| {
-                        (pending.v03_operation.as_ref() == Some(&request.operation_token))
-                            .then_some(*parent)
-                    });
+                let parent_request_id =
+                    lock_std_mutex(&state.pending)
+                        .iter()
+                        .find_map(|(parent, pending)| {
+                            (pending.v03_operation.as_ref() == Some(&request.operation_token))
+                                .then_some(*parent)
+                        });
                 let Some(parent_request_id) = parent_request_id else {
                     return reject_unparented_child_request(
                         state,
@@ -13592,17 +13577,16 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     return Err("catalog/replace requires extension API 0.3".into());
                 }
                 let id = parse_child_request_id(object, methods::CATALOG_REPLACE)?;
-                let request: ExtensionCatalogReplaceRequest =
-                    match serde_json::from_value(params) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return reject_unparented_child_request(
-                                state,
-                                id,
-                                format!("invalid catalog replacement: {error}"),
-                            )
-                        }
-                    };
+                let request: ExtensionCatalogReplaceRequest = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return reject_unparented_child_request(
+                            state,
+                            id,
+                            format!("invalid catalog replacement: {error}"),
+                        )
+                    }
+                };
                 let expected_process = ProcessFence {
                     instance_id: state.instance_id.clone(),
                     generation: state.generation,
@@ -13611,9 +13595,10 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     .as_ref()
                     .map(|catalog| catalog.revision)
                     .unwrap_or(0);
-                let next_revision = request.expected_revision.checked_add(1).ok_or_else(|| {
-                    "catalog revision space is exhausted".to_owned()
-                })?;
+                let next_revision = request
+                    .expected_revision
+                    .checked_add(1)
+                    .ok_or_else(|| "catalog revision space is exhausted".to_owned())?;
                 if request.process != expected_process
                     || request.expected_revision != current_revision
                 {
@@ -13634,17 +13619,16 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     return Err("document/read requires extension API 0.3".into());
                 }
                 let id = parse_child_request_id(object, methods::DOCUMENT_READ)?;
-                let request: ExtensionDocumentReadRequest =
-                    match serde_json::from_value(params) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return reject_unparented_child_request(
-                                state,
-                                id,
-                                format!("invalid document read: {error}"),
-                            )
-                        }
-                    };
+                let request: ExtensionDocumentReadRequest = match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return reject_unparented_child_request(
+                            state,
+                            id,
+                            format!("invalid document read: {error}"),
+                        )
+                    }
+                };
                 if let Err(error) = request.operation_token.validate() {
                     return reject_unparented_child_request(state, id, error.to_string());
                 }
@@ -18531,7 +18515,14 @@ send({
             "features": protocol["required_features"],
             "limits": {"max_concurrent_requests": 4},
             "host_services": protocol["host_services"],
-            "catalog": {"revision": 0, "events": ["session_start"]},
+            "catalog": {
+                "revision": 0,
+                "events": ["session_start"],
+                "providers": [{
+                    "id": "fixture-provider",
+                    "config": {"custom_stream_handle": "fixture-stream"},
+                }],
+            },
         },
     },
 })
@@ -18587,6 +18578,21 @@ send({
         "result": {"observed": True},
         "effects": {
             "operation_token": dispatch["invocation"]["operation"],
+            "effects": [],
+        },
+    },
+})
+provider = receive()
+assert provider["method"] == "provider/callback", provider
+assert provider["params"]["provider"] == "fixture-provider", provider
+assert provider["params"]["action"] == "custom_stream", provider
+send({
+    "jsonrpc": "2.0",
+    "id": provider["id"],
+    "result": {
+        "events": [{"type": "done", "message": "fixture"}],
+        "effects": {
+            "operation_token": provider["params"]["invocation"]["operation"],
             "effects": [],
         },
     },
@@ -18657,6 +18663,30 @@ send({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
             .expect("subscribed event");
         assert_eq!(result.result, Some(serde_json::json!({"observed":true})));
         assert!(result.effects.effects.is_empty());
+        assert_eq!(
+            process.contributions().providers,
+            [ExtensionCatalogProviderDeclaration {
+                id: "fixture-provider".into(),
+                config: serde_json::json!({"custom_stream_handle":"fixture-stream"}),
+            }]
+        );
+        let provider = process
+            .provider_callback(
+                "fixture-provider",
+                "custom_stream",
+                serde_json::json!({
+                    "model": {"id": "fixture-model"},
+                    "context": {"messages": []},
+                    "options": {},
+                }),
+                process.current_context_for_resource_owner(format!("session-{}", "4".repeat(64))),
+            )
+            .await
+            .expect("provider callback");
+        assert_eq!(
+            provider["events"],
+            serde_json::json!([{"type":"done","message":"fixture"}])
+        );
         assert!(process.shutdown().await);
     }
 
