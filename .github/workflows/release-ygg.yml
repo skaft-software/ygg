@@ -254,8 +254,9 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: apps/web/.node-version
-          cache: npm
-          cache-dependency-path: apps/web/package-lock.json
+      # Release audits and artifacts intentionally use clean dependency/build
+      # state. Pull-request or branch caches must never enter a privileged
+      # publish path.
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
       - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
         with:
@@ -298,10 +299,8 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Verify release Rust compiler
         run: test "$(rustc --version | awk '{print $2}')" = "1.97.1"
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
-        with:
-          key: ygg-binary-release-${{ matrix.target }}
-          workspaces: source -> target
+      # Build release artifacts from clean runner state. CI caches remain useful
+      # for unprivileged validation jobs, never for publishable binaries.
       - name: Build optimized Ygg binaries
         working-directory: source
         run: cargo build --release --locked --target "${{ matrix.target }}" -p ygg-coding-agent --bins
