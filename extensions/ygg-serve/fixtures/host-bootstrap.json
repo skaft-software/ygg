@@ -2,7 +2,7 @@
   "protocol": 1,
   "host": {
     "id": "host-demo",
-    "name": "Achu's Mac"
+    "name": "Developer Mac"
   },
   "capabilities": {
     "concurrentSessions": true,

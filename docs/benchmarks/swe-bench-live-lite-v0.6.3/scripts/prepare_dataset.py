@@ -29,6 +29,18 @@ from common import (  # noqa: E402
     write_jsonl,
 )
 
+PUBLIC_ROOT = Path("/workspace/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3")
+
+
+def public_path(path: Path) -> str:
+    """Represent a local input path without publishing its machine root."""
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(ROOT)
+    except ValueError:
+        return "/external/artifact"
+    return str(PUBLIC_ROOT / relative)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -68,7 +80,7 @@ def main() -> int:
             "schema_version": "swebench-live-lite-dataset-v1",
             "dataset": DATASET_REPOSITORY,
             "revision": DATASET_REVISION,
-            "parquet_path": str(parquet),
+            "parquet_path": public_path(parquet),
             "parquet_sha256": sha256_file(parquet),
             "expected_parquet_sha256": DATASET_SHA256,
             "source_url": DATASET_URL,
@@ -76,8 +88,9 @@ def main() -> int:
             "row_count": len(rows),
             "expected_row_count": DATASET_ROWS,
             "columns": list(DATASET_COLUMNS),
-            "agent_manifest_path": str(args.public_output.resolve()),
-            "full_manifest_path": str(args.full_output.resolve()) if args.full_output else None,
+            "agent_manifest_path": public_path(args.public_output),
+            "full_manifest_path": public_path(args.full_output) if args.full_output else None,
+            "local_paths_are_public_placeholders": True,
             "privileged_columns_are_excluded_from_agent_manifest": True,
         },
     )

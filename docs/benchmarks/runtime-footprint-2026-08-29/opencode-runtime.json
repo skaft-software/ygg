@@ -2,7 +2,7 @@
   "created_unix_ms": 1788044747891,
   "environment": {
     "cpu_count": 8,
-    "cwd": "/Users/achumukundan/github/skaft-software/ygg",
+    "cwd": "/workspace/ygg",
     "kernel_version": "Darwin Kernel Version 27.0.0: Tue Aug 11 22:06:24 PDT 2026; root:xnu-13432.1.9~3/RELEASE_ARM64_T8122",
     "machine": "arm64",
     "os_release": "27.0.0",
@@ -90,15 +90,15 @@
     {
       "argv": [
         "/usr/bin/env",
-        "HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/opencode",
-        "XDG_CONFIG_HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/opencode/config",
-        "XDG_DATA_HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/opencode/data",
-        "XDG_CACHE_HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/opencode/cache",
+        "HOME=/benchmark/config/opencode",
+        "XDG_CONFIG_HOME=/benchmark/config/opencode/config",
+        "XDG_DATA_HOME=/benchmark/config/opencode/data",
+        "XDG_CACHE_HOME=/benchmark/config/opencode/cache",
         "/opt/homebrew/bin/opencode",
         "acp",
         "--pure",
         "--cwd",
-        "/Users/achumukundan/github/skaft-software/ygg"
+        "/workspace/ygg"
       ],
       "cpu_peak_percent": {
         "count": 9,

@@ -167,7 +167,7 @@ fn bootstrap() -> HostBootstrap {
         protocol: 1,
         host: HostDescriptor {
             id: HostId::new("host-demo").unwrap(),
-            name: "Achu's Mac".into(),
+            name: "Developer Mac".into(),
         },
         capabilities: HostCapabilities {
             concurrent_sessions: true,

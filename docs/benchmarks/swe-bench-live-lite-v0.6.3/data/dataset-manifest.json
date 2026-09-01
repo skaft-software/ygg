@@ -1,5 +1,5 @@
 {
-  "agent_manifest_path": "/Users/achumukundan/github/skaft-software/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/data/agent_tasks.jsonl",
+  "agent_manifest_path": "/workspace/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/data/agent_tasks.jsonl",
   "columns": [
     "repo",
     "pull_number",
@@ -23,8 +23,9 @@
   "dataset": "SWE-bench-Live/SWE-bench-Live",
   "expected_parquet_sha256": "7ee0a75c41bfc954fd441b67ce738fc5c1cbae00721c4e30e7db4d893057c9ab",
   "expected_row_count": 300,
-  "full_manifest_path": "/Users/achumukundan/github/skaft-software/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/private/lite-full.jsonl",
-  "parquet_path": "/Users/achumukundan/github/skaft-software/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/data/lite.parquet",
+  "full_manifest_path": "/workspace/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/private/lite-full.jsonl",
+  "local_paths_are_public_placeholders": true,
+  "parquet_path": "/workspace/ygg/docs/benchmarks/swe-bench-live-lite-v0.6.3/data/lite.parquet",
   "parquet_sha256": "7ee0a75c41bfc954fd441b67ce738fc5c1cbae00721c4e30e7db4d893057c9ab",
   "privileged_columns_are_excluded_from_agent_manifest": true,
   "revision": "a637bd46829f3132e12938c8a0ca93173a977b8e",
