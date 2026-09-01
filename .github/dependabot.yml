@@ -1,0 +1,71 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - area/infra
+    groups:
+      rust-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: cargo
+    directory: /extensions/ygg-serve
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:30"
+      timezone: America/Toronto
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ygg-serve
+      - area/infra
+    groups:
+      serve-rust-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /apps/web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ygg-serve
+      - area/infra
+    groups:
+      web-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:30"
+      timezone: America/Toronto
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github_actions
+      - area/infra
+    groups:
+      actions:
+        patterns:
+          - "*"

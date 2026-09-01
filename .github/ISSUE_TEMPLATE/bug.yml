@@ -1,0 +1,71 @@
+name: Bug or regression
+description: Report reproducible incorrect behavior in a supported Ygg path.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem. Never include credentials, private prompts, repository contents, or unredacted session files. If this may be a vulnerability, stop and use private security reporting instead.
+  - type: checkboxes
+    attributes:
+      label: Intake checks
+      options:
+        - label: I searched open and closed issues for the same behavior.
+          required: true
+        - label: I reproduced this on the current supported release or a named commit.
+          required: true
+        - label: This report does not disclose a suspected security vulnerability.
+          required: true
+  - type: input
+    attributes:
+      label: Ygg version or commit
+      placeholder: ygg 0.6.5 or a full commit SHA
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Platform
+      placeholder: macOS 15 arm64, Ubuntu 24.04 x86_64, terminal name/version
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Surface
+      options:
+        - TUI / terminal rendering
+        - Agent / tools / sessions
+        - Provider / model / authentication
+        - Extensions / MCP / Pi compatibility
+        - Ygg Serve
+        - Install / update / release
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: State the observable behavior and impact. Redact paths and private data where possible.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Minimal reproduction
+      description: Include the smallest deterministic steps, configuration shape with values removed, and whether it reproduces after restart.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized evidence
+      description: Paste only bounded, inspected diagnostics. Do not attach credentials, prompts, tool arguments/results, private repository data, or raw sessions.
+  - type: textarea
+    attributes:
+      label: Additional context
+      description: Note workarounds, frequency, regressions from a prior version, or related issues.

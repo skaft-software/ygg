@@ -15,6 +15,16 @@ __pycache__/
 /.lavish
 /.tmp-ui/
 artifacts/
+/notes/
+/research/
+
+# Raw benchmark/runtime captures are never publication artifacts. Commit only
+# bounded, sanitized summaries, manifests, fixtures, and hashes.
+/docs/benchmarks/**/runs/
+/docs/benchmarks/**/raw/
+/docs/benchmarks/**/home/
+/docs/benchmarks/**/sessions/
+/docs/benchmarks/**/workspace/
 
 # Local working notes (checked-in design docs remain tracked)
 docs/research/

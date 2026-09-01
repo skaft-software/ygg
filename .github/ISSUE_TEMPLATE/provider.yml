@@ -1,0 +1,51 @@
+name: Provider compatibility report
+description: Report incorrect or missing provider, model, authentication, pricing, quota, or protocol behavior.
+title: "provider: "
+labels:
+  - area/providers
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys, OAuth tokens, account IDs, authorization headers, private endpoint URLs, or raw provider bodies. Use private security reporting if the problem exposes credentials or bypasses authority.
+  - type: input
+    attributes:
+      label: Provider and route
+      placeholder: DeepSeek API-key route, OpenRouter Chat, Codex subscription
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Ygg version or commit
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Incorrect or missing behavior
+      description: Identify the model/catalog/auth/protocol/pricing/quota behavior and its user impact.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Authoritative reference
+      description: Link provider documentation or a reproducible public compatibility source. Do not include private account data.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Sanitized reproduction
+      description: Include request shape or diagnostics with all credentials, identifiers, paths, and provider bodies removed.
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Likely contract area
+      options:
+        - Provider definition / generated model catalog
+        - Existing protocol compatibility metadata
+        - Authentication / credential lifecycle
+        - New API family or transport
+        - Pricing / subscription quota
+        - Unknown
+    validations:
+      required: true

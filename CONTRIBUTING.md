@@ -22,12 +22,35 @@ the prompts behind a contribution are welcome too.
 ## Before opening a change
 
 1. Search existing issues and pull requests for the same behavior.
-2. For security-sensitive findings, stop and use the private reporting path in
+2. Read [ROADMAP.md](ROADMAP.md) and the target milestone. Broad or unresolved
+   ideas should begin in [Discussions](https://github.com/skaft-software/ygg/discussions)
+   rather than a large implementation.
+3. For security-sensitive findings, stop and use the private reporting path in
    [SECURITY.md](SECURITY.md). Do not open a public issue first.
-3. Keep unrelated formatting, generated output, local notes, credentials, and
+4. Keep unrelated formatting, generated output, local notes, credentials, and
    editor state out of the change.
-4. Explain the user-visible problem and the boundary the fix is intended to
+5. Explain the user-visible problem and the boundary the fix is intended to
    preserve.
+
+## Roadmap and proposal lifecycle
+
+`ROADMAP.md` is the high-level source of truth; the
+[public Project](https://github.com/orgs/skaft-software/projects/5) shows accepted
+work in motion, and milestones define compatibility/release buckets. Roadmap
+placement is not an ETA or a promise that a specific implementation will merge.
+Release notes remain authoritative for shipped behavior.
+
+- `status/exploring`: worth discussing, not committed.
+- `status/accepted`: accepted into a milestone, not actively implemented.
+- `status/in-progress`: actively owned work.
+- `status/shipped`: completed with release or merge evidence.
+
+A substantial proposal should state the user problem and evidence, the smallest
+complete outcome, whether it belongs in core/an extension/provider data/a
+frontend, explicit non-goals, a success measure, and a stop condition. Approval
+of the problem does not approve a large prewritten patch. Existing external bug
+reports remain product evidence: they are closed only with shipped evidence, a
+verified duplicate, or an explicit product/non-goal decision.
 
 ## Development setup
 
