@@ -99,6 +99,7 @@ confirmations = true
             name: "Conformance".into(),
             version: Some("1.2.3".into()),
         }],
+        ..ExtensionHostState::default()
     };
     let mut config = ExtensionRuntimeConfig::new(temp.path());
     config.host_state = host_state.clone();
@@ -223,6 +224,16 @@ confirmations = true
         "model": "local/model",
         "reasoning": {"effort": "high"},
         "active_skills": [],
+        "active_tools": [],
+        "all_tools": [],
+        "idle": false,
+        "models": [],
+        "pending_messages": false,
+        "project_trusted": false,
+        "scoped_models": [],
+        "session_entries": [],
+        "session_labels": {},
+        "session_tree": [],
     });
     let tool_wire_context = json!({
         "workspace": temp.path(),
@@ -373,6 +384,7 @@ hooks = ["before_prompt"]
         model: Some("local/python-proof".into()),
         reasoning: None,
         active_skills: Vec::new(),
+        ..ExtensionHostState::default()
     };
     let mut config = ExtensionRuntimeConfig::new(temp.path());
     config.host_state = host_state.clone();

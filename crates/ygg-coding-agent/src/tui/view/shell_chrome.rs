@@ -97,7 +97,7 @@ fn render_extension_chrome(state: &ShellState, width: u16) -> Vec<String> {
                 .values()
                 .map(String::as_str)
                 .collect::<Vec<_>>()
-                .join(&separator),
+                .join(separator),
             width,
         ));
     }

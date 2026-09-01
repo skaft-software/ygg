@@ -5943,7 +5943,7 @@ pub struct ExtensionProcess {
 enum CatalogMutation {
     Register(Vec<ToolDefinition>),
     Unregister(Vec<String>),
-    ReplaceV03(ExtensionCatalogReplaceRequest),
+    ReplaceV03(Box<ExtensionCatalogReplaceRequest>),
 }
 
 struct CatalogUpdateRequest {
@@ -13611,7 +13611,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 if let Err(error) = request.catalog.validate_revision(next_revision) {
                     return reject_unparented_child_request(state, id, error.to_string());
                 }
-                queue_catalog_update(state, id, CatalogMutation::ReplaceV03(request))?;
+                queue_catalog_update(state, id, CatalogMutation::ReplaceV03(Box::new(request)))?;
             }
             methods::DOCUMENT_READ => {
                 require_feature(state, EXTENSION_FEATURE_DOCUMENT_STREAMS)?;

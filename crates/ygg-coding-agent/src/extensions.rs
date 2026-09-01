@@ -3759,7 +3759,6 @@ fn pi_session_projection(
     // exact parent ID needed by Pi-compatible consumers.
     let tree = entries
         .iter()
-        .cloned()
         .map(|entry| serde_json::json!({ "entry": entry, "children": [] }))
         .collect();
     (entries, tree, labels)

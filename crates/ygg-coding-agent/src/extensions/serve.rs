@@ -9784,9 +9784,14 @@ fn branch_entry_label(entry: &Entry) -> String {
                 _ => None,
             })
             .unwrap_or("Assistant response"),
+        EntryValue::ExtensionCustomMessage {
+            content, display, ..
+        } => display.as_deref().unwrap_or(content),
         EntryValue::Config { .. } => "Internal session state",
         EntryValue::Compaction { .. } => "Compaction",
-        EntryValue::ResponsesTurn { .. }
+        EntryValue::ExtensionCustom { .. }
+        | EntryValue::ExtensionLabel { .. }
+        | EntryValue::ResponsesTurn { .. }
         | EntryValue::ResponsesCompaction { .. }
         | EntryValue::PromptTemplateSelected { .. }
         | EntryValue::SkillActivated { .. }
@@ -10103,6 +10108,26 @@ fn project_entry(
                 ));
             }
         }
+        EntryValue::ExtensionCustomMessage {
+            content, display, ..
+        } => {
+            let visible = display.as_deref().unwrap_or(content);
+            if !visible.is_empty() {
+                items.push(committed_item(
+                    preferred.unwrap_or(item_id_for_entry(entry, 0)?),
+                    run_id,
+                    durable_id,
+                    ItemPayload::UserMessage {
+                        text: bounded_text(visible, MAX_PROMPT_BYTES),
+                        attachments: Vec::new(),
+                        documents: Vec::new(),
+                        project_files: Vec::new(),
+                        delivery: None,
+                        branch_provenance: None,
+                    },
+                ));
+            }
+        }
         EntryValue::Compaction { summary, .. } => {
             items.push(committed_item(
                 item_id_for_entry(entry, 0)?,
@@ -10144,7 +10169,9 @@ fn project_entry(
                 ));
             }
         }
-        EntryValue::ResponsesTurn { .. }
+        EntryValue::ExtensionCustom { .. }
+        | EntryValue::ExtensionLabel { .. }
+        | EntryValue::ResponsesTurn { .. }
         | EntryValue::ResponsesCompaction { .. }
         | EntryValue::PromptTemplateSelected { .. }
         | EntryValue::SkillActivated { .. }
