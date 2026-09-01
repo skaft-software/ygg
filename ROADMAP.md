@@ -1,14 +1,17 @@
 # Ygg roadmap
 
-Ygg is building a small, local-first coding-agent kernel with strict boundaries for
-models, sessions, tools, and language-neutral extensions.
+Ygg is building a high-performance coding agent for real work: fast,
+context-efficient, and deeply integrated.
 
-The long-term direction is broader than a plugin list:
+Local-model support, native execution, durable sessions, and language-neutral
+extensions are evidence for that promise, not separate product stories.
+
+The long-term architectural direction is broader than a plugin list:
 
 > Models are interchangeable brains. Extensions are senses, hands, instruments,
 > and institutions. Ygg is the language-neutral nervous system connecting them.
 
-The near-term product promise is narrower and testable:
+A near-term consequence of that architecture is:
 
 > One agent can operate across existing software, services, runtimes, and devices
 > without requiring those ecosystems to be rewritten in JavaScript.
@@ -35,6 +38,38 @@ A conceptual proposal can be accepted for discussion without being accepted for
 implementation. Large changes should state the user problem, smallest complete
 outcome, core-versus-extension placement, non-goals, success measure, and a reason
 to stop.
+
+## Roadmap filter
+
+A feature belongs on the core roadmap only when it materially improves at least
+one of:
+
+- task success or human reviewability;
+- time to a useful result;
+- baseline or active-context footprint;
+- integration depth or reliability;
+- operational reliability of long-running work.
+
+Otherwise it should be deferred, made optional, or live at the extension edge.
+This filter applies to attractive polish and integrations as well as large
+architecture proposals. Core complexity is a cost that must buy an observable
+user outcome.
+
+## Measurements that organize the work
+
+Ygg evaluates roadmap progress with:
+
+- same-model, same-task end-to-end completion time;
+- task success and human acceptance;
+- baseline system-prompt and tool-schema token cost;
+- incremental token cost of each enabled integration;
+- provider/tool-call compatibility and recovery rate;
+- local-model task success at constrained context sizes;
+- installation-to-first-success time for key integrations.
+
+Supporting systems measurements—RSS/PSS, CPU, FDs, process/thread count, render
+work, request/tool count, cache buckets, and cost—explain those product outcomes.
+They do not replace them.
 
 ## Engineering principles
 

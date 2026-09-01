@@ -45,6 +45,15 @@ Release notes remain authoritative for shipped behavior.
 - `status/in-progress`: actively owned work.
 - `status/shipped`: completed with release or merge evidence.
 
+Core roadmap work must materially improve task success/reviewability, time to a
+useful result, baseline/active-context footprint, integration depth/reliability,
+or long-running operational reliability. Otherwise prefer deferral, an optional
+package, or the extension edge. Measurements should connect systems evidence to
+same-model task outcomes, human acceptance, context/schema token cost,
+integration recovery, constrained-context local-model success, or
+installation-to-first-success time; see the
+[roadmap filter](ROADMAP.md#roadmap-filter).
+
 A substantial proposal should state the user problem and evidence, the smallest
 complete outcome, whether it belongs in core/an extension/provider data/a
 frontend, explicit non-goals, a success measure, and a stop condition. Approval
