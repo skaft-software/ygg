@@ -12,6 +12,7 @@ from __future__ import annotations
 import codecs
 import copy
 import hashlib
+import hmac
 import html
 from html.parser import HTMLParser
 import http.client
@@ -1562,6 +1563,9 @@ class WebService:
     def __init__(self, http: Optional[HttpClient] = None, cache: Optional[BoundedCache] = None) -> None:
         self.http = http or HttpClient()
         self.cache = cache or BoundedCache()
+        # Cache entries are process-local, so a random keyed digest can isolate
+        # credentials without retaining or publishing a stable hash of a secret.
+        self._credential_scope_key = secrets.token_bytes(32)
 
     def configure_cache(self, config: Configuration) -> None:
         limits = config.limits
@@ -1594,7 +1598,11 @@ class WebService:
                     "Brave Search needs an API key; get one at %s" % BRAVE_SEARCH_KEY_URL
                 )
             validated_api_key = validate_brave_api_key(api_key)
-            credential_scope = hashlib.sha256(validated_api_key.encode("ascii")).hexdigest()
+            credential_scope = hmac.new(
+                self._credential_scope_key,
+                validated_api_key.encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
         key = _cache_key(
             "search",
             config.fingerprint,
