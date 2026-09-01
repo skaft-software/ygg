@@ -12,11 +12,12 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ygg_agent::extension_process::{
     ExtensionCapabilities, ExtensionEntrypoint, ExtensionFilesystemAccess, ExtensionHook,
-    ExtensionManifest, ExtensionUiSurface, ManifestContributions,
+    ExtensionHostServiceDeclaration, ExtensionManifest, ExtensionOrderedEventName,
+    ExtensionUiSurface, ManifestContributions,
 };
-use ygg_agent::EXTENSION_API_VERSION_0_2;
+use ygg_agent::EXTENSION_API_VERSION_0_3;
 
-const BRIDGE_VERSION: &str = "0.2.0";
+const BRIDGE_VERSION: &str = "0.3.0";
 const SUPPORTED_PI_VERSION: &str = "0.84.4";
 const YGG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const PROFILE_ID: &str = "pi-0.84.4";
@@ -606,6 +607,71 @@ fn list(requested_extension_root: Option<&Path>, invocation_cwd: &Path) -> anyho
     Ok(())
 }
 
+fn pi_host_services() -> anyhow::Result<Vec<ExtensionHostServiceDeclaration>> {
+    [
+        "state@1:host,context-usage,system-prompt,system-prompt-options,pending,idle,project-trust",
+        "control@1:abort,wait-idle,shutdown,reload",
+        "session@1:read,path,append,label,name,compact,navigate,new,fork,switch",
+        "messaging@1:custom,user,steer,follow-up,next-turn,templates",
+        "catalog@1:read,tools,active-tools,commands,flags,shortcuts,renderers,roles",
+        "resources@1:skills,prompts,themes",
+        "ui@1:notify,dialogs,status,working,widgets,header,footer,title,editor,autocomplete,components,themes,disclosure,terminal-input",
+        "providers@1:read,register,override,refresh-models,intercept-payload,intercept-headers,credential-headers,custom-stream,oauth",
+        "process@1:exec,user-bash",
+        "policy@1:evaluate,approvals",
+        "artifacts@1:publish,resolve",
+    ]
+    .into_iter()
+    .map(|declaration| {
+        declaration
+            .parse()
+            .map_err(|error: String| anyhow::anyhow!(error))
+    })
+    .collect()
+}
+
+fn pi_ordered_events() -> Vec<ExtensionOrderedEventName> {
+    use ExtensionOrderedEventName::*;
+    vec![
+        ProjectTrust,
+        ResourcesDiscover,
+        SessionStart,
+        SessionInfoChanged,
+        SessionBeforeSwitch,
+        SessionBeforeFork,
+        SessionBeforeCompact,
+        SessionCompact,
+        SessionCompactFailed,
+        SessionShutdown,
+        SessionBeforeTree,
+        SessionTree,
+        Context,
+        BeforeProviderRequest,
+        BeforeProviderHeaders,
+        AfterProviderResponse,
+        BeforeAgentStart,
+        AgentStart,
+        AgentEnd,
+        AgentSettled,
+        UiPromptStart,
+        UiPromptEnd,
+        TurnStart,
+        TurnEnd,
+        MessageStart,
+        MessageUpdate,
+        MessageEnd,
+        ToolExecutionStart,
+        ToolExecutionUpdate,
+        ToolExecutionEnd,
+        ModelSelect,
+        ThinkingLevelSelect,
+        UserBash,
+        Input,
+        ToolCall,
+        ToolResult,
+    ]
+}
+
 fn manifest_for_lock(
     record: &PiLockRecord,
     bridge_path: &Path,
@@ -644,7 +710,7 @@ fn manifest_for_lock(
     Ok(ExtensionManifest {
         name: record.name.clone(),
         version: BRIDGE_VERSION.to_owned(),
-        api_version: EXTENSION_API_VERSION_0_2.to_owned(),
+        api_version: EXTENSION_API_VERSION_0_3.to_owned(),
         requires_ygg: Some(format!("={YGG_VERSION}")),
         description: Some(format!(
             "Disabled-by-default Pi compatibility aggregate for {} ordered source(s), lock {}",
@@ -663,11 +729,11 @@ fn manifest_for_lock(
             network: true,
             secrets: Vec::new(),
             environment: Vec::new(),
-            host_services: Vec::new(),
+            host_services: pi_host_services()?,
         },
         contributes: ManifestContributions {
             tools: Vec::new(),
-            commands: vec![record.name.clone()],
+            commands: Vec::new(),
             hooks: vec![
                 ExtensionHook::AfterResponse,
                 ExtensionHook::BeforeToolCall,
@@ -679,8 +745,8 @@ fn manifest_for_lock(
             notifications: true,
             confirmations: true,
             presentation: false,
-            runtime_catalog: false,
-            events: Vec::new(),
+            runtime_catalog: true,
+            events: pi_ordered_events(),
             roles: Vec::new(),
         },
     })
@@ -2172,7 +2238,10 @@ mod tests {
             manifest.entrypoint.env.get(AGGREGATE_DIGEST_ENV),
             Some(&record.aggregate_digest)
         );
-        assert_eq!(manifest.contributes.commands, ["pi-aggregate"]);
+        assert!(manifest.contributes.commands.is_empty());
+        assert!(manifest.contributes.runtime_catalog);
+        assert_eq!(manifest.contributes.events.len(), 36);
+        assert!(!manifest.capabilities.host_services.is_empty());
         assert_eq!(manifest.contributes.hooks.len(), 3);
         assert!(!manifest
             .contributes
@@ -2353,14 +2422,21 @@ mod tests {
         .unwrap();
         assert!(process
             .negotiated_features()
-            .contains(ygg_agent::EXTENSION_FEATURE_RUNTIME_COMMANDS));
+            .contains(ygg_agent::EXTENSION_FEATURE_CATALOG_TRANSACTIONS));
+        assert!(process
+            .negotiated_features()
+            .contains(ygg_agent::EXTENSION_FEATURE_ORDERED_EVENTS));
         let commands = &process.contributions().commands;
         assert!(commands.iter().any(|command| command.name == "ui-methods"));
         assert!(!commands
             .iter()
             .any(|command| command.name == "pi-host-integration"));
         let output = process
-            .execute_command("ui-methods", Vec::new(), process.current_context())
+            .execute_command(
+                "ui-methods",
+                Vec::new(),
+                process.current_context_for_resource_owner("pi-host-test-owner"),
+            )
             .await
             .unwrap();
         assert!(output.text.contains("completed"));
@@ -2445,7 +2521,7 @@ mod tests {
             .call_tool(
                 "hello",
                 serde_json::json!({"name": "Ygg"}),
-                process.current_context(),
+                process.current_context_for_resource_owner("pi-real-hello-owner"),
             )
             .await
             .unwrap();

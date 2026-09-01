@@ -2233,6 +2233,7 @@ mod tests {
         cli.workspace = Some(directory.path().into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert_eq!(config.compaction.mode, CompactionMode::Local);
+        assert_eq!(config.compaction.max_active_tokens, Some(272_000));
 
         std::fs::write(&global, "[compaction]\nenabled = false\n").unwrap();
         let mut cli = base();

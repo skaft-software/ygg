@@ -21,7 +21,7 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
-fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
+fn default_compaction_caps_active_context_and_allows_full_window_opt_out() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = config(directory.path(), None);
     let catalog = base_model_catalog(true).unwrap();
@@ -32,10 +32,9 @@ fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
     Arc::make_mut(&mut model.endpoint).id = EndpointId(crate::auth::codex::ENDPOINT_ID.into());
     Arc::make_mut(&mut model.spec).limits.context_window = 872_000;
 
-    // No route default: the full provider-advertised window is available.
     assert_eq!(
         effective_compaction_threshold_fraction(&config, &model),
-        1.0
+        272_000.0 / 872_000.0
     );
 
     config.compaction.threshold_fraction = 0.25;
@@ -64,7 +63,6 @@ fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
     );
 
     config.compaction.max_active_tokens = None;
-    Arc::make_mut(&mut model.endpoint).id = EndpointId("openai".into());
     assert_eq!(
         effective_compaction_threshold_fraction(&config, &model),
         1.0

@@ -24,9 +24,9 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Changed
 
-- Keep authenticated Codex routes on the provider's full advertised context
-  window by default for in-context learning; `compaction.max_active_tokens`
-  (for example 272000) optionally constrains the active working set.
+- Default the active compaction working set to 272,000 tokens, matching Pi and
+  avoiding repeated near-full-context replay in long sessions. Set
+  `compaction.max_active_tokens = 0` to use the full provider-advertised window.
 
 ### Performance
 

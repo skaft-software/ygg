@@ -27,7 +27,8 @@ use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
     DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
-    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
+    ExtensionHook, ExtensionHookDisposition, ExtensionHostServiceResponse, ExtensionHostState,
+    ExtensionInputRequest,
     ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
     ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionPrincipal, ExtensionProcess,
     ExtensionRequestId, ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust,
@@ -713,6 +714,7 @@ pub struct ExecutableExtensions {
     confirmation_tasks: Vec<JoinHandle<()>>,
     input_cancellations: VecDeque<PendingInputCancellation>,
     input_tasks: Vec<JoinHandle<()>>,
+    host_service_tasks: Vec<JoinHandle<()>>,
     policy_supervisors: Vec<JoinHandle<()>>,
     session_id: Option<String>,
     resource_owner: Option<String>,
@@ -907,6 +909,7 @@ impl Default for ExecutableExtensions {
             confirmation_tasks: Vec::new(),
             input_cancellations: VecDeque::new(),
             input_tasks: Vec::new(),
+            host_service_tasks: Vec::new(),
             policy_supervisors: Vec::new(),
             session_id: None,
             resource_owner: None,
@@ -2367,6 +2370,9 @@ impl ExecutableExtensions {
         for task in self.input_tasks.drain(..) {
             task.abort();
         }
+        for task in self.host_service_tasks.drain(..) {
+            task.abort();
+        }
         for task in self.policy_supervisors.drain(..) {
             task.abort();
         }
@@ -2602,6 +2608,66 @@ impl ExecutableExtensions {
                             snapshot,
                         ) {
                             self.diagnostics.push(format!("warning: {name}: {error}"));
+                        }
+                    }
+                    Ok(ExtensionEvent::CatalogUpdated {
+                        generation,
+                        catalog,
+                    }) => {
+                        if let Some(summary) = self.summaries.iter_mut().find(|summary| {
+                            summary.name == name
+                                && summary
+                                    .health
+                                    .as_ref()
+                                    .is_some_and(|health| health.generation == generation)
+                        }) {
+                            summary.tools = catalog
+                                .tools
+                                .iter()
+                                .map(|tool| tool.name.clone())
+                                .collect();
+                            summary.commands = catalog
+                                .commands
+                                .iter()
+                                .map(|command| command.name.clone())
+                                .collect();
+                        }
+                        messages.push(format!(
+                            "[{name}] contribution catalog advanced to revision {}",
+                            catalog.revision
+                        ));
+                    }
+                    Ok(ExtensionEvent::EffectJournalReady { journal, .. }) => {
+                        messages.push(format!(
+                            "[{name}] rejected {} extension effect(s): no product transaction adapter is bound",
+                            journal.effects.len()
+                        ));
+                    }
+                    Ok(ExtensionEvent::HostServiceRequested {
+                        request_id,
+                        generation,
+                        request,
+                        ..
+                    }) => {
+                        self.host_service_tasks.retain(|task| !task.is_finished());
+                        let service = format!("{}@{}:{}", request.service, request.version.as_u16(), request.scope.as_str());
+                        messages.push(format!(
+                            "[{name}] host service {service} rejected: no product adapter is bound"
+                        ));
+                        if let Some(process) = process.clone() {
+                            if self.host_service_tasks.len() < EVENT_DRAIN_BUDGET {
+                                self.host_service_tasks.push(tokio::spawn(async move {
+                                    let _ = process
+                                        .respond_to_host_service(
+                                            request_id,
+                                            generation,
+                                            ExtensionHostServiceResponse::Error {
+                                                message: "host service is unavailable in this product mode".into(),
+                                            },
+                                        )
+                                        .await;
+                                }));
+                            }
                         }
                     }
                     Ok(ExtensionEvent::Diagnostic { message }) => {

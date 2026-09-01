@@ -34,6 +34,7 @@ export async function discoverAndLoadExtensions(paths) {
     messageRenderers: new Map(),
     entryRenderers: new Map(),
     markdownTransformer: null,
+    handlers: new Map([["session_start", []], ["input", []]]),
   };
   return { extensions: [extension], runtime: {} };
 }
@@ -120,12 +121,15 @@ export class ExtensionRunner {
           if (this.ui.theme.fg("accent", "plain") !== "plain") {
             throw new Error("compatibility theme did not preserve text");
           }
-          try {
-            this.ui.getEditorComponent();
-            throw new Error("unsupported UI method unexpectedly succeeded");
-          } catch (error) {
-            if (!String(error).includes("Pi compatibility API is not supported by Ygg")) throw error;
+          if (this.ui.getEditorComponent() !== undefined) {
+            throw new Error("unexpected default editor component");
           }
+          if (!this.ui.getAllThemes().some((theme) => theme.name === "compat")) {
+            throw new Error("compatibility theme was not discoverable");
+          }
+          if (!this.ui.setTheme("compat").success) throw new Error("compatibility theme was not selectable");
+          this.ui.setToolsExpanded(true);
+          if (!this.ui.getToolsExpanded()) throw new Error("tool disclosure state was not retained");
           this.ui.notify("ui-current-methods-explicit");
         },
       },
@@ -139,6 +143,16 @@ export class ExtensionRunner {
           if (this.actions.getThinkingLevel() !== "high") {
             throw new Error(`unexpected thinking level ${this.actions.getThinkingLevel()}`);
           }
+        },
+      },
+      {
+        name: "mutations",
+        description: "Exercise API 0.3 declarative effects",
+        handler: async () => {
+          this.actions.setSessionName("renamed by fixture");
+          this.actions.appendEntry("fixture_state", { enabled: true });
+          this.actions.setActiveTools(["fixture_echo"]);
+          this.ui.setWorkingMessage("fixture working");
         },
       },
       {

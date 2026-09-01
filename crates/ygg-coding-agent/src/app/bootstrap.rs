@@ -2851,10 +2851,6 @@ const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
-/// Optional absolute active-context ceiling for Codex routes. There is no
-/// route default: the full provider-advertised window (872K, 1M on Pro) is
-/// available for in-context learning, and users can constrain the working
-/// set with `compaction.max_active_tokens` (for example 272_000).
 const CODEX_MODEL_CACHE_VERSION: u8 = 2;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,

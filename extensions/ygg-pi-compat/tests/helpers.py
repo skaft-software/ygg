@@ -18,6 +18,15 @@ BRIDGE = ROOT / "bridge.mjs"
 FAKE_PI = FIXTURES / "fake-pi"
 FIXTURE_EXTENSION = FIXTURES / "fixture-extension.mjs"
 NODE = shutil.which("node")
+API_V03_REQUIRED_FEATURES = [
+    "request_cancellation",
+    "content_parts",
+    "owner_context",
+    "ordered_events",
+    "catalog_transactions",
+    "effect_transactions",
+    "document_streams",
+]
 
 
 class BridgeProcess:
@@ -61,6 +70,7 @@ class BridgeProcess:
         self._condition = threading.Condition()
         self._write_lock = threading.Lock()
         self._next_id = 1
+        self._process_fence = {"instance_id": "bridge-test-instance", "generation": 1}
         self._stdout_thread = threading.Thread(target=self._read_stdout, daemon=True)
         self._stderr_thread = threading.Thread(target=self._read_stderr, daemon=True)
         self._stdout_thread.start()
@@ -82,7 +92,26 @@ class BridgeProcess:
                 self.messages.append(message)
                 self._condition.notify_all()
             method = message.get("method")
-            if method in self.handlers and "id" in message:
+            if method == "catalog/replace" and "id" in message and method not in self.handlers:
+                self.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {"catalog": message.get("params", {}).get("catalog")},
+                    }
+                )
+            elif method == "host/call" and "id" in message and method not in self.handlers:
+                self.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {
+                            "status": "error",
+                            "message": "fixture host service is unavailable",
+                        },
+                    }
+                )
+            elif method in self.handlers and "id" in message:
                 try:
                     result = self.handlers[method](message)
                     self.send({"jsonrpc": "2.0", "id": message["id"], "result": result})
@@ -109,15 +138,47 @@ class BridgeProcess:
             self.process.stdin.write(line)
             self.process.stdin.flush()
 
+    def _invocation(self, request_id: int, method: str) -> dict[str, Any]:
+        kind = {
+            "tool/call": "tool",
+            "command/execute": "command",
+            "hook/run": "event",
+            "provider/callback": "provider",
+            "event/handle": "event",
+        }.get(method, "host_action")
+        operation = {
+            "process": self._process_fence,
+            "request_id": request_id,
+            "kind": kind,
+            "mode": "rpc",
+            "deadline_unix_ms": int(time.time() * 1000) + 30_000,
+            "cancellation_owner": f"bridge-test-{request_id}",
+        }
+        return {
+            "principal": {"name": "pi-test", "sha256": "1" * 64},
+            "session_owner": {"sha256": "2" * 64},
+            "process": self._process_fence,
+            "operation": operation,
+        }
+
     def send_request(self, method: str, params: dict[str, Any] | None = None) -> int:
         request_id = self._next_id
         self._next_id += 1
+        payload = dict(params or {})
+        if self.initialized and method in {
+            "tool/call",
+            "command/execute",
+            "hook/run",
+            "provider/callback",
+            "event/handle",
+        }:
+            payload.setdefault("invocation", self._invocation(request_id, method))
         self.send(
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "method": method,
-                "params": params or {},
+                "params": payload,
             }
         )
         return request_id
@@ -167,13 +228,21 @@ class BridgeProcess:
         self,
         *optional_features: str,
         host: dict[str, Any] | None = None,
+        host_services: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         response = self.request(
             "initialize",
             {
+                "api_version": "0.3",
                 "workspace": str(ROOT),
                 "host": host or {},
-                "protocol": {"optional_features": list(optional_features)},
+                "protocol": {
+                    "version": "0.3",
+                    "required_features": API_V03_REQUIRED_FEATURES,
+                    "optional_features": list(optional_features),
+                    "limits": {"max_concurrent_requests": 64},
+                    "host_services": host_services or [],
+                },
             },
         )
         if "error" in response:

@@ -8,9 +8,9 @@ import tempfile
 import unittest
 
 try:
-    from .helpers import BridgeProcess, NODE
+    from .helpers import API_V03_REQUIRED_FEATURES, BridgeProcess, NODE
 except ImportError:  # unittest discovery imports this file as a top-level module.
-    from helpers import BridgeProcess, NODE
+    from helpers import API_V03_REQUIRED_FEATURES, BridgeProcess, NODE
 
 
 def single_file_source_fingerprint(path: Path) -> str:
@@ -25,6 +25,21 @@ def single_file_source_fingerprint(path: Path) -> str:
     digest.update(len(content).to_bytes(8, "big"))
     digest.update(content)
     return digest.hexdigest()
+
+
+def api_v03_initialize_params(workspace: Path) -> dict:
+    return {
+        "api_version": "0.3",
+        "workspace": str(workspace),
+        "host": {},
+        "protocol": {
+            "version": "0.3",
+            "required_features": API_V03_REQUIRED_FEATURES,
+            "optional_features": [],
+            "limits": {"max_concurrent_requests": 64},
+            "host_services": [],
+        },
+    }
 
 
 class CompatibilityProfileTests(unittest.TestCase):
@@ -98,14 +113,41 @@ class BridgeProtocolTests(unittest.TestCase):
         with BridgeProcess() as bridge:
             initialized = bridge.initialize("artifacts", "lifecycle_events", "unknown_feature")
             self.assertEqual(
-                {
-                    "request_cancellation",
-                    "content_parts",
-                    "artifacts",
-                    "lifecycle_events",
-                },
+                set(API_V03_REQUIRED_FEATURES) | {"artifacts"},
                 set(initialized["protocol"]["features"]),
             )
+
+    def test_api_v03_catalog_effects_and_ordered_events_are_live(self) -> None:
+        with BridgeProcess() as bridge:
+            initialized = bridge.initialize()
+            catalog = initialized["protocol"]["catalog"]
+            self.assertEqual(0, catalog["revision"])
+            self.assertIn("session_start", catalog["events"])
+            self.assertIn("mutations", {command["name"] for command in catalog["commands"]})
+
+            mutation = bridge.request(
+                "command/execute", {"name": "mutations", "arguments": []}
+            )
+            self.assertNotIn("error", mutation)
+            effects = mutation["result"]["effects"]["effects"]
+            self.assertEqual(
+                ["set_session_name", "append_custom", "set_active_tools", "set_ui_state"],
+                [effect["type"] for effect in effects],
+            )
+
+            ordered = bridge.request(
+                "event/handle",
+                {
+                    "sequence": 1,
+                    "event": "session_start",
+                    "payload": {"reason": "startup"},
+                    "barrier": True,
+                },
+            )
+            self.assertNotIn("error", ordered)
+            self.assertEqual(1, ordered["result"]["sequence"])
+            self.assertEqual([], ordered["result"]["effects"]["effects"])
+            self.assertIn("event:session_start:start", bridge.notifications())
 
     def test_negotiated_artifact_is_published_exactly_once(self) -> None:
         with BridgeProcess() as bridge:
@@ -336,23 +378,22 @@ class BridgeProtocolTests(unittest.TestCase):
 
     def test_dynamic_tools_publish_and_new_revision_executes(self) -> None:
         with BridgeProcess() as bridge:
-            bridge.handlers["tools/register"] = lambda message: {
-                "revision": 1,
-                "tools": ["fixture_echo", "fixture_prompt", "fixture_dynamic"],
-            }
-            bridge.initialize("dynamic_tools")
+            bridge.initialize()
             command = bridge.request(
-                "command/execute", {"name": "pi", "arguments": ["add-tool"]}
+                "command/execute", {"name": "add-tool", "arguments": []}
             )
             self.assertNotIn("error", command)
             registration = bridge.wait_for(
                 lambda messages: next(
-                    (message for message in messages if message.get("method") == "tools/register"),
+                    (message for message in messages if message.get("method") == "catalog/replace"),
                     None,
                 ),
-                description="dynamic tool registration",
+                description="dynamic catalog replacement",
             )
-            self.assertEqual(["fixture_dynamic"], [tool["name"] for tool in registration["params"]["tools"]])
+            self.assertIn(
+                "fixture_dynamic",
+                {tool["name"] for tool in registration["params"]["catalog"]["tools"]},
+            )
             response = bridge.request(
                 "tool/call",
                 {"name": "fixture_dynamic", "arguments": {}, "catalog_revision": 1},
@@ -361,12 +402,11 @@ class BridgeProtocolTests(unittest.TestCase):
 
     def test_runtime_commands_are_exposed_without_the_package_mux(self) -> None:
         with BridgeProcess() as bridge:
-            bridge.handlers["tools/register"] = lambda _message: {
-                "revision": 1,
-                "tools": ["fixture_echo", "fixture_prompt", "fixture_progress", "fixture_dynamic"],
+            initialized = bridge.initialize()
+            command_names = {
+                command["name"]
+                for command in initialized["protocol"]["catalog"]["commands"]
             }
-            initialized = bridge.initialize("dynamic_tools", "runtime_commands")
-            command_names = {command["name"] for command in initialized["commands"]}
             self.assertIn("add-tool", command_names)
             self.assertIn("ui-methods", command_names)
             self.assertNotIn("pi", command_names)
@@ -377,10 +417,10 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertNotIn("error", response)
             bridge.wait_for(
                 lambda messages: next(
-                    (message for message in messages if message.get("method") == "tools/register"),
+                    (message for message in messages if message.get("method") == "catalog/replace"),
                     None,
                 ),
-                description="direct-command dynamic tool registration",
+                description="direct-command catalog replacement",
             )
 
     def test_progress_is_emitted_only_when_negotiated(self) -> None:
@@ -427,12 +467,12 @@ class BridgeProtocolTests(unittest.TestCase):
         with BridgeProcess() as bridge:
             bridge.initialize(host={"session_name": "fixture session", "reasoning": "High"})
             ui = bridge.request(
-                "command/execute", {"name": "pi", "arguments": ["ui-methods"]}
+                "command/execute", {"name": "ui-methods", "arguments": []}
             )
             self.assertNotIn("error", ui)
             self.assertIn("ui-current-methods-explicit", bridge.notifications())
             state = bridge.request(
-                "command/execute", {"name": "pi", "arguments": ["host-state"]}
+                "command/execute", {"name": "host-state", "arguments": []}
             )
             self.assertNotIn("error", state)
 
@@ -452,7 +492,7 @@ class BridgeProtocolTests(unittest.TestCase):
             with BridgeProcess(pi_package=root) as bridge:
                 response = bridge.request(
                     "initialize",
-                    {"workspace": str(root), "host": {}, "protocol": {"optional_features": []}},
+                    api_v03_initialize_params(root),
                 )
                 self.assertEqual(-32000, response["error"]["code"])
                 self.assertIn("expected exactly 0.84.4", response["error"]["message"])
@@ -464,7 +504,7 @@ class BridgeProtocolTests(unittest.TestCase):
             with BridgeProcess(pi_package=root) as bridge:
                 response = bridge.request(
                     "initialize",
-                    {"workspace": str(root), "host": {}, "protocol": {"optional_features": []}},
+                    api_v03_initialize_params(root),
                 )
                 self.assertEqual(-32000, response["error"]["code"])
                 self.assertIn("262144-byte limit", response["error"]["message"])
@@ -479,7 +519,7 @@ class BridgeProtocolTests(unittest.TestCase):
                 source_fingerprint=fingerprint,
             ) as bridge:
                 initialized = bridge.initialize()
-                self.assertEqual("0.2", initialized["api_version"])
+                self.assertEqual("0.3", initialized["api_version"])
 
             extension.write_text(
                 "export default () => { throw new Error('changed'); };\n",
@@ -491,11 +531,7 @@ class BridgeProtocolTests(unittest.TestCase):
             ) as bridge:
                 response = bridge.request(
                     "initialize",
-                    {
-                        "workspace": str(extension.parent),
-                        "host": {},
-                        "protocol": {"optional_features": []},
-                    },
+                    api_v03_initialize_params(extension.parent),
                 )
                 self.assertEqual(-32000, response["error"]["code"])
                 self.assertIn(
@@ -516,8 +552,11 @@ class BridgeProtocolTests(unittest.TestCase):
             )
         ).resolve()
         with BridgeProcess(pi_package=package, extension=extension) as bridge:
-            initialized = bridge.initialize("runtime_commands")
-            self.assertTrue(any(tool["name"] == "hello" for tool in initialized["tools"]))
+            initialized = bridge.initialize()
+            self.assertTrue(any(
+                tool["name"] == "hello"
+                for tool in initialized["protocol"]["catalog"]["tools"]
+            ))
             response = bridge.request(
                 "tool/call",
                 {
@@ -536,27 +575,30 @@ class BridgeProtocolTests(unittest.TestCase):
         package = Path(os.environ["YGG_PI_REAL_PACKAGE"]).resolve()
         extension = package / "examples/extensions/plan-mode/index.ts"
         with BridgeProcess(pi_package=package, extension=extension) as bridge:
-            initialized = bridge.initialize("runtime_commands")
+            initialized = bridge.initialize()
             self.assertEqual(
                 {"plan", "todos"},
-                {command["name"] for command in initialized["commands"]},
+                {
+                    command["name"]
+                    for command in initialized["protocol"]["catalog"]["commands"]
+                },
             )
             response = bridge.request(
                 "command/execute", {"name": "todos", "arguments": []}
             )
             self.assertNotIn("error", response)
             self.assertTrue(any("No todos" in item for item in bridge.notifications()))
-            self.assertTrue(any("shortcuts is unavailable" in item for item in bridge.stderr))
-            self.assertTrue(any("flags is unavailable" in item for item in bridge.stderr))
+            self.assertTrue(initialized["protocol"]["catalog"]["shortcuts"])
+            self.assertTrue(initialized["protocol"]["catalog"]["flags"])
 
     def test_unsupported_command_context_is_an_explicit_error(self) -> None:
         with BridgeProcess() as bridge:
             bridge.initialize()
             response = bridge.request(
-                "command/execute", {"name": "pi", "arguments": ["unsupported"]}
+                "command/execute", {"name": "unsupported", "arguments": []}
             )
             self.assertEqual(-32000, response["error"]["code"])
-            self.assertIn("ctx.newSession", response["error"]["message"])
+            self.assertIn("fixture host service is unavailable", response["error"]["message"])
 
 
 if __name__ == "__main__":

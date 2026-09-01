@@ -370,9 +370,9 @@ impl CompactionMode {
 pub struct CompactionPolicy {
     pub mode: CompactionMode,
     pub threshold_fraction: f64,
-    /// Optional absolute active-context threshold. Unset uses the provider's
-    /// full advertised window; `Some(0)` is equivalent to unset.
-    /// `threshold_fraction` still applies.
+    /// Absolute active-context threshold. Defaults to 272,000 tokens;
+    /// `Some(0)` (or `None` for API callers) uses the provider's full advertised
+    /// window instead. `threshold_fraction` still applies.
     pub max_active_tokens: Option<u64>,
     pub keep_recent_tokens: u64,
     /// Optional model override for summary calls. When absent, bootstrap uses
@@ -381,12 +381,15 @@ pub struct CompactionPolicy {
     pub compact_model: Option<ModelId>,
 }
 
+/// Default absolute active-context budget, aligned with Pi's long-context working set.
+const DEFAULT_MAX_ACTIVE_TOKENS: u64 = 272_000;
+
 impl Default for CompactionPolicy {
     fn default() -> Self {
         Self {
             mode: CompactionMode::Local,
             threshold_fraction: 1.0,
-            max_active_tokens: None,
+            max_active_tokens: Some(DEFAULT_MAX_ACTIVE_TOKENS),
             keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
             compact_model: None,
         }
@@ -634,9 +637,12 @@ mod tests {
     }
 
     #[test]
-    fn default_compaction_uses_only_the_fixed_reserve() {
+    fn default_compaction_uses_pi_active_context_budget() {
         assert_eq!(CompactionPolicy::default().threshold_fraction, 1.0);
-        assert_eq!(CompactionPolicy::default().max_active_tokens, None);
+        assert_eq!(
+            CompactionPolicy::default().max_active_tokens,
+            Some(DEFAULT_MAX_ACTIVE_TOKENS)
+        );
     }
 
     #[test]

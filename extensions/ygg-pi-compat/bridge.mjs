@@ -6,7 +6,7 @@
  * This process is a compatibility boundary, not a second agent kernel. It
  * loads Pi extension factories with Pi's public loader and translates the
  * portable tool, command, lifecycle, notification, input, and confirmation
- * surfaces onto Ygg's API 0.2 JSON-RPC bus.
+ * surfaces onto Ygg's API 0.3 JSON-RPC bus.
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -36,8 +36,8 @@ import {
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-const API_VERSION = "0.2";
-const BRIDGE_VERSION = "0.2.0";
+const API_VERSION = "0.3";
+const BRIDGE_VERSION = "0.3.0";
 const LOCK_SCHEMA_VERSION = 2;
 const PROFILE_ID = "pi-0.84.4";
 const PROFILE_REPOSITORY = "https://github.com/earendil-works/pi.git";
@@ -67,13 +67,57 @@ const SKIPPED_SOURCE_DIRECTORIES = new Set([
   "node_modules",
   "target",
 ]);
-const REQUIRED_FEATURES = ["request_cancellation", "content_parts"];
+const REQUIRED_FEATURES = [
+  "request_cancellation",
+  "content_parts",
+  "owner_context",
+  "ordered_events",
+  "catalog_transactions",
+  "effect_transactions",
+  "document_streams",
+];
 const OPTIONAL_FEATURES = [
   "request_progress",
   "artifacts",
-  "lifecycle_events",
-  "dynamic_tools",
-  "runtime_commands",
+  "policy_intents",
+];
+const PI_EVENT_NAMES = [
+  "project_trust",
+  "resources_discover",
+  "session_start",
+  "session_info_changed",
+  "session_before_switch",
+  "session_before_fork",
+  "session_before_compact",
+  "session_compact",
+  "session_compact_failed",
+  "session_shutdown",
+  "session_before_tree",
+  "session_tree",
+  "context",
+  "before_provider_request",
+  "before_provider_headers",
+  "after_provider_response",
+  "before_agent_start",
+  "agent_start",
+  "agent_end",
+  "agent_settled",
+  "ui_prompt_start",
+  "ui_prompt_end",
+  "turn_start",
+  "turn_end",
+  "message_start",
+  "message_update",
+  "message_end",
+  "tool_execution_start",
+  "tool_execution_update",
+  "tool_execution_end",
+  "model_select",
+  "thinking_level_select",
+  "user_bash",
+  "input",
+  "tool_call",
+  "tool_result",
 ];
 const LIFECYCLE_EVENTS = [
   "session/started",
@@ -291,10 +335,58 @@ async function requestHost(method, params) {
   }
 }
 
+async function callHostService(service, scope, payload = {}) {
+  const response = await requestHost("host/call", {
+    operation_token: operationToken(),
+    service,
+    version: 1,
+    scope,
+    payload,
+  });
+  if (response?.status !== "success") {
+    throw new Error(response?.message ?? `Ygg host service ${service}:${scope} failed`);
+  }
+  return response.value;
+}
+
 function currentScope() {
   const scope = scopes.getStore();
   if (!scope) throw new Error("Pi compatibility API used outside an active request");
   return scope;
+}
+
+function operationToken() {
+  const token = currentScope().invocation?.operation;
+  if (!token || typeof token !== "object") {
+    throw new Error("Pi compatibility API requires an API 0.3 operation context");
+  }
+  return token;
+}
+
+function recordEffect(effect) {
+  const scope = currentScope();
+  if (!scope.invocation) {
+    throw new Error("Pi compatibility mutation used outside an API 0.3 operation");
+  }
+  if (scope.effects.length >= 128) {
+    throw new Error("Pi compatibility effect journal exceeds 128 effects");
+  }
+  scope.effects.push(effect);
+}
+
+function effectJournal() {
+  const scope = currentScope();
+  return {
+    operation_token: operationToken(),
+    effects: scope.effects.slice(),
+  };
+}
+
+function finishObjectResult(result) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new Error("Pi compatibility API 0.3 handler result must be an object");
+  }
+  return { ...result, effects: effectJournal() };
 }
 
 function notify(level, title, message) {
@@ -344,6 +436,49 @@ function makeCompatibilityTheme() {
   });
 }
 
+function makeRemoteTui() {
+  return makeThrowingProxy("ctx.ui.remoteTui", {
+    requestRender() {},
+    terminal: { columns: 80, rows: 24 },
+    get width() { return 80; },
+    get height() { return 24; },
+  });
+}
+
+function remoteComponentValue(kind, key, content, options = {}) {
+  if (content === undefined) return null;
+  let component;
+  let rows;
+  if (Array.isArray(content)) {
+    rows = content.map(String);
+  } else if (typeof content === "function") {
+    component = content(makeRemoteTui(), makeCompatibilityTheme(), makeThrowingProxy("keybindings"));
+    if (!component || typeof component.render !== "function") {
+      throw new Error(`Pi ${kind} factory did not return a renderable component`);
+    }
+    rows = component.render(80).map(String);
+  } else {
+    throw new Error(`Pi ${kind} content must be string rows or a component factory`);
+  }
+  const id = `${kind}:${String(key ?? "default")}`;
+  bridge.remoteComponents.set(id, component ?? null);
+  return {
+    component_id: id,
+    generation: bridge.remoteComponentGeneration,
+    revision: (bridge.remoteComponentRevisions.get(id) ?? 0) + 1,
+    width: 80,
+    rows,
+    placement: options.placement ?? null,
+  };
+}
+
+function setRemoteUiState(key, value) {
+  if (value?.component_id) {
+    bridge.remoteComponentRevisions.set(value.component_id, value.revision);
+  }
+  recordEffect({ type: "set_ui_state", key, value });
+}
+
 function makeUi() {
   return {
     theme: makeCompatibilityTheme(),
@@ -375,8 +510,18 @@ function makeUi() {
       });
       return response?.value ?? undefined;
     },
-    async editor() {
-      return unsupported("ctx.ui.editor");
+    async editor(title, prefill = "") {
+      const response = await requestHost("host/call", {
+        operation_token: operationToken(),
+        service: "ui",
+        version: 1,
+        scope: "editor",
+        payload: { action: "open", title: String(title), prefill: String(prefill) },
+      });
+      if (response?.status !== "success") {
+        throw new Error(response?.message ?? "remote editor is unavailable");
+      }
+      return response.value?.value ?? undefined;
     },
     notify(message, type = "info") {
       void notify(type, "Pi extension", message);
@@ -385,79 +530,126 @@ function makeUi() {
       return unsupported("ctx.ui.onTerminalInput");
     },
     setStatus(key, text) {
-      return send({
-        jsonrpc: "2.0",
-        method: "status/contribution",
-        params: {
-          surface: "status",
-          text: text === undefined ? "" : `${key}: ${text}`,
-          style_role: "extension.pi.status",
-          priority: 0,
-        },
+      recordEffect({
+        type: "set_ui_state",
+        key: "status",
+        value: { key: String(key), text: text === undefined ? null : String(text) },
       });
     },
-    setWorkingMessage() {
-      return unsupported("ctx.ui.setWorkingMessage");
+    setWorkingMessage(message) {
+      recordEffect({ type: "set_ui_state", key: "working_message", value: message ?? null });
     },
-    setWorkingVisible() {
-      return unsupported("ctx.ui.setWorkingVisible");
+    setWorkingVisible(visible) {
+      recordEffect({ type: "set_ui_state", key: "working_visible", value: Boolean(visible) });
     },
-    setWorkingIndicator() {
-      return unsupported("ctx.ui.setWorkingIndicator");
+    setWorkingIndicator(options) {
+      recordEffect({ type: "set_ui_state", key: "working_indicator", value: options ?? null });
     },
-    setHiddenThinkingLabel() {
-      return unsupported("ctx.ui.setHiddenThinkingLabel");
+    setHiddenThinkingLabel(label) {
+      recordEffect({ type: "set_ui_state", key: "hidden_thinking_label", value: label ?? null });
     },
-    setWidget() {
-      return unsupported("ctx.ui.setWidget");
+    setWidget(key, content, options) {
+      setRemoteUiState("widget", remoteComponentValue("widget", key, content, options));
     },
-    setFooter() {
-      return unsupported("ctx.ui.setFooter");
+    setFooter(factory) {
+      setRemoteUiState("footer", remoteComponentValue("footer", "footer", factory));
     },
-    setHeader() {
-      return unsupported("ctx.ui.setHeader");
+    setHeader(factory) {
+      setRemoteUiState("header", remoteComponentValue("header", "header", factory));
     },
-    setTitle() {
-      return unsupported("ctx.ui.setTitle");
+    setTitle(title) {
+      recordEffect({ type: "set_ui_state", key: "title", value: String(title) });
     },
-    custom() {
-      return unsupported("ctx.ui.custom");
+    async custom(factory, options = {}) {
+      let completed = false;
+      let completedValue;
+      const done = (value) => {
+        completed = true;
+        completedValue = value;
+      };
+      const component = await factory(
+        makeRemoteTui(),
+        makeCompatibilityTheme(),
+        makeThrowingProxy("keybindings"),
+        done,
+      );
+      const frame = remoteComponentValue("custom", "focused", () => component, options.overlayOptions ?? {});
+      setRemoteUiState("custom", { ...frame, overlay: options.overlay === true });
+      if (completed) return completedValue;
+      const response = await requestHost("host/call", {
+        operation_token: operationToken(),
+        service: "ui",
+        version: 1,
+        scope: "components",
+        payload: { action: "focus", frame, overlay: options.overlay === true },
+      });
+      if (response?.status !== "success") {
+        throw new Error(response?.message ?? "remote component host rejected the component");
+      }
+      return response.value?.result;
     },
-    pasteToEditor() {
-      return unsupported("ctx.ui.pasteToEditor");
+    pasteToEditor(text) {
+      bridge.editorText += String(text);
+      recordEffect({ type: "set_ui_state", key: "editor_text", value: bridge.editorText });
     },
-    setEditorText() {
-      return unsupported("ctx.ui.setEditorText");
+    setEditorText(text) {
+      bridge.editorText = String(text);
+      recordEffect({ type: "set_ui_state", key: "editor_text", value: bridge.editorText });
     },
     getEditorText() {
-      return unsupported("ctx.ui.getEditorText");
+      return bridge.editorText;
     },
-    addAutocompleteProvider() {
-      return unsupported("ctx.ui.addAutocompleteProvider");
+    addAutocompleteProvider(factory) {
+      bridge.autocompleteProviders.push(factory);
+      recordEffect({
+        type: "set_ui_state",
+        key: "autocomplete",
+        value: { provider_count: bridge.autocompleteProviders.length },
+      });
     },
-    setAutocompleteProvider() {
-      return unsupported("ctx.ui.setAutocompleteProvider");
+    setAutocompleteProvider(factory) {
+      bridge.autocompleteProviders = factory ? [factory] : [];
+      recordEffect({
+        type: "set_ui_state",
+        key: "autocomplete",
+        value: { provider_count: bridge.autocompleteProviders.length },
+      });
     },
-    setEditorComponent() {
-      return unsupported("ctx.ui.setEditorComponent");
+    setEditorComponent(factory) {
+      bridge.editorComponent = factory;
+      const value = factory
+        ? remoteComponentValue("editor", "editor", () => factory(
+            makeRemoteTui(),
+            makeThrowingProxy("editorTheme"),
+            makeThrowingProxy("keybindings"),
+          ))
+        : null;
+      setRemoteUiState("editor_component", value);
     },
     getEditorComponent() {
-      return unsupported("ctx.ui.getEditorComponent");
+      return bridge.editorComponent;
     },
     getAllThemes() {
-      return unsupported("ctx.ui.getAllThemes");
+      return [...bridge.themes.values()].map((theme) => ({ name: theme.name, path: theme.path }));
     },
-    getTheme() {
-      return unsupported("ctx.ui.getTheme");
+    getTheme(name) {
+      return bridge.themes.get(String(name))?.theme;
     },
-    setTheme() {
-      return unsupported("ctx.ui.setTheme");
+    setTheme(theme) {
+      const name = typeof theme === "string" ? theme : theme?.name ?? "custom";
+      if (typeof theme === "string" && !bridge.themes.has(name)) {
+        return { success: false, error: `Unknown theme: ${name}` };
+      }
+      bridge.currentTheme = typeof theme === "string" ? bridge.themes.get(name).theme : theme;
+      recordEffect({ type: "set_ui_state", key: "theme", value: { name } });
+      return { success: true };
     },
     getToolsExpanded() {
-      return unsupported("ctx.ui.getToolsExpanded");
+      return bridge.toolsExpanded;
     },
-    setToolsExpanded() {
-      return unsupported("ctx.ui.setToolsExpanded");
+    setToolsExpanded(expanded) {
+      bridge.toolsExpanded = Boolean(expanded);
+      recordEffect({ type: "set_ui_state", key: "disclosure", value: bridge.toolsExpanded });
     },
   };
 }
@@ -472,9 +664,26 @@ function makeThrowingProxy(label, values = {}) {
 }
 
 function updateHostStateFromMessage(message) {
-  const state = message?.params?.context?.host;
+  const state = message?.params?.context?.host ?? message?.params?.payload?.host;
   if (state && typeof state === "object" && !Array.isArray(state)) {
     bridge.hostState = { ...bridge.hostState, ...state };
+    if (state.model) {
+      bridge.model = bridge.models.find((model) => model.id === state.model)
+        ?? { id: String(state.model), provider: String(state.model).split("/")[0] };
+    }
+  }
+  const payload = message?.params?.payload;
+  if (payload?.session && typeof payload.session === "object") {
+    const session = payload.session;
+    if (Array.isArray(session.entries)) bridge.sessionSnapshot.entries = session.entries.slice();
+    if (Array.isArray(session.tree)) bridge.sessionSnapshot.tree = session.tree.slice();
+    if (Object.hasOwn(session, "leaf_id")) bridge.sessionSnapshot.leafId = session.leaf_id;
+    if (session.header) bridge.sessionSnapshot.header = session.header;
+  }
+  const mode = message?.params?.invocation?.operation?.mode;
+  if (mode) {
+    const piMode = mode === "tui" ? "tui" : mode === "print" ? "print" : "rpc";
+    bridge.runner?.setUIContext(makeUi(), piMode);
   }
 }
 
@@ -488,46 +697,227 @@ function thinkingLevelFromHost() {
 
 function makeExtensionContextActions() {
   return {
-    getModel: () => undefined,
-    getScopedModels: () => [],
+    getModel: () => bridge.model,
+    getScopedModels: () => bridge.scopedModels,
     isIdle: () => bridge.agentActive !== true,
-    isProjectTrusted: () => false,
+    isProjectTrusted: () => bridge.hostState?.project_trusted === true,
     getSignal: () => scopes.getStore()?.signal,
     abort: () => currentScope().controller.abort(),
-    hasPendingMessages: () => unsupported("ctx.hasPendingMessages"),
-    shutdown: () => unsupported("ctx.shutdown"),
-    getContextUsage: () => undefined,
-    compact: () => unsupported("ctx.compact"),
-    getSystemPrompt: () => unsupported("ctx.getSystemPrompt"),
-    getSystemPromptOptions: () => ({ cwd: bridge.cwd }),
+    hasPendingMessages: () => bridge.pendingMessages > 0,
+    shutdown() {
+      void requestHost("host/call", {
+        operation_token: operationToken(),
+        service: "control",
+        version: 1,
+        scope: "shutdown",
+        payload: {},
+      }).catch((error) => boundedDiagnostic(`Pi shutdown request failed: ${error}`));
+    },
+    getContextUsage: () => bridge.hostState?.context_usage,
+    compact(options = {}) {
+      void requestHost("host/call", {
+        operation_token: operationToken(),
+        service: "session",
+        version: 1,
+        scope: "compact",
+        payload: { custom_instructions: options.customInstructions ?? null },
+      }).catch((error) => options.onError?.(error));
+    },
+    getSystemPrompt: () => String(bridge.hostState?.system_prompt ?? ""),
+    getSystemPromptOptions: () => bridge.hostState?.system_prompt_options ?? { cwd: bridge.cwd },
   };
 }
 
 function makeExtensionActions() {
   return {
-    sendMessage: () => unsupported("pi.sendMessage"),
-    sendUserMessage: () => unsupported("pi.sendUserMessage"),
-    appendEntry: () => unsupported("pi.appendEntry"),
-    setSessionName: () => unsupported("pi.setSessionName"),
-    getSessionName: () => bridge.hostState?.session_name,
-    setLabel: () => unsupported("pi.setLabel"),
-    getActiveTools: () => bridge.toolNames,
+    sendMessage(message, options = {}) {
+      recordEffect({
+        type: "append_custom_message",
+        custom_type: String(message.customType),
+        content: typeof message.content === "string" ? message.content : textFromContent(message.content),
+        ...(message.display === undefined ? {} : { display: String(message.display) }),
+        details: message.details ?? null,
+      });
+      if (options.triggerTurn || options.deliverAs) {
+        recordEffect({
+          type: "enqueue_message",
+          delivery: options.deliverAs === "followUp"
+            ? "follow_up"
+            : options.deliverAs === "nextTurn"
+              ? "next_turn"
+              : "steer",
+          content: typeof message.content === "string" ? message.content : textFromContent(message.content),
+        });
+      }
+    },
+    sendUserMessage(content, options = {}) {
+      const text = typeof content === "string" ? content : textFromContent(content);
+      if (!text) throw new Error("Pi sendUserMessage requires text content in the Ygg bridge");
+      recordEffect({
+        type: "enqueue_message",
+        delivery: options.deliverAs === "followUp" ? "follow_up" : "user",
+        content: text,
+      });
+    },
+    appendEntry(customType, data) {
+      recordEffect({ type: "append_custom", custom_type: String(customType), details: data ?? null });
+    },
+    setSessionName(name) {
+      bridge.hostState.session_name = name === undefined ? null : String(name);
+      recordEffect({ type: "set_session_name", name: bridge.hostState.session_name });
+    },
+    getSessionName: () => bridge.hostState?.session_name ?? undefined,
+    setLabel(entryId, label) {
+      recordEffect({
+        type: "set_entry_label",
+        entry_id: String(entryId),
+        label: label === undefined ? null : String(label),
+      });
+    },
+    getActiveTools: () => bridge.activeToolNames.slice(),
     getAllTools: () => bridge.toolInfos,
-    setActiveTools: () => unsupported("pi.setActiveTools"),
-    refreshTools: () => scheduleToolRefresh(),
+    setActiveTools(toolNames) {
+      bridge.activeToolNames = toolNames.map(String);
+      recordEffect({ type: "set_active_tools", tools: bridge.activeToolNames.slice() });
+    },
+    refreshTools: () => scheduleCatalogRefresh(),
     getCommands: () => bridge.runner?.getRegisteredCommands?.() ?? [],
-    setModel: () => Promise.reject(new Error("Pi compatibility API is not supported by Ygg: pi.setModel")),
+    async setModel(model) {
+      const modelId = String(model?.id ?? model?.apiName ?? model);
+      recordEffect({ type: "select_model", model: modelId });
+      bridge.model = model;
+      return true;
+    },
     getThinkingLevel: () => thinkingLevelFromHost(),
-    setThinkingLevel: () => unsupported("pi.setThinkingLevel"),
+    setThinkingLevel(level) {
+      bridge.hostState.reasoning = String(level);
+      recordEffect({ type: "select_reasoning", reasoning: String(level) });
+    },
   };
 }
 
 function makeModelRegistry() {
-  return makeThrowingProxy("ctx.modelRegistry");
+  return makeThrowingProxy("ctx.modelRegistry", {
+    async refresh() {
+      const response = await requestHost("host/call", {
+        operation_token: operationToken(),
+        service: "providers",
+        version: 1,
+        scope: "refresh-models",
+        payload: {},
+      });
+      return response?.value ?? { providers: 0, models: 0 };
+    },
+    getError: () => undefined,
+    getAll: () => bridge.models.slice(),
+    getAvailable: () => bridge.models.slice(),
+    find: (provider, modelId) => bridge.models.find(
+      (model) => model.provider === provider && model.id === modelId,
+    ),
+    hasConfiguredAuth: (model) => model?.available !== false,
+    getProvider: (provider) => bridge.providers.get(String(provider))?.config,
+    getProviderDisplayName: (provider) => bridge.providers.get(String(provider))?.config?.name ?? String(provider),
+    getRegisteredProviderConfig: (provider) => bridge.providers.get(String(provider))?.config,
+    getRegisteredProviderIds: () => [...bridge.providers.keys()],
+    registerProvider(name, config) {
+      registerProviderLocal(name, config);
+    },
+    unregisterProvider(name) {
+      unregisterProviderLocal(name);
+    },
+  });
 }
 
 function makeSessionManager() {
-  return makeThrowingProxy("ctx.sessionManager");
+  const syntheticId = () => `pi-entry-${bridge.nextSyntheticEntryId++}`;
+  const appendLocal = (entry) => {
+    const value = {
+      id: syntheticId(),
+      parentId: bridge.sessionSnapshot.leafId,
+      timestamp: new Date().toISOString(),
+      ...entry,
+    };
+    bridge.sessionSnapshot.entries.push(value);
+    bridge.sessionSnapshot.leafId = value.id;
+    return value.id;
+  };
+  return makeThrowingProxy("ctx.sessionManager", {
+    getCwd: () => bridge.cwd,
+    getSessionDir: () => "",
+    getSessionId: () => bridge.hostState?.session_id ?? "ygg-session",
+    getSessionFile: () => bridge.hostState?.session_file,
+    getSessionName: () => bridge.hostState?.session_name ?? undefined,
+    getLeafId: () => bridge.sessionSnapshot.leafId,
+    getLeafEntry: () => bridge.sessionSnapshot.entries.find(
+      (entry) => entry.id === bridge.sessionSnapshot.leafId,
+    ),
+    getEntry: (id) => bridge.sessionSnapshot.entries.find((entry) => entry.id === id),
+    getChildren: (id) => bridge.sessionSnapshot.entries.filter((entry) => entry.parentId === id),
+    getLabel: (id) => bridge.sessionSnapshot.labels.get(String(id)),
+    getBranch() {
+      const byId = new Map(bridge.sessionSnapshot.entries.map((entry) => [entry.id, entry]));
+      const branch = [];
+      let id = bridge.sessionSnapshot.leafId;
+      while (id) {
+        const entry = byId.get(id);
+        if (!entry) break;
+        branch.push(entry);
+        id = entry.parentId;
+      }
+      return branch.reverse();
+    },
+    buildContextEntries() {
+      return this.getBranch();
+    },
+    buildSessionContext() {
+      return {
+        messages: this.getBranch().filter((entry) => entry.type === "message").map((entry) => entry.message),
+        thinkingLevel: thinkingLevelFromHost(),
+        model: bridge.model ? { provider: bridge.model.provider, modelId: bridge.model.id } : null,
+      };
+    },
+    getHeader: () => bridge.sessionSnapshot.header,
+    getEntries: () => bridge.sessionSnapshot.entries.slice(),
+    getTree: () => bridge.sessionSnapshot.tree.slice(),
+    appendCustomEntry(customType, data) {
+      recordEffect({ type: "append_custom", custom_type: String(customType), details: data ?? null });
+      return appendLocal({ type: "custom", customType: String(customType), data });
+    },
+    appendCustomMessageEntry(customType, content, display, details) {
+      const text = typeof content === "string" ? content : textFromContent(content);
+      recordEffect({
+        type: "append_custom_message",
+        custom_type: String(customType),
+        content: text,
+        display: display ? text : "",
+        details: details ?? null,
+      });
+      return appendLocal({ type: "custom_message", customType, content, display, details });
+    },
+    appendSessionInfo(name) {
+      bridge.hostState.session_name = String(name);
+      recordEffect({ type: "set_session_name", name: String(name) });
+      return appendLocal({ type: "session_info", name: String(name) });
+    },
+    appendLabelChange(targetId, label) {
+      bridge.sessionSnapshot.labels.set(String(targetId), label);
+      recordEffect({
+        type: "set_entry_label",
+        entry_id: String(targetId),
+        label: label === undefined ? null : String(label),
+      });
+      return appendLocal({ type: "label", targetId: String(targetId), label });
+    },
+    branch(id) {
+      if (!bridge.sessionSnapshot.entries.some((entry) => entry.id === id)) {
+        throw new Error(`Unknown session entry: ${id}`);
+      }
+      bridge.sessionSnapshot.leafId = id;
+    },
+    resetLeaf() {
+      bridge.sessionSnapshot.leafId = null;
+    },
+  });
 }
 
 function unsignedBigEndian(value, bytes) {
@@ -1132,6 +1522,118 @@ function commandDefinitionToYgg(command) {
   };
 }
 
+function stableCatalogId(kind, value) {
+  const digest = createHash("sha256").update(`${kind}\0${value}`).digest("hex").slice(0, 24);
+  return `pi_${kind}_${digest}`;
+}
+
+function registerProviderLocal(nameOrProvider, config, extensionPath) {
+  const native = typeof nameOrProvider === "object" && nameOrProvider !== null;
+  const name = String(native ? nameOrProvider.id : nameOrProvider);
+  const providerConfig = native ? nameOrProvider : config;
+  bridge.providers.set(name, { config: providerConfig, extensionPath, native });
+  bridge.models = [...bridge.providers.entries()].flatMap(([provider, registration]) =>
+    (registration.config?.models ?? []).map((model) => ({ ...model, provider })),
+  );
+  if (scopes.getStore()?.invocation) {
+    recordEffect({
+      type: "update_provider_catalog",
+      update: { action: "register", provider: name, config: serializableProviderConfig(providerConfig) },
+    });
+  }
+  scheduleCatalogRefresh();
+}
+
+function unregisterProviderLocal(name) {
+  const provider = String(name);
+  bridge.providers.delete(provider);
+  bridge.models = bridge.models.filter((model) => model.provider !== provider);
+  if (scopes.getStore()?.invocation) {
+    recordEffect({ type: "update_provider_catalog", update: { action: "unregister", provider } });
+  }
+  scheduleCatalogRefresh();
+}
+
+function serializableProviderConfig(config) {
+  if (!config || typeof config !== "object") return {};
+  const result = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (typeof value === "function") continue;
+    if (key === "oauth" && value && typeof value === "object") {
+      result.oauth = {
+        name: String(value.name ?? "OAuth"),
+        isSubscription: value.isSubscription === true,
+        handle: stableCatalogId("oauth", String(value.name ?? "oauth")),
+      };
+      continue;
+    }
+    result[key] = value;
+  }
+  if (typeof config.streamSimple === "function") {
+    result.custom_stream_handle = stableCatalogId("stream", String(config.name ?? "provider"));
+  }
+  return result;
+}
+
+function buildRuntimeCatalog(revision = bridge.catalogRevision) {
+  const commands = bridge.runner.getRegisteredCommands().map(commandDefinitionToYgg);
+  const flags = [];
+  const shortcuts = [];
+  const events = new Set();
+  const toolRenderers = [];
+  const messageRenderers = [];
+  const entryRenderers = [];
+  const markdownTransformers = [];
+  for (const extension of bridge.loadedExtensions) {
+    for (const flag of extension.flags?.values?.() ?? []) {
+      flags.push({
+        name: flag.name,
+        description: flag.description ?? `Pi flag --${flag.name}`,
+        kind: flag.type,
+        ...(flag.default === undefined ? {} : { default: flag.default }),
+      });
+    }
+    for (const shortcut of extension.shortcuts?.values?.() ?? []) {
+      shortcuts.push({
+        id: stableCatalogId("shortcut", `${extension.path}:${shortcut.shortcut}`),
+        key: String(shortcut.shortcut),
+        description: shortcut.description ?? `Pi shortcut ${shortcut.shortcut}`,
+      });
+    }
+    for (const name of extension.handlers?.keys?.() ?? []) {
+      if (PI_EVENT_NAMES.includes(name)) events.add(name);
+    }
+    for (const tool of extension.tools?.values?.() ?? []) {
+      if (tool.definition.renderCall || tool.definition.renderResult) {
+        toolRenderers.push(tool.definition.name);
+      }
+    }
+    for (const customType of extension.messageRenderers?.keys?.() ?? []) {
+      messageRenderers.push(stableCatalogId("message", `${extension.path}:${customType}`));
+    }
+    for (const customType of extension.entryRenderers?.keys?.() ?? []) {
+      entryRenderers.push(stableCatalogId("entry", `${extension.path}:${customType}`));
+    }
+    if (extension.markdownTransformer) {
+      markdownTransformers.push(stableCatalogId("markdown", extension.path));
+    }
+  }
+  return {
+    revision,
+    tools: bridge.runner.getAllRegisteredTools().map((tool) => toolDefinitionToYgg(tool.definition)),
+    commands,
+    flags,
+    shortcuts,
+    events: [...events],
+    tool_renderers: [...new Set(toolRenderers)],
+    message_renderers: messageRenderers,
+    entry_renderers: entryRenderers,
+    markdown_transformers: markdownTransformers,
+    providers: [...bridge.providers.keys()].map((id) => ({ id })),
+    roles: [],
+  };
+}
+
 function toolDefinitionToYgg(definition) {
   const parameters = definition.parameters ?? { type: "object", properties: {} };
   if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) {
@@ -1148,6 +1650,8 @@ function setCurrentTools(tools, revision) {
   bridge.tools = tools;
   bridge.catalogRevision = revision;
   bridge.toolNames = tools.map((tool) => tool.definition.name);
+  if (bridge.activeToolNames.length === 0) bridge.activeToolNames = bridge.toolNames.slice();
+  else bridge.activeToolNames = bridge.activeToolNames.filter((name) => bridge.toolNames.includes(name));
   bridge.toolInfos = tools.map((tool) => ({
     name: tool.definition.name,
     description: tool.definition.description,
@@ -1161,51 +1665,44 @@ function setCurrentTools(tools, revision) {
   }
 }
 
-function sameToolDefinition(left, right) {
-  return JSON.stringify(toolDefinitionToYgg(left.definition)) === JSON.stringify(toolDefinitionToYgg(right.definition));
-}
-
-function scheduleToolRefresh() {
+function scheduleCatalogRefresh() {
   if (!bridge) return;
-  if (!bridge.initialized) {
-    bridge.toolRefreshRequested = true;
+  if (!bridge.initialized || !bridge.processFence) {
+    bridge.catalogRefreshRequested = true;
     return;
   }
-  if (!bridge.features?.has("dynamic_tools")) return;
-  bridge.toolRefreshChain = bridge.toolRefreshChain
-    .then(() => refreshPublishedTools())
-    .catch((error) => diagnostic(`Pi dynamic tool publication failed: ${error instanceof Error ? error.message : String(error)}`));
+  bridge.catalogRefreshChain = bridge.catalogRefreshChain
+    .then(() => refreshPublishedCatalog())
+    .catch((error) => diagnostic(`Pi catalog publication failed: ${error instanceof Error ? error.message : String(error)}`));
 }
 
-async function refreshPublishedTools() {
-  const runtimeTools = bridge.runner.getAllRegisteredTools();
-  const runtimeByName = new Map(runtimeTools.map((tool) => [tool.definition.name, tool]));
-  const currentByName = new Map(bridge.tools.map((tool) => [tool.definition.name, tool]));
-  const removed = [...currentByName.keys()].filter((name) => !runtimeByName.has(name));
-  if (removed.length) {
-    const response = await requestHost("tools/unregister", { names: removed });
-    const accepted = new Set(response.tools ?? []);
-    setCurrentTools(
-      bridge.tools.filter((tool) => accepted.has(tool.definition.name)),
-      response.revision,
-    );
+async function refreshPublishedCatalog() {
+  if (!bridge.processFence) {
+    bridge.catalogRefreshRequested = true;
+    return;
   }
-
-  const publishedByName = new Map(bridge.tools.map((tool) => [tool.definition.name, tool]));
-  const changed = runtimeTools.filter((tool) => {
-    const published = publishedByName.get(tool.definition.name);
-    return !published || published !== tool || !sameToolDefinition(published, tool);
+  const next = buildRuntimeCatalog(bridge.catalogRevision + 1);
+  const currentComparable = { ...(bridge.currentCatalog ?? {}), revision: 0 };
+  const nextComparable = { ...next, revision: 0 };
+  if (JSON.stringify(currentComparable) === JSON.stringify(nextComparable)) return;
+  const response = await requestHost("catalog/replace", {
+    process: bridge.processFence,
+    expected_revision: bridge.catalogRevision,
+    catalog: next,
   });
-  if (changed.length) {
-    const response = await requestHost("tools/register", {
-      tools: changed.map((tool) => toolDefinitionToYgg(tool.definition)),
-    });
-    const accepted = new Set(response.tools ?? []);
-    setCurrentTools(
-      runtimeTools.filter((tool) => accepted.has(tool.definition.name)),
-      response.revision,
-    );
+  const accepted = response.catalog;
+  if (!accepted || accepted.revision !== next.revision) {
+    throw new Error("Ygg returned an invalid API 0.3 catalog acknowledgement");
   }
+  const acceptedTools = new Set((accepted.tools ?? []).map((tool) => tool.name));
+  setCurrentTools(
+    bridge.runner.getAllRegisteredTools().filter((tool) => acceptedTools.has(tool.definition.name)),
+    accepted.revision,
+  );
+  bridge.currentCatalog = accepted;
+  bridge.commands = bridge.runner.getRegisteredCommands().filter((command) =>
+    (accepted.commands ?? []).some((definition) => definition.name === (command.invocationName ?? command.name)),
+  );
 }
 
 function textFromContent(content) {
@@ -1310,13 +1807,40 @@ async function loadBridge(params) {
     commandName: args.commandName,
     hostState: params.host && typeof params.host === "object" ? { ...params.host } : {},
     agentActive: false,
+    pendingMessages: 0,
     toolNames: [],
+    activeToolNames: [],
     toolInfos: [],
     toolSnapshots: new Map(),
-    toolRefreshChain: Promise.resolve(),
-    toolRefreshRequested: false,
+    catalogRefreshChain: Promise.resolve(),
+    catalogRefreshRequested: false,
     catalogRevision: 0,
+    currentCatalog: null,
+    processFence: null,
     features: new Set(REQUIRED_FEATURES),
+    hostServices: params.protocol?.host_services ?? [],
+    loadedExtensions: [],
+    providers: new Map(),
+    models: [],
+    model: undefined,
+    scopedModels: [],
+    editorText: "",
+    editorComponent: undefined,
+    autocompleteProviders: [],
+    toolsExpanded: false,
+    remoteComponents: new Map(),
+    remoteComponentRevisions: new Map(),
+    remoteComponentGeneration: 1,
+    themes: new Map([["compat", { name: "compat", path: undefined, theme: makeCompatibilityTheme() }]]),
+    currentTheme: makeCompatibilityTheme(),
+    nextSyntheticEntryId: 1,
+    sessionSnapshot: {
+      entries: Array.isArray(params.host?.session_entries) ? params.host.session_entries.slice() : [],
+      leafId: params.host?.session_leaf_id ?? null,
+      labels: new Map(),
+      tree: Array.isArray(params.host?.session_tree) ? params.host.session_tree.slice() : [],
+      header: params.host?.session_header ?? null,
+    },
     terminal: {
       pendingCompletedTurn: null,
       pendingAgentMessages: null,
@@ -1353,6 +1877,9 @@ async function loadBridge(params) {
   if (!loaded.extensions?.length) {
     throw new Error("Pi loader found no extension modules");
   }
+  bridge.pi = pi;
+  bridge.loaded = loaded;
+  bridge.loadedExtensions = loaded.extensions;
 
   bridge.runner = new pi.ExtensionRunner(
     loaded.extensions,
@@ -1367,69 +1894,106 @@ async function loadBridge(params) {
     boundedDiagnostic(`Pi extension handler failed${location}${event}: ${error?.error ?? error}`);
   });
   bridge.runner.bindCore(makeExtensionActions(), makeExtensionContextActions(), {
-    registerProvider: () => unsupported("pi.registerProvider"),
-    registerNativeProvider: () => unsupported("pi.registerProvider"),
-    unregisterProvider: () => unsupported("pi.unregisterProvider"),
+    registerProvider: (name, config) => registerProviderLocal(name, config),
+    registerNativeProvider: (provider) => registerProviderLocal(provider),
+    unregisterProvider: (name) => unregisterProviderLocal(name),
   });
   bridge.runner.bindCommandContext({
-    waitForIdle: async () => {},
-    newSession: async () => unsupported("ctx.newSession"),
-    fork: async () => unsupported("ctx.fork"),
-    navigateTree: async () => unsupported("ctx.navigateTree"),
-    switchSession: async () => unsupported("ctx.switchSession"),
-    reload: async () => unsupported("ctx.reload"),
+    waitForIdle: async () => {
+      await callHostService("control", "wait-idle", {});
+    },
+    async newSession(options = {}) {
+      const result = await callHostService("session", "new", {
+        parent_session: options.parentSession ?? null,
+      });
+      if (!result?.cancelled && options.withSession) {
+        await options.withSession(bridge.runner.createCommandContext());
+      }
+      return { cancelled: result?.cancelled === true };
+    },
+    async fork(entryId, options = {}) {
+      const result = await callHostService("session", "fork", {
+        entry_id: String(entryId),
+        position: options.position ?? "at",
+      });
+      if (!result?.cancelled && options.withSession) {
+        await options.withSession(bridge.runner.createCommandContext());
+      }
+      return { cancelled: result?.cancelled === true };
+    },
+    async navigateTree(targetId, options = {}) {
+      const result = await callHostService("session", "navigate", {
+        target_id: String(targetId),
+        summarize: options.summarize === true,
+        custom_instructions: options.customInstructions ?? null,
+        replace_instructions: options.replaceInstructions === true,
+        label: options.label ?? null,
+      });
+      return { cancelled: result?.cancelled === true };
+    },
+    async switchSession(sessionPath, options = {}) {
+      const result = await callHostService("session", "switch", { session_path: String(sessionPath) });
+      if (!result?.cancelled && options.withSession) {
+        await options.withSession(bridge.runner.createCommandContext());
+      }
+      return { cancelled: result?.cancelled === true };
+    },
+    reload: async () => {
+      await callHostService("control", "reload", {});
+    },
   });
   bridge.runner.setUIContext(makeUi(), "rpc");
 
   const initialTools = bridge.runner.getAllRegisteredTools();
   setCurrentTools(initialTools, 0);
   bridge.commands = bridge.runner.getRegisteredCommands();
-  bridge.unsupported = [];
-  for (const extension of loaded.extensions) {
-    if (extension.shortcuts.size) bridge.unsupported.push(`${extension.path}: shortcuts`);
-    if (extension.flags.size) bridge.unsupported.push(`${extension.path}: flags`);
-    if (extension.messageRenderers.size) bridge.unsupported.push(`${extension.path}: message renderers`);
-    if (extension.entryRenderers?.size) bridge.unsupported.push(`${extension.path}: entry renderers`);
-    if (extension.markdownTransformer) bridge.unsupported.push(`${extension.path}: markdown transformer`);
-  }
+  bridge.currentCatalog = buildRuntimeCatalog(0);
 }
 
 async function handleInitialize(message) {
-  await loadBridge(message.params ?? {});
-  bridge.initialized = true;
-  if (bridge.toolRefreshRequested) {
-    bridge.toolRefreshRequested = false;
-    setImmediate(() => scheduleToolRefresh());
+  const params = message.params ?? {};
+  if (params.api_version !== API_VERSION || params.protocol?.version !== API_VERSION) {
+    throw new Error(`Pi compatibility bridge requires extension API ${API_VERSION}`);
   }
-  const tools = bridge.tools.map((tool) => toolDefinitionToYgg(tool.definition));
-  const commands = bridge.features.has("runtime_commands")
-    ? bridge.commands.map(commandDefinitionToYgg)
-    : [
-        {
-          name: bridge.commandName,
-          description: `Run bridged Pi command(s): /${bridge.commandName} COMMAND [arguments]`,
-          usage: `/${bridge.commandName} COMMAND [arguments]`,
-        },
-      ];
-  for (const warning of bridge.unsupported) diagnostic(`Pi compatibility: ${warning} is unavailable in Ygg`);
+  const required = params.protocol?.required_features ?? [];
+  if (
+    required.length !== REQUIRED_FEATURES.length
+    || REQUIRED_FEATURES.some((feature) => !required.includes(feature))
+  ) {
+    throw new Error("Ygg did not offer the exact mandatory API 0.3 feature set");
+  }
+  await loadBridge(params);
+  bridge.initialized = true;
+  if (bridge.catalogRefreshRequested && bridge.processFence) {
+    bridge.catalogRefreshRequested = false;
+    setImmediate(() => scheduleCatalogRefresh());
+  }
   diagnostic(`Pi compatibility profile ${bridge.piRuntimeVersion} initialized`);
   return {
     api_version: API_VERSION,
-    tools,
-    commands,
+    tools: [],
+    commands: [],
     protocol: {
       version: API_VERSION,
       features: [...bridge.features],
       limits: { max_concurrent_requests: 4 },
-      ...(bridge.features.has("lifecycle_events") ? { lifecycle_events: LIFECYCLE_EVENTS } : {}),
+      host_services: bridge.hostServices,
+      catalog: bridge.currentCatalog,
     },
   };
 }
 
-async function runScoped(id, operation) {
+async function runScoped(id, operation, invocation = null) {
   const controller = new AbortController();
   const entry = { controller };
   inflight.set(keyOf(id), entry);
+  if (invocation?.process) {
+    bridge.processFence = invocation.process;
+    if (bridge.catalogRefreshRequested) {
+      bridge.catalogRefreshRequested = false;
+      setImmediate(() => scheduleCatalogRefresh());
+    }
+  }
   try {
     return await scopes.run(
       {
@@ -1437,6 +2001,8 @@ async function runScoped(id, operation) {
         controller,
         signal: controller.signal,
         progressSequence: 0,
+        invocation,
+        effects: [],
       },
       operation,
     );
@@ -1517,37 +2083,26 @@ async function callPiTool(message) {
   if (transformed.usage !== undefined) {
     metadata = { details: transformed.details ?? null, usage: transformed.usage };
   }
-  return {
+  return finishObjectResult({
     content: finalContent,
     is_error: transformed.isError === true,
     ...(metadata === undefined ? {} : { metadata }),
-  };
+  });
 }
 
 async function executePiCommand(message) {
-  let command;
-  let argumentsList;
-  if (bridge.features.has("runtime_commands")) {
-    command = message.params?.name;
-    argumentsList = message.params?.arguments ?? [];
-  } else {
-    if (message.params?.name !== bridge.commandName) {
-      throw new Error(`unknown bridged Pi command ${message.params?.name}`);
-    }
-    command = message.params?.arguments?.[0];
-    if (!command) throw new Error(`/${bridge.commandName} requires the bridged Pi command name`);
-    argumentsList = message.params.arguments.slice(1) ?? [];
-  }
+  const command = message.params?.name;
+  const argumentsList = message.params?.arguments ?? [];
   const registered = bridge.commands.find(
     (candidate) => (candidate.invocationName ?? candidate.name) === command,
   );
   if (!registered) throw new Error(`unknown bridged Pi command ${command}`);
   await registered.handler(argumentsList.join(" "), bridge.runner.createCommandContext());
-  return {
+  return finishObjectResult({
     text: `Pi command ${command} completed.`,
     notifications: [],
     context: [],
-  };
+  });
 }
 
 async function runHook(message) {
@@ -1580,13 +2135,13 @@ async function runHook(message) {
     if (!result?.block && bridge.toolNames.includes(payload.name)) {
       enqueueByName(bridge.pendingPiToolCalls, payload.name, { id: toolCallId, input });
     }
-    return {
+    return finishObjectResult({
       disposition: result?.block
         ? { action: "deny", reason: result.reason ?? "Blocked by Pi extension" }
         : { action: "continue" },
       context: [],
       notifications: [],
-    };
+    });
   }
   if (hook === "after_tool_call") {
     if (!bridge.toolNames.includes(payload.name)) {
@@ -1602,14 +2157,14 @@ async function runHook(message) {
         return unsupported("tool_result mutation for Ygg-native tools");
       }
     }
-    return { disposition: { action: "continue" }, context: [], notifications: [] };
+    return finishObjectResult({ disposition: { action: "continue" }, context: [], notifications: [] });
   }
   if (hook === "before_prompt") {
-    return {
+    return finishObjectResult({
       disposition: { action: "continue" },
       context: await collectBeforePromptContext(String(payload.prompt ?? "")),
       notifications: [],
-    };
+    });
   }
   if (hook === "after_response") {
     const messages = [
@@ -1621,7 +2176,7 @@ async function runHook(message) {
     } else {
       bridge.terminal.pendingAgentMessages = messages;
     }
-    return { disposition: { action: "continue" }, context: [], notifications: [] };
+    return finishObjectResult({ disposition: { action: "continue" }, context: [], notifications: [] });
   }
   throw new Error(`unsupported Ygg hook ${hook}`);
 }
@@ -1633,7 +2188,238 @@ async function collectContext(message) {
     const contribution = contextContribution("pi-context", messageContent(item));
     if (contribution) context.push(contribution);
   }
+  if (currentScope().effects.length) {
+    throw new Error("Pi context collection produced mutation effects outside an ordered event");
+  }
   return context;
+}
+
+async function resolveOrderedPayload(payload, invocation) {
+  const reference = payload?.document;
+  if (!reference) return payload ?? {};
+  if (payload.encoding !== "json") throw new Error("unsupported ordered-event document encoding");
+  const chunks = [];
+  let offset = 0;
+  let index = 0;
+  while (true) {
+    const response = await requestHost("document/read", {
+      operation_token: invocation.operation,
+      document_id: reference.document_id,
+      offset,
+    });
+    const chunk = response?.chunk;
+    if (!chunk || chunk.index !== index || chunk.offset !== offset) {
+      throw new Error("Ygg returned an out-of-order document chunk");
+    }
+    const bytes = Buffer.from(chunk.data, "base64");
+    if (bytes.length !== chunk.decoded_bytes) throw new Error("document chunk length mismatch");
+    chunks.push(bytes);
+    offset += bytes.length;
+    index += 1;
+    if (response.eof) break;
+  }
+  const bytes = Buffer.concat(chunks);
+  if (bytes.length !== reference.byte_length) throw new Error("document byte length mismatch");
+  if (createHash("sha256").update(bytes).digest("hex") !== reference.sha256) {
+    throw new Error("document SHA-256 mismatch");
+  }
+  return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+}
+
+function topLevelPiEvent(type, payload) {
+  const event = { type };
+  const names = {
+    session_id: "sessionId",
+    run_id: "runId",
+    turn_id: "turnId",
+    tool_call_id: "toolCallId",
+    tool_name: "toolName",
+    duration_ms: "durationMs",
+    turn_index: "turnIndex",
+    is_error: "isError",
+    custom_instructions: "customInstructions",
+    replace_instructions: "replaceInstructions",
+  };
+  for (const [key, value] of Object.entries(payload ?? {})) {
+    event[names[key] ?? key] = value;
+  }
+  return event;
+}
+
+async function emitOrderedPiEvent(type, payload) {
+  const event = topLevelPiEvent(type, payload);
+  switch (type) {
+    case "project_trust": {
+      if (typeof bridge.pi.emitProjectTrustEvent !== "function") {
+        throw new Error("pinned Pi runtime does not expose emitProjectTrustEvent");
+      }
+      const emitted = await bridge.pi.emitProjectTrustEvent(
+        bridge.loaded,
+        event,
+        bridge.runner.createContext(),
+      );
+      for (const error of emitted.errors ?? []) bridge.runner.emitError(error);
+      return emitted.result;
+    }
+    case "resources_discover":
+      return bridge.runner.emitResourcesDiscover(
+        event.cwd ?? bridge.cwd,
+        event.reason ?? "reload",
+      );
+    case "context":
+      return { messages: await bridge.runner.emitContext(event.messages ?? []) };
+    case "before_provider_request":
+      return await bridge.runner.emitBeforeProviderRequest(event.payload);
+    case "before_provider_headers":
+      return { headers: await bridge.runner.emitBeforeProviderHeaders(event.headers ?? {}) };
+    case "before_agent_start":
+      return await bridge.runner.emitBeforeAgentStart(
+        event.prompt ?? "",
+        event.images,
+        event.systemPrompt ?? "",
+        event.systemPromptOptions ?? { cwd: bridge.cwd },
+      );
+    case "message_end": {
+      const message = await bridge.runner.emitMessageEnd(event);
+      return message === undefined ? undefined : { message };
+    }
+    case "tool_call": {
+      const result = await bridge.runner.emitToolCall(event);
+      return { ...(result ?? {}), input: event.input };
+    }
+    case "tool_result":
+      return await bridge.runner.emitToolResult(event);
+    case "user_bash":
+      return await bridge.runner.emitUserBash(event);
+    case "input":
+      return await bridge.runner.emitInput(
+        event.text ?? "",
+        event.images,
+        event.source ?? "extension",
+        event.streamingBehavior,
+      );
+    default:
+      return await bridge.runner.emit(event);
+  }
+}
+
+async function handleOrderedEvent(message) {
+  const dispatch = message.params ?? {};
+  if (!Number.isSafeInteger(dispatch.sequence) || dispatch.sequence <= 0) {
+    throw new Error("ordered event requires a positive sequence");
+  }
+  const invocation = dispatch.invocation;
+  if (!invocation?.operation || invocation.operation.kind !== "event") {
+    throw new Error("ordered event requires a host event invocation");
+  }
+  if (dispatch.event === "session_start") bridge.terminal.sessionShutdown = false;
+  if (dispatch.event === "session_shutdown") bridge.terminal.sessionShutdown = true;
+  if (dispatch.event === "turn_start" || dispatch.event === "agent_start") bridge.agentActive = true;
+  if (dispatch.event === "agent_settled" || dispatch.event === "session_shutdown") bridge.agentActive = false;
+  const payload = await resolveOrderedPayload(dispatch.payload, invocation);
+  const result = await emitOrderedPiEvent(dispatch.event, payload);
+  return {
+    sequence: dispatch.sequence,
+    ...(result === undefined ? {} : { result }),
+    effects: effectJournal(),
+  };
+}
+
+async function handleOrderedEventBatch(message) {
+  const events = message.params?.events;
+  if (!Array.isArray(events) || events.length === 0 || events.length > 64) {
+    throw new Error("ordered event batch must contain 1 to 64 events");
+  }
+  const outer = currentScope();
+  for (const dispatch of events) {
+    const result = await scopes.run(
+      { ...outer, invocation: dispatch.invocation, effects: [] },
+      async () => emitOrderedPiEvent(
+        dispatch.event,
+        await resolveOrderedPayload(dispatch.payload, dispatch.invocation),
+      ),
+    );
+    void result;
+  }
+  return {};
+}
+
+async function handleProviderCallback(message) {
+  const params = message.params ?? {};
+  const registration = bridge.providers.get(String(params.provider));
+  if (!registration) throw new Error(`Unknown Pi provider: ${params.provider}`);
+  const config = registration.config ?? {};
+  switch (params.action) {
+    case "custom_stream": {
+      if (typeof config.streamSimple !== "function") {
+        throw new Error(`Pi provider ${params.provider} has no custom stream handler`);
+      }
+      const options = {
+        ...(params.options ?? {}),
+        signal: currentScope().signal,
+        onPayload: (payload) => bridge.runner.emitBeforeProviderRequest(payload),
+        onResponse: async (response) => {
+          await bridge.runner.emit({
+            type: "after_provider_response",
+            status: response.status,
+            headers: Object.fromEntries(response.headers?.entries?.() ?? []),
+          });
+        },
+      };
+      const stream = config.streamSimple(params.model, params.context, options);
+      const events = [];
+      for await (const event of stream) {
+        if (events.length >= 100_000) throw new Error("custom provider stream exceeds 100000 events");
+        events.push(event);
+      }
+      return { events };
+    }
+    case "refresh_models": {
+      if (typeof config.refreshModels !== "function") return { models: config.models ?? [] };
+      const models = await config.refreshModels({
+        signal: currentScope().signal,
+        publish: async (entry) => {
+          await callHostService("providers", "refresh-models", {
+            provider: params.provider,
+            publish: entry,
+          });
+        },
+      });
+      return { models };
+    }
+    case "oauth_login": {
+      if (!config.oauth?.login) throw new Error(`Pi provider ${params.provider} has no OAuth login`);
+      const credentials = await config.oauth.login({
+        onAuth: ({ url, instructions }) => callHostService("providers", "oauth", {
+          action: "authorize",
+          provider: params.provider,
+          url,
+          instructions: instructions ?? null,
+        }),
+        onPrompt: async ({ message, placeholder }) => {
+          const result = await callHostService("providers", "oauth", {
+            action: "prompt",
+            provider: params.provider,
+            message,
+            placeholder: placeholder ?? null,
+          });
+          return result.value;
+        },
+        onProgress: (message) => progress(String(message)),
+      });
+      return { credentials };
+    }
+    case "oauth_refresh": {
+      if (!config.oauth?.refreshToken) throw new Error(`Pi provider ${params.provider} has no OAuth refresh`);
+      return { credentials: await config.oauth.refreshToken(params.credentials, currentScope().signal) };
+    }
+    case "oauth_api_key": {
+      if (!config.oauth?.getApiKey) throw new Error(`Pi provider ${params.provider} has no OAuth key projection`);
+      return { api_key: config.oauth.getApiKey(params.credentials) };
+    }
+    default:
+      throw new Error(`Unknown Pi provider callback action: ${params.action}`);
+  }
 }
 
 async function finishTurn(messages) {
@@ -1714,6 +2500,9 @@ async function handleRequest(message) {
   if (message.method === "initialize") return handleInitialize(message);
   if (!bridge?.initialized) throw new Error("Pi compatibility host is not initialized");
   updateHostStateFromMessage(message);
+  if (message.method === "event/handle") return handleOrderedEvent(message);
+  if (message.method === "event/batch") return handleOrderedEventBatch(message);
+  if (message.method === "provider/callback") return handleProviderCallback(message);
   if (LIFECYCLE_EVENTS.includes(message.method)) {
     await handleLifecycle(message.method, message.params ?? {});
     return null;
@@ -1759,7 +2548,8 @@ async function onMessage(message) {
     return;
   }
   try {
-    const result = await runScoped(message.id, () => handleRequest(message));
+    const invocation = message.method === "event/batch" ? null : message.params?.invocation ?? null;
+    const result = await runScoped(message.id, () => handleRequest(message), invocation);
     await send({ jsonrpc: "2.0", id: message.id, result });
   } catch (error) {
     const code = error instanceof CancellationError ? -32800 : -32000;

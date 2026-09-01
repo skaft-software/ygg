@@ -116,11 +116,10 @@ instructions use labelled blocks with stable IDs and hashes.
 ## Compaction and handoff summaries
 
 Before installing the agent policy, bootstrap combines the generic fractional
-threshold with an optional absolute active-context ceiling. There is no route
-default: the full provider-advertised window (872K, 1M on Pro) is available for
-in-context learning. An explicit `compaction.max_active_tokens` constrains the
-working set (for example 272_000), and zero disables the absolute cap while
-leaving `threshold_fraction` authoritative. The lower effective threshold is
+threshold with the absolute active-context ceiling. The default
+`compaction.max_active_tokens` is 272_000, limiting the working set before
+repeated long-context replay dominates wall time; zero disables that cap and
+leaves `threshold_fraction` authoritative. The lower effective threshold is
 applied on initial construction, rebuild, interactive reconfiguration, and RPC
 toggles, and `/context` reports that same effective capacity.
 
