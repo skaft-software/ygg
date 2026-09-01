@@ -21,6 +21,7 @@
 <p align="center">
   <a href="#install"><strong>Install</strong></a> ·
   <a href="docs/benchmarks/tb21-v0.6.2/README.md"><strong>Performance</strong></a> ·
+  <a href="ROADMAP.md"><strong>Roadmap</strong></a> ·
   <a href="https://skaft.org/ygg/docs"><strong>Documentation</strong></a> ·
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
@@ -973,6 +974,7 @@ third_party/              upstream license texts
 | --- | --- |
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
+| [Public roadmap](ROADMAP.md) | Current release outcomes, engineering principles, evidence campaigns, and non-goals. |
 | [Release notes](docs/releases/v0.6.5.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |

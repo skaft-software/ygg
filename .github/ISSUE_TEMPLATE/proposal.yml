@@ -1,0 +1,69 @@
+name: Scoped proposal
+description: Propose an implementation-ready product or engineering outcome after discussion.
+title: "proposal: "
+labels:
+  - enhancement
+  - status/exploring
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for a bounded proposal with evidence. Broad ideas should start in Discussions. Acceptance for discussion is not a promise to merge or schedule the work.
+  - type: checkboxes
+    attributes:
+      label: Intake checks
+      options:
+        - label: I searched existing issues, Discussions, and ROADMAP.md.
+          required: true
+        - label: I can describe the user problem independently of my preferred implementation.
+          required: true
+        - label: I have not started a large implementation that depends on this being accepted.
+          required: true
+  - type: textarea
+    attributes:
+      label: User problem and evidence
+      description: Who experiences the problem, what happens today, and what evidence or explicitly labeled assumption supports it?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Smallest complete outcome
+      description: Describe observable behavior, including first use, success, failure, cancellation, and recovery.
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Proposed ownership
+      options:
+        - Core irreducible contract
+        - First-party extension
+        - External/community extension
+        - Provider definition or compatibility data
+        - TUI / frontend presentation
+        - Ygg Serve
+        - Documentation / release / infrastructure
+        - Unknown — needs design discussion
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Why this belongs in Ygg
+      description: Explain why an existing extension, provider definition, or external tool cannot solve it.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Non-goals
+      description: State what this proposal deliberately will not build.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Success measure and stop condition
+      description: What evidence would justify shipping, revising, or rejecting the proposal?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Compatibility, security, and maintenance impact
+      description: Note API/version effects, authority, data migration, new dependencies, generated-vs-hand-maintained surface, and expected code deletion or complexity.

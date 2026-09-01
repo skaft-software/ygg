@@ -1,0 +1,57 @@
+name: Extension or package report
+description: Report an extension runtime, SDK, package, MCP, or Pi compatibility problem.
+title: "extension: "
+labels:
+  - extensions-api
+body:
+  - type: checkboxes
+    attributes:
+      label: Intake checks
+      options:
+        - label: I searched existing issues and the extension documentation.
+          required: true
+        - label: This report contains no credential, private source, raw session, or suspected vulnerability disclosure.
+          required: true
+  - type: input
+    attributes:
+      label: Ygg and extension versions
+      placeholder: ygg 0.6.5; ygg-mcp 0.6.5; API 0.2
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: Extension/package identity
+      description: Public package name and source type only; do not paste private paths.
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Surface
+      options:
+        - Discovery / install / update
+        - Enablement / trust / authority
+        - Startup / supervision / shutdown
+        - JSON-RPC protocol / SDK
+        - Catalog / tools / commands / hooks
+        - MCP
+        - Pi compatibility / migration
+        - Presentation / setup UI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Observable behavior and impact
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Minimal sanitized reproduction
+      description: Include manifest shape and bounded diagnostics with source paths, arguments, results, and secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true

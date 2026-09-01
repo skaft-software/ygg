@@ -1,0 +1,29 @@
+name: Documentation problem
+description: Report incorrect, stale, missing, or inaccessible public documentation.
+title: "docs: "
+labels:
+  - documentation
+body:
+  - type: input
+    attributes:
+      label: Page or file
+      placeholder: URL or repository-relative path
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Problem
+      description: Quote only the minimum public text needed to identify the issue.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected correction
+    validations:
+      required: true
+  - type: checkboxes
+    attributes:
+      label: Safety
+      options:
+        - label: This report contains no credentials, private data, or suspected vulnerability details.
+          required: true
