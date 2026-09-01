@@ -7,8 +7,8 @@
 <h1 align="center">ygg</h1>
 
 <p align="center">
-  <strong>A tiny, precise and fast coding agent.</strong><br>
-  Model choice, explicit control, and verifiable engineering in one Rust CLI.
+  <strong>A high-performance coding agent for real work.</strong><br>
+  Fast, context-efficient, and deeply integrated.
 </p>
 
 <p align="center">
@@ -26,10 +26,12 @@
   <a href="SECURITY.md"><strong>Security</strong></a>
 </p>
 
-ygg is a small, local-first coding agent written in Rust. The `ygg` CLI works
-with local OpenAI-compatible servers and cloud providers, keeps durable
-inspectable sessions on disk, and puts optional capabilities outside its minimal
-core so it stays out of the model's way.
+ygg is a high-performance coding agent written in Rust. It works with frontier
+cloud models and local OpenAI-compatible servers, keeps durable inspectable
+sessions on disk, and puts optional capabilities behind language-neutral
+extension boundaries. Native speed, context efficiency, local-model support,
+and deep integrations serve one goal: getting real work to a useful,
+reviewable result with less overhead.
 
 ## Install
 

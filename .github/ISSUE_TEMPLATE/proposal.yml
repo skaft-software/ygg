@@ -25,6 +25,19 @@ body:
       description: Who experiences the problem, what happens today, and what evidence or explicitly labeled assumption supports it?
     validations:
       required: true
+  - type: dropdown
+    attributes:
+      label: Primary roadmap improvement
+      description: Core work must materially improve at least one. Otherwise prefer an optional or extension-edge implementation.
+      options:
+        - Task success or human reviewability
+        - Time to a useful result
+        - Baseline or active-context footprint
+        - Integration depth or reliability
+        - Operational reliability of long-running work
+        - None — this should remain optional or at the extension edge
+    validations:
+      required: true
   - type: textarea
     attributes:
       label: Smallest complete outcome
