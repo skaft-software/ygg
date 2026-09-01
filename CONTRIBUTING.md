@@ -5,6 +5,20 @@ work, provider compatibility updates, tests, and documentation corrections.
 The project is pre-1.0, so small changes with strong evidence are easier to
 review and safer to ship than broad rewrites.
 
+## AI-assisted contributions
+
+AI-generated issues and pull requests are welcome and will be considered. If
+AI helped produce your contribution, please include a brief, genuine note from
+you explaining what you observed, what you care about, or why the change
+matters. Fully machine-generated requests without evidence of human review or
+diligence may be treated as spam. I may not respond to messages that appear AI-
+generated when I judge them to be unimportant or spam.
+
+Please also include any relevant prompts used to reach the conclusions in an
+issue or to generate a pull request. Include enough context to make clear what
+you verified yourself, and redact secrets or private information. Requests for
+the prompts behind a contribution are welcome too.
+
 ## Before opening a change
 
 1. Search existing issues and pull requests for the same behavior.
