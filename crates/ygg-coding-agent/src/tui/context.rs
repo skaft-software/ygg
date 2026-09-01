@@ -576,25 +576,22 @@ mod tests {
         let default = report
             .render(&crate::tui::theme::test_theme(), 100)
             .join("\n");
-        let named = report
+        let custom = report
             .render(
-                &crate::tui::theme::test_bundled_theme_with(
-                    "clawed",
-                    crate::tui::terminal::TerminalCapabilities::test(
-                        true,
-                        true,
-                        crate::tui::terminal::ColorDepth::TrueColor,
-                    ),
-                    crate::tui::theme::TerminalBackground::Dark,
+                &crate::tui::theme::test_theme_from_source(
+                    "[roles.context_system]\nforeground = '#ff00ff'",
                 ),
                 100,
             )
             .join("\n");
         assert_eq!(
             sexy_tui_rs::strip_terminal_sequences(&default),
-            sexy_tui_rs::strip_terminal_sequences(&named)
+            sexy_tui_rs::strip_terminal_sequences(&custom)
         );
-        assert_ne!(default, named, "theme semantics did not restyle the report");
+        assert_ne!(
+            default, custom,
+            "theme semantics did not restyle the report"
+        );
     }
 
     #[test]

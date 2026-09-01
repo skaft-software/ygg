@@ -38,41 +38,39 @@ const rgb = (hex: string) => {
 };
 
 const themeCatalog: ThemeOption[] = [
-  ["clawed", "Clawed", "#d97757", "comfortable"],
-  ["kodex", "Kodex", "#00cdcd", "compact"],
-  ["pie", "Pie", "#8abeb7", "airy"],
-].map(([id, name, accent, density], index) => ({
-  id,
-  theme: {
-    name,
-    source: "bundled",
-    revision: index + 1,
-    scheme: "unknown",
-    density,
-    motion: "full",
-    typography: {
-      body_family: "system-sans",
-      mono_family: "system-mono",
-      body_size: 17,
-      display_ratio_milli: 1235,
-    },
-    colors: {
-      accent: rgb(accent),
-      foreground: rgb("#edf3f2"),
-      muted: rgb("#778384"),
-    },
-    roles: {
-      tool_title: {
-        foreground: "accent",
-        bold: true,
-        dim: false,
-        italic: false,
-        underline: false,
-        strikethrough: false,
+  {
+    id: "theme-37a8eec1ce19687d132fe290",
+    theme: {
+      name: "Ygg Default",
+      source: "bundled",
+      revision: 1,
+      scheme: "unknown",
+      density: "comfortable",
+      motion: "full",
+      typography: {
+        body_family: "system-ui",
+        mono_family: "ui-monospace",
+        body_size: 17,
+        display_ratio_milli: 1235,
+      },
+      colors: {
+        accent: rgb("#16876d"),
+        foreground: { kind: "default" },
+        muted: rgb("#778384"),
+      },
+      roles: {
+        tool_title: {
+          foreground: "accent",
+          bold: true,
+          dim: false,
+          italic: false,
+          underline: false,
+          strikethrough: false,
+        },
       },
     },
   },
-})) as ThemeOption[];
+];
 
 const devicesCatalog: ConnectedDevice[] = [
   {
@@ -291,7 +289,7 @@ export const fixtureBootstrap: HostBootstrap = {
   authorityProfiles: ["readOnly", "workspace"],
   authorityCeiling: "workspace",
   themes: themeCatalog,
-  selectedThemeId: "clawed",
+  selectedThemeId: "theme-37a8eec1ce19687d132fe290",
   devices: devicesCatalog,
   capabilities: {
     attachments: true,

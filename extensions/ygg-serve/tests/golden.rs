@@ -121,17 +121,17 @@ fn snapshot() -> SessionSnapshot {
 
 fn theme() -> ThemeOption {
     ThemeOption {
-        id: ThemeId::new("clawed").unwrap(),
+        id: ThemeId::new("theme-37a8eec1ce19687d132fe290").unwrap(),
         theme: ThemeDto {
-            name: "Clawed".into(),
+            name: "Ygg Default".into(),
             source: ThemeSourceClass::Bundled,
-            revision: 3,
+            revision: 1,
             scheme: ColorScheme::Dark,
             density: ThemeDensity::Comfortable,
             motion: ThemeMotion::Full,
             typography: ThemeTypography {
-                body_family: "system-sans".into(),
-                mono_family: "system-mono".into(),
+                body_family: "system-ui".into(),
+                mono_family: "ui-monospace".into(),
                 body_size: 17,
                 display_ratio_milli: 1235,
             },
@@ -139,9 +139,9 @@ fn theme() -> ThemeOption {
                 (
                     "accent".into(),
                     ThemeColor::Rgb {
-                        red: 217,
-                        green: 119,
-                        blue: 87,
+                        red: 22,
+                        green: 135,
+                        blue: 109,
                     },
                 ),
                 ("canvas".into(), ThemeColor::Default),
@@ -211,7 +211,7 @@ fn bootstrap() -> HostBootstrap {
         authority_profiles: vec![AuthorityProfile::ReadOnly, AuthorityProfile::Workspace],
         authority_ceiling: AuthorityProfile::Workspace,
         themes: vec![theme()],
-        selected_theme_id: ThemeId::new("clawed").unwrap(),
+        selected_theme_id: ThemeId::new("theme-37a8eec1ce19687d132fe290").unwrap(),
         projects: vec![ProjectSummary {
             id: ProjectId::new("project-ygg").unwrap(),
             name: "ygg".into(),

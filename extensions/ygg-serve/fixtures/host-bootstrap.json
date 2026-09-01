@@ -56,26 +56,26 @@
   "authorityCeiling": "workspace",
   "themes": [
     {
-      "id": "clawed",
+      "id": "theme-37a8eec1ce19687d132fe290",
       "theme": {
-        "name": "Clawed",
+        "name": "Ygg Default",
         "source": "bundled",
-        "revision": 3,
+        "revision": 1,
         "scheme": "dark",
         "density": "comfortable",
         "motion": "full",
         "typography": {
-          "bodyFamily": "system-sans",
-          "monoFamily": "system-mono",
+          "bodyFamily": "system-ui",
+          "monoFamily": "ui-monospace",
           "bodySize": 17,
           "displayRatioMilli": 1235
         },
         "colors": {
           "accent": {
             "kind": "rgb",
-            "red": 217,
-            "green": 119,
-            "blue": 87
+            "red": 22,
+            "green": 135,
+            "blue": 109
           },
           "canvas": {
             "kind": "default"
@@ -95,7 +95,7 @@
       }
     }
   ],
-  "selectedThemeId": "clawed",
+  "selectedThemeId": "theme-37a8eec1ce19687d132fe290",
   "projects": [
     {
       "id": "project-ygg",

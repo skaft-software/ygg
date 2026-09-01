@@ -10,7 +10,5 @@ pub mod pickers;
 pub(crate) mod splash;
 pub mod terminal;
 pub mod theme;
-#[cfg(test)]
-mod theme_pack;
 mod theme_schema;
 pub mod view;
