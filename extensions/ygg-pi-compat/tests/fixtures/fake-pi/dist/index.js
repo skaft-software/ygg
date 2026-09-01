@@ -69,9 +69,43 @@ export class ExtensionRunner {
     ];
   }
 
-  bindCore(actions, contextActions) {
+  bindCore(actions, contextActions, providerActions) {
     this.actions = actions;
     this.contextActions = contextActions;
+    providerActions.registerProvider("fixture-provider", {
+      name: "Fixture Provider",
+      baseUrl: "https://fixture.invalid/v1",
+      api: "openai-completions",
+      models: [{
+        id: "fixture-model",
+        name: "Fixture Model",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 4096,
+        maxTokens: 1024,
+      }],
+      async *streamSimple(model) {
+        yield { type: "start", partial: { role: "assistant", content: [], model: model.id } };
+        yield { type: "text_delta", contentIndex: 0, delta: "fixture", partial: { role: "assistant", content: [{ type: "text", text: "fixture" }], model: model.id } };
+        yield { type: "done", reason: "stop", message: { role: "assistant", content: [{ type: "text", text: "fixture" }], model: model.id } };
+      },
+      oauth: {
+        name: "Fixture OAuth",
+        async login(callbacks) {
+          await callbacks.onAuth({ url: "https://fixture.invalid/oauth", instructions: "Enter the fixture code" });
+          const code = await callbacks.onPrompt({ message: "Fixture code", placeholder: "code" });
+          callbacks.onProgress?.("fixture oauth complete");
+          return { access: `access-${code}`, refresh: "refresh-fixture" };
+        },
+        async refreshToken(credentials) {
+          return { ...credentials, access: "access-refreshed" };
+        },
+        getApiKey(credentials) {
+          return credentials.access;
+        },
+      },
+    });
   }
 
   bindCommandContext(context) {

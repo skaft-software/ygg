@@ -92,6 +92,35 @@ class CompatibilityProfileTests(unittest.TestCase):
         )
         self.assertEqual(profile["official_extension_examples"], actual)
 
+    @unittest.skipUnless(NODE, "node is required for the Pi compatibility subprocess tests")
+    def test_all_78_official_examples_execute_unchanged_when_selected(self) -> None:
+        selected = os.environ.get("YGG_PI_REAL_PACKAGE")
+        if not selected:
+            self.skipTest("YGG_PI_REAL_PACKAGE is not set")
+        package = Path(selected).resolve()
+        profile_path = Path(__file__).resolve().parents[1] / "profiles/0.84.4.json"
+        profile = json.loads(profile_path.read_text())
+        examples_root = package / "examples/extensions"
+        dependency_root = os.environ.get("YGG_PI_DEPENDENCY_EXAMPLES_ROOT")
+        loaded: list[str] = []
+        for relative in profile["official_extension_examples"]:
+            extension = examples_root / relative
+            if dependency_root and relative in {"gondolin", "sandbox"}:
+                extension = Path(dependency_root).resolve() / relative
+            with self.subTest(example=relative):
+                with BridgeProcess(pi_package=package, extension=extension) as bridge:
+                    initialized = bridge.initialize(
+                        "ui_remote_components",
+                        "provider_runtime",
+                        "process_runtime",
+                        "theme_runtime",
+                    )
+                    catalog = initialized["protocol"]["catalog"]
+                    self.assertEqual(0, catalog["revision"])
+                    self.assertEqual([], bridge.protocol_errors)
+                    loaded.append(relative)
+        self.assertEqual(profile["official_extension_examples"], loaded)
+
 
 @unittest.skipUnless(NODE, "node is required for the Pi compatibility subprocess tests")
 class BridgeProtocolTests(unittest.TestCase):
@@ -116,6 +145,82 @@ class BridgeProtocolTests(unittest.TestCase):
                 set(API_V03_REQUIRED_FEATURES) | {"artifacts"},
                 set(initialized["protocol"]["features"]),
             )
+
+    def test_provider_stream_and_oauth_callbacks_are_operation_fenced(self) -> None:
+        services = [
+            {
+                "name": "providers",
+                "version": 1,
+                "scopes": ["custom-stream", "oauth"],
+                "limits": {
+                    "max_concurrent_requests": 4,
+                    "max_request_bytes": 524288,
+                    "max_response_bytes": 524288,
+                    "max_items": 128,
+                    "timeout_ms": 30000,
+                },
+            }
+        ]
+        with BridgeProcess() as bridge:
+            initialized = bridge.initialize("request_progress", host_services=services)
+            provider = next(
+                item
+                for item in initialized["protocol"]["catalog"]["providers"]
+                if item["id"] == "fixture-provider"
+            )
+            self.assertEqual("Fixture Provider", provider["config"]["name"])
+            self.assertIn("custom_stream_handle", provider["config"])
+            self.assertEqual("Fixture OAuth", provider["config"]["oauth"]["name"])
+
+            streamed = bridge.request(
+                "provider/callback",
+                {
+                    "provider": "fixture-provider",
+                    "action": "custom_stream",
+                    "model": {"id": "fixture-model"},
+                    "context": {"messages": []},
+                    "options": {},
+                },
+            )["result"]
+            self.assertEqual(
+                ["start", "text_delta", "done"],
+                [event["type"] for event in streamed["events"]],
+            )
+            self.assertEqual([], streamed["effects"]["effects"])
+
+            oauth_calls: list[str] = []
+
+            def oauth_host(message: dict) -> dict:
+                payload = message["params"]["payload"]
+                oauth_calls.append(payload["action"])
+                value = {"value": "1234"} if payload["action"] == "prompt" else {}
+                return {"status": "success", "value": value}
+
+            bridge.handlers["host/call"] = oauth_host
+            login = bridge.request(
+                "provider/callback",
+                {"provider": "fixture-provider", "action": "oauth_login"},
+            )["result"]
+            self.assertEqual(["authorize", "prompt"], oauth_calls)
+            self.assertEqual("access-1234", login["credentials"]["access"])
+            refreshed = bridge.request(
+                "provider/callback",
+                {
+                    "provider": "fixture-provider",
+                    "action": "oauth_refresh",
+                    "credentials": login["credentials"],
+                },
+            )["result"]
+            self.assertEqual("access-refreshed", refreshed["credentials"]["access"])
+            projected = bridge.request(
+                "provider/callback",
+                {
+                    "provider": "fixture-provider",
+                    "action": "oauth_api_key",
+                    "credentials": refreshed["credentials"],
+                },
+            )["result"]
+            self.assertEqual("access-refreshed", projected["api_key"])
 
     def test_api_v03_catalog_effects_and_ordered_events_are_live(self) -> None:
         with BridgeProcess() as bridge:
@@ -573,9 +678,16 @@ class BridgeProtocolTests(unittest.TestCase):
     )
     def test_real_pi_0844_plan_mode_load_smoke(self) -> None:
         package = Path(os.environ["YGG_PI_REAL_PACKAGE"]).resolve()
-        extension = package / "examples/extensions/plan-mode/index.ts"
+        extension = package / "examples/extensions/plan-mode"
+        host = {
+            "active_tools": ["read", "bash", "edit", "write"],
+            "all_tools": [
+                {"name": name, "description": name, "parameters": {"type": "object"}}
+                for name in ["read", "bash", "edit", "write"]
+            ],
+        }
         with BridgeProcess(pi_package=package, extension=extension) as bridge:
-            initialized = bridge.initialize()
+            initialized = bridge.initialize(host=host)
             self.assertEqual(
                 {"plan", "todos"},
                 {
@@ -584,10 +696,31 @@ class BridgeProtocolTests(unittest.TestCase):
                 },
             )
             response = bridge.request(
-                "command/execute", {"name": "todos", "arguments": []}
+                "command/execute", {"name": "plan", "arguments": []}
             )
             self.assertNotIn("error", response)
-            self.assertTrue(any("No todos" in item for item in bridge.notifications()))
+            effects = response["result"]["effects"]["effects"]
+            active = next(effect for effect in effects if effect["type"] == "set_active_tools")
+            self.assertNotIn("edit", active["tools"])
+            self.assertNotIn("write", active["tools"])
+            persisted = next(effect for effect in effects if effect["type"] == "append_custom")
+            self.assertEqual("plan-mode", persisted["custom_type"])
+            self.assertTrue(persisted["details"]["enabled"])
+            blocked = bridge.request(
+                "event/handle",
+                {
+                    "sequence": 1,
+                    "event": "tool_call",
+                    "payload": {
+                        "toolCallId": "plan-bash",
+                        "toolName": "bash",
+                        "input": {"command": "rm -rf /tmp/unsafe"},
+                    },
+                    "barrier": True,
+                },
+            )
+            self.assertTrue(blocked["result"]["result"]["block"])
+            self.assertIn("not allowlisted", blocked["result"]["result"]["reason"])
             self.assertTrue(initialized["protocol"]["catalog"]["shortcuts"])
             self.assertTrue(initialized["protocol"]["catalog"]["flags"])
 

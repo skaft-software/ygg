@@ -189,7 +189,7 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                         .get("action")
                         .and_then(serde_json::Value::as_str)
                     {
-                        Some("present") => {
+                        Some("authorize") => {
                             if let Some(url) = request
                                 .payload
                                 .get("url")
