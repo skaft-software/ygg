@@ -132,6 +132,117 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
             }
         })
     }
+
+    fn host_service<'a>(
+        &'a mut self,
+        extension: &'a str,
+        request: &'a ygg_agent::extension_process::ExtensionHostServiceRequest,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = anyhow::Result<
+                        ygg_agent::extension_process::ExtensionHostServiceResponse,
+                    >,
+                > + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use ygg_agent::extension_process::{
+                ExtensionHostServiceName as Service,
+                ExtensionHostServiceResponse as Response,
+                ExtensionHostServiceScope as Scope,
+            };
+            let success = |value| Ok(Response::Success { value });
+            match (request.service, &request.scope) {
+                (Service::Control, Scope::WaitIdle) => success(serde_json::json!({})),
+                (Service::Control, Scope::Shutdown) => {
+                    self.shell.request_close();
+                    success(serde_json::json!({ "accepted": true }))
+                }
+                (Service::Ui, Scope::Editor) => {
+                    let title = request
+                        .payload
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("Extension editor");
+                    let input_request = ygg_agent::extension_process::ExtensionInputRequest {
+                        parent_request_id: request.operation_token.request_id,
+                        prompt: title.to_owned(),
+                        secret: false,
+                    };
+                    let value = extension_input_picker(self.shell, self.input, &input_request).await?;
+                    success(serde_json::json!({ "value": value }))
+                }
+                (Service::Ui, Scope::Components) => {
+                    let frame = request
+                        .payload
+                        .get("frame")
+                        .ok_or_else(|| anyhow::anyhow!("component request is missing its frame"))?;
+                    self.shell
+                        .apply_extension_ui_state(extension, "custom", frame)?;
+                    self.shell.render();
+                    success(serde_json::json!({ "result": null }))
+                }
+                (Service::Providers, Scope::Oauth) => {
+                    match request
+                        .payload
+                        .get("action")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        Some("present") => {
+                            if let Some(url) = request
+                                .payload
+                                .get("url")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                self.shell.notice(format!("OAuth URL: {url}"));
+                            }
+                            if let Some(instructions) = request
+                                .payload
+                                .get("instructions")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                self.shell.notice(instructions);
+                            }
+                            self.shell.render();
+                            success(serde_json::json!({ "presented": true }))
+                        }
+                        Some("prompt") => {
+                            let prompt = request
+                                .payload
+                                .get("message")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("OAuth response");
+                            let input_request =
+                                ygg_agent::extension_process::ExtensionInputRequest {
+                                    parent_request_id: request.operation_token.request_id,
+                                    prompt: prompt.to_owned(),
+                                    secret: false,
+                                };
+                            let value = extension_input_picker(
+                                self.shell,
+                                self.input,
+                                &input_request,
+                            )
+                            .await?;
+                            success(serde_json::json!({ "value": value }))
+                        }
+                        _ => Ok(Response::Error {
+                            message: "unknown OAuth UI action".to_owned(),
+                        }),
+                    }
+                }
+                _ => Ok(Response::Error {
+                    message: format!(
+                        "host service {}@{}:{} is unavailable at this interactive boundary",
+                        request.service,
+                        request.version.as_u16(),
+                        request.scope.as_str()
+                    ),
+                }),
+            }
+        })
+    }
 }
 
 /// Reconfiguration work requested while the Agent is active. It is applied
@@ -1583,6 +1694,60 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
     );
     for message in app.executable_extensions.drain_events() {
         shell.notice(message);
+    }
+    let effects = app
+        .executable_extensions
+        .apply_pending_effects(app.agent.session_mut(), &app.sessions);
+    for message in effects.messages {
+        shell.notice(message);
+    }
+    for update in effects.ui {
+        if let Err(error) =
+            shell.apply_extension_ui_state(&update.extension, &update.key, &update.value)
+        {
+            shell.notice_error(format!(
+                "[{}] extension UI update {:?} rejected: {error}",
+                update.extension, update.key
+            ));
+        }
+    }
+    for action in effects.messaging {
+        let (kind, content) = match action {
+            crate::extensions::ExtensionMessageAction::Steer(content) => ("steer", content),
+            crate::extensions::ExtensionMessageAction::FollowUp(content) => {
+                ("follow-up", content)
+            }
+            crate::extensions::ExtensionMessageAction::NextTurn(content) => {
+                ("next-turn", content)
+            }
+            crate::extensions::ExtensionMessageAction::User(content) => ("user", content),
+        };
+        shell.prefill_editor(content);
+        shell.notice(format!(
+            "extension {kind} message placed in the editor for host-owned submission"
+        ));
+    }
+    if let Some(model) = effects.selected_model {
+        shell.notice_error(format!(
+            "extension model selection {model:?} requires an idle reconfiguration boundary"
+        ));
+    }
+    if let Some(reasoning) = effects.selected_reasoning {
+        shell.notice_error(format!(
+            "extension reasoning selection {reasoning} requires an idle reconfiguration boundary"
+        ));
+    }
+    if !effects.provider_updates.is_empty() {
+        shell.notice_error(format!(
+            "rejected {} extension provider update(s): provider transaction adapter is unavailable",
+            effects.provider_updates.len()
+        ));
+    }
+    if !effects.catalog_updates.is_empty() {
+        shell.notice_error(format!(
+            "rejected {} extension catalog update(s): use catalog/replace",
+            effects.catalog_updates.len()
+        ));
     }
 }
 

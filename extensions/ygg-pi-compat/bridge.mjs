@@ -526,8 +526,25 @@ function makeUi() {
     notify(message, type = "info") {
       void notify(type, "Pi extension", message);
     },
-    onTerminalInput() {
-      return unsupported("ctx.ui.onTerminalInput");
+    onTerminalInput(handler) {
+      if (typeof handler !== "function") throw new TypeError("ctx.ui.onTerminalInput requires a function");
+      bridge.terminalInputHandlers.add(handler);
+      recordEffect({
+        type: "set_ui_state",
+        key: "terminal_input",
+        value: { handler_count: bridge.terminalInputHandlers.size },
+      });
+      let active = true;
+      return () => {
+        if (!active) return;
+        active = false;
+        bridge.terminalInputHandlers.delete(handler);
+        recordEffect({
+          type: "set_ui_state",
+          key: "terminal_input",
+          value: { handler_count: bridge.terminalInputHandlers.size },
+        });
+      };
     },
     setStatus(key, text) {
       recordEffect({
@@ -549,7 +566,10 @@ function makeUi() {
       recordEffect({ type: "set_ui_state", key: "hidden_thinking_label", value: label ?? null });
     },
     setWidget(key, content, options) {
-      setRemoteUiState("widget", remoteComponentValue("widget", key, content, options));
+      setRemoteUiState("widget", {
+        key: String(key),
+        frame: remoteComponentValue("widget", key, content, options),
+      });
     },
     setFooter(factory) {
       setRemoteUiState("footer", remoteComponentValue("footer", "footer", factory));
@@ -671,6 +691,25 @@ function updateHostStateFromMessage(message) {
       bridge.model = bridge.models.find((model) => model.id === state.model)
         ?? { id: String(state.model), provider: String(state.model).split("/")[0] };
     }
+    if (Array.isArray(state.models)) bridge.models = state.models.slice();
+    if (Array.isArray(state.scoped_models)) bridge.scopedModels = state.scoped_models.slice();
+    if (Array.isArray(state.active_tools)) {
+      bridge.hostActiveToolNames = state.active_tools.map(String);
+      bridge.activeToolNames = [...new Set([...bridge.hostActiveToolNames, ...bridge.toolNames])];
+    }
+    if (Array.isArray(state.all_tools)) {
+      bridge.hostToolInfos = state.all_tools.slice();
+      setCurrentTools(bridge.tools, bridge.catalogRevision);
+    }
+    if (Array.isArray(state.session_entries)) {
+      bridge.sessionSnapshot.entries = state.session_entries.slice();
+    }
+    if (Array.isArray(state.session_tree)) bridge.sessionSnapshot.tree = state.session_tree.slice();
+    if (Object.hasOwn(state, "session_leaf_id")) bridge.sessionSnapshot.leafId = state.session_leaf_id;
+    if (state.session_header) bridge.sessionSnapshot.header = state.session_header;
+    if (state.session_labels && typeof state.session_labels === "object") {
+      bridge.sessionSnapshot.labels = new Map(Object.entries(state.session_labels));
+    }
   }
   const payload = message?.params?.payload;
   if (payload?.session && typeof payload.session === "object") {
@@ -703,7 +742,7 @@ function makeExtensionContextActions() {
     isProjectTrusted: () => bridge.hostState?.project_trusted === true,
     getSignal: () => scopes.getStore()?.signal,
     abort: () => currentScope().controller.abort(),
-    hasPendingMessages: () => bridge.pendingMessages > 0,
+    hasPendingMessages: () => bridge.pendingMessages > 0 || bridge.hostState?.pending_messages === true,
     shutdown() {
       void requestHost("host/call", {
         operation_token: operationToken(),
@@ -843,7 +882,7 @@ function makeSessionManager() {
   };
   return makeThrowingProxy("ctx.sessionManager", {
     getCwd: () => bridge.cwd,
-    getSessionDir: () => "",
+    getSessionDir: () => bridge.hostState?.session_file ? dirname(bridge.hostState.session_file) : "",
     getSessionId: () => bridge.hostState?.session_id ?? "ygg-session",
     getSessionFile: () => bridge.hostState?.session_file,
     getSessionName: () => bridge.hostState?.session_name ?? undefined,
@@ -1629,7 +1668,10 @@ function buildRuntimeCatalog(revision = bridge.catalogRevision) {
     message_renderers: messageRenderers,
     entry_renderers: entryRenderers,
     markdown_transformers: markdownTransformers,
-    providers: [...bridge.providers.keys()].map((id) => ({ id })),
+    providers: [...bridge.providers.entries()].map(([id, registration]) => ({
+      id,
+      config: serializableProviderConfig(registration.config),
+    })),
     roles: [],
   };
 }
@@ -1650,15 +1692,23 @@ function setCurrentTools(tools, revision) {
   bridge.tools = tools;
   bridge.catalogRevision = revision;
   bridge.toolNames = tools.map((tool) => tool.definition.name);
-  if (bridge.activeToolNames.length === 0) bridge.activeToolNames = bridge.toolNames.slice();
-  else bridge.activeToolNames = bridge.activeToolNames.filter((name) => bridge.toolNames.includes(name));
-  bridge.toolInfos = tools.map((tool) => ({
+  const availableNames = new Set([...bridge.hostToolInfos.map((tool) => tool.name), ...bridge.toolNames]);
+  if (bridge.activeToolNames.length === 0) {
+    bridge.activeToolNames = [...new Set([...bridge.hostActiveToolNames, ...bridge.toolNames])];
+  } else {
+    bridge.activeToolNames = bridge.activeToolNames.filter((name) => availableNames.has(name));
+  }
+  const piToolInfos = tools.map((tool) => ({
     name: tool.definition.name,
     description: tool.definition.description,
     parameters: tool.definition.parameters,
     promptGuidelines: tool.definition.promptGuidelines,
     sourceInfo: tool.sourceInfo,
   }));
+  bridge.toolInfos = [
+    ...bridge.hostToolInfos,
+    ...piToolInfos.filter((tool) => !bridge.hostToolInfos.some((hostTool) => hostTool.name === tool.name)),
+  ];
   bridge.toolSnapshots.set(revision, tools.slice());
   while (bridge.toolSnapshots.size > 8) {
     bridge.toolSnapshots.delete(bridge.toolSnapshots.keys().next().value);
@@ -1809,8 +1859,14 @@ async function loadBridge(params) {
     agentActive: false,
     pendingMessages: 0,
     toolNames: [],
-    activeToolNames: [],
-    toolInfos: [],
+    hostActiveToolNames: Array.isArray(params.host?.active_tools)
+      ? params.host.active_tools.map(String)
+      : [],
+    activeToolNames: Array.isArray(params.host?.active_tools)
+      ? params.host.active_tools.map(String)
+      : [],
+    hostToolInfos: Array.isArray(params.host?.all_tools) ? params.host.all_tools.slice() : [],
+    toolInfos: Array.isArray(params.host?.all_tools) ? params.host.all_tools.slice() : [],
     toolSnapshots: new Map(),
     catalogRefreshChain: Promise.resolve(),
     catalogRefreshRequested: false,
@@ -1821,12 +1877,15 @@ async function loadBridge(params) {
     hostServices: params.protocol?.host_services ?? [],
     loadedExtensions: [],
     providers: new Map(),
-    models: [],
+    models: Array.isArray(params.host?.models) ? params.host.models.slice() : [],
     model: undefined,
-    scopedModels: [],
+    scopedModels: Array.isArray(params.host?.scoped_models)
+      ? params.host.scoped_models.slice()
+      : [],
     editorText: "",
     editorComponent: undefined,
     autocompleteProviders: [],
+    terminalInputHandlers: new Set(),
     toolsExpanded: false,
     remoteComponents: new Map(),
     remoteComponentRevisions: new Map(),
@@ -1837,7 +1896,7 @@ async function loadBridge(params) {
     sessionSnapshot: {
       entries: Array.isArray(params.host?.session_entries) ? params.host.session_entries.slice() : [],
       leafId: params.host?.session_leaf_id ?? null,
-      labels: new Map(),
+      labels: new Map(Object.entries(params.host?.session_labels ?? {})),
       tree: Array.isArray(params.host?.session_tree) ? params.host.session_tree.slice() : [],
       header: params.host?.session_header ?? null,
     },
@@ -1851,6 +1910,10 @@ async function loadBridge(params) {
     hostToolCallIds: new Map(),
     initialized: false,
   };
+  bridge.model = bridge.models.find((model) => model.id === bridge.hostState.model)
+    ?? (bridge.hostState.model
+      ? { id: String(bridge.hostState.model), provider: "ygg", available: true }
+      : undefined);
 
   const offeredOptionalFeatures = new Set(params.protocol?.optional_features ?? []);
   for (const feature of OPTIONAL_FEATURES) {
@@ -1945,7 +2008,16 @@ async function loadBridge(params) {
   bridge.runner.setUIContext(makeUi(), "rpc");
 
   const initialTools = bridge.runner.getAllRegisteredTools();
+  const hostToolInfos = Array.isArray(params.host?.all_tools) ? params.host.all_tools.slice() : [];
+  const hostActiveTools = Array.isArray(params.host?.active_tools)
+    ? params.host.active_tools.map(String)
+    : [];
   setCurrentTools(initialTools, 0);
+  bridge.toolInfos = [
+    ...hostToolInfos,
+    ...bridge.toolInfos.filter((tool) => !hostToolInfos.some((hostTool) => hostTool.name === tool.name)),
+  ];
+  bridge.activeToolNames = [...new Set([...hostActiveTools, ...bridge.activeToolNames])];
   bridge.commands = bridge.runner.getRegisteredCommands();
   bridge.currentCatalog = buildRuntimeCatalog(0);
 }
@@ -1989,6 +2061,7 @@ async function runScoped(id, operation, invocation = null) {
   inflight.set(keyOf(id), entry);
   if (invocation?.process) {
     bridge.processFence = invocation.process;
+    bridge.remoteComponentGeneration = invocation.process.generation;
     if (bridge.catalogRefreshRequested) {
       bridge.catalogRefreshRequested = false;
       setImmediate(() => scheduleCatalogRefresh());
@@ -2279,6 +2352,28 @@ async function emitOrderedPiEvent(type, payload) {
         event.systemPrompt ?? "",
         event.systemPromptOptions ?? { cwd: bridge.cwd },
       );
+    case "turn_start":
+      return await bridge.runner.emit({ ...event, turnIndex: event.turnIndex ?? 0, timestamp: event.timestamp ?? Date.now() });
+    case "turn_end": {
+      const messages = bridge.terminal.pendingAgentMessages ?? [];
+      return await bridge.runner.emit({
+        ...event,
+        turnIndex: event.turnIndex ?? 0,
+        message: event.message ?? messages[0] ?? { role: "assistant", content: [{ type: "text", text: "" }] },
+        toolResults: event.toolResults ?? [],
+      });
+    }
+    case "agent_end":
+      return await bridge.runner.emit({
+        ...event,
+        messages: event.messages ?? bridge.terminal.pendingAgentMessages ?? [],
+      });
+    case "agent_settled": {
+      const result = await bridge.runner.emit(event);
+      bridge.agentActive = false;
+      bridge.terminal.pendingAgentMessages = null;
+      return result;
+    }
     case "message_end": {
       const message = await bridge.runner.emitMessageEnd(event);
       return message === undefined ? undefined : { message };
@@ -2502,7 +2597,9 @@ async function handleRequest(message) {
   updateHostStateFromMessage(message);
   if (message.method === "event/handle") return handleOrderedEvent(message);
   if (message.method === "event/batch") return handleOrderedEventBatch(message);
-  if (message.method === "provider/callback") return handleProviderCallback(message);
+  if (message.method === "provider/callback") {
+    return finishObjectResult(await handleProviderCallback(message));
+  }
   if (LIFECYCLE_EVENTS.includes(message.method)) {
     await handleLifecycle(message.method, message.params ?? {});
     return null;

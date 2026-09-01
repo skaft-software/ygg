@@ -11,6 +11,7 @@ use super::{fit_line, semantic_separator, wrap_hanging, ShellState};
 pub(super) struct ShellChrome {
     pub(super) header: Vec<String>,
     pub(super) subagents: Vec<String>,
+    pub(super) extensions: Vec<String>,
     pub(super) composer: Vec<String>,
     pub(super) panel: Vec<String>,
     pub(super) pending: Vec<String>,
@@ -72,6 +73,38 @@ fn render_shell_header(state: &ShellState, width: u16) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+fn render_extension_chrome(state: &ShellState, width: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(title) = state.extension_title.as_deref() {
+        lines.push(fit_line(
+            &state.theme.bold(&state.theme.fg("accent", title)),
+            width,
+        ));
+    }
+    for rows in state.extension_headers.values() {
+        lines.extend(rows.iter().map(|row| fit_line(row, width)));
+    }
+    for rows in state.extension_widgets.values() {
+        lines.extend(rows.iter().map(|row| fit_line(row, width)));
+    }
+    if !state.extension_status.is_empty() {
+        let separator = semantic_separator(&state.theme);
+        lines.push(fit_line(
+            &state
+                .extension_status
+                .values()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&separator),
+            width,
+        ));
+    }
+    for rows in state.extension_footers.values() {
+        lines.extend(rows.iter().map(|row| fit_line(row, width)));
+    }
+    lines
 }
 
 fn render_subagent_activity(state: &ShellState, width: u16) -> Vec<String> {
@@ -319,12 +352,21 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     // Autocomplete can claim that row below once we know it has real matches.
     let footer_visible = crate::tui::composer_surface::status_footer_visible(state, width);
     let mut composer = crate::tui::composer_surface::render_composer_surface(state, width, now);
+    let mut extensions = if state.panel.is_none() {
+        render_extension_chrome(state, width)
+    } else {
+        Vec::new()
+    };
+    let extension_limit = rows.saturating_sub(header.len() + error.len() + composer.len() + 1);
+    extensions.truncate(extension_limit);
     let mut subagents = if state.panel.is_none() {
         render_subagent_activity(state, width)
     } else {
         Vec::new()
     };
-    let subagent_limit = rows.saturating_sub(header.len() + error.len() + composer.len() + 1);
+    let subagent_limit = rows.saturating_sub(
+        header.len() + error.len() + extensions.len() + composer.len() + 1,
+    );
     // The roster is bounded by the host's eight-concurrent-children cap, but
     // each child renders several rows, so only the viewport bounds how much
     // of the strip shows.
@@ -340,8 +382,9 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
         );
         error.truncate(error_limit);
     }
-    let mut remaining =
-        rows.saturating_sub(header.len() + error.len() + subagents.len() + composer.len());
+    let mut remaining = rows.saturating_sub(
+        header.len() + error.len() + extensions.len() + subagents.len() + composer.len(),
+    );
 
     let panel = render_panel_with_limit(state, width, remaining);
     remaining = remaining.saturating_sub(panel.len());
@@ -366,6 +409,7 @@ pub(super) fn shell_chrome(state: &ShellState, width: u16, now: Instant) -> Shel
     ShellChrome {
         header,
         subagents,
+        extensions,
         composer,
         panel,
         pending,
@@ -386,6 +430,7 @@ pub(super) fn append_viewport_chrome(lines: &mut Vec<String>, chrome: ShellChrom
     lines.extend(chrome.pending);
     lines.extend(chrome.panel);
     lines.extend(chrome.subagents);
+    lines.extend(chrome.extensions);
     lines.extend(chrome.composer);
     // Input discovery expands downward from the composer and temporarily
     // occupies the status row, keeping model/token telemetry from competing
@@ -414,6 +459,7 @@ pub(super) fn append_chrome(
     lines.extend(chrome.pending);
     lines.extend(chrome.panel);
     lines.extend(chrome.subagents);
+    lines.extend(chrome.extensions);
     lines.extend(chrome.composer);
     // Keep autocomplete adjacent to the composer in terminal-owned mode as
     // well as in the application-owned viewport above.
@@ -425,6 +471,7 @@ pub(super) fn shell_chrome_rows(chrome: &ShellChrome) -> usize {
         .header
         .len()
         .saturating_add(chrome.subagents.len())
+        .saturating_add(chrome.extensions.len())
         .saturating_add(chrome.error.len())
         .saturating_add(chrome.pending.len())
         .saturating_add(chrome.suggestions.len())

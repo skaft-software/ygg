@@ -40,7 +40,7 @@ use crate::extension_presentation::ExtensionPresentationSnapshot;
 use crate::extension_secret::{ExtensionSecretBroker, ExtensionSecretRequest};
 use crate::tool::{
     CancellationToken, OutputStream, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput,
-    ToolOutputContentPart, ToolProgressSink,
+    ToolOutputContentPart, ToolProgress, ToolProgressSink,
 };
 
 /// The newest executable-extension API implemented by this Ygg release.
@@ -2986,11 +2986,15 @@ pub struct ExtensionCatalogShortcutDefinition {
 }
 
 /// One provider declaration in an API `0.3` epoch-zero catalog.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionCatalogProviderDeclaration {
     /// Stable provider identifier. Runtime callbacks remain fenced handles.
     pub id: String,
+    /// Serializable public provider/model configuration. Function-valued
+    /// callbacks are represented only by opaque handles into this process.
+    #[serde(default)]
+    pub config: serde_json::Value,
 }
 
 /// Authoritative API `0.3` contribution catalog at process epoch zero.
@@ -3165,6 +3169,13 @@ impl ExtensionCatalogEpochZero {
             .map(|provider| provider.id.clone())
             .collect::<Vec<_>>();
         validate_identifiers("provider", &provider_ids, true)?;
+        for provider in &self.providers {
+            validate_v03_json(
+                &provider.config,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "provider configuration",
+            )?;
+        }
         validate_unique("ordered event", &self.events)?;
         validate_unique("role", &self.roles)?;
         let total = self
@@ -3270,6 +3281,54 @@ pub struct ExtensionHostState {
     /// Skills explicitly active at this boundary.
     #[serde(default)]
     pub active_skills: Vec<ExtensionActiveSkill>,
+    /// Canonical session file path for inspectable Pi session-manager methods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    /// Current active-branch leaf entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_leaf_id: Option<String>,
+    /// Bounded recent active-branch projection in Pi's public entry shape.
+    #[serde(default)]
+    pub session_entries: Vec<serde_json::Value>,
+    /// Bounded session tree projection.
+    #[serde(default)]
+    pub session_tree: Vec<serde_json::Value>,
+    /// Pi-compatible session header projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_header: Option<serde_json::Value>,
+    /// Latest active-branch labels keyed by target entry ID.
+    #[serde(default)]
+    pub session_labels: BTreeMap<String, Option<String>>,
+    /// Complete policy-admitted host tool descriptors.
+    #[serde(default)]
+    pub all_tools: Vec<serde_json::Value>,
+    /// Exact active host tool names.
+    #[serde(default)]
+    pub active_tools: Vec<String>,
+    /// Bounded model registry projection.
+    #[serde(default)]
+    pub models: Vec<serde_json::Value>,
+    /// Bounded command-scoped model projection.
+    #[serde(default)]
+    pub scoped_models: Vec<serde_json::Value>,
+    /// Exact effective system prompt when product policy permits disclosure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Effective system-prompt construction options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_options: Option<serde_json::Value>,
+    /// Bounded context usage snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<serde_json::Value>,
+    /// Whether owner-scoped messages await delivery.
+    #[serde(default)]
+    pub pending_messages: bool,
+    /// Whether the root agent is idle.
+    #[serde(default)]
+    pub idle: bool,
+    /// Host-owned project trust fact.
+    #[serde(default)]
+    pub project_trusted: bool,
 }
 
 /// Compact skill metadata sent to executable extensions.
@@ -4187,6 +4246,18 @@ impl ExtensionLifecycleEvent {
             )));
         }
         Ok(value)
+    }
+
+    fn ordered_event_names(&self) -> &'static [ExtensionOrderedEventName] {
+        use ExtensionOrderedEventName as Event;
+        match self {
+            Self::SessionStarted { .. } => &[Event::SessionStart],
+            Self::SessionSettled { .. } => &[Event::SessionShutdown],
+            Self::TurnStarted { .. } => &[Event::TurnStart, Event::AgentStart],
+            Self::TurnSettled { .. } => &[Event::TurnEnd, Event::AgentEnd, Event::AgentSettled],
+            Self::ToolStarted { .. } => &[Event::ToolExecutionStart],
+            Self::ToolSettled { .. } => &[Event::ToolExecutionEnd],
+        }
     }
 
     fn ordered_dispatch(
@@ -5676,6 +5747,8 @@ pub mod methods {
     pub const EVENT_HANDLE: &str = "event/handle";
     /// API `0.3` bounded batch of non-mutating ordered observations.
     pub const EVENT_BATCH: &str = "event/batch";
+    /// API `0.3` provider stream/OAuth callback invocation.
+    pub const PROVIDER_CALLBACK: &str = "provider/callback";
     /// Graceful lifecycle shutdown request.
     pub const SHUTDOWN: &str = "shutdown";
     /// Idempotent cancellation of a host or extension-originated request.
@@ -5968,6 +6041,7 @@ struct ExtensionProcessInner {
     initial_events: StdMutex<Option<broadcast::Receiver<ExtensionEvent>>>,
     answered_confirmations: StdMutex<AnsweredConfirmations>,
     answered_inputs: StdMutex<AnsweredConfirmations>,
+    answered_host_services: StdMutex<AnsweredConfirmations>,
     generation: AtomicU64,
     next_generation: AtomicU64,
     instance_id: String,
@@ -6014,6 +6088,9 @@ struct ActiveLifecycleTurn {
     started_at: Instant,
     endpoint: LifecycleEndpoint,
     start_queued: bool,
+    message_started: bool,
+    streamed_text: String,
+    streamed_reasoning: String,
 }
 
 struct ActiveLifecycleTool {
@@ -6188,6 +6265,7 @@ impl ExtensionProcess {
                 initial_events: StdMutex::new(Some(initial_events)),
                 answered_confirmations: StdMutex::new(AnsweredConfirmations::default()),
                 answered_inputs: StdMutex::new(AnsweredConfirmations::default()),
+                answered_host_services: StdMutex::new(AnsweredConfirmations::default()),
                 generation: AtomicU64::new(generation),
                 next_generation: AtomicU64::new(generation.saturating_add(1)),
                 instance_id,
@@ -6349,6 +6427,116 @@ impl ExtensionProcess {
             ));
         }
         Ok(Some(result))
+    }
+
+    /// Invokes one provider-owned API `0.3` stream, interception, or OAuth
+    /// callback through its exact process generation and session owner.
+    pub async fn provider_callback(
+        &self,
+        provider: impl Into<String>,
+        action: impl Into<String>,
+        payload: serde_json::Value,
+        mut context: ExtensionExecutionContext,
+    ) -> Result<serde_json::Value, ExtensionRuntimeError> {
+        if self.api_version() != EXTENSION_API_VERSION_0_3 {
+            return Err(ExtensionRuntimeError::Protocol(
+                "provider callbacks require extension API 0.3".to_owned(),
+            ));
+        }
+        let provider = provider.into();
+        if !self
+            .inner
+            .contributions
+            .providers
+            .iter()
+            .any(|declaration| declaration.id == provider)
+        {
+            return Err(self.undeclared("provider", provider));
+        }
+        let action = action.into();
+        validate_identifier("provider callback action", &action, true)?;
+        validate_v03_json(
+            &payload,
+            MAX_EXTENSION_DOCUMENT_BYTES as usize,
+            "provider callback payload",
+        )?;
+        let connection = read_std_lock(&self.inner.connection).clone();
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        let invocation = self
+            .invocation_for_execution(
+                &connection,
+                ExtensionOperationKind::Provider,
+                &context,
+                None,
+            )?
+            .ok_or_else(|| {
+                ExtensionRuntimeError::Protocol(
+                    "API 0.3 provider callback has no invocation".to_owned(),
+                )
+            })?;
+        let mut params = payload.as_object().cloned().ok_or_else(|| {
+            ExtensionRuntimeError::Protocol("provider callback payload must be an object".to_owned())
+        })?;
+        for reserved in ["provider", "action", "invocation", "context"] {
+            if params.contains_key(reserved) {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "provider callback payload contains reserved field `{reserved}`"
+                )));
+            }
+        }
+        params.insert("provider".to_owned(), serde_json::Value::String(provider));
+        params.insert("action".to_owned(), serde_json::Value::String(action));
+        params.insert(
+            "invocation".to_owned(),
+            serde_json::to_value(&invocation)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+        );
+        params.insert(
+            "context".to_owned(),
+            serde_json::to_value(&context)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+        );
+        let result = connection
+            .request_with_resource_owner(
+                methods::PROVIDER_CALLBACK,
+                serde_json::Value::Object(params),
+                self.inner.config.request_timeout,
+                resource_owner,
+                Some(invocation.operation.clone()),
+            )
+            .await?;
+        let mut object = result.as_object().cloned().ok_or_else(|| {
+            ExtensionRuntimeError::Protocol(
+                "provider callback response must be an object".to_owned(),
+            )
+        })?;
+        let effects = object
+            .remove("effects")
+            .ok_or_else(|| {
+                ExtensionRuntimeError::Protocol(
+                    "API 0.3 provider callback omitted its effect journal".to_owned(),
+                )
+            })
+            .and_then(|effects| {
+                serde_json::from_value::<ExtensionEffectJournal>(effects).map_err(|error| {
+                    ExtensionRuntimeError::Protocol(format!(
+                        "invalid provider callback effect journal: {error}"
+                    ))
+                })
+            })?;
+        validate_handler_effect_journal(
+            EXTENSION_API_VERSION_0_3,
+            Some(&invocation),
+            Some(&effects),
+            "provider callback",
+        )?;
+        self.publish_effect_journal(effects);
+        Ok(serde_json::Value::Object(object))
     }
 
     /// Dispatches a bounded batch of subscribed non-barrier API `0.3`
@@ -7131,6 +7319,9 @@ impl ExtensionProcess {
         generation: u64,
         response: ExtensionHostServiceResponse,
     ) -> Result<(), ExtensionRuntimeError> {
+        request_id
+            .validate_confirmation_id()
+            .map_err(ExtensionRuntimeError::Protocol)?;
         let connection = read_std_lock(&self.inner.connection).clone();
         if generation != connection.generation {
             return Err(ExtensionRuntimeError::Closed(format!(
@@ -7153,7 +7344,30 @@ impl ExtensionProcess {
                 validate_v03_plain_text(message, 16 * 1024, "host-service error")?;
             }
         }
-        connection.send_child_response(request_id, &response).await
+        {
+            let mut answered = lock_std_mutex(&self.inner.answered_host_services);
+            if !answered.insert(generation, request_id.clone()) {
+                return Ok(());
+            }
+        }
+        let mut reservation = AnsweredConfirmationReservation {
+            answered: &self.inner.answered_host_services,
+            generation,
+            request_id: request_id.clone(),
+            committed: false,
+        };
+        connection.send_child_response(request_id, &response).await?;
+        reservation.commit();
+        Ok(())
+    }
+
+    /// Whether a product owner already answered this reverse service request.
+    pub fn host_service_answered(
+        &self,
+        request_id: &ExtensionRequestId,
+        generation: u64,
+    ) -> bool {
+        lock_std_mutex(&self.inner.answered_host_services).contains(generation, request_id)
     }
 
     /// Sends a non-veto lifecycle observation to a subscribed API `0.2`
@@ -7163,17 +7377,19 @@ impl ExtensionProcess {
         event: &ExtensionLifecycleEvent,
     ) -> Result<(), ExtensionRuntimeError> {
         if self.api_version() == EXTENSION_API_VERSION_0_3 {
-            let (name, payload, context) = event.ordered_dispatch()?;
-            if let Some(result) = self
-                .dispatch_ordered_event(name, payload, context, true)
-                .await?
-            {
-                if !result.effects.effects.is_empty() {
-                    let generation = result.effects.operation_token.process.generation;
-                    let _ = self.inner.events.send(ExtensionEvent::EffectJournalReady {
-                        generation,
-                        journal: result.effects,
-                    });
+            let (_, payload, context) = event.ordered_dispatch()?;
+            for name in event.ordered_event_names() {
+                if let Some(result) = self
+                    .dispatch_ordered_event(*name, payload.clone(), context.clone(), true)
+                    .await?
+                {
+                    if !result.effects.effects.is_empty() {
+                        let generation = result.effects.operation_token.process.generation;
+                        let _ = self.inner.events.send(ExtensionEvent::EffectJournalReady {
+                            generation,
+                            journal: result.effects,
+                        });
+                    }
                 }
             }
             return Ok(());
@@ -7309,6 +7525,9 @@ impl ExtensionProcess {
                 started_at: Instant::now(),
                 endpoint,
                 start_queued: false,
+                message_started: false,
+                streamed_text: String::new(),
+                streamed_reasoning: String::new(),
             },
         );
         lifecycle
@@ -7328,6 +7547,34 @@ impl ExtensionProcess {
     ) -> Result<bool, ExtensionRuntimeError> {
         let method = event.method();
         let protocol = read_std_lock(&endpoint.connection.protocol).clone();
+        if protocol.version == EXTENSION_API_VERSION_0_3 {
+            let (_, payload, context) = event.ordered_dispatch()?;
+            let mut queued = false;
+            for name in event.ordered_event_names() {
+                if !read_std_lock(&endpoint.connection.v03_catalog)
+                    .as_ref()
+                    .is_some_and(|catalog| catalog.events.contains(name))
+                {
+                    continue;
+                }
+                endpoint
+                    .connection
+                    .ordered_observations
+                    .try_send(QueuedOrderedObservation {
+                        event: *name,
+                        payload: payload.clone(),
+                        context: context.clone(),
+                    })
+                    .map_err(|_| {
+                        ExtensionRuntimeError::Protocol(format!(
+                            "ordered observation queue is full for generation {}",
+                            endpoint.generation
+                        ))
+                    })?;
+                queued = true;
+            }
+            return Ok(queued);
+        }
         if !protocol.supports(EXTENSION_FEATURE_LIFECYCLE_EVENTS)
             || !protocol.lifecycle_events.contains(method)
         {
@@ -7340,6 +7587,37 @@ impl ExtensionProcess {
                 endpoint.generation
             )));
         }
+        Ok(true)
+    }
+
+    fn queue_ordered_observation(
+        endpoint: &LifecycleEndpoint,
+        event: ExtensionOrderedEventName,
+        payload: serde_json::Value,
+        context: ExtensionOrderedEventContext,
+    ) -> Result<bool, ExtensionRuntimeError> {
+        let protocol = read_std_lock(&endpoint.connection.protocol).clone();
+        if protocol.version != EXTENSION_API_VERSION_0_3
+            || !read_std_lock(&endpoint.connection.v03_catalog)
+                .as_ref()
+                .is_some_and(|catalog| catalog.events.contains(&event))
+        {
+            return Ok(false);
+        }
+        endpoint
+            .connection
+            .ordered_observations
+            .try_send(QueuedOrderedObservation {
+                event,
+                payload,
+                context,
+            })
+            .map_err(|_| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "ordered observation queue is full for generation {}",
+                    endpoint.generation
+                ))
+            })?;
         Ok(true)
     }
 
@@ -7627,6 +7905,9 @@ impl ExtensionProcess {
                         started_at: Instant::now(),
                         endpoint: replacement_endpoint.clone(),
                         start_queued,
+                        message_started: turn.message_started,
+                        streamed_text: turn.streamed_text,
+                        streamed_reasoning: turn.streamed_reasoning,
                     },
                 );
             }
@@ -7673,6 +7954,7 @@ impl ExtensionProcess {
             .invalidate_generation(previous.generation);
         lock_std_mutex(&self.inner.answered_confirmations).retain_generation(generation);
         lock_std_mutex(&self.inner.answered_inputs).retain_generation(generation);
+        lock_std_mutex(&self.inner.answered_host_services).retain_generation(generation);
         Ok(ExtensionReloadReport {
             generation,
             previous_shutdown_graceful,
@@ -7855,10 +8137,282 @@ impl ExtensionProcess {
     }
 }
 
+fn extension_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn ordered_turn_context(turn: &ActiveLifecycleTurn) -> ExtensionOrderedEventContext {
+    ExtensionOrderedEventContext {
+        session_owner: turn.context.session_id.clone(),
+        run_id: Some(turn.context.run_id.clone()),
+        turn_id: Some(turn.context.turn_id.clone()),
+        tool_call_id: None,
+        command_id: None,
+    }
+}
+
+fn pi_streaming_assistant(turn: &ActiveLifecycleTurn) -> serde_json::Value {
+    let mut content = Vec::new();
+    if !turn.streamed_reasoning.is_empty() {
+        content.push(serde_json::json!({
+            "type": "thinking",
+            "thinking": turn.streamed_reasoning,
+        }));
+    }
+    if !turn.streamed_text.is_empty() {
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": turn.streamed_text,
+        }));
+    }
+    serde_json::json!({
+        "role": "assistant",
+        "content": content,
+        "api": "ygg",
+        "provider": "ygg",
+        "model": "ygg",
+        "usage": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+        },
+        "stopReason": "pending",
+        "timestamp": extension_unix_millis(),
+    })
+}
+
+fn pi_completed_assistant(
+    message: &ygg_ai::AssistantMessage,
+    stop_reason: &ygg_ai::StopReason,
+    usage: &ygg_ai::Usage,
+) -> serde_json::Value {
+    let content = message
+        .content
+        .iter()
+        .map(|part| match part {
+            ygg_ai::AssistantPart::Text(text) => {
+                serde_json::json!({ "type": "text", "text": text })
+            }
+            ygg_ai::AssistantPart::Reasoning(reasoning) => serde_json::json!({
+                "type": "thinking",
+                "thinking": reasoning.text,
+            }),
+            ygg_ai::AssistantPart::ToolCall(call) => serde_json::json!({
+                "type": "toolCall",
+                "id": call.id.0,
+                "name": call.name,
+                "arguments": call.arguments_value().unwrap_or(serde_json::Value::Null),
+            }),
+            ygg_ai::AssistantPart::Media(media) => serde_json::json!({
+                "type": "media",
+                "media": media,
+            }),
+        })
+        .collect::<Vec<_>>();
+    let stop_reason = match stop_reason {
+        ygg_ai::StopReason::MaxTokens => "length",
+        ygg_ai::StopReason::ToolUse => "toolUse",
+        _ => "stop",
+    };
+    serde_json::json!({
+        "role": "assistant",
+        "content": content,
+        "api": "ygg",
+        "provider": "ygg",
+        "model": message.model.0,
+        "usage": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "cacheRead": usage.cache_read_tokens,
+            "cacheWrite": usage.cache_write_tokens,
+            "reasoning": usage.reasoning_tokens,
+            "totalTokens": usage.total_tokens,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+        },
+        "stopReason": stop_reason,
+        "timestamp": extension_unix_millis(),
+    })
+}
+
 impl ExtensionProcess {
     fn observe_agent_event(&self, event: &AgentEvent, resource_owner: Option<&str>) {
         match event {
-            AgentEvent::ToolStarted { id, name, .. } => {
+            AgentEvent::TurnStarted => {
+                let mut lifecycle = lock_std_mutex(&self.inner.lifecycle);
+                let owner = resource_owner.map(str::to_owned).or_else(|| {
+                    (lifecycle.turns.len() == 1)
+                        .then(|| lifecycle.turns.keys().next().cloned())
+                        .flatten()
+                });
+                let Some(owner) = owner else {
+                    return;
+                };
+                let Some(turn) = lifecycle.turns.get_mut(&owner) else {
+                    return;
+                };
+                turn.message_started = true;
+                turn.streamed_text.clear();
+                turn.streamed_reasoning.clear();
+                let endpoint = turn.endpoint.clone();
+                let context = ordered_turn_context(turn);
+                let message = pi_streaming_assistant(turn);
+                drop(lifecycle);
+                let _ = Self::queue_ordered_observation(
+                    &endpoint,
+                    ExtensionOrderedEventName::MessageStart,
+                    serde_json::json!({ "message": message }),
+                    context,
+                );
+            }
+            AgentEvent::OutputDelta { channel, text } => {
+                let mut lifecycle = lock_std_mutex(&self.inner.lifecycle);
+                let owner = resource_owner.map(str::to_owned).or_else(|| {
+                    (lifecycle.turns.len() == 1)
+                        .then(|| lifecycle.turns.keys().next().cloned())
+                        .flatten()
+                });
+                let Some(owner) = owner else {
+                    return;
+                };
+                let Some(turn) = lifecycle.turns.get_mut(&owner) else {
+                    return;
+                };
+                let needs_start = !turn.message_started;
+                turn.message_started = true;
+                let (kind, content_index) = match channel {
+                    crate::events::OutputChannel::Text => {
+                        turn.streamed_text.push_str(text);
+                        (
+                            "text_delta",
+                            usize::from(!turn.streamed_reasoning.is_empty()),
+                        )
+                    }
+                    crate::events::OutputChannel::Reasoning => {
+                        turn.streamed_reasoning.push_str(text);
+                        ("thinking_delta", 0)
+                    }
+                };
+                let endpoint = turn.endpoint.clone();
+                let context = ordered_turn_context(turn);
+                let message = pi_streaming_assistant(turn);
+                drop(lifecycle);
+                if needs_start {
+                    let _ = Self::queue_ordered_observation(
+                        &endpoint,
+                        ExtensionOrderedEventName::MessageStart,
+                        serde_json::json!({ "message": message.clone() }),
+                        context.clone(),
+                    );
+                }
+                let _ = Self::queue_ordered_observation(
+                    &endpoint,
+                    ExtensionOrderedEventName::MessageUpdate,
+                    serde_json::json!({
+                        "message": message.clone(),
+                        "assistantMessageEvent": {
+                            "type": kind,
+                            "contentIndex": content_index,
+                            "delta": text,
+                            "partial": message,
+                        },
+                    }),
+                    context,
+                );
+            }
+            AgentEvent::TurnFinished {
+                message,
+                stop_reason,
+                turn_usage,
+                ..
+            } => {
+                let lifecycle = lock_std_mutex(&self.inner.lifecycle);
+                let owner = resource_owner.map(str::to_owned).or_else(|| {
+                    (lifecycle.turns.len() == 1)
+                        .then(|| lifecycle.turns.keys().next().cloned())
+                        .flatten()
+                });
+                let Some(owner) = owner else {
+                    return;
+                };
+                let Some(turn) = lifecycle.turns.get(&owner).cloned() else {
+                    return;
+                };
+                drop(lifecycle);
+                let message = pi_completed_assistant(message, stop_reason, turn_usage);
+                let _ = Self::queue_ordered_observation(
+                    &turn.endpoint,
+                    ExtensionOrderedEventName::MessageEnd,
+                    serde_json::json!({ "message": message }),
+                    ordered_turn_context(&turn),
+                );
+            }
+            AgentEvent::ToolProgress { id, progress } => {
+                let lifecycle = lock_std_mutex(&self.inner.lifecycle);
+                let owner = resource_owner.map(str::to_owned).or_else(|| {
+                    let mut owners = lifecycle
+                        .tools
+                        .keys()
+                        .filter(|(_, tool_call_id)| tool_call_id == &id.0)
+                        .map(|(owner, _)| owner.clone());
+                    let first = owners.next();
+                    (owners.next().is_none()).then_some(first).flatten()
+                });
+                let Some(owner) = owner else {
+                    return;
+                };
+                let Some(active) = lifecycle.tools.get(&(owner, id.0.clone())) else {
+                    return;
+                };
+                let partial_result = match progress {
+                    ToolProgress::Output { stream, bytes } => serde_json::json!({
+                        "content": [{
+                            "type": "text",
+                            "text": String::from_utf8_lossy(bytes),
+                        }],
+                        "stream": match stream {
+                            OutputStream::Stdout => "stdout",
+                            OutputStream::Stderr => "stderr",
+                        },
+                    }),
+                    ToolProgress::Status(status) => {
+                        serde_json::json!({ "content": [{ "type": "text", "text": status }] })
+                    }
+                    ToolProgress::Dropped { bytes, events } => {
+                        serde_json::json!({ "droppedBytes": bytes, "droppedEvents": events })
+                    }
+                    ToolProgress::Confirmation(_)
+                    | ToolProgress::Input(_)
+                    | ToolProgress::SessionEvent(_, _) => return,
+                };
+                let endpoint = active.endpoint.clone();
+                let context = ExtensionOrderedEventContext {
+                    session_owner: active.context.session_id.clone(),
+                    run_id: Some(active.context.run_id.clone()),
+                    turn_id: Some(active.context.turn_id.clone()),
+                    tool_call_id: Some(id.0.clone()),
+                    command_id: None,
+                };
+                let payload = serde_json::json!({
+                    "tool_call_id": id.0,
+                    "tool_name": active.name,
+                    "args": {},
+                    "partialResult": partial_result,
+                });
+                drop(lifecycle);
+                let _ = Self::queue_ordered_observation(
+                    &endpoint,
+                    ExtensionOrderedEventName::ToolExecutionUpdate,
+                    payload,
+                    context,
+                );
+            }
+            AgentEvent::ToolStarted { id, name, args } => {
                 let mut lifecycle = lock_std_mutex(&self.inner.lifecycle);
                 let owner = resource_owner.map(str::to_owned).or_else(|| {
                     (lifecycle.turns.len() == 1)
@@ -7877,16 +8431,36 @@ impl ExtensionProcess {
                     context: turn.context.clone(),
                     endpoint: turn.endpoint.clone(),
                 };
-                let _ = Self::queue_lifecycle_observation(
+                let event_context = ExtensionOrderedEventContext {
+                    session_owner: active.context.session_id.clone(),
+                    run_id: Some(active.context.run_id.clone()),
+                    turn_id: Some(active.context.turn_id.clone()),
+                    tool_call_id: Some(id.0.clone()),
+                    command_id: None,
+                };
+                let ordered = Self::queue_ordered_observation(
                     &active.endpoint,
-                    ExtensionLifecycleEvent::ToolStarted {
-                        session_id: active.context.session_id.clone(),
-                        run_id: active.context.run_id.clone(),
-                        turn_id: active.context.turn_id.clone(),
-                        tool_call_id: id.0.clone(),
-                        tool_name: name.clone(),
-                    },
-                );
+                    ExtensionOrderedEventName::ToolExecutionStart,
+                    serde_json::json!({
+                        "tool_call_id": id.0,
+                        "tool_name": name,
+                        "args": args,
+                    }),
+                    event_context,
+                )
+                .unwrap_or(false);
+                if !ordered {
+                    let _ = Self::queue_lifecycle_observation(
+                        &active.endpoint,
+                        ExtensionLifecycleEvent::ToolStarted {
+                            session_id: active.context.session_id.clone(),
+                            run_id: active.context.run_id.clone(),
+                            turn_id: active.context.turn_id.clone(),
+                            tool_call_id: id.0.clone(),
+                            tool_name: name.clone(),
+                        },
+                    );
+                }
                 lifecycle.tools.insert((owner, id.0.clone()), active);
             }
             AgentEvent::ToolFinished { id, result, .. } => {
@@ -7923,19 +8497,56 @@ impl ExtensionProcess {
                 });
                 let duration_ms =
                     u64::try_from(active.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                let _ = Self::queue_lifecycle_observation(
+                let (result_value, is_error) = match result {
+                    Ok(output) => (
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": output.text }],
+                            "details": output.details(),
+                        }),
+                        output.is_error(),
+                    ),
+                    Err(error) => (
+                        serde_json::json!({
+                            "content": [{ "type": "text", "text": error.message }],
+                        }),
+                        true,
+                    ),
+                };
+                let event_context = ExtensionOrderedEventContext {
+                    session_owner: active.context.session_id.clone(),
+                    run_id: Some(active.context.run_id.clone()),
+                    turn_id: Some(active.context.turn_id.clone()),
+                    tool_call_id: Some(id.0.clone()),
+                    command_id: None,
+                };
+                let ordered = Self::queue_ordered_observation(
                     &active.endpoint,
-                    ExtensionLifecycleEvent::ToolSettled {
-                        session_id: active.context.session_id,
-                        run_id: active.context.run_id,
-                        turn_id: active.context.turn_id,
-                        tool_call_id: id.0.clone(),
-                        tool_name: active.name,
-                        outcome,
-                        duration_ms,
-                        reason,
-                    },
-                );
+                    ExtensionOrderedEventName::ToolExecutionEnd,
+                    serde_json::json!({
+                        "tool_call_id": id.0,
+                        "tool_name": active.name,
+                        "result": result_value,
+                        "is_error": is_error,
+                        "duration_ms": duration_ms,
+                    }),
+                    event_context,
+                )
+                .unwrap_or(false);
+                if !ordered {
+                    let _ = Self::queue_lifecycle_observation(
+                        &active.endpoint,
+                        ExtensionLifecycleEvent::ToolSettled {
+                            session_id: active.context.session_id,
+                            run_id: active.context.run_id,
+                            turn_id: active.context.turn_id,
+                            tool_call_id: id.0.clone(),
+                            tool_name: active.name,
+                            outcome,
+                            duration_ms,
+                            reason,
+                        },
+                    );
+                }
             }
             _ => {}
         }
@@ -8701,6 +9312,12 @@ impl Drop for DocumentOperationLease {
     }
 }
 
+struct QueuedOrderedObservation {
+    event: ExtensionOrderedEventName,
+    payload: serde_json::Value,
+    context: ExtensionOrderedEventContext,
+}
+
 struct ProcessConnection {
     writer: mpsc::Sender<WriterFrame>,
     child: Arc<Mutex<Child>>,
@@ -8714,6 +9331,7 @@ struct ProcessConnection {
     documents: ExtensionDocuments,
     ordered_sequence: AtomicU64,
     ordered_dispatch: Mutex<()>,
+    ordered_observations: mpsc::Sender<QueuedOrderedObservation>,
     principal: ExtensionPrincipal,
     instance_id: String,
     operation_mode: ExtensionOperationMode,
@@ -8722,6 +9340,7 @@ struct ProcessConnection {
     active_admissions: AtomicU64,
     slots: StdRwLock<Arc<Semaphore>>,
     max_message_bytes: usize,
+    request_timeout: Duration,
     shutdown_timeout: Duration,
     cancellation_grace: Duration,
     tombstone_ttl: Duration,
@@ -9193,6 +9812,95 @@ impl ProcessConnection {
         };
         invocation.validate()?;
         Ok(invocation)
+    }
+
+    async fn dispatch_ordered_observation(
+        self: &Arc<Self>,
+        event: ExtensionOrderedEventName,
+        payload: serde_json::Value,
+        context: ExtensionOrderedEventContext,
+    ) -> Result<(), ExtensionRuntimeError> {
+        if !read_std_lock(&self.v03_catalog)
+            .as_ref()
+            .is_some_and(|catalog| catalog.events.contains(&event))
+        {
+            return Ok(());
+        }
+        let _ordered = self.ordered_dispatch.lock().await;
+        if self.draining.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return Err(ExtensionRuntimeError::Closed(
+                "extension generation is not accepting ordered observations".to_owned(),
+            ));
+        }
+        let sequence = self
+            .ordered_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| next.checked_add(1))
+            .map_err(|_| {
+                ExtensionRuntimeError::Protocol(
+                    "ordered-event sequence space is exhausted".to_owned(),
+                )
+            })?;
+        let invocation = self.new_v03_invocation(
+            ExtensionOperationKind::Event,
+            &context,
+            self.request_timeout,
+        )?;
+        let encoded_payload = serde_json::to_vec(&payload)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let (_document_lease, payload) =
+            if encoded_payload.len() > MAX_EXTENSION_INLINE_SEMANTIC_BYTES {
+                validate_v03_json(
+                    &payload,
+                    MAX_EXTENSION_DOCUMENT_BYTES as usize,
+                    "ordered-event document payload",
+                )?;
+                let (reference, lease) = self.stage_v03_document(&invocation, encoded_payload)?;
+                (
+                    Some(lease),
+                    serde_json::json!({ "document": reference, "encoding": "json" }),
+                )
+            } else {
+                (None, payload)
+            };
+        let dispatch = ExtensionOrderedEvent {
+            sequence,
+            event,
+            invocation,
+            payload,
+            barrier: true,
+        };
+        dispatch.validate()?;
+        let value = serde_json::to_value(&dispatch)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let result = self
+            .request_with_v03_operation(
+                methods::EVENT_HANDLE,
+                value,
+                self.request_timeout,
+                dispatch.invocation.operation.clone(),
+            )
+            .await?;
+        let result: ExtensionOrderedEventResult = serde_json::from_value(result).map_err(|error| {
+            ExtensionRuntimeError::Protocol(format!(
+                "invalid `{}` response: {error}",
+                methods::EVENT_HANDLE
+            ))
+        })?;
+        result.validate()?;
+        if result.sequence != dispatch.sequence
+            || result.effects.operation_token != dispatch.invocation.operation
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "ordered-event response did not echo its sequence and operation token".to_owned(),
+            ));
+        }
+        if !result.effects.effects.is_empty() {
+            let _ = self.events.send(ExtensionEvent::EffectJournalReady {
+                generation: self.generation,
+                journal: result.effects,
+            });
+        }
+        Ok(())
     }
 
     fn stage_v03_document(
@@ -9920,6 +10628,34 @@ impl ProcessConnection {
     }
 }
 
+async fn run_ordered_observations(
+    connection: Weak<ProcessConnection>,
+    mut observations: mpsc::Receiver<QueuedOrderedObservation>,
+) {
+    while let Some(observation) = observations.recv().await {
+        let Some(connection) = connection.upgrade() else {
+            return;
+        };
+        if let Err(error) = connection
+            .dispatch_ordered_observation(
+                observation.event,
+                observation.payload,
+                observation.context,
+            )
+            .await
+        {
+            if connection.closed.load(Ordering::Acquire)
+                || connection.draining.load(Ordering::Acquire)
+            {
+                return;
+            }
+            let _ = connection.events.send(ExtensionEvent::Diagnostic {
+                message: format!("ordered observation failed: {error}"),
+            });
+        }
+    }
+}
+
 impl Drop for ProcessConnection {
     fn drop(&mut self) {
         self.process_group.terminate_now();
@@ -10198,6 +10934,8 @@ async fn spawn_connection(
         config.max_message_bytes,
     ));
 
+    let (ordered_observations, ordered_observation_rx) =
+        mpsc::channel(config.max_pending_requests.max(1));
     let connection = Arc::new(ProcessConnection {
         writer,
         child,
@@ -10211,6 +10949,7 @@ async fn spawn_connection(
         documents,
         ordered_sequence: AtomicU64::new(1),
         ordered_dispatch: Mutex::new(()),
+        ordered_observations,
         principal: descriptor.principal.clone(),
         instance_id: instance_id.to_owned(),
         operation_mode: config.operation_mode,
@@ -10219,6 +10958,7 @@ async fn spawn_connection(
         active_admissions: AtomicU64::new(0),
         slots: StdRwLock::new(Arc::new(Semaphore::new(config.max_pending_requests))),
         max_message_bytes: config.max_message_bytes,
+        request_timeout: config.request_timeout,
         shutdown_timeout: config.shutdown_timeout,
         cancellation_grace: config.cancellation_grace,
         tombstone_ttl: config.tombstone_ttl,
@@ -10238,6 +10978,10 @@ async fn spawn_connection(
         process_group,
         _staging: staging,
     });
+    tokio::spawn(run_ordered_observations(
+        Arc::downgrade(&connection),
+        ordered_observation_rx,
+    ));
     artifact_guard.disarm();
     let offered_host_services = OfferedHostServices {
         agent_sessions: config.agent_sessions,

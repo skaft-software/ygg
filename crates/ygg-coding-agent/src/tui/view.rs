@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender};
@@ -693,6 +693,15 @@ pub(crate) struct ShellState {
     /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
     pub(crate) editor_cursor: usize,
     status_detail: String,
+    pub(crate) extension_status: BTreeMap<String, String>,
+    pub(crate) extension_widgets: BTreeMap<String, Vec<String>>,
+    pub(crate) extension_headers: BTreeMap<String, Vec<String>>,
+    pub(crate) extension_footers: BTreeMap<String, Vec<String>>,
+    pub(crate) extension_working_message: Option<String>,
+    pub(crate) extension_working_indicator: Option<Vec<String>>,
+    pub(crate) extension_working_visible: Option<bool>,
+    pub(crate) extension_hidden_thinking_label: Option<String>,
+    pub(crate) extension_title: Option<String>,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
     tool_panels: HashMap<ToolCallId, usize>,
@@ -1158,7 +1167,16 @@ impl ShellState {
     }
 
     fn open_working_status(&mut self) {
-        self.open_activity_status(Some("Working"), false);
+        let label = if self.extension_working_visible == Some(false) {
+            None
+        } else {
+            Some(
+                self.extension_working_message
+                    .clone()
+                    .unwrap_or_else(|| "Working".to_owned()),
+            )
+        };
+        self.open_activity_status(label.as_deref(), false);
     }
 
     fn open_activity_status(&mut self, label: Option<&str>, show_reasoning_hint: bool) {
@@ -3739,6 +3757,151 @@ impl InteractiveShell {
         if let Some(Panel::SessionPicker { picker }) = state.panel.as_mut() {
             picker.message = Some((message.into(), Instant::now() + ttl));
         }
+    }
+
+    /// Apply one validated extension-owned semantic UI state update. Remote
+    /// component rows have already passed the API 0.3 frame codec; this final
+    /// boundary namespaces retained state by extension and strips controls from
+    /// scalar text before it reaches terminal-owned chrome.
+    pub(crate) fn apply_extension_ui_state(
+        &mut self,
+        extension: &str,
+        key: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        fn frame_rows(value: &serde_json::Value) -> Result<Option<Vec<String>>> {
+            if value.is_null() {
+                return Ok(None);
+            }
+            let rows = value
+                .get("rows")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("remote component frame is missing rows"))?;
+            rows.iter()
+                .map(|row| {
+                    let row = row
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("remote component row is not text"))?;
+                    sexy_tui_rs::parse_pi_rendered_row(row)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    Ok(row.to_owned())
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(Some)
+        }
+
+        let mut state = self.state.borrow_mut();
+        let owner_key = |suffix: &str| format!("{extension}:{suffix}");
+        match key {
+            "status" => {
+                let status_key = value
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("extension status is missing its key"))?;
+                let map_key = owner_key(status_key);
+                match value.get("text").and_then(serde_json::Value::as_str) {
+                    Some(text) => {
+                        state
+                            .extension_status
+                            .insert(map_key, sanitize_for_terminal(text));
+                    }
+                    None => {
+                        state.extension_status.remove(&map_key);
+                    }
+                }
+            }
+            "widget" => {
+                let widget_key = value
+                    .get("key")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("extension widget is missing its key"))?;
+                let map_key = owner_key(widget_key);
+                match frame_rows(value.get("frame").unwrap_or(&serde_json::Value::Null))? {
+                    Some(rows) => {
+                        state.extension_widgets.insert(map_key, rows);
+                    }
+                    None => {
+                        state.extension_widgets.remove(&map_key);
+                    }
+                }
+            }
+            "header" | "footer" => {
+                let map = if key == "header" {
+                    &mut state.extension_headers
+                } else {
+                    &mut state.extension_footers
+                };
+                match frame_rows(value)? {
+                    Some(rows) => {
+                        map.insert(extension.to_owned(), rows);
+                    }
+                    None => {
+                        map.remove(extension);
+                    }
+                }
+            }
+            "custom" | "editor_component" => {
+                let map_key = owner_key(key);
+                match frame_rows(value)? {
+                    Some(rows) => {
+                        state.extension_widgets.insert(map_key, rows);
+                    }
+                    None => {
+                        state.extension_widgets.remove(&map_key);
+                    }
+                }
+            }
+            "working_message" => {
+                state.extension_working_message = value
+                    .as_str()
+                    .map(sanitize_for_terminal);
+            }
+            "working_visible" => {
+                state.extension_working_visible = value.as_bool();
+            }
+            "working_indicator" => {
+                state.extension_working_indicator = value
+                    .get("frames")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|frames| {
+                        frames
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(sanitize_for_terminal)
+                            .collect()
+                    });
+            }
+            "hidden_thinking_label" => {
+                state.extension_hidden_thinking_label =
+                    value.as_str().map(sanitize_for_terminal);
+            }
+            "title" => {
+                state.extension_title = value.as_str().map(sanitize_for_terminal);
+            }
+            "editor_text" => {
+                let text = value
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("extension editor text is not a string"))?;
+                let (text, cursor) = sanitized_editor(text, text.len());
+                state.editor = text;
+                state.editor_cursor = cursor;
+                state.slash_selection = 0;
+                state.slash_scroll = 0;
+                state.slash_popup_dismissed = false;
+            }
+            "disclosure" => {
+                state.verbose_tools = value
+                    .as_bool()
+                    .ok_or_else(|| anyhow::anyhow!("extension disclosure state is not boolean"))?;
+            }
+            // Autocomplete callback transport and Pi theme selection are
+            // retained by the bridge. Their state update is still explicit,
+            // but neither contains terminal rows to project here.
+            "autocomplete" | "theme" | "terminal_input" => {}
+            other => anyhow::bail!("unsupported extension UI state key {other:?}"),
+        }
+        *state.cached_layout.get_mut() = None;
+        Ok(())
     }
 
     /// Put a selected user message back into the ordinary composer.

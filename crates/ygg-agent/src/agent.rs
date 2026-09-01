@@ -1581,7 +1581,10 @@ fn pending_tool_state(session: &Session) -> Option<(Vec<ToolCall>, HashSet<ygg_a
                     persisted.insert(result.tool_call_id.clone());
                 }
             }
-            EntryValue::Compaction { .. }
+            EntryValue::ExtensionCustom { .. }
+            | EntryValue::ExtensionCustomMessage { .. }
+            | EntryValue::ExtensionLabel { .. }
+            | EntryValue::Compaction { .. }
             | EntryValue::ResponsesTurn { .. }
             | EntryValue::ResponsesCompaction { .. }
             | EntryValue::Config { .. }
@@ -2332,8 +2335,11 @@ fn previous_message_is_user(session: &Session, entry: &crate::session::Entry) ->
         };
         match &previous.value {
             EntryValue::Message(Message::User(user)) => return !user.content.is_empty(),
+            EntryValue::ExtensionCustomMessage { content, .. } => return !content.is_empty(),
             EntryValue::Message(Message::Assistant(_)) => return false,
-            EntryValue::Compaction { .. }
+            EntryValue::ExtensionCustom { .. }
+            | EntryValue::ExtensionLabel { .. }
+            | EntryValue::Compaction { .. }
             | EntryValue::ResponsesTurn { .. }
             | EntryValue::ResponsesCompaction { .. }
             | EntryValue::Config { .. }

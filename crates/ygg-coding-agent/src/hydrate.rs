@@ -379,6 +379,23 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     }
                 }
             }
+            EntryValue::ExtensionCustomMessage {
+                content, display, ..
+            } => {
+                if let Some(text) = display.as_deref().filter(|text| !text.is_empty()) {
+                    items.push(TranscriptItem::User {
+                        text: text.to_owned(),
+                        model_lab: active_lab,
+                        prompt_color: None,
+                    });
+                } else if display.is_none() && !content.is_empty() {
+                    items.push(TranscriptItem::User {
+                        text: content.clone(),
+                        model_lab: active_lab,
+                        prompt_color: None,
+                    });
+                }
+            }
             EntryValue::Config { model, .. } => {
                 // Update the active model lab whenever a config entry
                 // records a model change.
@@ -397,7 +414,9 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
             EntryValue::ResponsesCompaction { .. } => {
                 items.push(TranscriptItem::NativeCompactionMarker);
             }
-            EntryValue::ResponsesTurn { .. }
+            EntryValue::ExtensionCustom { .. }
+            | EntryValue::ExtensionLabel { .. }
+            | EntryValue::ResponsesTurn { .. }
             | EntryValue::SkillActivated { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::SkillResourceRead { .. }

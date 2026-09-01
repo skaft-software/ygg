@@ -968,6 +968,39 @@ impl<'a> RpcSessionProjection<'a> {
                     value.insert("details".into(), details);
                 }
             }
+            EntryValue::ExtensionCustom {
+                custom_type,
+                details,
+                ..
+            } => {
+                value.insert("type".into(), Value::String("custom".into()));
+                value.insert("customType".into(), Value::String(custom_type.clone()));
+                value.insert("data".into(), details.clone());
+            }
+            EntryValue::ExtensionCustomMessage {
+                custom_type,
+                content,
+                display,
+                details,
+                ..
+            } => {
+                value.insert("type".into(), Value::String("custom_message".into()));
+                value.insert("customType".into(), Value::String(custom_type.clone()));
+                value.insert("content".into(), Value::String(content.clone()));
+                value.insert(
+                    "display".into(),
+                    display.clone().map_or(Value::Null, Value::String),
+                );
+                value.insert("details".into(), details.clone());
+            }
+            EntryValue::ExtensionLabel { target, label, .. } => {
+                value.insert("type".into(), Value::String("label".into()));
+                value.insert("targetId".into(), Value::String(target.0.clone()));
+                value.insert(
+                    "label".into(),
+                    label.clone().map_or(Value::Null, Value::String),
+                );
+            }
             other => {
                 let custom_type = match other {
                     EntryValue::Config { .. } => "ygg:config",
@@ -977,7 +1010,11 @@ impl<'a> RpcSessionProjection<'a> {
                     EntryValue::SkillDeactivated { .. } => "ygg:legacy-skill-deactivated",
                     EntryValue::ResponsesTurn { .. } => "ygg:responses-turn",
                     EntryValue::ResponsesCompaction { .. } => "ygg:responses-compaction",
-                    EntryValue::Message(_) | EntryValue::Compaction { .. } => {
+                    EntryValue::ExtensionCustom { .. }
+                    | EntryValue::ExtensionCustomMessage { .. }
+                    | EntryValue::ExtensionLabel { .. }
+                    | EntryValue::Message(_)
+                    | EntryValue::Compaction { .. } => {
                         unreachable!("message and compaction entries are handled above")
                     }
                 };

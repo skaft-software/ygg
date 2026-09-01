@@ -20,18 +20,20 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use serde_json::Value;
+use sexy_tui_rs::{RemoteComponentId, RemoteFrame};
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
-    DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
-    ExtensionHook, ExtensionHookDisposition, ExtensionHostServiceResponse, ExtensionHostState,
-    ExtensionInputRequest,
-    ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
-    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionPrincipal, ExtensionProcess,
-    ExtensionRequestId, ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust,
+    DiscoveredExtension, ExtensionEffect, ExtensionEffectJournal, ExtensionEvent,
+    ExtensionHealthSnapshot, ExtensionHealthState, ExtensionHook, ExtensionHookDisposition,
+    ExtensionHostServiceDescriptor, ExtensionHostServiceLimits, ExtensionHostServiceRequest,
+    ExtensionHostServiceResponse, ExtensionHostState, ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
+    ExtensionLifecycleOutcome, ExtensionManifest, ExtensionMessageDelivery, ExtensionPolicy,
+    ExtensionPolicyEvaluationResponse, ExtensionPrincipal, ExtensionProcess, ExtensionRequestId,
+    ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust,
     ExtensionUiSurface, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
     EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
     EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
@@ -404,6 +406,22 @@ pub trait ExtensionConfirmationHandler {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
         Box::pin(std::future::ready(Ok(None)))
     }
+
+    fn host_service<'a>(
+        &'a mut self,
+        _extension: &'a str,
+        request: &'a ExtensionHostServiceRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ExtensionHostServiceResponse>> + 'a>> {
+        let service = format!(
+            "{}@{}:{}",
+            request.service,
+            request.version.as_u16(),
+            request.scope.as_str()
+        );
+        Box::pin(std::future::ready(Ok(ExtensionHostServiceResponse::Error {
+            message: format!("host service {service} is unavailable in this product mode"),
+        })))
+    }
 }
 
 struct PreapprovedExtensionConfirmation<'a, H: ?Sized> {
@@ -440,6 +458,14 @@ where
         request: &'a ExtensionInputRequest,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Option<String>>> + 'a>> {
         self.inner.input(extension, request)
+    }
+
+    fn host_service<'a>(
+        &'a mut self,
+        extension: &'a str,
+        request: &'a ExtensionHostServiceRequest,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<ExtensionHostServiceResponse>> + 'a>> {
+        self.inner.host_service(extension, request)
     }
 }
 
@@ -699,6 +725,37 @@ fn reduce_presentation_update(
     Ok(compact)
 }
 
+struct PendingExtensionEffects {
+    extension: String,
+    journal: ExtensionEffectJournal,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExtensionUiStateUpdate {
+    pub extension: String,
+    pub key: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionMessageAction {
+    Steer(String),
+    FollowUp(String),
+    NextTurn(String),
+    User(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ExtensionEffectApplication {
+    pub messages: Vec<String>,
+    pub messaging: Vec<ExtensionMessageAction>,
+    pub ui: Vec<ExtensionUiStateUpdate>,
+    pub selected_model: Option<String>,
+    pub selected_reasoning: Option<Value>,
+    pub provider_updates: Vec<Value>,
+    pub catalog_updates: Vec<Value>,
+}
+
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
@@ -715,9 +772,14 @@ pub struct ExecutableExtensions {
     input_cancellations: VecDeque<PendingInputCancellation>,
     input_tasks: Vec<JoinHandle<()>>,
     host_service_tasks: Vec<JoinHandle<()>>,
+    pending_effects: VecDeque<PendingExtensionEffects>,
+    extension_host: Option<ExtensionHost>,
+    ui_state: BTreeMap<(String, String), Value>,
+    applied_effect_operations: BTreeSet<(String, u64, u64)>,
     policy_supervisors: Vec<JoinHandle<()>>,
     session_id: Option<String>,
     resource_owner: Option<String>,
+    project_trusted: bool,
     session_started_at: Instant,
     session_lifecycle_started: bool,
     last_lifecycle_outcome: Option<ExtensionLifecycleOutcome>,
@@ -910,9 +972,14 @@ impl Default for ExecutableExtensions {
             input_cancellations: VecDeque::new(),
             input_tasks: Vec::new(),
             host_service_tasks: Vec::new(),
+            pending_effects: VecDeque::new(),
+            extension_host: None,
+            ui_state: BTreeMap::new(),
+            applied_effect_operations: BTreeSet::new(),
             policy_supervisors: Vec::new(),
             session_id: None,
             resource_owner: None,
+            project_trusted: false,
             session_started_at: Instant::now(),
             session_lifecycle_started: false,
             last_lifecycle_outcome: None,
@@ -1028,7 +1095,14 @@ impl ExecutableExtensions {
                 ));
             }
         }
-        let host_state = host_state(session, model, reasoning, sessions);
+        let host_state = host_state(
+            session,
+            model,
+            reasoning,
+            sessions,
+            Some(host),
+            config.workspace_trusted,
+        );
         let has_enabled_trusted = descriptors.iter().any(|descriptor| {
             descriptor.activation.enabled && descriptor.activation.trust == ExtensionTrust::Trusted
         });
@@ -1061,6 +1135,7 @@ impl ExecutableExtensions {
         } else {
             let workspace = config.workspace.clone();
             let state = host_state.clone();
+            let mut launch_host = host.clone();
             let subagents_tool_available =
                 model.spec.capabilities.tools && config.tool_available("subagent_spawn");
             match block_on_runtime(async move {
@@ -1069,6 +1144,7 @@ impl ExecutableExtensions {
                     let name = descriptor.manifest.name.clone();
                     let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
                     runtime.host_state = state.clone();
+                    runtime.host_services = product_host_services(&descriptor.manifest);
                     runtime.agent_sessions =
                         name == SUBAGENTS_EXTENSION_NAME && subagents_tool_available;
                     starts.push(async move {
@@ -1087,22 +1163,26 @@ impl ExecutableExtensions {
                         // dynamic child must not wait behind a slow sibling's
                         // independent initialization deadline, while observer
                         // and hook registration still follows discovery order.
-                        process.register_dynamic_tool_catalog(host);
+                        process.register_dynamic_tool_catalog(&mut launch_host);
                     }
                     completed.push((index, name, start));
                 }
                 completed.sort_by_key(|(index, _, _)| *index);
                 for (_, _, start) in &completed {
                     if let Ok(process) = start {
-                        host.load(process);
+                        launch_host.load(process);
                     }
                 }
-                completed
+                let starts = completed
                     .into_iter()
                     .map(|(_, name, start)| (name, start))
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (starts, launch_host)
             }) {
-                Ok(starts) => starts,
+                Ok((starts, launch_host)) => {
+                    *host = launch_host;
+                    starts
+                }
                 Err(error) => {
                     diagnostics.push(format!(
                         "error: executable extensions could not start: {error}"
@@ -1203,9 +1283,11 @@ impl ExecutableExtensions {
         extensions.processes = processes;
         extensions.receivers = receivers;
         extensions.summaries = summaries;
+        extensions.extension_host = Some(host.clone());
         extensions.diagnostics.extend(diagnostics);
         extensions.session_id = host_state.session_id.clone();
         extensions.resource_owner = Some(session.resource_owner_key());
+        extensions.project_trusted = config.workspace_trusted;
         extensions.start_policy_supervisors();
         extensions.start_session_lifecycle();
         extensions
@@ -1652,7 +1734,14 @@ impl ExecutableExtensions {
         reasoning: &ReasoningConfig,
         sessions: &SessionStore,
     ) {
-        let state = host_state(session, model, reasoning, sessions);
+        let state = host_state(
+            session,
+            model,
+            reasoning,
+            sessions,
+            self.extension_host.as_ref(),
+            self.project_trusted,
+        );
         for process in &self.processes {
             process.set_host_state(state.clone());
         }
@@ -2112,6 +2201,29 @@ impl ExecutableExtensions {
                             )
                             .await?;
                     }
+                    Ok(ExtensionEvent::HostServiceRequested {
+                        request_id,
+                        generation,
+                        parent_request_id,
+                        request,
+                    }) if operation
+                        .is_some_and(|operation| operation.owns(generation, parent_request_id)) =>
+                    {
+                        if process.host_service_answered(&request_id, generation) {
+                            continue;
+                        }
+                        let response = confirmations
+                            .host_service(&extension_name, &request)
+                            .await
+                            .with_context(|| {
+                                format!(
+                                    "host-service UI failed for extension {extension_name:?}"
+                                )
+                            })?;
+                        process
+                            .respond_to_host_service(request_id, generation, response)
+                            .await?;
+                    }
                     Ok(_) => {
                         // The product's persistent receiver owns ordinary
                         // notifications, status, context, and diagnostics.
@@ -2243,6 +2355,32 @@ impl ExecutableExtensions {
                                         request_id,
                                         generation,
                                         ExtensionInputResponse { value: None },
+                                    )
+                                    .await?;
+                            }
+                            Ok(ExtensionEvent::HostServiceRequested {
+                                request_id,
+                                generation,
+                                parent_request_id,
+                                request,
+                            }) if operation.is_some_and(|operation| {
+                                operation.owns(generation, parent_request_id)
+                            }) => {
+                                let service = format!(
+                                    "{}@{}:{}",
+                                    request.service,
+                                    request.version.as_u16(),
+                                    request.scope.as_str()
+                                );
+                                process
+                                    .respond_to_host_service(
+                                        request_id,
+                                        generation,
+                                        ExtensionHostServiceResponse::Error {
+                                            message: format!(
+                                                "host service {service} requires an interactive product owner"
+                                            ),
+                                        },
                                     )
                                     .await?;
                             }
@@ -2529,6 +2667,218 @@ impl ExecutableExtensions {
         self.schedule_input_cancellations();
     }
 
+    /// Apply every validated API 0.3 journal at the product's idle transaction
+    /// boundary. Session entries are committed in one append-only batch per
+    /// operation; tool policy is updated through the host's revisioned overlay.
+    /// Model, reasoning, messaging, provider, and UI actions are returned to
+    /// the owning frontend rather than being executed behind its back.
+    pub fn apply_pending_effects(
+        &mut self,
+        session: &mut Session,
+        sessions: &SessionStore,
+    ) -> ExtensionEffectApplication {
+        let mut applied = ExtensionEffectApplication::default();
+        while let Some(pending) = self.pending_effects.pop_front() {
+            let token = &pending.journal.operation_token;
+            let operation_key = (
+                token.process.instance_id.clone(),
+                token.process.generation,
+                token.request_id,
+            );
+            if self.applied_effect_operations.contains(&operation_key) {
+                continue;
+            }
+
+            let configured_tools = self.extension_host.as_ref().map(|host| {
+                host.configured_tool_definitions()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<BTreeSet<_>>()
+            });
+            let mut extension_entries = Vec::new();
+            let mut selected_tools = None;
+            let mut selected_name = None;
+            let mut journal_error = None;
+            for effect in &pending.journal.effects {
+                match effect {
+                    ExtensionEffect::AppendCustom {
+                        custom_type,
+                        details,
+                    } => extension_entries.push(ygg_agent::EntryValue::ExtensionCustom {
+                        extension: pending.extension.clone(),
+                        custom_type: custom_type.clone(),
+                        details: details.clone(),
+                    }),
+                    ExtensionEffect::AppendCustomMessage {
+                        custom_type,
+                        content,
+                        display,
+                        details,
+                    } => extension_entries.push(
+                        ygg_agent::EntryValue::ExtensionCustomMessage {
+                            extension: pending.extension.clone(),
+                            custom_type: custom_type.clone(),
+                            content: content.clone(),
+                            display: display.clone(),
+                            details: details.clone(),
+                        },
+                    ),
+                    ExtensionEffect::SetSessionName { name } => {
+                        if self.session_id.is_none() {
+                            journal_error = Some("session has no stable catalog id".to_owned());
+                            break;
+                        }
+                        selected_name = Some(name.clone());
+                    }
+                    ExtensionEffect::SetEntryLabel { entry_id, label } => extension_entries.push(
+                        ygg_agent::EntryValue::ExtensionLabel {
+                            extension: pending.extension.clone(),
+                            target: ygg_agent::EntryId(entry_id.clone()),
+                            label: label.clone(),
+                        },
+                    ),
+                    ExtensionEffect::SetActiveTools { tools } => {
+                        let Some(configured) = configured_tools.as_ref() else {
+                            journal_error = Some("tool-policy adapter is unavailable".to_owned());
+                            break;
+                        };
+                        // Pi deliberately ignores unknown names. Preserve that
+                        // behavior while the host remains authoritative over
+                        // the actual policy-admitted registry.
+                        selected_tools = Some(
+                            tools
+                                .iter()
+                                .filter(|name| configured.contains(*name))
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    ExtensionEffect::SetUiState { key, value } => {
+                        if let Err(error) = validate_ui_state_effect(
+                            key,
+                            value,
+                            pending.journal.operation_token.process.generation,
+                        ) {
+                            journal_error = Some(error);
+                            break;
+                        }
+                    }
+                    ExtensionEffect::UpdateProviderCatalog { .. } => {
+                        journal_error = Some(
+                            "provider transaction adapter is unavailable in this product mode"
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                    ExtensionEffect::UpdateCatalog { .. } => {
+                        journal_error = Some(
+                            "catalog effects are invalid; extensions must use catalog/replace"
+                                .to_owned(),
+                        );
+                        break;
+                    }
+                    ExtensionEffect::EnqueueMessage { .. }
+                    | ExtensionEffect::SelectModel { .. }
+                    | ExtensionEffect::SelectReasoning { .. } => {}
+                }
+            }
+
+            if journal_error.is_none() && !extension_entries.is_empty() {
+                if let Err(error) = session.append_extension_entries(extension_entries) {
+                    journal_error = Some(format!("session transaction failed: {error}"));
+                }
+            }
+            if journal_error.is_none() {
+                if let Some(name) = selected_name {
+                    let id = self
+                        .session_id
+                        .as_deref()
+                        .expect("session id preflighted above");
+                    let result = sessions.load_metadata(id).and_then(|mut metadata| {
+                        metadata.name = name;
+                        sessions.save_metadata(id, &metadata)
+                    });
+                    if let Err(error) = result {
+                        journal_error = Some(format!("session-name transaction failed: {error}"));
+                    }
+                }
+            }
+            if journal_error.is_none() {
+                if let Some(tools) = selected_tools {
+                    let result = self
+                        .extension_host
+                        .as_ref()
+                        .expect("tool host preflighted above")
+                        .set_active_tools(tools);
+                    if let Err(error) = result {
+                        journal_error = Some(format!("active-tool transaction failed: {error}"));
+                    }
+                }
+            }
+
+            if let Some(error) = journal_error {
+                applied.messages.push(format!(
+                    "[{}] rejected {} extension effect(s): {error}",
+                    pending.extension,
+                    pending.journal.effects.len()
+                ));
+                self.applied_effect_operations.insert(operation_key);
+                continue;
+            }
+
+            let effect_count = pending.journal.effects.len();
+            for effect in pending.journal.effects {
+                match effect {
+                    ExtensionEffect::EnqueueMessage { delivery, content } => {
+                        applied.messaging.push(match delivery {
+                            ExtensionMessageDelivery::Steer => ExtensionMessageAction::Steer(content),
+                            ExtensionMessageDelivery::FollowUp => {
+                                ExtensionMessageAction::FollowUp(content)
+                            }
+                            ExtensionMessageDelivery::NextTurn => {
+                                ExtensionMessageAction::NextTurn(content)
+                            }
+                            ExtensionMessageDelivery::User => ExtensionMessageAction::User(content),
+                        });
+                    }
+                    ExtensionEffect::SelectModel { model } => {
+                        applied.selected_model = Some(model);
+                    }
+                    ExtensionEffect::SelectReasoning { reasoning } => {
+                        applied.selected_reasoning = Some(reasoning);
+                    }
+                    ExtensionEffect::SetUiState { key, value } => {
+                        self.ui_state
+                            .insert((pending.extension.clone(), key.clone()), value.clone());
+                        applied.ui.push(ExtensionUiStateUpdate {
+                            extension: pending.extension.clone(),
+                            key,
+                            value,
+                        });
+                    }
+                    ExtensionEffect::UpdateProviderCatalog { update } => {
+                        applied.provider_updates.push(update);
+                    }
+                    ExtensionEffect::UpdateCatalog { update } => {
+                        applied.catalog_updates.push(update);
+                    }
+                    ExtensionEffect::AppendCustom { .. }
+                    | ExtensionEffect::AppendCustomMessage { .. }
+                    | ExtensionEffect::SetSessionName { .. }
+                    | ExtensionEffect::SetEntryLabel { .. }
+                    | ExtensionEffect::SetActiveTools { .. } => {}
+                }
+            }
+            applied.messages.push(format!(
+                "[{}] committed {} extension effect(s)",
+                pending.extension,
+                effect_count
+            ));
+            self.applied_effect_operations.insert(operation_key);
+        }
+        applied
+    }
+
     /// Drain a fixed amount of extension work without letting a continuously
     /// ready process monopolize the input/render task. The start receiver
     /// rotates between calls and each receiver has a smaller per-call quota.
@@ -2638,10 +2988,25 @@ impl ExecutableExtensions {
                         ));
                     }
                     Ok(ExtensionEvent::EffectJournalReady { journal, .. }) => {
-                        messages.push(format!(
-                            "[{name}] rejected {} extension effect(s): no product transaction adapter is bound",
-                            journal.effects.len()
-                        ));
+                        let operation = &journal.operation_token;
+                        let key = (
+                            operation.process.instance_id.clone(),
+                            operation.process.generation,
+                            operation.request_id,
+                        );
+                        if !self.applied_effect_operations.contains(&key)
+                            && !self.pending_effects.iter().any(|pending| {
+                                let token = &pending.journal.operation_token;
+                                token.process.instance_id == key.0
+                                    && token.process.generation == key.1
+                                    && token.request_id == key.2
+                            })
+                        {
+                            self.pending_effects.push_back(PendingExtensionEffects {
+                                extension: name.clone(),
+                                journal,
+                            });
+                        }
                     }
                     Ok(ExtensionEvent::HostServiceRequested {
                         request_id,
@@ -2649,6 +3014,13 @@ impl ExecutableExtensions {
                         request,
                         ..
                     }) => {
+                        if process.as_ref().is_some_and(|process| {
+                            process.host_service_answered(&request_id, generation)
+                        }) {
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        }
                         self.host_service_tasks.retain(|task| !task.is_finished());
                         let service = format!("{}@{}:{}", request.service, request.version.as_u16(), request.scope.as_str());
                         messages.push(format!(
@@ -3078,11 +3450,333 @@ fn extension_execution_context(
     )
 }
 
+#[derive(serde::Deserialize)]
+struct PiRemoteFrameWire {
+    component_id: String,
+    generation: u64,
+    revision: u64,
+    width: u16,
+    rows: Vec<String>,
+}
+
+fn validate_pi_remote_frame(value: &Value, expected_generation: u64) -> Result<(), String> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let wire: PiRemoteFrameWire = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid remote component frame: {error}"))?;
+    if wire.generation != expected_generation {
+        return Err(format!(
+            "remote component generation {} does not match operation generation {expected_generation}",
+            wire.generation
+        ));
+    }
+    let component_id = RemoteComponentId::parse(wire.component_id)
+        .map_err(|error| format!("invalid remote component id: {error}"))?;
+    let frame = RemoteFrame::from_pi_rows(
+        component_id,
+        wire.generation,
+        wire.revision,
+        wire.width,
+        &wire.rows,
+    )
+    .map_err(|error| format!("invalid remote component frame: {error}"))?;
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| format!("cannot encode remote component frame: {error}"))?;
+    frame
+        .validate_with_encoded_size(encoded.len())
+        .map_err(|error| format!("invalid remote component frame: {error}"))
+}
+
+fn validate_ui_state_effect(
+    key: &str,
+    value: &Value,
+    expected_generation: u64,
+) -> Result<(), String> {
+    match key {
+        "widget" => {
+            let object = value
+                .as_object()
+                .ok_or_else(|| "widget state must be an object".to_owned())?;
+            let widget_key = object
+                .get("key")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "widget state is missing its key".to_owned())?;
+            if widget_key.is_empty()
+                || widget_key.len() > 256
+                || widget_key.chars().any(char::is_control)
+            {
+                return Err("widget state has an invalid key".to_owned());
+            }
+            validate_pi_remote_frame(
+                object
+                    .get("frame")
+                    .ok_or_else(|| "widget state is missing its frame".to_owned())?,
+                expected_generation,
+            )
+        }
+        "footer" | "header" | "editor_component" => {
+            validate_pi_remote_frame(value, expected_generation)
+        }
+        "custom" => validate_pi_remote_frame(value, expected_generation),
+        "status"
+        | "working_message"
+        | "working_visible"
+        | "working_indicator"
+        | "hidden_thinking_label"
+        | "title"
+        | "editor_text"
+        | "autocomplete"
+        | "theme"
+        | "disclosure"
+        | "terminal_input" => Ok(()),
+        _ => Err(format!("unsupported extension UI state key {key:?}")),
+    }
+}
+
+fn product_host_services(manifest: &ExtensionManifest) -> Vec<ExtensionHostServiceDescriptor> {
+    manifest
+        .capabilities
+        .host_services
+        .iter()
+        .map(|declaration| ExtensionHostServiceDescriptor {
+            name: declaration.name,
+            version: declaration.version,
+            scopes: declaration.scopes.clone(),
+            limits: ExtensionHostServiceLimits {
+                max_concurrent_requests: Some(16),
+                max_request_bytes: Some(512 * 1024),
+                max_response_bytes: Some(8 * 1024 * 1024),
+                max_items: Some(4_096),
+                timeout_ms: Some(30_000),
+            },
+        })
+        .collect()
+}
+
+fn pi_message(message: &Message) -> Value {
+    match message {
+        Message::User(user) => {
+            let content = user
+                .content
+                .iter()
+                .map(|part| match part {
+                    ygg_ai::UserPart::Text(text) => {
+                        serde_json::json!({ "type": "text", "text": text })
+                    }
+                    ygg_ai::UserPart::Media(media) => serde_json::json!({
+                        "type": "media",
+                        "media": media,
+                    }),
+                    ygg_ai::UserPart::ToolResult(result) => serde_json::json!({
+                        "type": "toolResult",
+                        "toolCallId": result.tool_call_id.0,
+                        "content": result.content,
+                        "isError": result.is_error,
+                    }),
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({ "role": "user", "content": content })
+        }
+        Message::Assistant(assistant) => {
+            let content = assistant
+                .content
+                .iter()
+                .map(|part| match part {
+                    AssistantPart::Text(text) => {
+                        serde_json::json!({ "type": "text", "text": text })
+                    }
+                    AssistantPart::Reasoning(reasoning) => serde_json::json!({
+                        "type": "thinking",
+                        "thinking": reasoning.text,
+                    }),
+                    AssistantPart::ToolCall(call) => serde_json::json!({
+                        "type": "toolCall",
+                        "id": call.id.0,
+                        "name": call.name,
+                        "arguments": call.arguments_value().unwrap_or(Value::Null),
+                    }),
+                    AssistantPart::Media(media) => serde_json::json!({
+                        "type": "media",
+                        "media": media,
+                    }),
+                })
+                .collect::<Vec<_>>();
+            serde_json::json!({
+                "role": "assistant",
+                "content": content,
+                "model": assistant.model.0,
+            })
+        }
+    }
+}
+
+fn pi_session_entry(entry: &ygg_agent::Entry) -> Value {
+    let timestamp = entry
+        .timestamp_unix_ms
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    let mut base = serde_json::Map::from_iter([
+        ("id".to_owned(), Value::String(entry.id.0.clone())),
+        (
+            "parentId".to_owned(),
+            entry
+                .parent
+                .as_ref()
+                .map_or(Value::Null, |parent| Value::String(parent.0.clone())),
+        ),
+        ("timestamp".to_owned(), Value::String(timestamp)),
+    ]);
+    match &entry.value {
+        ygg_agent::EntryValue::Message(message) => {
+            base.insert("type".to_owned(), Value::String("message".to_owned()));
+            base.insert("message".to_owned(), pi_message(message));
+        }
+        ygg_agent::EntryValue::ExtensionCustom {
+            custom_type,
+            details,
+            ..
+        } => {
+            base.insert("type".to_owned(), Value::String("custom".to_owned()));
+            base.insert("customType".to_owned(), Value::String(custom_type.clone()));
+            base.insert("data".to_owned(), details.clone());
+        }
+        ygg_agent::EntryValue::ExtensionCustomMessage {
+            custom_type,
+            content,
+            display,
+            details,
+            ..
+        } => {
+            base.insert(
+                "type".to_owned(),
+                Value::String("custom_message".to_owned()),
+            );
+            base.insert("customType".to_owned(), Value::String(custom_type.clone()));
+            base.insert("content".to_owned(), Value::String(content.clone()));
+            base.insert(
+                "display".to_owned(),
+                Value::Bool(display.as_deref().is_none_or(|value| !value.is_empty())),
+            );
+            base.insert("details".to_owned(), details.clone());
+        }
+        ygg_agent::EntryValue::ExtensionLabel { target, label, .. } => {
+            base.insert("type".to_owned(), Value::String("label".to_owned()));
+            base.insert("targetId".to_owned(), Value::String(target.0.clone()));
+            base.insert(
+                "label".to_owned(),
+                label.clone().map_or(Value::Null, Value::String),
+            );
+        }
+        ygg_agent::EntryValue::Config {
+            model: Some(model), ..
+        } => {
+            base.insert(
+                "type".to_owned(),
+                Value::String("model_change".to_owned()),
+            );
+            base.insert("provider".to_owned(), Value::String("ygg".to_owned()));
+            base.insert("modelId".to_owned(), Value::String(model.clone()));
+        }
+        ygg_agent::EntryValue::Config {
+            reasoning: Some(reasoning),
+            ..
+        } => {
+            base.insert(
+                "type".to_owned(),
+                Value::String("thinking_level_change".to_owned()),
+            );
+            base.insert(
+                "thinkingLevel".to_owned(),
+                Value::String(reasoning.clone()),
+            );
+        }
+        ygg_agent::EntryValue::Compaction {
+            summary,
+            first_kept,
+            details,
+            ..
+        } => {
+            base.insert("type".to_owned(), Value::String("compaction".to_owned()));
+            base.insert("summary".to_owned(), Value::String(summary.clone()));
+            base.insert(
+                "firstKeptEntryId".to_owned(),
+                Value::String(first_kept.0.clone()),
+            );
+            base.insert("tokensBefore".to_owned(), Value::from(0));
+            base.insert(
+                "details".to_owned(),
+                serde_json::to_value(details).unwrap_or(Value::Null),
+            );
+        }
+        other => {
+            base.insert("type".to_owned(), Value::String("custom".to_owned()));
+            base.insert(
+                "customType".to_owned(),
+                Value::String("ygg:session-entry".to_owned()),
+            );
+            base.insert(
+                "data".to_owned(),
+                serde_json::to_value(other).unwrap_or(Value::Null),
+            );
+        }
+    }
+    Value::Object(base)
+}
+
+fn pi_session_projection(
+    session: &Session,
+) -> (Vec<Value>, Vec<Value>, BTreeMap<String, Option<String>>) {
+    const MAX_SNAPSHOT_BYTES: usize = 224 * 1024;
+    const MAX_SNAPSHOT_ENTRIES: usize = 512;
+    let mut branch = Vec::new();
+    let mut cursor = session.head_ref();
+    while let Some(id) = cursor {
+        let Some(entry) = session.entry(id) else {
+            break;
+        };
+        branch.push(entry);
+        cursor = entry.parent.as_ref();
+    }
+    branch.reverse();
+
+    let mut labels = BTreeMap::new();
+    for entry in &branch {
+        if let ygg_agent::EntryValue::ExtensionLabel { target, label, .. } = &entry.value {
+            labels.insert(target.0.clone(), label.clone());
+        }
+    }
+
+    let mut encoded_bytes = 0usize;
+    let mut entries = Vec::new();
+    for entry in branch.into_iter().rev().take(MAX_SNAPSHOT_ENTRIES) {
+        let value = pi_session_entry(entry);
+        let bytes = serde_json::to_vec(&value).map_or(usize::MAX, |bytes| bytes.len());
+        if encoded_bytes.saturating_add(bytes) > MAX_SNAPSHOT_BYTES {
+            break;
+        }
+        encoded_bytes = encoded_bytes.saturating_add(bytes);
+        entries.push(value);
+    }
+    entries.reverse();
+    // The bounded projection is an active branch. A flat list of root nodes is
+    // preferable to an unbounded recursive tree; each node still carries the
+    // exact parent ID needed by Pi-compatible consumers.
+    let tree = entries
+        .iter()
+        .cloned()
+        .map(|entry| serde_json::json!({ "entry": entry, "children": [] }))
+        .collect();
+    (entries, tree, labels)
+}
+
 fn host_state(
     session: &Session,
     model: &Model,
     reasoning: &ReasoningConfig,
     sessions: &SessionStore,
+    host: Option<&ExtensionHost>,
+    project_trusted: bool,
 ) -> ExtensionHostState {
     let session_id = session
         .path()
@@ -3108,12 +3802,66 @@ fn host_state(
                 .collect()
         })
         .unwrap_or_default();
+    let (session_entries, session_tree, session_labels) = pi_session_projection(session);
+    let tool_snapshot = host.map(ExtensionHost::tool_catalog_snapshot);
+    let all_tools = tool_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .configured
+                .iter()
+                .map(|tool| {
+                    serde_json::json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let active_tools = tool_snapshot
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .active
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let model_value = serde_json::json!({
+        "id": model.spec.id.0,
+        "provider": model.endpoint.id.0,
+        "name": model.spec.id.0,
+        "available": true,
+    });
     ExtensionHostState {
-        session_id,
+        session_id: session_id.clone(),
         session_name,
         model: Some(model.spec.id.0.clone()),
         reasoning: Some(serde_json::Value::String(format!("{reasoning:?}"))),
         active_skills,
+        session_file: Some(session.path().display().to_string()),
+        session_leaf_id: session.head().map(|id| id.0),
+        session_entries,
+        session_tree,
+        session_header: Some(serde_json::json!({
+            "type": "session",
+            "id": session_id,
+            "cwd": sessions.root(),
+        })),
+        session_labels,
+        all_tools,
+        active_tools,
+        models: vec![model_value.clone()],
+        scoped_models: vec![model_value],
+        system_prompt: None,
+        system_prompt_options: Some(serde_json::json!({ "cwd": sessions.root() })),
+        context_usage: None,
+        pending_messages: false,
+        idle: true,
+        project_trusted,
     }
 }
 

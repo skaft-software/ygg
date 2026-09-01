@@ -295,6 +295,47 @@ pub enum EntryValue {
     /// A complete conversation message (user, assistant, or tool results
     /// carried as a user message).
     Message(Message),
+    /// Opaque extension-owned state retained as append-only session data. It is
+    /// never model-visible; the exact trusted extension principal is retained
+    /// so one extension cannot impersonate another extension's state.
+    ExtensionCustom {
+        /// Stable extension principal name.
+        extension: String,
+        /// Extension-defined bounded entry discriminator.
+        custom_type: String,
+        /// Extension-defined inert JSON data.
+        #[serde(default)]
+        details: serde_json::Value,
+    },
+    /// Extension-owned model-visible message with separate transcript text and
+    /// inert details. This remains a distinct entry type so Pi-compatible
+    /// session readers can recover `customType`, `display`, and `details`
+    /// without weakening Ygg's canonical message schema.
+    ExtensionCustomMessage {
+        /// Stable extension principal name.
+        extension: String,
+        /// Extension-defined bounded message discriminator.
+        custom_type: String,
+        /// Canonical model-visible text.
+        content: String,
+        /// Optional user-visible transcript projection.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
+        /// Extension-defined inert JSON data.
+        #[serde(default)]
+        details: serde_json::Value,
+    },
+    /// Append-only label projection for an earlier entry. Consumers resolve the
+    /// latest label on the active branch; the target entry itself stays
+    /// immutable.
+    ExtensionLabel {
+        /// Stable extension principal name.
+        extension: String,
+        /// Entry receiving or losing the label.
+        target: EntryId,
+        /// New label, or `None` to clear it.
+        label: Option<String>,
+    },
     /// A manual compaction record: everything on the parent chain older than
     /// `first_kept` is replaced by `summary` during context reconstruction.
     Compaction {
@@ -1303,6 +1344,85 @@ impl Session {
         self.append_with_metadata(value, None)
     }
 
+    /// Atomically appends one non-empty batch of extension-owned entries.
+    ///
+    /// Every entry and the final head marker are serialized before one synced
+    /// write. A crash before the final head leaves the complete batch
+    /// unreachable, while a successful return makes the whole batch active.
+    /// Other entry variants are rejected so provider sidecar and presentation
+    /// metadata invariants cannot be bypassed through this transaction path.
+    pub fn append_extension_entries(
+        &mut self,
+        values: Vec<EntryValue>,
+    ) -> Result<Vec<EntryId>, SessionError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+        if values.iter().any(|value| {
+            !matches!(
+                value,
+                EntryValue::ExtensionCustom { .. }
+                    | EntryValue::ExtensionCustomMessage { .. }
+                    | EntryValue::ExtensionLabel { .. }
+            )
+        }) {
+            return Err(SessionError::Limit(
+                "extension entry transaction contains a non-extension entry".to_owned(),
+            ));
+        }
+
+        let mut next_id = self.next_id;
+        let mut parent = self.head.clone();
+        let timestamp_unix_ms = Some(now_unix_millis());
+        let mut entries = Vec::with_capacity(values.len());
+        for value in values {
+            let id = EntryId(format!("{next_id:03}"));
+            next_id = next_id.checked_add(1).ok_or_else(|| {
+                SessionError::Limit("session entry ID space is exhausted".to_owned())
+            })?;
+            entries.push(Entry {
+                id: id.clone(),
+                parent: parent.clone(),
+                metadata: None,
+                timestamp_unix_ms,
+                value,
+            });
+            parent = Some(id);
+        }
+
+        let final_id = entries
+            .last()
+            .expect("non-empty extension entry transaction")
+            .id
+            .clone();
+        let mut buf = Vec::with_capacity(entries.len().saturating_mul(256));
+        for entry in &entries {
+            write_json_line(&mut buf, &SessionRecordRef::Entry(entry))?;
+        }
+        write_json_line(
+            &mut buf,
+            &SessionRecordRef::Head {
+                id: &final_id,
+                total_cost_microdollars: &self.total_cost_microdollars,
+                total_cost_picodollars_remainder: &self.total_cost_picodollars_remainder,
+            },
+        )?;
+        self.persist(&buf)?;
+
+        let ids = entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            self.index.insert(entry.id.clone(), self.entries.len());
+            self.entries.push(entry);
+        }
+        self.head = Some(final_id);
+        self.next_id = next_id;
+        *self.context_cache.get_mut() = None;
+        Ok(ids)
+    }
+
     /// Append a durable, non-model-visible terminal marker for a frontend run.
     ///
     /// The marker uses the long-standing configuration entry envelope for
@@ -1426,7 +1546,14 @@ impl Session {
                     append_context_message(messages, message);
                 }
             }
-            EntryValue::Config { .. }
+            EntryValue::ExtensionCustomMessage { content, .. } => {
+                if let Some(messages) = cache {
+                    append_context_message(messages, &extension_custom_message(content));
+                }
+            }
+            EntryValue::ExtensionCustom { .. }
+            | EntryValue::ExtensionLabel { .. }
+            | EntryValue::Config { .. }
             | EntryValue::PromptTemplateSelected { .. }
             | EntryValue::ResponsesTurn { .. }
             | EntryValue::ResponsesCompaction { .. } => {}
@@ -2266,6 +2393,12 @@ impl Session {
                 EntryValue::Message(Message::User(user)) => {
                     replay.push(ygg_ai::responses::ResponsesReplayItem::User(user.clone()));
                 }
+                EntryValue::ExtensionCustomMessage { content, .. } => {
+                    let Message::User(user) = extension_custom_message(content) else {
+                        unreachable!("extension custom messages are user messages")
+                    };
+                    replay.push(ygg_ai::responses::ResponsesReplayItem::User(user));
+                }
                 EntryValue::Message(Message::Assistant(assistant))
                     if entry.metadata.as_ref().is_some_and(|metadata| {
                         metadata.local_synthetic_assistant
@@ -2296,7 +2429,9 @@ impl Session {
                         output.clone(),
                     ));
                 }
-                EntryValue::Compaction { .. }
+                EntryValue::ExtensionCustom { .. }
+                | EntryValue::ExtensionLabel { .. }
+                | EntryValue::Compaction { .. }
                 | EntryValue::ResponsesTurn { .. }
                 | EntryValue::ResponsesCompaction { .. }
                 | EntryValue::Config { .. }
@@ -2354,7 +2489,12 @@ impl Session {
                 .ok_or_else(|| SessionError::UnknownEntry(id.clone()))?;
             match &entry.value {
                 EntryValue::Message(m) => newest_first.push(m.clone()),
-                EntryValue::Config { .. }
+                EntryValue::ExtensionCustomMessage { content, .. } => {
+                    newest_first.push(extension_custom_message(content));
+                }
+                EntryValue::ExtensionCustom { .. }
+                | EntryValue::ExtensionLabel { .. }
+                | EntryValue::Config { .. }
                 | EntryValue::PromptTemplateSelected { .. }
                 | EntryValue::ResponsesTurn { .. }
                 | EntryValue::ResponsesCompaction { .. } => {}
@@ -2441,6 +2581,9 @@ impl Session {
         for entry in reverse {
             match &entry.value {
                 EntryValue::Message(message) => messages.push(message.clone()),
+                EntryValue::ExtensionCustomMessage { content, .. } => {
+                    messages.push(extension_custom_message(content));
+                }
                 EntryValue::Compaction { summary, .. } => {
                     messages.clear();
                     messages.push(Message::User(UserMessage {
@@ -2449,7 +2592,9 @@ impl Session {
                         ))],
                     }));
                 }
-                EntryValue::Config { .. }
+                EntryValue::ExtensionCustom { .. }
+                | EntryValue::ExtensionLabel { .. }
+                | EntryValue::Config { .. }
                 | EntryValue::PromptTemplateSelected { .. }
                 | EntryValue::ResponsesTurn { .. }
                 | EntryValue::ResponsesCompaction { .. }
@@ -2633,6 +2778,12 @@ fn merge_tool_result_turn(previous: &mut UserMessage, current: &[UserPart]) {
             .filter(|part| matches!(part, UserPart::Media(_)))
             .cloned(),
     );
+}
+
+fn extension_custom_message(content: &str) -> Message {
+    Message::User(UserMessage {
+        content: vec![UserPart::Text(content.to_owned())],
+    })
 }
 
 /// Appends one newly persisted message to an already materialized context.
