@@ -35,7 +35,7 @@ use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
 };
-use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
+use crate::extension::{EventObserver, ExtensionHost, ToolCallHook, ToolSnapshot};
 use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
@@ -78,6 +78,9 @@ pub enum AgentError {
     /// Two tools were registered under the same name.
     #[error("duplicate tool name registered: {0}")]
     DuplicateTool(String),
+    /// An active-tool overlay named a missing, duplicate, or policy-disabled tool.
+    #[error("invalid active tool selection: {0}")]
+    InvalidToolSelection(String),
     /// The configured collaboration runtime could not start an owning run.
     #[error("delegation error: {0}")]
     Delegation(String),
@@ -421,6 +424,7 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
         AgentError::IncompleteResponse { .. } => Some("response completion"),
         AgentError::Session(_)
         | AgentError::DuplicateTool(_)
+        | AgentError::InvalidToolSelection(_)
         | AgentError::Delegation(_)
         | AgentError::Workspace(_)
         | AgentError::TokenLimit { .. }
@@ -4656,9 +4660,35 @@ impl Agent {
         self.completion_policy
     }
 
-    /// Provider schemas for all currently executable tools, in wire order.
+    /// Provider schemas for all currently active tools, in wire order.
     pub fn registered_tool_definitions(&self) -> Vec<ToolDef> {
         self.extensions.tool_definitions()
+    }
+
+    /// Returns the current immutable configured/active tool catalog snapshot.
+    pub fn tool_catalog_snapshot(&self) -> ToolSnapshot {
+        self.extensions.tool_catalog_snapshot()
+    }
+
+    /// Replaces the session-local active-tool overlay at an idle Agent borrow.
+    ///
+    /// The new revision becomes visible at the next provider request boundary;
+    /// an in-flight request keeps the catalog it already froze. Persistence of
+    /// the selection is owned by the product/session service that invokes this
+    /// method.
+    pub fn set_active_tools<I, S>(&mut self, names: I) -> Result<ToolSnapshot, AgentError>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.extensions
+            .set_active_tools(names)
+            .map_err(AgentError::InvalidToolSelection)
+    }
+
+    /// Clears the session-local active-tool overlay at an idle Agent borrow.
+    pub fn clear_active_tools(&mut self) -> ToolSnapshot {
+        self.extensions.clear_active_tools()
     }
 
     /// Exact registered tool names after the frontend has applied all policy

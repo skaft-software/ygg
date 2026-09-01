@@ -14,10 +14,10 @@ use ygg_agent::extension_process::{
 };
 use ygg_agent::{
     CancellationToken, DiscoveredExtension, ExtensionActivation, ExtensionConfirmationResponse,
-    ExtensionEvent, ExtensionHook, ExtensionHostState, ExtensionManifest, ExtensionProcess,
-    ExtensionRuntimeConfig, ExtensionRuntimeError, ExtensionSource, ExtensionTrust, SandboxConfig,
-    ToolCallHook, ToolContext, ToolProgressSink, EXTENSION_API_VERSION_0_1,
-    EXTENSION_MANIFEST_FILENAME,
+    ExtensionEvent, ExtensionHook, ExtensionHostState, ExtensionManifest, ExtensionPrincipal,
+    ExtensionProcess, ExtensionRuntimeConfig, ExtensionRuntimeError, ExtensionSource,
+    ExtensionTrust, SandboxConfig, ToolCallHook, ToolContext, ToolProgressSink,
+    EXTENSION_API_VERSION_0_1, EXTENSION_MANIFEST_FILENAME,
 };
 
 const RAW_WIRE_CHILD: &str = r#"#!/bin/sh
@@ -705,9 +705,19 @@ fn trusted_descriptor(
     manifest_path: std::path::PathBuf,
     manifest: ExtensionManifest,
 ) -> DiscoveredExtension {
+    if !manifest_path.exists() {
+        std::fs::write(
+            &manifest_path,
+            toml::to_string_pretty(&manifest).expect("serialize identity manifest"),
+        )
+        .expect("write identity manifest");
+    }
+    let principal = ExtensionPrincipal::derive(&manifest.name, &manifest_path)
+        .expect("derive extension principal");
     DiscoveredExtension {
         manifest,
         manifest_path,
+        principal,
         source: ExtensionSource::Explicit,
         activation: ExtensionActivation {
             enabled: true,

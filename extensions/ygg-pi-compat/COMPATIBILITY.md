@@ -7,13 +7,21 @@ surface inventory, package integrity values, and 78-example corpus are pinned in
 [`profiles/0.84.4.json`](profiles/0.84.4.json). Private `dist/` imports are
 outside the target.
 
+Both machine ledgers deliberately remain `release_status: in_progress`. Run
+`python3 scripts/verify-pi-parity-profile.py` from the repository root to check
+this matrix against the inventories and release gates. The verifier rejects a
+`complete` claim while any required gate or TUI row is open, or while this
+matrix contains a `not implemented` or unapproved `safe divergence` row.
+
 Status meanings:
 
 - **passing** — exercised unchanged against the pinned real Pi runtime and has
   equivalent host-visible behavior for the stated surface.
 - **safe divergence** — bounded behavior exists, but an observable Pi behavior
-  is reduced or rejected explicitly. This still blocks a claim of complete Pi
-  compatibility unless the divergence is separately approved.
+  is reduced or rejected explicitly. This is unapproved and blocks a complete
+  Pi compatibility claim.
+- **approved safe divergence** — the same bounded reduction was explicitly
+  reviewed and accepted in this ledger. No row currently has this status.
 - **not implemented** — no equivalent bridge exists. Calls must fail explicitly
   or startup must diagnose a registration; they must never be silently accepted
   as equivalent.
@@ -153,8 +161,8 @@ Status meanings:
 | `navigateTree` | not implemented | Fails explicitly. |
 | `switchSession` | not implemented | Fails explicitly. |
 | `reload` | not implemented | Fails explicitly. |
-| replacement-context `sendMessage` | not implemented | Session replacement/messaging are unavailable. |
-| replacement-context `sendUserMessage` | not implemented | Session replacement/messaging are unavailable. |
+| `replacement.sendMessage` | not implemented | Session replacement/messaging are unavailable. |
+| `replacement.sendUserMessage` | not implemented | Session replacement/messaging are unavailable. |
 
 ## Release gates
 
@@ -163,12 +171,15 @@ the following are true:
 
 1. Every row above is `passing` or has an explicitly approved safe divergence;
    no `not implemented` row remains in the supported profile.
-2. A generated link, under the real Ygg API 0.2 host, passes cancellation,
+2. A generated aggregate, under the real Ygg API 0.2 host, passes cancellation,
    bounds, restart, trust, source-change, and sanitized-environment tests.
 3. Pi's official `examples/extensions/plan-mode/` passes unchanged through
-   toggle, tool policy, interception, persistence/resume, dialogs, widgets,
-   messaging, commands, flags, and shortcut journeys. The current load plus
-   `/todos` smoke is not this gate.
+   toggle, active-tool policy, interception, persistence/resume, dialogs,
+   widgets, messaging, commands, flags, and shortcut journeys. Plan mode uses
+   built-in tools and UI components; it does **not** register tools or message/
+   entry renderers, so those surfaces require evidence from the examples that
+   actually register them. The current load plus `/todos` smoke is not this
+   gate.
 4. All 78 loadable top-level official Pi 0.84.4 extension examples (69
    single-file and 9 directory examples, excluding the README) load unchanged;
    every example exercising a supported surface has a behavioral assertion
@@ -182,3 +193,7 @@ the following are true:
    through Ygg-owned policy/credential boundaries or are excluded from a
    narrower, honestly named release; they cannot be omitted from a claim of
    complete public-API compatibility.
+
+The profile mirrors these as required gate rows. A gate stays `open` until its
+`evidence` list names repository-relative proof; changing `release_status` does
+not bypass it.

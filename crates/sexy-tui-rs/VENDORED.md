@@ -18,16 +18,18 @@ advertising an external release.
 The behavioral source of truth is a pinned Pi TUI release, not `main` and not
 this crate's earlier independently evolved behavior:
 
-- Pi source: <https://github.com/earendil-works/pi/tree/20be4b18d4c57487f8993d2762bace129f0cf7c6/packages/tui>
-- Pi tag/package: `v0.81.1` / `@earendil-works/pi-tui@0.81.1`
-- Pi revision: `20be4b18d4c57487f8993d2762bace129f0cf7c6`
+- Pi source: <https://github.com/earendil-works/pi/tree/b79e4cc834970cca69daebffab7df1da7d1e52c4/packages/tui>
+- Pi tag/package: `v0.84.4` / `@earendil-works/pi-tui@0.84.4`
+- Pi revision: `b79e4cc834970cca69daebffab7df1da7d1e52c4`
 - Pi copyright: Copyright (c) 2025 Mario Zechner
 - Pi license: MIT; the upstream notice is preserved in this crate's `LICENSE`
   and in the workspace `THIRD_PARTY_NOTICES.md`.
 
-Core ports must cite and reproduce the pinned Pi tests. Rust-only rich rendering
-and Ygg native-scrollback behavior are additive layers and must not redefine
-core Pi APIs or semantics. See `UPSTREAM-PARITY.md` for the port gate and order.
+The matching machine ledger remains `in_progress`; this provenance update is
+not a claim that all 0.84.4 behavior has been ported. Core ports must cite and
+reproduce the pinned Pi tests. Rust-only rich rendering and Ygg
+native-scrollback behavior are additive layers and must not redefine core Pi
+APIs or semantics. See `UPSTREAM-PARITY.md` for the port gate and order.
 
 The vendored source includes Ygg-specific integration changes maintained in
 this workspace. Future updates should be imported deliberately and validated

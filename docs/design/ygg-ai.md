@@ -95,6 +95,24 @@ tokens, and is used as a fallback for discovered built-in routes; explicit
 `CatalogConfig` pricing remains authoritative. Runtime discovery is a
 coding-product concern and can be disabled with `--offline`/`YGG_OFFLINE=true`.
 
+`ProviderRegistry` layers validated owner catalogs above immutable built-ins and
+publishes revisioned `Arc` snapshots. A new owner receives stable precedence;
+updating it does not reorder it, and unregistering it reveals the next lower
+valid definition. Every upsert/replacement builds a complete candidate
+`ModelCatalog` before publication, so a failed transaction leaves the current
+snapshot unchanged. A resolved request retains the snapshot revision plus model
+and endpoint owner metadata for its lifetime.
+
+## Provider execution boundary
+
+`ProviderRuntime` is the object-safe canonical execution seam for built-in and
+extension-owned providers. `AiClient` implements it for existing HTTP/WebSocket
+routes. Custom runtimes return canonical `StreamEvent`s and must pass raw decoded
+events through `guard_stream`, which enforces start/finish, part balancing,
+usage, and terminal ordering before agent persistence. The product does not yet
+route extension processes through this trait; remote streaming, interception,
+credentials, and OAuth remain API 0.3 integration work.
+
 ## Cost accounting
 
 Usage buckets remain disjoint and pricing uses integer picodollar arithmetic. A response carries exact provider usage and optional cost; the agent decides when that completed operation becomes durable session accounting.

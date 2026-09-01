@@ -8,6 +8,7 @@
 
 pub mod capabilities;
 pub mod glyphs;
+pub mod remote_component;
 pub mod rich_text;
 pub mod sanitize;
 mod scrollback;
@@ -24,6 +25,14 @@ pub use capabilities::{
     TerminalSize,
 };
 pub use glyphs::GlyphSet;
+pub use remote_component::{
+    parse_pi_rendered_row, parse_pi_rendered_rows, RemoteColor, RemoteComponentId, RemoteCursor,
+    RemoteFrame, RemoteFrameError, RemoteFrameErrorKind, RemoteFrameValidator, RemoteImageId,
+    RemoteImagePlacement, RemoteLink, RemoteRow, RemoteSpan, RemoteStyle, RemoteTextAttributes,
+    MAX_REMOTE_FRAME_BYTES, MAX_REMOTE_ID_BYTES, MAX_REMOTE_IMAGES, MAX_REMOTE_LINK_BYTES,
+    MAX_REMOTE_ROWS, MAX_REMOTE_SPANS, MAX_REMOTE_SPANS_PER_ROW, MAX_REMOTE_SPAN_TEXT_BYTES,
+    MAX_REMOTE_WIDTH, MAX_REMOTE_WIRE_INTEGER,
+};
 pub use rich_text::diff::{DiffLine, DiffLineKind, DiffRenderOptions, UnifiedDiff};
 pub use rich_text::markdown::parse as parse_markdown;
 pub use rich_text::render::{

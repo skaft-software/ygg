@@ -1,7 +1,8 @@
 # Ygg Extension Protocol Reference
 
 > **API versions:** `0.1` (frozen compatibility) and `0.2` (current,
-> `EXTENSION_API_VERSION`)
+> `EXTENSION_API_VERSION`). API `0.3` contract types are defined in Rust but
+> runtime launch is intentionally rejected until its mandatory handlers ship.
 >
 > Every request and response uses the standard JSON-RPC 2.0 envelope with
 > exactly one JSON object per line on **stdout**. Human diagnostics belong on

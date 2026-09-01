@@ -29,11 +29,12 @@ use ygg_agent::extension_process::{
     DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
     ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
     ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
-    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
-    ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest,
-    ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
-    EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_DELEGATION_TELEMETRY,
-    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME,
+    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionPrincipal, ExtensionProcess,
+    ExtensionRequestId, ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust,
+    ExtensionUiSurface, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
+    EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
+    EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_MANIFEST_FILENAME,
 };
 use ygg_agent::{
     Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
@@ -120,8 +121,18 @@ fn denied_policy_response() -> ExtensionPolicyEvaluationResponse {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfiguredTrustGrant {
-    Global { name: String },
-    Exact { name: String, path: PathBuf },
+    Global {
+        name: String,
+    },
+    Exact {
+        name: String,
+        path: PathBuf,
+    },
+    Identity {
+        name: String,
+        path: PathBuf,
+        sha256: String,
+    },
 }
 
 impl ConfiguredTrustGrant {
@@ -133,6 +144,11 @@ impl ConfiguredTrustGrant {
             Self::Exact { name, path } => {
                 descriptor.manifest.name == *name && descriptor.manifest_path == *path
             }
+            Self::Identity { name, path, sha256 } => {
+                descriptor.manifest.name == *name
+                    && descriptor.manifest_path == *path
+                    && descriptor.principal.sha256 == *sha256
+            }
         }
     }
 
@@ -140,6 +156,9 @@ impl ConfiguredTrustGrant {
         match self {
             Self::Global { name } => name.clone(),
             Self::Exact { name, path } => format!("{name}@{}", path.display()),
+            Self::Identity { name, path, sha256 } => {
+                format!("{name}@{}@sha256:{sha256}", path.display())
+            }
         }
     }
 }
@@ -155,7 +174,37 @@ fn extension_policy(
 
     let mut grants = Vec::new();
     for grant in &config.trusted_extensions {
-        if let Some((name, path)) = grant.split_once('@') {
+        if let Some((source, sha256)) = grant.rsplit_once("@sha256:") {
+            let Some((name, path)) = source.split_once('@') else {
+                diagnostics.push(format!(
+                    "warning: invalid identity-bound extension trust grant {grant:?}: an exact manifest path is required"
+                ));
+                continue;
+            };
+            if sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                diagnostics.push(format!(
+                    "warning: invalid identity-bound extension trust grant {grant:?}: SHA-256 must be 64 lowercase hexadecimal characters"
+                ));
+                continue;
+            }
+            match normalize_trusted_manifest_path(Path::new(path)) {
+                Ok(path) => {
+                    policy.trust_source_identity(name.to_owned(), path.clone(), sha256.to_owned());
+                    grants.push(ConfiguredTrustGrant::Identity {
+                        name: name.to_owned(),
+                        path,
+                        sha256: sha256.to_owned(),
+                    });
+                }
+                Err(error) => diagnostics.push(format!(
+                    "warning: invalid identity-bound extension trust grant {grant:?}: {error}"
+                )),
+            }
+        } else if let Some((name, path)) = grant.split_once('@') {
             match normalize_trusted_manifest_path(Path::new(path)) {
                 Ok(path) => {
                     policy.trust_source(name.to_owned(), path.clone());
@@ -200,7 +249,14 @@ fn normalize_trusted_manifest_path(path: &Path) -> anyhow::Result<PathBuf> {
 }
 
 fn persistent_trust_grant(descriptor: &DiscoveredExtension) -> String {
-    if descriptor.source == ExtensionSource::Global {
+    if ExtensionPrincipal::requires_identity_bound_trust(&descriptor.manifest_path) {
+        format!(
+            "{}@{}@sha256:{}",
+            descriptor.manifest.name,
+            descriptor.manifest_path.display(),
+            descriptor.principal.sha256
+        )
+    } else if descriptor.source == ExtensionSource::Global {
         descriptor.manifest.name.clone()
     } else {
         format!(
@@ -276,11 +332,11 @@ fn load_extension_descriptor(
     policy: &ExtensionPolicy,
     diagnostics: &mut Vec<String>,
 ) -> Option<DiscoveredExtension> {
-    let manifest = match resolver
-        .read_text(resource)
-        .and_then(|source| ExtensionManifest::parse(&source).map_err(anyhow::Error::from))
-    {
-        Ok(manifest) => manifest,
+    let (manifest, manifest_bytes) = match resolver.read_text(resource).and_then(|source| {
+        let manifest = ExtensionManifest::parse(&source).map_err(anyhow::Error::from)?;
+        Ok((manifest, source.into_bytes()))
+    }) {
+        Ok(loaded) => loaded,
         Err(error) => {
             diagnostics.push(format!("error: {}: {error}", resource.path.display()));
             return None;
@@ -300,10 +356,29 @@ fn load_extension_descriptor(
         ResourceScope::Project => ExtensionSource::Project,
         ResourceScope::Explicit => ExtensionSource::Explicit,
     };
+    let principal = match ExtensionPrincipal::derive_for_manifest_bytes(
+        &manifest.name,
+        &resource.path,
+        &manifest_bytes,
+    ) {
+        Ok(principal) => principal,
+        Err(error) => {
+            diagnostics.push(format!("error: {}: {error}", resource.path.display()));
+            return None;
+        }
+    };
+    let require_identity = ExtensionPrincipal::requires_identity_bound_trust(&resource.path);
     Some(DiscoveredExtension {
-        activation: policy.activation(&manifest.name, &resource.path, source),
+        activation: policy.activation_with_identity(
+            &manifest.name,
+            &resource.path,
+            source,
+            Some(&principal),
+            require_identity,
+        ),
         manifest,
         manifest_path: resource.path.clone(),
+        principal,
         source,
     })
 }
@@ -373,6 +448,8 @@ pub struct ExtensionSummary {
     pub version: String,
     pub manifest_path: PathBuf,
     pub manifest_digest: String,
+    pub principal: String,
+    pub persistent_trust_grant: String,
     pub bundle_digest: Option<String>,
     pub source: ExtensionSource,
     pub enabled: bool,
@@ -1077,6 +1154,8 @@ impl ExecutableExtensions {
                     &negotiated_features,
                     health.as_ref(),
                 );
+                let principal = descriptor.principal.stable_id();
+                let persistent_trust_grant = persistent_trust_grant(&descriptor);
                 let manifest_path = descriptor.manifest_path;
                 let manifest_digest = sha256_manifest(&manifest_path);
                 let bundle_digest = installed_bundle_digest(&manifest_path);
@@ -1085,6 +1164,8 @@ impl ExecutableExtensions {
                     version: descriptor.manifest.version,
                     manifest_path,
                     manifest_digest,
+                    principal,
+                    persistent_trust_grant,
                     bundle_digest,
                     source: descriptor.source,
                     enabled: descriptor.activation.enabled,
@@ -1485,10 +1566,17 @@ impl ExecutableExtensions {
                     extension.manifest_path.display()
                 ));
                 lines.push(format!(
-                    "  manifest sha256: {} · bundle sha256: {}",
+                    "  principal: {} · manifest sha256: {} · bundle sha256: {}",
+                    extension.principal,
                     extension.manifest_digest,
                     extension.bundle_digest.as_deref().unwrap_or("unpackaged"),
                 ));
+                if !extension.trusted {
+                    lines.push(format!(
+                        "  persistent trust grant: {:?}",
+                        extension.persistent_trust_grant
+                    ));
+                }
                 lines.push(format!(
                     "  compatibility: {} · telemetry schema: {}",
                     extension.compatibility,
@@ -2980,6 +3068,24 @@ where
 mod tests {
     use super::*;
 
+    fn test_extension_principal(
+        manifest: &ExtensionManifest,
+        manifest_path: &Path,
+    ) -> ExtensionPrincipal {
+        if !manifest_path.exists() {
+            if let Some(parent) = manifest_path.parent() {
+                std::fs::create_dir_all(parent).expect("create identity manifest parent");
+            }
+            std::fs::write(
+                manifest_path,
+                toml::to_string_pretty(manifest).expect("serialize identity manifest"),
+            )
+            .expect("write identity manifest");
+        }
+        ExtensionPrincipal::derive(&manifest.name, manifest_path)
+            .expect("derive extension principal")
+    }
+
     #[test]
     fn first_party_status_marks_missing_delegation_telemetry_incompatible() {
         let (schema, compatibility) = extension_compatibility(
@@ -3336,6 +3442,7 @@ command = "lifecycle-fixture.sh"
         runtime.request_timeout = Duration::from_secs(2);
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,
@@ -3578,6 +3685,53 @@ command = "lifecycle-fixture.sh"
         assert_eq!(descriptor.activation.trust, ExtensionTrust::Trusted);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn aggregate_persistent_trust_requires_exact_principal_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        let directory = extension_root.join("pi-aggregate");
+        write_extension_manifest(&directory, "pi-aggregate", "aggregate");
+        std::fs::write(directory.join("pi-lock.json"), b"{\"revision\":1}").unwrap();
+
+        let mut config = executable_extension_config(temp.path(), &extension_root, "pi-aggregate");
+        config.invocation_trusted_extensions.clear();
+        let resolver = ResourceResolver::new(temp.path().to_owned(), false);
+        let snapshot = resolver.discover(ResourceKind::Extension, &[extension_root]);
+        let resource = snapshot.get("pi-aggregate").unwrap();
+        config.trusted_extensions = vec![format!("pi-aggregate@{}", resource.path.display())];
+        let mut diagnostics = Vec::new();
+        let (legacy_policy, _) = extension_policy(&config, &mut diagnostics);
+        let descriptor =
+            load_extension_descriptor(&resolver, resource, &legacy_policy, &mut diagnostics)
+                .unwrap();
+        assert_eq!(descriptor.activation.trust, ExtensionTrust::Untrusted);
+
+        let grant = persistent_trust_grant(&descriptor);
+        assert_eq!(
+            grant,
+            format!(
+                "pi-aggregate@{}@sha256:{}",
+                resource.path.display(),
+                descriptor.principal.sha256
+            )
+        );
+        config.trusted_extensions = vec![grant];
+        let (identity_policy, grants) = extension_policy(&config, &mut diagnostics);
+        let descriptor =
+            load_extension_descriptor(&resolver, resource, &identity_policy, &mut diagnostics)
+                .unwrap();
+        assert_eq!(descriptor.activation.trust, ExtensionTrust::Trusted);
+        assert!(grants[0].matches(&descriptor));
+
+        std::fs::write(directory.join("pi-lock.json"), b"{\"revision\":2}").unwrap();
+        let drifted =
+            load_extension_descriptor(&resolver, resource, &identity_policy, &mut diagnostics)
+                .unwrap();
+        assert_eq!(drifted.activation.trust, ExtensionTrust::Untrusted);
+        assert!(!grants[0].matches(&drifted));
+    }
+
     #[test]
     fn directory_and_manifest_names_must_match() {
         let temp = tempfile::tempdir().unwrap();
@@ -3808,6 +3962,7 @@ hooks = ["before_prompt", "after_response"]
         runtime.shutdown_timeout = Duration::from_secs(2);
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &manifest_path),
                 manifest,
                 manifest_path,
                 source: ExtensionSource::Explicit,
@@ -3939,6 +4094,10 @@ hooks = ["before_prompt", "after_response"]
         manifest.entrypoint.args = vec![log_path.to_string_lossy().into_owned()];
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(
+                    &manifest,
+                    &temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                ),
                 manifest,
                 manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
                 source: ExtensionSource::Explicit,
@@ -4028,6 +4187,10 @@ commands = ["owned"]
         .unwrap();
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(
+                    &manifest,
+                    &temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                ),
                 manifest,
                 manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
                 source: ExtensionSource::Explicit,
@@ -4104,6 +4267,10 @@ commands = ["shared"]
             processes.push(
                 ExtensionProcess::start(
                     DiscoveredExtension {
+                        principal: test_extension_principal(
+                            &manifest,
+                            &temp.path().join(format!("{name}.toml")),
+                        ),
                         manifest,
                         manifest_path: temp.path().join(format!("{name}.toml")),
                         source: ExtensionSource::Explicit,
@@ -4206,6 +4373,10 @@ confirmations = true
         .unwrap();
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(
+                    &manifest,
+                    &temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                ),
                 manifest,
                 manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
                 source: ExtensionSource::Explicit,
@@ -4362,6 +4533,7 @@ confirmations = true
         .unwrap();
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,
@@ -4450,6 +4622,7 @@ commands = ["configure"]
         .unwrap();
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,
@@ -4534,6 +4707,7 @@ confirmations = true
         .unwrap();
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,
@@ -4614,6 +4788,7 @@ tool_renderers = ["slow"]
         runtime.request_timeout = Duration::from_secs(5);
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,
@@ -4728,6 +4903,10 @@ command = "probe.sh"
             runtime.request_timeout = Duration::from_secs(2);
             let process = ExtensionProcess::start(
                 DiscoveredExtension {
+                    principal: test_extension_principal(
+                        &manifest,
+                        &directory.join("extension.toml"),
+                    ),
                     manifest,
                     manifest_path: directory.join("extension.toml"),
                     source: ExtensionSource::Explicit,
@@ -4821,6 +5000,7 @@ context = true
         runtime.request_timeout = Duration::from_secs(5);
         let process = ExtensionProcess::start(
             DiscoveredExtension {
+                principal: test_extension_principal(&manifest, &temp.path().join("extension.toml")),
                 manifest,
                 manifest_path: temp.path().join("extension.toml"),
                 source: ExtensionSource::Explicit,

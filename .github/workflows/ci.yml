@@ -103,6 +103,38 @@ jobs:
             fi
           done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
 
+  pi-parity-profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.19.0
+      - name: Verify pinned ledgers and compatibility bridge fixtures
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          YGG_PI_REAL_PACKAGE: ""
+        run: |
+          set -euo pipefail
+          node_version="$(node --version)"
+          echo "$node_version"
+          test "$node_version" = v22.19.0
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/python-cache" \
+            python3 -m py_compile scripts/verify-pi-parity-profile.py
+          python3 scripts/verify-pi-parity-profile.py --self-test
+          python3 scripts/verify-pi-parity-profile.py
+          (cd extensions/ygg-pi-compat && python3 -m unittest discover -s tests -t .)
+      - name: Verify a shallow checkout of the exact Pi source
+        run: |
+          set -euo pipefail
+          pi_source="$RUNNER_TEMP/pi-0.84.4"
+          git clone --depth 1 --branch v0.84.4 --single-branch \
+            https://github.com/earendil-works/pi.git "$pi_source"
+          test "$(git -C "$pi_source" rev-parse --is-shallow-repository)" = true
+          test "$(git -C "$pi_source" rev-parse HEAD)" = \
+            b79e4cc834970cca69daebffab7df1da7d1e52c4
+          python3 scripts/verify-pi-parity-profile.py --pi-source "$pi_source"
+
   test:
     strategy:
       fail-fast: false

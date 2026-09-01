@@ -591,8 +591,13 @@ impl ResponseBuilder {
     }
 }
 
-/// Wraps a raw stream of events, statefully enforcing the stream protocol invariants.
-pub(crate) fn guard<S>(inner: S) -> ResponseStream
+/// Wraps a raw provider stream and enforces Ygg's canonical event invariants.
+///
+/// Custom [`crate::ProviderRuntime`] implementations must pass decoded events
+/// through this guard before returning them. The guard rejects missing or
+/// duplicate starts, unbalanced parts, duplicate usage, events after finish,
+/// and premature EOF without interpreting provider-specific wire data.
+pub fn guard_stream<S>(inner: S) -> ResponseStream
 where
     S: futures_core::Stream<Item = Result<StreamEvent, AiError>> + Send + 'static,
 {
@@ -740,6 +745,13 @@ where
     };
 
     Box::pin(stream)
+}
+
+pub(crate) fn guard<S>(inner: S) -> ResponseStream
+where
+    S: futures_core::Stream<Item = Result<StreamEvent, AiError>> + Send + 'static,
+{
+    guard_stream(inner)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
-//! ANSI string algorithms compatible with Pi TUI v0.81.1.
+//! ANSI string algorithms targeting pinned Pi TUI v0.84.4 behavior.
 //!
-//! These are core compositing primitives, not generic terminal sanitizers.
+//! The 0.84.4 case audit remains open in the upstream parity ledger. These are
+//! core compositing primitives, not generic terminal sanitizers.
 //! In particular Pi assigns every visible tab three cells and carries exact
 //! style state across wrapping and overlay boundaries.
 

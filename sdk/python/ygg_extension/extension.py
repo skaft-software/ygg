@@ -1790,6 +1790,13 @@ class Extension:
             raise RpcError(-32600, "initialize must be the first request")
         if not isinstance(params, Mapping):
             raise RpcError(-32602, "initialize params must be an object")
+        if self.api_version == "0.3":
+            raise RpcError(
+                -32000,
+                "extension API 0.3 is defined but not runtime-ready in this SDK build",
+            )
+        if self.api_version not in {"0.1", "0.2"}:
+            raise RpcError(-32000, f"unsupported extension API version: {self.api_version!r}")
         host_version = params.get("api_version")
         if host_version != self.api_version:
             raise RpcError(

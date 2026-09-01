@@ -6,11 +6,12 @@ pub(crate) mod context;
 pub(crate) mod fuzzy;
 pub mod keymap;
 pub(crate) mod layout;
+pub(crate) mod pi_theme;
 pub mod pickers;
 pub(crate) mod splash;
 pub mod terminal;
 pub mod theme;
 #[cfg(test)]
 mod theme_pack;
-mod theme_schema;
+pub(crate) mod theme_schema;
 pub mod view;

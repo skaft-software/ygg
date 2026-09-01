@@ -665,28 +665,49 @@ fn normalize_extension_name(name: &str) -> anyhow::Result<String> {
 
 /// Normalize persistent executable trust grants without erasing their source
 /// binding. A bare name applies only to the global extension directory. A
-/// project or explicit source uses `name@path/to/extension.toml`.
+/// project or explicit source uses `name@path/to/extension.toml`; an installed
+/// aggregate can additionally bind its principal as `name@path@sha256:<hex>`.
 fn normalize_extension_trust_grants(
     grants: impl IntoIterator<Item = String>,
 ) -> anyhow::Result<Vec<String>> {
     let mut normalized = std::collections::BTreeSet::new();
     for grant in grants {
         let grant = grant.trim();
-        let normalized_grant = if let Some((name, path)) = grant.split_once('@') {
+        let (source, digest) = match grant.rsplit_once("@sha256:") {
+            Some((source, digest)) => {
+                if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                    anyhow::bail!(
+                        "invalid extension trust digest {digest:?}; SHA-256 must contain exactly 64 hexadecimal characters"
+                    );
+                }
+                (source, Some(digest.to_ascii_lowercase()))
+            }
+            None => (grant, None),
+        };
+        let normalized_grant = if let Some((name, path)) = source.split_once('@') {
             let name = normalize_extension_name(name)?;
             let path = path.trim();
             if path.is_empty()
                 || path.len() > 8 * 1024
                 || path.chars().any(char::is_control)
                 || !Path::new(path).is_absolute()
+                || Path::new(path).file_name().and_then(|name| name.to_str())
+                    != Some(ygg_agent::extension_process::EXTENSION_MANIFEST_FILENAME)
             {
                 anyhow::bail!(
                     "invalid extension trust path {path:?}; persistent source-bound grants require an absolute path to extension.toml"
                 );
             }
-            format!("{name}@{path}")
+            match digest {
+                Some(digest) => format!("{name}@{path}@sha256:{digest}"),
+                None => format!("{name}@{path}"),
+            }
+        } else if digest.is_some() {
+            anyhow::bail!(
+                "invalid identity-bound extension trust grant {grant:?}; an absolute manifest path is required before @sha256:"
+            );
         } else {
-            normalize_extension_name(grant)?
+            normalize_extension_name(source)?
         };
         normalized.insert(normalized_grant);
     }
@@ -2094,12 +2115,44 @@ mod tests {
     }
 
     #[test]
+    fn persistent_identity_trust_normalizes_and_validates_sha256() {
+        let digest = "A".repeat(64);
+        let grants = normalize_extension_trust_grants([format!(
+            "Pi-Aggregate@/Volumes/dev@home/pi/extension.toml@sha256:{digest}"
+        )])
+        .unwrap();
+        assert_eq!(
+            grants,
+            [format!(
+                "pi-aggregate@/Volumes/dev@home/pi/extension.toml@sha256:{}",
+                "a".repeat(64)
+            )]
+        );
+
+        let error = normalize_extension_trust_grants([
+            "pi-aggregate@/tmp/pi/extension.toml@sha256:abcd".to_owned(),
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly 64"));
+
+        let error =
+            normalize_extension_trust_grants([format!("pi-aggregate@sha256:{}", "a".repeat(64))])
+                .unwrap_err();
+        assert!(error.to_string().contains("manifest path"));
+    }
+
+    #[test]
     fn persistent_source_trust_rejects_relative_paths() {
         let error = normalize_extension_trust_grants([
             "git-tools@.ygg/extensions/git-tools/extension.toml".to_owned(),
         ])
         .unwrap_err();
         assert!(error.to_string().contains("absolute path"));
+
+        let error =
+            normalize_extension_trust_grants(["git-tools@/tmp/git-tools/other.toml".to_owned()])
+                .unwrap_err();
+        assert!(error.to_string().contains("extension.toml"));
     }
 
     #[test]
@@ -2529,6 +2582,65 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn pi_migration_plan_and_apply_forms_are_explicit_and_exclusive() {
+        let plan = Cli::try_parse_from([
+            "ygg",
+            "migrate",
+            "pi",
+            "--dry-run",
+            "--plan-out",
+            "./pi-plan.json",
+            "--pi-package",
+            "./pi-package",
+            "--extension-root",
+            "./extensions",
+            "--name",
+            "pi-reviewed",
+        ])
+        .unwrap();
+        assert!(matches!(
+            plan.command,
+            Some(TopLevelCommand::Migrate {
+                command: MigrationCommand::Pi {
+                    dry_run: true,
+                    plan_out: Some(_),
+                    apply: None,
+                    yes: false,
+                    name: Some(ref name),
+                    ..
+                }
+            }) if name == "pi-reviewed"
+        ));
+
+        let apply =
+            Cli::try_parse_from(["ygg", "migrate", "pi", "--apply", "./pi-plan.json", "--yes"])
+                .unwrap();
+        assert!(matches!(
+            apply.command,
+            Some(TopLevelCommand::Migrate {
+                command: MigrationCommand::Pi {
+                    apply: Some(_),
+                    yes: true,
+                    ..
+                }
+            })
+        ));
+
+        assert!(Cli::try_parse_from([
+            "ygg",
+            "migrate",
+            "pi",
+            "--dry-run",
+            "--apply",
+            "./pi-plan.json",
+        ])
+        .is_err());
+        assert!(
+            Cli::try_parse_from(["ygg", "migrate", "pi", "--pi-package", "./pi-package",]).is_err()
+        );
     }
 
     #[test]

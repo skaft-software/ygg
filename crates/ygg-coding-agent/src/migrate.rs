@@ -2,8 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 
+use anyhow::Context as _;
 use clap::Subcommand;
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
@@ -31,20 +33,37 @@ const MAX_PACKAGE_DIAGNOSTICS: usize = 256;
 const MAX_REPORT_DIAGNOSTICS: usize = 1024;
 const MAX_PACKAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_EXTENSION_MANIFEST_DEPTH: usize = 64;
+const MIGRATION_PLAN_SCHEMA_VERSION: u32 = 2;
+const MAX_MIGRATION_PLAN_BYTES: usize = 2 * 1024 * 1024;
+const MIGRATION_PLAN_DIGEST_DOMAIN: &[u8] = b"ygg-pi-migration-plan-v2\0";
+const MIGRATION_OPERATION_DIGEST_DOMAIN: &[u8] = b"ygg-pi-migration-operation-v1\0";
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum MigrationCommand {
     /// Inventory a Pi setup without executing packages or invoking a model.
     Pi {
         /// Explicitly state that this invocation must not modify either setup.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "apply")]
         dry_run: bool,
-        /// Emit the versioned machine-readable report.
-        #[arg(long, conflicts_with = "summary")]
+        /// Emit the versioned machine-readable inventory.
+        #[arg(long, conflicts_with_all = ["summary", "apply"])]
         json: bool,
         /// Emit only aggregate counts and diagnostics.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["json", "apply"])]
         summary: bool,
+        /// Write a content-digested schema-2 migration plan without applying it.
+        #[arg(long, value_name = "FILE", conflicts_with = "apply")]
+        plan_out: Option<PathBuf>,
+        /// Apply one previously saved schema-2 plan.
+        #[arg(
+            long,
+            value_name = "PLAN",
+            conflicts_with_all = ["dry_run", "json", "summary", "plan_out", "pi_home", "project", "npm_roots", "pi_package", "extension_root", "name"]
+        )]
+        apply: Option<PathBuf>,
+        /// Confirm a saved migration plan non-interactively.
+        #[arg(long, requires = "apply")]
+        yes: bool,
         /// Pi's user agent directory (defaults to PI_CODING_AGENT_DIR or ~/.pi/agent).
         #[arg(long, value_name = "DIR")]
         pi_home: Option<PathBuf>,
@@ -54,6 +73,15 @@ pub enum MigrationCommand {
         /// Additional legacy global npm node_modules root (repeatable).
         #[arg(long = "npm-root", value_name = "DIR")]
         npm_roots: Vec<PathBuf>,
+        /// Exact pinned Pi coding-agent package used by the aggregate bridge.
+        #[arg(long, value_name = "DIR", requires = "plan_out")]
+        pi_package: Option<PathBuf>,
+        /// Ygg extension root for the inert aggregate output.
+        #[arg(long, value_name = "DIR", requires = "plan_out")]
+        extension_root: Option<PathBuf>,
+        /// Override the inert aggregate extension name.
+        #[arg(long, requires = "plan_out")]
+        name: Option<String>,
     },
 }
 
@@ -430,6 +458,39 @@ struct MigrationReport {
     extensions: Vec<ExtensionReport>,
     resources: Vec<ResourceReport>,
     diagnostics: Vec<Diagnostic>,
+    #[serde(skip)]
+    ordered_extensions: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlannedDestinationState {
+    Absent,
+    Identical { output_digest: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiAggregatePlanOperation {
+    kind: String,
+    destination: PathBuf,
+    expected_destination: PlannedDestinationState,
+    lock: crate::pi::PiLockRecord,
+    operation_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PiMigrationPlan {
+    schema_version: u32,
+    source: String,
+    mode: String,
+    model_usage: String,
+    package_code_executed: bool,
+    project: PathBuf,
+    pi_home: PathBuf,
+    operation: PiAggregatePlanOperation,
+    plan_digest: String,
 }
 
 pub fn run(command: MigrationCommand, invocation_cwd: &Path) -> anyhow::Result<()> {
@@ -438,10 +499,21 @@ pub fn run(command: MigrationCommand, invocation_cwd: &Path) -> anyhow::Result<(
             dry_run: _,
             json,
             summary,
+            plan_out,
+            apply,
+            yes,
             pi_home,
             project,
             npm_roots,
+            pi_package,
+            extension_root,
+            name,
         } => {
+            if let Some(plan) = apply {
+                let plan = absolute_path(&plan, invocation_cwd)?;
+                return apply_pi_plan(&plan, yes);
+            }
+
             let project =
                 absolute_path(project.as_deref().unwrap_or(invocation_cwd), invocation_cwd)?;
             let pi_home = match pi_home {
@@ -452,15 +524,47 @@ pub fn run(command: MigrationCommand, invocation_cwd: &Path) -> anyhow::Result<(
                 .iter()
                 .map(|path| absolute_path(path, invocation_cwd))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let report = scan_pi(&ScanOptions {
-                pi_home,
-                project,
+            let options = ScanOptions {
+                pi_home: pi_home.clone(),
+                project: project.clone(),
                 npm_roots,
-            });
+            };
+            let report = scan_pi(&options);
             if json {
                 crate::output::stdout_multiline(serde_json::to_string_pretty(&report)?);
             } else {
                 print_human_report(&report, summary);
+            }
+            if let Some(plan_out) = plan_out {
+                let plan_out = absolute_path(&plan_out, invocation_cwd)?;
+                let selected_package = pi_package
+                    .as_deref()
+                    .map(|path| absolute_path(path, invocation_cwd))
+                    .transpose()?;
+                let extension_root =
+                    crate::pi::resolve_extension_root(extension_root.as_deref(), invocation_cwd)?;
+                let plan = build_pi_plan(
+                    &report,
+                    &options,
+                    selected_package.as_deref(),
+                    &extension_root,
+                    name.as_deref(),
+                    invocation_cwd,
+                )?;
+                write_pi_plan(&plan_out, &plan)?;
+                let saved = format!(
+                    "Saved inert aggregate migration plan to {}.",
+                    plan_out.display()
+                );
+                let next =
+                    "Review it, then run `ygg migrate pi --apply PLAN` or add `--yes` for automation.";
+                if json {
+                    crate::output::stderr_line(saved);
+                    crate::output::stderr_line(next);
+                } else {
+                    crate::output::stdout_line(saved);
+                    crate::output::stdout_line(next);
+                }
             }
             Ok(())
         }
@@ -473,6 +577,247 @@ fn default_pi_home() -> anyhow::Result<PathBuf> {
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?;
     absolute_path(&home.join(".pi/agent"), &std::env::current_dir()?)
+}
+
+fn build_pi_plan(
+    report: &MigrationReport,
+    options: &ScanOptions,
+    selected_pi_package: Option<&Path>,
+    extension_root: &Path,
+    requested_name: Option<&str>,
+    invocation_cwd: &Path,
+) -> anyhow::Result<PiMigrationPlan> {
+    if report
+        .diagnostics
+        .iter()
+        .chain(
+            report
+                .packages
+                .iter()
+                .flat_map(|package| &package.diagnostics),
+        )
+        .any(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+        || report
+            .extensions
+            .iter()
+            .chain(
+                report
+                    .packages
+                    .iter()
+                    .flat_map(|package| &package.extensions),
+            )
+            .any(|extension| extension.migration == MigrationPath::Blocked)
+    {
+        anyhow::bail!(
+            "cannot create a migration plan while the inventory has errors or blocked extensions"
+        );
+    }
+    if report.ordered_extensions.is_empty() {
+        anyhow::bail!("the Pi setup has no enabled extension sources to lock");
+    }
+
+    let mut sources = Vec::with_capacity(report.ordered_extensions.len());
+    for path in &report.ordered_extensions {
+        // The current aggregate bridge can revalidate source trees and the
+        // selected Pi runtime before import. Package-manager lock hashes remain
+        // inventory evidence until the lock records their exact root/file set;
+        // do not publish an unverifiable digest as a runtime precondition.
+        sources.push(crate::pi::PiLockedSource::from_canonical_path(
+            path.clone(),
+            None,
+        )?);
+    }
+    let pi_package = crate::pi::select_pi_package(
+        selected_pi_package,
+        &sources,
+        &options.pi_home,
+        invocation_cwd,
+    )?;
+    let name = requested_name
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::pi::DEFAULT_AGGREGATE_NAME.to_owned());
+    let lock =
+        crate::pi::PiLockRecord::new(name.clone(), sources, options.pi_home.clone(), pi_package)?;
+    let destination = extension_root.join(&name);
+    let expected_destination = match crate::pi::inspect_destination(&lock, &destination)? {
+        crate::pi::DestinationInspection::Absent => PlannedDestinationState::Absent,
+        crate::pi::DestinationInspection::Identical { output_digest } => {
+            PlannedDestinationState::Identical { output_digest }
+        }
+        crate::pi::DestinationInspection::Conflict { reason } => {
+            anyhow::bail!(
+                "cannot plan aggregate output at {}: {reason}",
+                destination.display()
+            );
+        }
+    };
+    let mut operation = PiAggregatePlanOperation {
+        kind: "publish_aggregate_lock".to_owned(),
+        destination,
+        expected_destination,
+        lock,
+        operation_digest: String::new(),
+    };
+    operation.operation_digest = migration_operation_digest(&operation)?;
+    let mut plan = PiMigrationPlan {
+        schema_version: MIGRATION_PLAN_SCHEMA_VERSION,
+        source: "pi".to_owned(),
+        mode: "plan".to_owned(),
+        model_usage: "disabled".to_owned(),
+        package_code_executed: false,
+        project: options.project.clone(),
+        pi_home: options.pi_home.clone(),
+        operation,
+        plan_digest: String::new(),
+    };
+    plan.plan_digest = migration_plan_digest(&plan)?;
+    validate_pi_plan(&plan)?;
+    Ok(plan)
+}
+
+fn migration_operation_digest(operation: &PiAggregatePlanOperation) -> anyhow::Result<String> {
+    let mut unsigned = operation.clone();
+    unsigned.operation_digest.clear();
+    crate::pi::canonical_content_digest(MIGRATION_OPERATION_DIGEST_DOMAIN, &unsigned)
+}
+
+fn migration_plan_digest(plan: &PiMigrationPlan) -> anyhow::Result<String> {
+    let mut unsigned = plan.clone();
+    unsigned.plan_digest.clear();
+    crate::pi::canonical_content_digest(MIGRATION_PLAN_DIGEST_DOMAIN, &unsigned)
+}
+
+fn validate_pi_plan(plan: &PiMigrationPlan) -> anyhow::Result<()> {
+    if plan.schema_version != MIGRATION_PLAN_SCHEMA_VERSION
+        || plan.source != "pi"
+        || plan.mode != "plan"
+        || plan.model_usage != "disabled"
+        || plan.package_code_executed
+        || plan.operation.kind != "publish_aggregate_lock"
+        || !plan.project.is_absolute()
+        || !plan.pi_home.is_absolute()
+        || !plan.operation.destination.is_absolute()
+    {
+        anyhow::bail!("invalid or unsupported Pi migration plan contract");
+    }
+    if plan.operation.lock.pi_home != plan.pi_home {
+        anyhow::bail!("Pi migration plan owner paths do not match its aggregate lock");
+    }
+    crate::pi::validate_lock_shape(&plan.operation.lock)?;
+    if crate::pi::aggregate_lock_digest(&plan.operation.lock)?
+        != plan.operation.lock.aggregate_digest
+    {
+        anyhow::bail!("Pi migration plan contains a tampered aggregate lock");
+    }
+    if migration_operation_digest(&plan.operation)? != plan.operation.operation_digest {
+        anyhow::bail!("Pi migration operation digest mismatch");
+    }
+    if migration_plan_digest(plan)? != plan.plan_digest {
+        anyhow::bail!("Pi migration plan digest mismatch");
+    }
+    if let PlannedDestinationState::Identical { output_digest } =
+        &plan.operation.expected_destination
+    {
+        if !crate::pi::valid_sha256(output_digest) {
+            anyhow::bail!("Pi migration plan has an invalid expected output digest");
+        }
+    }
+    let encoded = serde_json::to_vec_pretty(plan)?;
+    if encoded.len() > MAX_MIGRATION_PLAN_BYTES {
+        anyhow::bail!(
+            "Pi migration plan is {} bytes; limit is {MAX_MIGRATION_PLAN_BYTES}",
+            encoded.len()
+        );
+    }
+    Ok(())
+}
+
+fn write_pi_plan(path: &Path, plan: &PiMigrationPlan) -> anyhow::Result<()> {
+    validate_pi_plan(plan)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("migration plan path has no parent directory"))?;
+    if !parent.is_dir() {
+        anyhow::bail!(
+            "migration plan parent directory does not exist: {}",
+            parent.display()
+        );
+    }
+    let mut bytes = serde_json::to_vec_pretty(plan)?;
+    bytes.push(b'\n');
+    ygg_agent::secure_fs::write_private_atomic(path, &bytes, MAX_MIGRATION_PLAN_BYTES)
+        .with_context(|| format!("cannot write migration plan {}", path.display()))
+}
+
+fn read_pi_plan(path: &Path) -> anyhow::Result<PiMigrationPlan> {
+    let bytes = ygg_agent::secure_fs::read_regular_file_bounded(path, MAX_MIGRATION_PLAN_BYTES)
+        .with_context(|| format!("cannot read migration plan {}", path.display()))?;
+    let plan: PiMigrationPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid migration plan JSON in {}", path.display()))?;
+    validate_pi_plan(&plan)?;
+    Ok(plan)
+}
+
+fn confirm_pi_apply(plan: &PiMigrationPlan, yes: bool) -> anyhow::Result<()> {
+    if yes {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("migration apply requires interactive confirmation or explicit `--yes`");
+    }
+    crate::output::stdout_line(format!(
+        "Apply inert Pi aggregate {} to {}? [y/N]",
+        plan.operation.lock.name,
+        plan.operation.destination.display()
+    ));
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        anyhow::bail!("Pi migration apply cancelled");
+    }
+    Ok(())
+}
+
+fn apply_pi_plan(path: &Path, yes: bool) -> anyhow::Result<()> {
+    let plan = read_pi_plan(path)?;
+    crate::pi::validate_lock_preconditions(&plan.operation.lock)?;
+    let current =
+        crate::pi::inspect_destination(&plan.operation.lock, &plan.operation.destination)?;
+    match (&plan.operation.expected_destination, &current) {
+        (PlannedDestinationState::Absent, crate::pi::DestinationInspection::Absent)
+        | (PlannedDestinationState::Absent, crate::pi::DestinationInspection::Identical { .. }) => {
+        }
+        (
+            PlannedDestinationState::Identical {
+                output_digest: expected,
+            },
+            crate::pi::DestinationInspection::Identical {
+                output_digest: actual,
+            },
+        ) if expected == actual => {}
+        (_, crate::pi::DestinationInspection::Conflict { reason }) => {
+            anyhow::bail!("migration destination drifted: {reason}");
+        }
+        _ => anyhow::bail!("migration destination no longer matches the saved plan"),
+    }
+    confirm_pi_apply(&plan, yes)?;
+    let outcome =
+        crate::pi::publish_lock_extension(&plan.operation.lock, &plan.operation.destination)?;
+    match outcome {
+        crate::pi::PublishOutcome::Published => crate::output::stdout_line(format!(
+            "Applied inert Pi aggregate {}. It remains disabled and untrusted.",
+            plan.operation.lock.name
+        )),
+        crate::pi::PublishOutcome::AlreadyPresent => crate::output::stdout_line(format!(
+            "Pi aggregate {} is already present with identical content.",
+            plan.operation.lock.name
+        )),
+    }
+    crate::output::stdout_line(
+        "No package code, dependency installer, credential import, enablement, or trust grant was performed.",
+    );
+    Ok(())
 }
 
 fn print_human_report(report: &MigrationReport, summary_only: bool) {
@@ -588,7 +933,9 @@ fn print_human_report(report: &MigrationReport, summary_only: bool) {
 
     crate::output::stdout_line("");
     crate::output::stdout_line("Estimated model usage: 0 tokens");
-    crate::output::stdout_line("No files changed and no Pi package code executed.");
+    crate::output::stdout_line(
+        "No Pi or Ygg configuration changed and no Pi package code executed.",
+    );
 }
 
 fn scan_pi(options: &ScanOptions) -> MigrationReport {
@@ -603,12 +950,14 @@ fn scan_pi(options: &ScanOptions) -> MigrationReport {
         read_settings(&project_settings_path, Scope::Project, &mut diagnostics);
 
     let mut resolved = BTreeMap::<String, ResolvedPackageSetting>::new();
+    let mut resolved_order = Vec::new();
     resolve_settings_packages(
         &global_settings,
         Scope::User,
         &options.pi_home,
         options,
         &mut resolved,
+        &mut resolved_order,
         &mut diagnostics,
     );
     resolve_settings_packages(
@@ -617,14 +966,26 @@ fn scan_pi(options: &ScanOptions) -> MigrationReport {
         &project_base,
         options,
         &mut resolved,
+        &mut resolved_order,
         &mut diagnostics,
     );
 
     let mut analysis_budget = AnalysisBudget::default();
-    let mut packages = resolved
-        .into_values()
+    let mut packages = resolved_order
+        .into_iter()
+        .filter_map(|identity| resolved.remove(&identity))
         .map(|package| scan_package(package, &mut analysis_budget))
         .collect::<Vec<_>>();
+    let mut ordered_extensions = Vec::new();
+    for path in packages.iter().flat_map(|package| {
+        package
+            .resources
+            .iter()
+            .filter(|resource| resource.enabled && resource.kind == ResourceKind::Extension)
+            .map(|resource| resource.path.clone())
+    }) {
+        push_ordered_extension(&mut ordered_extensions, path);
+    }
     packages.sort_by(|left, right| left.identity.cmp(&right.identity));
 
     let mut resources = Vec::new();
@@ -647,6 +1008,13 @@ fn scan_pi(options: &ScanOptions) -> MigrationReport {
         &mut analysis_budget,
         &mut diagnostics,
     );
+    for path in resources
+        .iter()
+        .filter(|resource| resource.enabled && resource.kind == ResourceKind::Extension)
+        .map(|resource| resource.path.clone())
+    {
+        push_ordered_extension(&mut ordered_extensions, path);
+    }
     resources.sort_by(|left, right| (left.kind, &left.path).cmp(&(right.kind, &right.path)));
     resources.dedup_by(|left, right| left.kind == right.kind && left.path == right.path);
     extensions.sort_by(|left, right| left.path.cmp(&right.path));
@@ -707,7 +1075,15 @@ fn scan_pi(options: &ScanOptions) -> MigrationReport {
         extensions,
         resources,
         diagnostics,
+        ordered_extensions,
     }
+}
+
+fn push_ordered_extension(ordered: &mut Vec<PathBuf>, path: PathBuf) {
+    if let Some(index) = ordered.iter().position(|existing| existing == &path) {
+        ordered.remove(index);
+    }
+    ordered.push(path);
 }
 
 fn read_settings(
@@ -770,6 +1146,7 @@ fn resolve_settings_packages(
     settings_base: &Path,
     options: &ScanOptions,
     resolved: &mut BTreeMap<String, ResolvedPackageSetting>,
+    resolved_order: &mut Vec<String>,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for setting in &settings.packages {
@@ -806,7 +1183,11 @@ fn resolve_settings_packages(
             break;
         }
         // Pi gives a project package precedence over the same user package.
-        // Processing the project settings second mirrors that deterministic rule.
+        // Processing project settings second and moving an override to this
+        // position preserves the effective load order separately from the
+        // alphabetically sorted human report.
+        resolved_order.retain(|identity| identity != &package.identity);
+        resolved_order.push(package.identity.clone());
         resolved.insert(package.identity.clone(), package);
     }
 }
@@ -3874,6 +4255,159 @@ mod tests {
         assert_eq!(
             parse_git_source("https://github.com/user/repo.git@abc"),
             Some(("github.com".to_owned(), PathBuf::from("user/repo")))
+        );
+    }
+
+    fn create_pinned_pi_package(path: &Path) -> PathBuf {
+        write(
+            &path.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"0.84.4"}"#,
+        );
+        write(&path.join("dist/index.js"), "export {};\n");
+        fs::canonicalize(path).unwrap()
+    }
+
+    #[test]
+    fn migration_plan_preserves_extension_order_and_applies_one_inert_aggregate() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = options(temp.path());
+        let first = fs::canonicalize(temp.path()).unwrap().join("first.ts");
+        let second = fs::canonicalize(temp.path()).unwrap().join("second.ts");
+        write(
+            &first,
+            "export default (pi) => pi.registerTool({ name: 'first' });\n",
+        );
+        write(
+            &second,
+            "export default (pi) => pi.registerTool({ name: 'second' });\n",
+        );
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(
+                r#"{{"packages":[{},{}]}}"#,
+                serde_json::to_string(second.to_str().unwrap()).unwrap(),
+                serde_json::to_string(first.to_str().unwrap()).unwrap(),
+            ),
+        );
+        let package = create_pinned_pi_package(&temp.path().join("pi-package"));
+        let extension_root = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("ygg-extensions");
+        let marker = temp.path().join("executed-marker");
+
+        let report = scan_pi(&options);
+        assert_eq!(
+            report.ordered_extensions,
+            vec![second.clone(), first.clone()]
+        );
+        assert!(!marker.exists());
+        let plan = build_pi_plan(
+            &report,
+            &options,
+            Some(&package),
+            &extension_root,
+            Some("pi-migrated"),
+            temp.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.operation
+                .lock
+                .sources
+                .iter()
+                .map(|source| source.canonical_path.clone())
+                .collect::<Vec<_>>(),
+            vec![second, first]
+        );
+        assert_eq!(
+            plan.operation.expected_destination,
+            PlannedDestinationState::Absent
+        );
+
+        let plan_path = fs::canonicalize(temp.path()).unwrap().join("pi-plan.json");
+        write_pi_plan(&plan_path, &plan).unwrap();
+        assert_eq!(read_pi_plan(&plan_path).unwrap(), plan);
+        apply_pi_plan(&plan_path, true).unwrap();
+        apply_pi_plan(&plan_path, true).unwrap();
+        let destination = extension_root.join("pi-migrated");
+        assert!(destination.join("extension.toml").is_file());
+        assert!(destination.join(crate::pi::PI_LOCK_RECORD).is_file());
+        assert!(!marker.exists(), "planning or apply executed package code");
+    }
+
+    #[test]
+    fn migration_plan_tamper_source_drift_and_destination_conflict_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let options = options(temp.path());
+        let source = fs::canonicalize(temp.path()).unwrap().join("extension.ts");
+        write(
+            &source,
+            "export default (pi) => pi.registerCommand('safe', {});\n",
+        );
+        write(
+            &options.pi_home.join("settings.json"),
+            &format!(
+                r#"{{"packages":[{}]}}"#,
+                serde_json::to_string(source.to_str().unwrap()).unwrap(),
+            ),
+        );
+        let package = create_pinned_pi_package(&temp.path().join("pi-package"));
+        let extension_root = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("ygg-extensions");
+        let report = scan_pi(&options);
+        let plan = build_pi_plan(
+            &report,
+            &options,
+            Some(&package),
+            &extension_root,
+            Some("pi-drift"),
+            temp.path(),
+        )
+        .unwrap();
+
+        let mut tampered = plan.clone();
+        tampered.operation.lock.sources[0].enabled = false;
+        assert!(validate_pi_plan(&tampered).is_err());
+
+        let plan_path = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("drift-plan.json");
+        write_pi_plan(&plan_path, &plan).unwrap();
+        write(&source, "export default () => 'changed';\n");
+        assert!(apply_pi_plan(&plan_path, true)
+            .unwrap_err()
+            .to_string()
+            .contains("changed after planning"));
+        assert!(!extension_root.join("pi-drift").exists());
+
+        // Re-plan the changed source, then introduce an unrelated destination.
+        let report = scan_pi(&options);
+        let conflict = build_pi_plan(
+            &report,
+            &options,
+            Some(&package),
+            &extension_root,
+            Some("pi-conflict-plan"),
+            temp.path(),
+        )
+        .unwrap();
+        fs::create_dir_all(&extension_root).unwrap();
+        write(
+            &extension_root.join("pi-conflict-plan/unrelated"),
+            "preserve me",
+        );
+        let conflict_path = fs::canonicalize(temp.path())
+            .unwrap()
+            .join("conflict-plan.json");
+        write_pi_plan(&conflict_path, &conflict).unwrap();
+        assert!(apply_pi_plan(&conflict_path, true)
+            .unwrap_err()
+            .to_string()
+            .contains("destination drifted"));
+        assert_eq!(
+            fs::read_to_string(extension_root.join("pi-conflict-plan/unrelated")).unwrap(),
+            "preserve me"
         );
     }
 

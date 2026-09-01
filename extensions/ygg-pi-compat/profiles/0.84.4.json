@@ -231,11 +231,38 @@
     "working-message-test.ts"
   ],
   "release_gates": {
-    "plan_mode": "required",
-    "all_official_examples": 78,
-    "tui_test_files": 33,
-    "silent_unsupported_calls": 0,
-    "aggregate_process": "required",
-    "provider_and_oauth": "required"
+    "plan_mode": {
+      "required": true,
+      "status": "open",
+      "evidence": []
+    },
+    "all_official_examples": {
+      "required": true,
+      "status": "open",
+      "expected_count": 78,
+      "evidence": []
+    },
+    "tui_test_files": {
+      "required": true,
+      "status": "open",
+      "expected_count": 33,
+      "evidence": []
+    },
+    "silent_unsupported_calls": {
+      "required": true,
+      "status": "open",
+      "expected_count": 0,
+      "evidence": []
+    },
+    "aggregate_process": {
+      "required": true,
+      "status": "open",
+      "evidence": []
+    },
+    "provider_and_oauth": {
+      "required": true,
+      "status": "open",
+      "evidence": []
+    }
   }
 }

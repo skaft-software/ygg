@@ -1,12 +1,14 @@
 #![allow(missing_docs)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use ygg_agent::extension_process::{
     ExtensionCapabilities, ExtensionEntrypoint, ExtensionFilesystemAccess, ExtensionHook,
@@ -17,11 +19,22 @@ use ygg_agent::EXTENSION_API_VERSION_0_2;
 const BRIDGE_VERSION: &str = "0.2.0";
 const SUPPORTED_PI_VERSION: &str = "0.84.4";
 const YGG_VERSION: &str = env!("CARGO_PKG_VERSION");
+const PROFILE_ID: &str = "pi-0.84.4";
+const PROFILE_REPOSITORY: &str = "https://github.com/earendil-works/pi.git";
+const PROFILE_REVISION: &str = "b79e4cc834970cca69daebffab7df1da7d1e52c4";
+const PROFILE_TAG: &str = "v0.84.4";
+const PI_PACKAGE_NAME: &str = "@earendil-works/pi-coding-agent";
+const PI_PACKAGE_INTEGRITY: &str =
+    "sha512-jmOlrqUmvhh/siNWFRXjYLJzhKFIHNsAQaysRwzQPQFnPAaV/vhqHsLH/MBsIISA1Rjj7WTUFR3nJrpXoLx39w==";
+const PI_TUI_PACKAGE_NAME: &str = "@earendil-works/pi-tui";
+const PI_TUI_PACKAGE_INTEGRITY: &str =
+    "sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w==";
+const MINIMUM_NODE_VERSION: &str = "22.19.0";
 const LINK_SCHEMA_VERSION: u32 = 2;
 const LINK_RECORD: &str = "pi-link.json";
-const PI_LOCK_SCHEMA_VERSION: u32 = 1;
-const PI_LOCK_RECORD: &str = "pi-lock.json";
-const DEFAULT_AGGREGATE_NAME: &str = "pi-compat-0-84-4";
+const PI_LOCK_SCHEMA_VERSION: u32 = 2;
+pub(crate) const PI_LOCK_RECORD: &str = "pi-lock.json";
+pub(crate) const DEFAULT_AGGREGATE_NAME: &str = "pi-compat-0-84-4";
 const MAX_AGGREGATE_SOURCES: usize = 256;
 const SOURCE_FINGERPRINT_ALGORITHM: &str = "sha256";
 const SOURCE_FINGERPRINT_FORMAT: u32 = 1;
@@ -31,9 +44,13 @@ const MAX_SOURCE_ENTRIES: usize = 8192;
 const MAX_SOURCE_DEPTH: usize = 64;
 const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_LINK_RECORD_BYTES: usize = 64 * 1024;
-const MAX_PI_LOCK_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_PI_LOCK_BYTES: usize = 256 * 1024;
 const MAX_PI_PACKAGE_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_GENERATED_FILE_BYTES: usize = 4 * 1024 * 1024;
+const AGGREGATE_DIGEST_DOMAIN: &[u8] = b"ygg-pi-aggregate-lock-v2\0";
+const OUTPUT_DIGEST_DOMAIN: &[u8] = b"ygg-pi-aggregate-output-v1\0";
+const SOURCE_ID_DOMAIN: &[u8] = b"ygg-pi-source-id-v1\0";
+const AGGREGATE_DIGEST_ENV: &str = "YGG_PI_AGGREGATE_DIGEST";
 
 #[derive(Clone, Copy, Debug)]
 struct FingerprintLimits {
@@ -79,12 +96,13 @@ pub enum PiCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct SourceFingerprint {
-    algorithm: String,
-    format_version: u32,
-    digest: String,
-    file_count: u64,
-    byte_count: u64,
+#[serde(deny_unknown_fields)]
+pub(crate) struct SourceFingerprint {
+    pub(crate) algorithm: String,
+    pub(crate) format_version: u32,
+    pub(crate) digest: String,
+    pub(crate) file_count: u64,
+    pub(crate) byte_count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,59 +119,159 @@ struct PiLinkRecord {
     pi_package: Option<PathBuf>,
 }
 
-impl PiLinkRecord {
-    fn new(
-        name: String,
-        source: PathBuf,
-        pi_home: PathBuf,
-        pi_package: Option<PathBuf>,
-        source_fingerprint: SourceFingerprint,
-    ) -> Self {
-        Self {
-            schema_version: LINK_SCHEMA_VERSION,
-            bridge_version: BRIDGE_VERSION.to_owned(),
-            pi_version: SUPPORTED_PI_VERSION.to_owned(),
-            ygg_version: YGG_VERSION.to_owned(),
-            source_fingerprint,
-            name,
-            source,
-            pi_home,
-            pi_package,
-        }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiProfilePackage {
+    pub(crate) name: String,
+    pub(crate) version: String,
+    pub(crate) npm_integrity: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiProfileMetadata {
+    pub(crate) id: String,
+    pub(crate) repository: String,
+    pub(crate) revision: String,
+    pub(crate) tag: String,
+    pub(crate) coding_agent: PiProfilePackage,
+    pub(crate) tui: PiProfilePackage,
+    pub(crate) node_minimum_version: String,
+}
+
+pub(crate) fn supported_profile() -> PiProfileMetadata {
+    PiProfileMetadata {
+        id: PROFILE_ID.to_owned(),
+        repository: PROFILE_REPOSITORY.to_owned(),
+        revision: PROFILE_REVISION.to_owned(),
+        tag: PROFILE_TAG.to_owned(),
+        coding_agent: PiProfilePackage {
+            name: PI_PACKAGE_NAME.to_owned(),
+            version: SUPPORTED_PI_VERSION.to_owned(),
+            npm_integrity: PI_PACKAGE_INTEGRITY.to_owned(),
+        },
+        tui: PiProfilePackage {
+            name: PI_TUI_PACKAGE_NAME.to_owned(),
+            version: SUPPORTED_PI_VERSION.to_owned(),
+            npm_integrity: PI_TUI_PACKAGE_INTEGRITY.to_owned(),
+        },
+        node_minimum_version: MINIMUM_NODE_VERSION.to_owned(),
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PiLockedSource {
-    source: PathBuf,
-    source_fingerprint: SourceFingerprint,
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiBridgeMetadata {
+    pub(crate) version: String,
+    pub(crate) script_digest: String,
+}
+
+pub(crate) fn bridge_script_bytes() -> &'static [u8] {
+    include_bytes!("../../../extensions/ygg-pi-compat/bridge.mjs")
+}
+
+pub(crate) fn bridge_metadata() -> PiBridgeMetadata {
+    PiBridgeMetadata {
+        version: BRIDGE_VERSION.to_owned(),
+        script_digest: format!("{:x}", Sha256::digest(bridge_script_bytes())),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PiSourceKind {
+    File,
+    Directory,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PiLockRecord {
-    schema_version: u32,
-    bridge_version: String,
-    pi_version: String,
-    ygg_version: String,
-    name: String,
-    sources: Vec<PiLockedSource>,
-    pi_home: PathBuf,
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiLockedSource {
+    pub(crate) id: String,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) kind: PiSourceKind,
+    pub(crate) source_fingerprint: SourceFingerprint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pi_package: Option<PathBuf>,
-    aggregate_digest: String,
+    pub(crate) dependency_lock_hash: Option<String>,
+    pub(crate) enabled: bool,
+}
+
+impl PiLockedSource {
+    pub(crate) fn from_canonical_path(
+        canonical_path: PathBuf,
+        dependency_lock_hash: Option<String>,
+    ) -> anyhow::Result<Self> {
+        validate_canonical_source_path(&canonical_path)?;
+        let metadata = fs::symlink_metadata(&canonical_path).with_context(|| {
+            format!(
+                "cannot inspect Pi extension source {}",
+                canonical_path.display()
+            )
+        })?;
+        let kind = if metadata.file_type().is_file() {
+            PiSourceKind::File
+        } else if metadata.file_type().is_dir() {
+            PiSourceKind::Directory
+        } else {
+            anyhow::bail!(
+                "Pi extension source must be a regular file or directory: {}",
+                canonical_path.display()
+            );
+        };
+        let id = stable_source_id(&canonical_path, kind)?;
+        let source_fingerprint = fingerprint_source(&canonical_path)?;
+        if dependency_lock_hash
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256(digest))
+        {
+            anyhow::bail!("Pi dependency lock hash must be a lowercase SHA-256 digest");
+        }
+        Ok(Self {
+            id,
+            canonical_path,
+            kind,
+            source_fingerprint,
+            dependency_lock_hash,
+            enabled: true,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiPackageMetadata {
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) metadata_path: PathBuf,
+    pub(crate) metadata_digest: String,
+    pub(crate) name: String,
+    pub(crate) version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PiLockRecord {
+    pub(crate) schema_version: u32,
+    pub(crate) profile: PiProfileMetadata,
+    pub(crate) bridge: PiBridgeMetadata,
+    pub(crate) ygg_version: String,
+    pub(crate) name: String,
+    pub(crate) sources: Vec<PiLockedSource>,
+    pub(crate) pi_home: PathBuf,
+    pub(crate) pi_package: PiPackageMetadata,
+    pub(crate) aggregate_digest: String,
 }
 
 impl PiLockRecord {
-    fn new(
+    pub(crate) fn new(
         name: String,
         sources: Vec<PiLockedSource>,
         pi_home: PathBuf,
-        pi_package: Option<PathBuf>,
+        pi_package: PiPackageMetadata,
     ) -> anyhow::Result<Self> {
         let mut record = Self {
             schema_version: PI_LOCK_SCHEMA_VERSION,
-            bridge_version: BRIDGE_VERSION.to_owned(),
-            pi_version: SUPPORTED_PI_VERSION.to_owned(),
+            profile: supported_profile(),
+            bridge: bridge_metadata(),
             ygg_version: YGG_VERSION.to_owned(),
             name,
             sources,
@@ -161,6 +279,7 @@ impl PiLockRecord {
             pi_package,
             aggregate_digest: String::new(),
         };
+        validate_lock_shape(&record)?;
         record.aggregate_digest = aggregate_lock_digest(&record)?;
         Ok(record)
     }
@@ -211,16 +330,32 @@ impl ParsedPiLinkRecord {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct LegacyPiLockedSource {
+    source: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct LegacyPiLockRecord {
+    schema_version: u32,
+    name: String,
+    sources: Vec<LegacyPiLockedSource>,
+    pi_home: PathBuf,
+    pi_package: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedPiInstallation {
     Link(ParsedPiLinkRecord),
-    Lock(PiLockRecord),
+    LegacyLock(LegacyPiLockRecord),
+    Lock(Box<PiLockRecord>),
 }
 
 impl ParsedPiInstallation {
     fn name(&self) -> &str {
         match self {
             Self::Link(record) => record.name(),
+            Self::LegacyLock(record) => &record.name,
             Self::Lock(record) => &record.name,
         }
     }
@@ -228,13 +363,23 @@ impl ParsedPiInstallation {
     fn source_summary(&self) -> String {
         match self {
             Self::Link(record) => record.source().display().to_string(),
+            Self::LegacyLock(record) => format!(
+                "{} legacy ordered source(s): {}",
+                record.sources.len(),
+                record
+                    .sources
+                    .iter()
+                    .map(|source| source.source.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Self::Lock(record) => format!(
                 "{} ordered source(s): {}",
                 record.sources.len(),
                 record
                     .sources
                     .iter()
-                    .map(|source| source.source.display().to_string())
+                    .map(|source| source.canonical_path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -244,6 +389,7 @@ impl ParsedPiInstallation {
     fn pi_home(&self) -> &Path {
         match self {
             Self::Link(record) => record.pi_home(),
+            Self::LegacyLock(record) => &record.pi_home,
             Self::Lock(record) => &record.pi_home,
         }
     }
@@ -251,13 +397,18 @@ impl ParsedPiInstallation {
     fn pi_package(&self) -> Option<&Path> {
         match self {
             Self::Link(record) => record.pi_package(),
-            Self::Lock(record) => record.pi_package.as_deref(),
+            Self::LegacyLock(record) => record.pi_package.as_deref(),
+            Self::Lock(record) => Some(&record.pi_package.canonical_path),
         }
     }
 
     fn status(&self) -> String {
         match self {
             Self::Link(record) => link_status(record),
+            Self::LegacyLock(record) => format!(
+                "legacy/stale (aggregate lock schema {} lacks digest-bound profile metadata)",
+                record.schema_version
+            ),
             Self::Lock(record) => aggregate_status(record),
         }
     }
@@ -337,36 +488,17 @@ fn install_sources(
         );
     }
     let mut sources = Vec::with_capacity(requested_sources.len());
-    let mut unique_sources = std::collections::BTreeSet::new();
+    let mut unique_sources = BTreeSet::new();
     for requested_source in requested_sources {
         let source = resolve_source(requested_source, invocation_cwd)?;
         if !unique_sources.insert(source.clone()) {
             anyhow::bail!("duplicate Pi extension source {}", source.display());
         }
-        let source_fingerprint = fingerprint_source(&source)?;
-        sources.push(PiLockedSource {
-            source,
-            source_fingerprint,
-        });
+        sources.push(PiLockedSource::from_canonical_path(source, None)?);
     }
     let pi_home = resolve_pi_home(requested_pi_home, invocation_cwd)?;
-    let pi_package = requested_pi_package
-        .map(|path| resolve_pi_package(path, invocation_cwd))
-        .transpose()?;
+    let pi_package = select_pi_package(requested_pi_package, &sources, &pi_home, invocation_cwd)?;
     let extension_root = resolve_extension_root(requested_extension_root, invocation_cwd)?;
-    fs::create_dir_all(&extension_root).with_context(|| {
-        format!(
-            "cannot create Ygg extension root {}",
-            extension_root.display()
-        )
-    })?;
-    reject_symlink(&extension_root, "Ygg extension root")?;
-    let extension_root = extension_root.canonicalize().with_context(|| {
-        format!(
-            "cannot resolve Ygg extension root {}",
-            extension_root.display()
-        )
-    })?;
 
     let aggregate = sources.len() > 1;
     let name = requested_name
@@ -376,102 +508,24 @@ fn install_sources(
             if aggregate {
                 DEFAULT_AGGREGATE_NAME.to_owned()
             } else {
-                generated_name(&sources[0].source)
+                generated_name(&sources[0].canonical_path)
             }
         });
     let package = extension_root.join(&name);
-    match fs::symlink_metadata(&package) {
-        Ok(_) => anyhow::bail!(
-            "Pi compatibility link {name:?} already exists at {}; remove it manually before reinstalling",
-            package.display()
-        ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "cannot inspect Pi compatibility link destination {}",
-                    package.display()
-                )
-            });
-        }
-    }
+    let record = PiLockRecord::new(name.clone(), sources.clone(), pi_home, pi_package)?;
+    let outcome = publish_lock_extension(&record, &package)?;
 
-    let bridge_path = package.join("bridge.mjs");
-    let manifest = manifest_for_sources(
-        &name,
-        &sources,
-        &pi_home,
-        pi_package.as_deref(),
-        &bridge_path,
-    )?;
-    let manifest_text = toml::to_string_pretty(&manifest)?;
-    let (record_name, record_text) = if aggregate {
-        let record = PiLockRecord::new(
-            name.clone(),
-            sources.clone(),
-            pi_home.clone(),
-            pi_package.clone(),
-        )?;
-        (
-            PI_LOCK_RECORD,
-            format!("{}\n", serde_json::to_string_pretty(&record)?),
-        )
-    } else {
-        let source = &sources[0];
-        let record = PiLinkRecord::new(
-            name.clone(),
-            source.source.clone(),
-            pi_home.clone(),
-            pi_package.clone(),
-            source.source_fingerprint.clone(),
-        );
-        (
-            LINK_RECORD,
-            format!("{}\n", serde_json::to_string_pretty(&record)?),
-        )
-    };
-
-    let mut publication = PackagePublication::create(&package)?;
-    let publish_result = (|| -> anyhow::Result<()> {
-        publication.write_private_file(
-            &bridge_path,
-            include_str!("../../../extensions/ygg-pi-compat/bridge.mjs"),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&bridge_path, fs::Permissions::from_mode(0o700))?;
-        }
-        publication.write_private_file(&package.join("extension.toml"), &manifest_text)?;
-        // The lock/record is written last so an incomplete package is never listed.
-        publication.write_private_file(&package.join(record_name), &record_text)?;
-        sync_directory(&package)?;
-        Ok(())
-    })();
-    if let Err(error) = publish_result {
-        return match publication.rollback() {
-            Ok(()) => Err(error),
-            Err(rollback) => Err(anyhow::anyhow!(
-                "{error:#}; rollback of {} also failed: {rollback:#}",
-                package.display()
-            )),
-        };
-    }
-    publication.commit();
-
-    if aggregate {
-        crate::output::stdout_line(format!(
-            "Installed Pi compatibility aggregate {name} with {} ordered sources.",
+    match outcome {
+        PublishOutcome::Published => crate::output::stdout_line(format!(
+            "Installed Pi compatibility aggregate {name} with {} ordered source(s).",
             sources.len()
-        ));
-    } else {
-        crate::output::stdout_line(format!(
-            "Installed Pi compatibility link {name} for {}.",
-            sources[0].source.display()
-        ));
+        )),
+        PublishOutcome::AlreadyPresent => crate::output::stdout_line(format!(
+            "Pi compatibility aggregate {name} is already installed with identical locked output."
+        )),
     }
     crate::output::stdout_line(
-        "The link remains disabled and untrusted until you explicitly enable and trust it.",
+        "The aggregate remains disabled and untrusted until you explicitly enable and trust it.",
     );
     crate::output::stdout_line(format!(
         "Run: ygg --enable-extension {name} --trust-extension {name}"
@@ -505,9 +559,16 @@ fn list(requested_extension_root: Option<&Path>, invocation_cwd: &Path) -> anyho
         if let Ok(bytes) =
             ygg_agent::secure_fs::read_regular_file_bounded(&lock_path, MAX_PI_LOCK_BYTES)
         {
-            if let Ok(record) = parse_lock_record(&bytes) {
-                records.push(ParsedPiInstallation::Lock(record));
-                continue;
+            if let Ok(schema) = serde_json::from_slice::<LinkRecordSchema>(&bytes) {
+                if schema.schema_version == 1 {
+                    if let Ok(record) = serde_json::from_slice::<LegacyPiLockRecord>(&bytes) {
+                        records.push(ParsedPiInstallation::LegacyLock(record));
+                        continue;
+                    }
+                } else if let Ok(record) = parse_lock_record(&bytes) {
+                    records.push(ParsedPiInstallation::Lock(Box::new(record)));
+                    continue;
+                }
             }
         }
         let record_path = path.join(LINK_RECORD);
@@ -545,45 +606,20 @@ fn list(requested_extension_root: Option<&Path>, invocation_cwd: &Path) -> anyho
     Ok(())
 }
 
-#[cfg(test)]
-fn manifest(
-    name: &str,
-    source: &Path,
-    source_fingerprint: &SourceFingerprint,
-    pi_home: &Path,
-    pi_package: Option<&Path>,
+fn manifest_for_lock(
+    record: &PiLockRecord,
     bridge_path: &Path,
+    lock_path: &Path,
 ) -> anyhow::Result<ExtensionManifest> {
-    manifest_for_sources(
-        name,
-        &[PiLockedSource {
-            source: source.to_path_buf(),
-            source_fingerprint: source_fingerprint.clone(),
-        }],
-        pi_home,
-        pi_package,
-        bridge_path,
-    )
-}
-
-fn manifest_for_sources(
-    name: &str,
-    sources: &[PiLockedSource],
-    pi_home: &Path,
-    pi_package: Option<&Path>,
-    bridge_path: &Path,
-) -> anyhow::Result<ExtensionManifest> {
-    if sources.is_empty() || sources.len() > MAX_AGGREGATE_SOURCES {
-        anyhow::bail!("invalid Pi compatibility source count {}", sources.len());
-    }
-    let pi_home_text = pi_home
-        .to_str()
-        .ok_or_else(|| anyhow::anyhow!("Pi home path is not valid UTF-8: {}", pi_home.display()))?;
+    validate_lock_shape(record)?;
     let bridge_text = bridge_path.to_str().ok_or_else(|| {
         anyhow::anyhow!(
             "Pi bridge path is not valid UTF-8: {}",
             bridge_path.display()
         )
+    })?;
+    let lock_text = lock_path.to_str().ok_or_else(|| {
+        anyhow::anyhow!("Pi lock path is not valid UTF-8: {}", lock_path.display())
     })?;
     // Ygg stages the selected entrypoint bytes before execution. On Unix,
     // staging a dynamically linked `node` binary can break loader-relative
@@ -598,50 +634,28 @@ fn manifest_for_sources(
     if !cfg!(unix) {
         entrypoint_args.push(bridge_text.to_owned());
     }
-    for locked in sources {
-        let source_text = locked.source.to_str().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Pi extension source path is not valid UTF-8: {}",
-                locked.source.display()
-            )
-        })?;
-        entrypoint_args.extend([
-            "--extension".to_owned(),
-            source_text.to_owned(),
-            "--source-fingerprint".to_owned(),
-            locked.source_fingerprint.digest.clone(),
-        ]);
-    }
-    entrypoint_args.extend(["--agent-dir".to_owned(), pi_home_text.to_owned()]);
-    if let Some(pi_package) = pi_package {
-        let pi_package = pi_package.to_str().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Pi package path is not valid UTF-8: {}",
-                pi_package.display()
-            )
-        })?;
-        entrypoint_args.extend(["--pi-package".to_owned(), pi_package.to_owned()]);
-    }
-    entrypoint_args.extend(["--command".to_owned(), name.to_owned()]);
+    entrypoint_args.extend(["--lock".to_owned(), lock_text.to_owned()]);
+    let mut entrypoint_env = BTreeMap::new();
+    entrypoint_env.insert(
+        AGGREGATE_DIGEST_ENV.to_owned(),
+        record.aggregate_digest.clone(),
+    );
 
-    let description = if sources.len() == 1 {
-        format!("Pi compatibility link for {}", sources[0].source.display())
-    } else {
-        format!(
-            "Pi compatibility aggregate for {} ordered sources",
-            sources.len()
-        )
-    };
     Ok(ExtensionManifest {
-        name: name.to_owned(),
+        name: record.name.clone(),
         version: BRIDGE_VERSION.to_owned(),
         api_version: EXTENSION_API_VERSION_0_2.to_owned(),
         requires_ygg: Some(format!("={YGG_VERSION}")),
-        description: Some(description),
+        description: Some(format!(
+            "Disabled-by-default Pi compatibility aggregate for {} ordered source(s), lock {}",
+            record.sources.len(),
+            record.aggregate_digest
+        )),
         entrypoint: ExtensionEntrypoint {
             command: entrypoint_command,
+            sha256: Some(record.bridge.script_digest.clone()),
             args: entrypoint_args,
-            env: Default::default(),
+            env: entrypoint_env,
         },
         capabilities: ExtensionCapabilities {
             filesystem: ExtensionFilesystemAccess::Unrestricted,
@@ -649,10 +663,11 @@ fn manifest_for_sources(
             network: true,
             secrets: Vec::new(),
             environment: Vec::new(),
+            host_services: Vec::new(),
         },
         contributes: ManifestContributions {
             tools: Vec::new(),
-            commands: vec![name.to_owned()],
+            commands: vec![record.name.clone()],
             hooks: vec![
                 ExtensionHook::AfterResponse,
                 ExtensionHook::BeforeToolCall,
@@ -664,6 +679,9 @@ fn manifest_for_sources(
             notifications: true,
             confirmations: true,
             presentation: false,
+            runtime_catalog: false,
+            events: Vec::new(),
+            roles: Vec::new(),
         },
     })
 }
@@ -679,36 +697,209 @@ fn parse_link_record(bytes: &[u8]) -> anyhow::Result<ParsedPiLinkRecord> {
 
 fn parse_lock_record(bytes: &[u8]) -> anyhow::Result<PiLockRecord> {
     let record: PiLockRecord = serde_json::from_slice(bytes)?;
+    validate_lock_shape(&record)?;
+    if !valid_sha256(&record.aggregate_digest) {
+        anyhow::bail!("invalid Pi aggregate digest");
+    }
+    let actual = aggregate_lock_digest(&record)?;
+    if actual != record.aggregate_digest {
+        anyhow::bail!(
+            "Pi aggregate lock digest mismatch: expected {}, found {actual}",
+            record.aggregate_digest
+        );
+    }
+    Ok(record)
+}
+
+pub(crate) fn validate_lock_shape(record: &PiLockRecord) -> anyhow::Result<()> {
     if record.schema_version != PI_LOCK_SCHEMA_VERSION {
         anyhow::bail!(
             "unsupported Pi aggregate lock schema {}",
             record.schema_version
         );
     }
-    if record.sources.len() < 2 || record.sources.len() > MAX_AGGREGATE_SOURCES {
+    if record.sources.is_empty() || record.sources.len() > MAX_AGGREGATE_SOURCES {
         anyhow::bail!("invalid Pi aggregate source count {}", record.sources.len());
     }
     validate_name(&record.name)?;
-    if !valid_sha256(&record.aggregate_digest) {
+    if record.profile != supported_profile() {
+        anyhow::bail!("Pi aggregate lock does not select the exact supported {PROFILE_ID} profile");
+    }
+    if record.bridge.version != BRIDGE_VERSION || !valid_sha256(&record.bridge.script_digest) {
+        anyhow::bail!("Pi aggregate lock bridge metadata is invalid");
+    }
+    if record.ygg_version != YGG_VERSION {
+        anyhow::bail!(
+            "Pi aggregate lock targets Ygg {}, but this binary is Ygg {YGG_VERSION}",
+            record.ygg_version
+        );
+    }
+    if !record.pi_home.is_absolute() || record.pi_home.to_str().is_none() {
+        anyhow::bail!("Pi aggregate lock pi_home must be an absolute UTF-8 path");
+    }
+    if record.pi_package.name != PI_PACKAGE_NAME
+        || record.pi_package.version != SUPPORTED_PI_VERSION
+        || !record.pi_package.canonical_path.is_absolute()
+        || record.pi_package.canonical_path.to_str().is_none()
+        || !record.pi_package.metadata_path.is_absolute()
+        || record.pi_package.metadata_path.to_str().is_none()
+        || record.pi_package.metadata_path != record.pi_package.canonical_path.join("package.json")
+        || !valid_sha256(&record.pi_package.metadata_digest)
+    {
+        anyhow::bail!("Pi aggregate lock package metadata is invalid");
+    }
+    if !record.aggregate_digest.is_empty() && !valid_sha256(&record.aggregate_digest) {
         anyhow::bail!("invalid Pi aggregate digest");
     }
-    let mut unique = std::collections::BTreeSet::new();
+    let mut unique_paths = BTreeSet::new();
+    let mut unique_ids = BTreeSet::new();
     for source in &record.sources {
-        if !unique.insert(&source.source) {
-            anyhow::bail!("duplicate Pi aggregate source {}", source.source.display());
+        if !source.enabled {
+            anyhow::bail!("Pi aggregate locks contain only enabled sources");
+        }
+        validate_canonical_source_path(&source.canonical_path)?;
+        if !unique_paths.insert(&source.canonical_path) {
+            anyhow::bail!(
+                "duplicate Pi aggregate source {}",
+                source.canonical_path.display()
+            );
+        }
+        if !unique_ids.insert(&source.id) {
+            anyhow::bail!("duplicate Pi aggregate source id {}", source.id);
+        }
+        let expected_id = stable_source_id(&source.canonical_path, source.kind)?;
+        if source.id != expected_id {
+            anyhow::bail!("Pi aggregate source {} has an invalid stable id", source.id);
+        }
+        if source.source_fingerprint.algorithm != SOURCE_FINGERPRINT_ALGORITHM
+            || source.source_fingerprint.format_version != SOURCE_FINGERPRINT_FORMAT
+            || !valid_sha256(&source.source_fingerprint.digest)
+            || source.source_fingerprint.file_count == 0
+            || source.source_fingerprint.file_count > MAX_SOURCE_FILES as u64
+            || source.source_fingerprint.byte_count > MAX_SOURCE_BYTES as u64
+            || (source.kind == PiSourceKind::File && source.source_fingerprint.file_count != 1)
+        {
+            anyhow::bail!("Pi aggregate source {} fingerprint is invalid", source.id);
+        }
+        if source
+            .dependency_lock_hash
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256(digest))
+        {
+            anyhow::bail!(
+                "Pi aggregate source {} dependency lock hash is invalid",
+                source.id
+            );
         }
     }
-    Ok(record)
+    let mut bounded = record.clone();
+    bounded.aggregate_digest = "0".repeat(64);
+    let encoded_len = serde_json::to_vec_pretty(&bounded)?
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("Pi aggregate lock size overflow"))?;
+    if encoded_len > MAX_PI_LOCK_BYTES {
+        anyhow::bail!(
+            "Pi aggregate lock is {encoded_len} bytes; limit is {MAX_PI_LOCK_BYTES} bytes"
+        );
+    }
+    Ok(())
 }
 
-fn aggregate_lock_digest(record: &PiLockRecord) -> anyhow::Result<String> {
+pub(crate) fn validate_lock_preconditions(record: &PiLockRecord) -> anyhow::Result<()> {
+    validate_lock_shape(record)?;
+    let actual_aggregate = aggregate_lock_digest(record)?;
+    if actual_aggregate != record.aggregate_digest {
+        anyhow::bail!("Pi aggregate lock digest changed");
+    }
+    if record.bridge != bridge_metadata() {
+        anyhow::bail!("Pi bridge script/profile changed after the lock was planned");
+    }
+    let actual_package =
+        inspect_pi_package(&record.pi_package.canonical_path).map_err(|error| {
+            anyhow::anyhow!(
+                "selected Pi package metadata changed after the lock was planned: {error:#}"
+            )
+        })?;
+    if actual_package != record.pi_package {
+        anyhow::bail!("selected Pi package metadata changed after the lock was planned");
+    }
+    for source in &record.sources {
+        let metadata = fs::symlink_metadata(&source.canonical_path).with_context(|| {
+            format!(
+                "cannot inspect locked Pi source {}",
+                source.canonical_path.display()
+            )
+        })?;
+        let actual_kind = if metadata.file_type().is_file() {
+            PiSourceKind::File
+        } else if metadata.file_type().is_dir() {
+            PiSourceKind::Directory
+        } else {
+            anyhow::bail!("locked Pi source is no longer a regular file or directory");
+        };
+        if actual_kind != source.kind {
+            anyhow::bail!("locked Pi source {} changed kind", source.id);
+        }
+        let actual = fingerprint_source(&source.canonical_path)?;
+        if actual != source.source_fingerprint {
+            anyhow::bail!("locked Pi source {} changed after planning", source.id);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn aggregate_lock_digest(record: &PiLockRecord) -> anyhow::Result<String> {
     let mut unsigned = record.clone();
     unsigned.aggregate_digest.clear();
-    let bytes = serde_json::to_vec(&unsigned)?;
+    canonical_content_digest(AGGREGATE_DIGEST_DOMAIN, &unsigned)
+}
+
+pub(crate) fn canonical_content_digest<T: Serialize>(
+    domain: &[u8],
+    value: &T,
+) -> anyhow::Result<String> {
+    let value = serde_json::to_value(value)?;
+    let mut canonical = String::new();
+    write_canonical_json(&value, &mut canonical)?;
     let mut hasher = Sha256::new();
-    hasher.update(b"ygg-pi-aggregate-lock\0");
-    hasher.update(bytes);
+    hasher.update(domain);
+    hasher.update(canonical.as_bytes());
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn write_canonical_json(value: &Value, output: &mut String) -> anyhow::Result<()> {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            output.push('{');
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key)?);
+                output.push(':');
+                write_canonical_json(&values[key], output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
 }
 
 fn link_status(record: &ParsedPiLinkRecord) -> String {
@@ -751,63 +942,51 @@ fn link_status(record: &ParsedPiLinkRecord) -> String {
 }
 
 fn aggregate_status(record: &PiLockRecord) -> String {
-    let mut stale = Vec::new();
-    if record.schema_version != PI_LOCK_SCHEMA_VERSION {
-        stale.push("lock schema changed".to_owned());
-    }
-    if record.bridge_version != BRIDGE_VERSION {
-        stale.push("bridge profile changed".to_owned());
-    }
-    if record.pi_version != SUPPORTED_PI_VERSION {
-        stale.push("supported Pi version changed".to_owned());
-    }
-    if record.ygg_version != YGG_VERSION {
-        stale.push("Ygg version changed".to_owned());
-    }
-    match aggregate_lock_digest(record) {
-        Ok(actual) if actual != record.aggregate_digest => {
-            stale.push("aggregate lock digest changed".to_owned());
-        }
-        Err(error) => stale.push(format!("aggregate lock cannot be verified: {error:#}")),
-        Ok(_) => {}
-    }
-    let mut unique = std::collections::BTreeSet::new();
-    for (index, source) in record.sources.iter().enumerate() {
-        if !unique.insert(&source.source) {
-            stale.push(format!("source {} is duplicated", source.source.display()));
-            continue;
-        }
-        if source.source_fingerprint.algorithm != SOURCE_FINGERPRINT_ALGORITHM
-            || source.source_fingerprint.format_version != SOURCE_FINGERPRINT_FORMAT
-            || !valid_sha256(&source.source_fingerprint.digest)
-        {
-            stale.push(format!("source {} fingerprint is invalid", index + 1));
-            continue;
-        }
-        match fingerprint_source(&source.source) {
-            Ok(actual) if actual != source.source_fingerprint => {
-                stale.push(format!("source {} changed", index + 1));
-            }
-            Err(error) => stale.push(format!(
-                "source {} cannot be verified: {error:#}",
-                index + 1
-            )),
-            Ok(_) => {}
-        }
-    }
-    if let Some(pi_package) = record.pi_package.as_deref() {
-        if let Err(error) = resolve_pi_package(pi_package, Path::new("/")) {
-            stale.push(format!("Pi package cannot be verified: {error:#}"));
-        }
-    }
-    if stale.is_empty() {
-        "aggregate-current (trust not asserted)".to_owned()
-    } else {
-        format!("stale ({})", stale.join("; "))
+    match validate_lock_preconditions(record) {
+        Ok(()) => "aggregate-current (disabled; trust not asserted)".to_owned(),
+        Err(error) => format!("stale ({error:#})"),
     }
 }
 
-fn valid_sha256(value: &str) -> bool {
+fn validate_canonical_source_path(path: &Path) -> anyhow::Result<()> {
+    let text = path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Pi extension source path is not valid UTF-8: {}",
+            path.display()
+        )
+    })?;
+    if !path.is_absolute() {
+        anyhow::bail!(
+            "Pi extension source path must be absolute: {}",
+            path.display()
+        );
+    }
+    if text.len() > MAX_SOURCE_PATH_BYTES {
+        anyhow::bail!("Pi extension source path exceeds {MAX_SOURCE_PATH_BYTES} bytes");
+    }
+    Ok(())
+}
+
+fn stable_source_id(path: &Path, kind: PiSourceKind) -> anyhow::Result<String> {
+    validate_canonical_source_path(path)?;
+    let path = path.to_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Pi extension source path is not valid UTF-8: {}",
+            path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(SOURCE_ID_DOMAIN);
+    hasher.update(match kind {
+        PiSourceKind::File => b"file".as_slice(),
+        PiSourceKind::Directory => b"directory".as_slice(),
+    });
+    hasher.update([0]);
+    hasher.update(path.as_bytes());
+    Ok(format!("pi-source-{:x}", hasher.finalize()))
+}
+
+pub(crate) fn valid_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -835,7 +1014,7 @@ impl SourceEntry {
     }
 }
 
-fn fingerprint_source(source: &Path) -> anyhow::Result<SourceFingerprint> {
+pub(crate) fn fingerprint_source(source: &Path) -> anyhow::Result<SourceFingerprint> {
     fingerprint_source_with_limits(source, FINGERPRINT_LIMITS)
 }
 
@@ -1116,13 +1295,13 @@ fn resolve_source(source: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
     Ok(canonical)
 }
 
-fn resolve_pi_package(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
-    let selected = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        cwd.join(path)
-    };
-    let metadata = fs::symlink_metadata(&selected)
+pub(crate) fn resolve_pi_package(path: &Path, cwd: &Path) -> anyhow::Result<PiPackageMetadata> {
+    let selected = absolute_path(path, cwd)?;
+    inspect_pi_package(&selected)
+}
+
+fn inspect_pi_package(selected: &Path) -> anyhow::Result<PiPackageMetadata> {
+    let metadata = fs::symlink_metadata(selected)
         .with_context(|| format!("cannot inspect Pi package root {}", selected.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         anyhow::bail!(
@@ -1133,6 +1312,12 @@ fn resolve_pi_package(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
     let root = selected
         .canonicalize()
         .with_context(|| format!("cannot resolve Pi package root {}", selected.display()))?;
+    if root != selected {
+        anyhow::bail!(
+            "Pi package root must already be canonical and may not traverse symlinks: {}",
+            selected.display()
+        );
+    }
     let manifest_path = root.join("package.json");
     let bytes = ygg_agent::secure_fs::read_regular_file_bounded(
         &manifest_path,
@@ -1146,11 +1331,9 @@ fn resolve_pi_package(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
     })?;
     let manifest: PiPackageManifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid Pi package manifest {}", manifest_path.display()))?;
-    if manifest.name != "@earendil-works/pi-coding-agent"
-        || manifest.version != SUPPORTED_PI_VERSION
-    {
+    if manifest.name != PI_PACKAGE_NAME || manifest.version != SUPPORTED_PI_VERSION {
         anyhow::bail!(
-            "Pi package must be @earendil-works/pi-coding-agent@{SUPPORTED_PI_VERSION}; found {}@{}",
+            "Pi package must be {PI_PACKAGE_NAME}@{SUPPORTED_PI_VERSION}; found {}@{}",
             manifest.name,
             manifest.version
         );
@@ -1176,7 +1359,113 @@ fn resolve_pi_package(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
             entrypoint.display()
         );
     }
-    Ok(root)
+    Ok(PiPackageMetadata {
+        canonical_path: root,
+        metadata_path: manifest_path,
+        metadata_digest: format!("{:x}", Sha256::digest(&bytes)),
+        name: manifest.name,
+        version: manifest.version,
+    })
+}
+
+pub(crate) fn select_pi_package(
+    requested: Option<&Path>,
+    sources: &[PiLockedSource],
+    pi_home: &Path,
+    cwd: &Path,
+) -> anyhow::Result<PiPackageMetadata> {
+    if let Some(path) = requested {
+        return resolve_pi_package(path, cwd);
+    }
+
+    let mut candidates = Vec::new();
+    for name in ["YGG_PI_PACKAGE", "PI_CODING_AGENT_PACKAGE"] {
+        if let Some(path) = std::env::var_os(name) {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    candidates.push(
+        pi_home
+            .join("npm/node_modules")
+            .join("@earendil-works/pi-coding-agent"),
+    );
+    for source in sources {
+        let mut current = if source.kind == PiSourceKind::File {
+            source.canonical_path.parent()
+        } else {
+            Some(source.canonical_path.as_path())
+        };
+        for _ in 0..8 {
+            let Some(directory) = current else { break };
+            candidates.push(directory.to_path_buf());
+            candidates.push(
+                directory
+                    .join("node_modules")
+                    .join("@earendil-works/pi-coding-agent"),
+            );
+            current = directory.parent();
+        }
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&path) {
+            let executable = directory.join(if cfg!(windows) { "pi.exe" } else { "pi" });
+            if let Ok(executable) = executable.canonicalize() {
+                for ancestor in executable.ancestors().take(8).skip(1) {
+                    candidates.push(ancestor.to_path_buf());
+                    candidates.push(
+                        ancestor
+                            .join("node_modules")
+                            .join("@earendil-works/pi-coding-agent"),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        candidates.extend([
+            home.join(".local/lib/node_modules/@earendil-works/pi-coding-agent"),
+            home.join(".npm-global/lib/node_modules/@earendil-works/pi-coding-agent"),
+        ]);
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent"),
+        PathBuf::from("/usr/local/lib/node_modules/@earendil-works/pi-coding-agent"),
+    ]);
+
+    let mut seen = BTreeSet::new();
+    let mut incompatible = Vec::new();
+    for candidate in candidates.into_iter().take(1024) {
+        let candidate = if candidate.is_absolute() {
+            candidate
+        } else {
+            cwd.join(candidate)
+        };
+        let Ok(canonical) = candidate.canonicalize() else {
+            continue;
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        match inspect_pi_package(&canonical) {
+            Ok(package) => return Ok(package),
+            Err(error) => {
+                if incompatible.len() < 8 {
+                    incompatible.push(error.to_string());
+                }
+            }
+        }
+    }
+    let detail = if incompatible.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Inspected incompatible candidates: {}",
+            incompatible.join("; ")
+        )
+    };
+    anyhow::bail!(
+        "could not locate exact {PI_PACKAGE_NAME}@{SUPPORTED_PI_VERSION} metadata without executing Pi; pass --pi-package DIR.{detail}"
+    )
 }
 
 fn resolve_pi_home(requested: Option<&Path>, cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -1190,7 +1479,10 @@ fn resolve_pi_home(requested: Option<&Path>, cwd: &Path) -> anyhow::Result<PathB
     Ok(home.join(".pi/agent"))
 }
 
-fn resolve_extension_root(requested: Option<&Path>, cwd: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn resolve_extension_root(
+    requested: Option<&Path>,
+    cwd: &Path,
+) -> anyhow::Result<PathBuf> {
     if let Some(path) = requested {
         return absolute_path(path, cwd);
     }
@@ -1198,13 +1490,50 @@ fn resolve_extension_root(requested: Option<&Path>, cwd: &Path) -> anyhow::Resul
     Ok(home.join(".ygg/extensions"))
 }
 
-fn absolute_path(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn absolute_path(path: &Path, cwd: &Path) -> anyhow::Result<PathBuf> {
     let path = if path.is_absolute() {
         path.to_owned()
     } else {
         cwd.join(path)
     };
-    Ok(path)
+    normalize_absolute(&path)
+}
+
+fn normalize_absolute(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("path must be absolute: {}", path.display());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("path escapes its filesystem root: {}", path.display());
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    if normalized.to_str().is_none() {
+        anyhow::bail!("path must be valid UTF-8: {}", normalized.display());
+    }
+    Ok(normalized)
+}
+
+fn path_matches_canonical_identity(path: &Path, canonical: &Path) -> bool {
+    if path == canonical {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(relative) = path.strip_prefix("/var") {
+            return Path::new("/private/var").join(relative) == canonical;
+        }
+    }
+    false
 }
 
 fn reject_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
@@ -1215,149 +1544,365 @@ fn reject_symlink(path: &Path, label: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn creation_error_with_rollback(path: &Path, error: anyhow::Error) -> anyhow::Error {
-    match fs::remove_dir(path) {
-        Ok(()) => error,
-        Err(rollback) => anyhow::anyhow!(
-            "{error:#}; rollback of newly created directory {} also failed: {rollback}",
-            path.display()
-        ),
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DestinationInspection {
+    Absent,
+    Identical { output_digest: String },
+    Conflict { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PublishOutcome {
+    Published,
+    AlreadyPresent,
+}
+
+struct GeneratedOutput {
+    bridge: Vec<u8>,
+    manifest: Vec<u8>,
+    lock: Vec<u8>,
+    digest: String,
+}
+
+fn generated_output(record: &PiLockRecord, destination: &Path) -> anyhow::Result<GeneratedOutput> {
+    validate_lock_shape(record)?;
+    if aggregate_lock_digest(record)? != record.aggregate_digest {
+        anyhow::bail!("cannot generate output from a tampered Pi aggregate lock");
     }
+    if !destination.is_absolute()
+        || destination.file_name().and_then(|name| name.to_str()) != Some(record.name.as_str())
+    {
+        anyhow::bail!(
+            "Pi aggregate destination must be an absolute directory named {:?}",
+            record.name
+        );
+    }
+    let bridge_path = destination.join("bridge.mjs");
+    let lock_path = destination.join(PI_LOCK_RECORD);
+    let bridge = bridge_script_bytes().to_vec();
+    let manifest =
+        toml::to_string_pretty(&manifest_for_lock(record, &bridge_path, &lock_path)?)?.into_bytes();
+    let mut lock = serde_json::to_string_pretty(record)?.into_bytes();
+    lock.push(b'\n');
+    let mut hasher = Sha256::new();
+    hasher.update(OUTPUT_DIGEST_DOMAIN);
+    for (name, mode, bytes) in [
+        ("bridge.mjs", 0o700_u32, bridge.as_slice()),
+        ("extension.toml", 0o600_u32, manifest.as_slice()),
+        (PI_LOCK_RECORD, 0o600_u32, lock.as_slice()),
+    ] {
+        hash_framed(&mut hasher, name.as_bytes());
+        hasher.update(mode.to_be_bytes());
+        hash_framed(&mut hasher, bytes);
+    }
+    Ok(GeneratedOutput {
+        bridge,
+        manifest,
+        lock,
+        digest: format!("{:x}", hasher.finalize()),
+    })
 }
 
-struct PackagePublication {
-    path: PathBuf,
-    files: Vec<PathBuf>,
-    committed: bool,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-}
-
-impl PackagePublication {
-    fn create(path: &Path) -> anyhow::Result<Self> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder.create(path).with_context(|| {
-                format!("cannot create Pi compatibility link {}", path.display())
-            })?;
+pub(crate) fn inspect_destination(
+    record: &PiLockRecord,
+    destination: &Path,
+) -> anyhow::Result<DestinationInspection> {
+    let metadata = match fs::symlink_metadata(destination) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DestinationInspection::Absent);
         }
-        #[cfg(not(unix))]
-        fs::create_dir(path)
-            .with_context(|| format!("cannot create Pi compatibility link {}", path.display()))?;
-
-        if let Err(error) = ygg_agent::secure_fs::create_private_directory_all(path) {
-            return match fs::remove_dir(path) {
-                Ok(()) => Err(error.into()),
-                Err(rollback) => Err(anyhow::anyhow!(
-                    "cannot make Pi compatibility link private: {error}; rollback also failed: {rollback}"
-                )),
-            };
+        Err(error) => return Err(error).context("cannot inspect Pi aggregate destination"),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(DestinationInspection::Conflict {
+            reason: "destination is not a regular non-symlink directory".to_owned(),
+        });
+    }
+    let canonical = destination
+        .canonicalize()
+        .context("cannot canonicalize Pi aggregate destination")?;
+    if !path_matches_canonical_identity(destination, &canonical) {
+        return Ok(DestinationInspection::Conflict {
+            reason: "destination path traverses an unrecognized symlink or is not canonical"
+                .to_owned(),
+        });
+    }
+    let output = generated_output(record, &canonical)?;
+    let destination = canonical.as_path();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o7777 != 0o700 {
+            return Ok(DestinationInspection::Conflict {
+                reason: "destination directory is not private mode 0700".to_owned(),
+            });
         }
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
+    }
+
+    let expected_names = BTreeSet::from([
+        "bridge.mjs".to_owned(),
+        "extension.toml".to_owned(),
+        PI_LOCK_RECORD.to_owned(),
+    ]);
+    let mut actual_names = BTreeSet::new();
+    for entry in fs::read_dir(destination).context("cannot read Pi aggregate destination")? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Ok(DestinationInspection::Conflict {
+                reason: "destination contains a non-UTF-8 entry".to_owned(),
+            });
+        };
+        actual_names.insert(name);
+    }
+    if actual_names != expected_names {
+        return Ok(DestinationInspection::Conflict {
+            reason: "destination contains missing or unrelated files".to_owned(),
+        });
+    }
+
+    for (name, expected_mode, expected_bytes, limit) in [
+        (
+            "bridge.mjs",
+            0o700_u32,
+            output.bridge.as_slice(),
+            MAX_GENERATED_FILE_BYTES,
+        ),
+        (
+            "extension.toml",
+            0o600_u32,
+            output.manifest.as_slice(),
+            MAX_GENERATED_FILE_BYTES,
+        ),
+        (
+            PI_LOCK_RECORD,
+            0o600_u32,
+            output.lock.as_slice(),
+            MAX_PI_LOCK_BYTES,
+        ),
+    ] {
+        let path = destination.join(name);
+        let actual = match ygg_agent::secure_fs::read_regular_file_bounded(&path, limit) {
+            Ok(actual) => actual,
             Err(error) => {
-                return Err(creation_error_with_rollback(path, error.into()));
+                return Ok(DestinationInspection::Conflict {
+                    reason: format!("{name} is not the expected regular file: {error}"),
+                });
             }
         };
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            return Err(creation_error_with_rollback(
-                path,
-                anyhow::anyhow!("new Pi compatibility link is not a private directory"),
-            ));
+        if actual != expected_bytes {
+            return Ok(DestinationInspection::Conflict {
+                reason: format!("{name} content differs from the planned output"),
+            });
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.permissions().mode() & 0o7777 != 0o700 {
-                return Err(creation_error_with_rollback(
-                    path,
-                    anyhow::anyhow!("new Pi compatibility link directory is not mode 0700"),
-                ));
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::symlink_metadata(&path)?.permissions().mode() & 0o7777;
+            if mode != expected_mode {
+                return Ok(DestinationInspection::Conflict {
+                    reason: format!(
+                        "{name} permissions are {mode:04o}, expected {expected_mode:04o}"
+                    ),
+                });
             }
-            Ok(Self {
-                path: path.to_owned(),
-                files: Vec::new(),
-                committed: false,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            })
         }
         #[cfg(not(unix))]
-        Ok(Self {
-            path: path.to_owned(),
-            files: Vec::new(),
-            committed: false,
-        })
+        let _ = expected_mode;
+    }
+    Ok(DestinationInspection::Identical {
+        output_digest: output.digest,
+    })
+}
+
+pub(crate) fn publish_lock_extension(
+    record: &PiLockRecord,
+    destination: &Path,
+) -> anyhow::Result<PublishOutcome> {
+    validate_lock_preconditions(record)?;
+    match inspect_destination(record, destination)? {
+        DestinationInspection::Identical { .. } => return Ok(PublishOutcome::AlreadyPresent),
+        DestinationInspection::Conflict { reason } => {
+            anyhow::bail!(
+                "Pi aggregate destination conflict at {}: {reason}",
+                destination.display()
+            );
+        }
+        DestinationInspection::Absent => {}
     }
 
-    fn write_private_file(&mut self, path: &Path, content: &str) -> anyhow::Result<()> {
-        if path.parent() != Some(self.path.as_path()) || path.file_name().is_none() {
-            anyhow::bail!("generated Pi link file is outside its private package");
-        }
-        self.files.push(path.to_owned());
+    let root = destination.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Pi aggregate destination has no extension root: {}",
+            destination.display()
+        )
+    })?;
+    ygg_agent::secure_fs::create_private_directory_all(root).with_context(|| {
+        format!(
+            "cannot create private Ygg extension root {}",
+            root.display()
+        )
+    })?;
+    reject_symlink(root, "Ygg extension root")?;
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("cannot canonicalize Ygg extension root {}", root.display()))?;
+    if !path_matches_canonical_identity(root, &canonical_root) {
+        anyhow::bail!(
+            "Ygg extension root path traverses an unrecognized symlink: {}",
+            root.display()
+        );
+    }
+    let destination_name = destination.file_name().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Pi aggregate destination has no directory name: {}",
+            destination.display()
+        )
+    })?;
+    let canonical_destination = canonical_root.join(destination_name);
+    let root = canonical_root.as_path();
+    let destination = canonical_destination.as_path();
+
+    let output = generated_output(record, destination)?;
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".{}-staging-", record.name))
+        .tempdir_in(root)
+        .context("cannot create private same-filesystem Pi aggregate staging directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o700))?;
+    }
+    for (name, bytes) in [
+        ("bridge.mjs", output.bridge.as_slice()),
+        ("extension.toml", output.manifest.as_slice()),
+        (PI_LOCK_RECORD, output.lock.as_slice()),
+    ] {
         ygg_agent::secure_fs::write_private_atomic(
-            path,
-            content.as_bytes(),
+            &staging.path().join(name),
+            bytes,
             MAX_GENERATED_FILE_BYTES,
         )
-        .with_context(|| format!("cannot create {}", path.display()))
+        .with_context(|| format!("cannot stage generated Pi aggregate {name}"))?;
     }
-
-    fn verify_directory(&self) -> anyhow::Result<()> {
-        let metadata = fs::symlink_metadata(&self.path)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            anyhow::bail!("Pi compatibility link directory was replaced during publication");
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.dev() != self.device
-                || metadata.ino() != self.inode
-                || metadata.permissions().mode() & 0o7777 != 0o700
-            {
-                anyhow::bail!("Pi compatibility link private directory identity changed");
-            }
-        }
-        Ok(())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let bridge = staging.path().join("bridge.mjs");
+        fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700))?;
+        fs::File::open(&bridge)?.sync_all()?;
     }
+    sync_directory(staging.path())?;
 
-    fn rollback(&mut self) -> anyhow::Result<()> {
-        self.verify_directory()?;
-        let mut failures = Vec::new();
-        for path in self.files.iter().rev() {
-            if let Err(error) = ygg_agent::secure_fs::remove_regular_file_if_exists(path) {
-                failures.push(format!("{}: {error}", path.display()));
-            }
-        }
-        if let Err(error) = self.verify_directory() {
-            failures.push(error.to_string());
-        } else if let Err(error) = fs::remove_dir(&self.path) {
-            failures.push(format!("{}: {error}", self.path.display()));
-        }
-        if failures.is_empty() {
-            self.committed = true;
-            Ok(())
-        } else {
-            anyhow::bail!("{}", failures.join("; "))
+    // Close the planning-to-publication window as far as a local filesystem
+    // transaction permits. The runtime repeats these checks before import and
+    // again before constructing its single ExtensionRunner.
+    validate_lock_preconditions(record)?;
+    match inspect_destination(record, destination)? {
+        DestinationInspection::Absent => {}
+        DestinationInspection::Identical { .. } => return Ok(PublishOutcome::AlreadyPresent),
+        DestinationInspection::Conflict { reason } => {
+            anyhow::bail!("Pi aggregate destination drifted during staging: {reason}");
         }
     }
 
-    fn commit(&mut self) {
-        self.committed = true;
+    match atomic_rename_noreplace(staging.path(), destination) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return match inspect_destination(record, destination)? {
+                DestinationInspection::Identical { .. } => Ok(PublishOutcome::AlreadyPresent),
+                DestinationInspection::Conflict { reason } => anyhow::bail!(
+                    "atomic Pi aggregate publication lost a destination race: {reason}"
+                ),
+                DestinationInspection::Absent => Err(error).context(
+                    "atomic Pi aggregate publication reported a conflict but no destination exists",
+                ),
+            };
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "cannot atomically publish Pi aggregate from {} to {}",
+                    staging.path().display(),
+                    destination.display()
+                )
+            });
+        }
+    }
+    sync_directory(root)?;
+    match inspect_destination(record, destination)? {
+        DestinationInspection::Identical { output_digest } if output_digest == output.digest => {
+            Ok(PublishOutcome::Published)
+        }
+        DestinationInspection::Identical { .. } => {
+            anyhow::bail!("published Pi aggregate output digest is inconsistent")
+        }
+        DestinationInspection::Conflict { reason } => {
+            anyhow::bail!("published Pi aggregate failed verification: {reason}")
+        }
+        DestinationInspection::Absent => {
+            anyhow::bail!("published Pi aggregate destination disappeared")
+        }
     }
 }
 
-impl Drop for PackagePublication {
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = self.rollback();
-        }
+#[cfg(target_os = "linux")]
+fn atomic_rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both C strings are live and NUL-terminated for the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn atomic_rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let destination = CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // SAFETY: both C strings are live and NUL-terminated for renamex_np.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn atomic_rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn atomic_rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory publication is unavailable on this platform",
+    ))
 }
 
 #[cfg(unix)]
@@ -1422,6 +1967,17 @@ mod tests {
         path.canonicalize().unwrap()
     }
 
+    fn create_pi_package(root: &Path) -> PathBuf {
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"{PI_PACKAGE_NAME}","version":"{SUPPORTED_PI_VERSION}"}}"#),
+        )
+        .unwrap();
+        fs::write(root.join("dist/index.js"), b"export {};\n").unwrap();
+        canonical(root)
+    }
+
     #[test]
     fn generated_names_are_stable_and_lowercase() {
         let name = generated_name(Path::new("/tmp/My Extension.ts"));
@@ -1475,18 +2031,24 @@ mod tests {
         fs::write(&source, b"before").unwrap();
         let source = canonical(&source);
         let before = fingerprint_source(&source).unwrap();
+        let locked = PiLockedSource::from_canonical_path(source.clone(), None).unwrap();
+        let pi_package = resolve_pi_package(
+            &create_pi_package(&temp.path().join("pi-package")),
+            temp.path(),
+        )
+        .unwrap();
+        let record = PiLockRecord::new(
+            "pi-example".to_owned(),
+            vec![locked],
+            temp.path().join("pi-home"),
+            pi_package,
+        )
+        .unwrap();
+
         fs::write(&source, b"after").unwrap();
         let after = fingerprint_source(&source).unwrap();
         assert_ne!(before.digest, after.digest);
-
-        let record = ParsedPiLinkRecord::V2(PiLinkRecord::new(
-            "pi-example".to_owned(),
-            source.clone(),
-            temp.path().join("pi-home"),
-            None,
-            before,
-        ));
-        assert!(link_status(&record).starts_with("stale (source changed"));
+        assert!(aggregate_status(&record).contains("changed after planning"));
     }
 
     #[test]
@@ -1549,76 +2111,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_record_and_manifest_pin_exact_compatibility_versions() {
-        let temp = tempfile::tempdir().unwrap();
-        let source = temp.path().join("example.ts");
-        fs::write(&source, b"export default () => {};\n").unwrap();
-        let source = canonical(&source);
-        let source_fingerprint = fingerprint_source(&source).unwrap();
-        let record = PiLinkRecord::new(
-            "pi-example".to_owned(),
-            source.clone(),
-            temp.path().join("pi-home"),
-            None,
-            source_fingerprint.clone(),
-        );
-        let encoded = serde_json::to_vec(&record).unwrap();
-        assert!(matches!(
-            parse_link_record(&encoded).unwrap(),
-            ParsedPiLinkRecord::V2(_)
-        ));
-        let value = serde_json::to_value(&record).unwrap();
-        assert_eq!(value["schema_version"], LINK_SCHEMA_VERSION);
-        assert_eq!(value["pi_version"], SUPPORTED_PI_VERSION);
-        assert_eq!(value["bridge_version"], BRIDGE_VERSION);
-        assert_eq!(value["ygg_version"], YGG_VERSION);
-        assert_eq!(
-            value["source_fingerprint"]["algorithm"],
-            SOURCE_FINGERPRINT_ALGORITHM
-        );
-
-        let manifest = manifest(
-            "pi-example",
-            &source,
-            &source_fingerprint,
-            &temp.path().join("pi-home"),
-            None,
-            &temp.path().join("link/bridge.mjs"),
-        )
-        .unwrap();
-        assert_eq!(manifest.version, BRIDGE_VERSION);
-        assert_eq!(
-            manifest.requires_ygg.as_deref(),
-            Some(concat!("=", env!("CARGO_PKG_VERSION")))
-        );
-        if cfg!(unix) {
-            assert_eq!(
-                manifest.entrypoint.command,
-                temp.path().join("link/bridge.mjs").to_str().unwrap()
-            );
-            assert_eq!(manifest.entrypoint.args.first().unwrap(), "--extension");
-        } else {
-            assert_eq!(manifest.entrypoint.command, "node");
-            assert!(manifest.entrypoint.args[0].ends_with("bridge.mjs"));
-        }
-        let fingerprint_arg = manifest
-            .entrypoint
-            .args
-            .windows(2)
-            .find(|args| args[0] == "--source-fingerprint")
-            .map(|args| args[1].as_str());
-        assert_eq!(fingerprint_arg, Some(source_fingerprint.digest.as_str()));
-        assert_eq!(manifest.contributes.commands, ["pi-example"]);
-        assert_eq!(manifest.contributes.hooks.len(), 3);
-        assert!(!manifest
-            .contributes
-            .hooks
-            .contains(&ExtensionHook::BeforePrompt));
-        assert!(manifest.contributes.context);
-    }
-
-    #[test]
-    fn aggregate_lock_and_manifest_preserve_source_order_and_detect_changes() {
+    fn schema_v2_lock_and_manifest_bind_the_ordered_runtime_inputs() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.ts");
         let second = temp.path().join("second.ts");
@@ -1627,138 +2120,170 @@ mod tests {
         let first = canonical(&first);
         let second = canonical(&second);
         let sources = vec![
-            PiLockedSource {
-                source: first.clone(),
-                source_fingerprint: fingerprint_source(&first).unwrap(),
-            },
-            PiLockedSource {
-                source: second.clone(),
-                source_fingerprint: fingerprint_source(&second).unwrap(),
-            },
+            PiLockedSource::from_canonical_path(first.clone(), None).unwrap(),
+            PiLockedSource::from_canonical_path(second.clone(), Some("a".repeat(64))).unwrap(),
         ];
+        let package_root = create_pi_package(&temp.path().join("pi-package"));
+        let package = resolve_pi_package(&package_root, temp.path()).unwrap();
         let record = PiLockRecord::new(
             "pi-aggregate".into(),
             sources.clone(),
             temp.path().join("pi-home"),
-            None,
+            package,
         )
         .unwrap();
         let encoded = serde_json::to_vec(&record).unwrap();
         let decoded = parse_lock_record(&encoded).unwrap();
         assert_eq!(decoded.sources, sources);
+        assert_eq!(decoded.schema_version, PI_LOCK_SCHEMA_VERSION);
+        assert_eq!(decoded.profile, supported_profile());
+        assert_eq!(decoded.bridge, bridge_metadata());
         assert_eq!(
             aggregate_status(&decoded),
-            "aggregate-current (trust not asserted)"
+            "aggregate-current (disabled; trust not asserted)"
         );
 
-        let manifest = manifest_for_sources(
-            "pi-aggregate",
-            &sources,
-            &temp.path().join("pi-home"),
-            None,
-            &temp.path().join("link/bridge.mjs"),
-        )
-        .unwrap();
-        let ordered = manifest
-            .entrypoint
-            .args
-            .windows(2)
-            .filter(|args| args[0] == "--extension")
-            .map(|args| args[1].clone())
-            .collect::<Vec<_>>();
+        let destination = temp.path().join("pi-aggregate");
+        let bridge_path = destination.join("bridge.mjs");
+        let lock_path = destination.join(PI_LOCK_RECORD);
+        let manifest = manifest_for_lock(&record, &bridge_path, &lock_path).unwrap();
+        assert_eq!(manifest.version, BRIDGE_VERSION);
         assert_eq!(
-            ordered,
-            vec![first.to_string_lossy(), second.to_string_lossy()]
+            manifest.requires_ygg.as_deref(),
+            Some(concat!("=", env!("CARGO_PKG_VERSION")))
         );
+        let mut expected_args = Vec::new();
+        if cfg!(unix) {
+            assert_eq!(manifest.entrypoint.command, bridge_path.to_str().unwrap());
+        } else {
+            assert_eq!(manifest.entrypoint.command, "node");
+            expected_args.push(bridge_path.to_string_lossy().into_owned());
+        }
+        expected_args.extend([
+            "--lock".to_owned(),
+            lock_path.to_string_lossy().into_owned(),
+        ]);
+        assert_eq!(manifest.entrypoint.args, expected_args);
+        assert_eq!(
+            manifest.entrypoint.sha256.as_deref(),
+            Some(record.bridge.script_digest.as_str())
+        );
+        assert_eq!(
+            manifest.entrypoint.env.get(AGGREGATE_DIGEST_ENV),
+            Some(&record.aggregate_digest)
+        );
+        assert_eq!(manifest.contributes.commands, ["pi-aggregate"]);
+        assert_eq!(manifest.contributes.hooks.len(), 3);
+        assert!(!manifest
+            .contributes
+            .hooks
+            .contains(&ExtensionHook::BeforePrompt));
+        assert!(manifest.contributes.context);
 
         fs::write(&second, b"export default () => 'changed';\n").unwrap();
-        assert!(aggregate_status(&decoded).contains("source 2 changed"));
+        assert!(aggregate_status(&decoded).contains("changed after planning"));
     }
 
     #[test]
-    fn aggregate_install_publishes_one_inert_locked_process() {
+    fn aggregate_install_publishes_one_inert_locked_process_idempotently() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.ts");
         let second = temp.path().join("second.ts");
         fs::write(&first, b"export default () => {};\n").unwrap();
         fs::write(&second, b"export default () => {};\n").unwrap();
+        let pi_package = create_pi_package(&temp.path().join("pi-package"));
         let extension_root = temp.path().join("extensions");
-        install_sources(
-            &[first, second],
-            Some("pi-aggregate"),
-            Some(&temp.path().join("pi-home")),
-            None,
-            Some(&extension_root),
-            temp.path(),
-        )
-        .unwrap();
+        let install_once = || {
+            install_sources(
+                &[first.clone(), second.clone()],
+                Some("pi-aggregate"),
+                Some(&temp.path().join("pi-home")),
+                Some(&pi_package),
+                Some(&extension_root),
+                temp.path(),
+            )
+        };
+        install_once().unwrap();
+        install_once().unwrap();
 
-        let package = extension_root.join("pi-aggregate");
-        assert!(package.join("bridge.mjs").is_file());
-        assert!(package.join("extension.toml").is_file());
-        assert!(package.join(PI_LOCK_RECORD).is_file());
-        assert!(!package.join(LINK_RECORD).exists());
-        let lock = parse_lock_record(&fs::read(package.join(PI_LOCK_RECORD)).unwrap()).unwrap();
+        let destination = extension_root.join("pi-aggregate");
+        assert!(destination.join("bridge.mjs").is_file());
+        assert!(destination.join("extension.toml").is_file());
+        assert!(destination.join(PI_LOCK_RECORD).is_file());
+        assert!(!destination.join(LINK_RECORD).exists());
+        let lock = parse_lock_record(&fs::read(destination.join(PI_LOCK_RECORD)).unwrap()).unwrap();
         assert_eq!(lock.sources.len(), 2);
         assert_eq!(lock.name, "pi-aggregate");
+        let effective_destination = destination.canonicalize().unwrap();
+        let expected = generated_output(&lock, &effective_destination)
+            .unwrap()
+            .digest;
         assert_eq!(
-            aggregate_status(&lock),
-            "aggregate-current (trust not asserted)"
+            inspect_destination(&lock, &destination).unwrap(),
+            DestinationInspection::Identical {
+                output_digest: expected
+            }
         );
     }
 
     #[test]
-    fn selected_pi_package_is_validated_and_pinned_into_the_bridge_args() {
+    fn atomic_publisher_refuses_to_replace_a_conflicting_destination() {
         let temp = tempfile::tempdir().unwrap();
-        let package = temp.path().join("pi-package");
-        fs::create_dir_all(package.join("dist")).unwrap();
-        fs::write(
-            package.join("package.json"),
-            format!(
-                r#"{{"name":"@earendil-works/pi-coding-agent","version":"{SUPPORTED_PI_VERSION}"}}"#
-            ),
-        )
-        .unwrap();
-        fs::write(package.join("dist/index.js"), b"export {};\n").unwrap();
-        let package = resolve_pi_package(&package, temp.path()).unwrap();
         let source = temp.path().join("extension.ts");
         fs::write(&source, b"export default () => {};\n").unwrap();
-        let source = canonical(&source);
-        let source_fingerprint = fingerprint_source(&source).unwrap();
-        let record = ParsedPiLinkRecord::V2(PiLinkRecord::new(
-            "pi-example".to_owned(),
-            source.clone(),
+        let package_root = create_pi_package(&temp.path().join("pi-package"));
+        let record = PiLockRecord::new(
+            "pi-conflict".to_owned(),
+            vec![PiLockedSource::from_canonical_path(canonical(&source), None).unwrap()],
             temp.path().join("pi-home"),
-            Some(package.clone()),
-            source_fingerprint.clone(),
-        ));
-        let manifest = manifest(
-            "pi-example",
-            &source,
-            &source_fingerprint,
-            &temp.path().join("pi-home"),
-            Some(&package),
-            &temp.path().join("link/bridge.mjs"),
+            resolve_pi_package(&package_root, temp.path()).unwrap(),
         )
         .unwrap();
-        let package_arg = manifest
-            .entrypoint
-            .args
-            .windows(2)
-            .find(|args| args[0] == "--pi-package")
-            .map(|args| args[1].as_str());
-        assert_eq!(package_arg, package.to_str());
+        let extension_root = canonical(temp.path()).join("extensions");
+        fs::create_dir_all(extension_root.join("pi-conflict")).unwrap();
+        fs::write(
+            extension_root.join("pi-conflict/unrelated"),
+            b"must survive",
+        )
+        .unwrap();
+        let destination = extension_root.join("pi-conflict");
+
+        let error = publish_lock_extension(&record, &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("destination conflict"));
+        assert_eq!(
+            fs::read(destination.join("unrelated")).unwrap(),
+            b"must survive"
+        );
+        assert!(!destination.join(PI_LOCK_RECORD).exists());
+    }
+
+    #[test]
+    fn selected_pi_package_metadata_is_digest_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_root = create_pi_package(&temp.path().join("pi-package"));
+        let package = resolve_pi_package(&package_root, temp.path()).unwrap();
+        let source = temp.path().join("extension.ts");
+        fs::write(&source, b"export default () => {};\n").unwrap();
+        let record = PiLockRecord::new(
+            "pi-example".to_owned(),
+            vec![PiLockedSource::from_canonical_path(canonical(&source), None).unwrap()],
+            temp.path().join("pi-home"),
+            package,
+        )
+        .unwrap();
 
         fs::write(
-            package.join("package.json"),
+            package_root.join("package.json"),
             r#"{"name":"@earendil-works/pi-coding-agent","version":"0.85.0"}"#,
         )
         .unwrap();
-        let error = resolve_pi_package(&package, temp.path())
+        let error = resolve_pi_package(&package_root, temp.path())
             .unwrap_err()
             .to_string();
         assert!(error.contains(SUPPORTED_PI_VERSION));
-        assert!(link_status(&record).contains("Pi package cannot be verified"));
+        assert!(aggregate_status(&record).contains("package metadata changed"));
     }
 
     #[cfg(unix)]
@@ -1860,7 +2385,7 @@ mod tests {
         };
         assert!(stale_error
             .to_string()
-            .contains("source changed after link installation"));
+            .contains("source changed after aggregate locking"));
     }
 
     #[cfg(unix)]
@@ -1929,14 +2454,27 @@ mod tests {
     }
 
     #[test]
-    fn uncommitted_private_publication_rolls_back_known_files() {
+    fn publisher_rechecks_sources_before_creating_any_output() {
         let temp = tempfile::tempdir().unwrap();
-        let package = canonical(temp.path()).join("pi-example");
-        let mut publication = PackagePublication::create(&package).unwrap();
-        publication
-            .write_private_file(&package.join("extension.toml"), "name = 'test'\n")
-            .unwrap();
-        publication.rollback().unwrap();
-        assert!(!package.exists());
+        let source = temp.path().join("extension.ts");
+        fs::write(&source, b"before").unwrap();
+        let source = canonical(&source);
+        let package_root = create_pi_package(&temp.path().join("pi-package"));
+        let record = PiLockRecord::new(
+            "pi-example".to_owned(),
+            vec![PiLockedSource::from_canonical_path(source.clone(), None).unwrap()],
+            temp.path().join("pi-home"),
+            resolve_pi_package(&package_root, temp.path()).unwrap(),
+        )
+        .unwrap();
+        fs::write(&source, b"after").unwrap();
+        let destination = canonical(temp.path()).join("extensions/pi-example");
+
+        let error = publish_lock_extension(&record, &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed after planning"));
+        assert!(!destination.exists());
+        assert!(!destination.parent().unwrap().exists());
     }
 }

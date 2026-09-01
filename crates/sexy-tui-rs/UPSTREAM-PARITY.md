@@ -8,7 +8,13 @@ Pi TUI is the normative implementation for this crate's core behavior.
 - npm integrity: `sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w==`
 - Source root: `packages/tui`
 - Normative test inventory: [`upstream/pi-tui-0.84.4.json`](upstream/pi-tui-0.84.4.json)
-  (33 `*.test.ts` files)
+  (33 `*.test.ts` files; `release_status` remains `in_progress`)
+
+Validate the local ledgers with `python3 scripts/verify-pi-parity-profile.py`
+from the workspace root. Pass `--pi-source DIR` to additionally inspect the
+exact commit object and lightweight tag in an existing Pi worktree. The verifier
+reads pinned blobs and trees from Git directly; it neither switches nor depends
+on that worktree's current checkout.
 
 To inspect the exact source and tests:
 
@@ -23,9 +29,12 @@ git checkout b79e4cc834970cca69daebffab7df1da7d1e52c4
 ## Port gate
 
 A module is not marked ported merely because its API compiles or selected
-regressions pass. Every test in the corresponding pinned Pi test files must
-have a named Rust behavioral equivalent. Deviations require an explicit
-compatibility-layer API and must not alter the Pi-equivalent core.
+regressions pass. Every pinned row is `required`; `requires_0.84.4_audit` and
+`requires_0.84.4_port` are open statuses. A `passing` or
+`approved_divergence` row must name at least one existing, crate-relative Rust
+behavioral equivalent. Deviations require an explicit compatibility-layer API
+and must not alter the Pi-equivalent core. The verifier blocks
+`release_status: complete` while any required row remains open.
 
 Port order:
 

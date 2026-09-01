@@ -499,7 +499,7 @@ class BridgeProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(-32000, response["error"]["code"])
                 self.assertIn(
-                    "source changed after link installation",
+                    "source changed after aggregate locking",
                     response["error"]["message"],
                 )
 

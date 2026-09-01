@@ -775,7 +775,7 @@ warning. New configuration should use `reasoning` alone.
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
 | Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes`, `--telemetry` |
-| Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
+| Pi migration | `migrate pi --dry-run`, `--json`, `--plan-out`, `--apply`, `--yes`, `--pi-home`, `--project`, `--npm-root` |
 | Pi compatibility | `pi install <PATH>`, `pi list` |
 | Customization | `--system-prompt`, `--prompt`, `--debug-prompt`, `--prompt-template`, `--skill-dir`, `--extension-dir`, `--enable-extension`, `--trust-extension` |
 
@@ -793,7 +793,7 @@ Prompts, skills, and extensions use one deterministic resolver:
 
 Roots are resolved global → trusted project → explicit. Inputs must be bounded regular files; symlinked roots, candidates, and entrypoints are rejected. Reload builds a complete immutable generation before swapping it into the running product.
 
-### Pi migration inventory
+### Pi migration
 
 `ygg migrate pi --dry-run` reads bounded Pi user/project settings and package
 manifests, resolves installed local/npm/git packages without installing them,
@@ -802,10 +802,16 @@ portable resources and extension API dependencies. It executes no package
 code, starts no provider or model, changes no files, and reports an estimated
 model use of zero tokens.
 
-Use `--json` for the versioned machine-readable inventory. This release does
-not yet copy resources or apply package recipes. Reviewed local Pi sources can
-be linked inertly through `ygg pi install`; the pinned bridge remains disabled
-and untrusted until explicitly activated. See
+Use `--json` for the versioned machine-readable inventory. `--plan-out FILE`
+adds a content-digested schema-2 plan for the scanner-selected, ordered extension
+sources; it still executes no package code and publishes nothing. After review,
+`--apply FILE` revalidates the plan, source/package fingerprints, and destination
+state, asks for confirmation (or requires explicit `--yes`), and atomically
+publishes one inert aggregate. It never installs dependencies, imports
+credentials, enables the extension, or grants trust. This release does not yet
+copy direct resources or apply package replacement recipes. Reviewed sources can
+also be aggregated explicitly through `ygg pi install`; every generated bridge
+remains disabled and untrusted until explicitly activated. See
 [docs/pi-migration.md](docs/pi-migration.md) for the exact Pi profile,
 classifications, bounds, and remaining compatibility gaps.
 

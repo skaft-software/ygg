@@ -24,15 +24,36 @@ import {
   realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join, relative as relativePath, resolve, sep } from "node:path";
+import {
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative as relativePath,
+  resolve,
+  sep,
+} from "node:path";
 import { createInterface } from "node:readline";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const API_VERSION = "0.2";
+const BRIDGE_VERSION = "0.2.0";
+const LOCK_SCHEMA_VERSION = 2;
+const PROFILE_ID = "pi-0.84.4";
+const PROFILE_REPOSITORY = "https://github.com/earendil-works/pi.git";
+const PROFILE_REVISION = "b79e4cc834970cca69daebffab7df1da7d1e52c4";
+const PROFILE_TAG = "v0.84.4";
 const SUPPORTED_PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const SUPPORTED_PI_VERSION = "0.84.4";
+const SUPPORTED_PI_INTEGRITY = "sha512-jmOlrqUmvhh/siNWFRXjYLJzhKFIHNsAQaysRwzQPQFnPAaV/vhqHsLH/MBsIISA1Rjj7WTUFR3nJrpXoLx39w==";
+const SUPPORTED_TUI_PACKAGE = "@earendil-works/pi-tui";
+const SUPPORTED_TUI_INTEGRITY = "sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w==";
 const MINIMUM_NODE_VERSION = [22, 19, 0];
 const MAX_PI_PACKAGE_MANIFEST_BYTES = 256 * 1024;
+const MAX_PI_LOCK_BYTES = 256 * 1024;
+const MAX_GENERATED_FILE_BYTES = 4 * 1024 * 1024;
+const MAX_AGGREGATE_SOURCES = 256;
+const AGGREGATE_DIGEST_ENV = "YGG_PI_AGGREGATE_DIGEST";
 const SOURCE_FINGERPRINT_FORMAT = 1;
 const MAX_SOURCE_FILES = 4096;
 const MAX_SOURCE_ENTRIES = 8192;
@@ -124,14 +145,22 @@ function parseArgs(argv) {
     cwd: null,
     commandName: "pi",
     piPackage: null,
+    lock: null,
   };
+  let legacySelectorSeen = false;
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
-    if (value === "--extension" || value === "-e") {
+    if (value === "--lock") {
+      if (result.lock) throw new Error("--lock may be provided only once");
+      result.lock = argv[++index];
+      if (!result.lock) throw new Error("--lock requires a path");
+    } else if (value === "--extension" || value === "-e") {
+      legacySelectorSeen = true;
       const extension = argv[++index];
       if (!extension) throw new Error("--extension requires a path");
       result.extensions.push(extension);
     } else if (value === "--source-fingerprint") {
+      legacySelectorSeen = true;
       const fingerprint = argv[++index];
       if (!fingerprint) throw new Error("--source-fingerprint requires a SHA-256 digest");
       if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
@@ -139,31 +168,38 @@ function parseArgs(argv) {
       }
       result.sourceFingerprints.push(fingerprint);
     } else if (value === "--agent-dir") {
+      legacySelectorSeen = true;
       result.agentDir = argv[++index];
       if (!result.agentDir) throw new Error("--agent-dir requires a path");
     } else if (value === "--cwd") {
       result.cwd = argv[++index];
       if (!result.cwd) throw new Error("--cwd requires a path");
     } else if (value === "--pi-package") {
+      legacySelectorSeen = true;
       result.piPackage = argv[++index];
       if (!result.piPackage) throw new Error("--pi-package requires a path");
     } else if (value === "--command") {
+      legacySelectorSeen = true;
       result.commandName = argv[++index];
       if (!result.commandName) throw new Error("--command requires a name");
     } else if (value === "--help" || value === "-h") {
       process.stdout.write(
-        "Usage: bridge.mjs --extension PATH [--source-fingerprint SHA256] [--extension PATH ...] [--agent-dir DIR] [--pi-package DIR]\n",
+        "Usage: bridge.mjs --lock PATH [--cwd DIR]\n       bridge.mjs --extension PATH [--source-fingerprint SHA256] [--extension PATH ...] [--agent-dir DIR] [--pi-package DIR]\n",
       );
       process.exit(0);
     } else {
       throw new Error(`unknown bridge argument ${value}`);
     }
   }
+  if (result.lock && legacySelectorSeen) {
+    throw new Error("--lock cannot be combined with extension, fingerprint, agent, package, or command selectors");
+  }
+  if (result.lock) return result;
   if (result.extensions.length === 0 && process.env.YGG_PI_EXTENSION) {
     result.extensions.push(process.env.YGG_PI_EXTENSION);
   }
   if (result.extensions.length === 0) {
-    throw new Error("at least one --extension path is required");
+    throw new Error("at least one --extension path or one --lock path is required");
   }
   if (
     result.sourceFingerprints.length !== 0
@@ -628,6 +664,7 @@ function fingerprintSource(source) {
   hash.update(unsignedBigEndian(SOURCE_FINGERPRINT_FORMAT, 4));
   hash.update(Buffer.from(rootTag));
   let total = 0;
+  let fileCount = 0;
   for (const entry of entries) {
     hash.update(Buffer.from(entry.tag));
     const relative = Buffer.from(entry.relative);
@@ -635,6 +672,7 @@ function fingerprintSource(source) {
     hash.update(relative);
     if (entry.tag === "f") {
       total += hashSourceFile(hash, entry.path, MAX_SOURCE_BYTES - total);
+      fileCount += 1;
     }
   }
 
@@ -646,7 +684,13 @@ function fingerprintSource(source) {
       throw new Error("Pi extension source tree changed while it was being fingerprinted");
     }
   }
-  return hash.digest("hex");
+  return {
+    algorithm: "sha256",
+    format_version: SOURCE_FINGERPRINT_FORMAT,
+    digest: hash.digest("hex"),
+    file_count: fileCount,
+    byte_count: total,
+  };
 }
 
 function verifySourceFingerprints() {
@@ -654,15 +698,27 @@ function verifySourceFingerprints() {
   for (let index = 0; index < args.extensions.length; index += 1) {
     const actual = fingerprintSource(args.extensions[index]);
     const expected = args.sourceFingerprints[index];
-    if (actual !== expected) {
+    const expectedDigest = typeof expected === "string" ? expected : expected.digest;
+    if (actual.digest !== expectedDigest) {
       throw new Error(
-        `Pi extension source changed after link installation: ${args.extensions[index]} (expected ${expected}, found ${actual})`,
+        `Pi extension source changed after aggregate locking: ${args.extensions[index]} (expected ${expectedDigest}, found ${actual.digest})`,
       );
+    }
+    if (
+      typeof expected === "object"
+      && (
+        actual.algorithm !== expected.algorithm
+        || actual.format_version !== expected.format_version
+        || actual.file_count !== expected.file_count
+        || actual.byte_count !== expected.byte_count
+      )
+    ) {
+      throw new Error(`Pi extension source fingerprint metadata changed after lock publication: ${args.extensions[index]}`);
     }
   }
 }
 
-function readRegularUtf8Bounded(path, maxBytes) {
+function readRegularBufferBounded(path, maxBytes) {
   const pathMetadata = lstatSync(path);
   if (pathMetadata.isSymbolicLink() || !pathMetadata.isFile()) {
     throw new Error("is not a regular non-symlink file");
@@ -673,6 +729,14 @@ function readRegularUtf8Bounded(path, maxBytes) {
     file = openSync(path, fsConstants.O_RDONLY | noFollow);
     const before = fstatSync(file);
     if (!before.isFile()) throw new Error("is not a regular file");
+    if (
+      pathMetadata.dev !== before.dev
+      || pathMetadata.ino !== before.ino
+      || pathMetadata.size !== before.size
+      || pathMetadata.mtimeMs !== before.mtimeMs
+    ) {
+      throw new Error("changed before it was read");
+    }
     if (before.size > maxBytes) throw new Error(`exceeds the ${maxBytes}-byte limit`);
     const chunks = [];
     let total = 0;
@@ -694,24 +758,269 @@ function readRegularUtf8Bounded(path, maxBytes) {
     ) {
       throw new Error("changed while it was being read");
     }
-    return Buffer.concat(chunks, total).toString("utf8");
+    return Buffer.concat(chunks, total);
   } finally {
     if (file !== undefined) closeSync(file);
   }
 }
 
+function readRegularUtf8Bounded(path, maxBytes) {
+  return new TextDecoder("utf-8", { fatal: true }).decode(readRegularBufferBounded(path, maxBytes));
+}
+
+const EXPECTED_PROFILE = {
+  id: PROFILE_ID,
+  repository: PROFILE_REPOSITORY,
+  revision: PROFILE_REVISION,
+  tag: PROFILE_TAG,
+  coding_agent: {
+    name: SUPPORTED_PI_PACKAGE,
+    version: SUPPORTED_PI_VERSION,
+    npm_integrity: SUPPORTED_PI_INTEGRITY,
+  },
+  tui: {
+    name: SUPPORTED_TUI_PACKAGE,
+    version: SUPPORTED_PI_VERSION,
+    npm_integrity: SUPPORTED_TUI_INTEGRITY,
+  },
+  node_minimum_version: MINIMUM_NODE_VERSION.join("."),
+};
+
+function sha256(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+function requireExactObject(value, label, required, optional = []) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  const allowed = new Set([...required, ...optional]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`${label} contains unknown field ${JSON.stringify(key)}`);
+  }
+  for (const key of required) {
+    if (!Object.hasOwn(value, key)) throw new Error(`${label} is missing field ${JSON.stringify(key)}`);
+  }
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === "boolean" || typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value)) throw new Error("Pi aggregate lock numbers must be safe integers");
+    return String(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+      .join(",")}}`;
+  }
+  throw new Error("Pi aggregate lock contains a value that JSON cannot canonically encode");
+}
+
+function aggregateLockDigest(record) {
+  const unsigned = { ...record, aggregate_digest: "" };
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-aggregate-lock-v2\0"));
+  hash.update(Buffer.from(canonicalJson(unsigned)));
+  return hash.digest("hex");
+}
+
+function stableSourceId(path, kind) {
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-source-id-v1\0"));
+  hash.update(Buffer.from(kind));
+  hash.update(Buffer.from([0]));
+  hash.update(Buffer.from(path));
+  return `pi-source-${hash.digest("hex")}`;
+}
+
+function validateAggregateLockShape(record) {
+  requireExactObject(
+    record,
+    "Pi aggregate lock",
+    [
+      "schema_version",
+      "profile",
+      "bridge",
+      "ygg_version",
+      "name",
+      "sources",
+      "pi_home",
+      "pi_package",
+      "aggregate_digest",
+    ],
+  );
+  if (record.schema_version !== LOCK_SCHEMA_VERSION) {
+    throw new Error(`unsupported Pi aggregate lock schema ${record.schema_version}`);
+  }
+  if (canonicalJson(record.profile) !== canonicalJson(EXPECTED_PROFILE)) {
+    throw new Error(`Pi aggregate lock does not select the exact supported ${PROFILE_ID} profile`);
+  }
+  requireExactObject(record.bridge, "Pi aggregate bridge", ["version", "script_digest"]);
+  if (record.bridge.version !== BRIDGE_VERSION || !/^[0-9a-f]{64}$/.test(record.bridge.script_digest)) {
+    throw new Error("Pi aggregate lock bridge metadata is invalid");
+  }
+  if (typeof record.ygg_version !== "string" || !record.ygg_version || record.ygg_version.length > 128) {
+    throw new Error("Pi aggregate lock Ygg version is invalid");
+  }
+  if (
+    typeof record.name !== "string"
+    || Buffer.byteLength(record.name) > 64
+    || !/^[a-z][a-z0-9-]*$/.test(record.name)
+  ) {
+    throw new Error("Pi aggregate lock name is invalid");
+  }
+  if (!Array.isArray(record.sources) || record.sources.length === 0 || record.sources.length > MAX_AGGREGATE_SOURCES) {
+    throw new Error(`invalid Pi aggregate source count ${record.sources?.length}`);
+  }
+  if (typeof record.pi_home !== "string" || !isAbsolute(record.pi_home)) {
+    throw new Error("Pi aggregate lock pi_home must be absolute");
+  }
+  requireExactObject(
+    record.pi_package,
+    "Pi aggregate package",
+    ["canonical_path", "metadata_path", "metadata_digest", "name", "version"],
+  );
+  if (
+    typeof record.pi_package.canonical_path !== "string"
+    || !isAbsolute(record.pi_package.canonical_path)
+    || typeof record.pi_package.metadata_path !== "string"
+    || record.pi_package.metadata_path !== join(record.pi_package.canonical_path, "package.json")
+    || record.pi_package.name !== SUPPORTED_PI_PACKAGE
+    || record.pi_package.version !== SUPPORTED_PI_VERSION
+    || !/^[0-9a-f]{64}$/.test(record.pi_package.metadata_digest)
+  ) {
+    throw new Error("Pi aggregate lock package metadata is invalid");
+  }
+  if (!/^[0-9a-f]{64}$/.test(record.aggregate_digest)) {
+    throw new Error("Pi aggregate lock digest is invalid");
+  }
+
+  const paths = new Set();
+  const ids = new Set();
+  for (const source of record.sources) {
+    requireExactObject(
+      source,
+      "Pi aggregate source",
+      ["id", "canonical_path", "kind", "source_fingerprint", "enabled"],
+      ["dependency_lock_hash"],
+    );
+    if (
+      typeof source.canonical_path !== "string"
+      || !isAbsolute(source.canonical_path)
+      || Buffer.byteLength(source.canonical_path) > MAX_SOURCE_PATH_BYTES
+    ) {
+      throw new Error("Pi aggregate source path must be a bounded absolute path");
+    }
+    if (source.kind !== "file" && source.kind !== "directory") {
+      throw new Error("Pi aggregate source kind is invalid");
+    }
+    if (source.enabled !== true) throw new Error("Pi aggregate locks contain only enabled sources");
+    if (source.id !== stableSourceId(source.canonical_path, source.kind)) {
+      throw new Error(`Pi aggregate source ${source.id} has an invalid stable id`);
+    }
+    if (paths.has(source.canonical_path) || ids.has(source.id)) {
+      throw new Error("Pi aggregate lock contains a duplicate source");
+    }
+    paths.add(source.canonical_path);
+    ids.add(source.id);
+    requireExactObject(
+      source.source_fingerprint,
+      "Pi source fingerprint",
+      ["algorithm", "format_version", "digest", "file_count", "byte_count"],
+    );
+    const fingerprint = source.source_fingerprint;
+    if (
+      fingerprint.algorithm !== "sha256"
+      || fingerprint.format_version !== SOURCE_FINGERPRINT_FORMAT
+      || !/^[0-9a-f]{64}$/.test(fingerprint.digest)
+      || !Number.isSafeInteger(fingerprint.file_count)
+      || fingerprint.file_count < 1
+      || fingerprint.file_count > MAX_SOURCE_FILES
+      || !Number.isSafeInteger(fingerprint.byte_count)
+      || fingerprint.byte_count < 0
+      || fingerprint.byte_count > MAX_SOURCE_BYTES
+      || (source.kind === "file" && fingerprint.file_count !== 1)
+    ) {
+      throw new Error(`Pi aggregate source ${source.id} fingerprint metadata is invalid`);
+    }
+    if (
+      source.dependency_lock_hash !== undefined
+      && !/^[0-9a-f]{64}$/.test(source.dependency_lock_hash)
+    ) {
+      throw new Error(`Pi aggregate source ${source.id} dependency lock hash is invalid`);
+    }
+  }
+}
+
+function configureFromAggregateLock(path) {
+  if (!isAbsolute(path)) throw new Error("--lock requires an absolute path");
+  const canonicalPath = realpathSync(path);
+  if (canonicalPath !== path) throw new Error("Pi aggregate lock path must be canonical");
+  let record;
+  try {
+    record = JSON.parse(readRegularUtf8Bounded(path, MAX_PI_LOCK_BYTES));
+  } catch (error) {
+    throw new Error(`cannot read Pi aggregate lock ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  validateAggregateLockShape(record);
+  const actualAggregate = aggregateLockDigest(record);
+  if (actualAggregate !== record.aggregate_digest) {
+    throw new Error(`Pi aggregate lock digest mismatch: expected ${record.aggregate_digest}, found ${actualAggregate}`);
+  }
+  const expectedAggregate = process.env[AGGREGATE_DIGEST_ENV];
+  if (!expectedAggregate || !/^[0-9a-f]{64}$/.test(expectedAggregate)) {
+    throw new Error(`generated Pi lock mode requires ${AGGREGATE_DIGEST_ENV}`);
+  }
+  if (expectedAggregate !== record.aggregate_digest) {
+    throw new Error(`Pi aggregate lock does not match ${AGGREGATE_DIGEST_ENV}`);
+  }
+  const scriptDigest = sha256(readRegularBufferBounded(fileURLToPath(import.meta.url), MAX_GENERATED_FILE_BYTES));
+  if (scriptDigest !== record.bridge.script_digest) {
+    throw new Error("Pi bridge script does not match the digest-bound aggregate lock");
+  }
+  const selectedPackage = inspectPiPackage(record.pi_package.canonical_path);
+  if (!selectedPackage || selectedPackage.error) {
+    throw new Error(`locked Pi package is unavailable: ${selectedPackage?.error ?? "package.json is missing"}`);
+  }
+  if (
+    selectedPackage.root !== record.pi_package.canonical_path
+    || selectedPackage.manifestPath !== record.pi_package.metadata_path
+    || selectedPackage.metadataDigest !== record.pi_package.metadata_digest
+  ) {
+    throw new Error("selected Pi package metadata changed after lock publication");
+  }
+  args.extensions = record.sources.map((source) => source.canonical_path);
+  args.sourceFingerprints = record.sources.map((source) => source.source_fingerprint);
+  args.agentDir = record.pi_home;
+  args.commandName = record.name;
+  args.piPackage = record.pi_package.canonical_path;
+  args.lockRecord = record;
+}
+
 function inspectPiPackage(candidate) {
+  const selected = resolve(candidate);
   let root;
   try {
-    root = realpathSync(resolve(candidate));
+    const metadata = lstatSync(selected);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      return { root: selected, error: "package root is not a regular non-symlink directory" };
+    }
+    root = realpathSync(selected);
   } catch {
     return null;
   }
   const manifestPath = join(root, "package.json");
   if (!existsSync(manifestPath)) return null;
   let manifest;
+  let manifestBytes;
   try {
-    manifest = JSON.parse(readRegularUtf8Bounded(manifestPath, MAX_PI_PACKAGE_MANIFEST_BYTES));
+    manifestBytes = readRegularBufferBounded(manifestPath, MAX_PI_PACKAGE_MANIFEST_BYTES);
+    manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes));
   } catch (error) {
     return { root, error: `cannot read package.json: ${error instanceof Error ? error.message : String(error)}` };
   }
@@ -736,7 +1045,12 @@ function inspectPiPackage(candidate) {
       error: `cannot validate dist/index.js: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  return { root, version: manifest.version };
+  return {
+    root,
+    version: manifest.version,
+    manifestPath,
+    metadataDigest: sha256(manifestBytes),
+  };
 }
 
 function findPiPackageRoot(extensionPaths, selectedPackage) {
@@ -987,6 +1301,7 @@ async function collectBeforePromptContext(prompt) {
 
 async function loadBridge(params) {
   validateNodeRuntime();
+  if (args.lock) configureFromAggregateLock(args.lock);
   verifySourceFingerprints();
   bridge = {
     cwd: resolve(params.workspace ?? args.cwd ?? process.cwd()),

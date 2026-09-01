@@ -3861,13 +3861,16 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
             visible
                 .lines()
                 .next()
-                .is_some_and(|line| line.contains("Context ·")),
+                .is_some_and(|line| line.contains("Context Usage")),
             "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
         );
-        assert!(visible.contains(" input + "), "{visible}");
-        assert!(visible.contains("auto-compact"), "{visible}");
-        assert!(visible.contains('━'), "context bar was clipped:\n{visible}");
-        assert!(visible.contains("System prompt"), "{visible}");
+        assert!(visible.contains(" tokens ("), "{visible}");
+        assert!(visible.contains("Estimated usage by category"), "{visible}");
+        assert!(
+            visible.contains('⛶'),
+            "context grid was clipped:\n{visible}"
+        );
+        assert!(visible.contains("System instructions"), "{visible}");
         assert!(
             visible
                 .lines()
@@ -3889,7 +3892,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert!(
-            !physical.contains("Context ·"),
+            !physical.contains("Context Usage"),
             "overlay entered history:\n{physical}"
         );
         for index in 0..40 {

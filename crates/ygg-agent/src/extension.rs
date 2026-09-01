@@ -95,8 +95,46 @@ struct DynamicToolRegistry {
     ready: bool,
     ready_changed: Arc<Notify>,
     policy: Option<ToolPolicy>,
+    /// `None` means every configured tool is active. Once an explicit
+    /// selection is installed, newly configured tools remain inactive until a
+    /// later selection admits them.
+    active_names: Option<BTreeSet<String>>,
     revision: u64,
 }
+
+/// Immutable provider-facing view of the configured and active tool catalog.
+///
+/// A model request freezes one revision and receives only `active`. Catalog or
+/// active-selection changes publish a later revision and cannot alter an
+/// already-open provider request.
+#[derive(Clone, Debug)]
+pub struct ToolSnapshot {
+    /// Monotonic catalog/selection revision for this host.
+    pub revision: u64,
+    /// Complete policy-admitted tool definitions in deterministic wire order.
+    pub configured: Vec<ToolDef>,
+    /// Definitions exposed to the next provider request.
+    pub active: Vec<ToolDef>,
+}
+
+impl PartialEq for ToolSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        fn definitions_equal(left: &[ToolDef], right: &[ToolDef]) -> bool {
+            left.len() == right.len()
+                && left.iter().zip(right).all(|(left, right)| {
+                    left.name == right.name
+                        && left.description == right.description
+                        && left.parameters == right.parameters
+                })
+        }
+
+        self.revision == other.revision
+            && definitions_equal(&self.configured, &other.configured)
+            && definitions_equal(&self.active, &other.active)
+    }
+}
+
+impl Eq for ToolSnapshot {}
 
 struct DynamicToolGroup {
     owner: String,
@@ -249,6 +287,7 @@ impl DynamicToolRegistration {
             .reservations
             .retain(|reservation| reservation.owner != self.owner);
         if registry.groups.len() != previous_len {
+            retain_available_active_names(&mut registry);
             registry.revision = registry.revision.saturating_add(1);
         }
         registry.revision
@@ -308,6 +347,7 @@ impl DynamicToolReservation {
                 .sort_by(|left, right| left.owner.cmp(&right.owner));
         }
         registry.reservations.swap_remove(index);
+        retain_available_active_names(&mut registry);
         registry.revision = revision;
         Ok((registry.revision, published))
     }
@@ -324,6 +364,23 @@ impl Drop for DynamicToolReservation {
         registry
             .reservations
             .retain(|reservation| reservation.id != self.id || reservation.owner != self.owner);
+    }
+}
+
+fn retain_available_active_names(registry: &mut DynamicToolRegistry) {
+    let available = registry
+        .static_names
+        .iter()
+        .cloned()
+        .chain(
+            registry
+                .groups
+                .iter()
+                .flat_map(|group| group.tools.iter().map(|tool| tool.definition().name)),
+        )
+        .collect::<BTreeSet<_>>();
+    if let Some(active) = registry.active_names.as_mut() {
+        active.retain(|name| available.contains(name));
     }
 }
 
@@ -426,6 +483,7 @@ impl ExtensionHost {
         } else {
             dynamic.static_names.insert(name);
             self.tools.push(tool);
+            dynamic.revision = dynamic.revision.saturating_add(1);
         }
     }
 
@@ -512,6 +570,7 @@ impl ExtensionHost {
         for group in &mut dynamic.groups {
             group.tools.retain(|tool| keep(&tool.definition().name));
         }
+        retain_available_active_names(&mut dynamic);
         dynamic.revision = dynamic.revision.saturating_add(1);
     }
 
@@ -532,6 +591,7 @@ impl ExtensionHost {
         for group in &mut dynamic.groups {
             group.tools.retain(|tool| keep(&tool.definition().name));
         }
+        retain_available_active_names(&mut dynamic);
         dynamic.policy = Some(keep);
         dynamic.revision = dynamic.revision.saturating_add(1);
     }
@@ -570,21 +630,132 @@ impl ExtensionHost {
         Ok((scoped, effective))
     }
 
-    pub(crate) fn tool_snapshot(&self) -> (u64, Vec<Arc<dyn Tool>>) {
-        let dynamic = self
-            .dynamic_tools
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fn configured_tools(
+        dynamic: &DynamicToolRegistry,
+        static_tools: &[Arc<dyn Tool>],
+    ) -> Vec<Arc<dyn Tool>> {
         let dynamic_len: usize = dynamic.groups.iter().map(|group| group.tools.len()).sum();
-        let mut tools = Vec::with_capacity(self.tools.len() + dynamic_len);
-        tools.extend(self.tools.iter().cloned());
+        let mut tools = Vec::with_capacity(static_tools.len() + dynamic_len);
+        tools.extend(static_tools.iter().cloned());
         tools.extend(
             dynamic
                 .groups
                 .iter()
                 .flat_map(|group| group.tools.iter().cloned()),
         );
-        (dynamic.revision, tools)
+        tools
+    }
+
+    fn active_tools(
+        dynamic: &DynamicToolRegistry,
+        configured: &[Arc<dyn Tool>],
+    ) -> Vec<Arc<dyn Tool>> {
+        match &dynamic.active_names {
+            None => configured.to_vec(),
+            Some(active) => configured
+                .iter()
+                .filter(|tool| active.contains(&tool.definition().name))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    pub(crate) fn tool_snapshot(&self) -> (u64, Vec<Arc<dyn Tool>>) {
+        let dynamic = self
+            .dynamic_tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let configured = Self::configured_tools(&dynamic, &self.tools);
+        let active = Self::active_tools(&dynamic, &configured);
+        (dynamic.revision, active)
+    }
+
+    /// Returns an immutable configured/active definition snapshot.
+    pub fn tool_catalog_snapshot(&self) -> ToolSnapshot {
+        let dynamic = self
+            .dynamic_tools
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let configured_tools = Self::configured_tools(&dynamic, &self.tools);
+        let active_tools = Self::active_tools(&dynamic, &configured_tools);
+        ToolSnapshot {
+            revision: dynamic.revision,
+            configured: configured_tools
+                .iter()
+                .map(|tool| tool.definition())
+                .collect(),
+            active: active_tools.iter().map(|tool| tool.definition()).collect(),
+        }
+    }
+
+    /// Replaces the active-tool overlay after validating every requested name
+    /// against the complete policy-admitted configured catalog.
+    ///
+    /// The new selection is observed at the next provider request boundary;
+    /// an already-open request retains its frozen implementation snapshot.
+    pub fn set_active_tools<I, S>(&self, names: I) -> Result<ToolSnapshot, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let requested = names.into_iter().map(Into::into).collect::<Vec<_>>();
+        let requested_set = requested.iter().cloned().collect::<BTreeSet<_>>();
+        if requested_set.len() != requested.len() {
+            return Err("active tool selection contains duplicate names".into());
+        }
+
+        let mut dynamic = self
+            .dynamic_tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let configured_tools = Self::configured_tools(&dynamic, &self.tools);
+        let configured_names = configured_tools
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect::<BTreeSet<_>>();
+        if let Some(name) = requested_set
+            .iter()
+            .find(|name| !configured_names.contains(*name))
+        {
+            return Err(format!("unknown or policy-disabled active tool `{name}`"));
+        }
+        if dynamic.active_names.as_ref() != Some(&requested_set) {
+            dynamic.active_names = Some(requested_set);
+            dynamic.revision = dynamic.revision.saturating_add(1);
+        }
+        let active_tools = Self::active_tools(&dynamic, &configured_tools);
+        Ok(ToolSnapshot {
+            revision: dynamic.revision,
+            configured: configured_tools
+                .iter()
+                .map(|tool| tool.definition())
+                .collect(),
+            active: active_tools.iter().map(|tool| tool.definition()).collect(),
+        })
+    }
+
+    /// Removes an explicit active-tool overlay so every currently configured
+    /// tool, and later policy-admitted registrations, becomes active.
+    pub fn clear_active_tools(&self) -> ToolSnapshot {
+        let mut dynamic = self
+            .dynamic_tools
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if dynamic.active_names.take().is_some() {
+            dynamic.revision = dynamic.revision.saturating_add(1);
+        }
+        let configured_tools = Self::configured_tools(&dynamic, &self.tools);
+        ToolSnapshot {
+            revision: dynamic.revision,
+            configured: configured_tools
+                .iter()
+                .map(|tool| tool.definition())
+                .collect(),
+            active: configured_tools
+                .iter()
+                .map(|tool| tool.definition())
+                .collect(),
+        }
     }
 
     /// Opens live extension catalog publication after all host tool names have
@@ -604,13 +775,15 @@ impl ExtensionHost {
         ready_changed.notify_waiters();
     }
 
-    /// Returns the exact provider schemas currently registered, in wire order.
+    /// Returns the exact active provider schemas in wire order.
     pub fn tool_definitions(&self) -> Vec<ToolDef> {
-        self.tool_snapshot()
-            .1
-            .iter()
-            .map(|tool| tool.definition())
-            .collect()
+        self.tool_catalog_snapshot().active
+    }
+
+    /// Returns every policy-admitted configured schema, including tools hidden
+    /// by the current active overlay.
+    pub fn configured_tool_definitions(&self) -> Vec<ToolDef> {
+        self.tool_catalog_snapshot().configured
     }
 }
 
@@ -787,6 +960,114 @@ mod tests {
         assert_eq!(
             alpha.published_names(),
             BTreeSet::from(["alpha_new".to_owned()])
+        );
+    }
+
+    #[test]
+    fn static_registration_publishes_a_new_snapshot_revision() {
+        let mut host = ExtensionHost::new();
+        let empty = host.tool_catalog_snapshot();
+        host.tool(NamedTool("read"));
+        let configured = host.tool_catalog_snapshot();
+        assert!(configured.revision > empty.revision);
+        assert!(empty.configured.is_empty());
+        assert_eq!(configured.configured[0].name, "read");
+    }
+
+    #[test]
+    fn active_tool_selection_is_atomic_and_preserves_frozen_snapshots() {
+        let mut host = ExtensionHost::new();
+        host.tool(NamedTool("read"));
+        host.tool(NamedTool("write"));
+        host.dynamic_tools("search-provider", vec![named_tool("search")])
+            .unwrap();
+        let (initial_revision, frozen) = host.tool_snapshot();
+
+        let selected = host
+            .set_active_tools(["read".to_owned(), "search".to_owned()])
+            .unwrap();
+        assert!(selected.revision > initial_revision);
+        assert_eq!(
+            selected
+                .configured
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "write", "search"]
+        );
+        assert_eq!(
+            selected
+                .active
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "search"]
+        );
+        assert_eq!(
+            frozen
+                .iter()
+                .map(|tool| tool.definition().name)
+                .collect::<Vec<_>>(),
+            vec!["read", "write", "search"],
+            "an in-flight request keeps the implementation snapshot it froze"
+        );
+        assert_eq!(
+            host.tool_definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["read", "search"]
+        );
+    }
+
+    #[test]
+    fn invalid_active_tool_selection_leaves_revision_and_catalog_unchanged() {
+        let mut host = ExtensionHost::new();
+        host.tool(NamedTool("read"));
+        host.tool(NamedTool("write"));
+        let before = host.tool_catalog_snapshot();
+
+        assert!(host
+            .set_active_tools(["read".to_owned(), "missing".to_owned()])
+            .unwrap_err()
+            .contains("unknown or policy-disabled"));
+        assert_eq!(host.tool_catalog_snapshot(), before);
+        assert!(host
+            .set_active_tools(["read".to_owned(), "read".to_owned()])
+            .unwrap_err()
+            .contains("duplicate"));
+        assert_eq!(host.tool_catalog_snapshot(), before);
+    }
+
+    #[test]
+    fn active_overlay_does_not_implicitly_admit_new_dynamic_tools() {
+        let mut host = ExtensionHost::new();
+        host.tool(NamedTool("read"));
+        let dynamic = host
+            .dynamic_tools("provider", vec![named_tool("old")])
+            .unwrap();
+        host.set_active_tools(["old".to_owned()]).unwrap();
+
+        dynamic.replace(vec![named_tool("new")]).unwrap();
+        let replaced = host.tool_catalog_snapshot();
+        assert_eq!(
+            replaced
+                .configured
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "new"]
+        );
+        assert!(replaced.active.is_empty());
+
+        let cleared = host.clear_active_tools();
+        assert_eq!(
+            cleared
+                .active
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read", "new"]
         );
     }
 }

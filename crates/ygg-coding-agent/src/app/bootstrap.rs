@@ -2863,7 +2863,10 @@ const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60
 const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
 
 pub(crate) fn effective_compaction_threshold_fraction(config: &Config, model: &Model) -> f64 {
-    let Some(max_active_tokens) = config.compaction.max_active_tokens.filter(|tokens| *tokens > 0)
+    let Some(max_active_tokens) = config
+        .compaction
+        .max_active_tokens
+        .filter(|tokens| *tokens > 0)
     else {
         return config.compaction.threshold_fraction;
     };

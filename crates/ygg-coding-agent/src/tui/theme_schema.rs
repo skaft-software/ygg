@@ -246,7 +246,7 @@ impl ThemeSurface {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(super) struct RoleStyleSpec {
+pub(crate) struct RoleStyleSpec {
     pub foreground: Option<String>,
     pub background: Option<String>,
     pub bold: Option<bool>,
@@ -259,7 +259,7 @@ pub(super) struct RoleStyleSpec {
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct ParsedTheme {
+pub(crate) struct ParsedTheme {
     pub metadata: ThemeMetadata,
     pub tokens: BTreeMap<String, String>,
     pub roles: BTreeMap<String, RoleStyleSpec>,

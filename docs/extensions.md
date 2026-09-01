@@ -63,14 +63,20 @@ Two exact manifest-selected protocol versions are implemented:
   capabilities, and owner-scoped secret lookup are offered conditionally;
   parent-correlated ephemeral input is part of the base `0.2` contract.
 
+API `0.3` DTOs and negotiation validators are defined for ongoing Pi-parity
+work, but its mandatory handlers are not runtime-ready. The advertised default
+remains `0.2`, and a `0.3` manifest is rejected before process spawn rather than
+silently receiving partial behavior.
+
 API `0.2` supplies the stateful transport foundation for trusted daily use
 within those boundaries. It does not add an operating-system sandbox or move a
 domain capability into the host.
 
 Pi migration is capability-oriented rather than a promise to reproduce Pi's
 in-process ABI. `ygg migrate pi --dry-run` inventories package resources and
-extension surfaces without executing them; `ygg pi install` creates an inert
-wrapper for the bounded `ygg-pi-compat` subset. See [Migrating from
+extension surfaces without executing them; its separate `--plan-out`/`--apply`
+flow and `ygg pi install` can publish an inert aggregate for the bounded
+`ygg-pi-compat` subset. See [Migrating from
 Pi](pi-migration.md) for the scanner contract, classifications, and staged
 compatibility architecture.
 
@@ -132,6 +138,24 @@ trusted_extensions = [
 ]
 ```
 
+Aggregate installations with an adjacent `pi-lock.json` require a
+content-identity grant even when they live under the global extension root. Use
+the exact value reported by `/extensions status` or the startup diagnostic:
+
+```toml
+enabled_extensions = ["pi-aggregate"]
+trusted_extensions = [
+  "pi-aggregate@/absolute/path/extension.toml@sha256:<64-lowercase-hex-principal>",
+]
+```
+
+The principal digest binds the canonical manifest path, exact manifest bytes,
+and adjacent install/aggregate identity records. Adding, removing, reordering,
+or changing an aggregate source therefore invalidates persistent trust. Legacy
+bare-name and path-only grants cannot admit a locked aggregate. A one-shot
+`--trust-extension pi-aggregate` remains an explicit invocation-scoped override
+and is never persisted.
+
 `--trust-extension git-tools` is deliberately different: it trusts the
 currently selected `git-tools` source for this process invocation only and is
 never written back as a persistent name grant.
@@ -165,6 +189,7 @@ description = "Small local git helpers"
 
 [entrypoint]
 command = "git-tools"
+# sha256 = "<64 lowercase hex characters>" # optional exact code binding
 args = ["--stdio"]
 
 [capabilities]
@@ -187,10 +212,15 @@ presentation = true # API 0.2 frontend-neutral activity/list/tree/detail snapsho
 ```
 
 Bare entrypoint commands are first resolved beside the manifest, then through
-`PATH`. Arguments are passed directly without a shell. The child working
-directory is the active workspace. Ygg supplies `YGG_EXTENSION_API_VERSION`,
-`YGG_EXTENSION_NAME`, `YGG_EXTENSION_DIR`, `YGG_EXTENSION_MANIFEST`, and
-`YGG_WORKSPACE`. Every generation also receives `YGG_EXTENSION_SCRATCH` for
+`PATH`. Arguments are passed directly without a shell. Resolved local/path
+entrypoints are copied to a private staging file before spawn. Optional
+`entrypoint.sha256` must match those exact staged bytes; for a bare interpreter
+command whose first argument names a file, Ygg instead verifies, stages, and
+substitutes that script argument. Digest mismatch fails before any child code
+runs. The child working directory is the active workspace. Ygg supplies
+`YGG_EXTENSION_API_VERSION`, `YGG_EXTENSION_NAME`, `YGG_EXTENSION_DIR`,
+`YGG_EXTENSION_MANIFEST`, and `YGG_WORKSPACE`. Every generation also receives
+`YGG_EXTENSION_SCRATCH` for
 host-verified artifact publication. To keep an existing extension on the
 frozen wire, leave `api_version = "0.1"` in its manifest. Semantic
 `presentation` is API `0.2`-only and is rejected on a frozen `0.1` manifest.

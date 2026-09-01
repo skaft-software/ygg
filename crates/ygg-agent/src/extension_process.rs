@@ -8,7 +8,6 @@
 //! sandbox; executable extensions run with the current user's privileges.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -53,6 +52,9 @@ pub const EXTENSION_API_VERSION_0_1: &str = "0.1";
 /// Stateful extension protocol with cancellation, progress, and lifecycle.
 pub const EXTENSION_API_VERSION_0_2: &str = "0.2";
 
+/// Selected parity-contract version. Its runtime is intentionally not ready.
+pub const EXTENSION_API_VERSION_0_3: &str = "0.3";
+
 /// API `0.2` cooperative request cancellation feature.
 pub const EXTENSION_FEATURE_REQUEST_CANCELLATION: &str = "request_cancellation";
 /// API `0.2` structured/media result feature.
@@ -86,6 +88,27 @@ pub const DELEGATION_TELEMETRY_SCHEMA: &str = "ygg.delegation.telemetry.v1";
 pub const EXTENSION_FEATURE_APPROVALS: &str = "approvals";
 /// API `0.2` owner-scoped host secret lookup service.
 pub const EXTENSION_FEATURE_SECRETS: &str = "secrets";
+/// API `0.3` host-injected split owner and operation identity.
+pub const EXTENSION_FEATURE_OWNER_CONTEXT: &str = "owner_context";
+/// API `0.3` total-order lifecycle dispatch and barriers.
+pub const EXTENSION_FEATURE_ORDERED_EVENTS: &str = "ordered_events";
+/// API `0.3` atomic revisioned contribution catalogs.
+pub const EXTENSION_FEATURE_CATALOG_TRANSACTIONS: &str = "catalog_transactions";
+/// API `0.3` declarative, bounded mutation journals.
+pub const EXTENSION_FEATURE_EFFECT_TRANSACTIONS: &str = "effect_transactions";
+/// API `0.3` flow-controlled immutable document transfer.
+pub const EXTENSION_FEATURE_DOCUMENT_STREAMS: &str = "document_streams";
+
+/// Mandatory feature set for every API `0.3` negotiation.
+pub const EXTENSION_API_0_3_REQUIRED_FEATURES: &[&str] = &[
+    EXTENSION_FEATURE_REQUEST_CANCELLATION,
+    EXTENSION_FEATURE_CONTENT_PARTS,
+    EXTENSION_FEATURE_OWNER_CONTEXT,
+    EXTENSION_FEATURE_ORDERED_EVENTS,
+    EXTENSION_FEATURE_CATALOG_TRANSACTIONS,
+    EXTENSION_FEATURE_EFFECT_TRANSACTIONS,
+    EXTENSION_FEATURE_DOCUMENT_STREAMS,
+];
 
 const API_0_2_REQUIRED_FEATURES: &[&str] = &[
     EXTENSION_FEATURE_REQUEST_CANCELLATION,
@@ -113,6 +136,8 @@ pub const EXTENSION_MANIFEST_FILENAME: &str = "extension.toml";
 
 /// Default maximum manifest size (64 KiB).
 pub const DEFAULT_EXTENSION_MANIFEST_BYTES: u64 = 64 * 1024;
+/// Product hard maximum used for manifest-bound security identities (256 KiB).
+pub const MAX_EXTENSION_MANIFEST_BYTES: u64 = 256 * 1024;
 
 /// Default maximum size of one JSON protocol message (1 MiB).
 pub const DEFAULT_EXTENSION_MESSAGE_BYTES: usize = 1024 * 1024;
@@ -129,6 +154,36 @@ const MAX_CHILD_REQUESTS: usize = 128;
 const MAX_CHILD_WORKERS: usize = 8;
 const MAX_DYNAMIC_EXTENSION_TOOLS: usize = 256;
 const MAX_EXTENSION_COMMANDS: usize = 256;
+/// Maximum effects returned by one API `0.3` event handler.
+pub const MAX_EXTENSION_EFFECTS: usize = 128;
+/// Maximum encoded bytes in one API `0.3` effect journal.
+pub const MAX_EXTENSION_EFFECT_JOURNAL_BYTES: usize = 512 * 1024;
+/// Maximum decoded bytes in one API `0.3` document chunk.
+pub const MAX_EXTENSION_DOCUMENT_CHUNK_BYTES: usize = 192 * 1024;
+/// Maximum decoded bytes in one API `0.3` immutable document.
+pub const MAX_EXTENSION_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum unacknowledged API `0.3` document chunks.
+pub const MAX_EXTENSION_DOCUMENT_WINDOW: usize = 8;
+/// Maximum events in one API `0.3` observational batch.
+pub const MAX_EXTENSION_ORDERED_EVENT_BATCH: usize = 64;
+/// Maximum encoded bytes in one API `0.3` observational batch.
+pub const MAX_EXTENSION_ORDERED_EVENT_BATCH_BYTES: usize = 256 * 1024;
+/// Maximum encoded bytes in one inline API `0.3` semantic payload.
+pub const MAX_EXTENSION_INLINE_SEMANTIC_BYTES: usize = 512 * 1024;
+const MAX_EXTENSION_HOST_SERVICES: usize = 16;
+const MAX_EXTENSION_HOST_SERVICE_SCOPES: usize = 32;
+const MAX_EXTENSION_HOST_SERVICE_DECLARATION_BYTES: usize = 1024;
+const MAX_EXTENSION_CATALOG_ENTRIES: usize = 1024;
+const MAX_EXTENSION_FLAGS: usize = 128;
+const MAX_EXTENSION_SHORTCUTS: usize = 128;
+const MAX_EXTENSION_RENDERERS: usize = 128;
+const MAX_EXTENSION_PROVIDERS: usize = 64;
+const MAX_EXTENSION_V03_JSON_DEPTH: usize = 64;
+const MAX_EXTENSION_V03_JSON_NODES: usize = 65_536;
+/// Maximum aggregate bytes read from a manifest and its source-identity records.
+pub const MAX_EXTENSION_IDENTITY_BYTES: usize = 1024 * 1024;
+/// Maximum adjacent source-identity records bound into an extension principal.
+pub const MAX_EXTENSION_IDENTITY_RECORDS: usize = 3;
 const DYNAMIC_CATALOG_QUEUE_CAPACITY: usize = 32;
 const SUPERVISOR_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -1105,6 +1160,770 @@ pub fn force_kill_registered_process_groups() {
     }
 }
 
+/// Finite API `0.3` host-service names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionHostServiceName {
+    /// Read-only host state snapshots.
+    State,
+    /// Host lifecycle control.
+    Control,
+    /// Durable session access.
+    Session,
+    /// Owner-scoped messaging.
+    Messaging,
+    /// Revisioned contribution catalogs.
+    Catalog,
+    /// Candidate resource roots.
+    Resources,
+    /// Semantic frontend services.
+    Ui,
+    /// Provider registration and interception.
+    Providers,
+    /// Host-admitted process execution.
+    Process,
+    /// Policy evaluation and approvals.
+    Policy,
+    /// Artifact publication and resolution.
+    Artifacts,
+    /// Exact-name secret lookup.
+    Secrets,
+    /// Host-owned child model sessions.
+    AgentSessions,
+}
+
+impl ExtensionHostServiceName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::State => "state",
+            Self::Control => "control",
+            Self::Session => "session",
+            Self::Messaging => "messaging",
+            Self::Catalog => "catalog",
+            Self::Resources => "resources",
+            Self::Ui => "ui",
+            Self::Providers => "providers",
+            Self::Process => "process",
+            Self::Policy => "policy",
+            Self::Artifacts => "artifacts",
+            Self::Secrets => "secrets",
+            Self::AgentSessions => "agent_sessions",
+        }
+    }
+}
+
+impl std::fmt::Display for ExtensionHostServiceName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ExtensionHostServiceName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "state" => Ok(Self::State),
+            "control" => Ok(Self::Control),
+            "session" => Ok(Self::Session),
+            "messaging" => Ok(Self::Messaging),
+            "catalog" => Ok(Self::Catalog),
+            "resources" => Ok(Self::Resources),
+            "ui" => Ok(Self::Ui),
+            "providers" => Ok(Self::Providers),
+            "process" => Ok(Self::Process),
+            "policy" => Ok(Self::Policy),
+            "artifacts" => Ok(Self::Artifacts),
+            "secrets" => Ok(Self::Secrets),
+            "agent_sessions" => Ok(Self::AgentSessions),
+            _ => Err(format!("unknown host service `{value}`")),
+        }
+    }
+}
+
+/// Independently versioned API `0.3` host-service contract version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExtensionHostServiceVersion {
+    /// Initial host-service contract.
+    V1,
+}
+
+impl ExtensionHostServiceVersion {
+    /// Returns the integer carried on the wire.
+    pub const fn as_u16(self) -> u16 {
+        match self {
+            Self::V1 => 1,
+        }
+    }
+}
+
+impl Serialize for ExtensionHostServiceVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u16(self.as_u16())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionHostServiceVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match u16::deserialize(deserializer)? {
+            1 => Ok(Self::V1),
+            version => Err(serde::de::Error::custom(format!(
+                "unsupported host-service version {version}"
+            ))),
+        }
+    }
+}
+
+/// Finite API `0.3` host-service scopes.
+///
+/// `SecretName` is the sole resource-valued scope: it is valid only for
+/// `secrets@1` and must also occur in `capabilities.secrets`.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExtensionHostServiceScope {
+    Host,
+    ContextUsage,
+    SystemPrompt,
+    SystemPromptOptions,
+    Pending,
+    Idle,
+    ProjectTrust,
+    Abort,
+    WaitIdle,
+    Shutdown,
+    Reload,
+    Read,
+    Path,
+    Append,
+    Label,
+    Name,
+    Compact,
+    Navigate,
+    New,
+    Fork,
+    Switch,
+    Custom,
+    User,
+    Steer,
+    FollowUp,
+    NextTurn,
+    Templates,
+    Tools,
+    ActiveTools,
+    Commands,
+    Flags,
+    Shortcuts,
+    Renderers,
+    Roles,
+    Skills,
+    Prompts,
+    Themes,
+    Notify,
+    Dialogs,
+    Status,
+    Working,
+    Widgets,
+    Header,
+    Footer,
+    Title,
+    Editor,
+    Autocomplete,
+    Components,
+    Disclosure,
+    TerminalInput,
+    Register,
+    Override,
+    RefreshModels,
+    InterceptPayload,
+    InterceptHeaders,
+    CredentialHeaders,
+    CustomStream,
+    Oauth,
+    Exec,
+    UserBash,
+    Evaluate,
+    Approvals,
+    Publish,
+    Resolve,
+    Spawn,
+    Message,
+    List,
+    Wait,
+    Interrupt,
+    Observe,
+    SecretName(String),
+}
+
+impl ExtensionHostServiceScope {
+    /// Returns the declaration/wire spelling.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Host => "host",
+            Self::ContextUsage => "context-usage",
+            Self::SystemPrompt => "system-prompt",
+            Self::SystemPromptOptions => "system-prompt-options",
+            Self::Pending => "pending",
+            Self::Idle => "idle",
+            Self::ProjectTrust => "project-trust",
+            Self::Abort => "abort",
+            Self::WaitIdle => "wait-idle",
+            Self::Shutdown => "shutdown",
+            Self::Reload => "reload",
+            Self::Read => "read",
+            Self::Path => "path",
+            Self::Append => "append",
+            Self::Label => "label",
+            Self::Name => "name",
+            Self::Compact => "compact",
+            Self::Navigate => "navigate",
+            Self::New => "new",
+            Self::Fork => "fork",
+            Self::Switch => "switch",
+            Self::Custom => "custom",
+            Self::User => "user",
+            Self::Steer => "steer",
+            Self::FollowUp => "follow-up",
+            Self::NextTurn => "next-turn",
+            Self::Templates => "templates",
+            Self::Tools => "tools",
+            Self::ActiveTools => "active-tools",
+            Self::Commands => "commands",
+            Self::Flags => "flags",
+            Self::Shortcuts => "shortcuts",
+            Self::Renderers => "renderers",
+            Self::Roles => "roles",
+            Self::Skills => "skills",
+            Self::Prompts => "prompts",
+            Self::Themes => "themes",
+            Self::Notify => "notify",
+            Self::Dialogs => "dialogs",
+            Self::Status => "status",
+            Self::Working => "working",
+            Self::Widgets => "widgets",
+            Self::Header => "header",
+            Self::Footer => "footer",
+            Self::Title => "title",
+            Self::Editor => "editor",
+            Self::Autocomplete => "autocomplete",
+            Self::Components => "components",
+            Self::Disclosure => "disclosure",
+            Self::TerminalInput => "terminal-input",
+            Self::Register => "register",
+            Self::Override => "override",
+            Self::RefreshModels => "refresh-models",
+            Self::InterceptPayload => "intercept-payload",
+            Self::InterceptHeaders => "intercept-headers",
+            Self::CredentialHeaders => "credential-headers",
+            Self::CustomStream => "custom-stream",
+            Self::Oauth => "oauth",
+            Self::Exec => "exec",
+            Self::UserBash => "user-bash",
+            Self::Evaluate => "evaluate",
+            Self::Approvals => "approvals",
+            Self::Publish => "publish",
+            Self::Resolve => "resolve",
+            Self::Spawn => "spawn",
+            Self::Message => "message",
+            Self::List => "list",
+            Self::Wait => "wait",
+            Self::Interrupt => "interrupt",
+            Self::Observe => "observe",
+            Self::SecretName(name) => name,
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        let scope = match value {
+            "host" => Self::Host,
+            "context-usage" => Self::ContextUsage,
+            "system-prompt" => Self::SystemPrompt,
+            "system-prompt-options" => Self::SystemPromptOptions,
+            "pending" => Self::Pending,
+            "idle" => Self::Idle,
+            "project-trust" => Self::ProjectTrust,
+            "abort" => Self::Abort,
+            "wait-idle" => Self::WaitIdle,
+            "shutdown" => Self::Shutdown,
+            "reload" => Self::Reload,
+            "read" => Self::Read,
+            "path" => Self::Path,
+            "append" => Self::Append,
+            "label" => Self::Label,
+            "name" => Self::Name,
+            "compact" => Self::Compact,
+            "navigate" => Self::Navigate,
+            "new" => Self::New,
+            "fork" => Self::Fork,
+            "switch" => Self::Switch,
+            "custom" => Self::Custom,
+            "user" => Self::User,
+            "steer" => Self::Steer,
+            "follow-up" => Self::FollowUp,
+            "next-turn" => Self::NextTurn,
+            "templates" => Self::Templates,
+            "tools" => Self::Tools,
+            "active-tools" => Self::ActiveTools,
+            "commands" => Self::Commands,
+            "flags" => Self::Flags,
+            "shortcuts" => Self::Shortcuts,
+            "renderers" => Self::Renderers,
+            "roles" => Self::Roles,
+            "skills" => Self::Skills,
+            "prompts" => Self::Prompts,
+            "themes" => Self::Themes,
+            "notify" => Self::Notify,
+            "dialogs" => Self::Dialogs,
+            "status" => Self::Status,
+            "working" => Self::Working,
+            "widgets" => Self::Widgets,
+            "header" => Self::Header,
+            "footer" => Self::Footer,
+            "title" => Self::Title,
+            "editor" => Self::Editor,
+            "autocomplete" => Self::Autocomplete,
+            "components" => Self::Components,
+            "disclosure" => Self::Disclosure,
+            "terminal-input" => Self::TerminalInput,
+            "register" => Self::Register,
+            "override" => Self::Override,
+            "refresh-models" => Self::RefreshModels,
+            "intercept-payload" => Self::InterceptPayload,
+            "intercept-headers" => Self::InterceptHeaders,
+            "credential-headers" => Self::CredentialHeaders,
+            "custom-stream" => Self::CustomStream,
+            "oauth" => Self::Oauth,
+            "exec" => Self::Exec,
+            "user-bash" => Self::UserBash,
+            "evaluate" => Self::Evaluate,
+            "approvals" => Self::Approvals,
+            "publish" => Self::Publish,
+            "resolve" => Self::Resolve,
+            "spawn" => Self::Spawn,
+            "message" => Self::Message,
+            "list" => Self::List,
+            "wait" => Self::Wait,
+            "interrupt" => Self::Interrupt,
+            "observe" => Self::Observe,
+            other if valid_v03_identifier(other, 64) => Self::SecretName(other.to_owned()),
+            _ => return Err(format!("invalid host-service scope `{value}`")),
+        };
+        Ok(scope)
+    }
+
+    fn parse_for_service(service: ExtensionHostServiceName, value: &str) -> Result<Self, String> {
+        if service == ExtensionHostServiceName::Secrets {
+            if valid_extension_secret_name(value) {
+                Ok(Self::SecretName(value.to_owned()))
+            } else {
+                Err(format!("invalid secret host-service scope `{value}`"))
+            }
+        } else {
+            Self::parse(value)
+        }
+    }
+}
+
+impl Serialize for ExtensionHostServiceScope {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionHostServiceScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn host_service_scope_is_valid(
+    service: ExtensionHostServiceName,
+    scope: &ExtensionHostServiceScope,
+) -> bool {
+    use ExtensionHostServiceName as Service;
+    use ExtensionHostServiceScope as Scope;
+    match service {
+        Service::State => matches!(
+            scope,
+            Scope::Host
+                | Scope::ContextUsage
+                | Scope::SystemPrompt
+                | Scope::SystemPromptOptions
+                | Scope::Pending
+                | Scope::Idle
+                | Scope::ProjectTrust
+        ),
+        Service::Control => matches!(
+            scope,
+            Scope::Abort | Scope::WaitIdle | Scope::Shutdown | Scope::Reload
+        ),
+        Service::Session => matches!(
+            scope,
+            Scope::Read
+                | Scope::Path
+                | Scope::Append
+                | Scope::Label
+                | Scope::Name
+                | Scope::Compact
+                | Scope::Navigate
+                | Scope::New
+                | Scope::Fork
+                | Scope::Switch
+        ),
+        Service::Messaging => matches!(
+            scope,
+            Scope::Custom
+                | Scope::User
+                | Scope::Steer
+                | Scope::FollowUp
+                | Scope::NextTurn
+                | Scope::Templates
+        ),
+        Service::Catalog => matches!(
+            scope,
+            Scope::Read
+                | Scope::Tools
+                | Scope::ActiveTools
+                | Scope::Commands
+                | Scope::Flags
+                | Scope::Shortcuts
+                | Scope::Renderers
+                | Scope::Roles
+        ),
+        Service::Resources => matches!(scope, Scope::Skills | Scope::Prompts | Scope::Themes),
+        Service::Ui => matches!(
+            scope,
+            Scope::Notify
+                | Scope::Dialogs
+                | Scope::Status
+                | Scope::Working
+                | Scope::Widgets
+                | Scope::Header
+                | Scope::Footer
+                | Scope::Title
+                | Scope::Editor
+                | Scope::Autocomplete
+                | Scope::Components
+                | Scope::Themes
+                | Scope::Disclosure
+                | Scope::TerminalInput
+        ),
+        Service::Providers => matches!(
+            scope,
+            Scope::Read
+                | Scope::Register
+                | Scope::Override
+                | Scope::RefreshModels
+                | Scope::InterceptPayload
+                | Scope::InterceptHeaders
+                | Scope::CredentialHeaders
+                | Scope::CustomStream
+                | Scope::Oauth
+        ),
+        Service::Process => matches!(scope, Scope::Exec | Scope::UserBash),
+        Service::Policy => matches!(scope, Scope::Evaluate | Scope::Approvals),
+        Service::Artifacts => matches!(scope, Scope::Publish | Scope::Resolve),
+        Service::Secrets => matches!(scope, Scope::SecretName(_)),
+        Service::AgentSessions => matches!(
+            scope,
+            Scope::Spawn
+                | Scope::Message
+                | Scope::FollowUp
+                | Scope::List
+                | Scope::Wait
+                | Scope::Interrupt
+                | Scope::Observe
+        ),
+    }
+}
+
+/// Strict manifest declaration such as `session@1:read,append`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionHostServiceDeclaration {
+    /// Finite service name.
+    pub name: ExtensionHostServiceName,
+    /// Independently versioned service shape.
+    pub version: ExtensionHostServiceVersion,
+    /// Consent scopes forming the extension's upper bound.
+    pub scopes: Vec<ExtensionHostServiceScope>,
+}
+
+impl ExtensionHostServiceDeclaration {
+    /// Validates the declaration's service-specific scopes and bounds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.scopes.is_empty() {
+            return Err(format!("host service `{}` has no scopes", self.name));
+        }
+        if self.scopes.len() > MAX_EXTENSION_HOST_SERVICE_SCOPES {
+            return Err(format!(
+                "host service `{}` has {} scopes; limit is {MAX_EXTENSION_HOST_SERVICE_SCOPES}",
+                self.name,
+                self.scopes.len()
+            ));
+        }
+        let mut unique = BTreeSet::new();
+        for scope in &self.scopes {
+            if !host_service_scope_is_valid(self.name, scope) {
+                return Err(format!(
+                    "unknown scope `{}` for host service `{}@{}`",
+                    scope.as_str(),
+                    self.name,
+                    self.version.as_u16()
+                ));
+            }
+            if !unique.insert(scope) {
+                return Err(format!(
+                    "duplicate scope `{}` for host service `{}`",
+                    scope.as_str(),
+                    self.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for ExtensionHostServiceDeclaration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}@{}:", self.name, self.version.as_u16())?;
+        for (index, scope) in self.scopes.iter().enumerate() {
+            if index != 0 {
+                formatter.write_str(",")?;
+            }
+            formatter.write_str(scope.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::str::FromStr for ExtensionHostServiceDeclaration {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty()
+            || value.len() > MAX_EXTENSION_HOST_SERVICE_DECLARATION_BYTES
+            || value.chars().any(char::is_whitespace)
+        {
+            return Err(
+                "host-service declaration must be non-empty, bounded, and contain no whitespace"
+                    .into(),
+            );
+        }
+        let (service_version, scopes) = value
+            .split_once(':')
+            .ok_or_else(|| "host-service declaration must contain `:`".to_owned())?;
+        if scopes.contains(':') {
+            return Err("host-service declaration contains more than one `:`".into());
+        }
+        let (service, version) = service_version
+            .split_once('@')
+            .ok_or_else(|| "host-service declaration must contain `@`".to_owned())?;
+        if version.contains('@') || version != "1" {
+            return Err(format!("unsupported host-service version `{version}`"));
+        }
+        let name = service.parse::<ExtensionHostServiceName>()?;
+        let scopes = scopes
+            .split(',')
+            .map(|scope| ExtensionHostServiceScope::parse_for_service(name, scope))
+            .collect::<Result<Vec<_>, _>>()?;
+        let declaration = Self {
+            name,
+            version: ExtensionHostServiceVersion::V1,
+            scopes,
+        };
+        declaration.validate()?;
+        Ok(declaration)
+    }
+}
+
+impl Serialize for ExtensionHostServiceDeclaration {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionHostServiceDeclaration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Finite generic limit keys for an offered API `0.3` host service.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionHostServiceLimits {
+    /// Maximum simultaneously admitted calls to this service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_requests: Option<u32>,
+    /// Maximum encoded request bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<u64>,
+    /// Maximum encoded response bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<u64>,
+    /// Maximum returned or mutated items.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_items: Option<u32>,
+    /// Maximum call duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+impl ExtensionHostServiceLimits {
+    /// Validates positive, finite protocol limits.
+    pub fn validate(&self) -> Result<(), String> {
+        fn positive<T>(value: Option<T>, field: &str) -> Result<(), String>
+        where
+            T: PartialEq + Default,
+        {
+            if value.is_some_and(|value| value == T::default()) {
+                Err(format!(
+                    "host-service limit `{field}` must be greater than zero"
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        positive(self.max_concurrent_requests, "max_concurrent_requests")?;
+        positive(self.max_request_bytes, "max_request_bytes")?;
+        positive(self.max_response_bytes, "max_response_bytes")?;
+        positive(self.max_items, "max_items")?;
+        positive(self.timeout_ms, "timeout_ms")?;
+        if self
+            .max_concurrent_requests
+            .is_some_and(|value| value > 1024)
+            || self
+                .max_request_bytes
+                .is_some_and(|value| value > MAX_EXTENSION_DOCUMENT_BYTES)
+            || self
+                .max_response_bytes
+                .is_some_and(|value| value > MAX_EXTENSION_DOCUMENT_BYTES)
+            || self.max_items.is_some_and(|value| value > 1_048_576)
+            || self.timeout_ms.is_some_and(|value| value > 86_400_000)
+        {
+            return Err("host-service limit exceeds the API 0.3 contract maximum".into());
+        }
+        Ok(())
+    }
+
+    fn is_subset_of(&self, offered: &Self) -> bool {
+        fn subset<T: PartialOrd>(accepted: Option<T>, offered: Option<T>) -> bool {
+            match (accepted, offered) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(accepted), Some(offered)) => accepted <= offered,
+            }
+        }
+        subset(
+            self.max_concurrent_requests,
+            offered.max_concurrent_requests,
+        ) && subset(self.max_request_bytes, offered.max_request_bytes)
+            && subset(self.max_response_bytes, offered.max_response_bytes)
+            && subset(self.max_items, offered.max_items)
+            && subset(self.timeout_ms, offered.timeout_ms)
+    }
+}
+
+/// Typed host-service offer or accepted subset in API `0.3` negotiation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExtensionHostServiceDescriptor {
+    /// Finite service name.
+    pub name: ExtensionHostServiceName,
+    /// Independently versioned service shape.
+    pub version: ExtensionHostServiceVersion,
+    /// Offered or accepted scopes.
+    pub scopes: Vec<ExtensionHostServiceScope>,
+    /// Host-authoritative service bounds.
+    pub limits: ExtensionHostServiceLimits,
+}
+
+impl ExtensionHostServiceDescriptor {
+    /// Validates name/version/scope/limit consistency.
+    pub fn validate(&self) -> Result<(), String> {
+        ExtensionHostServiceDeclaration {
+            name: self.name,
+            version: self.version,
+            scopes: self.scopes.clone(),
+        }
+        .validate()?;
+        self.limits.validate()
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionHostServiceDescriptor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawDescriptor {
+            name: ExtensionHostServiceName,
+            version: ExtensionHostServiceVersion,
+            scopes: Vec<String>,
+            limits: ExtensionHostServiceLimits,
+        }
+
+        let raw = RawDescriptor::deserialize(deserializer)?;
+        let scopes = raw
+            .scopes
+            .iter()
+            .map(|scope| ExtensionHostServiceScope::parse_for_service(raw.name, scope))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom)?;
+        let descriptor = Self {
+            name: raw.name,
+            version: raw.version,
+            scopes,
+            limits: raw.limits,
+        };
+        descriptor.validate().map_err(serde::de::Error::custom)?;
+        Ok(descriptor)
+    }
+}
+
+fn valid_extension_secret_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && value.len() <= MAX_EXTENSION_SECRET_NAME_BYTES
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+fn valid_v03_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'.')
+                || (index == 0 && byte == b'@')
+        })
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'@'))
+}
+
 /// Parsed `extension.toml` metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1155,12 +1974,24 @@ impl ExtensionManifest {
         path: impl AsRef<Path>,
         max_bytes: u64,
     ) -> Result<Self, ExtensionRuntimeError> {
-        let path = path.as_ref();
+        Self::load_bounded_with_bytes(path.as_ref(), max_bytes).map(|(manifest, _)| manifest)
+    }
+
+    fn load_bounded_with_bytes(
+        path: &Path,
+        max_bytes: u64,
+    ) -> Result<(Self, Vec<u8>), ExtensionRuntimeError> {
         let metadata =
-            std::fs::metadata(path).map_err(|error| ExtensionRuntimeError::ManifestIo {
+            std::fs::symlink_metadata(path).map_err(|error| ExtensionRuntimeError::ManifestIo {
                 path: path.to_path_buf(),
                 message: error.to_string(),
             })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "manifest {} is not a regular non-symlink file",
+                path.display()
+            )));
+        }
         if metadata.len() > max_bytes {
             return Err(ExtensionRuntimeError::ManifestTooLarge {
                 path: path.to_path_buf(),
@@ -1168,29 +1999,33 @@ impl ExtensionManifest {
                 limit: max_bytes,
             });
         }
-
-        let file = File::open(path).map_err(|error| ExtensionRuntimeError::ManifestIo {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        })?;
-        let mut bytes = Vec::with_capacity(metadata.len().min(max_bytes) as usize);
-        file.take(max_bytes.saturating_add(1))
-            .read_to_end(&mut bytes)
+        let canonical = path
+            .canonicalize()
             .map_err(|error| ExtensionRuntimeError::ManifestIo {
                 path: path.to_path_buf(),
                 message: error.to_string(),
             })?;
-        if bytes.len() as u64 > max_bytes {
-            return Err(ExtensionRuntimeError::ManifestTooLarge {
-                path: path.to_path_buf(),
-                bytes: bytes.len() as u64,
-                limit: max_bytes,
-            });
-        }
+        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let bytes =
+            crate::secure_fs::read_regular_file_bounded(&canonical, limit).map_err(|error| {
+                match error {
+                    crate::secure_fs::SecureFileError::TooLarge { actual, .. } => {
+                        ExtensionRuntimeError::ManifestTooLarge {
+                            path: path.to_path_buf(),
+                            bytes: actual,
+                            limit: max_bytes,
+                        }
+                    }
+                    error => ExtensionRuntimeError::ManifestIo {
+                        path: path.to_path_buf(),
+                        message: error.to_string(),
+                    },
+                }
+            })?;
         let source = std::str::from_utf8(&bytes).map_err(|_| {
             ExtensionRuntimeError::InvalidManifest("manifest is not valid UTF-8".into())
         })?;
-        Self::parse(source)
+        Ok((Self::parse(source)?, bytes))
     }
 
     /// Validates identifiers, versions, launch data, and contribution lists.
@@ -1204,11 +2039,13 @@ impl ExtensionManifest {
         })?;
         if !matches!(
             self.api_version.as_str(),
-            EXTENSION_API_VERSION_0_1 | EXTENSION_API_VERSION_0_2
+            EXTENSION_API_VERSION_0_1 | EXTENSION_API_VERSION_0_2 | EXTENSION_API_VERSION_0_3
         ) {
             return Err(ExtensionRuntimeError::UnsupportedApiVersion {
                 extension: self.api_version.clone(),
-                host: format!("{EXTENSION_API_VERSION_0_1} or {EXTENSION_API_VERSION_0_2}"),
+                host: format!(
+                    "{EXTENSION_API_VERSION_0_1}, {EXTENSION_API_VERSION_0_2}, or {EXTENSION_API_VERSION_0_3}"
+                ),
             });
         }
         if let Some(requires_ygg) = &self.requires_ygg {
@@ -1233,11 +2070,64 @@ impl ExtensionManifest {
                 "semantic presentation requires extension API 0.2".into(),
             ));
         }
+        let has_api_0_3_manifest_fields = !self.capabilities.host_services.is_empty()
+            || self.contributes.runtime_catalog
+            || !self.contributes.events.is_empty()
+            || !self.contributes.roles.is_empty();
+        if self.api_version != EXTENSION_API_VERSION_0_3 && has_api_0_3_manifest_fields {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "host_services, runtime_catalog, events, and roles require extension API 0.3"
+                    .into(),
+            ));
+        }
+        if self.capabilities.host_services.len() > MAX_EXTENSION_HOST_SERVICES {
+            return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "manifest declares {} host services; limit is {MAX_EXTENSION_HOST_SERVICES}",
+                self.capabilities.host_services.len()
+            )));
+        }
+        let mut service_names = BTreeSet::new();
+        for declaration in &self.capabilities.host_services {
+            declaration
+                .validate()
+                .map_err(ExtensionRuntimeError::InvalidManifest)?;
+            if !service_names.insert((declaration.name, declaration.version)) {
+                return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                    "duplicate host service `{}@{}`",
+                    declaration.name,
+                    declaration.version.as_u16()
+                )));
+            }
+            if declaration.name == ExtensionHostServiceName::Secrets {
+                for scope in &declaration.scopes {
+                    let ExtensionHostServiceScope::SecretName(name) = scope else {
+                        continue;
+                    };
+                    if !self.capabilities.secrets.contains(name) {
+                        return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                            "secret host-service scope `{name}` is absent from capabilities.secrets"
+                        )));
+                    }
+                }
+            }
+        }
+        validate_unique("ordered event", &self.contributes.events)?;
+        validate_unique("role", &self.contributes.roles)?;
         if self.entrypoint.command.trim().is_empty()
             || self.entrypoint.command.chars().any(char::is_control)
         {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "entrypoint.command must be non-empty and contain no control characters".into(),
+            ));
+        }
+        if self.entrypoint.sha256.as_ref().is_some_and(|sha256| {
+            sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "entrypoint.sha256 must be a lowercase SHA-256 digest".into(),
             ));
         }
         for argument in &self.entrypoint.args {
@@ -1290,6 +2180,11 @@ pub struct ExtensionEntrypoint {
     /// Executable name or path. A bare name found beside the manifest wins
     /// over `PATH`, which makes self-contained extension folders convenient.
     pub command: String,
+    /// Optional lowercase SHA-256 required for the exact staged executable
+    /// bytes. For a bare interpreter command whose first argument is a file
+    /// path, the digest binds that staged script instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
     /// Arguments passed directly without shell interpretation.
     #[serde(default)]
     pub args: Vec<String>,
@@ -1319,6 +2214,10 @@ pub struct ExtensionCapabilities {
     /// Only host-reviewed non-value names such as `SSH_AUTH_SOCK` are accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub environment: Vec<String>,
+    /// API `0.3` host-service consent declarations. They are an upper bound,
+    /// never an authority grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_services: Vec<ExtensionHostServiceDeclaration>,
 }
 
 /// Filesystem access declared by an extension.
@@ -1332,6 +2231,57 @@ pub enum ExtensionFilesystemAccess {
     Workspace,
     /// The extension asks for unrestricted user-level filesystem access.
     Unrestricted,
+}
+
+/// Finite ordered lifecycle event inventory for API `0.3`.
+#[allow(missing_docs)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionOrderedEventName {
+    ProjectTrust,
+    ResourcesDiscover,
+    SessionStart,
+    SessionInfoChanged,
+    SessionShutdown,
+    SessionBeforeSwitch,
+    SessionBeforeFork,
+    SessionBeforeCompact,
+    SessionCompact,
+    SessionCompactFailed,
+    SessionBeforeTree,
+    SessionTree,
+    Input,
+    BeforeAgentStart,
+    AgentStart,
+    AgentEnd,
+    AgentSettled,
+    Context,
+    TurnStart,
+    TurnEnd,
+    MessageStart,
+    MessageUpdate,
+    MessageEnd,
+    ToolExecutionStart,
+    ToolExecutionUpdate,
+    ToolExecutionEnd,
+    ToolCall,
+    ToolResult,
+    BeforeProviderRequest,
+    BeforeProviderHeaders,
+    AfterProviderResponse,
+    ModelSelect,
+    ThinkingLevelSelect,
+    UserBash,
+    UiPromptStart,
+    UiPromptEnd,
+}
+
+/// Finite public exclusive roles contributed by API `0.3` extensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExtensionRole {
+    /// Receives the public delegation-observer role when selected and healthy.
+    #[serde(rename = "delegation.observer")]
+    DelegationObserver,
 }
 
 /// Contribution names declared in `extension.toml`.
@@ -1365,6 +2315,15 @@ pub struct ManifestContributions {
     /// Whether API `0.2` semantic presentation snapshots may arrive.
     #[serde(default, skip_serializing_if = "is_false")]
     pub presentation: bool,
+    /// Whether initialize may authoritatively discover catalog names at epoch zero.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub runtime_catalog: bool,
+    /// Ordered API `0.3` event subscriptions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<ExtensionOrderedEventName>,
+    /// Public API `0.3` roles requested by this extension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<ExtensionRole>,
 }
 
 /// Supported extension lifecycle hooks.
@@ -1532,6 +2491,7 @@ pub struct ExtensionPolicy {
     enabled: BTreeSet<String>,
     trusted_global: BTreeSet<String>,
     trusted_sources: BTreeSet<(String, PathBuf)>,
+    trusted_source_identities: BTreeSet<(String, PathBuf, String)>,
     trusted_for_invocation: BTreeSet<String>,
 }
 
@@ -1554,6 +2514,19 @@ impl ExtensionPolicy {
             .insert((name.into(), manifest_path.into()));
     }
 
+    /// Persistently trusts one exact manifest path and source-identity digest.
+    /// Identity-bound manifests, including aggregate Pi locks, do not accept a
+    /// legacy path-only or global-name grant.
+    pub fn trust_source_identity(
+        &mut self,
+        name: impl Into<String>,
+        manifest_path: impl Into<PathBuf>,
+        sha256: impl Into<String>,
+    ) {
+        self.trusted_source_identities
+            .insert((name.into(), manifest_path.into(), sha256.into()));
+    }
+
     /// Trusts whichever descriptor with this name was selected for the
     /// current process invocation. Frontends should expose this only through
     /// an explicit one-shot CLI/action boundary, never persistent config.
@@ -1572,6 +2545,8 @@ impl ExtensionPolicy {
         self.trusted_for_invocation.remove(name);
         self.trusted_sources
             .retain(|(trusted_name, _)| trusted_name != name);
+        self.trusted_source_identities
+            .retain(|(trusted_name, _, _)| trusted_name != name);
     }
 
     /// Returns the two independent decisions for one selected source.
@@ -1581,12 +2556,41 @@ impl ExtensionPolicy {
         manifest_path: &Path,
         source: ExtensionSource,
     ) -> ExtensionActivation {
-        let source_bound = self
+        self.activation_with_identity(name, manifest_path, source, None, false)
+    }
+
+    /// Returns activation while enforcing an optional exact source identity.
+    pub fn activation_with_identity(
+        &self,
+        name: &str,
+        manifest_path: &Path,
+        source: ExtensionSource,
+        principal: Option<&ExtensionPrincipal>,
+        require_identity: bool,
+    ) -> ExtensionActivation {
+        let invocation_bound = self.trusted_for_invocation.contains(name);
+        let identity_bound = principal.is_some_and(|principal| {
+            self.trusted_source_identities.contains(&(
+                name.to_owned(),
+                manifest_path.to_owned(),
+                principal.sha256.clone(),
+            ))
+        });
+        let identity_configured_for_source =
+            self.trusted_source_identities
+                .iter()
+                .any(|(trusted_name, trusted_path, _)| {
+                    trusted_name == name && trusted_path == manifest_path
+                });
+        let require_identity = require_identity || identity_configured_for_source;
+        let legacy_source_bound = self
             .trusted_sources
             .contains(&(name.to_owned(), manifest_path.to_owned()));
-        let trusted = self.trusted_for_invocation.contains(name)
-            || source_bound
-            || (source == ExtensionSource::Global && self.trusted_global.contains(name));
+        let legacy_global_bound =
+            source == ExtensionSource::Global && self.trusted_global.contains(name);
+        let trusted = invocation_bound
+            || identity_bound
+            || (!require_identity && (legacy_source_bound || legacy_global_bound));
         ExtensionActivation {
             enabled: self.enabled.contains(name),
             trust: if trusted {
@@ -1598,6 +2602,15 @@ impl ExtensionPolicy {
     }
 }
 
+fn manifest_requires_identity_bound_trust(manifest_path: &Path) -> bool {
+    manifest_path
+        .parent()
+        .and_then(|parent| std::fs::symlink_metadata(parent.join("pi-lock.json")).ok())
+        .is_some_and(|metadata| {
+            metadata.file_type().is_file() && !metadata.file_type().is_symlink()
+        })
+}
+
 /// A valid manifest plus its provenance and activation decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveredExtension {
@@ -1605,6 +2618,8 @@ pub struct DiscoveredExtension {
     pub manifest: ExtensionManifest,
     /// Exact manifest file used.
     pub manifest_path: PathBuf,
+    /// Exact content/source principal derived during discovery.
+    pub principal: ExtensionPrincipal,
     /// Resource provenance.
     pub source: ExtensionSource,
     /// Explicit enablement and trust state.
@@ -1618,6 +2633,29 @@ impl DiscoveredExtension {
         }
         if self.activation.trust != ExtensionTrust::Trusted {
             return Err(ExtensionRuntimeError::Untrusted(self.manifest.name.clone()));
+        }
+        Ok(())
+    }
+
+    fn revalidate_source_identity(&self) -> Result<(), ExtensionRuntimeError> {
+        let (manifest, manifest_bytes) = ExtensionManifest::load_bounded_with_bytes(
+            &self.manifest_path,
+            MAX_EXTENSION_MANIFEST_BYTES,
+        )?;
+        if manifest != self.manifest {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension manifest changed after discovery".into(),
+            ));
+        }
+        let principal = ExtensionPrincipal::derive_for_manifest_bytes(
+            &self.manifest.name,
+            &self.manifest_path,
+            &manifest_bytes,
+        )?;
+        if principal != self.principal {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension source identity changed before process admission".into(),
+            ));
         }
         Ok(())
     }
@@ -1644,8 +2682,8 @@ impl ExtensionCatalog {
         let mut catalog = Self::default();
         let mut names = BTreeMap::<String, PathBuf>::new();
         for input in inputs {
-            match ExtensionManifest::load_bounded(&input.path, max_manifest_bytes) {
-                Ok(manifest) => {
+            match ExtensionManifest::load_bounded_with_bytes(&input.path, max_manifest_bytes) {
+                Ok((manifest, manifest_bytes)) => {
                     if let Some(first) = names.get(&manifest.name) {
                         catalog.diagnostics.push(ExtensionDiagnostic {
                             level: ExtensionDiagnosticLevel::Warning,
@@ -1658,12 +2696,35 @@ impl ExtensionCatalog {
                         });
                         continue;
                     }
+                    let principal = match ExtensionPrincipal::derive_for_manifest_bytes(
+                        &manifest.name,
+                        &input.path,
+                        &manifest_bytes,
+                    ) {
+                        Ok(principal) => principal,
+                        Err(error) => {
+                            catalog.diagnostics.push(ExtensionDiagnostic {
+                                level: ExtensionDiagnosticLevel::Error,
+                                path: input.path,
+                                message: error.to_string(),
+                            });
+                            continue;
+                        }
+                    };
                     names.insert(manifest.name.clone(), input.path.clone());
-                    let activation = policy.activation(&manifest.name, &input.path, input.source);
+                    let require_identity = manifest_requires_identity_bound_trust(&input.path);
+                    let activation = policy.activation_with_identity(
+                        &manifest.name,
+                        &input.path,
+                        input.source,
+                        Some(&principal),
+                        require_identity,
+                    );
                     catalog.extensions.push(DiscoveredExtension {
                         activation,
                         manifest,
                         manifest_path: input.path,
+                        principal,
                         source: input.source,
                     });
                 }
@@ -1865,6 +2926,238 @@ pub struct CommandDefinition {
     /// Optional compact usage string.
     #[serde(default)]
     pub usage: Option<String>,
+}
+
+/// Supported value kind for an API `0.3` dynamic flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionCatalogFlagKind {
+    /// Boolean switch.
+    Boolean,
+    /// UTF-8 string value.
+    String,
+}
+
+/// One flag in the authoritative API `0.3` epoch-zero catalog.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionCatalogFlagDefinition {
+    /// Long flag name without leading dashes.
+    pub name: String,
+    /// User-facing help text.
+    pub description: String,
+    /// Finite accepted value kind.
+    pub kind: ExtensionCatalogFlagKind,
+    /// Optional default matching `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+}
+
+/// One normalized key shortcut in an API `0.3` epoch-zero catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionCatalogShortcutDefinition {
+    /// Stable extension-local shortcut identifier.
+    pub id: String,
+    /// Pi-compatible normalized key identifier.
+    pub key: String,
+    /// User-facing summary.
+    pub description: String,
+}
+
+/// One provider declaration in an API `0.3` epoch-zero catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionCatalogProviderDeclaration {
+    /// Stable provider identifier. Runtime callbacks remain fenced handles.
+    pub id: String,
+}
+
+/// Authoritative API `0.3` contribution catalog at process epoch zero.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionCatalogEpochZero {
+    /// Must be zero for every candidate process generation.
+    pub revision: u64,
+    /// Complete tool definitions.
+    #[serde(default)]
+    pub tools: Vec<ToolDefinition>,
+    /// Complete command definitions.
+    #[serde(default)]
+    pub commands: Vec<CommandDefinition>,
+    /// Complete dynamic flag definitions.
+    #[serde(default)]
+    pub flags: Vec<ExtensionCatalogFlagDefinition>,
+    /// Complete normalized shortcut definitions.
+    #[serde(default)]
+    pub shortcuts: Vec<ExtensionCatalogShortcutDefinition>,
+    /// Ordered event subscriptions.
+    #[serde(default)]
+    pub events: Vec<ExtensionOrderedEventName>,
+    /// Tool renderer handles.
+    #[serde(default)]
+    pub tool_renderers: Vec<String>,
+    /// Message renderer handles.
+    #[serde(default)]
+    pub message_renderers: Vec<String>,
+    /// Durable-entry renderer handles.
+    #[serde(default)]
+    pub entry_renderers: Vec<String>,
+    /// Markdown transformer handles.
+    #[serde(default)]
+    pub markdown_transformers: Vec<String>,
+    /// Provider declarations.
+    #[serde(default)]
+    pub providers: Vec<ExtensionCatalogProviderDeclaration>,
+    /// Public exclusive role declarations.
+    #[serde(default)]
+    pub roles: Vec<ExtensionRole>,
+}
+
+impl ExtensionCatalogEpochZero {
+    /// Enforces epoch, per-kind, total, identifier, schema, and byte bounds.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if self.revision != 0 {
+            return Err(ExtensionRuntimeError::Protocol(
+                "initialize catalog revision must be zero".into(),
+            ));
+        }
+        validate_tool_definitions(&self.tools, EXTENSION_API_VERSION_0_3)?;
+        for tool in &self.tools {
+            validate_v03_json(
+                &tool.parameters,
+                DEFAULT_EXTENSION_MESSAGE_BYTES,
+                "tool parameter schema",
+            )?;
+            if let Some(schema) = &tool.output_schema {
+                validate_v03_json(
+                    schema,
+                    DEFAULT_EXTENSION_MESSAGE_BYTES,
+                    "tool output schema",
+                )?;
+            }
+            validate_v03_plain_text(
+                &tool.description,
+                DEFAULT_EXTENSION_MESSAGE_BYTES,
+                "tool description",
+            )?;
+        }
+        validate_command_definitions(&self.commands)?;
+        for command in &self.commands {
+            validate_v03_compact_text(
+                &command.description,
+                DEFAULT_EXTENSION_MESSAGE_BYTES,
+                "command description",
+            )?;
+            if let Some(usage) = &command.usage {
+                validate_v03_compact_text(usage, 16 * 1024, "command usage")?;
+            }
+        }
+        if self.flags.len() > MAX_EXTENSION_FLAGS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "catalog contains {} flags; limit is {MAX_EXTENSION_FLAGS}",
+                self.flags.len()
+            )));
+        }
+        let mut flag_names = BTreeSet::new();
+        for flag in &self.flags {
+            validate_identifier("flag", &flag.name, true)?;
+            if !flag_names.insert(&flag.name) {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "duplicate flag definition `{}`",
+                    flag.name
+                )));
+            }
+            validate_v03_plain_text(&flag.description, 16 * 1024, "flag description")?;
+            if let Some(default) = &flag.default {
+                let valid = match flag.kind {
+                    ExtensionCatalogFlagKind::Boolean => default.is_boolean(),
+                    ExtensionCatalogFlagKind::String => default.is_string(),
+                };
+                if !valid {
+                    return Err(ExtensionRuntimeError::Protocol(format!(
+                        "flag `{}` default does not match its kind",
+                        flag.name
+                    )));
+                }
+            }
+        }
+        if self.shortcuts.len() > MAX_EXTENSION_SHORTCUTS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "catalog contains {} shortcuts; limit is {MAX_EXTENSION_SHORTCUTS}",
+                self.shortcuts.len()
+            )));
+        }
+        let mut shortcut_ids = BTreeSet::new();
+        for shortcut in &self.shortcuts {
+            validate_identifier("shortcut", &shortcut.id, true)?;
+            if !shortcut_ids.insert(&shortcut.id) {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "duplicate shortcut definition `{}`",
+                    shortcut.id
+                )));
+            }
+            if shortcut.key.is_empty()
+                || shortcut.key.len() > 64
+                || shortcut.key.chars().any(char::is_control)
+            {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "shortcut `{}` has an invalid key",
+                    shortcut.id
+                )));
+            }
+            validate_v03_plain_text(&shortcut.description, 16 * 1024, "shortcut description")?;
+        }
+        let renderer_count = self
+            .tool_renderers
+            .len()
+            .saturating_add(self.message_renderers.len())
+            .saturating_add(self.entry_renderers.len())
+            .saturating_add(self.markdown_transformers.len());
+        if renderer_count > MAX_EXTENSION_RENDERERS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "catalog contains {renderer_count} renderers; limit is {MAX_EXTENSION_RENDERERS}"
+            )));
+        }
+        for (kind, values) in [
+            ("tool renderer", &self.tool_renderers),
+            ("message renderer", &self.message_renderers),
+            ("entry renderer", &self.entry_renderers),
+            ("Markdown transformer", &self.markdown_transformers),
+        ] {
+            validate_identifiers(kind, values, true)?;
+        }
+        if self.providers.len() > MAX_EXTENSION_PROVIDERS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "catalog contains {} providers; limit is {MAX_EXTENSION_PROVIDERS}",
+                self.providers.len()
+            )));
+        }
+        let provider_ids = self
+            .providers
+            .iter()
+            .map(|provider| provider.id.clone())
+            .collect::<Vec<_>>();
+        validate_identifiers("provider", &provider_ids, true)?;
+        validate_unique("ordered event", &self.events)?;
+        validate_unique("role", &self.roles)?;
+        let total = self
+            .tools
+            .len()
+            .saturating_add(self.commands.len())
+            .saturating_add(self.flags.len())
+            .saturating_add(self.shortcuts.len())
+            .saturating_add(self.events.len())
+            .saturating_add(renderer_count)
+            .saturating_add(self.providers.len())
+            .saturating_add(self.roles.len());
+        if total > MAX_EXTENSION_CATALOG_ENTRIES {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "catalog contains {total} entries; limit is {MAX_EXTENSION_CATALOG_ENTRIES}"
+            )));
+        }
+        validate_v03_serialized(self, DEFAULT_EXTENSION_MESSAGE_BYTES, "epoch-zero catalog")
+    }
 }
 
 /// Fully negotiated contributions for a running process.
@@ -2287,6 +3580,293 @@ pub struct ExtensionProtocolResponse {
     pub lifecycle_events: Vec<String>,
 }
 
+/// Host offer for the selected but not-yet-runnable API `0.3` contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionProtocolV03Request {
+    /// Must be exactly `0.3`.
+    pub version: String,
+    /// Exact seven mandatory features.
+    pub required_features: Vec<String>,
+    /// Finite optional feature offers.
+    #[serde(default)]
+    pub optional_features: Vec<String>,
+    /// Host-capped transport limits.
+    pub limits: ExtensionProtocolLimits,
+    /// Manifest-, mode-, trust-, and broker-intersected service offers.
+    #[serde(default)]
+    pub host_services: Vec<ExtensionHostServiceDescriptor>,
+}
+
+/// Extension acceptance and authoritative epoch-zero catalog for API `0.3`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionProtocolV03Response {
+    /// Must be exactly `0.3`.
+    pub version: String,
+    /// Accepted feature subset, including every required feature.
+    pub features: Vec<String>,
+    /// Extension-accepted transport limit, still capped by the host.
+    pub limits: ExtensionProtocolLimits,
+    /// Exact service/scope/limit subset accepted by the extension.
+    #[serde(default)]
+    pub host_services: Vec<ExtensionHostServiceDescriptor>,
+    /// Authoritative process-generation catalog at revision zero.
+    pub catalog: ExtensionCatalogEpochZero,
+}
+
+/// Pure API `0.3` negotiation result. Runtime dispatch remains unavailable.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionNegotiatedV03 {
+    /// Accepted mandatory and optional feature set.
+    pub features: BTreeSet<String>,
+    /// Effective maximum concurrent host requests.
+    pub max_concurrent_requests: usize,
+    /// Accepted service descriptors.
+    pub host_services: Vec<ExtensionHostServiceDescriptor>,
+    /// Validated authoritative epoch-zero catalog.
+    pub catalog: ExtensionCatalogEpochZero,
+}
+
+/// Validates API `0.3` feature, service, escalation, and epoch-zero catalog
+/// negotiation without marking a process runtime ready.
+pub fn negotiate_extension_api_v03(
+    manifest: &ExtensionManifest,
+    offer: &ExtensionProtocolV03Request,
+    response: ExtensionProtocolV03Response,
+) -> Result<ExtensionNegotiatedV03, ExtensionRuntimeError> {
+    manifest.validate()?;
+    if manifest.api_version != EXTENSION_API_VERSION_0_3 {
+        return Err(ExtensionRuntimeError::UnsupportedApiVersion {
+            extension: manifest.api_version.clone(),
+            host: EXTENSION_API_VERSION_0_3.to_owned(),
+        });
+    }
+    if offer.version != EXTENSION_API_VERSION_0_3 {
+        return Err(ExtensionRuntimeError::UnsupportedApiVersion {
+            extension: offer.version.clone(),
+            host: EXTENSION_API_VERSION_0_3.to_owned(),
+        });
+    }
+    if response.version != EXTENSION_API_VERSION_0_3 {
+        return Err(ExtensionRuntimeError::UnsupportedApiVersion {
+            extension: response.version,
+            host: EXTENSION_API_VERSION_0_3.to_owned(),
+        });
+    }
+    if offer.limits.max_concurrent_requests == 0
+        || response.limits.max_concurrent_requests == 0
+        || response.limits.max_concurrent_requests > offer.limits.max_concurrent_requests
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "invalid API 0.3 max_concurrent_requests negotiation".into(),
+        ));
+    }
+
+    let required = collect_unique_features(&offer.required_features, "required")?;
+    let mandatory = EXTENSION_API_0_3_REQUIRED_FEATURES
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if required.iter().map(String::as_str).collect::<BTreeSet<_>>() != mandatory {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 requires exactly the seven mandatory protocol features".into(),
+        ));
+    }
+    let optional = collect_unique_features(&offer.optional_features, "optional")?;
+    if let Some(feature) = optional
+        .iter()
+        .find(|feature| required.contains(*feature) || !valid_api_0_3_feature(feature.as_str()))
+    {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "invalid API 0.3 optional feature `{feature}`"
+        )));
+    }
+    let features = collect_unique_features(&response.features, "accepted")?;
+    let offered = required
+        .iter()
+        .chain(optional.iter())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(feature) = features.iter().find(|feature| !offered.contains(*feature)) {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "extension escalated unoffered feature `{feature}`"
+        )));
+    }
+    if let Some(feature) = required.iter().find(|feature| !features.contains(*feature)) {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "extension is missing required API 0.3 feature `{feature}`"
+        )));
+    }
+
+    validate_service_descriptors(&offer.host_services, "offered")?;
+    let declared = manifest
+        .capabilities
+        .host_services
+        .iter()
+        .map(|service| ((service.name, service.version), service))
+        .collect::<BTreeMap<_, _>>();
+    for service in &offer.host_services {
+        let declaration = declared
+            .get(&(service.name, service.version))
+            .ok_or_else(|| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "host offered undeclared service `{}@{}`",
+                    service.name,
+                    service.version.as_u16()
+                ))
+            })?;
+        if service
+            .scopes
+            .iter()
+            .any(|scope| !declaration.scopes.contains(scope))
+        {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "host offered undeclared scope for service `{}`",
+                service.name
+            )));
+        }
+    }
+    validate_service_descriptors(&response.host_services, "accepted")?;
+    let offered_services = offer
+        .host_services
+        .iter()
+        .map(|service| ((service.name, service.version), service))
+        .collect::<BTreeMap<_, _>>();
+    for accepted in &response.host_services {
+        let offered = offered_services
+            .get(&(accepted.name, accepted.version))
+            .ok_or_else(|| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "extension escalated unoffered service `{}@{}`",
+                    accepted.name,
+                    accepted.version.as_u16()
+                ))
+            })?;
+        if accepted
+            .scopes
+            .iter()
+            .any(|scope| !offered.scopes.contains(scope))
+            || !accepted.limits.is_subset_of(&offered.limits)
+        {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "extension escalated scope or limit for service `{}`",
+                accepted.name
+            )));
+        }
+    }
+
+    response.catalog.validate()?;
+    if !manifest.contributes.runtime_catalog {
+        ensure_same_contributions(
+            "tools",
+            &manifest.contributes.tools,
+            &response
+                .catalog
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        ensure_same_contributions(
+            "commands",
+            &manifest.contributes.commands,
+            &response
+                .catalog
+                .commands
+                .iter()
+                .map(|command| command.name.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        ensure_same_contributions(
+            "tool renderers",
+            &manifest.contributes.tool_renderers,
+            &response.catalog.tool_renderers,
+        )?;
+        if manifest.contributes.events.iter().collect::<BTreeSet<_>>()
+            != response.catalog.events.iter().collect::<BTreeSet<_>>()
+            || manifest.contributes.roles.iter().collect::<BTreeSet<_>>()
+                != response.catalog.roles.iter().collect::<BTreeSet<_>>()
+            || !response.catalog.flags.is_empty()
+            || !response.catalog.shortcuts.is_empty()
+            || !response.catalog.message_renderers.is_empty()
+            || !response.catalog.entry_renderers.is_empty()
+            || !response.catalog.markdown_transformers.is_empty()
+            || !response.catalog.providers.is_empty()
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "static API 0.3 catalog does not match manifest declarations".into(),
+            ));
+        }
+    }
+
+    Ok(ExtensionNegotiatedV03 {
+        features,
+        max_concurrent_requests: response.limits.max_concurrent_requests,
+        host_services: response.host_services,
+        catalog: response.catalog,
+    })
+}
+
+fn valid_api_0_3_feature(feature: &str) -> bool {
+    EXTENSION_API_0_3_REQUIRED_FEATURES.contains(&feature)
+        || matches!(
+            feature,
+            EXTENSION_FEATURE_REQUEST_PROGRESS
+                | EXTENSION_FEATURE_ARTIFACTS
+                | EXTENSION_FEATURE_LIFECYCLE_EVENTS
+                | EXTENSION_FEATURE_POLICY_INTENTS
+                | EXTENSION_FEATURE_DYNAMIC_TOOLS
+                | EXTENSION_FEATURE_RUNTIME_COMMANDS
+                | EXTENSION_FEATURE_AGENT_SESSIONS
+                | EXTENSION_FEATURE_DELEGATION_TELEMETRY
+                | EXTENSION_FEATURE_APPROVALS
+                | EXTENSION_FEATURE_SECRETS
+        )
+}
+
+fn collect_unique_features(
+    features: &[String],
+    kind: &str,
+) -> Result<BTreeSet<String>, ExtensionRuntimeError> {
+    let set = features.iter().cloned().collect::<BTreeSet<_>>();
+    if set.len() != features.len()
+        || features
+            .iter()
+            .any(|feature| !valid_v03_identifier(feature, 64))
+    {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "API 0.3 {kind} features are invalid or duplicated"
+        )));
+    }
+    Ok(set)
+}
+
+fn validate_service_descriptors(
+    services: &[ExtensionHostServiceDescriptor],
+    kind: &str,
+) -> Result<(), ExtensionRuntimeError> {
+    if services.len() > MAX_EXTENSION_HOST_SERVICES {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "{kind} host-service count exceeds {MAX_EXTENSION_HOST_SERVICES}"
+        )));
+    }
+    let mut unique = BTreeSet::new();
+    for service in services {
+        service
+            .validate()
+            .map_err(ExtensionRuntimeError::Protocol)?;
+        if !unique.insert((service.name, service.version)) {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "duplicate {kind} host service `{}`",
+                service.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Immutable protocol facts negotiated for one process generation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtensionNegotiatedProtocol {
@@ -2698,6 +4278,766 @@ pub enum ExtensionEvent {
     },
 }
 
+/// Stable security principal for one exact extension code identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionPrincipal {
+    /// Manifest-declared extension name.
+    pub name: String,
+    /// Lowercase SHA-256 over canonical path, exact manifest bytes, and adjacent
+    /// installed-source identity records.
+    pub sha256: String,
+}
+
+impl ExtensionPrincipal {
+    /// Returns whether this manifest has an adjacent source lock that requires
+    /// an exact identity-bound persistent trust grant.
+    pub fn requires_identity_bound_trust(manifest_path: impl AsRef<Path>) -> bool {
+        manifest_requires_identity_bound_trust(manifest_path.as_ref())
+    }
+
+    /// Derives the stable principal from the canonical manifest, its exact
+    /// bytes, and recognized adjacent install/aggregate identity records.
+    pub fn derive(
+        name: impl Into<String>,
+        manifest_path: impl AsRef<Path>,
+    ) -> Result<Self, ExtensionRuntimeError> {
+        let (canonical, manifest_bytes) = Self::read_manifest_identity(manifest_path.as_ref())?;
+        Self::from_bound_manifest_bytes(name.into(), &canonical, &manifest_bytes)
+    }
+
+    /// Derives a principal only when the current manifest bytes exactly match
+    /// the bytes already parsed by discovery.
+    pub fn derive_for_manifest_bytes(
+        name: impl Into<String>,
+        manifest_path: impl AsRef<Path>,
+        expected_manifest_bytes: &[u8],
+    ) -> Result<Self, ExtensionRuntimeError> {
+        let requested = manifest_path.as_ref();
+        let (canonical, current_manifest_bytes) = Self::read_manifest_identity(requested)?;
+        if current_manifest_bytes != expected_manifest_bytes {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "manifest {} changed while extension discovery was in progress",
+                requested.display()
+            )));
+        }
+        Self::from_bound_manifest_bytes(name.into(), &canonical, expected_manifest_bytes)
+    }
+
+    fn read_manifest_identity(path: &Path) -> Result<(PathBuf, Vec<u8>), ExtensionRuntimeError> {
+        let metadata =
+            std::fs::symlink_metadata(path).map_err(|error| ExtensionRuntimeError::ManifestIo {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "manifest {} is not a regular non-symlink file",
+                path.display()
+            )));
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|error| ExtensionRuntimeError::ManifestIo {
+                path: path.to_path_buf(),
+                message: error.to_string(),
+            })?;
+        let manifest_bytes = crate::secure_fs::read_regular_file_bounded(
+            &canonical,
+            MAX_EXTENSION_MANIFEST_BYTES as usize,
+        )
+        .map_err(|error| ExtensionRuntimeError::ManifestIo {
+            path: canonical.clone(),
+            message: error.to_string(),
+        })?;
+        Ok((canonical, manifest_bytes))
+    }
+
+    fn from_bound_manifest_bytes(
+        name: String,
+        canonical: &Path,
+        manifest_bytes: &[u8],
+    ) -> Result<Self, ExtensionRuntimeError> {
+        validate_identifier("extension principal", &name, false)?;
+        if manifest_bytes.len() > MAX_EXTENSION_MANIFEST_BYTES as usize {
+            return Err(ExtensionRuntimeError::ManifestTooLarge {
+                path: canonical.to_path_buf(),
+                bytes: manifest_bytes.len() as u64,
+                limit: MAX_EXTENSION_MANIFEST_BYTES,
+            });
+        }
+        let manifest_text = std::str::from_utf8(manifest_bytes).map_err(|_| {
+            ExtensionRuntimeError::InvalidManifest("manifest is not valid UTF-8".into())
+        })?;
+        let manifest = ExtensionManifest::parse(manifest_text)?;
+        if manifest.name != name {
+            return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "principal name `{name}` does not match manifest name `{}`",
+                manifest.name
+            )));
+        }
+
+        let parent = canonical.parent().ok_or_else(|| {
+            ExtensionRuntimeError::InvalidManifest("manifest has no parent directory".into())
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(b"ygg-extension-principal-v1\0");
+        update_digest_path(&mut digest, canonical);
+        update_digest_bytes(&mut digest, manifest_bytes);
+        let mut identity_bytes = manifest_bytes.len();
+        const IDENTITY_RECORDS: [&str; MAX_EXTENSION_IDENTITY_RECORDS] =
+            ["install.json", "pi-lock.json", "pi-link.json"];
+        for identity_name in IDENTITY_RECORDS {
+            update_digest_bytes(&mut digest, identity_name.as_bytes());
+            let identity_path = parent.join(identity_name);
+            match std::fs::symlink_metadata(&identity_path) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                        return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                            "extension identity record {} is not a regular non-symlink file",
+                            identity_path.display()
+                        )));
+                    }
+                    let remaining = MAX_EXTENSION_IDENTITY_BYTES
+                        .checked_sub(identity_bytes)
+                        .ok_or_else(|| {
+                            ExtensionRuntimeError::InvalidManifest(
+                                "extension source identity exceeds its aggregate byte limit".into(),
+                            )
+                        })?;
+                    let bytes =
+                        crate::secure_fs::read_regular_file_bounded(&identity_path, remaining)
+                            .map_err(|error| ExtensionRuntimeError::ManifestIo {
+                                path: identity_path.clone(),
+                                message: error.to_string(),
+                            })?;
+                    identity_bytes = identity_bytes.saturating_add(bytes.len());
+                    digest.update([1]);
+                    update_digest_bytes(&mut digest, &bytes);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    digest.update([0]);
+                }
+                Err(error) => {
+                    return Err(ExtensionRuntimeError::ManifestIo {
+                        path: identity_path,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        let principal = Self {
+            name,
+            sha256: format!("{:x}", digest.finalize()),
+        };
+        principal.validate()?;
+        Ok(principal)
+    }
+
+    /// Recomputes this principal and fails if the trusted source identity
+    /// changed before process admission.
+    pub fn revalidate(&self, manifest_path: impl AsRef<Path>) -> Result<(), ExtensionRuntimeError> {
+        let current = Self::derive(self.name.clone(), manifest_path)?;
+        if current != *self {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension source identity changed before process admission".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns the path-free stable principal spelling used by host services.
+    pub fn stable_id(&self) -> String {
+        format!("{}@sha256:{}", self.name, self.sha256)
+    }
+
+    /// Validates the identifier and digest shape.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        validate_identifier("extension principal", &self.name, false)?;
+        validate_sha256_text(&self.sha256, "extension principal")
+    }
+}
+
+/// Stable owner namespace derived from the canonical authoritative session path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOwner {
+    /// Lowercase path-domain SHA-256.
+    pub sha256: String,
+}
+
+impl SessionOwner {
+    /// Derives an owner from an existing canonicalizable session path.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, ExtensionRuntimeError> {
+        let path = path.as_ref().canonicalize().map_err(|error| {
+            ExtensionRuntimeError::Protocol(format!(
+                "cannot canonicalize session owner path {}: {error}",
+                path.as_ref().display()
+            ))
+        })?;
+        let mut digest = Sha256::new();
+        digest.update(b"ygg-extension-session-owner-v1\0");
+        update_digest_path(&mut digest, &path);
+        Ok(Self {
+            sha256: format!("{:x}", digest.finalize()),
+        })
+    }
+
+    /// Validates the digest shape.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        validate_sha256_text(&self.sha256, "session owner")
+    }
+}
+
+/// Ephemeral process-instance and generation fence.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessFence {
+    /// Non-repeating host process-instance ID.
+    pub instance_id: String,
+    /// Monotonic generation within the instance.
+    pub generation: u64,
+}
+
+impl ProcessFence {
+    /// Validates a bounded non-empty instance and nonzero generation.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if self.instance_id.is_empty()
+            || self.instance_id.len() > 128
+            || self.instance_id.chars().any(char::is_control)
+            || self.generation == 0
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "invalid API 0.3 process fence".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Finite host operation kind used for reverse-service authorization.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionOperationKind {
+    /// Ordered lifecycle event handler.
+    Event,
+    /// Model tool invocation.
+    Tool,
+    /// User command invocation.
+    Command,
+    /// Idempotent idle-boundary host action.
+    HostAction,
+    /// Session transition or mutation operation.
+    Session,
+    /// Provider interception or stream callback.
+    Provider,
+    /// User-interface callback.
+    Ui,
+    /// Coordinated reload.
+    Reload,
+    /// Coordinated shutdown.
+    Shutdown,
+}
+
+/// Product mode constraining API `0.3` reverse-service availability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionOperationMode {
+    /// Interactive terminal UI.
+    Tui,
+    /// Interactive plain terminal.
+    Plain,
+    /// One-shot print execution.
+    Print,
+    /// RPC frontend.
+    Rpc,
+    /// Serve frontend.
+    Serve,
+    /// Host background boundary.
+    Background,
+}
+
+/// Host-created token binding one API `0.3` operation to all ambient owners.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationToken {
+    /// Exact ephemeral process fence.
+    pub process: ProcessFence,
+    /// Host JSON-RPC request ID within the process generation.
+    pub request_id: u64,
+    /// Authority-relevant operation class.
+    pub kind: ExtensionOperationKind,
+    /// Optional admitted run ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Optional admitted turn ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Optional admitted tool-call ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Optional user-command ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// Frontend/product mode.
+    pub mode: ExtensionOperationMode,
+    /// Absolute Unix deadline in milliseconds.
+    pub deadline_unix_ms: u64,
+    /// Opaque host cancellation-owner ID.
+    pub cancellation_owner: String,
+}
+
+impl OperationToken {
+    /// Validates all bounded opaque IDs and the embedded process fence.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        self.process.validate()?;
+        if self.request_id == 0 || self.deadline_unix_ms == 0 {
+            return Err(ExtensionRuntimeError::Protocol(
+                "API 0.3 operation request ID and deadline must be nonzero".into(),
+            ));
+        }
+        for (kind, value) in [
+            ("run", self.run_id.as_deref()),
+            ("turn", self.turn_id.as_deref()),
+            ("tool call", self.tool_call_id.as_deref()),
+            ("command", self.command_id.as_deref()),
+            ("cancellation owner", Some(self.cancellation_owner.as_str())),
+        ] {
+            if value.is_some_and(|value| {
+                value.is_empty() || value.len() > 256 || value.chars().any(char::is_control)
+            }) {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "invalid API 0.3 {kind} ID"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Complete host-injected identity context for one API `0.3` handler.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionInvocation {
+    /// Exact extension code principal.
+    pub principal: ExtensionPrincipal,
+    /// Durable session owner.
+    pub session_owner: SessionOwner,
+    /// Ephemeral process fence.
+    pub process: ProcessFence,
+    /// Operation and cancellation context.
+    pub operation: OperationToken,
+}
+
+impl ExtensionInvocation {
+    /// Validates each split identity and rejects a mismatched operation fence.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        self.principal.validate()?;
+        self.session_owner.validate()?;
+        self.process.validate()?;
+        self.operation.validate()?;
+        if self.process != self.operation.process {
+            return Err(ExtensionRuntimeError::Protocol(
+                "API 0.3 invocation and operation process fences differ".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Delivery boundary for an API `0.3` message-enqueue effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionMessageDelivery {
+    /// Deliver as steering input to an active run.
+    Steer,
+    /// Queue after the active run.
+    FollowUp,
+    /// Queue for the next model turn boundary.
+    NextTurn,
+    /// Append a user message through the owner queue.
+    User,
+}
+
+/// Finite declarative mutation effects returned by API `0.3` handlers.
+#[allow(missing_docs)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionEffect {
+    AppendCustom {
+        custom_type: String,
+        #[serde(default)]
+        details: serde_json::Value,
+    },
+    AppendCustomMessage {
+        custom_type: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
+        #[serde(default)]
+        details: serde_json::Value,
+    },
+    SetSessionName {
+        name: Option<String>,
+    },
+    SetEntryLabel {
+        entry_id: String,
+        label: Option<String>,
+    },
+    EnqueueMessage {
+        delivery: ExtensionMessageDelivery,
+        content: String,
+    },
+    SetActiveTools {
+        tools: Vec<String>,
+    },
+    SelectModel {
+        model: String,
+    },
+    SelectReasoning {
+        reasoning: serde_json::Value,
+    },
+    SetUiState {
+        key: String,
+        value: serde_json::Value,
+    },
+    UpdateProviderCatalog {
+        update: serde_json::Value,
+    },
+    UpdateCatalog {
+        update: serde_json::Value,
+    },
+}
+
+impl ExtensionEffect {
+    fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        fn bounded(value: &str, bytes: usize, label: &str) -> Result<(), ExtensionRuntimeError> {
+            if value.is_empty() || value.len() > bytes || value.chars().any(char::is_control) {
+                Err(ExtensionRuntimeError::Protocol(format!(
+                    "invalid API 0.3 effect {label}"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+        match self {
+            Self::AppendCustom {
+                custom_type,
+                details,
+            } => {
+                if !valid_v03_identifier(custom_type, 64) {
+                    return Err(ExtensionRuntimeError::Protocol(
+                        "invalid custom effect type".into(),
+                    ));
+                }
+                validate_v03_json(
+                    details,
+                    MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                    "custom details",
+                )
+            }
+            Self::AppendCustomMessage {
+                custom_type,
+                content,
+                display,
+                details,
+            } => {
+                if !valid_v03_identifier(custom_type, 64) {
+                    return Err(ExtensionRuntimeError::Protocol(
+                        "invalid custom effect type".into(),
+                    ));
+                }
+                validate_v03_plain_text(
+                    content,
+                    MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                    "custom-message content",
+                )?;
+                if let Some(display) = display {
+                    validate_v03_plain_text(display, 16 * 1024, "custom-message display")?;
+                }
+                validate_v03_json(
+                    details,
+                    MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                    "custom-message details",
+                )
+            }
+            Self::SetSessionName { name } => {
+                if let Some(name) = name {
+                    validate_v03_compact_text(name, 4 * 1024, "session name")?;
+                }
+                Ok(())
+            }
+            Self::SetEntryLabel { entry_id, label } => {
+                bounded(entry_id, 256, "entry ID")?;
+                if let Some(label) = label {
+                    validate_v03_compact_text(label, 4 * 1024, "entry label")?;
+                }
+                Ok(())
+            }
+            Self::EnqueueMessage { content, .. } => validate_v03_plain_text(
+                content,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "message effect",
+            ),
+            Self::SetActiveTools { tools } => {
+                if tools.len() > MAX_DYNAMIC_EXTENSION_TOOLS {
+                    return Err(ExtensionRuntimeError::Protocol(
+                        "active-tools effect exceeds its item limit".into(),
+                    ));
+                }
+                validate_identifiers("active tool", tools, true)
+            }
+            Self::SelectModel { model } => bounded(model, 256, "model"),
+            Self::SelectReasoning { reasoning } => validate_v03_json(
+                reasoning,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "reasoning selection",
+            ),
+            Self::SetUiState { key, value } => {
+                if !valid_v03_identifier(key, 64) {
+                    return Err(ExtensionRuntimeError::Protocol(
+                        "invalid keyed UI state name".into(),
+                    ));
+                }
+                validate_v03_json(value, MAX_EXTENSION_INLINE_SEMANTIC_BYTES, "UI state")
+            }
+            Self::UpdateProviderCatalog { update } => validate_v03_json(
+                update,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "provider catalog update",
+            ),
+            Self::UpdateCatalog { update } => validate_v03_json(
+                update,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "catalog update",
+            ),
+        }
+    }
+}
+
+/// Ordered bounded effects keyed by operation token and implicit array index.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionEffectJournal {
+    /// Host-issued token echoed without modification.
+    pub operation_token: OperationToken,
+    /// Effects whose stable IDs are `(operation_token, effect_index)`.
+    pub effects: Vec<ExtensionEffect>,
+}
+
+impl ExtensionEffectJournal {
+    /// Validates token identity, count, each finite effect, JSON depth/nodes,
+    /// and the 512 KiB encoded journal ceiling.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        self.operation_token.validate()?;
+        if self.effects.len() > MAX_EXTENSION_EFFECTS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "effect journal contains {} effects; limit is {MAX_EXTENSION_EFFECTS}",
+                self.effects.len()
+            )));
+        }
+        for effect in &self.effects {
+            effect.validate()?;
+        }
+        validate_v03_serialized(self, MAX_EXTENSION_EFFECT_JOURNAL_BYTES, "effect journal")
+    }
+}
+
+/// One totally ordered API `0.3` lifecycle dispatch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionOrderedEvent {
+    /// Monotonic sequence within a process generation.
+    pub sequence: u64,
+    /// Finite event boundary.
+    pub event: ExtensionOrderedEventName,
+    /// Complete host-injected owner/operation identity.
+    pub invocation: ExtensionInvocation,
+    /// Event-specific semantic payload.
+    pub payload: serde_json::Value,
+    /// Whether every earlier observation must settle before this event.
+    pub barrier: bool,
+}
+
+impl ExtensionOrderedEvent {
+    /// Validates identity and bounded semantic payload.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if self.sequence == 0 {
+            return Err(ExtensionRuntimeError::Protocol(
+                "ordered-event sequence must be nonzero".into(),
+            ));
+        }
+        self.invocation.validate()?;
+        validate_v03_json(
+            &self.payload,
+            MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+            "ordered-event payload",
+        )?;
+        validate_v03_serialized(
+            self,
+            DEFAULT_EXTENSION_MESSAGE_BYTES,
+            "ordered-event dispatch",
+        )
+    }
+}
+
+/// Bounded ordered batch used only for non-mutating high-rate observations.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionOrderedEventBatch {
+    /// Strictly increasing events for one process generation.
+    pub events: Vec<ExtensionOrderedEvent>,
+}
+
+impl ExtensionOrderedEventBatch {
+    /// Validates batch count, byte size, order, common process fence, and the
+    /// absence of barrier events.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if self.events.is_empty() || self.events.len() > MAX_EXTENSION_ORDERED_EVENT_BATCH {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "ordered-event batch must contain 1..={MAX_EXTENSION_ORDERED_EVENT_BATCH} events"
+            )));
+        }
+        let first_process = self.events[0].invocation.process.clone();
+        let mut previous = None;
+        for event in &self.events {
+            event.validate()?;
+            if event.barrier {
+                return Err(ExtensionRuntimeError::Protocol(
+                    "barrier event cannot appear in event/batch".into(),
+                ));
+            }
+            if event.invocation.process != first_process
+                || previous.is_some_and(|sequence| event.sequence <= sequence)
+            {
+                return Err(ExtensionRuntimeError::Protocol(
+                    "ordered-event batch has a mixed fence or non-increasing sequence".into(),
+                ));
+            }
+            previous = Some(event.sequence);
+        }
+        validate_v03_serialized(
+            self,
+            MAX_EXTENSION_ORDERED_EVENT_BATCH_BYTES,
+            "ordered-event batch",
+        )
+    }
+}
+
+/// Result and declarative effects for one ordered API `0.3` event.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionOrderedEventResult {
+    /// Sequence copied from the dispatch.
+    pub sequence: u64,
+    /// Event-specific result, when the event is mutating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Whole effect journal committed or rejected atomically.
+    pub effects: ExtensionEffectJournal,
+}
+
+impl ExtensionOrderedEventResult {
+    /// Validates bounded result data and effect journal.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if self.sequence == 0 {
+            return Err(ExtensionRuntimeError::Protocol(
+                "ordered-event result sequence must be nonzero".into(),
+            ));
+        }
+        if let Some(result) = &self.result {
+            validate_v03_json(
+                result,
+                MAX_EXTENSION_INLINE_SEMANTIC_BYTES,
+                "ordered-event result",
+            )?;
+        }
+        self.effects.validate()
+    }
+}
+
+/// Single-use immutable API `0.3` document reference.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionDocumentReference {
+    /// Opaque generation-unique document ID.
+    pub document_id: String,
+    /// Exact decoded byte length.
+    pub byte_length: u64,
+    /// Lowercase SHA-256 of decoded bytes.
+    pub sha256: String,
+    /// Durable session owner binding.
+    pub session_owner: SessionOwner,
+    /// Ephemeral process fence binding.
+    pub process: ProcessFence,
+    /// Parent host request owning the one-use reference.
+    pub parent_request_id: u64,
+}
+
+impl ExtensionDocumentReference {
+    /// Validates identity, owner, digest, and the 64 MiB document ceiling.
+    pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        if !valid_v03_identifier(&self.document_id, 128)
+            || self.byte_length > MAX_EXTENSION_DOCUMENT_BYTES
+            || self.parent_request_id == 0
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "invalid API 0.3 document reference".into(),
+            ));
+        }
+        validate_sha256_text(&self.sha256, "document")?;
+        self.session_owner.validate()?;
+        self.process.validate()
+    }
+}
+
+/// One base64-encoded API `0.3` immutable document chunk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionDocumentChunk {
+    /// Referenced document ID.
+    pub document_id: String,
+    /// Zero-based chunk sequence.
+    pub index: u32,
+    /// Decoded byte offset within the document.
+    pub offset: u64,
+    /// Declared decoded byte count.
+    pub decoded_bytes: u32,
+    /// RFC 4648 base64 data.
+    pub data: String,
+}
+
+impl ExtensionDocumentChunk {
+    /// Validates base64, decoded length, offset, reference binding, and the
+    /// 192 KiB decoded chunk ceiling.
+    pub fn validate_for(
+        &self,
+        reference: &ExtensionDocumentReference,
+    ) -> Result<(), ExtensionRuntimeError> {
+        reference.validate()?;
+        if self.document_id != reference.document_id {
+            return Err(ExtensionRuntimeError::Protocol(
+                "document chunk ID does not match its reference".into(),
+            ));
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&self.data)
+            .map_err(|_| ExtensionRuntimeError::Protocol("invalid document chunk base64".into()))?;
+        if decoded.len() != self.decoded_bytes as usize
+            || decoded.len() > MAX_EXTENSION_DOCUMENT_CHUNK_BYTES
+            || self
+                .offset
+                .checked_add(decoded.len() as u64)
+                .is_none_or(|end| end > reference.byte_length)
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "document chunk length or offset is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Host-owned identity for one admitted extension operation.
 ///
 /// JSON-RPC request IDs restart in every process generation, so consumers must
@@ -2842,6 +5182,12 @@ pub enum ExtensionRuntimeError {
         extension: String,
         /// Host API version.
         host: String,
+    },
+    /// The selected contract is defined but its process runtime is not yet enabled.
+    #[error("extension API {version} is defined but not runtime-ready in this build")]
+    ApiNotReady {
+        /// Manifest-selected API version.
+        version: String,
     },
     /// The extension has not been explicitly enabled.
     #[error("extension `{0}` is not enabled")]
@@ -3363,6 +5709,12 @@ impl ExtensionProcess {
         config: ExtensionRuntimeConfig,
     ) -> Result<Self, ExtensionRuntimeError> {
         descriptor.ensure_startable()?;
+        descriptor.revalidate_source_identity()?;
+        if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3 {
+            return Err(ExtensionRuntimeError::ApiNotReady {
+                version: EXTENSION_API_VERSION_0_3.to_owned(),
+            });
+        }
         if config.max_message_bytes == 0
             || config.max_pending_requests == 0
             || config.writer_queue_capacity == 0
@@ -3507,14 +5859,7 @@ impl ExtensionProcess {
     /// Returns the stable path-free principal used to isolate host-owned child
     /// sessions across supervised process restarts.
     pub fn agent_session_principal(&self) -> String {
-        let manifest_identity = self
-            .inner
-            .descriptor
-            .manifest_path
-            .canonicalize()
-            .unwrap_or_else(|_| self.inner.descriptor.manifest_path.clone());
-        let digest = Sha256::digest(manifest_identity.to_string_lossy().as_bytes());
-        format!("{}@sha256:{digest:x}", self.inner.descriptor.manifest.name)
+        self.inner.descriptor.principal.stable_id()
     }
 
     /// Returns an inspectable bounded health snapshot for the active process.
@@ -5523,6 +7868,7 @@ struct ProcessConnection {
     artifact_leases_changed: Notify,
     artifacts_settled: AtomicBool,
     process_group: ProcessGroupGuard,
+    _staging: Vec<tempfile::TempDir>,
 }
 
 fn connection_is_usable(connection: &ProcessConnection) -> bool {
@@ -6597,6 +8943,7 @@ async fn spawn_connection(
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
     approval_store: Arc<ExtensionApprovalStore>,
 ) -> Result<(Arc<ProcessConnection>, ExtensionContributions), ExtensionRuntimeError> {
+    descriptor.revalidate_source_identity()?;
     let extension_dir =
         descriptor
             .manifest_path
@@ -6605,13 +8952,45 @@ async fn spawn_connection(
                 extension: descriptor.manifest.name.clone(),
                 message: "manifest has no parent directory".into(),
             })?;
-    let resolved_entrypoint =
-        resolve_entrypoint_command(extension_dir, &descriptor.manifest.entrypoint).map_err(
-            |error| ExtensionRuntimeError::Spawn {
+    let digest_bound_argument =
+        digest_bound_interpreter_argument(&config.workspace, &descriptor.manifest.entrypoint);
+    let executable_sha256 = if digest_bound_argument.is_none() {
+        descriptor.manifest.entrypoint.sha256.as_deref()
+    } else {
+        None
+    };
+    let resolved_entrypoint = resolve_entrypoint_command(
+        extension_dir,
+        &descriptor.manifest.entrypoint,
+        executable_sha256,
+    )
+    .map_err(|error| ExtensionRuntimeError::Spawn {
+        extension: descriptor.manifest.name.clone(),
+        message: error.to_string(),
+    })?;
+    let mut launch_args = descriptor
+        .manifest
+        .entrypoint
+        .args
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    let mut staging = Vec::with_capacity(1);
+    if let Some((path, expected_sha256)) = digest_bound_argument {
+        let mut script = stage_entrypoint(&path, Some(expected_sha256))
+            .map_err(|error| ExtensionRuntimeError::Spawn {
                 extension: descriptor.manifest.name.clone(),
                 message: error.to_string(),
-            },
-        )?;
+            })?
+            .ok_or_else(|| ExtensionRuntimeError::Spawn {
+                extension: descriptor.manifest.name.clone(),
+                message: "digest-bound interpreter script is missing".into(),
+            })?;
+        launch_args[0] = script.command.into_os_string();
+        if let Some(temporary) = script.staging.take() {
+            staging.push(temporary);
+        }
+    }
     let scratch_directory = artifact_store
         .begin_generation(generation)
         .map_err(|error| ExtensionRuntimeError::Spawn {
@@ -6625,7 +9004,7 @@ async fn spawn_connection(
     };
     let mut command = Command::new(&resolved_entrypoint.command);
     command
-        .args(&descriptor.manifest.entrypoint.args)
+        .args(&launch_args)
         .current_dir(&config.workspace)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -6826,6 +9205,7 @@ async fn spawn_connection(
         artifact_leases_changed: Notify::new(),
         artifacts_settled: AtomicBool::new(false),
         process_group,
+        _staging: staging,
     });
     artifact_guard.disarm();
     let offered_host_services = OfferedHostServices {
@@ -6932,10 +9312,13 @@ const MAX_STAGED_ENTRYPOINT_BYTES: u64 = 64 * 1024 * 1024;
 
 struct ResolvedEntrypoint {
     command: PathBuf,
-    _staging: Option<tempfile::TempDir>,
+    staging: Option<tempfile::TempDir>,
 }
 
-fn stage_entrypoint(path: &Path) -> std::io::Result<Option<ResolvedEntrypoint>> {
+fn stage_entrypoint(
+    path: &Path,
+    expected_sha256: Option<&str>,
+) -> std::io::Result<Option<ResolvedEntrypoint>> {
     let mut source = match crate::secure_fs::open_regular_file_for_read(path) {
         Ok(source) => source,
         Err(crate::secure_fs::SecureFileError::Io(error))
@@ -6966,14 +9349,35 @@ fn stage_entrypoint(path: &Path) -> std::io::Result<Option<ResolvedEntrypoint>> 
         options.mode(0o700);
     }
     let mut destination = options.open(&staged)?;
-    let copied = std::io::copy(
-        &mut Read::by_ref(&mut source).take(MAX_STAGED_ENTRYPOINT_BYTES + 1),
-        &mut destination,
-    )?;
-    if copied > MAX_STAGED_ENTRYPOINT_BYTES {
-        return Err(std::io::Error::other(
-            "extension entrypoint grew beyond the 64 MiB staging limit",
-        ));
+    let mut digest = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let remaining = MAX_STAGED_ENTRYPOINT_BYTES
+            .saturating_add(1)
+            .saturating_sub(copied);
+        let read_limit =
+            usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let count = source.read(&mut buffer[..read_limit])?;
+        if count == 0 {
+            break;
+        }
+        copied = copied.saturating_add(count as u64);
+        if copied > MAX_STAGED_ENTRYPOINT_BYTES {
+            return Err(std::io::Error::other(
+                "extension entrypoint grew beyond the 64 MiB staging limit",
+            ));
+        }
+        digest.update(&buffer[..count]);
+        destination.write_all(&buffer[..count])?;
+    }
+    let actual_sha256 = format!("{:x}", digest.finalize());
+    if let Some(expected) = expected_sha256 {
+        if expected != actual_sha256 {
+            return Err(std::io::Error::other(format!(
+                "extension entrypoint SHA-256 mismatch: expected {expected}, found {actual_sha256}"
+            )));
+        }
     }
     destination.flush()?;
     destination.sync_all()?;
@@ -6990,17 +9394,38 @@ fn stage_entrypoint(path: &Path) -> std::io::Result<Option<ResolvedEntrypoint>> 
     }
     Ok(Some(ResolvedEntrypoint {
         command: staged,
-        _staging: Some(temporary),
+        staging: Some(temporary),
     }))
+}
+
+fn digest_bound_interpreter_argument<'a>(
+    argument_base: &Path,
+    entrypoint: &'a ExtensionEntrypoint,
+) -> Option<(PathBuf, &'a str)> {
+    let expected = entrypoint.sha256.as_deref()?;
+    let command = Path::new(&entrypoint.command);
+    if command.is_absolute() || command.components().count() != 1 {
+        return None;
+    }
+    let argument = PathBuf::from(entrypoint.args.first()?);
+    let candidate = if argument.is_absolute() {
+        argument
+    } else {
+        argument_base.join(argument)
+    };
+    std::fs::symlink_metadata(&candidate)
+        .is_ok()
+        .then_some((candidate, expected))
 }
 
 fn resolve_entrypoint_command(
     directory: &Path,
     entrypoint: &ExtensionEntrypoint,
+    expected_sha256: Option<&str>,
 ) -> std::io::Result<ResolvedEntrypoint> {
     let configured = PathBuf::from(&entrypoint.command);
     if configured.is_absolute() {
-        return stage_entrypoint(&configured)?.ok_or_else(|| {
+        return stage_entrypoint(&configured, expected_sha256)?.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "extension entrypoint is missing",
@@ -7009,7 +9434,7 @@ fn resolve_entrypoint_command(
     }
 
     let local = directory.join(&configured);
-    if let Some(staged) = stage_entrypoint(&local)? {
+    if let Some(staged) = stage_entrypoint(&local, expected_sha256)? {
         return Ok(staged);
     }
 
@@ -7022,16 +9447,22 @@ fn resolve_entrypoint_command(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
-                if let Some(staged) = stage_entrypoint(&resolved)? {
+                if let Some(staged) = stage_entrypoint(&resolved, expected_sha256)? {
                     return Ok(staged);
                 }
             }
         }
     }
 
+    if expected_sha256.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "digest-bound extension entrypoint could not be resolved and staged",
+        ));
+    }
     Ok(ResolvedEntrypoint {
         command: configured,
-        _staging: None,
+        staging: None,
     })
 }
 
@@ -10035,6 +12466,187 @@ fn extension_process_group_id(_child: &Child) -> u64 {
 #[cfg(not(unix))]
 fn kill_process_group(_process_group_id: u64) {}
 
+fn validate_v03_plain_text(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ExtensionRuntimeError> {
+    if value.trim().is_empty()
+        || value.len() > max_bytes
+        || value
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+    {
+        Err(ExtensionRuntimeError::Protocol(format!(
+            "{label} must be non-empty terminal-safe text of at most {max_bytes} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_v03_compact_text(
+    value: &str,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ExtensionRuntimeError> {
+    if value.trim().is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
+        Err(ExtensionRuntimeError::Protocol(format!(
+            "{label} must be non-empty single-line text of at most {max_bytes} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_command_definitions(
+    commands: &[CommandDefinition],
+) -> Result<(), ExtensionRuntimeError> {
+    if commands.len() > MAX_EXTENSION_COMMANDS {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "command catalog contains {} commands; limit is {MAX_EXTENSION_COMMANDS}",
+            commands.len()
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for command in commands {
+        validate_identifier("command", &command.name, true)?;
+        if !names.insert(command.name.as_str()) {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "duplicate command definition `{}`",
+                command.name
+            )));
+        }
+        if command.description.trim().is_empty()
+            || command.description.len() > 16 * 1024
+            || command
+                .description
+                .chars()
+                .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+            || command.usage.as_deref().is_some_and(|usage| {
+                usage.len() > 16 * 1024
+                    || usage.chars().any(|character| {
+                        character.is_control() && !matches!(character, '\n' | '\t')
+                    })
+            })
+        {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "command `{}` has invalid description or usage text",
+                command.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_v03_serialized<T: Serialize>(
+    value: &T,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ExtensionRuntimeError> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| ExtensionRuntimeError::Protocol(format!("invalid {label}: {error}")))?;
+    if encoded.len() > max_bytes {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "{label} is {} bytes; limit is {max_bytes}",
+            encoded.len()
+        )));
+    }
+    let value = serde_json::from_slice::<serde_json::Value>(&encoded)
+        .map_err(|error| ExtensionRuntimeError::Protocol(format!("invalid {label}: {error}")))?;
+    validate_v03_json(&value, max_bytes, label)
+}
+
+fn validate_v03_json(
+    value: &serde_json::Value,
+    max_bytes: usize,
+    label: &str,
+) -> Result<(), ExtensionRuntimeError> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| ExtensionRuntimeError::Protocol(format!("invalid {label}: {error}")))?;
+    if encoded.len() > max_bytes {
+        return Err(ExtensionRuntimeError::Protocol(format!(
+            "{label} is {} bytes; limit is {max_bytes}",
+            encoded.len()
+        )));
+    }
+
+    let mut nodes = 0usize;
+    let mut stack = vec![(value, 1usize)];
+    while let Some((node, depth)) = stack.pop() {
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_EXTENSION_V03_JSON_NODES {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "{label} exceeds the JSON node limit of {MAX_EXTENSION_V03_JSON_NODES}"
+            )));
+        }
+        if depth > MAX_EXTENSION_V03_JSON_DEPTH {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "{label} exceeds the JSON depth limit of {MAX_EXTENSION_V03_JSON_DEPTH}"
+            )));
+        }
+        match node {
+            serde_json::Value::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, depth.saturating_add(1))));
+            }
+            serde_json::Value::Object(values) => {
+                if values.keys().any(|key| key.len() > 256) {
+                    return Err(ExtensionRuntimeError::Protocol(format!(
+                        "{label} contains a JSON key longer than 256 bytes"
+                    )));
+                }
+                stack.extend(
+                    values
+                        .values()
+                        .map(|value| (value, depth.saturating_add(1))),
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_sha256_text(value: &str, label: &str) -> Result<(), ExtensionRuntimeError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ExtensionRuntimeError::Protocol(format!(
+            "{label} must be a lowercase SHA-256 digest"
+        )))
+    }
+}
+
+fn update_digest_bytes(digest: &mut Sha256, bytes: &[u8]) {
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
+fn update_digest_path(digest: &mut Sha256, path: &Path) {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(windows)]
+    let bytes = {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>()
+    };
+    #[cfg(not(any(unix, windows)))]
+    let bytes = path.to_string_lossy().as_bytes().to_vec();
+
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+}
+
 fn validate_identifiers(
     kind: &str,
     values: &[String],
@@ -11232,6 +13844,16 @@ confirmations = true
             ExtensionManifest::parse(&unknown),
             Err(ExtensionRuntimeError::ManifestParse(_))
         ));
+
+        let invalid_digest = VALID_MANIFEST.replace(
+            "command = \"git-tools\"",
+            "command = \"git-tools\"\nsha256 = \"ABC\"",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&invalid_digest),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("entrypoint.sha256")
+        ));
     }
 
     #[test]
@@ -11300,6 +13922,37 @@ confirmations = true
             error,
             ExtensionRuntimeError::ManifestTooLarge { limit: 10, .. }
         ));
+    }
+
+    #[test]
+    fn manifest_principal_supports_the_product_bound_above_the_default_loader_bound() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(EXTENSION_MANIFEST_FILENAME);
+        let mut source = VALID_MANIFEST.to_owned();
+        source.push_str("\n#");
+        source.push_str(&"x".repeat(70 * 1024));
+        std::fs::write(&path, source).expect("write product-sized manifest");
+
+        assert!(ExtensionManifest::load(&path).is_err());
+        ExtensionManifest::load_bounded(&path, MAX_EXTENSION_MANIFEST_BYTES)
+            .expect("product-sized manifest");
+        ExtensionPrincipal::derive("git-tools", &path).expect("product-sized principal");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_manifest_load_rejects_a_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target.toml");
+        let link = temp.path().join(EXTENSION_MANIFEST_FILENAME);
+        std::fs::write(&target, VALID_MANIFEST).expect("write target");
+        symlink(&target, &link).expect("create symlink");
+        let error = ExtensionManifest::load_bounded(&link, 64 * 1024)
+            .expect_err("symlinked manifests must fail closed");
+        assert!(error.to_string().contains("non-symlink"));
+        assert!(ExtensionPrincipal::derive("git-tools", &link).is_err());
     }
 
     #[test]
@@ -11396,11 +14049,230 @@ confirmations = true
         );
     }
 
+    #[test]
+    fn identity_required_activation_rejects_legacy_persistent_grants() {
+        let path = PathBuf::from("/home/user/.ygg/extensions/pi-aggregate/extension.toml");
+        let principal = ExtensionPrincipal {
+            name: "pi-aggregate".into(),
+            sha256: "a".repeat(64),
+        };
+        let mut policy = ExtensionPolicy::default();
+        policy.enable("pi-aggregate");
+        policy.trust("pi-aggregate");
+        policy.trust_source("pi-aggregate", path.clone());
+
+        assert_eq!(
+            policy
+                .activation_with_identity(
+                    "pi-aggregate",
+                    &path,
+                    ExtensionSource::Global,
+                    Some(&principal),
+                    true,
+                )
+                .trust,
+            ExtensionTrust::Untrusted
+        );
+        policy.trust_source_identity("pi-aggregate", path.clone(), "b".repeat(64));
+        assert_eq!(
+            policy
+                .activation_with_identity(
+                    "pi-aggregate",
+                    &path,
+                    ExtensionSource::Global,
+                    Some(&principal),
+                    true,
+                )
+                .trust,
+            ExtensionTrust::Untrusted
+        );
+        policy.trust_source_identity("pi-aggregate", path.clone(), principal.sha256.clone());
+        assert_eq!(
+            policy
+                .activation_with_identity(
+                    "pi-aggregate",
+                    &path,
+                    ExtensionSource::Global,
+                    Some(&principal),
+                    true,
+                )
+                .trust,
+            ExtensionTrust::Trusted
+        );
+        policy.revoke_trust("pi-aggregate");
+        policy.trust_for_invocation("pi-aggregate");
+        assert_eq!(
+            policy
+                .activation_with_identity(
+                    "pi-aggregate",
+                    &path,
+                    ExtensionSource::Global,
+                    Some(&principal),
+                    true,
+                )
+                .trust,
+            ExtensionTrust::Trusted
+        );
+    }
+
+    #[test]
+    fn aggregate_lock_drift_invalidates_persistent_identity_trust() {
+        let temp = TempDir::new().expect("tempdir");
+        let directory = temp.path().join("pi-aggregate");
+        write_manifest(&directory, "pi-aggregate", "aggregate");
+        let manifest_path = directory.join(EXTENSION_MANIFEST_FILENAME);
+        std::fs::write(directory.join("pi-lock.json"), b"{\"revision\":1}").expect("write lock");
+        let principal = ExtensionPrincipal::derive("pi-aggregate", &manifest_path)
+            .expect("derive locked principal");
+
+        let mut legacy_policy = ExtensionPolicy::default();
+        legacy_policy.enable("pi-aggregate");
+        legacy_policy.trust_source("pi-aggregate", manifest_path.clone());
+        let legacy = ExtensionCatalog::load_resolved(
+            [ExtensionManifestInput {
+                path: manifest_path.clone(),
+                source: ExtensionSource::Explicit,
+            }],
+            &legacy_policy,
+            64 * 1024,
+        );
+        assert_eq!(
+            legacy.extensions[0].activation.trust,
+            ExtensionTrust::Untrusted
+        );
+
+        let mut policy = ExtensionPolicy::default();
+        policy.enable("pi-aggregate");
+        policy.trust_source_identity(
+            "pi-aggregate",
+            manifest_path.clone(),
+            principal.sha256.clone(),
+        );
+        let trusted = ExtensionCatalog::load_resolved(
+            [ExtensionManifestInput {
+                path: manifest_path.clone(),
+                source: ExtensionSource::Explicit,
+            }],
+            &policy,
+            64 * 1024,
+        );
+        assert_eq!(
+            trusted.extensions[0].activation.trust,
+            ExtensionTrust::Trusted
+        );
+
+        std::fs::write(directory.join("pi-lock.json"), b"{\"revision\":2}").expect("mutate lock");
+        let drifted = ExtensionCatalog::load_resolved(
+            [ExtensionManifestInput {
+                path: manifest_path,
+                source: ExtensionSource::Explicit,
+            }],
+            &policy,
+            64 * 1024,
+        );
+        assert_eq!(
+            drifted.extensions[0].activation.trust,
+            ExtensionTrust::Untrusted
+        );
+        assert_ne!(drifted.extensions[0].principal, principal);
+
+        policy.trust("pi-aggregate");
+        policy.trust_source("pi-aggregate", drifted.extensions[0].manifest_path.clone());
+        std::fs::remove_file(directory.join("pi-lock.json")).expect("remove lock");
+        let removed = ExtensionCatalog::load_resolved(
+            [ExtensionManifestInput {
+                path: drifted.extensions[0].manifest_path.clone(),
+                source: ExtensionSource::Global,
+            }],
+            &policy,
+            64 * 1024,
+        );
+        assert_eq!(
+            removed.extensions[0].activation.trust,
+            ExtensionTrust::Untrusted,
+            "a configured identity grant must fail closed instead of falling back to legacy trust"
+        );
+    }
+
+    #[test]
+    fn digest_bound_entrypoints_stage_only_exact_executable_or_interpreter_bytes() {
+        let temp = TempDir::new().expect("tempdir");
+        let script = temp.path().join("bridge.mjs");
+        let bytes = b"console.log('bounded');\n";
+        std::fs::write(&script, bytes).expect("write script");
+        let digest = format!("{:x}", Sha256::digest(bytes));
+
+        let staged = stage_entrypoint(&script, Some(&digest))
+            .expect("stage entrypoint")
+            .expect("entrypoint exists");
+        assert_eq!(std::fs::read(&staged.command).unwrap(), bytes);
+        let wrong_digest = "0".repeat(64);
+        assert!(stage_entrypoint(&script, Some(&wrong_digest)).is_err());
+
+        let entrypoint = ExtensionEntrypoint {
+            command: "node".into(),
+            sha256: Some(digest.clone()),
+            args: vec![script.to_string_lossy().into_owned()],
+            env: BTreeMap::new(),
+        };
+        let (selected, selected_digest) =
+            digest_bound_interpreter_argument(temp.path(), &entrypoint)
+                .expect("bare interpreter must bind its script argument");
+        assert_eq!(selected, script);
+        assert_eq!(selected_digest, digest);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn digest_mismatch_rejects_entrypoint_before_child_execution() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("digest-bound.sh");
+        let original = b"#!/bin/sh\nexit 0\n";
+        write_executable_script(&script_path, std::str::from_utf8(original).unwrap());
+        let mut manifest = minimal_manifest("digest-bound", "digest-bound.sh");
+        manifest.entrypoint.sha256 = Some(format!("{:x}", Sha256::digest(original)));
+        let descriptor = trusted_descriptor(temp.path(), manifest);
+        write_executable_script(
+            &script_path,
+            "#!/bin/sh\nprintf executed > \"$YGG_WORKSPACE/executed\"\n",
+        );
+
+        let error =
+            match ExtensionProcess::start(descriptor, ExtensionRuntimeConfig::new(temp.path()))
+                .await
+            {
+                Ok(process) => {
+                    let _ = process.shutdown().await;
+                    panic!("digest-mismatched entrypoint unexpectedly started")
+                }
+                Err(error) => error,
+            };
+        assert!(matches!(&error, ExtensionRuntimeError::Spawn { .. }));
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+        assert!(!temp.path().join("executed").exists());
+    }
+
+    #[test]
+    fn process_admission_rejects_a_manifest_not_bound_to_its_principal() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = minimal_manifest("identity-mismatch", "original-command");
+        let mut descriptor = trusted_descriptor(temp.path(), manifest);
+        descriptor.manifest.entrypoint.command = "replacement-command".into();
+        let error = descriptor
+            .revalidate_source_identity()
+            .expect_err("descriptor manifest must match its principal source");
+        assert!(error.to_string().contains("changed after discovery"));
+    }
+
     #[tokio::test]
     async fn launch_requires_both_enablement_and_trust() {
         let temp = TempDir::new().expect("tempdir");
         let manifest = minimal_manifest("policy-test", "does-not-exist");
         let descriptor = DiscoveredExtension {
+            principal: ExtensionPrincipal {
+                name: manifest.name.clone(),
+                sha256: "0".repeat(64),
+            },
             manifest,
             manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
             source: ExtensionSource::Explicit,
@@ -13065,6 +15937,333 @@ command = "dynamic.py"
         assert!(process.shutdown().await);
     }
 
+    fn api_v03_manifest() -> ExtensionManifest {
+        ExtensionManifest::parse(
+            r#"name = "api-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "never-started"
+[capabilities]
+host_services = ["session@1:read,append", "catalog@1:read,tools,active-tools"]
+[contributes]
+runtime_catalog = true
+events = ["session_start", "tool_call"]
+roles = ["delegation.observer"]
+"#,
+        )
+        .expect("API 0.3 manifest")
+    }
+
+    fn api_v03_service(
+        name: ExtensionHostServiceName,
+        scopes: Vec<ExtensionHostServiceScope>,
+        max_items: u32,
+    ) -> ExtensionHostServiceDescriptor {
+        ExtensionHostServiceDescriptor {
+            name,
+            version: ExtensionHostServiceVersion::V1,
+            scopes,
+            limits: ExtensionHostServiceLimits {
+                max_concurrent_requests: Some(4),
+                max_request_bytes: Some(64 * 1024),
+                max_response_bytes: Some(64 * 1024),
+                max_items: Some(max_items),
+                timeout_ms: Some(30_000),
+            },
+        }
+    }
+
+    fn api_v03_offer() -> ExtensionProtocolV03Request {
+        ExtensionProtocolV03Request {
+            version: EXTENSION_API_VERSION_0_3.into(),
+            required_features: EXTENSION_API_0_3_REQUIRED_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            optional_features: Vec::new(),
+            limits: ExtensionProtocolLimits {
+                max_concurrent_requests: 8,
+            },
+            host_services: vec![api_v03_service(
+                ExtensionHostServiceName::Session,
+                vec![
+                    ExtensionHostServiceScope::Read,
+                    ExtensionHostServiceScope::Append,
+                ],
+                256,
+            )],
+        }
+    }
+
+    fn api_v03_response() -> ExtensionProtocolV03Response {
+        let mut accepted = api_v03_service(
+            ExtensionHostServiceName::Session,
+            vec![ExtensionHostServiceScope::Read],
+            128,
+        );
+        accepted.limits.max_concurrent_requests = Some(2);
+        ExtensionProtocolV03Response {
+            version: EXTENSION_API_VERSION_0_3.into(),
+            features: EXTENSION_API_0_3_REQUIRED_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            limits: ExtensionProtocolLimits {
+                max_concurrent_requests: 4,
+            },
+            host_services: vec![accepted],
+            catalog: ExtensionCatalogEpochZero::default(),
+        }
+    }
+
+    #[test]
+    fn api_v03_manifest_fields_are_strict_and_version_scoped() {
+        let manifest = api_v03_manifest();
+        assert_eq!(manifest.capabilities.host_services.len(), 2);
+        assert!(manifest.contributes.runtime_catalog);
+        assert_eq!(manifest.contributes.events.len(), 2);
+        assert_eq!(
+            manifest.contributes.roles,
+            vec![ExtensionRole::DelegationObserver]
+        );
+
+        let duplicate = r#"name = "bad-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "bad"
+[capabilities]
+host_services = ["session@1:read,read"]
+"#;
+        assert!(ExtensionManifest::parse(duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate scope"));
+
+        let old_api = r#"name = "bad-old"
+version = "0.2.0"
+api_version = "0.2"
+[entrypoint]
+command = "bad"
+[capabilities]
+host_services = ["session@1:read"]
+"#;
+        assert!(ExtensionManifest::parse(old_api)
+            .unwrap_err()
+            .to_string()
+            .contains("require extension API 0.3"));
+    }
+
+    #[test]
+    fn api_v03_negotiation_accepts_only_feature_and_service_subsets() {
+        let manifest = api_v03_manifest();
+        let offer = api_v03_offer();
+        let negotiated = negotiate_extension_api_v03(&manifest, &offer, api_v03_response())
+            .expect("valid API 0.3 negotiation");
+        assert_eq!(negotiated.max_concurrent_requests, 4);
+        assert_eq!(negotiated.features.len(), 7);
+        assert_eq!(negotiated.host_services.len(), 1);
+        assert_eq!(
+            negotiated.host_services[0].scopes,
+            vec![ExtensionHostServiceScope::Read]
+        );
+
+        let mut escalated = api_v03_response();
+        escalated.host_services[0]
+            .scopes
+            .push(ExtensionHostServiceScope::Name);
+        assert!(negotiate_extension_api_v03(&manifest, &offer, escalated)
+            .unwrap_err()
+            .to_string()
+            .contains("escalated scope"));
+
+        let mut missing = api_v03_response();
+        missing.features.pop();
+        assert!(negotiate_extension_api_v03(&manifest, &offer, missing)
+            .unwrap_err()
+            .to_string()
+            .contains("missing required"));
+
+        let mut duplicate = api_v03_response();
+        duplicate
+            .host_services
+            .push(duplicate.host_services[0].clone());
+        assert!(negotiate_extension_api_v03(&manifest, &offer, duplicate)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    fn api_v03_operation() -> OperationToken {
+        OperationToken {
+            process: ProcessFence {
+                instance_id: "instance-v03".into(),
+                generation: 1,
+            },
+            request_id: 7,
+            kind: ExtensionOperationKind::Event,
+            run_id: Some("run-v03".into()),
+            turn_id: Some("turn-v03".into()),
+            tool_call_id: None,
+            command_id: None,
+            mode: ExtensionOperationMode::Tui,
+            deadline_unix_ms: 1,
+            cancellation_owner: "cancel-v03".into(),
+        }
+    }
+
+    fn api_v03_invocation() -> ExtensionInvocation {
+        let process = ProcessFence {
+            instance_id: "instance-v03".into(),
+            generation: 1,
+        };
+        ExtensionInvocation {
+            principal: ExtensionPrincipal {
+                name: "api-v03".into(),
+                sha256: "1".repeat(64),
+            },
+            session_owner: SessionOwner {
+                sha256: "2".repeat(64),
+            },
+            process: process.clone(),
+            operation: OperationToken {
+                process,
+                ..api_v03_operation()
+            },
+        }
+    }
+
+    #[test]
+    fn api_v03_effect_event_and_document_bounds_fail_closed() {
+        let oversized = ExtensionEffectJournal {
+            operation_token: api_v03_operation(),
+            effects: (0..=MAX_EXTENSION_EFFECTS)
+                .map(|index| ExtensionEffect::SelectModel {
+                    model: format!("model-{index}"),
+                })
+                .collect(),
+        };
+        assert!(oversized
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("effects"));
+
+        let event = ExtensionOrderedEvent {
+            sequence: 0,
+            event: ExtensionOrderedEventName::Context,
+            invocation: api_v03_invocation(),
+            payload: serde_json::json!({}),
+            barrier: true,
+        };
+        assert!(event
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sequence"));
+
+        let reference = ExtensionDocumentReference {
+            document_id: "document-v03".into(),
+            byte_length: (MAX_EXTENSION_DOCUMENT_CHUNK_BYTES + 1) as u64,
+            sha256: "3".repeat(64),
+            session_owner: SessionOwner {
+                sha256: "2".repeat(64),
+            },
+            process: ProcessFence {
+                instance_id: "instance-v03".into(),
+                generation: 1,
+            },
+            parent_request_id: 7,
+        };
+        let bytes = vec![0_u8; MAX_EXTENSION_DOCUMENT_CHUNK_BYTES + 1];
+        let chunk = ExtensionDocumentChunk {
+            document_id: reference.document_id.clone(),
+            index: 0,
+            offset: 0,
+            decoded_bytes: bytes.len() as u32,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        assert!(chunk
+            .validate_for(&reference)
+            .unwrap_err()
+            .to_string()
+            .contains("chunk length"));
+    }
+
+    #[test]
+    fn extension_principal_changes_with_manifest_and_aggregate_identity() {
+        let temp = TempDir::new().unwrap();
+        let manifest_path = temp.path().join(EXTENSION_MANIFEST_FILENAME);
+        std::fs::write(
+            &manifest_path,
+            r#"name = "principal"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "never-started"
+"#,
+        )
+        .unwrap();
+        let initial = ExtensionPrincipal::derive("principal", &manifest_path).unwrap();
+        let manifest_bytes = std::fs::read(&manifest_path).unwrap();
+        assert_eq!(
+            ExtensionPrincipal::derive_for_manifest_bytes(
+                "principal",
+                &manifest_path,
+                &manifest_bytes,
+            )
+            .unwrap(),
+            initial
+        );
+        std::fs::write(
+            &manifest_path,
+            String::from_utf8(manifest_bytes.clone())
+                .unwrap()
+                .replace("never-started", "changed-before-admission"),
+        )
+        .unwrap();
+        assert!(ExtensionPrincipal::derive_for_manifest_bytes(
+            "principal",
+            &manifest_path,
+            &manifest_bytes,
+        )
+        .is_err());
+        std::fs::write(&manifest_path, &manifest_bytes).unwrap();
+        assert_eq!(
+            ExtensionPrincipal::derive("principal", &manifest_path).unwrap(),
+            initial
+        );
+        std::fs::write(temp.path().join("pi-lock.json"), b"{\"revision\":1}").unwrap();
+        let locked = ExtensionPrincipal::derive("principal", &manifest_path).unwrap();
+        assert_ne!(locked, initial);
+        assert!(initial.revalidate(&manifest_path).is_err());
+        assert!(locked.stable_id().starts_with("principal@sha256:"));
+    }
+
+    #[tokio::test]
+    async fn api_v03_process_launch_is_rejected_before_spawn() {
+        let temp = TempDir::new().unwrap();
+        let manifest = api_v03_manifest();
+        let error = match ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        {
+            Ok(process) => {
+                let _ = process.shutdown().await;
+                panic!("API 0.3 runtime unexpectedly started")
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ExtensionRuntimeError::ApiNotReady { version }
+                if version == EXTENSION_API_VERSION_0_3
+        ));
+    }
+
     fn write_manifest(directory: &Path, name: &str, description: &str) {
         std::fs::create_dir_all(directory).expect("create extension directory");
         std::fs::write(
@@ -13111,9 +16310,20 @@ command = "{command}"
     }
 
     fn trusted_descriptor(directory: &Path, manifest: ExtensionManifest) -> DiscoveredExtension {
+        let manifest_path = directory.join(EXTENSION_MANIFEST_FILENAME);
+        if !manifest_path.exists() {
+            std::fs::write(
+                &manifest_path,
+                toml::to_string_pretty(&manifest).expect("serialize identity manifest"),
+            )
+            .expect("write identity manifest");
+        }
+        let principal = ExtensionPrincipal::derive(&manifest.name, &manifest_path)
+            .expect("derive extension principal");
         DiscoveredExtension {
             manifest,
-            manifest_path: directory.join(EXTENSION_MANIFEST_FILENAME),
+            manifest_path,
+            principal,
             source: ExtensionSource::Explicit,
             activation: ExtensionActivation {
                 enabled: true,

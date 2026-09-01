@@ -454,7 +454,8 @@ pub struct Config {
     /// True when project, environment, or command-line activation participates
     /// in the effective list, making the user-config menu non-authoritative.
     pub extension_activation_overridden: bool,
-    /// Persistent executable trust grants: global names or `name@manifest-path`.
+    /// Persistent executable trust grants: global names,
+    /// `name@manifest-path`, or `name@manifest-path@sha256:<principal>`.
     pub trusted_extensions: Vec<String>,
     /// One-shot extension names trusted only for this process invocation.
     pub invocation_trusted_extensions: Vec<String>,

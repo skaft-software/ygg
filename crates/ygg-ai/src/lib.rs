@@ -39,6 +39,8 @@ pub mod error;
 mod json_repair;
 pub mod model_metadata;
 pub mod pricing;
+pub mod provider_registry;
+pub mod provider_runtime;
 pub mod responses;
 mod responses_ws;
 pub mod stream;
@@ -61,11 +63,18 @@ pub use error::{
 };
 pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};
+pub use provider_registry::{
+    ProviderEndpointEntry, ProviderModelEntry, ProviderOwnerId, ProviderRegistry,
+    ProviderRegistryError, ProviderRegistrySnapshot, ProviderSource, ResolvedProviderModel,
+    BUILTIN_PROVIDER_OWNER_ID, MAX_PROVIDER_OWNERS, MAX_PROVIDER_OWNER_ID_BYTES,
+    MAX_PROVIDER_TRANSACTION_ENTRIES,
+};
+pub use provider_runtime::{ProviderRuntime, ProviderRuntimeRef};
 pub use responses::{
     ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
     ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
-pub use stream::{ResponseStream, StreamEvent};
+pub use stream::{guard_stream, ResponseStream, StreamEvent};
 pub use transform::transform_messages;
 pub use types::{
     AgentDelegation, AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,

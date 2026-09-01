@@ -620,10 +620,10 @@ impl<'a> TUI<'a> {
         }
     }
 
-    /// Rust port of Pi TUI's `doRender()` at revision
-    /// `20be4b18d4c57487f8993d2762bace129f0cf7c6`.
-    /// Keep this control flow structurally aligned with
-    /// `packages/tui/src/tui.ts`; named upstream cases live in
+    /// Re-audit target: Pi TUI 0.84.4's `doRender()` at revision
+    /// `b79e4cc834970cca69daebffab7df1da7d1e52c4`; the matching ledger rows
+    /// remain open pending full case coverage. Keep this control flow aligned
+    /// with `packages/tui/src/tui.ts`; named upstream cases live in
     /// `tests/pi_tui_render.rs`. Ygg-specific native-scrollback policy belongs
     /// only to the explicit `inline_scrollback` compatibility path below.
     fn render_pi_frame(&mut self) {

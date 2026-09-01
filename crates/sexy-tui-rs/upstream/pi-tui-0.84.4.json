@@ -17,180 +17,210 @@
     {
       "upstream": "test/autocomplete.test.ts",
       "area": "autocomplete",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/bug-regression-isimageline-startswith-bug.test.ts",
       "area": "terminal-image",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/editor-history-keybindings.test.ts",
       "area": "editor",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/editor.test.ts",
       "area": "editor",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/fuzzy.test.ts",
       "area": "autocomplete",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/input.test.ts",
       "area": "input",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/keybindings.test.ts",
       "area": "keybindings",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/keys.test.ts",
       "area": "keys",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/latex.test.ts",
       "area": "markdown",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/layout.test.ts",
       "area": "layout",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/markdown.test.ts",
       "area": "markdown",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/native-module-path.test.ts",
       "area": "native-module",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/overlay-non-capturing.test.ts",
       "area": "overlay",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/overlay-options.test.ts",
       "area": "overlay",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/overlay-short-content.test.ts",
       "area": "overlay",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/regression-overlay-cjk-boundary.test.ts",
       "area": "overlay",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/regression-regional-indicator-width.test.ts",
       "area": "width",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/select-list.test.ts",
       "area": "widgets",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/settings-list.test.ts",
       "area": "widgets",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/stdin-buffer.test.ts",
       "area": "stdin-buffer",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/tab-width.test.ts",
       "area": "width",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/terminal-colors.test.ts",
       "area": "terminal",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/terminal-image.test.ts",
       "area": "terminal-image",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/terminal.test.ts",
       "area": "terminal",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/truncate-to-width.test.ts",
       "area": "width",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     },
     {
       "upstream": "test/truncated-text.test.ts",
       "area": "widgets",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/tui-alt-screen.test.ts",
       "area": "tui",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/tui-cell-size-input.test.ts",
       "area": "tui",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/tui-overlay-style-leak.test.ts",
       "area": "overlay",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/tui-render.test.ts",
       "area": "tui",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": [
         "tests/pi_tui_render.rs"
@@ -199,6 +229,7 @@
     {
       "upstream": "test/tui-shrink.test.ts",
       "area": "tui",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": [
         "tests/pi_tui_render.rs"
@@ -207,12 +238,14 @@
     {
       "upstream": "test/word-navigation.test.ts",
       "area": "editor",
+      "required": true,
       "status": "requires_0.84.4_port",
       "rust_equivalents": []
     },
     {
       "upstream": "test/wrap-ansi.test.ts",
       "area": "width",
+      "required": true,
       "status": "requires_0.84.4_audit",
       "rust_equivalents": []
     }

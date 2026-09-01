@@ -156,3 +156,12 @@ The path guard applies to explicit built-in paths. It is not process containment
 ## Extension boundary
 
 All tools implement `Tool` and register through `ExtensionHost`; core tools are not privileged inside the run loop. A product policy filters the host before `Agent::new`, ensuring provider definitions and executable implementations are the same set. Tool implementations own effect metadata and default to `Unknown`; provider schemas and model arguments cannot select authority. Executable extension tools classify as `Extension`, remain non-replayable and sequential, and the coding product prevents their process from starting under Controlled.
+
+`ExtensionHost` now publishes immutable `ToolSnapshot { revision, configured,
+active }` views. An explicit active-tool overlay is validated atomically against
+the complete policy-admitted catalog; invalid or duplicate names leave the old
+revision live. Provider requests freeze the active implementation set, while a
+later selection or dynamic registration is visible only at the next request
+boundary. `Agent::set_active_tools` requires an idle mutable Agent borrow. Durable
+session markers and the API 0.3 catalog service remain product-integration work;
+the kernel method itself does not claim persistence.

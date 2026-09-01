@@ -15,12 +15,16 @@ public surface names, and the 78-example corpus live in the machine-readable
 [`profiles/0.84.4.json`](profiles/0.84.4.json); the human status ledger and
 completion gates live in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-Generated links are inert until separately enabled and trusted. Schema-v2 link
-metadata records the bridge profile, Pi and Ygg versions, and a bounded source
-fingerprint. `ygg pi list` marks legacy, changed, or otherwise stale links, and
-generated links re-verify that fingerprint before Pi imports extension code.
-Dependency/build/cache directories are excluded from this source digest and
-remain part of the separately reviewed runtime installation.
+Generated aggregates are inert until separately enabled and trusted. Their
+schema-2 lock records the bridge profile, exact Pi/Ygg versions, pinned Pi
+package identity, ordered sources, and bounded source fingerprints.
+`ygg pi list` marks legacy, changed, or otherwise stale installations, and the
+bridge re-verifies the lock, package, and every source before importing
+extension code.
+Dependency/build/cache directories are excluded from source fingerprints and
+remain bound by the separately reviewed pinned runtime installation. The same
+aggregate output can be produced from a reviewed scanner result through the
+separate `ygg migrate pi --plan-out` and `--apply` flow.
 
 ## Current supported surface
 

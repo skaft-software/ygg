@@ -7,9 +7,9 @@ a model:
 ygg migrate pi --dry-run
 ```
 
-This is the first, deterministic stage of Pi migration. It is an inspection and
-planning command, not a source-compatibility promise and not yet an apply
-command.
+The same deterministic scanner can write a reviewable, content-digested plan
+for one inert aggregate and apply only that saved plan in a separate step. This
+is not a source-compatibility or full-parity promise.
 
 ## Current command
 
@@ -19,19 +19,43 @@ can select another user directory, and `--project` can select another project:
 
 ```console
 ygg migrate pi --dry-run --project /path/to/project
-ygg migrate pi --dry-run --json > pi-migration.json
+ygg migrate pi --dry-run --json > pi-inventory.json
 ```
 
-All current invocations are dry runs; `--dry-run` makes that intent explicit and
-keeps scripts compatible with a future separately authorized apply stage. The
-command exits before normal Ygg configuration, provider discovery, session
-startup, extension startup, or model bootstrap. It therefore consumes zero
-model tokens.
+With neither `--plan-out` nor `--apply`, the command is an inventory-only dry
+run; `--dry-run` makes that intent explicit. To stage an aggregate migration:
 
-## Link a compatible extension
+```console
+ygg migrate pi --plan-out ./pi-plan.json \
+  --pi-package /absolute/path/to/pi-coding-agent \
+  --extension-root /absolute/path/to/ygg/extensions \
+  --name pi-compat-0-84-4
+# Review the JSON plan and its ordered, fingerprinted sources.
+ygg migrate pi --apply ./pi-plan.json
+# Non-interactive automation must opt in explicitly:
+ygg migrate pi --apply ./pi-plan.json --yes
+```
+
+Planning scans the setup and writes a private schema-2 plan but does not publish
+an extension. Apply revalidates the plan and operation digests, every locked
+source and pinned Pi package precondition, and the expected destination state
+before asking for confirmation. It then atomically publishes only
+`bridge.mjs`, `extension.toml`, and `pi-lock.json` into one disabled, untrusted
+Ygg extension directory. The generated manifest carries the lock's bridge
+SHA-256, so Ygg verifies and stages those exact script bytes before process
+execution. A changed source/package, tampered plan, symlinked or conflicting
+destination, or non-interactive apply without `--yes` fails closed.
+
+Inventory, planning, and apply all exit before normal Ygg configuration,
+provider discovery, session startup, extension startup, or model bootstrap.
+They consume zero model tokens and never import Pi package code. Apply is the
+only form that writes migration output; it does not modify the Pi setup, install
+dependencies, import credentials, enable the extension, or grant trust.
+
+## Install a compatible aggregate
 
 Once a local Pi extension or installed Pi package has been reviewed, create an
-inert Ygg wrapper without running its code:
+inert Ygg aggregate without running its code:
 
 ```console
 ygg pi install ./path/to/extension.ts
@@ -42,29 +66,35 @@ ygg pi install ./first.ts --with ./second-package --with ./third.ts \
 ygg pi list
 ```
 
-The wrapper lives under `~/.ygg/extensions/`, points at the existing source, and
-uses the persistent `ygg-pi-compat` host. It does not install npm dependencies,
-run lifecycle scripts, copy the Pi package, or enable/trust the resulting Ygg
-extension. Schema-v2 link metadata records the bridge profile, exact Pi and Ygg
-versions, and a bounded source fingerprint; `ygg pi list` marks legacy or changed
-links stale without asserting trust, and a generated bridge rejects a fingerprint
-mismatch before importing extension code. The source digest excludes `.git`,
-`node_modules`, `target`, and recognized cache directories; dependency/runtime
-changes remain part of the separately reviewed Pi installation rather than the
-source-link digest. Start a current link explicitly after
-verifying its source:
+The aggregate lives under `~/.ygg/extensions/` by default, records the
+existing source set, and embeds the pinned `ygg-pi-compat` bridge. It does not
+install npm dependencies, run lifecycle scripts, copy the Pi package or source,
+or enable/trust the resulting Ygg extension. The schema-2 aggregate lock records
+the exact bridge profile, Pi/Ygg versions, pinned Pi package identity, ordered
+sources, and bounded source fingerprints. `ygg pi list` marks legacy or changed
+installations stale without asserting trust, and the bridge rejects lock,
+package, or source drift before importing extension code. Source fingerprints
+exclude `.git`, `node_modules`, `target`, and recognized cache directories;
+dependency/runtime changes remain bound separately by the pinned Pi package
+metadata. Start a current aggregate explicitly after verifying its source:
 
 ```console
 ygg --enable-extension pi-extension-name --trust-extension pi-extension-name
 ```
 
+The command-line trust above is invocation-scoped. Persistent trust for a locked
+aggregate must use the digest-qualified grant printed by `/extensions status`;
+changing its ordered source set or lock invalidates that grant. See
+[Executable extensions](extensions.md#layout-and-discovery).
+
 Bridge profile `0.2.0` targets exactly
 `@earendil-works/pi-coding-agent@0.84.4` and Node 22.19 or newer. The bridge
 validates that profile before importing extension code instead of silently using
 a newer runtime found on `PATH`. Pass `ygg pi install --pi-package DIR ...` when
-the package is not in a conventional location; the generated inert link records
-and forwards that exact path across Ygg's sanitized subprocess environment.
-The exhaustive per-event/API/UI ledger and completion gates are maintained in
+the package is not in a conventional location; the generated inert aggregate
+records and forwards that exact path across Ygg's sanitized subprocess
+environment. The exhaustive per-event/API/UI ledger and completion gates are
+maintained in
 [`extensions/ygg-pi-compat/COMPATIBILITY.md`](../extensions/ygg-pi-compat/COMPATIBILITY.md).
 It supports Pi tools, transformed result details/error/usage, live tool catalogs,
 notifications, confirmations, text input, basic lifecycle/context events, and
@@ -101,7 +131,7 @@ The human and JSON reports use migration-path classifications:
 | --- | --- |
 | `direct` | Pi skill or Markdown prompt content has a deterministic Ygg resource path. The dry run does not copy it. |
 | `replace` | Reserved for an exact package/version/source-hash recipe that selects a Ygg-native replacement. No replacement recipes ship in this first scanner slice. |
-| `bridge` | The extension uses only surfaces implemented by the pinned compatibility process. A generated link still needs a successful runtime handshake before it is known compatible. |
+| `bridge` | The extension uses only surfaces implemented by the pinned compatibility process. A generated aggregate still needs a successful runtime handshake before it is known compatible. |
 | `native_port` | The extension uses a known Pi 0.84.4 mutation or registration that needs an explicit Ygg-native port or a future bounded host primitive. |
 | `manual` | The extension depends on arbitrary Pi TUI/editor components, custom providers, or deep session/compaction internals; redesign is required. Pi JSON themes are also manual because Ygg themes use a different semantic schema. |
 | `blocked` | The package could not be resolved/read or parsed completely, or it uses names outside the pinned Pi 0.84.4 public compatibility profile. |
@@ -135,6 +165,14 @@ its complete selected input cannot be read within the bounds. A future recipe
 must key on package identity, version, source hash, and lock hash rather than
 package name alone.
 
+A file written with `--plan-out` is a separate schema-2 contract. It records
+absolute owner/destination paths, the expected absent-or-identical destination
+state, one `publish_aggregate_lock` operation, the complete aggregate lock, and
+both operation and whole-plan SHA-256 digests. Those digests detect edits; they
+are not a signature or proof of who authored the plan. Apply therefore also
+revalidates every filesystem/package/source precondition and requires explicit
+human or `--yes` authorization.
+
 ## Safety and bounds
 
 The scanner does not:
@@ -145,6 +183,12 @@ The scanner does not:
 - send source, settings, or the report to a model or network service;
 - copy, rewrite, or delete Pi or Ygg files; or
 - read Pi authentication/model credential stores.
+
+Plan generation has the same no-execution boundary and writes only the selected
+private plan file. Apply reads that bounded regular file and publishes only the
+three generated aggregate files under its exact destination. Publication uses a
+same-filesystem private staging directory and atomic rename, refuses destination
+extras or drift, and never rewrites an existing non-identical directory.
 
 Settings, package manifests, source files, lockfiles, resource counts, relative
 import closure, and aggregate hashing all have fixed limits. Selected files use
@@ -162,10 +206,12 @@ policy](../SECURITY.md).
 
 ## Migration architecture
 
-Universal Pi source compatibility is deliberately not the goal. Pi extensions
-can mutate in-process agent, provider, session, and TUI state that Ygg keeps
-behind a language-neutral subprocess boundary. Recreating that ABI in the Ygg
-kernel would compromise the boundary rather than improve migration.
+Recreating Pi's mutable in-process JavaScript object ABI is deliberately not
+the goal. The target is semantic compatibility with Pi 0.84.4's public extension
+surface through language-neutral, typed subprocess contracts. Pi extensions can
+mutate agent, provider, session, and TUI state directly; Ygg keeps those objects
+behind an authority boundary and represents compatible mutations as validated
+host effects instead.
 
 The intended staged system is:
 
@@ -178,21 +224,24 @@ scanner/compiler
 
 ### Deterministic scanner/compiler
 
-The shipped dry run is the inventory front end for this stage. `ygg pi install`
-now creates an inert generated wrapper for an existing local source; it does not
-install dependencies or execute package code. Future recipes can copy compatible
-skills/prompts, transform known configuration, and cache intermediate results by
-source and lock hash. Those operations should remain deterministic and
-model-free.
+The shipped scanner is the inventory front end for this stage. `ygg pi install`
+and the explicit migration plan/apply flow create the same inert aggregate form
+for reviewed sources; neither installs dependencies nor executes package code.
+No direct skill/prompt copy or replacement recipe is applied yet. Future recipes
+can copy compatible skills/prompts, transform known configuration, and cache
+intermediate results by source and lock hash. Those operations should remain
+deterministic and model-free.
 
 ### Compatibility process
 
-The generated `ygg pi install` link hosts a deliberately bounded subset of Pi's
-`ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated `--with`
-arguments record an ordered, source-fingerprinted set in one aggregate lock and
-load those sources through one real `ExtensionRunner`, preserving their local
-event bus, `globalThis`, and shared registries. Automatically selecting and
-locking an entire reviewed Pi setup remains future migration work.
+The generated `ygg pi install` aggregate hosts a deliberately bounded subset of
+Pi's `ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated
+`--with` arguments record an ordered, source-fingerprinted set in one aggregate
+lock and load those sources through one real `ExtensionRunner`, preserving their
+local event bus, `globalThis`, and shared registries. `ygg migrate pi --plan-out`
+selects the scanner's enabled extension sources in Pi load order and locks that
+whole reviewed set; `--apply` publishes it only after revalidation and explicit
+authorization.
 
 Unsupported Pi APIs must raise a clear compatibility error. The bridge must not
 silently discard a policy, mutation, lifecycle, or UI call. Static and runtime
@@ -234,8 +283,8 @@ Capability migration is often practical even when exact UX is not:
 - Ygg should evolve semantic, frontend-neutral UI contributions rather than an
   arbitrary component ABI.
 
-None of those possible protocol additions is implied by the current dry-run
-command. They should be introduced only with a concrete migrated package,
+None of those possible protocol additions is implied by the current migration
+pipeline. They should be introduced only with a concrete migrated package,
 wire-level tests, bounded failure semantics, and no cost on the no-extension
 path.
 
@@ -248,10 +297,10 @@ The intended promise is:
 > compatible subset through an explicitly trusted bridge, and identify exactly
 > what still requires a port.
 
-Today the zero-token scanner and explicitly trusted, pinned compatibility links
-are implemented. The bridge runs a tested subset of Pi 0.84.4 tools, commands,
-dialogs, context, and lifecycle behavior; explicit ordered source sets can share
-one locked runtime. Deterministic resource apply, exact replacement recipes,
-automatic whole-setup selection, session/provider mutation, and arbitrary Pi
-component parity remain unfinished and are reported rather than silently
-emulated.
+Today the zero-token scanner, content-digested aggregate plan/apply flow, and
+explicitly trusted pinned compatibility aggregates are implemented. The bridge
+runs a tested subset of Pi 0.84.4 tools, commands, dialogs, context, and
+lifecycle behavior; scanner-selected or explicitly ordered source sets can share
+one locked runtime. Direct portable-resource apply, exact replacement recipes,
+session/provider mutation, and arbitrary Pi component parity remain unfinished
+and are reported rather than silently emulated.
