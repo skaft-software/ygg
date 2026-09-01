@@ -4622,20 +4622,11 @@ fn application_viewport_theme_swap_repaints_without_clearing_shell_scrollback() 
 }
 
 #[test]
-fn switching_back_to_default_clears_named_theme_attributes() {
+fn switching_back_to_default_clears_custom_theme_attributes() {
     const WIDTH: u16 = 48;
     const HEIGHT: u16 = 10;
-    let capabilities = crate::tui::terminal::TerminalCapabilities::test(
-        true,
-        true,
-        crate::tui::terminal::ColorDepth::TrueColor,
-    );
-    let violet = crate::tui::theme::test_bundled_theme_with(
-        "pie",
-        capabilities,
-        crate::tui::theme::TerminalBackground::Unknown,
-    );
-    let (mut shell, bytes) = emulated_shell(violet, WIDTH, HEIGHT);
+    let custom = crate::tui::theme::test_theme_from_source(SURFACE_TEST_THEME);
+    let (mut shell, bytes) = emulated_shell(custom, WIDTH, HEIGHT);
     shell
         .state
         .borrow_mut()
@@ -4644,8 +4635,8 @@ fn switching_back_to_default_clears_named_theme_attributes() {
         )));
     shell.render();
 
-    // Pi terminates every rendered row with a full rendition reset. Switching
-    // themes then clears and replays the complete frame from that invariant.
+    // Custom surface rendering terminates every row with a full rendition
+    // reset. Switching themes must clear and replay the complete frame.
     shell.set_theme(crate::tui::theme::test_theme());
     shell.render();
 
@@ -5109,16 +5100,10 @@ fn renderer_covers_idle_and_every_active_run_phase() {
 }
 
 #[test]
-fn named_theme_keeps_active_work_out_of_the_footer() {
+fn custom_theme_keeps_active_work_out_of_the_footer() {
     let mut shell = InteractiveShell::test_shell();
-    shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-        "clawed",
-        crate::tui::terminal::TerminalCapabilities::test(
-            true,
-            true,
-            crate::tui::terminal::ColorDepth::TrueColor,
-        ),
-        crate::tui::theme::TerminalBackground::Dark,
+    shell.set_theme(crate::tui::theme::test_theme_from_source(
+        SURFACE_TEST_THEME,
     ));
     let now = Instant::now();
     {
@@ -7145,56 +7130,6 @@ fn prompt_padding_adds_static_prompt_background_rows() {
 
     assert_eq!(plan.geometry.leading_rows, 1);
     assert_eq!(plan.geometry.trailing_rows, 1);
-}
-
-#[test]
-fn pie_keeps_bounded_cards_without_synthetic_padding() {
-    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
-    use crate::tui::theme::{self, TerminalBackground};
-
-    let theme = theme::test_bundled_theme_with(
-        "pie",
-        TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
-        TerminalBackground::Dark,
-    );
-    let renderer = theme.rich_renderer();
-    let prompt = TranscriptBlock::User {
-        text: "hello from pie".into(),
-        model_lab: None,
-        prompt_color: None,
-        persisted: true,
-    };
-    let plan = compile_surface_plan(None, &prompt, &theme, 120);
-    assert!(
-        plan.frame_width <= 96,
-        "Pie cards must retain their v0.6 width cap: {plan:?}"
-    );
-    assert_eq!(plan.geometry.leading_rows, 0);
-    assert_eq!(plan.geometry.trailing_rows, 0);
-    let rendered = render_block(None, &prompt, &theme, &renderer, &renderer, 120, false);
-    assert_eq!(
-        rendered.len(),
-        1,
-        "Pie prompt added synthetic blank rows: {rendered:?}"
-    );
-
-    let reasoning = TranscriptBlock::Reasoning(Box::new(AssistantBlock::streaming_reasoning(
-        "private detail",
-    )));
-    let reasoning_lines = render_block(None, &reasoning, &theme, &renderer, &renderer, 120, false)
-        .into_iter()
-        .map(|line| strip_terminal_sequences(&line))
-        .collect::<Vec<_>>();
-    assert!(
-        reasoning_lines[0].contains('•') && reasoning_lines[0].contains("Thinking"),
-        "{reasoning_lines:?}"
-    );
-    assert!(
-        reasoning_lines
-            .iter()
-            .any(|line| line.contains("└ (ctrl+o to expand)")),
-        "Pie must retain the two-row disclosure treatment: {reasoning_lines:?}"
-    );
 }
 
 #[test]
@@ -9709,66 +9644,78 @@ fn active_model_switch_keeps_run_identity_and_clears_stale_idle_telemetry() {
 }
 
 #[test]
-fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
-    use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
-    use crate::tui::theme::TerminalBackground;
-
-    let composer_lines = |name: &str| -> Vec<String> {
+fn custom_theme_composer_tokens_render_framed_ruled_and_shaded_composers() {
+    let composer_lines = |source: &str| -> Vec<String> {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(60, 12);
-        shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-            name,
-            TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
-            TerminalBackground::Dark,
-        ));
-        let lines = render_shell(&shell.state.borrow(), 60);
-        lines
+        shell.set_theme(crate::tui::theme::test_theme_from_source(source));
+        let rendered = render_shell(&shell.state.borrow(), 60);
+        rendered
     };
 
-    // Pie retains its v0.6 rounded composer.
-    {
-        let name = "pie";
-        let lines = composer_lines(name);
-        let plain = lines
-            .iter()
-            .map(|line| strip_terminal_sequences(line))
-            .collect::<Vec<_>>();
-        let top = plain
-            .iter()
-            .position(|line| line.trim_start().starts_with('╭') && line.ends_with('╮'))
-            .unwrap_or_else(|| panic!("{name} composer lost its top corners: {plain:?}"));
-        assert!(
-            plain[top + 1..]
-                .iter()
-                .any(|line| line.trim_start().starts_with('╰') && line.ends_with('╯')),
-            "{name} composer lost its bottom corners"
-        );
-        assert!(
-            plain[top + 1].trim_start().starts_with('│') && plain[top + 1].ends_with('│'),
-            "{name} composer content rows lost their side borders: {:?}",
-            plain[top + 1]
-        );
-    }
-
-    // Clawed now uses the shared static top/bottom-rule composer.
-    let clawed = composer_lines("clawed")
+    let framed = composer_lines(
+        r##"
+            [colors]
+            composer = "framed"
+            composer_border = "#6688aa"
+            [layout]
+            composer_padding = 1
+        "##,
+    );
+    let plain = framed
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
+    let top = plain
+        .iter()
+        .position(|line| line.trim_start().starts_with('╭') && line.ends_with('╮'))
+        .unwrap_or_else(|| panic!("framed composer lost its top corners: {plain:?}"));
     assert!(
-        clawed
+        plain[top + 1..]
+            .iter()
+            .any(|line| line.trim_start().starts_with('╰') && line.ends_with('╯')),
+        "framed composer lost its bottom corners"
+    );
+    assert!(
+        plain[top + 1].trim_start().starts_with('│') && plain[top + 1].ends_with('│'),
+        "framed composer content rows lost their side borders: {:?}",
+        plain[top + 1]
+    );
+
+    let ruled = composer_lines(
+        r##"
+            [colors]
+            composer = "boxed"
+            composer_border = "#6688aa"
+            [layout]
+            composer_padding = 1
+        "##,
+    )
+    .iter()
+    .map(|line| strip_terminal_sequences(line))
+    .collect::<Vec<_>>();
+    assert!(
+        ruled
             .iter()
             .filter(|line| {
                 !line.trim().is_empty() && line.trim().chars().all(|character| character == '─')
             })
             .count()
             >= 2,
-        "clawed composer lost its rules: {clawed:?}"
+        "ruled composer lost its rules: {ruled:?}"
     );
 
-    // kodex: no rules at all — a shaded rectangle painted with composer_bg.
-    let lines = composer_lines("kodex");
-    let plain = lines
+    let shaded = composer_lines(
+        r##"
+            [colors]
+            composer = "shaded"
+            composer_bg = "#323232"
+            [layout]
+            prompt_padding = true
+            composer_padding = 1
+        "##,
+    );
+    let plain = shaded
         .iter()
         .map(|line| strip_terminal_sequences(line))
         .collect::<Vec<_>>();
@@ -9776,16 +9723,15 @@ fn theme_composer_chrome_tokens_render_framed_and_shaded_composers() {
         !plain
             .iter()
             .any(|line| line.contains('─') || line.contains('╭') || line.contains('│')),
-        "kodex composer must not draw rules or frames: {plain:?}"
+        "shaded composer must not draw rules or frames: {plain:?}"
     );
-    // #323232 fill on the prompt row and its padding rows.
     assert_eq!(
-        lines
+        shaded
             .iter()
             .filter(|line| line.contains("\x1b[48;2;50;50;50m"))
             .count(),
         3,
-        "kodex composer should paint exactly three shaded rows"
+        "shaded composer should paint exactly three rows"
     );
 }
 
@@ -10552,8 +10498,6 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
     assert!(narrow.iter().all(|line| !line.chars().all(|ch| ch == '─')));
 }
 
-const BUNDLED_THEME_NAMES: [&str; 3] = ["clawed", "kodex", "pie"];
-
 fn populate_theme_fixture(shell: &mut InteractiveShell) {
     shell.set_identity("local", "qwen3.6-27b", "high");
     let mut state = shell.state.borrow_mut();
@@ -10659,80 +10603,79 @@ fn ansi_background_is_open_at_end(line: &str) -> bool {
 }
 
 #[test]
-fn bundled_theme_pack_shares_safe_transcript_geometry_across_wide_and_narrow_identities() {
+fn custom_theme_keeps_safe_transcript_geometry_across_color_and_width_profiles() {
     use crate::tui::terminal::{ColorDepth, TerminalCapabilities};
     use crate::tui::theme::TerminalBackground;
 
-    for name in BUNDLED_THEME_NAMES {
-        let mut shell = InteractiveShell::test_shell();
-        shell.set_size(96, 80);
-        shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-            name,
-            TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
-            TerminalBackground::Dark,
-        ));
-        populate_theme_fixture(&mut shell);
-        let transcript = shell.state.borrow().rendered_transcript(96).join("\n");
-        assert!(
-            !transcript.contains("\x1b[48;2;255;112;24m"),
-            "{name} leaked the default theme's model-adaptive provenance paint"
-        );
-        assert!(
-            !transcript.contains("\x1b[38;2;255;112;24m"),
-            "{name} rendered provenance as foreground-only"
-        );
-        let unclosed_backgrounds = transcript
-            .lines()
-            .filter(|line| ansi_background_is_open_at_end(line))
-            .collect::<Vec<_>>();
-        assert!(
-            unclosed_backgrounds.is_empty(),
-            "{name} leaked a painted surface beyond its row: {unclosed_backgrounds:?}"
-        );
+    let fixed_surface_theme = format!("{SURFACE_TEST_THEME}\n[model]\nuse_lab_color = false\n");
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(96, 80);
+    shell.set_theme(crate::tui::theme::test_theme_source_with(
+        &fixed_surface_theme,
+        TerminalCapabilities::test(true, true, ColorDepth::TrueColor),
+        TerminalBackground::Dark,
+    ));
+    populate_theme_fixture(&mut shell);
+    let transcript = shell.state.borrow().rendered_transcript(96).join("\n");
+    assert!(
+        !transcript.contains("\x1b[48;2;255;112;24m"),
+        "custom theme leaked the default model-adaptive provenance paint"
+    );
+    assert!(
+        !transcript.contains("\x1b[38;2;255;112;24m"),
+        "custom theme rendered provenance as foreground-only"
+    );
+    let unclosed_backgrounds = transcript
+        .lines()
+        .filter(|line| ansi_background_is_open_at_end(line))
+        .collect::<Vec<_>>();
+    assert!(
+        unclosed_backgrounds.is_empty(),
+        "custom theme leaked a painted surface beyond its row: {unclosed_backgrounds:?}"
+    );
 
-        let mut plain_shell = InteractiveShell::test_shell();
-        plain_shell.set_size(96, 80);
-        plain_shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-            name,
-            TerminalCapabilities::test(false, false, ColorDepth::None),
-            TerminalBackground::Dark,
-        ));
-        populate_theme_fixture(&mut plain_shell);
-        let plain = plain_shell
-            .state
-            .borrow()
-            .rendered_transcript(96)
-            .join("\n");
-        assert!(
-            !plain.contains('\x1b'),
-            "{name} emitted ANSI in no-color mode"
-        );
+    let mut plain_shell = InteractiveShell::test_shell();
+    plain_shell.set_size(96, 80);
+    plain_shell.set_theme(crate::tui::theme::test_theme_source_with(
+        &fixed_surface_theme,
+        TerminalCapabilities::test(false, false, ColorDepth::None),
+        TerminalBackground::Dark,
+    ));
+    populate_theme_fixture(&mut plain_shell);
+    let plain = plain_shell
+        .state
+        .borrow()
+        .rendered_transcript(96)
+        .join("\n");
+    assert!(
+        !plain.contains('\x1b'),
+        "custom theme emitted ANSI in no-color mode"
+    );
 
-        let mut narrow_shell = InteractiveShell::test_shell();
-        narrow_shell.set_size(40, 80);
-        narrow_shell.set_theme(crate::tui::theme::test_bundled_theme_with(
-            name,
-            TerminalCapabilities::test(false, false, ColorDepth::None),
-            TerminalBackground::Dark,
-        ));
-        populate_theme_fixture(&mut narrow_shell);
-        let narrow_frame = narrow_shell
-            .state
-            .borrow()
-            .rendered_transcript(40)
-            .join("\n");
-        assert!(
-            narrow_frame.lines().all(|line| visible_width(line) <= 40),
-            "{name} overflowed a narrow terminal"
-        );
+    let mut narrow_shell = InteractiveShell::test_shell();
+    narrow_shell.set_size(40, 80);
+    narrow_shell.set_theme(crate::tui::theme::test_theme_source_with(
+        &fixed_surface_theme,
+        TerminalCapabilities::test(false, false, ColorDepth::None),
+        TerminalBackground::Dark,
+    ));
+    populate_theme_fixture(&mut narrow_shell);
+    let narrow_frame = narrow_shell
+        .state
+        .borrow()
+        .rendered_transcript(40)
+        .join("\n");
+    assert!(
+        narrow_frame.lines().all(|line| visible_width(line) <= 40),
+        "custom theme overflowed a narrow terminal"
+    );
 
-        if std::env::var_os("YGG_DUMP_THEME_FRAMES").is_some() {
-            eprintln!(
-                "\n===== {name} / wide =====\n{}",
-                strip_terminal_sequences(&transcript)
-            );
-            eprintln!("\n===== {name} / narrow =====\n{narrow_frame}");
-        }
+    if std::env::var_os("YGG_DUMP_THEME_FRAMES").is_some() {
+        eprintln!(
+            "\n===== custom / wide =====\n{}",
+            strip_terminal_sequences(&transcript)
+        );
+        eprintln!("\n===== custom / narrow =====\n{narrow_frame}");
     }
 }
 

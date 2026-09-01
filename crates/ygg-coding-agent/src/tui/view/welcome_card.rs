@@ -244,16 +244,17 @@ mod tests {
     use sexy_tui_rs::strip_terminal_sequences;
 
     #[test]
-    fn clawed_welcome_is_solid_orange_and_framed() {
+    fn custom_welcome_theme_is_solid_accent_and_framed() {
         let shell =
-            InteractiveShell::test_shell_with_theme(crate::tui::theme::test_bundled_theme_with(
-                "clawed",
-                crate::tui::terminal::TerminalCapabilities::test(
-                    true,
-                    true,
-                    crate::tui::terminal::ColorDepth::TrueColor,
-                ),
-                crate::tui::theme::TerminalBackground::Dark,
+            InteractiveShell::test_shell_with_theme(crate::tui::theme::test_theme_from_source(
+                r##"
+                    [metadata]
+                    name = "Welcome fixture"
+                    adaptive = false
+                    [colors]
+                    splash = "#d97757"
+                    splash_box = "#d97757"
+                "##,
             ));
         shell.state.borrow_mut().startup_card_started_at = Some(Instant::now());
         let rendered = render_welcome_card(&shell.state.borrow(), 80, 10, Instant::now());

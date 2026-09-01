@@ -113,8 +113,8 @@ describe("authoritative Rust wire contract", () => {
     ]);
     expect(bootstrap.authorityCeiling).toBe("workspace");
     expect(bootstrap.themes[0]?.theme.typography).toEqual({
-      body_family: "system-sans",
-      mono_family: "system-mono",
+      body_family: "system-ui",
+      mono_family: "ui-monospace",
       body_size: 17,
       display_ratio_milli: 1235,
     });
