@@ -88,7 +88,7 @@ describe("authoritative Rust wire contract", () => {
 
     expect(bootstrap.host).toEqual({
       id: "host-demo",
-      name: "Achu's Mac",
+      name: "Developer Mac",
       connection: "local",
     });
     expect(bootstrap.models[0]).toMatchObject({
@@ -1017,7 +1017,7 @@ describe("authoritative Rust wire contract", () => {
   it("projects complete cross-client catalog summary changes", () => {
     const summary = clone(hostBootstrapGolden.sessions[0]);
     summary.id = "session-from-other-client";
-    summary.title = "Created on Achu’s phone";
+    summary.title = "Created on review phone";
     summary.attention = "unreadCompletion";
 
     expect(
@@ -1039,7 +1039,7 @@ describe("authoritative Rust wire contract", () => {
         catalogRevision: 9,
         summary: {
           id: "session-from-other-client",
-          title: "Created on Achu’s phone",
+          title: "Created on review phone",
           unread: true,
           attentionCount: 0,
         },

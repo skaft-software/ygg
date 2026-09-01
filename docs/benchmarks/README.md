@@ -99,6 +99,17 @@ Those cases require a harness-specific driver and should be supplied with
 same task, endpoint, model weights, context limit, timeout, hardware, and
 concurrency for every harness.
 
+## Publication boundary
+
+Raw campaign homes and first-pass captures remain owner-only. Before committing
+an evidence package, replace user-home, workspace, configuration-root, and
+nonessential host-identity strings with stable public placeholders; remove
+credentials, sessions, private evaluator material, and provider payloads rather
+than redacting them in place. Keep methodology-relevant hardware, versions,
+digests, argument flags, environment keys, and numeric samples. Record exactly
+what was sanitized, state whether any measurements changed, and recompute public
+artifact checksums after sanitation.
+
 ## Failure taxonomy
 
 Record each non-success trial in one primary class and optional secondary

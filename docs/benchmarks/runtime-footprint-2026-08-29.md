@@ -86,8 +86,8 @@ the measured commands through a shell. The campaign parameters were:
 - stdin held open for all headless runtime modes; stdout/stderr discarded;
 - no prompt or model request, and no inference server.
 
-Each runtime used a private, otherwise empty configuration root under
-`/private/tmp/ygg-runtime-footprint-2026-08-29`. Ygg used the checked-in static
+Each runtime used a private, otherwise empty configuration root represented as
+`/benchmark/config` in the public artifacts. Ygg used the checked-in static
 [benchmark provider declaration](runtime-footprint-2026-08-29/ygg-custom-provider.json)
 with discovery disabled and `--offline`; its unreachable placeholder endpoint
 was never contacted. Pi used offline RPC mode with sessions, tools, extensions,
@@ -123,9 +123,13 @@ flushing, thermal controls, or a claim of an otherwise quiescent OS.
 | Pi Node runtime | Node v26.7.0; executable SHA-256 `1ef99ea25fe70c9b67e7efe768ef8ee22148d3cabc703db6131b57aeb617d040` |
 | Codex CLI | 0.149.0; executable SHA-256 `f4a74117b8142cda581c95ff753abf4508b5636d89682c1ed77e4a9249af8963` |
 
-Resolved executable paths, exact argument vectors, full kernel text, and all
-configuration-root paths are retained in the JSON. The machine-readable
-[manifest](runtime-footprint-2026-08-29/manifest.json) records the same pins.
+Resolved executable identities, argument-vector shapes, and environment keys are
+retained in the JSON. User-home, workspace, and isolated configuration-root
+strings were replaced after capture with stable `/opt/...`, `/workspace/ygg`,
+and `/benchmark/config` placeholders. Numeric samples, versions, executable
+digests, flags, and environment keys are unchanged. The machine-readable
+[manifest](runtime-footprint-2026-08-29/manifest.json) records this sanitization,
+and `SHA256SUMS` covers the resulting public artifacts.
 
 ## Raw evidence
 

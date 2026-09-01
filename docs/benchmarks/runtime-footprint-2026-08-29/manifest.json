@@ -41,10 +41,10 @@
       "version_output": "1.18.20"
     },
     "pi": {
-      "launcher": "/Users/achumukundan/.local/bin/pi",
+      "launcher": "/opt/pi/bin/pi",
       "name": "Pi",
       "package": "@earendil-works/pi-coding-agent",
-      "resolved_script": "/Users/achumukundan/.local/lib/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+      "resolved_script": "/opt/pi/lib/pi-coding-agent/dist/bundle/cli.js",
       "runtime": {
         "name": "Node.js",
         "resolved_executable": "/opt/homebrew/Cellar/node/26.7.0/bin/node",
@@ -56,9 +56,9 @@
       "version_output": "0.84.4"
     },
     "ygg": {
-      "launcher": "/Users/achumukundan/.local/bin/ygg",
+      "launcher": "/opt/ygg/bin/ygg",
       "name": "Ygg",
-      "resolved_executable": "/Users/achumukundan/.local/bin/ygg",
+      "resolved_executable": "/opt/ygg/bin/ygg",
       "sha256": "55bb257792a7e13782ca016a7432ee9c6dbe5787665ad8885b0ba4abd4c09cf9",
       "version": "0.6.3",
       "version_output": "ygg 0.6.3"
@@ -67,8 +67,17 @@
   "notes": [
     "PSS is unavailable on this macOS host and is never replaced with RSS.",
     "Startup is only wall time for the generic --version case.",
-    "Runtime commands use isolated configuration roots and stdin-open headless protocol modes; exact argv is retained in every raw report."
+    "Runtime commands use isolated configuration roots and stdin-open headless protocol modes; argument-vector shapes and environment keys are retained in every public report."
   ],
+  "public_sanitization": {
+    "applied": true,
+    "measurements_changed": false,
+    "replaced_fields": [
+      "user-home paths",
+      "workspace paths",
+      "isolated configuration-root paths"
+    ]
+  },
   "raw_reports": [
     "codex-runtime.json",
     "opencode-runtime.json",
@@ -94,6 +103,6 @@
     "sha256": "726711574d778bd493cc2ff43bff0657a70f80a5ab1acf90a5fe660d568735b2"
   },
   "schema": "ygg.runtime-footprint-manifest.v1",
-  "workspace": "/Users/achumukundan/github/skaft-software/ygg",
+  "workspace": "/workspace/ygg",
   "workspace_head": "a161941442b0fa6e3ad335e9eb90549cc1661c54"
 }

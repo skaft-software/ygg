@@ -212,7 +212,9 @@ reports retained.
 ## Artifact map
 
 - `data/dataset-manifest.json`: immutable dataset revision, schema, row count,
-  and parquet hash.
+  and parquet hash. Original local absolute paths are represented under the
+  stable public `/workspace/ygg` placeholder; content hashes and row data are
+  unchanged.
 - `data/agent_tasks.jsonl`: public-safe task metadata; no evaluator labels.
 - `selection/*.json`: deterministic selections and seeds.
 - `scripts/`: dataset, serial and isolated-parallel runners, official evaluator

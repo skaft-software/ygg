@@ -2,7 +2,7 @@
   "created_unix_ms": 1788045580764,
   "environment": {
     "cpu_count": 8,
-    "cwd": "/Users/achumukundan/github/skaft-software/ygg",
+    "cwd": "/workspace/ygg",
     "kernel_version": "Darwin Kernel Version 27.0.0: Tue Aug 11 22:06:24 PDT 2026; root:xnu-13432.1.9~3/RELEASE_ARM64_T8122",
     "machine": "arm64",
     "os_release": "27.0.0",
@@ -14,11 +14,11 @@
     {
       "argv": [
         "/usr/bin/env",
-        "HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/codex",
-        "CODEX_HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/codex/.codex",
+        "HOME=/benchmark/config/codex",
+        "CODEX_HOME=/benchmark/config/codex/.codex",
         "/opt/homebrew/bin/codex",
         "-C",
-        "/Users/achumukundan/github/skaft-software/ygg",
+        "/workspace/ygg",
         "--disable",
         "plugins",
         "--disable",

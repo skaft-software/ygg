@@ -75,7 +75,7 @@ const themeCatalog: ThemeOption[] = [
 const devicesCatalog: ConnectedDevice[] = [
   {
     id: "device-this-mac",
-    name: "Achu’s MacBook Pro",
+    name: "Developer Mac",
     platform: "macOS",
     status: "this_device",
     lastSeen: "Now",
@@ -83,7 +83,7 @@ const devicesCatalog: ConnectedDevice[] = [
   },
   {
     id: "device-phone",
-    name: "Achu’s iPhone",
+    name: "Review iPhone",
     platform: "iOS",
     status: "connected",
     lastSeen: "Now",
@@ -91,7 +91,7 @@ const devicesCatalog: ConnectedDevice[] = [
   },
   {
     id: "device-linux",
-    name: "temper",
+    name: "Build host",
     platform: "Linux",
     status: "offline",
     lastSeen: "Yesterday at 11:42 PM",
@@ -139,7 +139,7 @@ export const fixtureBootstrap: HostBootstrap = {
   protocolVersion: PROTOCOL_VERSION,
   host: {
     id: "host-macbook",
-    name: "Achu’s MacBook Pro",
+    name: "Developer Mac",
     connection: "local",
   },
   catalogRevision: 12,

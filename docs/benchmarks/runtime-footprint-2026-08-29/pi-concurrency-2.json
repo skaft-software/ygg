@@ -2,7 +2,7 @@
   "created_unix_ms": 1788045443202,
   "environment": {
     "cpu_count": 8,
-    "cwd": "/Users/achumukundan/github/skaft-software/ygg",
+    "cwd": "/workspace/ygg",
     "kernel_version": "Darwin Kernel Version 27.0.0: Tue Aug 11 22:06:24 PDT 2026; root:xnu-13432.1.9~3/RELEASE_ARM64_T8122",
     "machine": "arm64",
     "os_release": "27.0.0",
@@ -14,10 +14,10 @@
     {
       "argv": [
         "/usr/bin/env",
-        "HOME=/private/tmp/ygg-runtime-footprint-2026-08-29/pi",
-        "PI_CODING_AGENT_DIR=/private/tmp/ygg-runtime-footprint-2026-08-29/pi/agent",
+        "HOME=/benchmark/config/pi",
+        "PI_CODING_AGENT_DIR=/benchmark/config/pi/agent",
         "PI_OFFLINE=1",
-        "/Users/achumukundan/.local/bin/pi",
+        "/opt/pi/bin/pi",
         "--mode",
         "rpc",
         "--offline",

@@ -172,7 +172,7 @@ silently regenerated.
   "devices": [
     {
       "id": "device-example",
-      "name": "Achu's iPhone",
+      "name": "Reviewer's iPhone",
       "platform": "ios",
       "tokenHash": "sha256:...",
       "pairedAtMs": 0,
