@@ -194,80 +194,107 @@ impl Tool for SearchTool {
         args: serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolOutput, ToolError> {
+        self.execute_with_program(args, ctx, std::path::Path::new("rg"))
+            .await
+    }
+}
+
+impl SearchTool {
+    async fn execute_with_program(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext<'_>,
+        program: &std::path::Path,
+    ) -> Result<ToolOutput, ToolError> {
         self.effect(&args, ctx)?;
         let args: SearchArgs = parse_args(args)?;
-        let max_results = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
+        execute_search(args, ctx, program).await
+    }
+}
 
-        // Resolve explicit paths through the host policy. `rg` keeps relative
-        // display paths for workspace targets and receives an absolute target
-        // for trusted-local paths outside the workspace.
-        let search_path = args
-            .path
-            .as_deref()
-            .map(|path| ctx.resolve_existing(path))
-            .transpose()?;
+async fn execute_search(
+    args: SearchArgs,
+    ctx: &ToolContext<'_>,
+    program: &std::path::Path,
+) -> Result<ToolOutput, ToolError> {
+    let max_results = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
 
-        let mut command = tokio::process::Command::new("rg");
-        command.args([
-            "--json",
-            "--sort",
-            "path",
-            "--no-config",
-            "--max-columns",
-            RG_MAX_COLUMNS,
-            "--max-columns-preview",
-            "--max-filesize",
-            RG_MAX_FILESIZE,
-        ]);
-        if args.mode == SearchMode::Literal {
-            command.arg("--fixed-strings");
-        }
-        if let Some(glob) = &args.glob {
-            command.args(["--glob", glob]);
-        }
-        // `--` terminates flags: the model's query and path are data, never
-        // options, and no shell is involved at any point.
-        command.arg("--").arg(&args.query);
-        if let Some(path) = &search_path {
-            if let Ok(relative) = path.strip_prefix(ctx.workspace) {
-                command.arg(if relative.as_os_str().is_empty() {
-                    std::path::Path::new(".")
-                } else {
-                    relative
-                });
+    // Resolve explicit paths through the host policy. `rg` keeps relative
+    // display paths for workspace targets and receives an absolute target
+    // for trusted-local paths outside the workspace.
+    let search_path = args
+        .path
+        .as_deref()
+        .map(|path| ctx.resolve_existing(path))
+        .transpose()?;
+
+    let mut command = tokio::process::Command::new(program);
+    command.args([
+        "--json",
+        "--sort",
+        "path",
+        "--no-config",
+        "--max-columns",
+        RG_MAX_COLUMNS,
+        "--max-columns-preview",
+        "--max-filesize",
+        RG_MAX_FILESIZE,
+    ]);
+    if args.mode == SearchMode::Literal {
+        command.arg("--fixed-strings");
+    }
+    if let Some(glob) = &args.glob {
+        command.args(["--glob", glob]);
+    }
+    // `--` terminates flags: the model's query and path are data, never
+    // options, and no shell is involved at any point.
+    command.arg("--").arg(&args.query);
+    if let Some(path) = &search_path {
+        if let Ok(relative) = path.strip_prefix(ctx.workspace) {
+            command.arg(if relative.as_os_str().is_empty() {
+                std::path::Path::new(".")
             } else {
-                command.arg(path);
-            }
+                relative
+            });
+        } else {
+            command.arg(path);
         }
-        command
-            .env_clear()
-            .envs(crate::extension_process::sanitized_subprocess_environment())
-            .current_dir(ctx.workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            // Error text is not surfaced (it can contain host paths), so never
-            // create an unread pipe that a child can fill and deadlock on.
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
+    }
+    command
+        .env_clear()
+        .envs(crate::extension_process::sanitized_subprocess_environment())
+        .current_dir(ctx.workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        // Error text is not surfaced (it can contain host paths), so never
+        // create an unread pipe that a child can fill and deadlock on.
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
 
-        let mut child = command.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ToolError::new("search is unavailable: ripgrep (rg) was not found on PATH")
-            } else {
-                ToolError::new(format!("failed to start ripgrep: {e}"))
-            }
-        })?;
+    let mut child = command.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            ToolError::new("search is unavailable: ripgrep (rg) was not found on PATH")
+        } else {
+            ToolError::new(format!("failed to start ripgrep: {e}"))
+        }
+    })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ToolError::new("failed to capture ripgrep output"))?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            return Err(ToolError::new("failed to capture ripgrep output"));
+        }
+    };
 
-        let byte_budget = ctx.sandbox.max_output_bytes.saturating_sub(128).max(1024);
-        let collect = async {
-            let (results, truncated) = collect_rg_stdout(stdout, max_results, byte_budget).await?;
+    let byte_budget = ctx.sandbox.max_output_bytes.saturating_sub(128).max(1024);
+    let deadline = tokio::time::Instant::now() + ctx.sandbox.bash_timeout;
+    let collect = async {
+        let (results, truncated) = collect_rg_stdout(stdout, max_results, byte_budget).await?;
 
-            let status = if truncated {
+        let status =
+            if truncated {
                 // Enough results — stop ripgrep instead of draining it.
                 let _ = child.start_kill();
                 child
@@ -280,50 +307,48 @@ impl Tool for SearchTool {
                     ToolError::new(format!("failed to wait for ripgrep: {error}"))
                 })?)
             };
-            Ok::<_, ToolError>((results, truncated, status))
-        };
-        let (results, truncated, status) =
-            match tokio::time::timeout(ctx.sandbox.bash_timeout, collect).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => {
-                    let _ = child.start_kill();
-                    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-                    return Err(error);
-                }
-                Err(_) => {
-                    let _ = child.start_kill();
-                    // Bound cleanup separately; `kill_on_drop` remains the final
-                    // backstop if an unusual platform does not reap promptly.
-                    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-                    return Err(ToolError::new(format!(
-                        "search exceeded the {:.0}s execution limit",
-                        ctx.sandbox.bash_timeout.as_secs_f64()
-                    )));
-                }
-            };
-
-        // rg exits 0 on matches, 1 on no matches, 2 on real errors.
-        if status.is_some_and(|status| status.code() == Some(2)) && results.is_empty() {
-            return Err(ToolError::new(
-                "search failed: ripgrep reported an error (check the query/glob syntax)",
-            ));
+        Ok::<_, ToolError>((results, truncated, status))
+    };
+    let (results, truncated, status) = match tokio::time::timeout_at(deadline, collect).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            return Err(error);
         }
-
-        if results.is_empty() {
-            return Ok(ToolOutput::new("no matches"));
+        Err(_) => {
+            let _ = child.start_kill();
+            // Bound cleanup separately; `kill_on_drop` remains the final
+            // backstop if an unusual platform does not reap promptly.
+            let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
+            return Err(ToolError::new(format!(
+                "search exceeded the {:.0}s execution limit",
+                ctx.sandbox.bash_timeout.as_secs_f64()
+            )));
         }
-        let count_line = if truncated {
-            format!("{}+ matches", results.len())
-        } else if results.len() == 1 {
-            "1 match".to_string()
-        } else {
-            format!("{} matches", results.len())
-        };
-        Ok(ToolOutput::new(format!(
-            "{count_line}\n{}\ntruncated={truncated}",
-            results.join("\n")
-        )))
+    };
+
+    // rg exits 0 on matches, 1 on no matches, 2 on real errors.
+    if status.is_some_and(|status| status.code() == Some(2)) && results.is_empty() {
+        return Err(ToolError::new(
+            "search failed: ripgrep reported an error (check the query/glob syntax)",
+        ));
     }
+
+    if results.is_empty() {
+        return Ok(ToolOutput::new("no matches"));
+    }
+    let count_line = if truncated {
+        format!("{}+ matches", results.len())
+    } else if results.len() == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{} matches", results.len())
+    };
+    Ok(ToolOutput::new(format!(
+        "{count_line}\n{}\ntruncated={truncated}",
+        results.join("\n")
+    )))
 }
 
 async fn collect_rg_stdout<R: tokio::io::AsyncRead + Unpin>(
@@ -436,6 +461,7 @@ mod tests {
     use crate::ToolProgressSink;
     use serde_json::json;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     struct Fixture {
         _dir: tempfile::TempDir,
@@ -469,9 +495,13 @@ mod tests {
 
     impl Fixture {
         fn ctx(&self) -> ToolContext<'_> {
+            self.ctx_with(&self.sandbox)
+        }
+
+        fn ctx_with<'a>(&'a self, sandbox: &'a SandboxConfig) -> ToolContext<'a> {
             ToolContext {
                 workspace: &self.workspace,
-                sandbox: &self.sandbox,
+                sandbox,
                 execution_scope: "search-test",
                 resource_owner: "search-test",
                 active_skills: &[],
@@ -489,6 +519,98 @@ mod tests {
             .stderr(Stdio::null())
             .status()
             .is_ok()
+    }
+
+    #[cfg(unix)]
+    fn executable_script(workspace: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = workspace.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: i32) -> bool {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while process_is_alive(pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        !process_is_alive(pid)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_saturation_does_not_block_search() {
+        let f = fixture();
+        let program = executable_script(
+            &f.workspace,
+            "rg-stderr-saturating",
+            r#"
+            dd if=/dev/zero bs=1048576 count=1 >&2
+            exit 2
+            "#,
+        );
+        let mut sandbox = f.sandbox.clone();
+        sandbox.bash_timeout = Duration::from_secs(2);
+        let ctx = f.ctx_with(&sandbox);
+        let started = Instant::now();
+
+        let error = SearchTool
+            .execute_with_program(json!({"query": "needle"}), &ctx, &program)
+            .await
+            .unwrap_err();
+
+        assert!(started.elapsed() < sandbox.bash_timeout);
+        assert!(
+            error.message.contains("ripgrep reported an error"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_eof_does_not_bypass_search_timeout_or_cleanup() {
+        let f = fixture();
+        let program = executable_script(
+            &f.workspace,
+            "rg-closes-stdout",
+            r#"
+            printf '%s' "$$" > child.pid
+            exec 1>&-
+            exec /bin/sleep 5
+            "#,
+        );
+        let mut sandbox = f.sandbox.clone();
+        sandbox.bash_timeout = Duration::from_millis(150);
+        let ctx = f.ctx_with(&sandbox);
+        let started = Instant::now();
+
+        let error = SearchTool
+            .execute_with_program(json!({"query": "needle"}), &ctx, &program)
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("execution limit"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "search waited for a child that had already closed stdout"
+        );
+        let pid: i32 = std::fs::read_to_string(f.workspace.join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_for_process_exit(pid, Duration::from_secs(1)).await,
+            "timed-out search child was not reaped"
+        );
     }
 
     #[test]
