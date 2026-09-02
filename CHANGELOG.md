@@ -2,6 +2,15 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## 0.6.7 — 2026-09-02
+
+### Fixed
+
+- Fully neutralize Git clean/process filters from repository, worktree, and
+  included configuration during Serve status refresh. Filter names that cannot
+  be represented safely, including invalid UTF-8 and delimiter-bearing names,
+  now fail closed before Git status can execute them.
+
 ## 0.6.6 — 2026-09-02
 
 ### Added
@@ -33,8 +42,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   search subprocesses from stalling on saturated output pipes.
 - Classify subagent turn-limit settlement as bounded completion and preserve the
   parent result.
-- Isolate repository clean filters from status refreshes and serialize durable
-  goal updates across independently opened processes.
+- Isolate ordinary repository-local clean filters from status refreshes and
+  serialize durable goal updates across independently opened processes.
 - Resolve and launch Serve's GitHub CLI through a hardened environment and clean
   up its complete descendant process tree after cancellation or timeout.
 - Keep web session selection and stalled resynchronization monotonic and

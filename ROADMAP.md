@@ -110,13 +110,15 @@ responsibilities.
 
 Tracking: [maintainability umbrella #19](https://github.com/skaft-software/ygg/issues/19).
 
-## Now — v0.6.6 daily-driver closure
+## Shipped — v0.6.6 daily-driver closure and v0.6.7 security hotfix
 
 [v0.6.6 milestone](https://github.com/skaft-software/ygg/milestone/7) ·
 [parent epic #186](https://github.com/skaft-software/ygg/issues/186)
 
-This is the final non-breaking v0.6 release. It finishes the product already in
-users' hands; it does not absorb v0.7 runtime work.
+v0.6.6 was the final feature-bearing non-breaking v0.6 release. v0.6.7
+completes its Git clean-filter isolation after final review found a
+worktree-config bypass. This line finishes the product already in users' hands;
+it does not absorb v0.7 runtime work.
 
 ### Terminal trust
 
@@ -151,26 +153,28 @@ Tracking: [repository safety #188](https://github.com/skaft-software/ygg/issues/
 
 - Promote one protected immutable candidate through build, signing, publication,
   and post-publish verification.
-- Preserve reproducible GitHub release archives, checksums, signatures,
+- Ship reproducible GitHub release archives, checksums, signatures,
   attestations, installer smokes, and repair procedures.
-- Add npm trusted publishing with native platform packages and no network-running
-  postinstall hook.
-- Add a Homebrew tap/formula with audit/install/update/uninstall tests.
-- Verify GitHub, npm, and Homebrew resolve the same version and provenance.
+- Keep npm, Homebrew, and crates.io unpublished until the product/package rename
+  and external channel ownership are decided; repository-side packaging remains
+  fail-closed and does not imply publication.
 
-Tracking: [release/distribution #189](https://github.com/skaft-software/ygg/issues/189).
+Tracking:
+[deferred release/distribution #189](https://github.com/skaft-software/ygg/issues/189) ·
+[npm #213](https://github.com/skaft-software/ygg/issues/213) ·
+[Homebrew #214](https://github.com/skaft-software/ygg/issues/214).
 
 ### Exit gate
 
 - No known unclassified critical vulnerability or live secret.
-- Required release, security, package, installer, and post-publish checks pass on
-  the exact candidate.
+- Required release, security, GitHub package, installer, and post-publish checks
+  pass on the exact candidate.
 - Canonical TUI traces show no corruption or unexplained destructive replay.
 - Public docs and package versions agree.
-- An unguided beta covers install, first task, clean exit/resume, cancellation,
-  and second-day return.
+- Live-provider/audio acceptance and an unguided external beta remain explicit
+  v0.6 release waivers; this roadmap makes no claim that they ran.
 
-## Next — v0.7 universal runtime and pinned Pi parity
+## Now — v0.7 universal runtime and pinned Pi parity
 
 [v0.7 milestone](https://github.com/skaft-software/ygg/milestone/8) ·
 [parent epic #190](https://github.com/skaft-software/ygg/issues/190)
