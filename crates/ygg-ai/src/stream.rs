@@ -148,8 +148,9 @@ pub(crate) struct ResponseBuilder {
     pub(crate) pricing: Option<Pricing>,
     /// The request's exact tool-definition snapshot. `None` is reserved for
     /// direct schema-less codec fixtures; production assembly sets `Some`, even
-    /// when the request has no tools, so missing or unknown response tools fail
-    /// closed rather than being matched to a guessed schema.
+    /// when the request has no tools, so known response tools are validated
+    /// against the exact snapshot while unknown names remain available for
+    /// the agent's bounded unknown-tool recovery path.
     pub(crate) tool_definitions: Option<Vec<ToolDef>>,
     pub(crate) response_id: Option<String>,
     /// Authoritative terminal OpenAI Responses output, if supplied.

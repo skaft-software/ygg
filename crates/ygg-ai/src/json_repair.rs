@@ -209,10 +209,12 @@ pub(crate) fn validate_tool_arguments(
         }
     }
     let Some(schema) = schema else {
-        return Err(bounded_error(
-            "tool argument schema validation failed",
-            format!("no schema for tool `{}`", bounded_text(tool_name, 128)),
-        ));
+        // Keep unknown calls in the canonical response so the agent dispatcher
+        // can return its bounded `unknown tool` result to the model. There is
+        // no schema to validate or typed tool to invoke in this case; treating
+        // the provider response as a decode failure would prevent that normal
+        // recovery path.
+        return Ok(());
     };
 
     let mut schema_budget = ValidationBudget::default();
@@ -991,7 +993,10 @@ mod tests {
         ] {
             assert!(validate_tool_arguments("read", &invalid, &tools).is_err());
         }
-        assert!(validate_tool_arguments("write", &arguments, &tools).is_err());
+        assert!(validate_tool_arguments("read", &serde_json::json!({}), &tools).is_err());
+        // Unknown names are preserved for the agent dispatcher to report as a
+        // tool result so the model can recover on its next turn.
+        assert!(validate_tool_arguments("no_such_tool", &arguments, &tools).is_ok());
     }
 
     #[test]
