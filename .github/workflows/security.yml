@@ -12,14 +12,14 @@ jobs:
   dependencies:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: apps/web/.node-version
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       # cargo-audit validates Cargo.lock by default; unlike Cargo, current
@@ -36,7 +36,7 @@ jobs:
   fuzz-session-records:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install pinned nightly toolchain
         run: rustup toolchain install nightly-2026-08-01 --profile minimal --no-self-update
       - run: cargo +nightly-2026-08-01 install cargo-fuzz --version 0.13.2 --locked
@@ -45,7 +45,7 @@ jobs:
   address-sanitizer:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - name: Install pinned nightly toolchain
         run: rustup toolchain install nightly-2026-08-01 --profile minimal --component rust-src --target x86_64-unknown-linux-gnu --no-self-update
       - run: RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" cargo +nightly-2026-08-01 test -Zbuild-std --target x86_64-unknown-linux-gnu -p ygg-agent --lib
@@ -53,15 +53,15 @@ jobs:
   coverage:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@f7446eecb41674ffe9e1e12a2bc5e69a9dec09d3
+      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
         with:
           tool: cargo-llvm-cov@0.8.7
       - run: cargo llvm-cov --workspace --all-features --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: coverage-lcov
           path: lcov.info
