@@ -2845,8 +2845,8 @@ fn extract_ctx_from_model_entry(entry: &serde_json::Value) -> u64 {
 }
 
 // Codex's checked-in defaults are only a discovery fallback. The authenticated
-// `/models` response can downshift a Plus account or expose a larger Pro
-// window, and is authoritative whenever available.
+// `/models` response is authoritative for plan-specific advertised limits; Ygg
+// then applies the bounded working-window policy below.
 const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;

@@ -2,6 +2,14 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
+## Unreleased
+
+### Changed
+
+- Cap authenticated Codex model and request budgeting at 272,000 tokens by
+  default, matching Pi. Smaller provider windows remain authoritative while
+  larger advertised maxima remain available as discovery metadata.
+
 ## 0.6.5 — 2026-08-30
 
 ### Added
