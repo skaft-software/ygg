@@ -13,6 +13,67 @@ use std::time::Duration;
 
 /// Default maximum bytes retained for each model-visible tool result.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
+/// Default total number of attempts for one remote media read, including the
+/// initial request.
+pub const DEFAULT_REMOTE_READ_MAX_ATTEMPTS: usize = 3;
+/// Default delay before the first remote media retry.
+pub const DEFAULT_REMOTE_READ_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+/// Default upper bound for exponential remote media retry delays.
+pub const DEFAULT_REMOTE_READ_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// Hard upper bound for the total number of remote media attempts, including
+/// the initial request.
+pub const MAX_REMOTE_READ_ATTEMPTS: usize = 8;
+/// Hard upper bound for one remote media retry delay.
+pub const MAX_REMOTE_READ_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Bounded retry behavior for idempotent remote media reads.
+///
+/// `max_attempts` includes the initial request. Transport failures, response
+/// timeouts, and HTTP 408, 429, or 5xx responses may consume the remaining
+/// attempts; validation, content, and other HTTP errors do not. A zero
+/// `max_attempts` value is treated as one attempt. Setting either backoff to
+/// zero disables the corresponding delay without disabling retries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteReadRetryPolicy {
+    /// Total requests allowed for one remote media read, including the first.
+    pub max_attempts: usize,
+    /// Delay before the first retry; later delays double up to `max_backoff`.
+    pub initial_backoff: Duration,
+    /// Maximum delay between remote media attempts.
+    pub max_backoff: Duration,
+}
+
+impl Default for RemoteReadRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: DEFAULT_REMOTE_READ_MAX_ATTEMPTS,
+            initial_backoff: DEFAULT_REMOTE_READ_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_REMOTE_READ_MAX_BACKOFF,
+        }
+    }
+}
+
+impl RemoteReadRetryPolicy {
+    /// Normalize a caller-provided attempt count at the execution boundary.
+    pub(crate) fn attempts(&self) -> usize {
+        self.max_attempts.clamp(1, MAX_REMOTE_READ_ATTEMPTS)
+    }
+
+    /// Return the deterministic capped exponential delay for a retry numbered
+    /// from one. Saturating arithmetic keeps malformed host configuration from
+    /// overflowing a duration.
+    pub(crate) fn backoff_for_retry(&self, retry_number: usize) -> Duration {
+        let cap = self.max_backoff.min(MAX_REMOTE_READ_BACKOFF);
+        if retry_number == 0 || self.initial_backoff.is_zero() || cap.is_zero() {
+            return Duration::ZERO;
+        }
+        let mut delay = self.initial_backoff.min(cap);
+        for _ in 1..retry_number.min(64) {
+            delay = delay.saturating_mul(2);
+        }
+        delay.min(cap)
+    }
+}
 
 /// Capability gates and resource limits enforced by the agent's tools.
 ///
@@ -48,6 +109,8 @@ pub struct SandboxConfig {
     /// This narrow authority is independent of process execution and defaults
     /// off so conservative library hosts never gain network access implicitly.
     pub allow_remote_read: bool,
+    /// Bounded retry and backoff policy for transient remote media failures.
+    pub remote_read_retry: RemoteReadRetryPolicy,
     /// Explicit Bash-compatible shell executable. When unset on Unix, Ygg
     /// follows Pi's order: `/bin/bash`, `bash` on `PATH`, then `sh`.
     pub shell_path: Option<PathBuf>,
@@ -72,6 +135,7 @@ impl SandboxConfig {
             allow_process: false,
             allow_shell: false,
             allow_remote_read: false,
+            remote_read_retry: RemoteReadRetryPolicy::default(),
             shell_path: None,
             bash_timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
@@ -249,6 +313,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let canonical = dir.path().canonicalize().unwrap();
         (dir, canonical)
+    }
+
+    #[test]
+    fn remote_read_retry_policy_is_bounded_and_exponential() {
+        let policy = RemoteReadRetryPolicy::default();
+        assert_eq!(policy.attempts(), DEFAULT_REMOTE_READ_MAX_ATTEMPTS);
+        assert_eq!(policy.backoff_for_retry(0), Duration::ZERO);
+        assert_eq!(policy.backoff_for_retry(1), Duration::from_millis(100));
+        assert_eq!(policy.backoff_for_retry(2), Duration::from_millis(200));
+        assert_eq!(policy.backoff_for_retry(5), Duration::from_millis(1600));
+        assert_eq!(policy.backoff_for_retry(6), Duration::from_secs(2));
+
+        let untrusted = RemoteReadRetryPolicy {
+            max_attempts: usize::MAX,
+            initial_backoff: Duration::from_secs(60),
+            max_backoff: Duration::from_secs(60),
+        };
+        assert_eq!(untrusted.attempts(), MAX_REMOTE_READ_ATTEMPTS);
+        assert_eq!(untrusted.backoff_for_retry(1), MAX_REMOTE_READ_BACKOFF);
     }
 
     #[test]
