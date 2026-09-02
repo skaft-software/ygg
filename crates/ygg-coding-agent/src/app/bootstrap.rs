@@ -4598,9 +4598,7 @@ mod bounded_env_tests {
             strict_env_value("STRICT", oversized_result("STRICT")),
         ];
         for result in errors {
-            let error = result
-                .err()
-                .expect("oversized environment values must fail");
+            let error = result.expect_err("oversized environment values must fail");
             assert!(error.to_string().contains("4096-byte limit"));
         }
     }
