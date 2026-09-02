@@ -3,6 +3,7 @@
 //! Default-off adapter from the graphical host contracts to the real Ygg App.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -30,44 +31,45 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    isolate_process_group, parse_test_output, refresh_repository_context, ActiveCompaction,
-    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AgentRunPhase as ServeRunPhase,
-    AgentRunTelemetry, AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind,
-    ArtifactRef, AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef,
-    AttachmentStore, AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery,
-    CommandSuggestion, CommandSuggestionKind, CompletedCompaction, CompletionReview,
-    ContextCategory, ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals,
-    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    ActiveCompaction, ActivityPhase, ActivityPhaseSummary, ActorOwnerState,
+    AgentRunPhase as ServeRunPhase, AgentRunTelemetry,
+    AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind, ArtifactRef,
+    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
+    AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery, CommandSuggestion,
+    CommandSuggestionKind, CompletedCompaction, CompletionReview, ContextCategory,
+    ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
+    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, ExtensionPresentation, FileChange, FileEntryId,
     FinalizeCompletion, FinalizeDecision, GoalAction, GoalState as ServeGoalState, GoalStore,
     GoalStoreError, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
     InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
-    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProcessTree,
-    ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError,
-    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError,
-    ProjectSummary, PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary,
-    RegistryProjectId, RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot,
-    RequestAnswer, RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument,
-    SearchDocumentKind, SearchError, SemanticRole, ServiceError, SessionBranchEntry,
-    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor,
-    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
-    SessionSnapshot, SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation,
-    SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
-    SupervisorConfig, TerminationSignal, TestCommandOutcome, TestCommandStatus, TestFramework,
-    TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
-    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
-    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
-    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
-    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
-    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
-    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
-    PROTOCOL_VERSION,
+    LifetimeUsage, LoopbackConfig, LoopbackServer, MAX_ITEM_TEXT_BYTES,
+    MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES, ModelInputPricing,
+    ModelInputPricingTier, ModelSelection, ModelSummary, PROTOCOL_VERSION, PendingRequest,
+    PermanentDeleteConfirmation, ProcessTree, ProjectFileRead, ProjectFileSearchResult,
+    ProjectFileSystem, ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId,
+    ProjectRegistry, ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation,
+    PullRequestState, PullRequestSummary, RegistryProjectId, RegistryProjectState,
+    RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind,
+    RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole,
+    ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
+    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
+    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
+    SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef,
+    StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig, TerminationSignal,
+    TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput, ThemeColor,
+    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass,
+    ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus, ToolKind,
+    ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest, TranscriptSearchResult,
+    TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary, TrustedFileRead,
+    TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity, UsagePeriod,
+    UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery, isolate_process_group,
+    parse_test_output, refresh_repository_context,
 };
 
-use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
-use crate::app::{reasoning_label, supported_levels_with_subagents, App, Reconfig};
+use crate::app::bootstrap::{LaunchSelection, SessionSelection, build_app, rebuild_app};
+use crate::app::{App, Reconfig, reasoning_label, supported_levels_with_subagents};
 use crate::commands;
 use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
@@ -618,8 +620,161 @@ const GITHUB_CLI_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_m
 const GITHUB_CLI_FORCE_PERIOD: std::time::Duration = std::time::Duration::from_millis(400);
 const GITHUB_CLI_CLEANUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 const PULL_REQUEST_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Explicitly retained values for the host-owned `gh` helper. Provider
+/// credentials, dynamic-loader controls, and arbitrary dotenv values must not
+/// cross this boundary.
+const GITHUB_CLI_INHERITED_ENVIRONMENT: &[&str] = &[
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GH_HOST",
+    "GH_CONFIG_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "CURL_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_COLLATE",
+    "LC_MESSAGES",
+    "LC_MONETARY",
+    "LC_NUMERIC",
+    "LC_TIME",
+    "__CF_USER_TEXT_ENCODING",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TERM",
+    "COLORTERM",
+];
+
+#[cfg(windows)]
+const GITHUB_CLI_EXECUTABLE_NAMES: &[&str] = &["gh.exe", "gh"];
+#[cfg(not(windows))]
+const GITHUB_CLI_EXECUTABLE_NAMES: &[&str] = &["gh"];
+
 static GITHUB_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_GITHUB_QUERIES);
+
+fn external_github_path_directory(root: &Path, directory: &Path) -> Option<PathBuf> {
+    if !directory.is_absolute() || directory.starts_with(root) {
+        return None;
+    }
+    let directory = directory.canonicalize().ok()?;
+    if !directory.is_absolute()
+        || directory.starts_with(root)
+        || !directory.symlink_metadata().ok()?.is_dir()
+    {
+        return None;
+    }
+    Some(directory)
+}
+
+fn resolve_github_cli_executable_from_path(workspace: &Path, path: &OsStr) -> Option<PathBuf> {
+    let root = workspace.canonicalize().ok()?;
+    if !root.is_absolute() || !root.symlink_metadata().ok()?.is_dir() {
+        return None;
+    }
+    for raw_directory in std::env::split_paths(path) {
+        let Some(directory) = external_github_path_directory(&root, &raw_directory) else {
+            continue;
+        };
+        for name in GITHUB_CLI_EXECUTABLE_NAMES {
+            let Ok(candidate) = directory.join(name).canonicalize() else {
+                continue;
+            };
+            if !candidate.is_absolute() || candidate.starts_with(&root) {
+                continue;
+            }
+            let Ok(metadata) = candidate.symlink_metadata() else {
+                continue;
+            };
+            let file_type = metadata.file_type();
+            if !file_type.is_file() || file_type.is_symlink() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if metadata.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn resolve_github_cli_executable(workspace: &Path) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    resolve_github_cli_executable_from_path(workspace, &path)
+}
+
+fn sanitized_github_cli_path_from(workspace: &Path, path: &OsStr) -> Option<OsString> {
+    let root = workspace.canonicalize().ok()?;
+    let mut directories = Vec::new();
+    for raw_directory in std::env::split_paths(path) {
+        let Some(directory) = external_github_path_directory(&root, &raw_directory) else {
+            continue;
+        };
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    (!directories.is_empty())
+        .then(|| std::env::join_paths(directories).ok())
+        .flatten()
+}
+
+fn github_cli_environment_from(
+    workspace: &Path,
+    mut get: impl FnMut(&str) -> Option<OsString>,
+    path: Option<&OsStr>,
+) -> BTreeMap<OsString, OsString> {
+    let mut environment = GITHUB_CLI_INHERITED_ENVIRONMENT
+        .iter()
+        .filter_map(|name| get(name).map(|value| (OsString::from(*name), value)))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(path) = path.and_then(|path| sanitized_github_cli_path_from(workspace, path)) {
+        environment.insert(OsString::from("PATH"), path);
+    }
+    environment
+}
+
+fn github_cli_environment(workspace: &Path) -> BTreeMap<OsString, OsString> {
+    let path = std::env::var_os("PATH");
+    github_cli_environment_from(workspace, |name| std::env::var_os(name), path.as_deref())
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct PullRequestIdentity {
@@ -1764,10 +1919,11 @@ impl YggHost {
             },
         )?;
         seed.summary.pull_request = self.cached_pull_request(session_id);
-        let pull_request_discovery_enabled = session
-            .entries()
-            .iter()
-            .any(|entry| matches!(&entry.value, EntryValue::Message(Message::User(_))));
+        let pull_request_discovery_enabled = context.config.sandbox.process_execution_allowed()
+            && session
+                .entries()
+                .iter()
+                .any(|entry| matches!(&entry.value, EntryValue::Message(Message::User(_))));
         let reasoning =
             config::parse_reasoning(&selection.reasoning).map_err(|_| ServiceError::InvalidSeed)?;
         let known_entries = session.entries().len();
@@ -2280,7 +2436,7 @@ fn export_session_bytes(
         match ygg_agent::secure_fs::read_regular_file_bounded(&report.destination, max_bytes) {
             Ok(bytes) => bytes,
             Err(ygg_agent::secure_fs::SecureFileError::TooLarge { .. }) => {
-                return Err(ServiceError::PayloadTooLarge)
+                return Err(ServiceError::PayloadTooLarge);
             }
             Err(_) => return Err(ServiceError::Internal),
         };
@@ -3524,6 +3680,7 @@ struct PullRequestRefreshPlan {
     projection: Arc<Mutex<Option<PullRequestSummary>>>,
     discovery_enabled: Arc<AtomicBool>,
     refresh_requested: Arc<tokio::sync::Notify>,
+    process_execution_allowed: bool,
 }
 
 impl From<&WorkerPlan> for PullRequestRefreshPlan {
@@ -3535,6 +3692,7 @@ impl From<&WorkerPlan> for PullRequestRefreshPlan {
             projection: Arc::clone(&plan.pull_request_projection),
             discovery_enabled: Arc::clone(&plan.pull_request_discovery_enabled),
             refresh_requested: Arc::clone(&plan.pull_request_refresh_requested),
+            process_execution_allowed: plan.config.sandbox.process_execution_allowed(),
         }
     }
 }
@@ -3667,8 +3825,28 @@ async fn execute_github_pull_request_query(
     executable: &Path,
     timeout: std::time::Duration,
 ) -> PullRequestObservation {
+    let environment = github_cli_environment(workspace);
+    execute_github_pull_request_query_with_environment(
+        workspace,
+        selector,
+        executable,
+        timeout,
+        &environment,
+    )
+    .await
+}
+
+async fn execute_github_pull_request_query_with_environment(
+    workspace: &Path,
+    selector: Option<&str>,
+    executable: &Path,
+    timeout: std::time::Duration,
+    environment: &BTreeMap<OsString, OsString>,
+) -> PullRequestObservation {
     let mut command = tokio::process::Command::new(executable);
     command
+        .env_clear()
+        .envs(environment)
         .args(["pr", "view"])
         .current_dir(workspace)
         .env_remove("GH_REPO")
@@ -3803,7 +3981,18 @@ async fn publish_pull_request_projection(
 async fn refresh_pull_request_projection(
     plan: &PullRequestRefreshPlan,
     events: &mpsc::Sender<TimestampedEvent>,
-    executable: &Path,
+) -> Result<(), ServiceError> {
+    let executable = plan
+        .process_execution_allowed
+        .then(|| resolve_github_cli_executable(&plan.workspace))
+        .flatten();
+    refresh_pull_request_projection_inner(plan, events, executable.as_deref()).await
+}
+
+async fn refresh_pull_request_projection_inner(
+    plan: &PullRequestRefreshPlan,
+    events: &mpsc::Sender<TimestampedEvent>,
+    executable: Option<&Path>,
 ) -> Result<(), ServiceError> {
     let pull_requests = Arc::clone(&plan.pull_requests);
     let session_id = plan.session_id.clone();
@@ -3825,9 +4014,13 @@ async fn refresh_pull_request_projection(
         .as_ref()
         .is_some_and(|pull_request| pull_request.state == PullRequestState::Merged)
         || (previous.is_none() && !plan.discovery_enabled.load(Ordering::Acquire))
+        || !plan.process_execution_allowed
     {
         return Ok(());
     }
+    let Some(executable) = executable else {
+        return Ok(());
+    };
     let observation = query_hosted_github_pull_request(
         &plan.workspace,
         previous
@@ -3855,6 +4048,9 @@ async fn run_hosted_pull_request_refresh(
     plan: PullRequestRefreshPlan,
     events: mpsc::Sender<TimestampedEvent>,
 ) {
+    if !plan.process_execution_allowed {
+        return;
+    }
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + PULL_REQUEST_REFRESH_INTERVAL,
         PULL_REQUEST_REFRESH_INTERVAL,
@@ -3866,7 +4062,7 @@ async fn run_hosted_pull_request_refresh(
             _ = interval.tick() => {}
             () = plan.refresh_requested.notified() => {}
         }
-        let _ = refresh_pull_request_projection(&plan, &events, Path::new("gh")).await;
+        let _ = refresh_pull_request_projection(&plan, &events).await;
     }
 }
 
@@ -3876,7 +4072,12 @@ async fn refresh_pull_request_projection_with_executable(
     events: &mpsc::Sender<TimestampedEvent>,
     executable: &Path,
 ) -> Result<(), ServiceError> {
-    refresh_pull_request_projection(&PullRequestRefreshPlan::from(plan), events, executable).await
+    refresh_pull_request_projection_inner(
+        &PullRequestRefreshPlan::from(plan),
+        events,
+        Some(executable),
+    )
+    .await
 }
 
 fn select_inactive_pull_request_batch(
@@ -3927,6 +4128,9 @@ async fn refresh_inactive_pull_requests_once(
     attempted: &mut BTreeSet<String>,
     executable: &Path,
 ) {
+    if !host.config.sandbox.process_execution_allowed() {
+        return;
+    }
     let hosted = supervisor.hosted_session_ids().await;
     let pull_requests = Arc::clone(&host.pull_requests);
     let refreshable = match tokio::task::spawn_blocking(move || {
@@ -4025,6 +4229,9 @@ async fn run_pull_request_catalog_refresh(
     host: Arc<YggHost>,
     supervisor: Arc<SessionSupervisor<YggHost>>,
 ) {
+    if !host.config.sandbox.process_execution_allowed() {
+        return;
+    }
     let mut pending_catalog = BTreeSet::new();
     let mut attempted = BTreeSet::new();
     let mut interval = tokio::time::interval_at(
@@ -4034,12 +4241,15 @@ async fn run_pull_request_catalog_refresh(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        let Some(executable) = resolve_github_cli_executable(&host.config.workspace) else {
+            continue;
+        };
         refresh_inactive_pull_requests_once(
             &host,
             &supervisor,
             &mut pending_catalog,
             &mut attempted,
-            Path::new("gh"),
+            &executable,
         )
         .await;
     }
@@ -6476,7 +6686,7 @@ async fn start_and_drive_run(
                 return Ok(RunDriveOutcome::Rejected {
                     admission,
                     error: ServiceError::Internal,
-                })
+                });
             }
             Ok(Some(rendered)) => rendered.text,
             Ok(None) => model_text,
@@ -6507,7 +6717,7 @@ async fn start_and_drive_run(
                 return Ok(RunDriveOutcome::Rejected {
                     admission,
                     error: ServiceError::Internal,
-                })
+                });
             }
         };
         let pending_context_count = composition.pending_context_count;
@@ -6635,9 +6845,11 @@ async fn start_and_drive_run(
             control.abort();
         }
     }
-    plan.pull_request_discovery_enabled
-        .store(true, Ordering::Release);
-    plan.pull_request_refresh_requested.notify_one();
+    if plan.config.sandbox.process_execution_allowed() {
+        plan.pull_request_discovery_enabled
+            .store(true, Ordering::Release);
+        plan.pull_request_refresh_requested.notify_one();
+    }
 
     let mut response_text = String::new();
     let mut extension_refresh = tokio::time::interval(std::time::Duration::from_millis(250));
@@ -9175,7 +9387,11 @@ fn build_completion_review(
         action_count,
         if action_count == 1 { "" } else { "s" },
         changed_file_item_ids.len(),
-        if changed_file_item_ids.len() == 1 { "" } else { "s" },
+        if changed_file_item_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
         verification_action_item_ids.len(),
         if verification_action_item_ids.len() == 1 {
             ""
@@ -9183,7 +9399,11 @@ fn build_completion_review(
             "s"
         },
         failed_action_item_ids.len(),
-        if failed_action_item_ids.len() == 1 { "" } else { "s" },
+        if failed_action_item_ids.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
         warning_action_item_ids.len(),
         if warning_action_item_ids.len() == 1 {
             ""
@@ -11435,8 +11655,8 @@ mod tests {
     use ygg_ai::{AiError, AssistantMessage, Protocol, TransportPhase, UserMessage};
     use ygg_serve_backend::{
         AckDisposition, ActorConfig, ActorError, CatalogCursor, CommandId, DeviceId, HostBootstrap,
-        SessionActorCore, SessionCommandEnvelope, SessionSupervisor, SupervisorConfig,
-        SupervisorError, PROTOCOL_VERSION,
+        PROTOCOL_VERSION, SessionActorCore, SessionCommandEnvelope, SessionSupervisor,
+        SupervisorConfig, SupervisorError,
     };
 
     #[test]
@@ -11969,10 +12189,12 @@ mod tests {
         drop(host);
 
         let mut reopened = YggHost::new(config).unwrap();
-        assert!(reopened
-            .catalog
-            .resolve(&ModelId(historical_selection.model.clone()))
-            .is_ok());
+        assert!(
+            reopened
+                .catalog
+                .resolve(&ModelId(historical_selection.model.clone()))
+                .is_ok()
+        );
         let advertised_model_count = reopened.models.len();
         reopened.models.retain(|model| {
             model.provider != historical_selection.provider
@@ -12354,17 +12576,19 @@ mod tests {
         let mut store = PullRequestStore::open(directory.path()).unwrap();
 
         store.delete_session(&session_id).unwrap();
-        assert!(apply_pull_request_observation(
-            &mut store,
-            &session_id,
-            PullRequestObservation::Trackable {
-                number: 124,
-                url: "https://github.com/skaft-software/ygg/pull/124".into(),
-                state: PullRequestState::Ready,
-            },
-            20,
-        )
-        .is_err());
+        assert!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::Ready,
+                },
+                20,
+            )
+            .is_err()
+        );
         assert_eq!(store.summary(&session_id), None);
         assert!(store.take_catalog_changes().is_empty());
     }
@@ -12474,17 +12698,19 @@ mod tests {
         let persisted_path = store.path.clone();
         store.path = directory.path().join("unreplaceable-directory");
         std::fs::create_dir(&store.path).unwrap();
-        assert!(apply_pull_request_observation(
-            &mut store,
-            &session_id,
-            PullRequestObservation::Trackable {
-                number: 124,
-                url: "https://github.com/skaft-software/ygg/pull/124".into(),
-                state: PullRequestState::Merged,
-            },
-            20,
-        )
-        .is_err());
+        assert!(
+            apply_pull_request_observation(
+                &mut store,
+                &session_id,
+                PullRequestObservation::Trackable {
+                    number: 124,
+                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                    state: PullRequestState::Merged,
+                },
+                20,
+            )
+            .is_err()
+        );
         assert_eq!(
             store.summary(&session_id),
             Some(PullRequestSummary {
@@ -12678,6 +12904,282 @@ mod tests {
                 })
             }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_cli_resolver_ignores_relative_and_workspace_local_fakes() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let workspace_bin = workspace.join("bin");
+        let workspace_alias = directory.path().join("workspace-bin-alias");
+        let external_bin = directory.path().join("external-bin");
+        std::fs::create_dir_all(&workspace_bin).unwrap();
+        std::fs::create_dir_all(&external_bin).unwrap();
+        symlink(&workspace_bin, &workspace_alias).unwrap();
+
+        let write_executable = |path: &Path, body: &str| {
+            std::fs::write(path, body).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write_executable(
+            &workspace_bin.join("gh"),
+            r#"#!/bin/sh
+printf workspace > workspace-gh-ran
+printf '%s' '{"number":111,"url":"https://github.com/skaft-software/ygg/pull/111","state":"OPEN","isDraft":false}'
+"#,
+        );
+        write_executable(
+            &external_bin.join("gh"),
+            r#"#!/bin/sh
+printf external > external-gh-ran
+printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124","state":"OPEN","isDraft":false}'
+"#,
+        );
+        let path = std::env::join_paths([
+            OsString::from("relative-bin"),
+            workspace_bin.as_os_str().to_owned(),
+            workspace_alias.as_os_str().to_owned(),
+            external_bin.as_os_str().to_owned(),
+        ])
+        .unwrap();
+
+        let resolved = resolve_github_cli_executable_from_path(&workspace, &path).unwrap();
+        assert_eq!(resolved, external_bin.canonicalize().unwrap().join("gh"));
+        assert_eq!(
+            query_github_pull_request(&workspace, None, &resolved).await,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            }
+        );
+        assert!(!workspace.join("workspace-gh-ran").exists());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("external-gh-ran")).unwrap(),
+            "external"
+        );
+    }
+
+    #[test]
+    fn github_cli_environment_retains_auth_and_filters_provider_canaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let workspace_bin = workspace.join("bin");
+        let external_bin = directory.path().join("external-bin");
+        std::fs::create_dir_all(&workspace_bin).unwrap();
+        std::fs::create_dir_all(&external_bin).unwrap();
+        let path = std::env::join_paths([
+            OsString::from("relative-bin"),
+            workspace_bin.as_os_str().to_owned(),
+            external_bin.as_os_str().to_owned(),
+        ])
+        .unwrap();
+        let values = BTreeMap::from([
+            (OsString::from("GH_TOKEN"), OsString::from("gh-token")),
+            (
+                OsString::from("GITHUB_TOKEN"),
+                OsString::from("github-token"),
+            ),
+            (
+                OsString::from("GH_ENTERPRISE_TOKEN"),
+                OsString::from("enterprise-token"),
+            ),
+            (OsString::from("GH_HOST"), OsString::from("github.example")),
+            (
+                OsString::from("HTTPS_PROXY"),
+                OsString::from("https://proxy"),
+            ),
+            (
+                OsString::from("SSL_CERT_FILE"),
+                OsString::from("/etc/reviewed-ca.pem"),
+            ),
+            (OsString::from("LANG"), OsString::from("C.UTF-8")),
+            (OsString::from("HOME"), OsString::from("/home/reviewer")),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("provider-canary"),
+            ),
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("provider-canary"),
+            ),
+            (
+                OsString::from("YGG_PROVIDER_CANARY"),
+                OsString::from("provider-canary"),
+            ),
+            (OsString::from("LD_PRELOAD"), OsString::from("/tmp/evil.so")),
+            (
+                OsString::from("GH_REPO"),
+                OsString::from("wrong/repository"),
+            ),
+        ]);
+        let environment = github_cli_environment_from(
+            &workspace,
+            |name| values.get(OsStr::new(name)).cloned(),
+            Some(path.as_os_str()),
+        );
+
+        assert_eq!(
+            environment
+                .get(OsStr::new("GH_TOKEN"))
+                .and_then(|value| value.to_str()),
+            Some("gh-token")
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("GITHUB_TOKEN"))
+                .and_then(|value| value.to_str()),
+            Some("github-token")
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("GH_ENTERPRISE_TOKEN"))
+                .and_then(|value| value.to_str()),
+            Some("enterprise-token")
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("HTTPS_PROXY"))
+                .and_then(|value| value.to_str()),
+            Some("https://proxy")
+        );
+        assert_eq!(
+            environment
+                .get(OsStr::new("SSL_CERT_FILE"))
+                .and_then(|value| value.to_str()),
+            Some("/etc/reviewed-ca.pem")
+        );
+        assert_eq!(
+            std::env::split_paths(environment.get(OsStr::new("PATH")).unwrap()).collect::<Vec<_>>(),
+            vec![external_bin.canonicalize().unwrap()]
+        );
+        for name in [
+            "OPENAI_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "YGG_PROVIDER_CANARY",
+            "LD_PRELOAD",
+            "GH_REPO",
+        ] {
+            assert!(!environment.contains_key(OsStr::new(name)), "leaked {name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_cli_fixture_receives_auth_without_provider_canaries() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let external_bin = directory.path().join("external-bin");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&external_bin).unwrap();
+        let executable = external_bin.join("gh");
+        std::fs::write(
+            &executable,
+            r#"#!/bin/sh
+if [ "${GH_TOKEN-}" != "gh-token" ] || [ "${GH_ENTERPRISE_TOKEN-}" != "enterprise-token" ]; then
+  exit 21
+fi
+if [ -n "${OPENAI_API_KEY-}" ] || [ -n "${AWS_SECRET_ACCESS_KEY-}" ] || [ -n "${YGG_PROVIDER_CANARY-}" ] || [ -n "${LD_PRELOAD-}" ] || [ -n "${GH_REPO-}" ]; then
+  exit 22
+fi
+printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124","state":"OPEN","isDraft":false}'
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = std::env::join_paths([external_bin.as_os_str()]).unwrap();
+        let values = BTreeMap::from([
+            (OsString::from("GH_TOKEN"), OsString::from("gh-token")),
+            (
+                OsString::from("GH_ENTERPRISE_TOKEN"),
+                OsString::from("enterprise-token"),
+            ),
+            (
+                OsString::from("OPENAI_API_KEY"),
+                OsString::from("provider-canary"),
+            ),
+            (
+                OsString::from("AWS_SECRET_ACCESS_KEY"),
+                OsString::from("provider-canary"),
+            ),
+            (
+                OsString::from("YGG_PROVIDER_CANARY"),
+                OsString::from("provider-canary"),
+            ),
+            (OsString::from("LD_PRELOAD"), OsString::from("/tmp/evil.so")),
+            (
+                OsString::from("GH_REPO"),
+                OsString::from("wrong/repository"),
+            ),
+        ]);
+        let environment = github_cli_environment_from(
+            &workspace,
+            |name| values.get(OsStr::new(name)).cloned(),
+            Some(path.as_os_str()),
+        );
+
+        assert_eq!(
+            execute_github_pull_request_query_with_environment(
+                &workspace,
+                None,
+                &executable,
+                std::time::Duration::from_secs(1),
+                &environment,
+            )
+            .await,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pull_request_refresh_honors_no_process_for_periodic_and_requested_work() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = pull_request_worker_plan(directory.path(), "no-process-refresh");
+        plan.config.sandbox.allow_process = false;
+        plan.pull_request_discovery_enabled
+            .store(true, Ordering::Release);
+        let executable = directory.path().join("gh-no-process-fixture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf spawned > no-process-gh-ran\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (events, mut received) = mpsc::channel(4);
+        let refresh_plan = PullRequestRefreshPlan::from(&plan);
+        assert!(!refresh_plan.process_execution_allowed);
+        let request = Arc::clone(&refresh_plan.refresh_requested);
+        let task = tokio::spawn(run_hosted_pull_request_refresh(
+            refresh_plan,
+            events.clone(),
+        ));
+        request.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+
+        refresh_pull_request_projection_with_executable(&plan, &events, &executable)
+            .await
+            .unwrap();
+        assert!(!plan.config.workspace.join("no-process-gh-ran").exists());
+        assert_eq!(
+            plan.pull_requests.lock().unwrap().summary(&plan.session_id),
+            None
+        );
+        assert!(received.try_recv().is_err());
     }
 
     #[cfg(unix)]
@@ -13193,9 +13695,11 @@ mod tests {
                 .trashed_at_ms,
             Some(41_000)
         );
-        assert!(load_pending_session_deletions(&host.serve_state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            load_pending_session_deletions(&host.serve_state_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -13331,12 +13835,13 @@ mod tests {
         .unwrap();
 
         assert!(sessions.path_by_id(session_id.as_str()).is_err());
-        assert!(host
-            .projects
-            .lock()
-            .unwrap()
-            .project_for_session(session_id.as_str())
-            .is_none());
+        assert!(
+            host.projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .is_none()
+        );
         assert_eq!(
             host.attachments
                 .as_ref()
@@ -13345,13 +13850,14 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert!(host
-            .documents
-            .as_ref()
-            .unwrap()
-            .list_for_session(project_id.as_str(), session_id.as_str())
-            .unwrap()
-            .is_empty());
+        assert!(
+            host.documents
+                .as_ref()
+                .unwrap()
+                .list_for_session(project_id.as_str(), session_id.as_str())
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             host.documents.as_ref().unwrap().get_for_session(
                 project_id.as_str(),
@@ -13360,27 +13866,31 @@ mod tests {
             ),
             Err(DocumentStoreError::NotFound)
         );
-        assert!(host
-            .resources
-            .as_ref()
-            .unwrap()
-            .content(&session_id, &resource.handle)
-            .is_err());
-        assert!(host
-            .resources
-            .as_ref()
-            .unwrap()
-            .run_record(&session_id, &run_entry)
-            .is_err());
+        assert!(
+            host.resources
+                .as_ref()
+                .unwrap()
+                .content(&session_id, &resource.handle)
+                .is_err()
+        );
+        assert!(
+            host.resources
+                .as_ref()
+                .unwrap()
+                .run_record(&session_id, &run_entry)
+                .is_err()
+        );
         assert_eq!(host.goals.get(&session_id).unwrap(), None);
         assert_eq!(
             host.pull_requests.lock().unwrap().summary(&session_id),
             None
         );
         assert_eq!(host.usage.lock().unwrap().lifetime().request_count, 1);
-        assert!(load_pending_session_deletions(&host.serve_state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            load_pending_session_deletions(&host.serve_state_dir)
+                .unwrap()
+                .is_empty()
+        );
 
         drop(host);
         let reopened = YggHost::new(config).unwrap();
@@ -13389,16 +13899,20 @@ mod tests {
             reopened.pull_requests.lock().unwrap().summary(&session_id),
             None
         );
-        assert!(reopened
-            .documents
-            .as_ref()
-            .unwrap()
-            .list_for_session(project_id.as_str(), session_id.as_str())
-            .unwrap()
-            .is_empty());
-        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .documents
+                .as_ref()
+                .unwrap()
+                .list_for_session(project_id.as_str(), session_id.as_str())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            load_pending_session_deletions(&reopened.serve_state_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -13459,15 +13973,19 @@ mod tests {
         assert_eq!(metadata.trashed_at_ms, Some(76_000));
         assert!(sessions.path_by_id(session_id.as_str()).is_ok());
         assert!(!staged_metadata.exists());
-        assert!(reopened
-            .projects
-            .lock()
-            .unwrap()
-            .project_for_session(session_id.as_str())
-            .is_some());
-        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .is_some()
+        );
+        assert!(
+            load_pending_session_deletions(&reopened.serve_state_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -13510,12 +14028,14 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].committed);
         assert!(reopened.goals.get(&session_id).unwrap().is_some());
-        assert!(reopened
-            .projects
-            .lock()
-            .unwrap()
-            .project_for_session(session_id.as_str())
-            .is_some());
+        assert!(
+            reopened
+                .projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .is_some()
+        );
     }
 
     #[test]
@@ -13552,19 +14072,23 @@ mod tests {
         drop(deletion_guard);
 
         host.recover_pending_session_deletions();
-        assert!(load_pending_session_deletions(&host.serve_state_dir)
-            .unwrap()
-            .is_empty());
-        assert!(!sessions
-            .dir()
-            .join(".metadata")
-            .read_dir()
-            .unwrap()
-            .any(|entry| entry
+        assert!(
+            load_pending_session_deletions(&host.serve_state_dir)
                 .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".delete-locked-recovery-delete-")));
+                .is_empty()
+        );
+        assert!(
+            !sessions
+                .dir()
+                .join(".metadata")
+                .read_dir()
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".delete-locked-recovery-delete-"))
+        );
     }
 
     #[test]
@@ -13608,12 +14132,13 @@ mod tests {
         sessions
             .finish_permanent_delete(session_id.as_str())
             .unwrap();
-        assert!(host
-            .projects
-            .lock()
-            .unwrap()
-            .project_for_session(session_id.as_str())
-            .is_some());
+        assert!(
+            host.projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .is_some()
+        );
         let registry_project_id = RegistryProjectId::parse(project_id.as_str()).unwrap();
         host.projects
             .lock()
@@ -13623,22 +14148,28 @@ mod tests {
         drop(host);
 
         let reopened = YggHost::new(config).unwrap();
-        assert!(reopened
-            .projects
-            .lock()
-            .unwrap()
-            .project_for_session(session_id.as_str())
-            .is_none());
-        assert!(reopened
-            .documents
-            .as_ref()
-            .unwrap()
-            .list_for_session(project_id.as_str(), session_id.as_str())
-            .unwrap()
-            .is_empty());
-        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
-            .unwrap()
-            .is_empty());
+        assert!(
+            reopened
+                .projects
+                .lock()
+                .unwrap()
+                .project_for_session(session_id.as_str())
+                .is_none()
+        );
+        assert!(
+            reopened
+                .documents
+                .as_ref()
+                .unwrap()
+                .list_for_session(project_id.as_str(), session_id.as_str())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            load_pending_session_deletions(&reopened.serve_state_dir)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -14307,13 +14838,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!loaded.events.is_empty());
-        assert!(driver
-            .command_discovery()
-            .await
-            .unwrap()
-            .skills
-            .iter()
-            .any(|skill| skill.id == "composer-skill" && skill.active));
+        assert!(
+            driver
+                .command_discovery()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.id == "composer-skill" && skill.active)
+        );
 
         let unloaded = driver
             .dispatch(SessionCommand::InvokeSlashCommand {
@@ -14324,13 +14857,15 @@ mod tests {
             .await
             .unwrap();
         assert!(!unloaded.events.is_empty());
-        assert!(driver
-            .command_discovery()
-            .await
-            .unwrap()
-            .skills
-            .iter()
-            .any(|skill| skill.id == "composer-skill" && !skill.active));
+        assert!(
+            driver
+                .command_discovery()
+                .await
+                .unwrap()
+                .skills
+                .iter()
+                .any(|skill| skill.id == "composer-skill" && !skill.active)
+        );
 
         assert_eq!(
             driver
@@ -14626,11 +15161,13 @@ mod tests {
                 .map(ItemId::as_str),
             Some("item-call-branch-read")
         );
-        assert!(restored
-            .snapshot
-            .items
-            .iter()
-            .any(|item| matches!(item.payload, ItemPayload::Source(_))));
+        assert!(
+            restored
+                .snapshot
+                .items
+                .iter()
+                .any(|item| matches!(item.payload, ItemPayload::Source(_)))
+        );
     }
 
     #[test]
@@ -14654,19 +15191,21 @@ mod tests {
             outside_tool.arguments.clone(),
             "secret",
         );
-        assert!(project_tool_evidence(
-            &outside_session,
-            workspace.path(),
-            &registry,
-            &session_id,
-            &run_id,
-            &turn_id,
-            "call-outside",
-            &tool_item_id,
-            &outside_tool,
-            &ToolOutput::new("secret"),
-        )
-        .is_empty());
+        assert!(
+            project_tool_evidence(
+                &outside_session,
+                workspace.path(),
+                &registry,
+                &session_id,
+                &run_id,
+                &turn_id,
+                "call-outside",
+                &tool_item_id,
+                &outside_tool,
+                &ToolOutput::new("secret"),
+            )
+            .is_empty()
+        );
 
         std::fs::write(workspace.path().join("notes.md"), b"after\nsecond\n").unwrap();
         let edit = projected_tool(
@@ -14750,19 +15289,21 @@ mod tests {
             &output,
         );
 
-        assert!(project_tool_evidence(
-            &session,
-            workspace.path(),
-            &store,
-            &session_id,
-            &RunId::new("run-partial-evidence").unwrap(),
-            &TurnId::new("turn-partial-evidence").unwrap(),
-            "call-partial-write",
-            &ItemId::new("item-partial-evidence").unwrap(),
-            &tool,
-            &ToolOutput::new(output),
-        )
-        .is_empty());
+        assert!(
+            project_tool_evidence(
+                &session,
+                workspace.path(),
+                &store,
+                &session_id,
+                &RunId::new("run-partial-evidence").unwrap(),
+                &TurnId::new("turn-partial-evidence").unwrap(),
+                "call-partial-write",
+                &ItemId::new("item-partial-evidence").unwrap(),
+                &tool,
+                &ToolOutput::new(output),
+            )
+            .is_empty()
+        );
 
         let replacement = store
             .register(
@@ -14875,9 +15416,11 @@ mod tests {
             &replaced,
             &ToolOutput::new(replaced_output),
         );
-        assert!(replaced_events
-            .iter()
-            .all(|event| !matches!(event, EventPayload::ArtifactUpserted { .. })));
+        assert!(
+            replaced_events
+                .iter()
+                .all(|event| !matches!(event, EventPayload::ArtifactUpserted { .. }))
+        );
         assert!(replaced_events.iter().any(|event| {
             matches!(
                 event,
@@ -15406,10 +15949,12 @@ mod tests {
             graph.head,
             Some(DurableEntryId::new(first.0.clone()).unwrap())
         );
-        assert!(graph
-            .entries
-            .iter()
-            .any(|entry| entry.entry_id.as_str() == first.0));
+        assert!(
+            graph
+                .entries
+                .iter()
+                .any(|entry| entry.entry_id.as_str() == first.0)
+        );
         graph.validate().unwrap();
     }
 
@@ -15940,9 +16485,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(projection.known_entries, session.entries().len());
-        assert!(!live
-            .iter()
-            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
+        assert!(
+            !live
+                .iter()
+                .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. }))
+        );
         assert!(live.iter().any(|item| matches!(
             &item.payload,
             ItemPayload::RunOutcome {
@@ -15989,11 +16536,13 @@ mod tests {
         let public_snapshot = serde_json::to_string(&seed.snapshot).unwrap();
         assert!(!public_snapshot.contains(marker));
         assert!(public_snapshot.contains(diagnostic));
-        assert!(!seed
-            .snapshot
-            .items
-            .iter()
-            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
+        assert!(
+            !seed
+                .snapshot
+                .items
+                .iter()
+                .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. }))
+        );
     }
 
     #[test]
@@ -16228,10 +16777,12 @@ mod tests {
         assert_eq!(redacted_search.target.as_deref(), Some("[redacted query]"));
         let public = serde_json::to_string(&redacted_search).unwrap();
         assert!(!public.contains(query_canary));
-        assert!(redacted_search
-            .target
-            .as_deref()
-            .is_some_and(|target| target.len() <= 512));
+        assert!(
+            redacted_search
+                .target
+                .as_deref()
+                .is_some_and(|target| target.len() <= 512)
+        );
 
         let outside = tempfile::tempdir().unwrap();
         let outside_cwd = semantic_tool_activity(
@@ -16410,10 +16961,12 @@ mod tests {
         assert_eq!(review.warning_action_item_ids, vec![command_item]);
         assert_eq!(review.output_ids, vec![output_id]);
         assert_eq!(review.evidence_coverage, EvidenceCoverage::Partial);
-        assert!(review
-            .phases
-            .iter()
-            .any(|phase| phase.phase == ActivityPhase::Verified && phase.failed_count == 1));
+        assert!(
+            review
+                .phases
+                .iter()
+                .any(|phase| phase.phase == ActivityPhase::Verified && phase.failed_count == 1)
+        );
         review.validate().unwrap();
     }
 
@@ -16879,10 +17432,12 @@ mod tests {
             .unwrap();
         assert_eq!(context.document_context_tokens, 41);
         assert_eq!(context.project_file_context_tokens, 15);
-        assert!(items
-            .pending_user_items
-            .iter()
-            .all(|pending| pending.context_attributed));
+        assert!(
+            items
+                .pending_user_items
+                .iter()
+                .all(|pending| pending.context_attributed)
+        );
     }
 
     #[test]
