@@ -24,6 +24,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_OFFLINE: "false"
+  NPM_REGISTRY: https://registry.npmjs.org/
 
 jobs:
   resolve:
@@ -547,18 +548,30 @@ jobs:
             echo "canonical release $RELEASE_TAG is no longer a published stable release" >&2
             exit 1
           fi
-          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
           for asset in release-assets/*; do
             name=${asset##*/}
-            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              # Intentional rerun: replace the stale asset instead of refusing.
-              echo "replacing existing release asset: $name" >&2
-              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-                --jq '.assets[] | select(.name=="'"$name"'") | .id')
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
             fi
           done
-          gh release upload "$RELEASE_TAG" release-assets/*
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all release assets already match the immutable candidate"
+          fi
           verify_release_refs publishing
 
   verify-published:
@@ -788,7 +801,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npm install --global npm@11.5.1
+          npm_cli_integrity='sha512-Iy5vXZ55m8tIaSCz6bqQf9+W5XbPfoyURsgWLjOkFglqHTep6RDZqRj2sfYGeRyZvGu2HuJWm0lux0rxPQ29lQ=='
+          npm_cli_directory=$(mktemp -d "$RUNNER_TEMP/npm-cli.XXXXXX")
+          trap 'rm -rf "$npm_cli_directory"' EXIT
+          npm pack npm@11.5.1 --registry "$NPM_REGISTRY" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --pack-destination "$npm_cli_directory" >/dev/null
+          npm_cli_archive="$npm_cli_directory/npm-11.5.1.tgz"
+          test -f "$npm_cli_archive"
+          actual_integrity=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "$npm_cli_archive")
+          test "$actual_integrity" = "$npm_cli_integrity"
+          npm install --global \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "$npm_cli_archive"
           test "$(npm --version)" = "11.5.1"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -839,7 +868,7 @@ jobs:
             '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz'; do
             IFS='|' read -r package artifact <<< "$descriptor"
             expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
-            if existing=$(npm view "$package@$VERSION" dist.integrity --json 2>/dev/null); then
+            if existing=$(npm view "$package@$VERSION" dist.integrity --json --registry "$NPM_REGISTRY" 2>/dev/null); then
               existing=${existing#\"}
               existing=${existing%\"}
               if [[ "$existing" != "$expected" ]]; then
@@ -863,11 +892,11 @@ jobs:
             '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz' \
             '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
             IFS='|' read -r package artifact <<< "$descriptor"
-            if npm view "$package@$VERSION" version >/dev/null 2>&1; then
+            if npm view "$package@$VERSION" version --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
               echo "skipping already verified immutable package $package@$VERSION"
               continue
             fi
-            npm publish "npm-assets/$artifact" \
+            npm publish "npm-assets/$artifact" --registry "$NPM_REGISTRY" \
               --access public \
               --provenance \
               --ignore-scripts \
@@ -878,6 +907,9 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           for descriptor in \
@@ -887,18 +919,51 @@ jobs:
             '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
             IFS='|' read -r package artifact <<< "$descriptor"
             expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
-            actual=$(npm view "$package@$VERSION" dist.integrity --json)
-            actual=${actual#\"}
-            actual=${actual%\"}
-            [[ "$actual" == "$expected" ]] || {
-              echo "npm integrity mismatch for $package@$VERSION" >&2
-              exit 1
-            }
-            provenance=$(npm view "$package@$VERSION" dist.attestations.provenance --json 2>/dev/null || true)
-            [[ -n "$provenance" && "$provenance" != null ]] || {
-              echo "npm provenance is missing for $package@$VERSION" >&2
-              exit 1
-            }
+            registry_metadata="$RUNNER_TEMP/npm-registry.json"
+            npm view "$package@$VERSION" --json --registry "$NPM_REGISTRY" > "$registry_metadata"
+          attestation_url=$(python3 - "$registry_metadata" "$package" "$VERSION" <<'PY'
+          import json
+          import sys
+          from urllib.parse import unquote, urlsplit
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          package, version = sys.argv[2:]
+          url = metadata.get("dist", {}).get("attestations", {}).get("url")
+          parsed = urlsplit(url) if isinstance(url, str) else None
+          if (
+              parsed is None
+              or parsed.scheme != "https"
+              or parsed.netloc != "registry.npmjs.org"
+              or parsed.query
+              or parsed.fragment
+              or unquote(parsed.path) != f"/-/npm/v1/attestations/{package}@{version}"
+          ):
+              raise SystemExit("registry returned a non-canonical npm attestation URL")
+          print(url)
+          PY
+          )
+            attestations="$RUNNER_TEMP/npm-attestations.json"
+            curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 30 \
+              --max-filesize 1048576 \
+              --output "$attestations" \
+              "$attestation_url"
+            python3 source/scripts/verify-ygg-npm-provenance.py \
+              "$registry_metadata" \
+              "$attestations" \
+              npm-assets/YGG_NPM_MANIFEST.json \
+              "$package" \
+              "$VERSION" \
+              "$expected" \
+              "https://github.com/$WORKFLOW_REPOSITORY" \
+              '.github/workflows/release-ygg.yml' \
+              "$SOURCE_COMMIT" \
+              "$WORKFLOW_COMMIT"
           done
       - name: Sign and attach npm evidence to the canonical release
         shell: bash
@@ -923,7 +988,30 @@ jobs:
           cosign sign-blob --yes --bundle npm-assets/YGG_NPM_MANIFEST.json.sigstore.json npm-assets/YGG_NPM_MANIFEST.json
           cosign verify-blob --bundle npm-assets/YGG_NPM_SHA256SUMS.sigstore.json "${verify[@]}" npm-assets/YGG_NPM_SHA256SUMS
           cosign verify-blob --bundle npm-assets/YGG_NPM_MANIFEST.json.sigstore.json "${verify[@]}" npm-assets/YGG_NPM_MANIFEST.json
-          gh release upload "$RELEASE_TAG" npm-assets/*.tgz npm-assets/*.sigstore.json npm-assets/YGG_NPM_SHA256SUMS npm-assets/YGG_NPM_MANIFEST.json --clobber
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
+          for asset in npm-assets/*.tgz npm-assets/*.sigstore.json npm-assets/YGG_NPM_SHA256SUMS npm-assets/YGG_NPM_MANIFEST.json; do
+            name=${asset##*/}
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
+            fi
+          done
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all npm evidence assets already match the immutable candidate"
+          fi
 
   verify-npm-published:
     name: Verify published npm provenance
@@ -948,6 +1036,9 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           (cd npm-assets && sha256sum --check YGG_NPM_SHA256SUMS)
@@ -959,15 +1050,51 @@ jobs:
             '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
             IFS='|' read -r package artifact <<< "$descriptor"
             expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
-            actual=$(npm view "$package@$VERSION" dist.integrity --json)
-            actual=${actual#\"}
-            actual=${actual%\"}
-            [[ "$actual" == "$expected" ]] || exit 1
-            provenance=$(npm view "$package@$VERSION" dist.attestations.provenance --json 2>/dev/null || true)
-            [[ -n "$provenance" && "$provenance" != null ]] || {
-              echo "npm provenance missing for $package@$VERSION" >&2
-              exit 1
-            }
+            registry_metadata="$RUNNER_TEMP/npm-registry.json"
+            npm view "$package@$VERSION" --json --registry "$NPM_REGISTRY" > "$registry_metadata"
+          attestation_url=$(python3 - "$registry_metadata" "$package" "$VERSION" <<'PY'
+          import json
+          import sys
+          from urllib.parse import unquote, urlsplit
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          package, version = sys.argv[2:]
+          url = metadata.get("dist", {}).get("attestations", {}).get("url")
+          parsed = urlsplit(url) if isinstance(url, str) else None
+          if (
+              parsed is None
+              or parsed.scheme != "https"
+              or parsed.netloc != "registry.npmjs.org"
+              or parsed.query
+              or parsed.fragment
+              or unquote(parsed.path) != f"/-/npm/v1/attestations/{package}@{version}"
+          ):
+              raise SystemExit("registry returned a non-canonical npm attestation URL")
+          print(url)
+          PY
+          )
+            attestations="$RUNNER_TEMP/npm-attestations.json"
+            curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 30 \
+              --max-filesize 1048576 \
+              --output "$attestations" \
+              "$attestation_url"
+            python3 scripts/verify-ygg-npm-provenance.py \
+              "$registry_metadata" \
+              "$attestations" \
+              npm-assets/YGG_NPM_MANIFEST.json \
+              "$package" \
+              "$VERSION" \
+              "$expected" \
+              "https://github.com/$WORKFLOW_REPOSITORY" \
+              '.github/workflows/release-ygg.yml' \
+              "$SOURCE_COMMIT" \
+              "$WORKFLOW_COMMIT"
           done
 
   smoke-npm-published:
@@ -997,7 +1124,7 @@ jobs:
           set -euo pipefail
           prefix="$RUNNER_TEMP/ygg-npm-prefix"
           mkdir -p "$prefix"
-          npm install --global --prefix "$prefix" \
+          npm install --global --prefix "$prefix" --registry "$NPM_REGISTRY" \
             --ignore-scripts \
             --no-audit \
             --no-fund \
@@ -1218,18 +1345,30 @@ jobs:
             echo "canonical release $RELEASE_TAG is not a published stable release" >&2
             exit 1
           fi
-          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
           for asset in release-assets/*; do
             name=${asset##*/}
-            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              # Intentional rerun: replace the stale asset instead of refusing.
-              echo "replacing existing release asset: $name" >&2
-              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-                --jq '.assets[] | select(.name=="'"$name"'") | .id')
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
             fi
           done
-          gh release upload "$RELEASE_TAG" release-assets/*
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all release assets already match the immutable candidate"
+          fi
           verify_release_refs published
 
   verify-installer-repair:

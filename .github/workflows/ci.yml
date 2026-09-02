@@ -56,7 +56,7 @@ jobs:
             scripts/test-ygg-npm.sh \
             scripts/test-ygg-npm-install.sh \
             scripts/test-homebrew-formula.sh
-          python3 -m py_compile scripts/provider-acceptance.py scripts/generate-ygg-release-metadata.py scripts/create-ygg-npm-manifest.py scripts/verify-ygg-npm.py scripts/generate-homebrew-formula.py
+          python3 -m py_compile scripts/provider-acceptance.py scripts/generate-ygg-release-metadata.py scripts/create-ygg-npm-manifest.py scripts/verify-ygg-npm.py scripts/verify-ygg-npm-provenance.py scripts/generate-homebrew-formula.py
           version="v$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
           while IFS= read -r extension; do
             [[ -n "$extension" ]] || continue

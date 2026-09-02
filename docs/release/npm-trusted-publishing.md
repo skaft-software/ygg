@@ -35,6 +35,13 @@ local scripts prove deterministic packing, tarball/path/lifecycle/secret
 checks, and an offline install; they do **not** prove registry publication or
 macOS-host acceptance.
 
+The protected release job also downloads a fixed npm CLI tarball, checks its
+recorded SHA-512 integrity, and installs it with lifecycle scripts, audit, and
+funding disabled before publication. Post-publish verification checks the
+registry's package integrity and requires the provenance attestation to bind the
+same artifact digest, repository, release workflow, and source/workflow
+identity; a mere non-empty provenance field is insufficient.
+
 ## Protected publication
 
 A maintainer must configure npm trusted publishers for all four packages to the

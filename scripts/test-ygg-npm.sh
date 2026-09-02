@@ -130,9 +130,146 @@ python3 "$script_directory/create-ygg-npm-manifest.py" \
     "$output_directory/YGG_NPM_MANIFEST.json" \
     "$output_directory/YGG_NPM_SHA256SUMS" >/dev/null
 python3 "$script_directory/verify-ygg-npm.py" "$version" "$output_directory" --json > "$work_directory/verification.json"
+python3 - "$output_directory/ygg-$version.tgz" "$work_directory/registry.json" "$work_directory/attestations.json" "$version" <<'PY'
+import base64
+import hashlib
+import json
+import pathlib
+import sys
 
-# Repacking the same immutable inputs with the same epoch must be byte-for-byte
-# identical, not merely semantically equivalent.
+artifact, registry_output, attestations_output, version = sys.argv[1:]
+source_commit = "0123456789abcdef0123456789abcdef01234567"
+workflow_commit = "abcdef0123456789abcdef0123456789abcdef01"
+integrity = "sha512-" + base64.b64encode(hashlib.sha512(pathlib.Path(artifact).read_bytes()).digest()).decode("ascii")
+digest = hashlib.sha512(pathlib.Path(artifact).read_bytes()).hexdigest()
+payload = {
+    "_type": "https://in-toto.io/Statement/v1",
+    "subject": [{
+        "name": "pkg:npm/%40skaft-software%2Fygg@" + version,
+        "digest": {"sha512": digest},
+    }],
+    "predicateType": "https://slsa.dev/provenance/v1",
+    "predicate": {
+        "buildDefinition": {
+            "externalParameters": {
+                "workflow": {
+                    "repository": "https://github.com/skaft-software/ygg",
+                    "path": ".github/workflows/release-ygg.yml",
+                }
+            },
+            "resolvedDependencies": [{
+                "uri": "git+https://github.com/skaft-software/ygg@refs/tags/ygg-binaries-v" + version,
+                "digest": {"gitCommit": workflow_commit},
+            }],
+        }
+    },
+}
+attestations = {
+    "attestations": [{
+        "predicateType": "https://slsa.dev/provenance/v1",
+        "bundle": {
+            "verificationMaterial": {},
+            "dsseEnvelope": {
+                "payload": base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode("ascii"),
+                "signatures": [{"sig": "fixture"}],
+            },
+        },
+    }]
+}
+registry = {
+    "name": "@skaft-software/ygg",
+    "version": version,
+    "dist": {
+        "integrity": integrity,
+        "attestations": {
+            "url": "https://registry.npmjs.org/-/npm/v1/attestations/%40skaft-software%2Fygg@" + version,
+            "provenance": {"predicateType": "https://slsa.dev/provenance/v1"},
+        },
+    },
+}
+pathlib.Path(registry_output).write_text(json.dumps(registry), encoding="utf-8")
+pathlib.Path(attestations_output).write_text(json.dumps(attestations), encoding="utf-8")
+PY
+expected_integrity=$(python3 - "$output_directory/ygg-$version.tgz" <<'PY'
+import base64
+import hashlib
+import pathlib
+import sys
+print("sha512-" + base64.b64encode(hashlib.sha512(pathlib.Path(sys.argv[1]).read_bytes()).digest()).decode("ascii"))
+PY
+)
+python3 "$script_directory/verify-ygg-npm-provenance.py" \
+    "$work_directory/registry.json" \
+    "$work_directory/attestations.json" \
+    "$output_directory/YGG_NPM_MANIFEST.json" \
+    "@skaft-software/ygg" \
+    "$version" \
+    "$expected_integrity" \
+    "https://github.com/skaft-software/ygg" \
+    ".github/workflows/release-ygg.yml" \
+    "0123456789abcdef0123456789abcdef01234567" \
+    "abcdef0123456789abcdef0123456789abcdef01" \
+    > "$work_directory/provenance-verification.json"
+
+# Attestation URLs must stay on the exact canonical registry endpoint.
+cp "$work_directory/attestations.json" "$work_directory/valid-attestations.json"
+python3 - "$work_directory/registry.json" "$work_directory/noncanonical-registry.json" <<'PY'
+import json
+import pathlib
+import sys
+
+source = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+source["dist"]["attestations"]["url"] = source["dist"]["attestations"]["url"].replace(
+    "/attestations/", "/attestations/unexpected/"
+)
+pathlib.Path(sys.argv[2]).write_text(json.dumps(source), encoding="utf-8")
+PY
+if python3 "$script_directory/verify-ygg-npm-provenance.py" \
+    "$work_directory/noncanonical-registry.json" \
+    "$work_directory/valid-attestations.json" \
+    "$output_directory/YGG_NPM_MANIFEST.json" \
+    "@skaft-software/ygg" "$version" \
+    "$expected_integrity" \
+    "https://github.com/skaft-software/ygg" \
+    ".github/workflows/release-ygg.yml" \
+    "0123456789abcdef0123456789abcdef01234567" \
+    "abcdef0123456789abcdef0123456789abcdef01" \
+    >/dev/null 2>&1; then
+    printf 'provenance verifier accepted a non-canonical attestation URL\n' >&2
+    exit 1
+fi
+
+# A provenance record that only claims presence but not the artifact digest is rejected.
+python3 - "$work_directory/attestations.json" <<'PY'
+import base64
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text(encoding="utf-8"))
+envelope = value["attestations"][0]["bundle"]["dsseEnvelope"]
+payload = json.loads(base64.b64decode(envelope["payload"]))
+payload["subject"][0]["digest"]["sha512"] = "0" * 128
+envelope["payload"] = base64.b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode("ascii")
+path.write_text(json.dumps(value), encoding="utf-8")
+PY
+if python3 "$script_directory/verify-ygg-npm-provenance.py" \
+    "$work_directory/registry.json" \
+    "$work_directory/attestations.json" \
+    "$output_directory/YGG_NPM_MANIFEST.json" \
+    "@skaft-software/ygg" "$version" \
+    "$expected_integrity" \
+    "https://github.com/skaft-software/ygg" \
+    ".github/workflows/release-ygg.yml" \
+    "0123456789abcdef0123456789abcdef01234567" \
+    "abcdef0123456789abcdef0123456789abcdef01" \
+    >/dev/null 2>&1; then
+    printf 'provenance verifier accepted a mismatched artifact binding\n' >&2
+    exit 1
+fi
+
+# Repacking the same immutable inputs with the same epoch must be byte-for-byte identical, not merely semantically equivalent.
 SOURCE_DATE_EPOCH=0 "$script_directory/package-ygg-npm.sh" \
     "$version" \
     "$native_directory" \

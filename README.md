@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.5"><img alt="Release: 0.6.5" src="https://img.shields.io/badge/release-0.6.5-536dfe?style=flat-square"></a>
+  <a href="https://github.com/skaft-software/ygg/releases/tag/v0.6.6"><img alt="Release: 0.6.6" src="https://img.shields.io/badge/release-0.6.6-536dfe?style=flat-square"></a>
   <img alt="Rust 1.86+" src="https://img.shields.io/badge/Rust-1.86%2B-111820?style=flat-square&logo=rust&logoColor=white">
   <img alt="Platforms: macOS and Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-111820?style=flat-square">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-58a67a?style=flat-square"></a>
@@ -42,11 +42,11 @@ verifies the release archive and installs `ygg` and `ygg-host` under
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.5/install-ygg.sh | sh
+  https://github.com/skaft-software/ygg/releases/download/v0.6.6/install-ygg.sh | sh
 ```
 
 ```sh
-ygg --version   # ygg 0.6.5
+ygg --version   # ygg 0.6.6
 ygg --help
 ```
 
@@ -129,7 +129,7 @@ To compile the pinned tag instead, install
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/skaft-software/ygg/releases/download/v0.6.5/install-ygg.sh \
+  https://github.com/skaft-software/ygg/releases/download/v0.6.6/install-ygg.sh \
   | sh -s -- --from-source
 ```
 
@@ -140,7 +140,7 @@ To install from source without changing a shell startup file:
 ```sh
 cargo install --locked \
   --git https://github.com/skaft-software/ygg \
-  --tag v0.6.5 \
+  --tag v0.6.6 \
   --bins \
   ygg-coding-agent
 ```
@@ -167,7 +167,7 @@ cargo install --locked --path crates/ygg-coding-agent --bins
 ### Updating
 
 Releases through v0.4.0 do not include `ygg update`. Upgrade those installations
-by re-running the v0.6.5 installer above with the same `YGG_INSTALL_DIR`, or by
+by re-running the v0.6.6 installer above with the same `YGG_INSTALL_DIR`, or by
 re-running the pinned Cargo command when Ygg was installed through Cargo. The
 installer replaces `ygg`, `ygg-host`, and packaged documentation without
 removing `~/.ygg` configuration, credentials, or sessions.
@@ -265,11 +265,11 @@ unprivileged user, and expects an explicit workspace mount. The build script
 refuses tracked changes and excludes all untracked workstation content:
 
 ```sh
-scripts/build-ygg-image.sh ygg:0.6.5
+scripts/build-ygg-image.sh ygg:0.6.6
 docker run --rm -it \
   -e ANTHROPIC_API_KEY \
   -v "$PWD:/workspace" \
-  ygg:0.6.5 --model claude-sonnet-4-6
+  ygg:0.6.6 --model claude-sonnet-4-6
 ```
 
 Only pass credentials and mount paths the container actually needs. The image
@@ -649,7 +649,7 @@ ygg's TUI is built on a vendored, terminal-correct Rust renderer. It treats nati
 - Responsive wide and narrow layouts with Unicode, ASCII, truecolor, 256-color, 16-color, and no-color fallbacks.
 - Semantic tool intent/lifecycle states, rich Markdown, syntax highlighting, tables, task lists, and links, with bounded sanitized tool-output projections.
 - Prompt colors are tied to the selected model in the compiled default theme.
-- The compiled default theme is the only theme exposed by the v0.6.5 runtime.
+- The compiled default theme is the only theme exposed by the v0.6.6 runtime.
 - Terminal control-sequence sanitization in user- and provider-controlled text.
 - The `sexy-tui-rs` crate enforces its memory-safety boundary with `#![forbid(unsafe_code)]`.
 
@@ -672,7 +672,7 @@ ygg --mouse app
 
 ## Terminal theming
 
-Theme selection is disabled in v0.6.5. The TUI and graphical Serve frontend expose
+Theme selection is disabled in v0.6.6. The TUI and graphical Serve frontend expose
 only Ygg's compiled default theme; that does **not** mean a fixed accent hue.
 The selected model's deterministic palette changes the atmosphere while layout,
 interaction grammar, and semantic status colours remain stable. See
@@ -1011,13 +1011,13 @@ third_party/              upstream license texts
 | [Security policy](SECURITY.md) | Authority boundary, containment, threat model, and private reporting. |
 | [Changelog](CHANGELOG.md) | Release-level behavior and compatibility changes. |
 | [Public roadmap](ROADMAP.md) | Current release outcomes, engineering principles, evidence campaigns, and non-goals. |
-| [Release notes](docs/releases/v0.6.5.md) | Current installation, highlights, compatibility notes, and limitations. |
+| [Release notes](docs/releases/v0.6.6.md) | Current installation, highlights, compatibility notes, and limitations. |
 | [Resources](docs/resources.md) | Discovery, precedence, trust, bounds, diagnostics, and reload. |
 | [Pi migration](docs/pi-migration.md) | Zero-token setup inventory, AST classification, safety bounds, and staged compatibility architecture. |
 | [Extensions](docs/extensions.md) | Manifest, JSON-RPC protocol, contributions, lifecycle, and trust. |
 | [Python extension SDK](sdk/python/README.md) | Decorators, stdio framing, handshake, logging, and host requests. |
 | [Native SDK host](docs/sdk.md) | Versioned NDJSON application protocol, sessions, providers, safety, and cancellation. |
-| [Themes](docs/themes.md) | v0.6.5 default-only status and reserved schema. |
+| [Themes](docs/themes.md) | v0.6.6 default-only status and reserved schema. |
 | [Sessions](docs/sessions.md) | Commands, JSONL schema, branching, export, redaction, and repair. |
 | [AI architecture](docs/design/ygg-ai.md) | Canonical inference model, validation, transport, and streaming. |
 | [Agent architecture](docs/design/ygg-agent.md) | Run loop, persistence, tools, cancellation, and compaction. |

@@ -228,11 +228,14 @@ jobs:
             exit 1
           fi
           mkdir -p Formula
-          if [[ -e "$formula_path" && -L "$formula_path" ]]; then
+          if [[ ! -d Formula || -L Formula ]]; then
+            echo "tap Formula path must be a real directory" >&2
+            exit 1
+          fi
+          if [[ -L "$formula_path" ]]; then
             echo "tap formula path must not be a symlink" >&2
             exit 1
           fi
-          cp ../formula-artifact/homebrew-ygg.rb "$formula_path"
           branch="ygg/v$VERSION"
           if [[ ! "$branch" =~ ^ygg/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "computed tap branch is malformed" >&2
@@ -259,8 +262,13 @@ jobs:
           fi
           git add -- Formula/ygg.rb
           git commit -m "Update Ygg formula to $RELEASE_TAG"
+          : "${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is required}"
+          # checkout intentionally leaves the fetch remote unauthenticated;
+          # provide the scoped tap credential only for this push.
+          git remote set-url --push origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git"
           git push --set-upstream origin "$branch"
-          GH_TOKEN=${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is required} \
+          git remote set-url --push origin "https://github.com/${TAP_REPOSITORY}.git"
+          GH_TOKEN="$HOMEBREW_TAP_TOKEN" \
             gh pr create \
             --repo "$TAP_REPOSITORY" \
             --base main \
