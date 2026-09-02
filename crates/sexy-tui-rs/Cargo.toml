@@ -16,7 +16,7 @@ benchmarks = []
 
 [dependencies]
 crossterm = "0.28"
-pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 serde = { version = "1", features = ["derive"] }
 syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 toml = "0.8"
