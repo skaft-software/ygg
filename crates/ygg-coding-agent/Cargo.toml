@@ -39,7 +39,7 @@ ygg-agent = { version = "=0.6.7", path = "../ygg-agent" }
 # makes fresh clones build the exact implementation reviewed with Ygg.
 sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util", "io-std", "process", "sync"] }
-crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+crossterm = { version = "0.29", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
 clap = { version = "4", features = ["derive"] }
