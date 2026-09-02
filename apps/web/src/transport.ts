@@ -2107,6 +2107,8 @@ export class FixtureTransport implements YggTransport {
   }
 }
 
+const SESSION_REQUEST_TIMEOUT_MS = 30_000;
+
 export class HttpTransport implements YggTransport {
   private listeners = new Set<EventListener>();
   private connectionListeners = new Set<ConnectionListener>();
@@ -2255,6 +2257,9 @@ export class HttpTransport implements YggTransport {
     sessionId: string,
     signal?: AbortSignal,
   ): Promise<SessionSnapshot> {
+    if (signal?.aborted) {
+      throw new DOMException("Aborted", "AbortError");
+    }
     if (this.selectedSessionCache?.sessionId === sessionId) {
       const cached = this.selectedSessionCache;
       this.selectedSessionCache = null;
@@ -2262,24 +2267,42 @@ export class HttpTransport implements YggTransport {
       this.rememberSnapshot(cached);
       return clone(cached);
     }
-    const response = await fetch(
-      `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
-      {
-        headers: { Accept: "application/json" },
-        credentials: "same-origin",
-        signal,
-      },
-    );
-    if (!response.ok) {
-      throw new Error(`Session failed with ${response.status}`);
+
+    const requestController = new AbortController();
+    let abortFromCaller: (() => void) | null = null;
+    if (signal) {
+      abortFromCaller = () => requestController.abort();
+      signal.addEventListener("abort", abortFromCaller, { once: true });
     }
-    const snapshot = projectSessionSnapshot(await response.json(), {
-      summary: this.summaries.get(sessionId),
-      models: this.models,
-    });
-    this.assertSnapshotPastReplacementBarrier(snapshot);
-    this.rememberSnapshot(snapshot);
-    return snapshot;
+    const timeoutId = window.setTimeout(
+      () => requestController.abort(),
+      SESSION_REQUEST_TIMEOUT_MS,
+    );
+    try {
+      const response = await fetch(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          headers: { Accept: "application/json" },
+          credentials: "same-origin",
+          signal: requestController.signal,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Session failed with ${response.status}`);
+      }
+      const snapshot = projectSessionSnapshot(await response.json(), {
+        summary: this.summaries.get(sessionId),
+        models: this.models,
+      });
+      this.assertSnapshotPastReplacementBarrier(snapshot);
+      this.rememberSnapshot(snapshot);
+      return snapshot;
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (signal && abortFromCaller) {
+        signal.removeEventListener("abort", abortFromCaller);
+      }
+    }
   }
 
   async getCommandDiscovery(sessionId: string): Promise<CommandDiscovery> {

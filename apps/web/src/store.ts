@@ -230,6 +230,77 @@ function updateSummary(
   return summary;
 }
 
+type SessionCursor = { actorGeneration: number; sequence: number };
+
+interface DeferredResyncState {
+  events: SessionEvent[];
+  bytes: number;
+  overflowed: boolean;
+}
+
+interface ResyncOperation {
+  initializationGeneration: number;
+  lifetimeController: AbortController;
+  attemptController: AbortController | null;
+  retryTimer: number | null;
+}
+
+const MAX_DEFERRED_RESYNC_EVENTS = 256;
+const MAX_DEFERRED_RESYNC_BYTES = 512 * 1024;
+const RESYNC_ATTEMPT_TIMEOUT_MS = 10_000;
+
+function sessionEventByteLength(event: SessionEvent): number {
+  const encoded = JSON.stringify(event);
+  return encoded === undefined
+    ? Number.POSITIVE_INFINITY
+    : new TextEncoder().encode(encoded).byteLength;
+}
+
+function sessionEventCursor(
+  event: SessionEvent,
+  fallbackGeneration: number,
+): SessionCursor {
+  return {
+    actorGeneration:
+      event.actorGeneration ??
+      (event.type === "session.snapshot"
+        ? event.snapshot.actorGeneration
+        : fallbackGeneration),
+    sequence: event.sequence,
+  };
+}
+
+function compareSessionCursors(
+  left: SessionCursor,
+  right: SessionCursor,
+): number {
+  if (left.actorGeneration !== right.actorGeneration) {
+    return left.actorGeneration - right.actorGeneration;
+  }
+  return left.sequence - right.sequence;
+}
+
+function contiguousDeferredEvents(
+  events: readonly SessionEvent[],
+  snapshotCursor: SessionCursor,
+): SessionEvent[] | null {
+  let cursor = snapshotCursor;
+  const replay: SessionEvent[] = [];
+  for (const event of events) {
+    const eventCursor = sessionEventCursor(event, cursor.actorGeneration);
+    if (compareSessionCursors(eventCursor, cursor) <= 0) continue;
+    if (
+      eventCursor.actorGeneration !== cursor.actorGeneration ||
+      eventCursor.sequence !== cursor.sequence + 1
+    ) {
+      return null;
+    }
+    replay.push(event);
+    cursor = eventCursor;
+  }
+  return replay;
+}
+
 export class YggStore {
   private state: YggState = initialState;
   private listeners = new Set<() => void>();
@@ -239,8 +310,8 @@ export class YggStore {
   private animationFrame: number | null = null;
   private selectionGeneration = 0;
   private selectionAbort: AbortController | null = null;
-  private resyncing = new Set<string>();
-  private deferredDuringResync = new Map<string, SessionEvent[]>();
+  private resyncOperations = new Map<string, ResyncOperation>();
+  private deferredDuringResync = new Map<string, DeferredResyncState>();
   private createSessionTail: Promise<void> = Promise.resolve();
   private initializationGeneration = 0;
   private goalRevision = 0;
@@ -257,6 +328,114 @@ export class YggStore {
 
   private isCurrentInitialization(generation: number): boolean {
     return !this.disposed && generation === this.initializationGeneration;
+  }
+
+  private isCurrentResync(
+    sessionId: string,
+    operation: ResyncOperation,
+  ): boolean {
+    return (
+      this.resyncOperations.get(sessionId) === operation &&
+      this.isCurrentInitialization(operation.initializationGeneration) &&
+      !operation.lifetimeController.signal.aborted
+    );
+  }
+
+  private deferEventDuringResync(event: SessionEvent): void {
+    let deferred = this.deferredDuringResync.get(event.sessionId);
+    if (!deferred) {
+      deferred = { events: [], bytes: 0, overflowed: false };
+      this.deferredDuringResync.set(event.sessionId, deferred);
+    }
+    if (deferred.overflowed) return;
+
+    const bytes = sessionEventByteLength(event);
+    if (
+      deferred.events.length >= MAX_DEFERRED_RESYNC_EVENTS ||
+      deferred.bytes + bytes > MAX_DEFERRED_RESYNC_BYTES
+    ) {
+      deferred.events = [];
+      deferred.bytes = 0;
+      deferred.overflowed = true;
+      return;
+    }
+    deferred.events.push(event);
+    deferred.bytes += bytes;
+  }
+
+  private cancelResyncs(): void {
+    for (const operation of this.resyncOperations.values()) {
+      if (operation.retryTimer !== null) {
+        window.clearTimeout(operation.retryTimer);
+        operation.retryTimer = null;
+      }
+      operation.lifetimeController.abort();
+      operation.attemptController?.abort();
+    }
+    this.resyncOperations.clear();
+    this.deferredDuringResync.clear();
+  }
+
+  private waitForResyncRetry(
+    operation: ResyncOperation,
+    delay: number,
+  ): Promise<boolean> {
+    const signal = operation.lifetimeController.signal;
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      let settled = false;
+      let timer: number | null = null;
+      const finish = (retry: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) window.clearTimeout(timer);
+        if (operation.retryTimer === timer) operation.retryTimer = null;
+        signal.removeEventListener("abort", onAbort);
+        resolve(retry);
+      };
+      const onAbort = () => finish(false);
+      timer = window.setTimeout(() => finish(true), delay);
+      operation.retryTimer = timer;
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) finish(false);
+    });
+  }
+
+  private async loadResyncSnapshot(
+    sessionId: string,
+    operation: ResyncOperation,
+    attemptController: AbortController,
+  ): Promise<SessionSnapshot> {
+    const operationSignal = operation.lifetimeController.signal;
+    let timeoutId: number | null = null;
+    let onAbort: (() => void) | null = null;
+    const request = Promise.resolve().then(() =>
+      this.transport.getSession(sessionId, attemptController.signal),
+    );
+    const canceled = new Promise<never>((_, reject) => {
+      const abort = () => {
+        attemptController.abort();
+        reject(new DOMException("Aborted", "AbortError"));
+      };
+      onAbort = abort;
+      if (operationSignal.aborted) abort();
+      else operationSignal.addEventListener("abort", abort, { once: true });
+    });
+    const timedOut = new Promise<never>((_, reject) => {
+      timeoutId = window.setTimeout(() => {
+        attemptController.abort();
+        reject(new Error("Session resync timed out."));
+      }, RESYNC_ATTEMPT_TIMEOUT_MS);
+    });
+
+    try {
+      return await Promise.race([request, canceled, timedOut]);
+    } finally {
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+      if (onAbort !== null) {
+        operationSignal.removeEventListener("abort", onAbort);
+      }
+    }
   }
 
   private publish(next: YggState): void {
@@ -336,10 +515,8 @@ export class YggStore {
         changed = true;
         continue;
       }
-      if (this.resyncing.has(event.sessionId)) {
-        const deferred = this.deferredDuringResync.get(event.sessionId) ?? [];
-        deferred.push(event);
-        this.deferredDuringResync.set(event.sessionId, deferred);
+      if (this.resyncOperations.has(event.sessionId)) {
+        this.deferEventDuringResync(event);
         continue;
       }
       const current = next.sessions[event.sessionId];
@@ -478,22 +655,40 @@ export class YggStore {
     sessionId: string,
     required?: { actorGeneration: number; sequence: number },
   ): Promise<void> {
-    if (this.resyncing.has(sessionId)) return;
-    this.resyncing.add(sessionId);
+    if (this.resyncOperations.has(sessionId)) return;
+    const operation: ResyncOperation = {
+      initializationGeneration: this.initializationGeneration,
+      lifetimeController: new AbortController(),
+      attemptController: null,
+      retryTimer: null,
+    };
+    this.resyncOperations.set(sessionId, operation);
+    this.deferredDuringResync.set(sessionId, {
+      events: [],
+      bytes: 0,
+      overflowed: false,
+    });
+
     let installed = false;
+    let installedCursor: SessionCursor | null = null;
     let retryDelay = 50;
     try {
-      while (!this.disposed && !installed) {
+      while (this.isCurrentResync(sessionId, operation)) {
+        const attemptController = new AbortController();
+        operation.attemptController = attemptController;
+        let failed = false;
         try {
-          const snapshot = await this.transport.getSession(sessionId);
+          const snapshot = await this.loadResyncSnapshot(
+            sessionId,
+            operation,
+            attemptController,
+          );
+          if (!this.isCurrentResync(sessionId, operation)) return;
           const current = this.state.sessions[sessionId];
           const predates = (
-            cursor: { actorGeneration: number; sequence: number },
-            minimum: { actorGeneration: number; sequence: number },
-          ) =>
-            cursor.actorGeneration < minimum.actorGeneration ||
-            (cursor.actorGeneration === minimum.actorGeneration &&
-              cursor.sequence < minimum.sequence);
+            cursor: SessionCursor,
+            minimum: SessionCursor,
+          ) => compareSessionCursors(cursor, minimum) < 0;
           if (
             (required &&
               predates(
@@ -552,21 +747,42 @@ export class YggStore {
             sessions: { ...this.state.sessions, [sessionId]: replacement },
           });
           installed = true;
+          installedCursor = {
+            actorGeneration: replacement.actorGeneration,
+            sequence: replacement.sequence,
+          };
         } catch {
-          if (this.disposed) break;
-          await new Promise<void>((resolve) => {
-            window.setTimeout(resolve, retryDelay);
-          });
-          retryDelay = Math.min(2_000, retryDelay * 2);
+          if (!this.isCurrentResync(sessionId, operation)) return;
+          failed = true;
+        } finally {
+          if (operation.attemptController === attemptController) {
+            operation.attemptController = null;
+          }
+          attemptController.abort();
         }
+
+        if (installed || !failed) break;
+        if (!this.isCurrentResync(sessionId, operation)) break;
+        if (!(await this.waitForResyncRetry(operation, retryDelay))) break;
+        retryDelay = Math.min(2_000, retryDelay * 2);
       }
     } finally {
-      this.resyncing.delete(sessionId);
-      const deferred = this.deferredDuringResync.get(sessionId) ?? [];
+      if (this.resyncOperations.get(sessionId) !== operation) return;
+      this.resyncOperations.delete(sessionId);
+      const deferred = this.deferredDuringResync.get(sessionId);
       this.deferredDuringResync.delete(sessionId);
-      if (installed) {
-        for (const event of deferred) this.queueEvent(event);
+      if (!installed || !installedCursor || !deferred) return;
+
+      const replay = deferred.overflowed
+        ? null
+        : contiguousDeferredEvents(deferred.events, installedCursor);
+      if (replay === null) {
+        if (this.isCurrentInitialization(operation.initializationGeneration)) {
+          void this.resyncSession(sessionId);
+        }
+        return;
       }
+      for (const event of replay) this.queueEvent(event);
     }
   }
 
@@ -581,6 +797,7 @@ export class YggStore {
 
   async initialize(): Promise<void> {
     const generation = ++this.initializationGeneration;
+    this.cancelResyncs();
     this.disposed = false;
     if (this.animationFrame !== null) {
       window.cancelAnimationFrame(this.animationFrame);
@@ -1586,7 +1803,7 @@ export class YggStore {
     }
     this.animationFrame = null;
     this.queuedEvents = [];
-    this.deferredDuringResync.clear();
+    this.cancelResyncs();
     this.unsubscribeTransport?.();
     this.unsubscribeConnection?.();
     this.transport.close();
