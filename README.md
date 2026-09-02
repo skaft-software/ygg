@@ -72,6 +72,22 @@ project and `npx` installations must be updated explicitly by their project.
 See [`docs/release/npm-trusted-publishing.md`](docs/release/npm-trusted-publishing.md)
 for the publication and recovery contract.
 
+### Homebrew distribution
+
+When the release formula has been published to the maintained macOS tap, install
+it with:
+
+```sh
+brew install skaft-software/tap/ygg
+ygg --version
+```
+
+The formula is macOS-only, installs both native commands, and requires
+[ripgrep](https://github.com/BurntSushi/ripgrep). It is generated from signed
+immutable release metadata rather than a mutable release lookup. See
+[`docs/distribution.md`](docs/distribution.md) for channel and release-gate
+details.
+
 ## Performance
 
 On the frozen Ygg v0.6.2 Terminal-Bench 2.1 campaign with GPT-5.6 Sol at

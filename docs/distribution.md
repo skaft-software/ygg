@@ -10,7 +10,8 @@ identity, the `YGG_SHA256SUMS` digest, and the two macOS archive digests.
 
 ## Homebrew
 
-The supported Homebrew channel is macOS only (Apple silicon and Intel). It
+For a release whose formula has completed the protected tap handoff, the
+supported Homebrew channel is macOS only (Apple silicon and Intel). It
 installs the two native executables and declares `ripgrep` as a dependency:
 
 ```sh

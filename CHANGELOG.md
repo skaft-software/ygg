@@ -9,6 +9,8 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 - Add deterministic, no-lifecycle npm packages for the native launcher and
   supported runtimes, with exact global-update detection and protected trusted
   publishing/recovery gates.
+- Add an offline Homebrew formula generator and protected tap handoff driven by
+  signed immutable release metadata.
 
 ### Changed
 
