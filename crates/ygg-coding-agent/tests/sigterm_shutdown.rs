@@ -60,11 +60,58 @@ impl PtyYgg {
         wait_for_app: bool,
         mouse: &str,
     ) -> Self {
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            extra_args,
+            interactive,
+            wait_for_app,
+            mouse,
+            None,
+            None,
+        )
+    }
+
+    fn spawn_with_explicit_workspace(root: &Path) -> Self {
+        let invocation_cwd = root.join("workspace").join("nested");
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            &[],
+            true,
+            true,
+            "app",
+            Some(&invocation_cwd),
+            None,
+        )
+    }
+
+    fn spawn_from_resume_command(root: &Path, command_line: &str, invocation_cwd: &Path) -> Self {
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            &[],
+            true,
+            true,
+            "app",
+            Some(invocation_cwd),
+            Some(command_line),
+        )
+    }
+
+    fn spawn_with_mode_and_mouse_at(
+        root: &Path,
+        extra_args: &[String],
+        interactive: bool,
+        wait_for_app: bool,
+        mouse: &str,
+        invocation_cwd: Option<&Path>,
+        command_line: Option<&str>,
+    ) -> Self {
         let home = root.join("home");
         let workspace = root.join("workspace");
         let sessions = root.join("sessions");
+        let invocation_cwd = invocation_cwd.unwrap_or(&workspace);
         std::fs::create_dir_all(home.join(".ygg/credentials")).expect("credential directory");
         std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(invocation_cwd).expect("invocation directory");
         std::fs::create_dir_all(&sessions).expect("sessions");
         let credential = home.join(".ygg/credentials/custom.json");
         std::fs::write(
@@ -116,27 +163,47 @@ impl PtyYgg {
         let stdout = duplicate_stdio(slave_probe.as_raw_fd());
         let stderr = duplicate_stdio(slave_probe.as_raw_fd());
         let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ygg"));
+        let path = if command_line.is_some() {
+            let binary_parent = Path::new(env!("CARGO_BIN_EXE_ygg"))
+                .parent()
+                .expect("ygg binary parent");
+            let paths = std::iter::once(binary_parent.to_owned())
+                .chain(std::env::split_paths(&path))
+                .collect::<Vec<_>>();
+            std::env::join_paths(paths).expect("test PATH")
+        } else {
+            path
+        };
+        let mut command = if let Some(command_line) = command_line {
+            let mut command = Command::new("sh");
+            command.args(["-c", command_line, "ygg"]);
+            command
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ygg"));
+            command
+                .args([
+                    "--offline",
+                    "--no-context-files",
+                    "--no-tools",
+                    "--allow-shell",
+                    "--mouse",
+                    mouse,
+                    "--model",
+                    "custom/probe",
+                    "--workspace",
+                ])
+                .arg(&workspace)
+                .arg("--session-dir")
+                .arg(&sessions)
+                .args(extra_args);
+            command
+        };
         command
-            .args([
-                "--offline",
-                "--no-context-files",
-                "--no-tools",
-                "--allow-shell",
-                "--mouse",
-                mouse,
-                "--model",
-                "custom/probe",
-                "--workspace",
-            ])
-            .arg(&workspace)
-            .arg("--session-dir")
-            .arg(&sessions)
-            .args(extra_args)
-            .current_dir(&workspace)
+            .current_dir(invocation_cwd)
             .env_clear()
             .env("HOME", &home)
             .env("PATH", path)
+            .env("PWD", invocation_cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("LANG", "C.UTF-8")
@@ -300,6 +367,36 @@ fn ctrl_d_prints_one_resume_command_after_terminal_restoration() {
 }
 
 #[test]
+fn printed_resume_command_round_trips_custom_session_scope() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let invocation_cwd = directory.path().join("workspace/nested");
+    let mut first = PtyYgg::spawn_with_explicit_workspace(directory.path());
+    let started = Instant::now();
+    first.write_input(&[4]);
+
+    let (status, elapsed, output) = first.wait_for_exit(started);
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "Ctrl-D shutdown took {elapsed:?}");
+    let notice = assert_resume_notice(directory.path(), &output);
+    assert!(notice.command.contains(" --session-dir "));
+    assert!(notice.command.contains(" --workspace "));
+
+    let mut resumed =
+        PtyYgg::spawn_from_resume_command(directory.path(), &notice.command, &invocation_cwd);
+    resumed.submit_command(b"/quit");
+    let (status, elapsed, output) = resumed.wait_for_exit(Instant::now());
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "resumed shutdown took {elapsed:?}");
+    assert_eq!(
+        assert_resume_notice(directory.path(), &output).id,
+        notice.id
+    );
+}
+
+#[test]
 fn slash_quit_prints_one_resume_command_after_terminal_restoration() {
     let _guard = PTY_TEST_LOCK
         .lock()
@@ -336,7 +433,7 @@ fn resume_notice_tracks_the_active_session_after_a_clone_transition() {
     assert_eq!(status.code(), Some(0));
     assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
     let current = assert_resume_notice(directory.path(), &output);
-    assert_ne!(current, initial);
+    assert_ne!(current.id, initial);
 }
 
 #[test]
@@ -364,7 +461,8 @@ fn resume_notice_tracks_the_active_session_after_a_resume_transition() {
     let (status, elapsed, output) = ygg.wait_for_exit(Instant::now());
     assert_eq!(status.code(), Some(0));
     assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
-    assert_eq!(assert_resume_notice(directory.path(), &output), original);
+    let notice = assert_resume_notice(directory.path(), &output);
+    assert_eq!(notice.id, original);
 }
 
 #[test]
@@ -835,7 +933,13 @@ fn session_ids(root: &Path) -> Vec<String> {
     ids
 }
 
-fn assert_resume_notice(root: &Path, output: &[u8]) -> String {
+#[derive(Debug)]
+struct ResumeNotice {
+    id: String,
+    command: String,
+}
+
+fn assert_resume_notice(root: &Path, output: &[u8]) -> ResumeNotice {
     const PREFIX: &[u8] = b"To resume this session: ygg --resume ";
     let starts = output
         .windows(PREFIX.len())
@@ -855,10 +959,15 @@ fn assert_resume_notice(root: &Path, output: &[u8]) -> String {
         .expect("resume notice line terminator");
     let line = &output[start..start + end];
     let line = std::str::from_utf8(line).expect("resume notice is UTF-8");
-    let id = line
-        .strip_prefix("To resume this session: ygg --resume ")
-        .unwrap();
-    assert!(!id.is_empty(), "resume notice has no session id");
+    let command = line
+        .strip_prefix("To resume this session: ")
+        .expect("resume notice prefix")
+        .to_owned();
+    let id = command
+        .split_whitespace()
+        .nth(2)
+        .expect("resume notice has no session id")
+        .to_owned();
     let sessions = root.join("sessions");
     let session_name = format!("{id}.jsonl");
     let in_root = sessions.join(&session_name).is_file();
@@ -895,7 +1004,7 @@ fn assert_resume_notice(root: &Path, output: &[u8]) -> String {
             String::from_utf8_lossy(output)
         );
     }
-    id.to_owned()
+    ResumeNotice { id, command }
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

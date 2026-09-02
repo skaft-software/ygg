@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -3810,9 +3811,111 @@ fn rendered_shell_captures(
     combined
 }
 
-fn resume_command_for_session(session: &Session) -> Option<String> {
+fn resume_command_for_session(session: &Session, config: &crate::config::Config) -> Option<String> {
     let id = crate::app::bootstrap::terminal_goal_session_id(session).ok()?;
-    Some(format!("To resume this session: ygg --resume {id}"))
+    let mut command = format!("To resume this session: ygg --resume {id}");
+
+    let session_dir = absolute_resume_path(&config.session_dir, &config.invocation_cwd);
+    let default_session_dir = absolute_resume_path(
+        &crate::config::default_session_dir(),
+        &config.invocation_cwd,
+    );
+    if session_dir != default_session_dir {
+        command.push_str(" --session-dir ");
+        command.push_str(&resume_scope_path(&session_dir, &config.invocation_cwd)?);
+    }
+    if config.workspace != config.invocation_cwd {
+        command.push_str(" --workspace ");
+        command.push_str(&resume_scope_path(
+            &config.workspace,
+            &config.invocation_cwd,
+        )?);
+    }
+    Some(command)
+}
+
+fn absolute_resume_path(path: &Path, cwd: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    };
+    let mut absolute = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => absolute.push(prefix.as_os_str()),
+            Component::RootDir => absolute.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                absolute.pop();
+            }
+            Component::Normal(component) => absolute.push(component),
+        }
+    }
+    absolute
+}
+
+fn resume_scope_path(path: &Path, cwd: &Path) -> Option<String> {
+    let relative = relative_resume_path(cwd, path)?;
+    let mut parents = Vec::new();
+    let mut suffix = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir if suffix.as_os_str().is_empty() => parents.push(".."),
+            Component::Normal(component) => suffix.push(component),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+
+    let base = if parents.is_empty() {
+        "\"$(pwd -P)\"".to_owned()
+    } else {
+        let parents = parents.join("/");
+        format!("\"$(cd \"$(pwd -P)/{parents}\" && pwd -P)\"")
+    };
+    let suffix = suffix.to_str()?;
+    if suffix.is_empty() {
+        return Some(base);
+    }
+    let suffix = format!("/{suffix}");
+    let suffix = suffix.replace('\'', "'\\''");
+    Some(format!("{base}'{suffix}'"))
+}
+
+fn relative_resume_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from = absolute_resume_path(from, from);
+    let to = absolute_resume_path(to, from.as_path());
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &from[common..] {
+        match component {
+            Component::Normal(_) => relative.push(".."),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    for component in &to[common..] {
+        match component {
+            Component::Normal(component) => relative.push(component),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Some(relative)
 }
 
 fn print_resume_command(command: Option<&str>) {
@@ -3896,7 +3999,7 @@ async fn run_interactive_without_model(
     })
     .await?;
 
-    let resume_command = resume_command_for_session(&session);
+    let resume_command = resume_command_for_session(&session, &boot.config);
     shell.set_identity("", "", "");
     shell.set_status_detail("no configured model · read-only session".to_owned());
     shell.set_workspace(workspace.clone());
@@ -4661,7 +4764,7 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             }
         }
     }
-    let resume_command = resume_command_for_session(app.agent.session());
+    let resume_command = resume_command_for_session(app.agent.session(), &app.config);
     shell.leave();
     print_resume_command(resume_command.as_deref());
     Ok(())
