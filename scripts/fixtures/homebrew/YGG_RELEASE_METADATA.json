@@ -1,0 +1,42 @@
+{
+  "assets": [
+    {
+      "kind": "installer",
+      "name": "install-ygg.sh",
+      "sha256": "306c6ca7407560340797866e077e053627ad409277d1b9da58106fce4cf717cb",
+      "url": "https://github.com/skaft-software/ygg/releases/download/v0.6.6/install-ygg.sh"
+    },
+    {
+      "kind": "binary",
+      "name": "ygg-0.6.6-aarch64-apple-darwin.tar.gz",
+      "sha256": "09be15cc7ace2cb887232033c8c443ae2b6dfae778b6213f7c313d79084745d5",
+      "target": "aarch64-apple-darwin",
+      "url": "https://github.com/skaft-software/ygg/releases/download/v0.6.6/ygg-0.6.6-aarch64-apple-darwin.tar.gz"
+    },
+    {
+      "kind": "binary",
+      "name": "ygg-0.6.6-x86_64-apple-darwin.tar.gz",
+      "sha256": "6aa6d23a60f0fbca903ee03349967eab0267f6991e98e895732e72cac15f140d",
+      "target": "x86_64-apple-darwin",
+      "url": "https://github.com/skaft-software/ygg/releases/download/v0.6.6/ygg-0.6.6-x86_64-apple-darwin.tar.gz"
+    },
+    {
+      "kind": "binary",
+      "name": "ygg-0.6.6-x86_64-unknown-linux-gnu.tar.gz",
+      "sha256": "45f871d77d686078784eb544b994a94cb365a2796c8b20c9eb143605b0683668",
+      "target": "x86_64-unknown-linux-gnu",
+      "url": "https://github.com/skaft-software/ygg/releases/download/v0.6.6/ygg-0.6.6-x86_64-unknown-linux-gnu.tar.gz"
+    }
+  ],
+  "checksum_manifest": {
+    "name": "YGG_SHA256SUMS",
+    "sha256": "a78cb3e2d30a54022e80e282c87222377650242a01d0c5516d119ba08b1d9796"
+  },
+  "repository": "skaft-software/ygg",
+  "schema": "ygg.release.metadata.v1",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "tag": "v0.6.6",
+  "version": "0.6.6",
+  "workflow_commit": "abcdef0123456789abcdef0123456789abcdef01",
+  "workflow_ref": "skaft-software/ygg/.github/workflows/release-ygg.yml@refs/tags/ygg-binaries-v0.6.6"
+}
