@@ -665,6 +665,209 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("keeps a cached selection from regressing behind live session and goal events", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    const liveGoal: GoalState = {
+      revision: 1,
+      objective: "the live objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-live",
+      actorGeneration: 3,
+      sequence: 29,
+      patch: { status: "done" },
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-live",
+      actorGeneration: 3,
+      sequence: 30,
+      revision: liveGoal.revision,
+      goal: liveGoal,
+    });
+    await nextFrame();
+
+    expect(store.getSnapshot().sessions["session-live"]).toMatchObject({
+      actorGeneration: 3,
+      sequence: 30,
+      status: "done",
+    });
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      sequence: 30,
+      status: "done",
+    });
+    expect(store.selectedGoal).toEqual(liveGoal);
+    store.dispose();
+  });
+
+  it("resynchronizes an unloaded selection after racing live session and goal events", async () => {
+    const transport = new TestTransport();
+    const stale = {
+      ...clone(fixtureSessions["session-live"]),
+      actorGeneration: 1,
+      sequence: 28,
+      status: "working" as const,
+    };
+    const liveGoal: GoalState = {
+      revision: 1,
+      objective: "the live objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    const authoritative = {
+      ...stale,
+      sequence: 30,
+      status: "done" as const,
+    };
+    const pendingSession = deferred<SessionSnapshot>();
+    const pendingGoal = deferred<GoalResponse>();
+    let liveLoads = 0;
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-live") {
+        liveLoads += 1;
+        if (liveLoads === 1) return pendingSession.promise;
+        return clone(authoritative);
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+    transport.getGoal = async () => pendingGoal.promise;
+
+    const pendingSelection = store.selectSession("session-live", "none");
+    await vi.waitFor(() => expect(liveLoads).toBe(1));
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-live",
+      actorGeneration: 1,
+      sequence: 29,
+      patch: { status: "done" },
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-live",
+      actorGeneration: 1,
+      sequence: 30,
+      revision: liveGoal.revision,
+      goal: liveGoal,
+    });
+    await nextFrame();
+    expect(store.getSnapshot().sessions["session-live"]).toBeUndefined();
+
+    pendingSession.resolve(stale);
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(liveLoads).toBe(2);
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: 1,
+      sequence: 30,
+      status: "done",
+    });
+    expect(store.selectedGoal).toEqual(liveGoal);
+    store.dispose();
+  });
+
+  it("compares actor generations before sequence for a cached selection", async () => {
+    const transport = new TestTransport();
+    const cached = {
+      ...clone(fixtureSessions["session-live"]),
+      actorGeneration: 1,
+      sequence: 100,
+      status: "working" as const,
+    };
+    transport.sessionLoader = async (sessionId) =>
+      sessionId === "session-live"
+        ? clone(cached)
+        : clone(fixtureSessions[sessionId]);
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    const replacement = {
+      ...cached,
+      actorGeneration: 2,
+      sequence: 1,
+      status: "done" as const,
+    };
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-live",
+      actorGeneration: 2,
+      sequence: 1,
+      snapshot: replacement,
+    });
+    await nextFrame();
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: 2,
+      sequence: 1,
+      status: "done",
+    });
+    store.dispose();
+  });
+
+  it("retains live data at an equal selection cursor", async () => {
+    const transport = new TestTransport();
+    const cached = {
+      ...clone(fixtureSessions["session-live"]),
+      status: "working" as const,
+    };
+    transport.sessionLoader = async (sessionId) =>
+      sessionId === "session-live"
+        ? clone(cached)
+        : clone(fixtureSessions[sessionId]);
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-live",
+      actorGeneration: cached.actorGeneration,
+      sequence: cached.sequence,
+      snapshot: { ...cached, status: "done" },
+    });
+    await nextFrame();
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: cached.actorGeneration,
+      sequence: cached.sequence,
+      status: "done",
+    });
+    store.dispose();
+  });
+
   it("does not let a pending selection replace command-center navigation", async () => {
     const transport = new TestTransport();
     const delayed = deferred<SessionSnapshot>();

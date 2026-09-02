@@ -243,8 +243,33 @@ interface ResyncOperation {
   lifetimeController: AbortController;
   attemptController: AbortController | null;
   retryTimer: number | null;
+  requiredCursor: SessionCursor | null;
   highestObservedCursor: SessionCursor | null;
+  completion: Promise<boolean>;
   deadlineAt: number;
+}
+
+interface SelectionObservation {
+  initializationGeneration: number;
+  generation: number;
+  sessionId: string;
+  initialCursor: SessionCursor | null;
+  observedCursor: SessionCursor | null;
+  unknownSequence: number | null;
+  requiresSnapshot: boolean;
+  version: number;
+  observedGoal: {
+    revision: number;
+    goal: GoalState | null;
+    cursor: SessionCursor | null;
+  } | null;
+}
+
+interface SelectionProjection {
+  snapshot: SessionSnapshot;
+  cursor: SessionCursor;
+  requiredCursor: SessionCursor | null;
+  needsResync: boolean;
 }
 
 const MAX_DEFERRED_RESYNC_EVENTS = 256;
@@ -270,6 +295,13 @@ function sessionEventCursor(
         ? event.snapshot.actorGeneration
         : fallbackGeneration),
     sequence: event.sequence,
+  };
+}
+
+function sessionSnapshotCursor(snapshot: SessionSnapshot): SessionCursor {
+  return {
+    actorGeneration: snapshot.actorGeneration,
+    sequence: snapshot.sequence,
   };
 }
 
@@ -322,6 +354,7 @@ export class YggStore {
   private animationFrame: number | null = null;
   private selectionGeneration = 0;
   private selectionAbort: AbortController | null = null;
+  private selectionObservation: SelectionObservation | null = null;
   private resyncOperations = new Map<string, ResyncOperation>();
   private deferredDuringResync = new Map<string, DeferredResyncState>();
   private createSessionTail: Promise<void> = Promise.resolve();
@@ -340,6 +373,210 @@ export class YggStore {
 
   private isCurrentInitialization(generation: number): boolean {
     return !this.disposed && generation === this.initializationGeneration;
+  }
+
+  private observeSelectionEvent(
+    observation: SelectionObservation,
+    event: SessionEvent,
+  ): void {
+    if (
+      this.selectionObservation !== observation ||
+      observation.sessionId !== event.sessionId
+    ) {
+      return;
+    }
+
+    const current = this.state.sessions[event.sessionId];
+    const currentCursor = current ? sessionSnapshotCursor(current) : null;
+    const fallbackGeneration =
+      currentCursor?.actorGeneration ??
+      observation.observedCursor?.actorGeneration ??
+      observation.initialCursor?.actorGeneration;
+    const baseline = newerSessionCursor(
+      currentCursor,
+      newerSessionCursor(observation.initialCursor, observation.observedCursor),
+    );
+
+    let eventCursor: SessionCursor | null = null;
+    if (event.actorGeneration !== undefined) {
+      eventCursor = {
+        actorGeneration: event.actorGeneration,
+        sequence: event.sequence,
+      };
+    } else if (event.type === "session.snapshot") {
+      eventCursor = sessionSnapshotCursor(event.snapshot);
+    } else if (fallbackGeneration !== undefined) {
+      eventCursor = {
+        actorGeneration: fallbackGeneration,
+        sequence: event.sequence,
+      };
+    } else {
+      observation.unknownSequence =
+        observation.unknownSequence === null
+          ? event.sequence
+          : Math.max(observation.unknownSequence, event.sequence);
+    }
+
+    if (
+      event.type === "session.projectionReplaced" &&
+      (baseline === null ||
+        eventCursor === null ||
+        compareSessionCursors(eventCursor, baseline) > 0)
+    ) {
+      observation.requiresSnapshot = true;
+    }
+    if (eventCursor !== null) {
+      observation.observedCursor = newerSessionCursor(
+        observation.observedCursor,
+        eventCursor,
+      );
+    }
+
+    if (event.type === "session.goalChanged") {
+      const previous = observation.observedGoal;
+      if (
+        previous === null ||
+        event.revision > previous.revision ||
+        (event.revision === previous.revision &&
+          (eventCursor === null ||
+            previous.cursor === null ||
+            compareSessionCursors(eventCursor, previous.cursor) >= 0))
+      ) {
+        observation.observedGoal = {
+          revision: event.revision,
+          goal: event.goal,
+          cursor: eventCursor,
+        };
+      }
+    }
+    observation.version += 1;
+  }
+
+  private beginSelectionObservation(
+    sessionId: string,
+    generation: number,
+  ): SelectionObservation {
+    const current = this.state.sessions[sessionId];
+    const observation: SelectionObservation = {
+      initializationGeneration: this.initializationGeneration,
+      generation,
+      sessionId,
+      initialCursor: current ? sessionSnapshotCursor(current) : null,
+      observedCursor: null,
+      unknownSequence: null,
+      requiresSnapshot: false,
+      version: 0,
+      observedGoal: null,
+    };
+    this.selectionObservation = observation;
+
+    // Events may have entered the queue between the caller's last frame and
+    // this selection. Observe them before either selection request starts.
+    for (const event of this.queuedEvents) {
+      if (event.type !== "catalog.summary" && event.sessionId === sessionId) {
+        this.observeSelectionEvent(observation, event);
+      }
+    }
+    return observation;
+  }
+
+  private requiredSelectionCursor(
+    observation: SelectionObservation,
+    candidate: SessionSnapshot,
+    current: SessionSnapshot | undefined,
+  ): SessionCursor | null {
+    let required = observation.observedCursor;
+    if (observation.unknownSequence !== null) {
+      const generation =
+        current?.actorGeneration ??
+        candidate.actorGeneration ??
+        observation.initialCursor?.actorGeneration ??
+        observation.observedCursor?.actorGeneration ??
+        0;
+      required = newerSessionCursor(required, {
+        actorGeneration: generation,
+        sequence: observation.unknownSequence,
+      });
+    }
+    return required;
+  }
+
+  private reconcileSelectionProjection(
+    observation: SelectionObservation,
+    candidate: SessionSnapshot,
+  ): SelectionProjection {
+    const current = this.state.sessions[observation.sessionId];
+    const candidateCursor = sessionSnapshotCursor(candidate);
+    const currentCursor = current ? sessionSnapshotCursor(current) : null;
+    const useCurrent =
+      current !== undefined &&
+      currentCursor !== null &&
+      compareSessionCursors(currentCursor, candidateCursor) >= 0;
+    const snapshot = useCurrent ? current! : candidate;
+    const cursor = useCurrent ? currentCursor! : candidateCursor;
+    const requiredCursor = this.requiredSelectionCursor(
+      observation,
+      candidate,
+      current,
+    );
+    const cursorBehind =
+      requiredCursor !== null &&
+      compareSessionCursors(cursor, requiredCursor) < 0;
+    const observationNeedsResync =
+      observation.requiresSnapshot &&
+      (current === undefined ||
+        requiredCursor === null ||
+        compareSessionCursors(cursor, requiredCursor) < 0);
+
+    return {
+      snapshot,
+      cursor,
+      requiredCursor,
+      needsResync: cursorBehind || observationNeedsResync,
+    };
+  }
+
+  private waitForSelectionResync(
+    operation: Promise<boolean>,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted) {
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let onAbort = () => {};
+      const cleanup = () => signal.removeEventListener("abort", onAbort);
+      const resolveOnce = (installed: boolean) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(installed);
+      };
+      const rejectOnce = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(error);
+      };
+      onAbort = () => rejectOnce(new DOMException("Aborted", "AbortError"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      operation.then(resolveOnce, rejectOnce);
+      if (signal.aborted) onAbort();
+    });
+  }
+
+  private isCurrentSelection(
+    observation: SelectionObservation,
+    controller: AbortController,
+  ): boolean {
+    return (
+      !this.disposed &&
+      observation.initializationGeneration === this.initializationGeneration &&
+      this.selectionObservation === observation &&
+      observation.generation === this.selectionGeneration &&
+      !controller.signal.aborted
+    );
   }
 
   private isCurrentResync(
@@ -472,6 +709,12 @@ export class YggStore {
   }
 
   private queueEvent(event: HostEvent): void {
+    if (event.type !== "catalog.summary") {
+      const observation = this.selectionObservation;
+      if (observation?.sessionId === event.sessionId) {
+        this.observeSelectionEvent(observation, event);
+      }
+    }
     this.queuedEvents.push(event);
     if (this.animationFrame !== null) return;
     this.animationFrame = window.requestAnimationFrame(() => {
@@ -566,19 +809,15 @@ export class YggStore {
       }
 
       if (event.type === "session.projectionReplaced") {
-        const incomingGeneration =
-          event.actorGeneration ?? current?.actorGeneration;
+        const eventCursor = sessionEventCursor(
+          event,
+          current?.actorGeneration ?? 0,
+        );
         const stale =
           current !== undefined &&
-          incomingGeneration !== undefined &&
-          (incomingGeneration < current.actorGeneration ||
-            (incomingGeneration === current.actorGeneration &&
-              event.sequence <= current.sequence));
+          compareSessionCursors(eventCursor, sessionSnapshotCursor(current)) <= 0;
         if (!stale) {
-          void this.resyncSession(event.sessionId, {
-            actorGeneration: incomingGeneration ?? 0,
-            sequence: event.sequence,
-          });
+          void this.resyncSession(event.sessionId, eventCursor);
         }
         continue;
       }
@@ -681,18 +920,38 @@ export class YggStore {
   private async resyncSession(
     sessionId: string,
     required?: { actorGeneration: number; sequence: number },
-  ): Promise<void> {
-    if (this.resyncOperations.has(sessionId)) return;
+  ): Promise<boolean> {
+    const existing = this.resyncOperations.get(sessionId);
+    if (existing) {
+      if (required) {
+        existing.requiredCursor = newerSessionCursor(
+          existing.requiredCursor,
+          required,
+        );
+        existing.highestObservedCursor = newerSessionCursor(
+          existing.highestObservedCursor,
+          required,
+        );
+      }
+      return existing.completion;
+    }
+
+    let resolveCompletion!: (installed: boolean) => void;
+    const completion = new Promise<boolean>((resolve) => {
+      resolveCompletion = resolve;
+    });
     const current = this.state.sessions[sessionId];
     const currentCursor = current
-      ? { actorGeneration: current.actorGeneration, sequence: current.sequence }
+      ? sessionSnapshotCursor(current)
       : null;
     const operation: ResyncOperation = {
       initializationGeneration: this.initializationGeneration,
       lifetimeController: new AbortController(),
       attemptController: null,
       retryTimer: null,
+      requiredCursor: required ?? null,
       highestObservedCursor: newerSessionCursor(required ?? null, currentCursor),
+      completion,
       deadlineAt: Date.now() + RESYNC_DEADLINE_MS,
     };
     this.resyncOperations.set(sessionId, operation);
@@ -719,23 +978,18 @@ export class YggStore {
             attemptController,
             Math.min(RESYNC_ATTEMPT_TIMEOUT_MS, remainingMs),
           );
-          if (!this.isCurrentResync(sessionId, operation)) return;
+          if (!this.isCurrentResync(sessionId, operation)) break;
           const current = this.state.sessions[sessionId];
-          const snapshotCursor = {
-            actorGeneration: snapshot.actorGeneration,
-            sequence: snapshot.sequence,
-          };
+          const snapshotCursor = sessionSnapshotCursor(snapshot);
           const predates = (
             cursor: SessionCursor,
             minimum: SessionCursor,
           ) => compareSessionCursors(cursor, minimum) < 0;
           if (
-            (required && predates(snapshotCursor, required)) ||
+            (operation.requiredCursor !== null &&
+              predates(snapshotCursor, operation.requiredCursor)) ||
             (current &&
-              predates(snapshotCursor, {
-                actorGeneration: current.actorGeneration,
-                sequence: current.sequence,
-              })) ||
+              predates(snapshotCursor, sessionSnapshotCursor(current))) ||
             (this.deferredDuringResync.get(sessionId)?.overflowed === true &&
               operation.highestObservedCursor !== null &&
               predates(snapshotCursor, operation.highestObservedCursor))
@@ -777,12 +1031,9 @@ export class YggStore {
             sessions: { ...this.state.sessions, [sessionId]: replacement },
           });
           installed = true;
-          installedCursor = {
-            actorGeneration: replacement.actorGeneration,
-            sequence: replacement.sequence,
-          };
+          installedCursor = sessionSnapshotCursor(replacement);
         } catch {
-          if (!this.isCurrentResync(sessionId, operation)) return;
+          if (!this.isCurrentResync(sessionId, operation)) break;
           failed = true;
         } finally {
           if (operation.attemptController === attemptController) {
@@ -806,33 +1057,45 @@ export class YggStore {
         retryDelay = Math.min(2_000, retryDelay * 2);
       }
     } finally {
-      if (this.resyncOperations.get(sessionId) !== operation) return;
-      this.resyncOperations.delete(sessionId);
-      const deferred = this.deferredDuringResync.get(sessionId);
-      this.deferredDuringResync.delete(sessionId);
-      if (!installed || !installedCursor || !deferred) return;
-
-      if (
-        deferred.overflowed &&
-        operation.highestObservedCursor !== null &&
-        compareSessionCursors(installedCursor, operation.highestObservedCursor) >= 0
-      ) {
-        return;
-      }
-      const replay = deferred.overflowed
-        ? null
-        : contiguousDeferredEvents(deferred.events, installedCursor);
-      if (replay === null) {
-        if (this.isCurrentInitialization(operation.initializationGeneration)) {
-          void this.resyncSession(
-            sessionId,
-            operation.highestObservedCursor ?? undefined,
-          );
+      try {
+        if (this.resyncOperations.get(sessionId) === operation) {
+          this.resyncOperations.delete(sessionId);
+          const deferred = this.deferredDuringResync.get(sessionId);
+          this.deferredDuringResync.delete(sessionId);
+          if (installed && installedCursor && deferred) {
+            const coversOverflow =
+              deferred.overflowed &&
+              operation.highestObservedCursor !== null &&
+              compareSessionCursors(
+                installedCursor,
+                operation.highestObservedCursor,
+              ) >= 0;
+            if (!coversOverflow) {
+              const replay = deferred.overflowed
+                ? null
+                : contiguousDeferredEvents(deferred.events, installedCursor);
+              if (replay === null) {
+                if (
+                  this.isCurrentInitialization(
+                    operation.initializationGeneration,
+                  )
+                ) {
+                  void this.resyncSession(
+                    sessionId,
+                    operation.highestObservedCursor ?? undefined,
+                  );
+                }
+              } else {
+                for (const event of replay) this.queueEvent(event);
+              }
+            }
+          }
         }
-        return;
+      } finally {
+        resolveCompletion(installed);
       }
-      for (const event of replay) this.queueEvent(event);
     }
+    return installed;
   }
 
   private async sendCommand(command: ClientCommand) {
@@ -847,6 +1110,10 @@ export class YggStore {
   async initialize(): Promise<void> {
     const generation = ++this.initializationGeneration;
     this.cancelResyncs();
+    this.selectionGeneration += 1;
+    this.selectionAbort?.abort();
+    this.selectionAbort = null;
+    this.selectionObservation = null;
     this.disposed = false;
     if (this.animationFrame !== null) {
       window.cancelAnimationFrame(this.animationFrame);
@@ -1193,6 +1460,7 @@ export class YggStore {
     this.selectionGeneration += 1;
     this.selectionAbort?.abort();
     this.selectionAbort = null;
+    this.selectionObservation = null;
     if (this.state.selectionError) {
       this.publish({ ...this.state, selectionError: null });
     }
@@ -1206,6 +1474,7 @@ export class YggStore {
       this.selectionGeneration += 1;
       this.selectionAbort?.abort();
       this.selectionAbort = null;
+      this.selectionObservation = null;
       if (this.state.selectionError) {
         this.publish({ ...this.state, selectionError: null });
       }
@@ -1216,34 +1485,97 @@ export class YggStore {
     this.selectionAbort?.abort();
     const controller = new AbortController();
     this.selectionAbort = controller;
+    const observation = this.beginSelectionObservation(sessionId, generation);
     if (this.state.selectionError) {
       this.publish({ ...this.state, selectionError: null });
     }
 
     try {
+      const cachedSnapshot = this.state.sessions[sessionId];
       const [snapshot, goalResponse] = await Promise.all([
-        this.state.sessions[sessionId] ??
+        cachedSnapshot ??
           this.transport.getSession(sessionId, controller.signal),
         this.transport.getGoal(sessionId, controller.signal),
       ]);
-      const goal = goalResponse.goal;
+      if (!this.isCurrentSelection(observation, controller)) return;
+
+      let failedResyncVersion: number | null = null;
+      let installedSnapshot: SessionSnapshot;
+      for (;;) {
+        if (!this.isCurrentSelection(observation, controller)) return;
+        // A request can resolve before the frame containing its live events.
+        // Reconcile that queue before choosing the projection to install.
+        this.flushEvents();
+        if (!this.isCurrentSelection(observation, controller)) return;
+
+        const projection = this.reconcileSelectionProjection(
+          observation,
+          snapshot,
+        );
+        const activeResync = this.resyncOperations.get(sessionId);
+        if (activeResync) {
+          const attemptVersion = observation.version;
+          const installed = await this.waitForSelectionResync(
+            activeResync.completion,
+            controller.signal,
+          );
+          if (!this.isCurrentSelection(observation, controller)) return;
+          this.flushEvents();
+          if (!this.isCurrentSelection(observation, controller)) return;
+          failedResyncVersion = installed ? null : attemptVersion;
+          continue;
+        }
+
+        if (!projection.needsResync) {
+          installedSnapshot = projection.snapshot;
+          break;
+        }
+        if (
+          failedResyncVersion !== null &&
+          failedResyncVersion === observation.version
+        ) {
+          throw new Error("The session could not be synchronized.");
+        }
+        const requiredCursor = projection.requiredCursor;
+        if (requiredCursor === null) {
+          throw new Error("The session could not be synchronized.");
+        }
+        const attemptVersion = observation.version;
+        const installed = await this.waitForSelectionResync(
+          this.resyncSession(sessionId, requiredCursor),
+          controller.signal,
+        );
+        if (!this.isCurrentSelection(observation, controller)) return;
+        this.flushEvents();
+        if (!this.isCurrentSelection(observation, controller)) return;
+        failedResyncVersion = installed ? null : attemptVersion;
+      }
+
+      if (!this.isCurrentSelection(observation, controller)) return;
       const summaryTitle = this.state.bootstrap?.sessions.find(
         (summary) => summary.id === sessionId,
       )?.title;
-      const installedSnapshot = summaryTitle
+      const normalizedSnapshot = summaryTitle
         ? {
-            ...snapshot,
-            title: stableSessionTitle(summaryTitle, snapshot.title),
+            ...installedSnapshot,
+            title: stableSessionTitle(summaryTitle, installedSnapshot.title),
           }
-        : snapshot;
-      primeSessionItemIndex(installedSnapshot);
-      if (
-        generation !== this.selectionGeneration ||
-        controller.signal.aborted
-      ) {
-        return;
-      }
-      this.goalRevision = goalResponse.revision;
+        : installedSnapshot;
+      primeSessionItemIndex(normalizedSnapshot);
+      if (!this.isCurrentSelection(observation, controller)) return;
+      const fetchedGoalRevision = Math.max(
+        goalResponse.revision,
+        goalResponse.goal?.revision ?? 0,
+      );
+      const observedGoal = observation.observedGoal;
+      const installedGoal =
+        observedGoal !== null && observedGoal.revision >= fetchedGoalRevision
+          ? observedGoal.goal
+          : goalResponse.goal;
+      this.goalRevision = Math.max(
+        fetchedGoalRevision,
+        observedGoal?.revision ?? 0,
+      );
       this.publish({
         ...this.state,
         bootstrap: this.state.bootstrap
@@ -1255,7 +1587,7 @@ export class YggStore {
                       ...summary,
                       title: stableSessionTitle(
                         summary.title,
-                        installedSnapshot.title,
+                        normalizedSnapshot.title,
                       ),
                       unread: false,
                     }
@@ -1265,23 +1597,22 @@ export class YggStore {
           : this.state.bootstrap,
         selectedSessionId: sessionId,
         selectionError: null,
-        goal,
+        goal: installedGoal,
         sessions: {
           ...this.state.sessions,
-          [sessionId]: installedSnapshot,
+          [sessionId]: normalizedSnapshot,
         },
       });
       if (routeMode !== "none") writeSessionRoute(sessionId, routeMode);
-      this.selectionAbort = null;
+      if (this.selectionAbort === controller) this.selectionAbort = null;
     } catch (error) {
       if (
         (error instanceof DOMException && error.name === "AbortError") ||
-        generation !== this.selectionGeneration ||
-        controller.signal.aborted
+        !this.isCurrentSelection(observation, controller)
       ) {
         return;
       }
-      this.selectionAbort = null;
+      if (this.selectionAbort === controller) this.selectionAbort = null;
       this.publish({
         ...this.state,
         selectionError: {
@@ -1294,6 +1625,10 @@ export class YggStore {
         },
       });
       throw error;
+    } finally {
+      if (this.selectionObservation === observation) {
+        this.selectionObservation = null;
+      }
     }
   }
 
@@ -1847,6 +2182,7 @@ export class YggStore {
     this.initializationGeneration += 1;
     this.selectionGeneration += 1;
     this.selectionAbort?.abort();
+    this.selectionObservation = null;
     if (this.animationFrame !== null) {
       window.cancelAnimationFrame(this.animationFrame);
     }
