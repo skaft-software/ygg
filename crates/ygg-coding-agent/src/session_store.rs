@@ -1433,67 +1433,108 @@ impl SessionStore {
         self.inspect_candidate(self.candidate_by_id(id)?, true)
     }
 
+    fn catalog_entry_from_cached_summary(
+        &self,
+        candidate: SessionCandidate,
+        id: String,
+        summary: CachedTranscriptSummary,
+    ) -> anyhow::Result<SessionCatalogEntry> {
+        let CachedTranscriptSummary::Summary {
+            title,
+            configured_model,
+            configured_reasoning,
+            message_count,
+        } = summary
+        else {
+            anyhow::bail!("session {id:?} is unreadable");
+        };
+        let metadata = title
+            .as_ref()
+            .map(|_| self.load_metadata(&id))
+            .transpose()?
+            .unwrap_or_default();
+        Ok(SessionCatalogEntry {
+            meta: title
+                .map(|title| self.meta_from_parts(candidate, id, title, metadata, message_count)),
+            configured_model,
+            configured_reasoning,
+        })
+    }
+
     /// Load catalog metadata for one named transcript without scanning the
     /// workspace catalog.
     #[cfg_attr(not(feature = "serve"), allow(dead_code))]
     pub(crate) fn catalog_by_id(&self, id: &str) -> anyhow::Result<SessionCatalogEntry> {
-        let candidate = self.candidate_by_id(id)?;
-        let fingerprint = catalog_fingerprint(&candidate);
+        self.catalog_by_ids([id])?
+            .into_iter()
+            .next()
+            .map(|(_, entry)| entry)
+            .ok_or_else(|| anyhow::anyhow!("session {id:?} is unavailable"))
+    }
+
+    /// Load catalog metadata for several already-authorized transcripts while
+    /// opening the disposable catalog and reading its cached rows only once.
+    ///
+    /// The requested IDs are never expanded into a workspace-wide listing. A
+    /// missing, invalid, or unreadable ID is omitted just as a failed targeted
+    /// [`Self::catalog_by_id`] lookup is omitted by Serve callers.
+    #[cfg_attr(not(feature = "serve"), allow(dead_code))]
+    pub(crate) fn catalog_by_ids<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<Vec<(String, SessionCatalogEntry)>> {
         let (mut catalog, cached) = SessionCatalog::open_loaded(&self.dir)?;
-        if let Some(summary) = fingerprint.and_then(|fingerprint| {
-            cached
-                .get(id)
-                .filter(|cached| cached.fingerprint == fingerprint)
-                .map(|cached| cached.summary.clone())
-        }) {
-            let CachedTranscriptSummary::Summary {
-                title,
-                configured_model,
-                configured_reasoning,
-                message_count,
-            } = summary
-            else {
-                anyhow::bail!("session {id:?} is unreadable");
+        let mut updates = Vec::new();
+        let mut entries = Vec::new();
+
+        for id in ids {
+            let Ok(candidate) = self.candidate_by_id(id) else {
+                continue;
             };
-            let metadata = title
-                .as_ref()
-                .map(|_| self.load_metadata(id))
-                .transpose()?
-                .unwrap_or_default();
-            return Ok(SessionCatalogEntry {
-                meta: title.map(|title| {
-                    self.meta_from_parts(candidate, id.to_owned(), title, metadata, message_count)
-                }),
-                configured_model,
-                configured_reasoning,
-            });
-        }
-        let inspection = self.inspect_candidate(candidate, false)?;
-        if let Some(fingerprint) = fingerprint {
-            let summary = CachedTranscriptSummary::Summary {
-                title: inspection
-                    .catalog
-                    .meta
-                    .as_ref()
-                    .map(|meta| meta.title.clone()),
-                configured_model: inspection.catalog.configured_model.clone(),
-                configured_reasoning: inspection.catalog.configured_reasoning.clone(),
-                message_count: inspection
-                    .catalog
-                    .meta
-                    .as_ref()
-                    .map_or(0, |meta| meta.message_count),
+            let fingerprint = catalog_fingerprint(&candidate);
+            if let Some(summary) = fingerprint.and_then(|fingerprint| {
+                cached
+                    .get(id)
+                    .filter(|cached| cached.fingerprint == fingerprint)
+                    .map(|cached| cached.summary.clone())
+            }) {
+                if let Ok(entry) =
+                    self.catalog_entry_from_cached_summary(candidate, id.to_owned(), summary)
+                {
+                    entries.push((id.to_owned(), entry));
+                }
+                continue;
+            }
+
+            let Ok(inspection) = self.inspect_candidate(candidate, false) else {
+                continue;
             };
-            catalog.apply(
-                &[CatalogUpdate {
+            if let Some(fingerprint) = fingerprint {
+                let summary = CachedTranscriptSummary::Summary {
+                    title: inspection
+                        .catalog
+                        .meta
+                        .as_ref()
+                        .map(|meta| meta.title.clone()),
+                    configured_model: inspection.catalog.configured_model.clone(),
+                    configured_reasoning: inspection.catalog.configured_reasoning.clone(),
+                    message_count: inspection
+                        .catalog
+                        .meta
+                        .as_ref()
+                        .map_or(0, |meta| meta.message_count),
+                };
+                updates.push(CatalogUpdate {
                     id: id.to_owned(),
                     fingerprint,
                     summary,
-                }],
-                &HashSet::new(),
-            )?;
+                });
+            }
+            entries.push((id.to_owned(), inspection.catalog));
         }
-        Ok(inspection.catalog)
+
+        catalog.apply(&updates, &HashSet::new())?;
+        Ok(entries)
     }
 
     /// Build catalog metadata from the already authorized, fully replayed
@@ -3203,6 +3244,15 @@ mod tests {
         // Populate the catalog before the targeted Serve lookup. The lookup must
         // retain the persisted configuration without reopening the transcript.
         store.list();
+        let catalogs = store.catalog_by_ids(["target", "corrupt"]).unwrap();
+        assert_eq!(catalogs.len(), 1);
+        assert_eq!(catalogs[0].0, "target");
+        assert_eq!(catalogs[0].1.meta.as_ref().unwrap().title, "target title");
+        assert_eq!(
+            catalogs[0].1.configured_model.as_deref(),
+            Some("target-config")
+        );
+        assert_eq!(catalogs[0].1.configured_reasoning.as_deref(), Some("high"));
         let catalog = store.catalog_by_id("target").unwrap();
         assert_eq!(catalog.meta.unwrap().title, "target title");
         assert_eq!(catalog.configured_model.as_deref(), Some("target-config"));

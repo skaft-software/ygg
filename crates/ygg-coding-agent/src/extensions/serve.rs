@@ -3247,15 +3247,18 @@ impl HostService for YggHost {
                 project_config.workspace = root.as_path().to_owned();
                 project_config.invocation_cwd = root.as_path().to_owned();
                 project_config.workspace_trusted = project.state == RegistryProjectState::Trusted;
-                for session_id in
-                    sessions.session_ids_newest_first(bound.iter().map(String::as_str))
-                {
+                let session_ids = sessions
+                    .session_ids_newest_first(bound.iter().map(String::as_str))
+                    .into_iter()
+                    .take(2_000)
+                    .collect::<Vec<_>>();
+                let catalog_entries = sessions
+                    .catalog_by_ids(session_ids.iter().map(String::as_str))
+                    .unwrap_or_default();
+                for (_session_id, catalog_entry) in catalog_entries {
                     if summaries.len() >= 2_000 {
                         break;
                     }
-                    let Ok(catalog_entry) = sessions.catalog_by_id(&session_id) else {
-                        continue;
-                    };
                     let Some(meta) = catalog_entry.meta.as_ref() else {
                         continue;
                     };
