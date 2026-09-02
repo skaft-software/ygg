@@ -487,7 +487,7 @@ jobs:
       - name: Create and verify immutable release metadata
         shell: bash
         env:
-          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          EXPECTED_OIDC_ISSUER: https://token.actions.githubusercontent.com
           COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
           WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
           WORKFLOW_REPOSITORY: ${{ github.repository }}
@@ -513,7 +513,7 @@ jobs:
           cosign verify-blob \
             --bundle release-assets/YGG_RELEASE_METADATA.json.sigstore.json \
             --certificate-identity "$COSIGN_IDENTITY" \
-            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            --certificate-oidc-issuer "$EXPECTED_OIDC_ISSUER" \
             --certificate-github-workflow-name "Ygg binary release" \
             --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY" \
             --certificate-github-workflow-sha "$WORKFLOW_COMMIT" \
