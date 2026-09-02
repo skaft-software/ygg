@@ -284,6 +284,90 @@ impl Drop for PtyYgg {
 }
 
 #[test]
+fn ctrl_d_prints_one_resume_command_after_terminal_restoration() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut ygg = PtyYgg::spawn(directory.path());
+    let started = Instant::now();
+    ygg.write_input(&[4]);
+
+    let (status, elapsed, output) = ygg.wait_for_exit(started);
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "Ctrl-D shutdown took {elapsed:?}");
+    let _ = assert_resume_notice(directory.path(), &output);
+}
+
+#[test]
+fn slash_quit_prints_one_resume_command_after_terminal_restoration() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut ygg = PtyYgg::spawn(directory.path());
+    ygg.submit_command(b"/quit");
+
+    let (status, elapsed, output) = ygg.wait_for_exit(Instant::now());
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "/quit shutdown took {elapsed:?}");
+    let _ = assert_resume_notice(directory.path(), &output);
+}
+
+#[test]
+fn resume_notice_tracks_the_active_session_after_a_clone_transition() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut ygg = PtyYgg::spawn(directory.path());
+    let initial = session_ids(directory.path())
+        .into_iter()
+        .next()
+        .expect("initial session");
+
+    ygg.submit_command(b"/clone");
+    ygg.wait_until(READY_DEADLINE, |output| {
+        contains_bytes(output, b"Cloned to new session")
+    });
+    ygg.submit_command(b"/quit");
+
+    let (status, elapsed, output) = ygg.wait_for_exit(Instant::now());
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
+    let current = assert_resume_notice(directory.path(), &output);
+    assert_ne!(current, initial);
+}
+
+#[test]
+fn resume_notice_tracks_the_active_session_after_a_resume_transition() {
+    let _guard = PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let directory = tempfile::tempdir().expect("tempdir");
+    let mut ygg = PtyYgg::spawn(directory.path());
+    let mut ids = session_ids(directory.path());
+    assert_eq!(ids.len(), 1, "expected one initial session, found {ids:?}");
+    let original = ids.pop().unwrap();
+
+    ygg.submit_command(b"/new");
+    ygg.wait_until(READY_DEADLINE, |output| {
+        contains_bytes(output, b"created a new session")
+    });
+    let resume = format!("/resume {original}");
+    ygg.submit_command(resume.as_bytes());
+    ygg.wait_until(READY_DEADLINE, |output| {
+        contains_bytes(output, b"resumed session")
+    });
+    ygg.submit_command(b"/quit");
+
+    let (status, elapsed, output) = ygg.wait_for_exit(Instant::now());
+    assert_eq!(status.code(), Some(0));
+    assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
+    assert_eq!(assert_resume_notice(directory.path(), &output), original);
+}
+
+#[test]
 fn idle_interactive_sigterm_is_coordinated_and_restores_terminal() {
     let _guard = PTY_TEST_LOCK
         .lock()
@@ -295,6 +379,10 @@ fn idle_interactive_sigterm_is_coordinated_and_restores_terminal() {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM));
     assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
     assert!(contains_bytes(&output, b"\x1b[?1003l"));
+    assert!(!contains_bytes(
+        &output,
+        b"To resume this session: ygg --resume "
+    ));
 }
 
 #[test]
@@ -715,6 +803,99 @@ fn assert_restoration_sequences(output: &[u8]) {
         contains_bytes(output, b"\x1b[?25h"),
         "cursor was not restored"
     );
+}
+
+fn session_ids(root: &Path) -> Vec<String> {
+    let sessions = root.join("sessions");
+    let mut ids = Vec::new();
+    for store in std::fs::read_dir(sessions).into_iter().flatten().flatten() {
+        if !store.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        for entry in std::fs::read_dir(store.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(id.to_owned());
+            }
+        }
+    }
+    ids.sort_unstable();
+    ids
+}
+
+fn assert_resume_notice(root: &Path, output: &[u8]) -> String {
+    const PREFIX: &[u8] = b"To resume this session: ygg --resume ";
+    let starts = output
+        .windows(PREFIX.len())
+        .enumerate()
+        .filter_map(|(index, window)| (window == PREFIX).then_some(index))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        starts.len(),
+        1,
+        "expected one resume notice; output: {}",
+        String::from_utf8_lossy(output)
+    );
+    let start = starts[0];
+    let end = output[start..]
+        .iter()
+        .position(|byte| matches!(byte, b'\r' | b'\n'))
+        .expect("resume notice line terminator");
+    let line = &output[start..start + end];
+    let line = std::str::from_utf8(line).expect("resume notice is UTF-8");
+    let id = line
+        .strip_prefix("To resume this session: ygg --resume ")
+        .unwrap();
+    assert!(!id.is_empty(), "resume notice has no session id");
+    let sessions = root.join("sessions");
+    let session_name = format!("{id}.jsonl");
+    let in_root = sessions.join(&session_name).is_file();
+    let in_workspace_store = std::fs::read_dir(&sessions)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir())
+                .map(|_| entry)
+        })
+        .any(|entry| entry.path().join(&session_name).is_file());
+    assert!(
+        in_root || in_workspace_store,
+        "resume notice did not name an existing session: {line}"
+    );
+    assert!(
+        !line.contains(&root.display().to_string()),
+        "resume notice leaked a filesystem path: {line}"
+    );
+    assert!(!line.bytes().any(|byte| byte < 0x20 || byte == 0x7f));
+
+    for marker in [b"\x1b[?2004l".as_slice(), b"\x1b[?1000l", b"\x1b[?25h"] {
+        let marker_position = output
+            .windows(marker.len())
+            .rposition(|window| window == marker)
+            .unwrap_or_else(|| panic!("missing terminal restoration marker {marker:?}"));
+        assert!(
+            marker_position < start,
+            "resume notice preceded terminal restoration {marker:?}; output: {}",
+            String::from_utf8_lossy(output)
+        );
+    }
+    id.to_owned()
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
