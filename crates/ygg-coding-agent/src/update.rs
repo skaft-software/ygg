@@ -1001,7 +1001,7 @@ mod tests {
     }
 
     fn create_npm_fixture(root: &Path) -> (PathBuf, PathBuf, String) {
-        let (platform_package, os, cpu) = expected_npm_platform().unwrap();
+        let (platform_package, _target, os, cpu) = expected_npm_platform().unwrap();
         let platform_name = platform_package.rsplit('/').next().unwrap();
         let npm_root = root.join("prefix/node_modules");
         let launcher_root = npm_root.join(NPM_LAUNCHER);
@@ -1017,6 +1017,9 @@ mod tests {
             None,
             None,
         );
+        for file in ["README.md", "LICENSE"] {
+            std::fs::write(launcher_root.join(file), file).unwrap();
+        }
         for file in ["bin/ygg", "bin/ygg-host", "lib/launch.sh"] {
             let path = launcher_root.join(file);
             std::fs::write(&path, "#!/bin/sh\n").unwrap();
@@ -1037,6 +1040,9 @@ mod tests {
             Some(os),
             Some(cpu),
         );
+        for file in ["README.md", "LICENSE"] {
+            std::fs::write(platform_root.join(file), file).unwrap();
+        }
         for file in ["bin/ygg", "bin/ygg-host"] {
             let path = platform_root.join(file);
             std::fs::write(&path, "native").unwrap();
@@ -1048,7 +1054,7 @@ mod tests {
         }
         std::fs::write(
             platform_root.join("share/ygg/.ygg-version"),
-            env!("CARGO_PKG_VERSION"),
+            format!("{}\n", env!("CARGO_PKG_VERSION")),
         )
         .unwrap();
         std::fs::write(platform_root.join("share/ygg/README.md"), "# Ygg\n").unwrap();
@@ -1158,7 +1164,8 @@ mod tests {
     #[test]
     fn detects_only_a_corroborated_global_npm_layout() {
         let root = tempfile::tempdir().unwrap();
-        let (npm_root, platform_root, platform_name) = create_npm_fixture(root.path());
+        let root_path = root.path().canonicalize().unwrap();
+        let (npm_root, platform_root, platform_name) = create_npm_fixture(&root_path);
         let exe = platform_root.join("bin/ygg");
         let environment = InstallEnvironment {
             npm_root: Some(npm_root.clone()),
