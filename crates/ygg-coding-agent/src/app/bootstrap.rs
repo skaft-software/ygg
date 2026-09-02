@@ -180,6 +180,54 @@ const MAX_PROVIDER_INVENTORY_CACHE_BYTES: usize = MAX_DISCOVERY_BODY_BYTES + 102
 const PROVIDER_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NEGATIVE_INVENTORY_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+fn optional_env_value(
+    _name: &str,
+    value: Result<Option<String>, ygg_ai::ConfigError>,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(value),
+        // Preserve the existing optional-reader policy for invalid Unicode:
+        // std::env::var(...).ok() treated it like an unavailable value.
+        Err(ygg_ai::ConfigError::InvalidEnv(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    optional_env_value(name, ygg_ai::auth::read_bounded_env(name))
+}
+
+fn required_env_value(
+    name: &str,
+    value: Result<Option<String>, ygg_ai::ConfigError>,
+) -> anyhow::Result<String> {
+    match value? {
+        Some(value) => Ok(value),
+        None => Err(anyhow::anyhow!("environment variable {name} not found")),
+    }
+}
+
+fn required_env(name: &str) -> anyhow::Result<String> {
+    required_env_value(name, ygg_ai::auth::read_bounded_env(name))
+}
+
+fn strict_env_value(
+    name: &str,
+    value: Result<Option<String>, ygg_ai::ConfigError>,
+) -> anyhow::Result<Option<String>> {
+    match value {
+        Ok(value) => Ok(value),
+        Err(ygg_ai::ConfigError::InvalidEnv(_)) => Err(anyhow::anyhow!(
+            "could not read {name}: invalid environment value"
+        )),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn strict_env(name: &str) -> anyhow::Result<Option<String>> {
+    strict_env_value(name, ygg_ai::auth::read_bounded_env(name))
+}
+
 fn blocking_discovery_client(timeout: Duration) -> reqwest::Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
         .timeout(timeout)
@@ -1110,8 +1158,8 @@ fn register_anthropic_compatible_models(
 }
 
 fn deepseek_base_url() -> anyhow::Result<url::Url> {
-    let configured = std::env::var("YGG_DEEPSEEK_BASE_URL")
-        .unwrap_or_else(|_| DEEPSEEK_DEFAULT_BASE_URL.to_owned());
+    let configured = optional_env("YGG_DEEPSEEK_BASE_URL")?
+        .unwrap_or_else(|| DEEPSEEK_DEFAULT_BASE_URL.to_owned());
     let normalized = if configured.ends_with('/') {
         configured
     } else {
@@ -1122,13 +1170,13 @@ fn deepseek_base_url() -> anyhow::Result<url::Url> {
 }
 
 fn deepseek_limit(name: &str, default: u64) -> anyhow::Result<u64> {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .map_err(|error| anyhow::anyhow!("invalid {name}={value:?}: {error}")),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(error) => Err(anyhow::anyhow!("could not read {name}: {error}")),
-    }
+    let value = match strict_env(name)? {
+        Some(value) => value,
+        None => return Ok(default),
+    };
+    value
+        .parse()
+        .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
 }
 
 fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
@@ -1149,7 +1197,7 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
         return Ok(());
     }
     let api_name =
-        std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.to_owned());
+        optional_env("YGG_DEEPSEEK_MODEL")?.unwrap_or_else(|| DEEPSEEK_MODEL_ID.to_owned());
     let cache = crate::providers::cache_compatibility(
         crate::providers::DEEPSEEK.id,
         &api_name,
@@ -1204,7 +1252,7 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
 }
 
 fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
-    let key = std::env::var("DEEPSEEK_API_KEY")?;
+    let key = required_env("DEEPSEEK_API_KEY")?;
     let url = deepseek_base_url()?.join("models")?.to_string();
     let Some(body) = cached_provider_inventory(
         crate::providers::DEEPSEEK.id,
@@ -1497,13 +1545,18 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
     Ok(models)
 }
 
-fn resolve_first_env(names: &'static [&'static str]) -> Option<(&'static str, String)> {
-    names.iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| (*name, value))
-    })
+fn resolve_first_env(
+    names: &'static [&'static str],
+) -> anyhow::Result<Option<(&'static str, String)>> {
+    for name in names {
+        let Some(value) = optional_env(name)? else {
+            continue;
+        };
+        if !value.trim().is_empty() {
+            return Ok(Some((*name, value)));
+        }
+    }
+    Ok(None)
 }
 
 fn preset_auth(protocol: Protocol, api_key_env: &'static str) -> Auth {
@@ -1624,7 +1677,7 @@ fn register_opencode(
 }
 
 fn try_register_preset(catalog: &mut ModelCatalog, preset: &ProviderPreset) -> anyhow::Result<()> {
-    let Some((api_key_env, api_key)) = resolve_first_env(preset.api_key_env) else {
+    let Some((api_key_env, api_key)) = resolve_first_env(preset.api_key_env)? else {
         return Ok(());
     };
 
@@ -1679,8 +1732,16 @@ fn merge_provider_catalog(target: &mut ModelCatalog, source: ModelCatalog) -> an
 fn register_configured_presets_parallel(catalog: &mut ModelCatalog) {
     let mut jobs = Vec::new();
     for preset in BUILTIN_PROVIDERS {
-        if resolve_first_env(preset.api_key_env).is_none() {
-            continue;
+        match resolve_first_env(preset.api_key_env) {
+            Ok(Some(_)) => {}
+            Ok(None) => continue,
+            Err(error) => {
+                // An invalid/oversized optional credential must not become a
+                // request, but one unusable provider must not block other
+                // configured providers from starting.
+                crate::output::stderr!("warning: {} unavailable: {error}", preset.name);
+                continue;
+            }
         }
         let preset = *preset;
         match std::thread::Builder::new()
@@ -1992,9 +2053,9 @@ fn resolve_custom_startup_timeout(
     environment: Option<&str>,
 ) -> anyhow::Result<Duration> {
     let seconds = match environment.map(str::trim).filter(|value| !value.is_empty()) {
-        Some(value) => value.parse::<u64>().map_err(|error| {
-            anyhow::anyhow!("invalid YGG_CUSTOM_STARTUP_TIMEOUT_SECS {value:?}: {error}")
-        })?,
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|error| anyhow::anyhow!("invalid YGG_CUSTOM_STARTUP_TIMEOUT_SECS: {error}"))?,
         None => configured_secs.unwrap_or(CUSTOM_ENDPOINT_STARTUP_TIMEOUT.as_secs()),
     };
     anyhow::ensure!(
@@ -2172,8 +2233,7 @@ fn resolve_custom_provider_auth(
                     .all(|character| character.is_ascii_alphanumeric() || character == '_'),
             "custom provider auth environment variable must be a valid name: {var:?}"
         );
-        let key = std::env::var(var)
-            .ok()
+        let key = optional_env(var)?
             .filter(|key| !key.trim().is_empty())
             .unwrap_or_default();
         Ok((Auth::bearer_env(var), key))
@@ -2195,9 +2255,7 @@ fn resolve_custom_provider_auth(
         ));
     }
     if legacy_single_endpoint {
-        let Some(key) = std::env::var("YGG_CUSTOM_API_KEY")
-            .ok()
-            .filter(|key| !key.trim().is_empty())
+        let Some(key) = optional_env("YGG_CUSTOM_API_KEY")?.filter(|key| !key.trim().is_empty())
         else {
             return Ok((Auth::None, String::new()));
         };
@@ -2459,12 +2517,14 @@ fn register_custom_openai_provider(
     // the provider registry. Requests use the redacted Auth strategy below.
     cred.api_key = effective_key.clone();
 
+    let startup_timeout_env = if legacy_single_endpoint {
+        optional_env("YGG_CUSTOM_STARTUP_TIMEOUT_SECS")?
+    } else {
+        None
+    };
     let startup_timeout = resolve_custom_startup_timeout(
         provider.startup_timeout_secs,
-        legacy_single_endpoint
-            .then(|| std::env::var("YGG_CUSTOM_STARTUP_TIMEOUT_SECS").ok())
-            .flatten()
-            .as_deref(),
+        startup_timeout_env.as_deref(),
     )?;
 
     let base_url = if cred.base_url.ends_with('/') {
@@ -4503,6 +4563,72 @@ pub fn rebuild_app(
         goal_driver,
         goal_session_id,
     })
+}
+
+#[cfg(test)]
+mod bounded_env_tests {
+    use super::*;
+
+    fn oversized_result(name: &str) -> Result<Option<String>, ygg_ai::ConfigError> {
+        Err(ygg_ai::ConfigError::EnvironmentValueTooLarge {
+            var: name.to_owned(),
+            max_bytes: ygg_ai::auth::MAX_ENV_VALUE_BYTES,
+        })
+    }
+
+    #[test]
+    fn bootstrap_env_adapters_accept_the_limit_and_propagate_oversized_values() {
+        let at_limit = "x".repeat(ygg_ai::auth::MAX_ENV_VALUE_BYTES);
+        assert_eq!(
+            optional_env_value("OPTIONAL", Ok(Some(at_limit.clone()))).unwrap(),
+            Some(at_limit.clone())
+        );
+        assert_eq!(
+            required_env_value("REQUIRED", Ok(Some(at_limit.clone()))).unwrap(),
+            at_limit.clone()
+        );
+        assert_eq!(
+            strict_env_value("STRICT", Ok(Some(at_limit))).unwrap(),
+            Some("x".repeat(ygg_ai::auth::MAX_ENV_VALUE_BYTES))
+        );
+
+        let errors = [
+            optional_env_value("OPTIONAL", oversized_result("OPTIONAL")),
+            required_env_value("REQUIRED", oversized_result("REQUIRED")).map(|_| None),
+            strict_env_value("STRICT", oversized_result("STRICT")),
+        ];
+        for result in errors {
+            let error = result
+                .err()
+                .expect("oversized environment values must fail");
+            assert!(error.to_string().contains("4096-byte limit"));
+        }
+    }
+
+    #[test]
+    fn bootstrap_env_adapters_preserve_unset_and_invalid_unicode_policies() {
+        assert_eq!(optional_env_value("OPTIONAL", Ok(None)).unwrap(), None);
+        assert_eq!(
+            optional_env_value(
+                "OPTIONAL",
+                Err(ygg_ai::ConfigError::InvalidEnv("OPTIONAL".to_owned()))
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(strict_env_value("STRICT", Ok(None)).unwrap(), None);
+        assert!(strict_env_value(
+            "STRICT",
+            Err(ygg_ai::ConfigError::InvalidEnv("STRICT".to_owned()))
+        )
+        .is_err());
+        assert!(required_env_value("REQUIRED", Ok(None)).is_err());
+        assert!(required_env_value(
+            "REQUIRED",
+            Err(ygg_ai::ConfigError::InvalidEnv("REQUIRED".to_owned()))
+        )
+        .is_err());
+    }
 }
 
 #[cfg(test)]

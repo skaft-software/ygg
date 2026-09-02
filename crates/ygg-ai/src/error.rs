@@ -434,6 +434,29 @@ mod tests {
     }
 
     #[test]
+    fn test_environment_limit_errors_do_not_expose_values() {
+        let sample = "oversized-secret-value";
+        let config = ConfigError::EnvironmentValueTooLarge {
+            var: "YGG_API_KEY".to_owned(),
+            max_bytes: 4096,
+        };
+        let auth = AuthError::EnvironmentValueTooLarge {
+            var: "YGG_API_KEY".to_owned(),
+            max_bytes: 4096,
+        };
+        assert_eq!(
+            config.to_string(),
+            "Environment variable YGG_API_KEY exceeds the 4096-byte limit"
+        );
+        assert_eq!(
+            auth.to_string(),
+            "Credential environment variable YGG_API_KEY exceeds the 4096-byte limit"
+        );
+        assert!(!config.to_string().contains(sample));
+        assert!(!auth.to_string().contains(sample));
+    }
+
+    #[test]
     fn test_transport_error_preserves_phase() {
         let err = AiError::Transport(TransportError {
             phase: TransportPhase::ResponseHeaders,
