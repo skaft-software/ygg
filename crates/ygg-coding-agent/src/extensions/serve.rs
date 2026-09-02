@@ -13510,8 +13510,9 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             &executable,
             concat!(
                 "#!/bin/sh\n",
-                "/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; while :; do /bin/sleep 1; done' &\n",
-                "while [ ! -s descendant.pid ]; do /bin/sleep 0.01; done\n",
+                "/bin/sh -c 'trap \"\" TERM; while :; do /bin/sleep 1; done' &\n",
+                "echo $! > descendant.pid\n",
+                "while :; do /bin/sleep 1; done\n",
             ),
         )
         .unwrap();
