@@ -835,7 +835,7 @@ fn run_git(root: &Path, args: &[&str], timeout: Duration, stdout_limit: usize) -
     let Some(git_executable) = safe_git_executable(root) else {
         return GitRunResult::Unavailable;
     };
-    let Some(filter_overrides) = local_filter_overrides(&git_executable, root, timeout) else {
+    let Some(filter_overrides) = repository_filter_overrides(&git_executable, root, timeout) else {
         return GitRunResult::Unavailable;
     };
     run_git_executable_with_overrides(
@@ -848,15 +848,17 @@ fn run_git(root: &Path, args: &[&str], timeout: Duration, stdout_limit: usize) -
     )
 }
 
-fn local_filter_overrides(
+fn repository_filter_overrides(
     git_executable: &Path,
     root: &Path,
     timeout: Duration,
 ) -> Option<Vec<String>> {
+    // Match the repository, worktree, and included config scopes that later Git
+    // commands read; system and global config remain disabled by the subprocess.
     let config = run_git_executable(
         git_executable,
         root,
-        &["config", "--local", "--name-only", "--list"],
+        &["config", "--includes", "--name-only", "--list"],
         timeout,
         MAX_GIT_CONFIG_BYTES,
     );
@@ -867,21 +869,24 @@ fn local_filter_overrides(
         return None;
     }
 
+    let config_names = std::str::from_utf8(&output.stdout).ok()?;
     let mut names = std::collections::BTreeSet::new();
-    for key in String::from_utf8_lossy(&output.stdout).lines() {
+    for key in config_names.lines() {
         let Some(key) = key.strip_prefix("filter.") else {
             continue;
         };
         let Some((name, kind)) = key.rsplit_once('.') else {
             continue;
         };
-        if !matches!(kind, "clean" | "process")
-            || name.is_empty()
+        if !matches!(kind, "clean" | "process") {
+            continue;
+        }
+        if name.is_empty()
             || name
                 .chars()
                 .any(|character| character.is_control() || character == '=')
         {
-            continue;
+            return None;
         }
         names.insert(name.to_owned());
     }
@@ -1811,7 +1816,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn git_status_neutralizes_repository_clean_filters() {
+    fn git_status_neutralizes_local_and_worktree_clean_filters() {
         use std::process::Command;
 
         let directory = tempfile::tempdir().unwrap();
@@ -1871,6 +1876,149 @@ mod tests {
         assert!(
             !marker.is_file(),
             "file status refresh ran the clean filter"
+        );
+
+        git(&["config", "--local", "--unset-all", "filter.poison.clean"]);
+        git(&["config", "--local", "--unset-all", "filter.poison.smudge"]);
+        git(&["config", "extensions.worktreeConfig", "true"]);
+        git(&[
+            "config",
+            "--worktree",
+            "filter.poison.clean",
+            filter.to_str().unwrap(),
+        ]);
+        git(&["config", "--worktree", "filter.poison.smudge", "cat"]);
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "lello\n").unwrap();
+        git(&["status", "--porcelain=v2", "--branch"]);
+        assert!(
+            marker.is_file(),
+            "worktree-config positive control did not run the clean filter"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "mello\n").unwrap();
+        let repository = super::refresh_git(&root, Duration::from_secs(2));
+        assert!(repository.dirty.unwrap_or(false));
+        assert!(
+            !marker.is_file(),
+            "repository refresh ran the worktree-config clean filter"
+        );
+
+        let files = super::refresh_git_file_status(&root, Duration::from_secs(2));
+        assert!(!files.entries.is_empty());
+        assert!(
+            !marker.is_file(),
+            "file status refresh ran the worktree-config clean filter"
+        );
+
+        git(&["config", "--worktree", "--unset-all", "filter.poison.clean"]);
+        git(&[
+            "config",
+            "--worktree",
+            "--unset-all",
+            "filter.poison.smudge",
+        ]);
+        let unsafe_filter_name = "poison=driver";
+        git(&[
+            "config",
+            "--worktree",
+            &format!("filter.{unsafe_filter_name}.clean"),
+            filter.to_str().unwrap(),
+        ]);
+        git(&[
+            "config",
+            "--worktree",
+            &format!("filter.{unsafe_filter_name}.smudge"),
+            "cat",
+        ]);
+        std::fs::write(
+            root.join(".gitattributes"),
+            format!("*.txt filter={unsafe_filter_name}\n"),
+        )
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "nello\n").unwrap();
+        git(&["status", "--porcelain=v2", "--branch"]);
+        assert!(
+            marker.is_file(),
+            "unsafe-name positive control did not run the clean filter"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "oello\n").unwrap();
+        let repository = super::refresh_git(&root, Duration::from_secs(2));
+        assert_eq!(
+            repository.refresh.state,
+            super::ContextRefreshState::Unavailable
+        );
+        assert!(
+            !marker.is_file(),
+            "repository refresh ran a filter whose name cannot be overridden"
+        );
+
+        let files = super::refresh_git_file_status(&root, Duration::from_secs(2));
+        assert!(files.entries.is_empty());
+        assert!(
+            !marker.is_file(),
+            "file status refresh ran a filter whose name cannot be overridden"
+        );
+
+        git(&[
+            "config",
+            "--worktree",
+            "--unset-all",
+            &format!("filter.{unsafe_filter_name}.clean"),
+        ]);
+        git(&[
+            "config",
+            "--worktree",
+            "--unset-all",
+            &format!("filter.{unsafe_filter_name}.smudge"),
+        ]);
+        let mut worktree_config =
+            std::fs::read(root.join(".git/config.worktree")).unwrap_or_default();
+        worktree_config.extend_from_slice(b"\n[filter \"poison");
+        worktree_config.push(0xff);
+        worktree_config.extend_from_slice(b"driver\"]\n\tclean = ");
+        worktree_config.extend_from_slice(filter.to_str().unwrap().as_bytes());
+        worktree_config.extend_from_slice(b"\n\tsmudge = cat\n");
+        std::fs::write(root.join(".git/config.worktree"), worktree_config).unwrap();
+        let mut attributes = b"*.txt filter=poison".to_vec();
+        attributes.push(0xff);
+        attributes.extend_from_slice(b"driver\n");
+        std::fs::write(root.join(".gitattributes"), attributes).unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "pello\n").unwrap();
+        git(&["status", "--porcelain=v2", "--branch"]);
+        assert!(
+            marker.is_file(),
+            "non-UTF-8-name positive control did not run the clean filter"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "qello\n").unwrap();
+        let repository = super::refresh_git(&root, Duration::from_secs(2));
+        assert_eq!(
+            repository.refresh.state,
+            super::ContextRefreshState::Unavailable
+        );
+        assert!(
+            !marker.is_file(),
+            "repository refresh ran a filter with a non-UTF-8 name"
+        );
+
+        let files = super::refresh_git_file_status(&root, Duration::from_secs(2));
+        assert!(files.entries.is_empty());
+        assert!(
+            !marker.is_file(),
+            "file status refresh ran a filter with a non-UTF-8 name"
         );
     }
 
