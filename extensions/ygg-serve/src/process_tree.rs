@@ -18,7 +18,7 @@ use std::process::Stdio;
 use std::sync::Mutex;
 
 /// Configures a command so its child becomes the leader of a new process group.
-pub(crate) fn isolate_process_group(command: &mut Command) {
+pub fn isolate_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -31,8 +31,10 @@ pub(crate) fn isolate_process_group(command: &mut Command) {
 
 /// Termination signal used for an owned process tree.
 #[derive(Clone, Copy)]
-pub(crate) enum TerminationSignal {
+pub enum TerminationSignal {
+    /// Ask the process tree to exit gracefully.
     Graceful,
+    /// Forcefully terminate the process tree.
     Force,
 }
 
@@ -41,7 +43,7 @@ pub(crate) enum TerminationSignal {
 /// Numeric process identities are retained only through bounded cleanup.
 /// Callers disarm the guard as soon as child and pipe settlement completes,
 /// limiting the ordinary PID-reuse exposure of process-group APIs.
-pub(crate) struct ProcessTree {
+pub struct ProcessTree {
     group_id: AtomicI32,
     track_descendants: AtomicBool,
     track_session: AtomicBool,
@@ -57,7 +59,7 @@ struct TrackedProcesses {
 
 impl ProcessTree {
     /// Owns the process group whose leader has `process_id`.
-    pub(crate) fn from_process_id(process_id: Option<u32>) -> Self {
+    pub fn from_process_id(process_id: Option<u32>) -> Self {
         let group_id = process_id
             .and_then(|id| i32::try_from(id).ok())
             .filter(|id| *id > 0)
@@ -141,7 +143,7 @@ impl ProcessTree {
     }
 
     /// Sends a signal to every currently known group in the owned tree.
-    pub(crate) fn signal(&self, signal: TerminationSignal) {
+    pub fn signal(&self, signal: TerminationSignal) {
         #[cfg(unix)]
         {
             if self.track_descendants.load(Ordering::Acquire) {
@@ -169,7 +171,7 @@ impl ProcessTree {
     }
 
     /// Returns whether any tracked process group is still observable.
-    pub(crate) fn is_alive(&self) -> bool {
+    pub fn is_alive(&self) -> bool {
         #[cfg(unix)]
         {
             self.tracked
@@ -189,7 +191,7 @@ impl ProcessTree {
     }
 
     /// Relinquishes numeric process identities after cleanup settles.
-    pub(crate) fn disarm(&self) {
+    pub fn disarm(&self) {
         self.track_descendants.store(false, Ordering::Release);
         self.track_session.store(false, Ordering::Release);
         self.group_id.store(0, Ordering::Release);

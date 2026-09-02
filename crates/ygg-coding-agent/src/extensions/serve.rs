@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -43,10 +43,11 @@ use ygg_serve_backend::{
     FinalizeCompletion, FinalizeDecision, GoalAction, GoalState as ServeGoalState, GoalStore,
     GoalStoreError, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
     InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
+    isolate_process_group, LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing,
+    ModelInputPricingTier,
     ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
     ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
-    ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
+    ProjectFileWrite, ProcessTree, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
     PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RegistryProjectId,
     RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
     RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind,
@@ -56,6 +57,7 @@ use ygg_serve_backend::{
     SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
     SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
     SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
+    TerminationSignal,
     ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
     ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
     ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
@@ -614,6 +616,9 @@ const MAX_PULL_REQUEST_RECORDS: usize = 2_000;
 const MAX_GITHUB_CLI_OUTPUT_BYTES: u64 = 16 * 1024;
 const MAX_CONCURRENT_GITHUB_QUERIES: usize = 4;
 const GITHUB_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+const GITHUB_CLI_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(100);
+const GITHUB_CLI_FORCE_PERIOD: std::time::Duration = std::time::Duration::from_millis(400);
+const GITHUB_CLI_CLEANUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 const PULL_REQUEST_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 static GITHUB_QUERY_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_CONCURRENT_GITHUB_QUERIES);
@@ -3630,6 +3635,37 @@ async fn query_github_pull_request_with_timeout_and_queued_permit(
     execute_github_pull_request_query(workspace, selector, executable, timeout).await
 }
 
+async fn terminate_github_process(
+    child: &mut tokio::process::Child,
+    process_tree: &ProcessTree,
+) {
+    process_tree.signal(TerminationSignal::Graceful);
+    let graceful_deadline = Instant::now() + GITHUB_CLI_GRACE_PERIOD;
+    while Instant::now() < graceful_deadline {
+        let child_settled = child.try_wait().ok().flatten().is_some();
+        if child_settled && !process_tree.is_alive() {
+            process_tree.disarm();
+            return;
+        }
+        tokio::time::sleep(GITHUB_CLI_CLEANUP_POLL_INTERVAL).await;
+    }
+
+    process_tree.signal(TerminationSignal::Force);
+    // Keep the direct-child fallback for platforms without process groups.
+    let _ = child.start_kill();
+    let force_deadline = Instant::now() + GITHUB_CLI_FORCE_PERIOD;
+    while Instant::now() < force_deadline {
+        let child_settled = child.try_wait().ok().flatten().is_some();
+        if child_settled && !process_tree.is_alive() {
+            process_tree.disarm();
+            return;
+        }
+        tokio::time::sleep(GITHUB_CLI_CLEANUP_POLL_INTERVAL).await;
+    }
+    // Keep the guard armed through return so Drop makes one final group-wide
+    // kill attempt without allowing cleanup to wait on inherited descriptors.
+}
+
 async fn execute_github_pull_request_query(
     workspace: &Path,
     selector: Option<&str>,
@@ -3653,11 +3689,13 @@ async fn execute_github_pull_request_query(
         command.arg(selector);
     }
     command.args(["--json", "number,url,state,isDraft"]);
+    isolate_process_group(command.as_std_mut());
     let Ok(mut child) = command.spawn() else {
         return PullRequestObservation::Unavailable;
     };
+    let process_tree = ProcessTree::from_process_id(Some(child.id()));
     let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill().await;
+        terminate_github_process(&mut child, &process_tree).await;
         return PullRequestObservation::Unavailable;
     };
     let result = tokio::time::timeout(timeout, async {
@@ -3666,17 +3704,20 @@ async fn execute_github_pull_request_query(
         bounded.read_to_end(&mut bytes).await?;
         drop(bounded);
         if bytes.len() as u64 > MAX_GITHUB_CLI_OUTPUT_BYTES {
-            let _ = child.kill().await;
+            return Ok::<_, std::io::Error>(None);
         }
         let status = child.wait().await?;
-        Ok::<_, std::io::Error>((status, bytes))
+        Ok(Some((status, bytes)))
     })
     .await;
-    let Ok(Ok((status, bytes))) = result else {
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+    let Ok(Ok(Some((status, bytes)))) = result else {
+        terminate_github_process(&mut child, &process_tree).await;
         return PullRequestObservation::Unavailable;
     };
+    // A successful read and wait settle the direct child, but a helper may
+    // still have escaped without retaining stdout. Do not let it escape.
+    process_tree.signal(TerminationSignal::Force);
+    process_tree.disarm();
     if !status.success() || bytes.len() as u64 > MAX_GITHUB_CLI_OUTPUT_BYTES {
         return PullRequestObservation::Unavailable;
     }
@@ -12917,6 +12958,59 @@ mod tests {
             PullRequestObservation::Unavailable
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_cli_query_timeout_kills_background_descendants() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("gh-descendant-fixture");
+        let descendant_pid = directory.path().join("descendant.pid");
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "/bin/sh -c 'trap \"\" TERM; echo $$ > descendant.pid; while :; do /bin/sleep 1; done' &\n",
+                "while [ ! -s descendant.pid ]; do /bin/sleep 0.01; done\n",
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            query_github_pull_request_with_timeout(
+                directory.path(),
+                None,
+                &executable,
+                std::time::Duration::from_millis(100),
+            )
+            .await,
+            PullRequestObservation::Unavailable
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "GitHub query cleanup exceeded its bound: {:?}",
+            started.elapsed()
+        );
+
+        let pid: i32 = std::fs::read_to_string(&descendant_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let process_exists = |pid: i32| {
+            let result = unsafe { libc::kill(pid, 0) };
+            result == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while process_exists(pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!process_exists(pid), "GitHub query descendant survived timeout cleanup");
     }
 
     #[cfg(unix)]
