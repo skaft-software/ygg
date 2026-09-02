@@ -440,7 +440,7 @@ jobs:
       - name: Verify checksums and signatures
         shell: bash
         env:
-          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          EXPECTED_OIDC_ISSUER: https://token.actions.githubusercontent.com
           COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
           WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
           WORKFLOW_REPOSITORY: ${{ github.repository }}
@@ -450,7 +450,7 @@ jobs:
           sha256sum --check SHA256SUMS
           verify=(
             --certificate-identity "$COSIGN_IDENTITY"
-            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER"
+            --certificate-oidc-issuer "$EXPECTED_OIDC_ISSUER"
             --certificate-github-workflow-name "Ygg Serve extension release"
             --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
             --certificate-github-workflow-sha "$WORKFLOW_COMMIT"
