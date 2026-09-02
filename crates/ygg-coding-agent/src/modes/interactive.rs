@@ -3872,16 +3872,15 @@ fn resume_scope_path(path: &Path, cwd: &Path) -> Option<String> {
     }
 
     let base = if parents.is_empty() {
-        "\"$(pwd -P)\"".to_owned()
+        "\"$(pwd -P)/\"".to_owned()
     } else {
         let parents = parents.join("/");
-        format!("\"$(cd \"$(pwd -P)/{parents}\" && pwd -P)\"")
+        format!("\"$(cd \"$(pwd -P)/{parents}\" && pwd -P)/\"")
     };
     let suffix = suffix.to_str()?;
     if suffix.is_empty() {
         return Some(base);
     }
-    let suffix = format!("/{suffix}");
     let suffix = suffix.replace('\'', "'\\''");
     Some(format!("{base}'{suffix}'"))
 }
