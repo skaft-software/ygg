@@ -344,31 +344,16 @@ def main(argv: Sequence[str]) -> int:
     expected_names = sorted(item.artifact for item in expected)
     if actual_tgz != expected_names:
         raise VerificationError(f"package directory artifact set mismatch: expected {expected_names}, found {actual_tgz}")
-    results = []
     for item in expected:
         path = args.package_directory / item.artifact
         if path.is_symlink() or not path.is_file():
             raise VerificationError(f"package artifact is not a regular file: {path}")
         inspection = inspect_tarball(path, item)
         validate(inspection, version)
-        results.append(
-            {
-                "artifact": item.artifact,
-                "name": item.name,
-                "version": version,
-            }
-        )
-    report = {
-        "schema": "ygg.npm.verification.v1",
-        "version": version,
-        "secret_scanner": SECRET_SCANNER_VERSION,
-        "packages": results,
-        "provenance": "external-canonical-release-gate-required",
-    }
     if args.as_json:
-        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+        print('{"schema":"ygg.npm.verification.v1","status":"passed"}')
     else:
-        print(json.dumps(report, sort_keys=True, indent=2))
+        print("npm package verification passed")
     return 0
 
 
