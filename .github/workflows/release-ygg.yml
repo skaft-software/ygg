@@ -43,7 +43,7 @@ jobs:
       core_workflow_commit: ${{ steps.release.outputs.core_workflow_commit }}
       mode: ${{ steps.release.outputs.mode }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - id: release
@@ -254,17 +254,17 @@ jobs:
     if: needs.resolve.outputs.mode == 'binaries'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: apps/web/.node-version
       # Release audits and artifacts intentionally use clean dependency/build
       # state. Pull-request or branch caches must never enter a privileged
       # publish path.
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - run: cargo audit
@@ -293,14 +293,14 @@ jobs:
             target: aarch64-apple-darwin
     steps:
       - name: Check out immutable release source and tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           path: source
           fetch-depth: 0
       # Keep release optimization independent from the workspace's 1.86 MSRV.
       # This immutable action revision installs Rust 1.97.1.
-      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
         with:
           targets: ${{ matrix.target }}
       - name: Verify release Rust compiler
@@ -352,7 +352,7 @@ jobs:
             echo "release archive contains a local-only asset" >&2
             exit 1
           fi
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ygg-core-${{ matrix.target }}
           path: ${{ runner.temp }}/ygg-release/*.tar.gz
@@ -376,11 +376,11 @@ jobs:
       id-token: write
     steps:
       - name: Check out immutable release source and tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: ygg-core-*
           path: release-assets
@@ -678,11 +678,11 @@ jobs:
       contents: read
     steps:
       - name: Check out immutable release tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           path: source
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: source/apps/web/.node-version
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
@@ -774,7 +774,7 @@ jobs:
             "$VERSION" \
             "$RUNNER_TEMP/npm-assets" \
             --json > "$RUNNER_TEMP/npm-verification.json"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ygg-npm
           path: ${{ runner.temp }}/npm-assets/*
@@ -793,11 +793,11 @@ jobs:
       id-token: write
     steps:
       - name: Check out immutable release tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
           path: source
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: source/apps/web/.node-version
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
@@ -825,7 +825,7 @@ jobs:
             --no-fund \
             "$npm_cli_archive"
           test "$(npm --version)" = "11.5.1"
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ygg-npm
           path: npm-assets
@@ -1028,11 +1028,11 @@ jobs:
       contents: read
     steps:
       - name: Check out immutable verifier
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: apps/web/.node-version
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ygg-npm
           path: npm-assets
@@ -1117,7 +1117,7 @@ jobs:
           - os: macos-15
             target: macOS Apple silicon
     steps:
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: 22.13.0
       - name: Install the exact public launcher without lifecycle scripts
@@ -1154,7 +1154,7 @@ jobs:
       id-token: write
     steps:
       - name: Check out immutable release source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0

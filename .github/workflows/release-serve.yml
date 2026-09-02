@@ -34,7 +34,7 @@ jobs:
       source_commit: ${{ steps.release.outputs.source_commit }}
       workflow_commit: ${{ steps.release.outputs.workflow_commit }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
       - id: release
@@ -188,17 +188,17 @@ jobs:
     needs: resolve
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version-file: apps/web/.node-version
       # Release audits and artifacts intentionally use clean dependency/build
       # state. Pull-request or branch caches must never enter a privileged
       # publish path.
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
-      - uses: taiki-e/install-action@6c6fd71fe4fb72c3697d269963d0e15df8adedad
+      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: cargo-audit@0.22.2,cargo-deny@0.20.2
       - run: cargo audit
@@ -225,7 +225,7 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
@@ -287,13 +287,13 @@ jobs:
           grep -Fx "preserve" "$package_home/.ygg/serve-data/sentinel"
       - name: Preserve Linux launcher for published-package verification
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ygg-extension-test-launcher
           path: target/x86_64-unknown-linux-gnu/debug/ygg
           if-no-files-found: error
           retention-days: 2
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ygg-serve-${{ matrix.target }}
           path: ${{ runner.temp }}/ygg-serve-release/*.tar.gz
@@ -305,7 +305,7 @@ jobs:
     needs: [resolve, security]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
@@ -385,7 +385,7 @@ jobs:
             HOME="$package_home" "$launcher" extension remove "$extension"
             test ! -e "$package_home/.ygg/extensions/$extension"
           done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: ygg-executable-extension-bundles
           path: ${{ runner.temp }}/ygg-extension-release/*.tar.gz
@@ -403,16 +403,16 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
           fetch-depth: 0
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: ygg-serve-*
           path: release-assets
           merge-multiple: true
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ygg-executable-extension-bundles
           path: release-assets
@@ -515,10 +515,10 @@ jobs:
     needs: [resolve, publish]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ needs.resolve.outputs.source_commit }}
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: ygg-extension-test-launcher
           path: test-bin
