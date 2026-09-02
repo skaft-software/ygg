@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -4012,7 +4013,7 @@ async fn run_interactive_without_model(
     launch: crate::app::bootstrap::LaunchSelection,
     shell: &mut InteractiveShell,
     input: &mut EventStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let mut boot = boot;
     let workspace = boot.config.workspace.clone();
     let mut prepared = boot.take_prepared_session();
@@ -4022,6 +4023,7 @@ async fn run_interactive_without_model(
     })
     .await?;
 
+    let resume_command = resume_command_for_session(&session, &boot.config);
     shell.set_identity("", "", "");
     shell.set_status_detail("no configured model · read-only session".to_owned());
     shell.set_workspace(workspace.clone());
@@ -4050,7 +4052,7 @@ async fn run_interactive_without_model(
         )
         .await?
         {
-            Idle::Quit => return Ok(()),
+            Idle::Quit => return Ok(resume_command),
             Idle::CycleThinking => {
                 shell.notice("thinking is unavailable until a model is configured");
                 shell.render();
@@ -4064,7 +4066,7 @@ async fn run_interactive_without_model(
                 shell.render();
             }
             Idle::Command(raw) => match commands::parse(&raw) {
-                Command::Quit => return Ok(()),
+                Command::Quit => return Ok(resume_command),
                 Command::Help(topic) => {
                     shell.show_overlay_text(commands::help_text(&workspace, topic.as_deref()));
                     shell.render();
@@ -4192,7 +4194,13 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     if boot.is_modeless() {
         let result = run_interactive_without_model(boot, launch, &mut shell, &mut input).await;
         shell.leave();
-        return result;
+        return match result {
+            Ok(resume_command) => {
+                print_resume_command(resume_command.as_deref());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
     }
     let mut app = run_blocking_lifecycle(
         &mut shell,
@@ -4780,7 +4788,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             }
         }
     }
+    let resume_command = resume_command_for_session(app.agent.session(), &app.config);
     shell.leave();
+    print_resume_command(resume_command.as_deref());
     Ok(())
 }
 

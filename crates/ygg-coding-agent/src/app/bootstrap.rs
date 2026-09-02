@@ -4108,7 +4108,7 @@ fn terminal_goal_store(config: &Config) -> anyhow::Result<Arc<DurableGoalStore>>
         .map_err(|error| anyhow::anyhow!("unable to open durable goal store: {error}"))
 }
 
-fn terminal_goal_session_id(session: &Session) -> anyhow::Result<String> {
+pub(crate) fn terminal_goal_session_id(session: &Session) -> anyhow::Result<String> {
     session
         .path()
         .file_stem()

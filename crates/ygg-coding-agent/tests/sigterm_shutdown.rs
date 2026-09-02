@@ -60,11 +60,58 @@ impl PtyYgg {
         wait_for_app: bool,
         mouse: &str,
     ) -> Self {
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            extra_args,
+            interactive,
+            wait_for_app,
+            mouse,
+            None,
+            None,
+        )
+    }
+
+    fn spawn_with_explicit_workspace(root: &Path) -> Self {
+        let invocation_cwd = root.join("workspace").join("nested");
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            &[],
+            true,
+            true,
+            "app",
+            Some(&invocation_cwd),
+            None,
+        )
+    }
+
+    fn spawn_from_resume_command(root: &Path, command_line: &str, invocation_cwd: &Path) -> Self {
+        Self::spawn_with_mode_and_mouse_at(
+            root,
+            &[],
+            true,
+            true,
+            "app",
+            Some(invocation_cwd),
+            Some(command_line),
+        )
+    }
+
+    fn spawn_with_mode_and_mouse_at(
+        root: &Path,
+        extra_args: &[String],
+        interactive: bool,
+        wait_for_app: bool,
+        mouse: &str,
+        invocation_cwd: Option<&Path>,
+        command_line: Option<&str>,
+    ) -> Self {
         let home = root.join("home");
         let workspace = root.join("workspace");
         let sessions = root.join("sessions");
+        let invocation_cwd = invocation_cwd.unwrap_or(&workspace);
         std::fs::create_dir_all(home.join(".ygg/credentials")).expect("credential directory");
         std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(invocation_cwd).expect("invocation directory");
         std::fs::create_dir_all(&sessions).expect("sessions");
         let credential = home.join(".ygg/credentials/custom.json");
         std::fs::write(
@@ -116,27 +163,47 @@ impl PtyYgg {
         let stdout = duplicate_stdio(slave_probe.as_raw_fd());
         let stderr = duplicate_stdio(slave_probe.as_raw_fd());
         let path = std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ygg"));
+        let path = if command_line.is_some() {
+            let binary_parent = Path::new(env!("CARGO_BIN_EXE_ygg"))
+                .parent()
+                .expect("ygg binary parent");
+            let paths = std::iter::once(binary_parent.to_owned())
+                .chain(std::env::split_paths(&path))
+                .collect::<Vec<_>>();
+            std::env::join_paths(paths).expect("test PATH")
+        } else {
+            path
+        };
+        let mut command = if let Some(command_line) = command_line {
+            let mut command = Command::new("sh");
+            command.args(["-c", command_line, "ygg"]);
+            command
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_ygg"));
+            command
+                .args([
+                    "--offline",
+                    "--no-context-files",
+                    "--no-tools",
+                    "--allow-shell",
+                    "--mouse",
+                    mouse,
+                    "--model",
+                    "custom/probe",
+                    "--workspace",
+                ])
+                .arg(&workspace)
+                .arg("--session-dir")
+                .arg(&sessions)
+                .args(extra_args);
+            command
+        };
         command
-            .args([
-                "--offline",
-                "--no-context-files",
-                "--no-tools",
-                "--allow-shell",
-                "--mouse",
-                mouse,
-                "--model",
-                "custom/probe",
-                "--workspace",
-            ])
-            .arg(&workspace)
-            .arg("--session-dir")
-            .arg(&sessions)
-            .args(extra_args)
-            .current_dir(&workspace)
+            .current_dir(invocation_cwd)
             .env_clear()
             .env("HOME", &home)
             .env("PATH", path)
+            .env("PWD", invocation_cwd)
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
             .env("LANG", "C.UTF-8")
@@ -444,6 +511,10 @@ fn idle_interactive_sigterm_is_coordinated_and_restores_terminal() {
     assert_eq!(status.code(), Some(128 + libc::SIGTERM));
     assert!(elapsed < EXIT_DEADLINE, "shutdown took {elapsed:?}");
     assert!(contains_bytes(&output, b"\x1b[?1003l"));
+    assert!(!contains_bytes(
+        &output,
+        b"To resume this session: ygg --resume "
+    ));
 }
 
 #[test]
