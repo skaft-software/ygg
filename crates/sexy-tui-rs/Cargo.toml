@@ -21,7 +21,7 @@ serde = { version = "1", features = ["derive"] }
 syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "regex-fancy"] }
 toml = "0.8"
 # Retain the reviewed grapheme behavior used by the vendored integration.
-unicode-segmentation = "=1.12.0"
+unicode-segmentation = "=1.13.3"
 unicode-width = "0.2"
 
 [dev-dependencies]
