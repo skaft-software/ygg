@@ -27,7 +27,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-subagents")
         self.assertEqual(manifest["version"], "0.2.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.6")
+        self.assertEqual(manifest["requires_ygg"], "=0.6.7")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-subagents")
         self.assertEqual(manifest["capabilities"]["filesystem"], "none")
         self.assertFalse(manifest["capabilities"]["process"])

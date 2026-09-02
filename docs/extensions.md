@@ -160,7 +160,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.6"
+requires_ygg = "=0.6.7"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -882,7 +882,7 @@ compatibility alongside its independent extension version:
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.6"
+requires_ygg = "=0.6.7"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present
@@ -968,7 +968,7 @@ Official installs download the matching target archive and shared release
 `SHA256SUMS`; local archives use:
 
 ```console
-ygg extension install --path ./ygg-serve-0.6.6-TARGET.tar.gz
+ygg extension install --path ./ygg-serve-0.6.7-TARGET.tar.gz
 ```
 
 The application archive keeps its existing strict two-file payload contract and

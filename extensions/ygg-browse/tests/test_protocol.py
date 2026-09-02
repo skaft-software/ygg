@@ -168,7 +168,7 @@ class ProtocolTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.6.6",
+                    "ygg_version": "0.6.7",
                     "extension": {
                         "name": "ygg-browse",
                         "version": "0.1.0",

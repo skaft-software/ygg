@@ -2,7 +2,7 @@
 
 `ygg-subagents` is a small API `0.2` executable extension for Claude Code-like background workers. It launches named, single-purpose child conversations through Ygg's **host-owned `agent_sessions` service**. It is not an agent team, graph/recipe runtime, swarm, hosted-agent scheduler, or second Agent loop.
 
-Version `0.2.0` targets exactly Ygg `0.6.6`.
+Version `0.2.0` targets exactly Ygg `0.6.7`.
 
 ## Safety model
 
@@ -83,7 +83,7 @@ use the graph/recipe spike, built-in team mailboxes, or another scheduler.
 The release archive has one root directory named `ygg-subagents`. Install a local archive with:
 
 ```console
-ygg extension install --path ./ygg-subagents-0.6.6.tar.gz
+ygg extension install --path ./ygg-subagents-0.6.7.tar.gz
 ```
 
 Installation/discovery is inert: it does not enable, trust, or start the process. Explicitly enable and trust the selected manifest in full-access mode, preferably inside separate OS isolation:

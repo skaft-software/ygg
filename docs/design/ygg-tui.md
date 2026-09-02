@@ -16,7 +16,7 @@ approval, and terminal-outcome semantics shared by these mechanics.
   screen and saved lines before replaying the complete frame. PageUp transfers
   rendering to the bounded, application-owned semantic viewport for the rest of
   that shell. Explicit `--mouse app` selects that viewport from startup.
-- Ygg v0.6.6 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely. Its model-aware accent palette changes atmosphere without changing layout or semantic status colours.
+- Ygg v0.6.7 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely. Its model-aware accent palette changes atmosphere without changing layout or semantic status colours.
 - Raw mode, bracketed paste, keyboard enhancements, and mouse reporting are
   enabled only when supported and restored idempotently. Matching Pi, every
   interactive frame is bracketed by CSI 2026 synchronized-output markers;
