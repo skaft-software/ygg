@@ -186,12 +186,14 @@ def inspect_tarball(path: pathlib.Path, expected: ExpectedPackage) -> Inspection
             parts = pathlib.PurePosixPath(name).parts
             if parts[0] != "package" or (len(parts) > 1 and parts[1] == ""):
                 fail(f"{path.name} contains a member outside package/: {name}")
+            if name.rstrip("/") != "/".join(parts) or (name.endswith("/") and not member.isdir()):
+                fail(f"{path.name} contains a non-canonical member path: {name}")
             relative = "/".join(parts[1:])
             if name in members:
                 fail(f"{path.name} repeats member {name}")
             if member.mode & 0o7000 or member.mode & 0o002:
                 fail(f"{path.name} has unsafe permissions on {name}")
-            if member.size > MAX_MEMBER_BYTES:
+            if member.size < 0 or member.size > MAX_MEMBER_BYTES:
                 fail(f"{path.name} member {name} exceeds {MAX_MEMBER_BYTES} bytes")
             if not (member.isdir() or member.isreg()):
                 fail(f"{path.name} contains a link or special member: {name}")

@@ -54,6 +54,24 @@ No Rust toolchain is needed. Prebuilt binaries cover GNU/Linux x86-64, macOS
 x86-64, and macOS Apple silicon; Linux musl is not included. Use the same binary
 with [cloud providers](#use-a-cloud-model) or [your own local endpoint](#use-custom-openai-compatible-providers).
 
+### npm distribution
+
+When a release has been published to the configured npm scope, install the
+native launcher globally at an exact version:
+
+```sh
+npm install --global --ignore-scripts --no-audit --no-fund @skaft-software/ygg@VERSION
+```
+
+The launcher selects the matching signed macOS or GNU/Linux x86-64 runtime and
+executes it directly; normal `ygg` and `ygg-host` use does not start Node or run
+an npm lifecycle hook. GNU/Linux musl and unsupported CPUs are rejected rather
+than downloading a fallback. `ygg update` recognizes only a physically
+validated global npm layout and uses the same exact-version command. Local
+project and `npx` installations must be updated explicitly by their project.
+See [`docs/release/npm-trusted-publishing.md`](docs/release/npm-trusted-publishing.md)
+for the publication and recovery contract.
+
 ## Performance
 
 On the frozen Ygg v0.6.2 Terminal-Bench 2.1 campaign with GPT-5.6 Sol at

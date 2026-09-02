@@ -15,6 +15,7 @@ fi
 
 repository_directory=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 version=${1:-$(awk -F '"' '/^version = / { print $2; exit }' "$repository_directory/Cargo.toml")}
+version=${version#v}
 script_directory="$repository_directory/scripts"
 for command in bash python3 npm; do
     command -v "$command" >/dev/null 2>&1 || {
@@ -96,8 +97,12 @@ printf '%s\\n' '{{"protocol_version":1,"request_id":"npm-test","seq":1,"type":"h
                 add_file(archive, f"{root}/sdk/python.py", b"# SDK fixture\\n")
 
 lines = []
-for path in sorted(native.glob("*.tar.gz")):
-    lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  ./{path.name}")
+install = native / "install-ygg.sh"
+install.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+install.chmod(0o755)
+for path in sorted(native.iterdir()):
+    if path.name == "install-ygg.sh" or path.suffix == ".gz":
+        lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  ./{path.name}")
 (native / "YGG_SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="ascii")
 PY
 
@@ -106,6 +111,24 @@ SOURCE_DATE_EPOCH=0 "$script_directory/package-ygg-npm.sh" \
     "$native_directory" \
     "$output_directory" \
     "$native_directory/YGG_SHA256SUMS"
+python3 "$script_directory/generate-ygg-release-metadata.py" \
+    "$version" \
+    "v$version" \
+    "0123456789abcdef0123456789abcdef01234567" \
+    "abcdef0123456789abcdef0123456789abcdef01" \
+    "skaft-software/ygg/.github/workflows/release-ygg.yml@refs/tags/ygg-binaries-v$version" \
+    "skaft-software/ygg" \
+    "$native_directory/YGG_SHA256SUMS" \
+    "$native_directory/YGG_RELEASE_METADATA.json" >/dev/null
+python3 "$script_directory/create-ygg-npm-manifest.py" \
+    "$version" \
+    "v$version" \
+    "0123456789abcdef0123456789abcdef01234567" \
+    "abcdef0123456789abcdef0123456789abcdef01" \
+    "$native_directory/YGG_RELEASE_METADATA.json" \
+    "$output_directory" \
+    "$output_directory/YGG_NPM_MANIFEST.json" \
+    "$output_directory/YGG_NPM_SHA256SUMS" >/dev/null
 python3 "$script_directory/verify-ygg-npm.py" "$version" "$output_directory" --json > "$work_directory/verification.json"
 
 # Repacking the same immutable inputs with the same epoch must be byte-for-byte

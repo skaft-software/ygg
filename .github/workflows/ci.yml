@@ -51,8 +51,11 @@ jobs:
             scripts/package-ygg-extension-release.sh \
             scripts/package-ygg-release.sh \
             scripts/package-ygg-serve-release.sh \
-            scripts/test-binary-installer.sh
-          python3 -m py_compile scripts/provider-acceptance.py
+            scripts/test-binary-installer.sh \
+            scripts/package-ygg-npm.sh \
+            scripts/test-ygg-npm.sh \
+            scripts/test-ygg-npm-install.sh
+          python3 -m py_compile scripts/provider-acceptance.py scripts/generate-ygg-release-metadata.py scripts/create-ygg-npm-manifest.py scripts/verify-ygg-npm.py
           version="v$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
           while IFS= read -r extension; do
             [[ -n "$extension" ]] || continue

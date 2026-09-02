@@ -4,6 +4,12 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ## Unreleased
 
+### Added
+
+- Add deterministic, no-lifecycle npm packages for the native launcher and
+  supported runtimes, with exact global-update detection and protected trusted
+  publishing/recovery gates.
+
 ### Changed
 
 - Cap authenticated Codex model and request budgeting at 272,000 tokens by
