@@ -108,6 +108,7 @@ class PresentationTests(unittest.TestCase):
             "waiting": "running",
             "stopping": "cancelled",
             "done": "succeeded",
+            "limit_reached": "degraded",
             "failed": "failed",
             "stopped": "stopped",
             "timed_out": "failed",

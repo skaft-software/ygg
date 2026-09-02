@@ -103,6 +103,18 @@ def _host_policy(
             code="host_state_invalid",
         )
     max_turns, max_cost, timeout_ms, deadline = values
+    effective_turn_limit = record.get("turn_limit")
+    if effective_turn_limit is None:
+        effective_turn_limit = max_turns
+    elif (
+        not isinstance(effective_turn_limit, int)
+        or isinstance(effective_turn_limit, bool)
+        or effective_turn_limit < 1
+    ):
+        raise SubagentError(
+            "agent_sessions returned an invalid effective turn limit",
+            code="host_state_invalid",
+        )
     if (
         (max_turns is not None and max_turns < 1)
         or (timeout_ms is not None and timeout_ms < 1)
@@ -114,7 +126,7 @@ def _host_policy(
         )
     return (
         tuple(raw_tools),
-        max_turns,
+        effective_turn_limit,
         max_tokens,
         max_cost,
         max_output,
@@ -152,6 +164,7 @@ def _host_timestamps(
         "completed",
         "done",
         "failed",
+        "limit_reached",
         "interrupted",
         "cancelled",
         "shutdown",
@@ -691,7 +704,7 @@ class Orchestrator:
         with self._lock:
             workers = list(state.workers.values())
             running = sum(worker.active for worker in workers)
-            failed = sum(worker.state in {"failed", "timed_out"} for worker in workers)
+            failed = sum(worker.state in {"failed", "timed_out", "limit_reached"} for worker in workers)
         if failed:
             style = "extension.subagents.degraded"
         elif running:
@@ -720,7 +733,7 @@ class Orchestrator:
                     if outcome in {"cancelled", "interrupted"}:
                         worker.state = "cancelled"
                     elif outcome == "limit_reached":
-                        worker.state = "timed_out"
+                        worker.state = "limit_reached"
                     else:
                         worker.state = "orphaned"
                     worker.phase = "parent session settled"
@@ -995,6 +1008,7 @@ class Orchestrator:
             "completed": "done",
             "done": "done",
             "failed": "failed",
+            "limit_reached": "limit_reached",
             "interrupted": "cancelled",
             "cancelled": "cancelled",
             "shutdown": "orphaned",
@@ -1091,6 +1105,7 @@ class Orchestrator:
                 "running": "running in host session",
                 "waiting": "waiting for host completion",
                 "done": "completed",
+                "limit_reached": "turn limit reached",
                 "failed": "failed",
                 "cancelled": "cancelled",
                 "stopped": "stopped",
@@ -1133,7 +1148,7 @@ class Orchestrator:
         delivery = record.get("delivery_state", status.get("delivery_state"))
         if delivery in {"pending", "claimed", "acked", "host_managed"}:
             worker.delivery_state = str(delivery)
-        if worker.state == "done":
+        if worker.state in {"done", "limit_reached"}:
             output = status.get("output")
             if isinstance(output, str):
                 worker.summary = sanitize_document(output, worker.max_output_bytes)

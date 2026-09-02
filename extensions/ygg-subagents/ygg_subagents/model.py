@@ -47,7 +47,7 @@ PROFILE_INSTRUCTIONS = {
     ),
 }
 TERMINAL_STATES = frozenset(
-    {"done", "failed", "stopped", "timed_out", "cancelled", "orphaned"}
+    {"done", "failed", "limit_reached", "stopped", "timed_out", "cancelled", "orphaned"}
 )
 ACTIVE_STATES = frozenset({"queued", "running", "waiting", "stopping"})
 

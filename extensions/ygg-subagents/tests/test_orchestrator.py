@@ -245,6 +245,37 @@ class OrchestrationTests(unittest.TestCase):
         self.assertIn("Host-observed final summary", detail["body"])
         self.assertIn("Requested tool policy: granted mutation scope", detail["body"])
 
+    def test_turn_limit_is_terminal_with_partial_output_and_claimable_completion(self):
+        agent_id = self.spawn("bounded-worker", max_turns=2)["worker"]["id"]
+        self.host.start(agent_id)
+        self.host.limit_reached(agent_id, "partial evidence before the limit", turns=2)
+
+        status = self.orchestrator.status(self.client, self.owner, {"target": agent_id})
+        worker = status["worker"]
+        self.assertEqual(worker["state"], "limit_reached")
+        self.assertEqual(worker["summary"], "partial evidence before the limit")
+        self.assertEqual(worker["turn_count"], 2)
+        self.assertEqual(worker["turn_limit"], 2)
+        self.assertEqual(self.snapshots[-1]["collection"]["nodes"][0]["state"], "degraded")
+        self.assertIn("1 limited", self.snapshots[-1]["collection"]["title"])
+
+        delivery = self.host.parent_turn_delivery(
+            owner="owner-a", principal="ygg-subagents@test", commit=True
+        )
+        self.assertIsNotNone(delivery)
+        self.assertEqual(delivery["summary"], "partial evidence before the limit")
+        self.assertEqual(delivery["state"], "limit_reached")
+        self.assertTrue(delivery["legal_new_parent_turn"])
+
+        resumed = self.orchestrator.continue_worker(
+            self.client,
+            self.owner,
+            {"target": agent_id, "message": "Continue from the partial evidence."},
+        )
+        self.assertEqual(resumed["action"], "resumed")
+        self.assertEqual(self.host.agents[agent_id].status["state"], "pending")
+        self.assertEqual(self.host.follow_ups[-1][1], "Continue from the partial evidence.")
+
     def test_host_cleanup_retains_failure_payload_and_sibling_roster(self):
         failed_id = self.spawn("failed-worker", idempotency_key="failed-v1")["worker"]["id"]
         sibling_id = self.spawn("running-sibling", idempotency_key="sibling-v1")["worker"]["id"]

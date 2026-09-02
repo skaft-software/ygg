@@ -16,6 +16,7 @@ GENERIC_STATE = {
     "waiting": "running",
     "stopping": "cancelled",
     "done": "succeeded",
+    "limit_reached": "degraded",
     "failed": "failed",
     "stopped": "stopped",
     "timed_out": "failed",
@@ -29,6 +30,7 @@ STATE_LABEL = {
     "waiting": "waiting",
     "stopping": "stopping",
     "done": "done",
+    "limit_reached": "limit reached",
     "failed": "failed",
     "stopped": "stopped",
     "timed_out": "timed out",
@@ -61,7 +63,14 @@ def cost_label(microdollars: Optional[int]) -> str:
 
 
 def counts(workers: Sequence[Worker]) -> Dict[str, int]:
-    values = {"queued": 0, "running": 0, "done": 0, "failed": 0, "stopped": 0}
+    values = {
+        "queued": 0,
+        "running": 0,
+        "done": 0,
+        "limited": 0,
+        "failed": 0,
+        "stopped": 0,
+    }
     for worker in workers:
         if worker.state == "queued":
             values["queued"] += 1
@@ -69,6 +78,8 @@ def counts(workers: Sequence[Worker]) -> Dict[str, int]:
             values["running"] += 1
         elif worker.state == "done":
             values["done"] += 1
+        elif worker.state == "limit_reached":
+            values["limited"] += 1
         elif worker.state == "failed" or worker.state == "timed_out":
             values["failed"] += 1
         else:
@@ -79,13 +90,16 @@ def counts(workers: Sequence[Worker]) -> Dict[str, int]:
 def compact_status(workers: Sequence[Worker]) -> Tuple[str, str, Optional[str]]:
     value = counts(workers)
     pieces = []
-    for key in ("running", "queued", "done", "failed", "stopped"):
+    for key in ("running", "queued", "done", "limited", "failed", "stopped"):
         if value[key]:
             pieces.append("%d %s" % (value[key], key))
     label = "Subagents" if not pieces else "Subagents · " + " · ".join(pieces)
     if value["failed"]:
         state = "degraded"
         detail = "One or more bounded workers failed or timed out."
+    elif value["limited"]:
+        state = "degraded"
+        detail = "One or more bounded workers reached their turn limit."
     elif value["running"] or value["queued"]:
         state = "active"
         detail = None
