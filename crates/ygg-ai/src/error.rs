@@ -24,6 +24,9 @@ pub struct StreamProgress {
     pub first_body_seen: bool,
     /// Elapsed milliseconds from stream start until the failure.
     pub elapsed_ms: u64,
+    /// Elapsed milliseconds from stream start until the last provider event.
+    /// `None` means the stream failed before any provider event arrived.
+    pub last_event_ms: Option<u64>,
 }
 
 /// Main error type for all ygg-ai operations.
@@ -496,6 +499,7 @@ mod tests {
                 buffered_bytes: 96,
                 first_body_seen: true,
                 elapsed_ms: 97321,
+                last_event_ms: Some(97_000),
             },
         };
         // Display delegates to the inner error so existing log lines stay
@@ -515,6 +519,7 @@ mod tests {
             buffered_bytes: 4,
             first_body_seen: true,
             elapsed_ms: 1200,
+            last_event_ms: Some(1_100),
         };
         let json = serde_json::to_string(&progress).unwrap();
         let back: StreamProgress = serde_json::from_str(&json).unwrap();

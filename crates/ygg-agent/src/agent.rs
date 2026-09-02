@@ -253,14 +253,18 @@ fn format_stream_progress(progress: &ygg_ai::StreamProgress) -> String {
     } else {
         "none"
     };
+    let last_event = progress
+        .last_event_ms
+        .map_or_else(|| "none".to_owned(), |elapsed| format!("{elapsed}ms"));
     format!(
-        "frames={} events={} content={}B buffered={}B first_byte={} elapsed={}ms",
+        "frames={} events={} content={}B buffered={}B first_byte={} elapsed={}ms last_event={}",
         progress.provider_events,
         progress.decoded_events,
         progress.content_bytes,
         progress.buffered_bytes,
         first_byte,
         progress.elapsed_ms,
+        last_event,
     )
 }
 
@@ -7046,6 +7050,7 @@ mod tests {
             buffered_bytes: 96,
             first_body_seen: true,
             elapsed_ms: 97_321,
+            last_event_ms: Some(97_000),
         };
 
         // A body-phase disconnect that already streamed bytes: replayable
@@ -7097,6 +7102,21 @@ mod tests {
         assert!(!looks_like_context_error(&deadline));
         assert!(!retryable_stream_start(&deadline));
         assert_eq!(provider_retry_limit(&deadline), 0);
+
+        // A post-send heartbeat deadline has ambiguous provider acceptance, so
+        // it is terminal even if no generation was decoded.
+        let heartbeat = AiError::StreamFailure {
+            inner: Box::new(AiError::Transport(ygg_ai::TransportError {
+                phase: ygg_ai::TransportPhase::Body,
+                timeout: true,
+                message: "Responses WebSocket heartbeat acknowledgement timed out".into(),
+            })),
+            progress,
+        };
+        assert!(!retryable_before_generation(&heartbeat));
+        assert!(!retryable_stream_start(&heartbeat));
+        assert!(!is_replayable_network_failure(&heartbeat));
+        assert_eq!(provider_retry_limit(&heartbeat), 0);
 
         // And a provider context-error frame inside a 2xx stream must still
         // be detected through the wrapper, so compaction still triggers.
@@ -7150,8 +7170,9 @@ mod tests {
             buffered_bytes: 96,
             first_body_seen: true,
             elapsed_ms: 97_321,
+            last_event_ms: Some(97_000),
         };
-        let suffix = "stream_progress=frames=412 events=38 content=18204B buffered=96B first_byte=seen elapsed=97321ms";
+        let suffix = "stream_progress=frames=412 events=38 content=18204B buffered=96B first_byte=seen elapsed=97321ms last_event=97000ms";
 
         let inner = AiError::Provider(ygg_ai::ProviderError {
             // Four oversized fields push the bare diagnostic past the public
