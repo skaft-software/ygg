@@ -104,6 +104,7 @@ class FakeAgent:
             "started_at_ms": self.started_at_ms,
             "completed_at_ms": self.completed_at_ms,
             "deadline_at_ms": self.deadline_at_ms,
+            "turn_limit": self.policy.get("max_turns"),
             "turn_count": self.usage.get("turns", 0),
             "tool_call_count": self.tool_call_count,
             "usage": {
@@ -201,6 +202,42 @@ class FakeHostState:
                 "cost_microdollars": cost_microdollars,
             }
             agent.artifacts = [dict(value) for value in (artifacts or [])]
+            agent.export_reference = "export:%s" % agent.agent_id
+            self._enqueue_delivery(agent, output)
+
+    def limit_reached(
+        self,
+        agent_id: str,
+        output: str,
+        *,
+        turns: int,
+        input_tokens: int = 800,
+        output_tokens: int = 200,
+        cost_microdollars: int = 1200,
+    ) -> None:
+        with self._lock:
+            agent = self._agent(agent_id)
+            output = _bounded_utf8(output, int(agent.policy["max_output_bytes"]))
+            if agent.started_at_ms is None:
+                agent.started_at_ms = agent.created_at_ms
+            agent.completed_at_ms = self.clock()
+            turn_limit = agent.policy.get("max_turns")
+            if not isinstance(turn_limit, int) or turn_limit < 1:
+                raise AssertionError("limit_reached fixture requires a finite turn limit")
+            agent.status = {
+                "state": "limit_reached",
+                "output": output,
+                "turn_count": turns,
+                "turn_limit": turn_limit,
+            }
+            agent.phase = "turn limit reached"
+            agent.usage = {
+                "turns": turns,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+                "cost_microdollars": cost_microdollars,
+            }
             agent.export_reference = "export:%s" % agent.agent_id
             self._enqueue_delivery(agent, output)
 

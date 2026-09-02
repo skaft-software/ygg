@@ -665,6 +665,209 @@ describe("YggStore", () => {
     store.dispose();
   });
 
+  it("keeps a cached selection from regressing behind live session and goal events", async () => {
+    const transport = new TestTransport();
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    const liveGoal: GoalState = {
+      revision: 1,
+      objective: "the live objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-live",
+      actorGeneration: 3,
+      sequence: 29,
+      patch: { status: "done" },
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-live",
+      actorGeneration: 3,
+      sequence: 30,
+      revision: liveGoal.revision,
+      goal: liveGoal,
+    });
+    await nextFrame();
+
+    expect(store.getSnapshot().sessions["session-live"]).toMatchObject({
+      actorGeneration: 3,
+      sequence: 30,
+      status: "done",
+    });
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      sequence: 30,
+      status: "done",
+    });
+    expect(store.selectedGoal).toEqual(liveGoal);
+    store.dispose();
+  });
+
+  it("resynchronizes an unloaded selection after racing live session and goal events", async () => {
+    const transport = new TestTransport();
+    const stale = {
+      ...clone(fixtureSessions["session-live"]),
+      actorGeneration: 1,
+      sequence: 28,
+      status: "working" as const,
+    };
+    const liveGoal: GoalState = {
+      revision: 1,
+      objective: "the live objective",
+      status: "active",
+      turnBudget: null,
+      turnsUsed: 0,
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+    const authoritative = {
+      ...stale,
+      sequence: 30,
+      status: "done" as const,
+    };
+    const pendingSession = deferred<SessionSnapshot>();
+    const pendingGoal = deferred<GoalResponse>();
+    let liveLoads = 0;
+    transport.sessionLoader = async (sessionId) => {
+      if (sessionId === "session-live") {
+        liveLoads += 1;
+        if (liveLoads === 1) return pendingSession.promise;
+        return clone(authoritative);
+      }
+      return clone(fixtureSessions[sessionId]);
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+    transport.getGoal = async () => pendingGoal.promise;
+
+    const pendingSelection = store.selectSession("session-live", "none");
+    await vi.waitFor(() => expect(liveLoads).toBe(1));
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-live",
+      actorGeneration: 1,
+      sequence: 29,
+      patch: { status: "done" },
+    });
+    transport.emit({
+      type: "session.goalChanged",
+      sessionId: "session-live",
+      actorGeneration: 1,
+      sequence: 30,
+      revision: liveGoal.revision,
+      goal: liveGoal,
+    });
+    await nextFrame();
+    expect(store.getSnapshot().sessions["session-live"]).toBeUndefined();
+
+    pendingSession.resolve(stale);
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(liveLoads).toBe(2);
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: 1,
+      sequence: 30,
+      status: "done",
+    });
+    expect(store.selectedGoal).toEqual(liveGoal);
+    store.dispose();
+  });
+
+  it("compares actor generations before sequence for a cached selection", async () => {
+    const transport = new TestTransport();
+    const cached = {
+      ...clone(fixtureSessions["session-live"]),
+      actorGeneration: 1,
+      sequence: 100,
+      status: "working" as const,
+    };
+    transport.sessionLoader = async (sessionId) =>
+      sessionId === "session-live"
+        ? clone(cached)
+        : clone(fixtureSessions[sessionId]);
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    const replacement = {
+      ...cached,
+      actorGeneration: 2,
+      sequence: 1,
+      status: "done" as const,
+    };
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-live",
+      actorGeneration: 2,
+      sequence: 1,
+      snapshot: replacement,
+    });
+    await nextFrame();
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: 2,
+      sequence: 1,
+      status: "done",
+    });
+    store.dispose();
+  });
+
+  it("retains live data at an equal selection cursor", async () => {
+    const transport = new TestTransport();
+    const cached = {
+      ...clone(fixtureSessions["session-live"]),
+      status: "working" as const,
+    };
+    transport.sessionLoader = async (sessionId) =>
+      sessionId === "session-live"
+        ? clone(cached)
+        : clone(fixtureSessions[sessionId]);
+    const store = new YggStore(transport);
+    await store.initialize();
+    await store.selectSession("session-live", "none");
+    await store.selectSession("session-done", "none");
+
+    const pendingGoal = deferred<GoalResponse>();
+    transport.getGoal = async () => pendingGoal.promise;
+    const pendingSelection = store.selectSession("session-live", "none");
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-live",
+      actorGeneration: cached.actorGeneration,
+      sequence: cached.sequence,
+      snapshot: { ...cached, status: "done" },
+    });
+    await nextFrame();
+    pendingGoal.resolve({ goal: null, revision: 0 });
+    await pendingSelection;
+
+    expect(store.selectedSession).toMatchObject({
+      actorGeneration: cached.actorGeneration,
+      sequence: cached.sequence,
+      status: "done",
+    });
+    store.dispose();
+  });
+
   it("does not let a pending selection replace command-center navigation", async () => {
     const transport = new TestTransport();
     const delayed = deferred<SessionSnapshot>();
@@ -1282,6 +1485,191 @@ describe("YggStore", () => {
       ]),
     );
     expect(store.getSnapshot().selectedSessionId).toBe("session-created-2");
+    store.dispose();
+  });
+
+  it("bounds deferred events while a stalled resync retries and recovers", async () => {
+    vi.useFakeTimers();
+    const transport = new TestTransport();
+    const authoritative = {
+      ...clone(fixtureSessions["session-fresh"]),
+      sequence: 400,
+      title: "Authoritative recovery",
+    };
+    let loads = 0;
+    let stalledSignal: AbortSignal | undefined;
+    transport.sessionLoader = async (sessionId, signal) => {
+      loads += 1;
+      if (loads === 1) return clone(fixtureSessions[sessionId]);
+      if (loads === 2) {
+        stalledSignal = signal;
+        return new Promise<SessionSnapshot>(() => {});
+      }
+      return clone(authoritative);
+    };
+    const store = new YggStore(transport);
+
+    try {
+      await store.initialize();
+      transport.emit({
+        type: "session.projectionReplaced",
+        sessionId: "session-fresh",
+        actorGeneration: 1,
+        sequence: 2,
+      });
+      await vi.advanceTimersToNextTimerAsync();
+      expect(loads).toBe(2);
+      expect(stalledSignal).toBeDefined();
+
+      for (let index = 0; index < 300; index += 1) {
+        transport.emit({
+          type: "session.updated",
+          sessionId: "session-fresh",
+          actorGeneration: 1,
+          sequence: index + 2,
+          patch: { title: `live-${index}` },
+        });
+      }
+      await vi.advanceTimersToNextTimerAsync();
+
+      const deferred = (
+        store as unknown as {
+          deferredDuringResync: Map<
+            string,
+            { events: unknown[]; bytes: number; overflowed: boolean }
+          >;
+        }
+      ).deferredDuringResync.get("session-fresh");
+      expect(deferred).toMatchObject({
+        events: [],
+        bytes: 0,
+        overflowed: true,
+      });
+
+      await vi.advanceTimersByTimeAsync(10_001);
+      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersToNextTimerAsync();
+
+      expect(stalledSignal?.aborted).toBe(true);
+      expect(loads).toBe(3);
+      expect(store.selectedSession).toMatchObject({
+        sequence: 400,
+        title: "Authoritative recovery",
+      });
+    } finally {
+      store.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds deferred resync bytes without retaining an oversized event", async () => {
+    const transport = new TestTransport();
+    const replacement = {
+      ...clone(fixtureSessions["session-fresh"]),
+      sequence: 2,
+      title: "Authoritative replacement",
+    };
+    const pending = deferred<SessionSnapshot>();
+    let loads = 0;
+    transport.sessionLoader = async (sessionId) => {
+      loads += 1;
+      if (loads === 1) return clone(fixtureSessions[sessionId]);
+      if (loads === 2) return pending.promise;
+      return clone(replacement);
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.projectionReplaced",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 2,
+    });
+    await nextFrame();
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 2,
+      patch: { title: "x".repeat(600_000) },
+    });
+    await nextFrame();
+
+    const deferredState = (
+      store as unknown as {
+        deferredDuringResync: Map<
+          string,
+          { events: unknown[]; bytes: number; overflowed: boolean }
+        >;
+      }
+    ).deferredDuringResync.get("session-fresh");
+    expect(deferredState).toMatchObject({
+      events: [],
+      bytes: 0,
+      overflowed: true,
+    });
+
+    pending.resolve(replacement);
+    await vi.waitFor(() =>
+      expect(store.selectedSession?.sequence).toBe(2),
+    );
+    expect(loads).toBe(2);
+    expect(store.selectedSession).toMatchObject({
+      sequence: 2,
+      title: "Authoritative replacement",
+    });
+    store.dispose();
+  });
+
+  it("discards deferred events covered by an installed snapshot", async () => {
+    const transport = new TestTransport();
+    const replacement = {
+      ...clone(fixtureSessions["session-fresh"]),
+      sequence: 4,
+      title: "Authoritative replacement",
+    };
+    const pending = deferred<SessionSnapshot>();
+    let loads = 0;
+    transport.sessionLoader = async (sessionId) => {
+      loads += 1;
+      if (loads === 1) return clone(fixtureSessions[sessionId]);
+      return pending.promise;
+    };
+    const store = new YggStore(transport);
+    await store.initialize();
+
+    transport.emit({
+      type: "session.projectionReplaced",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 4,
+    });
+    await nextFrame();
+    transport.emit({
+      type: "session.snapshot",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 4,
+      snapshot: { ...replacement, title: "Covered event" },
+    });
+    transport.emit({
+      type: "session.updated",
+      sessionId: "session-fresh",
+      actorGeneration: 1,
+      sequence: 5,
+      patch: { status: "working" },
+    });
+    await nextFrame();
+
+    pending.resolve(replacement);
+    await vi.waitFor(() => expect(store.selectedSession?.sequence).toBe(5));
+    expect(store.selectedSession).toMatchObject({
+      sequence: 5,
+      title: "Authoritative replacement",
+      status: "working",
+    });
+    expect(loads).toBe(2);
     store.dispose();
   });
 

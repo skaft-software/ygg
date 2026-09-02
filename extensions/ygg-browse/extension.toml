@@ -1,7 +1,7 @@
 name = "ygg-browse"
 version = "0.1.0"
 api_version = "0.2"
-requires_ygg = "=0.6.5"
+requires_ygg = "=0.6.6"
 description = "Always-headful semantic browser automation with an isolated persistent profile and manual-auth boundary"
 
 [entrypoint]

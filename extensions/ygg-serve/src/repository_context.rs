@@ -51,6 +51,7 @@ pub const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(3);
 
 const MAX_GIT_ROOT_BYTES: usize = 16 * 1024;
 const MAX_GIT_STDERR_BYTES: usize = 16 * 1024;
+const MAX_GIT_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_PUBLIC_BRANCH_BYTES: usize = 512;
 const AGENTS_FILE_NAME: &str = "AGENTS.md";
 
@@ -834,7 +835,68 @@ fn run_git(root: &Path, args: &[&str], timeout: Duration, stdout_limit: usize) -
     let Some(git_executable) = safe_git_executable(root) else {
         return GitRunResult::Unavailable;
     };
-    run_git_executable(&git_executable, root, args, timeout, stdout_limit)
+    let Some(filter_overrides) = local_filter_overrides(&git_executable, root, timeout) else {
+        return GitRunResult::Unavailable;
+    };
+    run_git_executable_with_overrides(
+        &git_executable,
+        root,
+        args,
+        timeout,
+        stdout_limit,
+        &filter_overrides,
+    )
+}
+
+fn local_filter_overrides(
+    git_executable: &Path,
+    root: &Path,
+    timeout: Duration,
+) -> Option<Vec<String>> {
+    let config = run_git_executable(
+        git_executable,
+        root,
+        &["config", "--local", "--name-only", "--list"],
+        timeout,
+        MAX_GIT_CONFIG_BYTES,
+    );
+    let GitRunResult::Finished(output) = config else {
+        return None;
+    };
+    if !output.status.success() || output.truncated {
+        return None;
+    }
+
+    let mut names = std::collections::BTreeSet::new();
+    for key in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(key) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((name, kind)) = key.rsplit_once('.') else {
+            continue;
+        };
+        if !matches!(kind, "clean" | "process")
+            || name.is_empty()
+            || name
+                .chars()
+                .any(|character| character.is_control() || character == '=')
+        {
+            continue;
+        }
+        names.insert(name.to_owned());
+    }
+
+    Some(
+        names
+            .into_iter()
+            .flat_map(|name| {
+                [
+                    format!("filter.{name}.clean=cat"),
+                    format!("filter.{name}.process="),
+                ]
+            })
+            .collect(),
+    )
 }
 
 fn run_git_executable(
@@ -844,7 +906,21 @@ fn run_git_executable(
     timeout: Duration,
     stdout_limit: usize,
 ) -> GitRunResult {
+    run_git_executable_with_overrides(git_executable, root, args, timeout, stdout_limit, &[])
+}
+
+fn run_git_executable_with_overrides(
+    git_executable: &Path,
+    root: &Path,
+    args: &[&str],
+    timeout: Duration,
+    stdout_limit: usize,
+    filter_overrides: &[String],
+) -> GitRunResult {
     let mut command = Command::new(git_executable);
+    for override_value in filter_overrides {
+        command.arg("-c").arg(override_value);
+    }
     command
         .args(args)
         .current_dir(root)
@@ -1731,6 +1807,71 @@ mod tests {
         let (statuses, file_statuses_truncated) = status_output(&records, false);
         assert!(statuses.is_empty());
         assert!(file_statuses_truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_status_neutralizes_repository_clean_filters() {
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.invalid"]);
+        git(&["config", "user.name", "Ygg test"]);
+        std::fs::write(root.join("file.txt"), "hello\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        std::fs::write(root.join(".gitattributes"), "*.txt filter=poison\n").unwrap();
+        git(&["add", ".gitattributes"]);
+        git(&["commit", "-qm", "attributes"]);
+
+        let filter = root.join(".git/clean-filter.sh");
+        std::fs::write(&filter, "#!/bin/sh\necho hit >> .git/filter-marker\ncat\n").unwrap();
+        std::fs::set_permissions(&filter, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        git(&["config", "filter.poison.clean", filter.to_str().unwrap()]);
+        git(&["config", "filter.poison.smudge", "cat"]);
+        let marker = root.join(".git/filter-marker");
+        std::fs::remove_file(&marker).ok();
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "jello\n").unwrap();
+        git(&["status", "--porcelain=v2", "--branch"]);
+        assert!(
+            marker.is_file(),
+            "positive control did not run the clean filter"
+        );
+
+        std::fs::remove_file(&marker).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(root.join("file.txt"), "kello\n").unwrap();
+        let repository = super::refresh_git(&root, Duration::from_secs(2));
+        assert!(repository.dirty.unwrap_or(false));
+        assert!(!marker.is_file(), "repository refresh ran the clean filter");
+
+        let files = super::refresh_git_file_status(&root, Duration::from_secs(2));
+        assert!(!files.entries.is_empty());
+        assert!(
+            !marker.is_file(),
+            "file status refresh ran the clean filter"
+        );
     }
 
     #[cfg(unix)]

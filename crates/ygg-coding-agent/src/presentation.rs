@@ -1614,6 +1614,7 @@ mod tests {
                         buffered_bytes: 0,
                         first_body_seen: true,
                         elapsed_ms: 94_300,
+                        last_event_ms: Some(94_000),
                     },
                 },
             ))),
@@ -1637,7 +1638,7 @@ mod tests {
         assert!(
             reason.ends_with(
                 "stream_progress=frames=412 events=38 content=18204B buffered=0B \
-                 first_byte=seen elapsed=94300ms"
+                 first_byte=seen elapsed=94300ms last_event=94000ms"
             ),
             "{reason}"
         );

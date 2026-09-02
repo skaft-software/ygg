@@ -16,6 +16,11 @@ on:
         required: false
         default: false
         type: boolean
+      publish_npm:
+        description: Publish npm packages after trusted-publisher and provenance verification setup
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -24,6 +29,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_NET_OFFLINE: "false"
+  NPM_REGISTRY: https://registry.npmjs.org/
 
 jobs:
   resolve:
@@ -478,6 +484,40 @@ jobs:
             --bundle YGG_SHA256SUMS.sigstore.json \
             "${verify[@]}" \
             YGG_SHA256SUMS
+      - name: Create and verify immutable release metadata
+        shell: bash
+        env:
+          COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+          COSIGN_IDENTITY: https://github.com/${{ github.workflow_ref }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-ygg-release-metadata.py \
+            "$VERSION" \
+            "$RELEASE_TAG" \
+            "$SOURCE_COMMIT" \
+            "$WORKFLOW_COMMIT" \
+            "$WORKFLOW_REF" \
+            "$WORKFLOW_REPOSITORY" \
+            release-assets/YGG_SHA256SUMS \
+            release-assets/YGG_RELEASE_METADATA.json
+          cosign sign-blob \
+            --yes \
+            --bundle release-assets/YGG_RELEASE_METADATA.json.sigstore.json \
+            release-assets/YGG_RELEASE_METADATA.json
+          cosign verify-blob \
+            --bundle release-assets/YGG_RELEASE_METADATA.json.sigstore.json \
+            --certificate-identity "$COSIGN_IDENTITY" \
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+            --certificate-github-workflow-name "Ygg binary release" \
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY" \
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT" \
+            release-assets/YGG_RELEASE_METADATA.json
       - name: Attach assets to canonical release
         shell: bash
         env:
@@ -513,18 +553,30 @@ jobs:
             echo "canonical release $RELEASE_TAG is no longer a published stable release" >&2
             exit 1
           fi
-          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
           for asset in release-assets/*; do
             name=${asset##*/}
-            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              # Intentional rerun: replace the stale asset instead of refusing.
-              echo "replacing existing release asset: $name" >&2
-              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-                --jq '.assets[] | select(.name=="'"$name"'") | .id')
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
             fi
           done
-          gh release upload "$RELEASE_TAG" release-assets/*
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all release assets already match the immutable candidate"
+          fi
           verify_release_refs publishing
 
   verify-published:
@@ -615,6 +667,481 @@ jobs:
           HOME="$test_home" "$binary" extension list | grep -F "ygg-serve"
           HOME="$test_home" "$binary" extension remove ygg-serve
           test ! -e "$test_home/.ygg/extensions/ygg-serve"
+
+  package-npm:
+    name: Package verified npm artifacts
+    needs: [resolve, verify-published]
+    if: needs.resolve.outputs.mode == 'binaries' && inputs.publish_npm == true
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out immutable release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: source/apps/web/.node-version
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+      - name: Download and verify the settled immutable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" \
+            --dir release-assets \
+            --clobber \
+            --pattern 'install-ygg.sh' \
+            --pattern 'install-ygg.sh.sigstore.json' \
+            --pattern 'ygg-*.tar.gz' \
+            --pattern 'ygg-*.tar.gz.sigstore.json' \
+            --pattern 'YGG_SHA256SUMS' \
+            --pattern 'YGG_SHA256SUMS.sigstore.json' \
+            --pattern 'YGG_RELEASE_METADATA.json' \
+            --pattern 'YGG_RELEASE_METADATA.json.sigstore.json'
+          cd release-assets
+          sha256sum --check YGG_SHA256SUMS
+          verify=(
+            --certificate-identity "https://github.com/$WORKFLOW_REF"
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            --certificate-github-workflow-name "Ygg binary release"
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT"
+          )
+          cosign verify-blob \
+            --bundle YGG_SHA256SUMS.sigstore.json \
+            "${verify[@]}" \
+            YGG_SHA256SUMS
+          cosign verify-blob \
+            --bundle YGG_RELEASE_METADATA.json.sigstore.json \
+            "${verify[@]}" \
+            YGG_RELEASE_METADATA.json
+          for artifact in ./*.tar.gz ./install-ygg.sh; do
+            cosign verify-blob \
+              --bundle "${artifact}.sigstore.json" \
+              "${verify[@]}" \
+              "$artifact"
+          done
+          python3 ../source/scripts/generate-ygg-release-metadata.py \
+            "$VERSION" \
+            "$RELEASE_TAG" \
+            "$SOURCE_COMMIT" \
+            "$WORKFLOW_COMMIT" \
+            "$WORKFLOW_REF" \
+            "$WORKFLOW_REPOSITORY" \
+            YGG_SHA256SUMS \
+            "$RUNNER_TEMP/recomputed-release-metadata.json"
+          cmp YGG_RELEASE_METADATA.json "$RUNNER_TEMP/recomputed-release-metadata.json"
+      - name: Build and validate npm tarballs from the verified assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+        run: |
+          set -euo pipefail
+          source_date_epoch=$(git -C source show -s --format=%ct "$SOURCE_COMMIT")
+          SOURCE_DATE_EPOCH="$source_date_epoch" source/scripts/package-ygg-npm.sh \
+            "$VERSION" \
+            "$PWD/release-assets" \
+            "$RUNNER_TEMP/npm-assets" \
+            "$PWD/release-assets/YGG_SHA256SUMS"
+          python3 source/scripts/create-ygg-npm-manifest.py \
+            "$VERSION" \
+            "$TAG" \
+            "$SOURCE_COMMIT" \
+            "$WORKFLOW_COMMIT" \
+            "$PWD/release-assets/YGG_RELEASE_METADATA.json" \
+            "$RUNNER_TEMP/npm-assets" \
+            "$RUNNER_TEMP/npm-assets/YGG_NPM_MANIFEST.json" \
+            "$RUNNER_TEMP/npm-assets/YGG_NPM_SHA256SUMS"
+          (cd "$RUNNER_TEMP/npm-assets" && sha256sum --check YGG_NPM_SHA256SUMS)
+          python3 source/scripts/verify-ygg-npm.py \
+            "$VERSION" \
+            "$RUNNER_TEMP/npm-assets" \
+            --json > "$RUNNER_TEMP/npm-verification.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ygg-npm
+          path: ${{ runner.temp }}/npm-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-npm:
+    name: Publish npm packages with trusted publishing
+    needs: [resolve, package-npm]
+    if: needs.resolve.outputs.mode == 'binaries'
+    runs-on: ubuntu-24.04
+    environment: stable-release-publish
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out immutable release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          path: source
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: source/apps/web/.node-version
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+      - name: Install the pinned trusted-publishing npm CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_cli_integrity='sha512-Iy5vXZ55m8tIaSCz6bqQf9+W5XbPfoyURsgWLjOkFglqHTep6RDZqRj2sfYGeRyZvGu2HuJWm0lux0rxPQ29lQ=='
+          npm_cli_directory=$(mktemp -d "$RUNNER_TEMP/npm-cli.XXXXXX")
+          trap 'rm -rf "$npm_cli_directory"' EXIT
+          npm pack npm@11.5.1 --registry "$NPM_REGISTRY" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            --pack-destination "$npm_cli_directory" >/dev/null
+          npm_cli_archive="$npm_cli_directory/npm-11.5.1.tgz"
+          test -f "$npm_cli_archive"
+          actual_integrity=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "$npm_cli_archive")
+          test "$actual_integrity" = "$npm_cli_integrity"
+          npm install --global \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "$npm_cli_archive"
+          test "$(npm --version)" = "11.5.1"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ygg-npm
+          path: npm-assets
+      - name: Revalidate package evidence before OIDC publication
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+        run: |
+          set -euo pipefail
+          (cd npm-assets && sha256sum --check YGG_NPM_SHA256SUMS)
+          python3 source/scripts/verify-ygg-npm.py "$VERSION" npm-assets --json > "$RUNNER_TEMP/npm-verification.json"
+          python3 - "$VERSION" "$TAG" "$SOURCE_COMMIT" "$WORKFLOW_COMMIT" npm-assets/YGG_NPM_MANIFEST.json <<'PY'
+          import json
+          import re
+          import sys
+          version, tag, source_commit, workflow_commit, path = sys.argv[1:]
+          manifest = json.load(open(path, encoding="utf-8"))
+          expected = {
+              "schema": "ygg.npm.release.v1",
+              "repository": "skaft-software/ygg",
+              "tag": tag,
+              "version": version,
+              "source_commit": source_commit,
+              "workflow_commit": workflow_commit,
+          }
+          if any(manifest.get(key) != value for key, value in expected.items()):
+              raise SystemExit("npm manifest identity does not match the immutable candidate")
+          if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None or re.fullmatch(r"[0-9a-f]{40}", workflow_commit) is None:
+              raise SystemExit("npm manifest commit identity is malformed")
+          if len(manifest.get("packages", [])) != 4:
+              raise SystemExit("npm manifest does not describe all four packages")
+          PY
+      - name: Preflight immutable npm versions
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          for descriptor in \
+            '@skaft-software/ygg|ygg-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-darwin-arm64|ygg-darwin-arm64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-darwin-x64|ygg-darwin-x64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz'; do
+            IFS='|' read -r package artifact <<< "$descriptor"
+            expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
+            if existing=$(npm view "$package@$VERSION" dist.integrity --json --registry "$NPM_REGISTRY" 2>/dev/null); then
+              existing=${existing#\"}
+              existing=${existing%\"}
+              if [[ "$existing" != "$expected" ]]; then
+                echo "immutable npm version exists with a different integrity: $package@$VERSION" >&2
+                exit 1
+              fi
+              echo "verified existing immutable package $package@$VERSION"
+            else
+              echo "package $package@$VERSION is not published yet"
+            fi
+          done
+      - name: Publish platform packages before the launcher with npm provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          for descriptor in \
+            '@skaft-software/ygg-darwin-arm64|ygg-darwin-arm64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-darwin-x64|ygg-darwin-x64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
+            IFS='|' read -r package artifact <<< "$descriptor"
+            if npm view "$package@$VERSION" version --registry "$NPM_REGISTRY" >/dev/null 2>&1; then
+              echo "skipping already verified immutable package $package@$VERSION"
+              continue
+            fi
+            npm publish "npm-assets/$artifact" --registry "$NPM_REGISTRY" \
+              --access public \
+              --provenance \
+              --ignore-scripts \
+              --no-audit \
+              --no-fund
+          done
+      - name: Verify registry integrity and provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          for descriptor in \
+            '@skaft-software/ygg-darwin-arm64|ygg-darwin-arm64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-darwin-x64|ygg-darwin-x64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
+            IFS='|' read -r package artifact <<< "$descriptor"
+            expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
+            registry_metadata="$RUNNER_TEMP/npm-registry.json"
+            npm view "$package@$VERSION" --json --registry "$NPM_REGISTRY" > "$registry_metadata"
+          attestation_url=$(python3 - "$registry_metadata" "$package" "$VERSION" <<'PY'
+          import json
+          import sys
+          from urllib.parse import unquote, urlsplit
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          package, version = sys.argv[2:]
+          url = metadata.get("dist", {}).get("attestations", {}).get("url")
+          parsed = urlsplit(url) if isinstance(url, str) else None
+          if (
+              parsed is None
+              or parsed.scheme != "https"
+              or parsed.netloc != "registry.npmjs.org"
+              or parsed.query
+              or parsed.fragment
+              or unquote(parsed.path) != f"/-/npm/v1/attestations/{package}@{version}"
+          ):
+              raise SystemExit("registry returned a non-canonical npm attestation URL")
+          print(url)
+          PY
+          )
+            attestations="$RUNNER_TEMP/npm-attestations.json"
+            curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 30 \
+              --max-filesize 1048576 \
+              --output "$attestations" \
+              "$attestation_url"
+            python3 source/scripts/verify-ygg-npm-provenance.py \
+              "$registry_metadata" \
+              "$attestations" \
+              npm-assets/YGG_NPM_MANIFEST.json \
+              "$package" \
+              "$VERSION" \
+              "$expected" \
+              "https://github.com/$WORKFLOW_REPOSITORY" \
+              '.github/workflows/release-ygg.yml' \
+              "$SOURCE_COMMIT" \
+              "$WORKFLOW_COMMIT"
+          done
+      - name: Sign and attach npm evidence to the canonical release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          verify=(
+            --certificate-identity "https://github.com/${{ github.workflow_ref }}"
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            --certificate-github-workflow-name "Ygg binary release"
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT"
+          )
+          for artifact in npm-assets/*.tgz; do
+            cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"
+          done
+          cosign sign-blob --yes --bundle npm-assets/YGG_NPM_SHA256SUMS.sigstore.json npm-assets/YGG_NPM_SHA256SUMS
+          cosign sign-blob --yes --bundle npm-assets/YGG_NPM_MANIFEST.json.sigstore.json npm-assets/YGG_NPM_MANIFEST.json
+          cosign verify-blob --bundle npm-assets/YGG_NPM_SHA256SUMS.sigstore.json "${verify[@]}" npm-assets/YGG_NPM_SHA256SUMS
+          cosign verify-blob --bundle npm-assets/YGG_NPM_MANIFEST.json.sigstore.json "${verify[@]}" npm-assets/YGG_NPM_MANIFEST.json
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
+          for asset in npm-assets/*.tgz npm-assets/*.sigstore.json npm-assets/YGG_NPM_SHA256SUMS npm-assets/YGG_NPM_MANIFEST.json; do
+            name=${asset##*/}
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
+            fi
+          done
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all npm evidence assets already match the immutable candidate"
+          fi
+
+  verify-npm-published:
+    name: Verify published npm provenance
+    needs: [resolve, publish-npm]
+    if: needs.resolve.outputs.mode == 'binaries'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out immutable verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: apps/web/.node-version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: ygg-npm
+          path: npm-assets
+      - name: Verify public registry contents and provenance
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SOURCE_COMMIT: ${{ needs.resolve.outputs.source_commit }}
+          WORKFLOW_COMMIT: ${{ needs.resolve.outputs.workflow_commit }}
+          WORKFLOW_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd npm-assets && sha256sum --check YGG_NPM_SHA256SUMS)
+          python3 scripts/verify-ygg-npm.py "$VERSION" npm-assets --json > "$RUNNER_TEMP/npm-verification.json"
+          for descriptor in \
+            '@skaft-software/ygg-darwin-arm64|ygg-darwin-arm64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-darwin-x64|ygg-darwin-x64-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg-linux-x64-gnu|ygg-linux-x64-gnu-'"$VERSION"'.tgz' \
+            '@skaft-software/ygg|ygg-'"$VERSION"'.tgz'; do
+            IFS='|' read -r package artifact <<< "$descriptor"
+            expected=$(node -e 'const fs=require("fs"); const crypto=require("crypto"); process.stdout.write("sha512-"+crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"));' "npm-assets/$artifact")
+            registry_metadata="$RUNNER_TEMP/npm-registry.json"
+            npm view "$package@$VERSION" --json --registry "$NPM_REGISTRY" > "$registry_metadata"
+          attestation_url=$(python3 - "$registry_metadata" "$package" "$VERSION" <<'PY'
+          import json
+          import sys
+          from urllib.parse import unquote, urlsplit
+          metadata = json.load(open(sys.argv[1], encoding="utf-8"))
+          package, version = sys.argv[2:]
+          url = metadata.get("dist", {}).get("attestations", {}).get("url")
+          parsed = urlsplit(url) if isinstance(url, str) else None
+          if (
+              parsed is None
+              or parsed.scheme != "https"
+              or parsed.netloc != "registry.npmjs.org"
+              or parsed.query
+              or parsed.fragment
+              or unquote(parsed.path) != f"/-/npm/v1/attestations/{package}@{version}"
+          ):
+              raise SystemExit("registry returned a non-canonical npm attestation URL")
+          print(url)
+          PY
+          )
+            attestations="$RUNNER_TEMP/npm-attestations.json"
+            curl \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 30 \
+              --max-filesize 1048576 \
+              --output "$attestations" \
+              "$attestation_url"
+            python3 scripts/verify-ygg-npm-provenance.py \
+              "$registry_metadata" \
+              "$attestations" \
+              npm-assets/YGG_NPM_MANIFEST.json \
+              "$package" \
+              "$VERSION" \
+              "$expected" \
+              "https://github.com/$WORKFLOW_REPOSITORY" \
+              '.github/workflows/release-ygg.yml' \
+              "$SOURCE_COMMIT" \
+              "$WORKFLOW_COMMIT"
+          done
+
+  smoke-npm-published:
+    name: Smoke published npm package on ${{ matrix.target }}
+    needs: [resolve, verify-npm-published]
+    if: needs.resolve.outputs.mode == 'binaries'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: GNU/Linux x64
+          - os: macos-15-intel
+            target: macOS Intel
+          - os: macos-15
+            target: macOS Apple silicon
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.13.0
+      - name: Install the exact public launcher without lifecycle scripts
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/ygg-npm-prefix"
+          mkdir -p "$prefix"
+          npm install --global --prefix "$prefix" --registry "$NPM_REGISTRY" \
+            --ignore-scripts \
+            --no-audit \
+            --no-fund \
+            "@skaft-software/ygg@$VERSION"
+          PATH="$prefix/bin:$PATH"
+          export PATH
+          test "$(ygg --version)" = "ygg $VERSION"
+          ygg --help >/dev/null
+          printf '%s\n' '{"protocol_version":1,"request_id":"npm-published-smoke","command":"hello"}' \
+            | ygg-host \
+            | grep -F '"type":"hello"' >/dev/null
+          npm uninstall --global --prefix "$prefix" --ignore-scripts --no-audit --no-fund @skaft-software/ygg
+          test ! -e "$prefix/bin/ygg"
 
   publish-installer-repair:
     name: Sign and attach portable Ygg installer
@@ -822,18 +1349,30 @@ jobs:
             echo "canonical release $RELEASE_TAG is not a published stable release" >&2
             exit 1
           fi
-          existing_assets=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')
+          existing_digests=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[] | [.name, (.digest // "")] | @tsv')
+          uploads=()
           for asset in release-assets/*; do
             name=${asset##*/}
-            if grep -Fx "$name" <<< "$existing_assets" >/dev/null; then
-              # Intentional rerun: replace the stale asset instead of refusing.
-              echo "replacing existing release asset: $name" >&2
-              asset_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-                --jq '.assets[] | select(.name=="'"$name"'") | .id')
-              gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" >/dev/null
+            if existing_digest=$(awk -F '\t' -v wanted="$name" '$1 == wanted { print $2; found=1 } END { exit found ? 0 : 1 }' <<< "$existing_digests"); then
+              if [[ -z "$existing_digest" ]]; then
+                echo "existing release asset has no immutable digest: $name" >&2
+                exit 1
+              fi
+              local_digest=$(sha256sum "$asset" | awk '{print $1}')
+              if [[ "$existing_digest" != "sha256:$local_digest" ]]; then
+                echo "immutable release asset differs from the existing asset: $name" >&2
+                exit 1
+              fi
+              echo "verified existing immutable release asset: $name"
+            else
+              uploads+=("$asset")
             fi
           done
-          gh release upload "$RELEASE_TAG" release-assets/*
+          if ((${#uploads[@]})); then
+            gh release upload "$RELEASE_TAG" "${uploads[@]}"
+          else
+            echo "all release assets already match the immutable candidate"
+          fi
           verify_release_refs published
 
   verify-installer-repair:

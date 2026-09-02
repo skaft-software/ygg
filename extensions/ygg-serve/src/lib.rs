@@ -21,6 +21,7 @@ mod ids;
 mod journal;
 mod model;
 mod process_tree;
+pub use process_tree::{isolate_process_group, ProcessTree, TerminationSignal};
 mod project_registry;
 mod prompt_context;
 mod pty;

@@ -4,6 +4,7 @@
     {"host": "pending", "extension": "queued", "terminal": false},
     {"host": "running", "extension": "running", "terminal": false},
     {"host": "completed", "extension": "done", "terminal": true},
+    {"host": "limit_reached", "extension": "limit_reached", "terminal": true},
     {"host": "failed", "extension": "failed", "terminal": true},
     {"host": "interrupted", "extension": "cancelled", "terminal": true},
     {"host": "interrupted_after_stop", "extension": "stopped", "terminal": true},

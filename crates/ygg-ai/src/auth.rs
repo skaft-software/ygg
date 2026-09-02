@@ -2,6 +2,9 @@
 
 use crate::error::{AuthError, ConfigError};
 
+/// Maximum number of bytes accepted from an environment variable.
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
 /// A wrapper for sensitive values (API keys, credentials) that prevents accidental exposure.
 ///
 /// It overrides `Debug` and `Display` to redact the underlying secret, and does not implement
@@ -33,13 +36,47 @@ impl From<&str> for Secret {
     }
 }
 
+fn bounded_env_value(
+    var: &str,
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<String>, ConfigError> {
+    match value {
+        Ok(value) if value.len() > MAX_ENV_VALUE_BYTES => {
+            Err(ConfigError::EnvironmentValueTooLarge {
+                var: var.to_owned(),
+                max_bytes: MAX_ENV_VALUE_BYTES,
+            })
+        }
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnv(var.to_owned())),
+    }
+}
+
+/// Reads an environment variable while enforcing [`MAX_ENV_VALUE_BYTES`].
+///
+/// An unset variable returns `Ok(None)`. A value that is not valid Unicode
+/// returns [`ConfigError::InvalidEnv`], and an otherwise valid value over the
+/// byte limit returns [`ConfigError::EnvironmentValueTooLarge`].
+pub fn read_bounded_env(var: &str) -> Result<Option<String>, ConfigError> {
+    bounded_env_value(var, std::env::var(var))
+}
+
+fn secret_from_bounded_env(
+    var: &str,
+    value: Result<Option<String>, ConfigError>,
+) -> Result<Secret, ConfigError> {
+    match value {
+        Ok(Some(value)) => Ok(Secret::from(value)),
+        Ok(None) | Err(ConfigError::InvalidEnv(_)) => Err(ConfigError::MissingEnv(var.to_owned())),
+        Err(error) => Err(error),
+    }
+}
+
 impl Secret {
     /// Loads a secret from the environment.
     pub fn from_env(var: &str) -> Result<Self, ConfigError> {
-        match std::env::var(var) {
-            Ok(val) => Ok(Self::from(val)),
-            Err(_) => Err(ConfigError::MissingEnv(var.to_string())),
-        }
+        secret_from_bounded_env(var, read_bounded_env(var))
     }
 
     /// Expose the underlying secret value. This is crate-private.
@@ -144,8 +181,8 @@ impl Auth {
     /// and dynamic credentials are usable by construction.
     pub fn is_configured(&self) -> bool {
         match self {
-            Self::BearerEnv { var } | Self::HeaderEnv { var, .. } => std::env::var(var)
-                .map(|value| !value.trim().is_empty())
+            Self::BearerEnv { var } | Self::HeaderEnv { var, .. } => Secret::from_env(var)
+                .map(|secret| !secret.expose().trim().is_empty())
                 .unwrap_or(false),
             Self::None | Self::Bearer(_) | Self::Header { .. } | Self::Dynamic(_) => true,
         }
@@ -258,9 +295,41 @@ impl CredentialRedactor {
     }
 }
 
+fn resolve_env_secret_value(
+    var: &str,
+    value: Result<Option<String>, ConfigError>,
+) -> Result<Secret, AuthError> {
+    secret_from_bounded_env(var, value).map_err(|error| match error {
+        ConfigError::MissingEnv(_) | ConfigError::InvalidEnv(_) => {
+            AuthError::MissingEnvironment(var.to_owned())
+        }
+        ConfigError::EnvironmentValueTooLarge { var, max_bytes } => {
+            AuthError::EnvironmentValueTooLarge { var, max_bytes }
+        }
+        _ => AuthError::Resolve,
+    })
+}
+
+fn resolve_env_secret_with<F>(var: &str, read_env: &F) -> Result<Secret, AuthError>
+where
+    F: Fn(&str) -> Result<Option<String>, ConfigError>,
+{
+    resolve_env_secret_value(var, read_env(var))
+}
+
 /// Resolves authentication settings into concrete headers and a request-scoped
 /// credential redactor.
 pub(crate) async fn resolve_headers(auth: &Auth) -> Result<ResolvedHeaders, AuthError> {
+    resolve_headers_with_env(auth, &read_bounded_env).await
+}
+
+async fn resolve_headers_with_env<F>(
+    auth: &Auth,
+    read_env: &F,
+) -> Result<ResolvedHeaders, AuthError>
+where
+    F: Fn(&str) -> Result<Option<String>, ConfigError>,
+{
     let mut headers = http::HeaderMap::new();
     let mut redactor = CredentialRedactor::default();
 
@@ -282,21 +351,19 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<ResolvedHeaders, Auth
             headers.insert(name.clone(), val);
         }
         Auth::BearerEnv { var } => {
-            let val_str =
-                std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
-            redactor.insert(Secret::from(val_str.as_str()));
-            let bearer_str = format!("Bearer {}", val_str);
+            let secret = resolve_env_secret_with(var, read_env)?;
+            redactor.insert(secret.clone());
+            let bearer_str = format!("Bearer {}", secret.expose());
             let mut val = http::HeaderValue::from_str(&bearer_str)
                 .map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
             headers.insert(http::header::AUTHORIZATION, val);
         }
         Auth::HeaderEnv { name, var } => {
-            let val_str =
-                std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
-            redactor.insert(Secret::from(val_str.as_str()));
-            let mut val =
-                http::HeaderValue::from_str(&val_str).map_err(|_| AuthError::InvalidHeaderValue)?;
+            let secret = resolve_env_secret_with(var, read_env)?;
+            redactor.insert(secret.clone());
+            let mut val = http::HeaderValue::from_str(secret.expose())
+                .map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
             headers.insert(name.clone(), val);
         }
@@ -398,24 +465,100 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_resolve_headers_env() {
-        let var_name = "YGG_RESOLVER_VAR";
-        std::env::set_var(var_name, "env-key");
-
-        let auth = Auth::bearer_env(var_name);
-        let resolved = resolve_headers(&auth).await.unwrap();
+    #[test]
+    fn bounded_env_values_preserve_missing_and_invalid_unicode() {
         assert_eq!(
-            resolved
-                .headers
-                .get(AUTHORIZATION)
-                .unwrap()
-                .to_str()
-                .unwrap(),
-            "Bearer env-key"
+            bounded_env_value("MISSING", Err(std::env::VarError::NotPresent)).unwrap(),
+            None
+        );
+        let error = bounded_env_value(
+            "INVALID",
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::from(
+                "not-utf8",
+            ))),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::InvalidEnv(var) if var == "INVALID"
+        ));
+        assert!(matches!(
+            secret_from_bounded_env("MISSING", Ok(None)),
+            Err(ConfigError::MissingEnv(var)) if var == "MISSING"
+        ));
+        assert!(matches!(
+            secret_from_bounded_env("INVALID", Err(ConfigError::InvalidEnv("INVALID".into()))),
+            Err(ConfigError::MissingEnv(var)) if var == "INVALID"
+        ));
+    }
+
+    #[test]
+    fn bounded_env_values_enforce_a_byte_limit() {
+        let at_limit = "x".repeat(MAX_ENV_VALUE_BYTES);
+        assert_eq!(
+            bounded_env_value("BOUNDARY", Ok(at_limit.clone())).unwrap(),
+            Some(at_limit)
         );
 
-        std::env::remove_var(var_name);
+        let utf8_at_limit = "é".repeat(MAX_ENV_VALUE_BYTES / 2);
+        assert_eq!(utf8_at_limit.len(), MAX_ENV_VALUE_BYTES);
+        assert!(bounded_env_value("UTF8_BOUNDARY", Ok(utf8_at_limit)).is_ok());
+
+        let error =
+            bounded_env_value("TOO_LARGE", Ok("x".repeat(MAX_ENV_VALUE_BYTES + 1))).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::EnvironmentValueTooLarge { var, max_bytes }
+                if var == "TOO_LARGE" && max_bytes == MAX_ENV_VALUE_BYTES
+        ));
+    }
+
+    #[tokio::test]
+    async fn env_auth_headers_accept_the_limit_and_reject_oversized_values() {
+        let at_limit = "k".repeat(MAX_ENV_VALUE_BYTES);
+        let read_at_limit = |var: &str| -> Result<Option<String>, ConfigError> {
+            bounded_env_value(var, Ok(at_limit.clone()))
+        };
+
+        let bearer = resolve_headers_with_env(&Auth::bearer_env("BEARER_KEY"), &read_at_limit)
+            .await
+            .unwrap();
+        assert_eq!(
+            bearer.headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            format!("Bearer {at_limit}")
+        );
+        assert!(bearer.headers.get(AUTHORIZATION).unwrap().is_sensitive());
+
+        let header = resolve_headers_with_env(
+            &Auth::header_env(http::HeaderName::from_static("x-api-key"), "HEADER_KEY"),
+            &read_at_limit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            header.headers.get("x-api-key").unwrap().to_str().unwrap(),
+            at_limit
+        );
+        assert!(header.headers.get("x-api-key").unwrap().is_sensitive());
+
+        let read_over_limit = |var: &str| -> Result<Option<String>, ConfigError> {
+            bounded_env_value(var, Ok("x".repeat(MAX_ENV_VALUE_BYTES + 1)))
+        };
+        for auth in [
+            Auth::bearer_env("BEARER_KEY"),
+            Auth::header_env(http::HeaderName::from_static("x-api-key"), "HEADER_KEY"),
+        ] {
+            let error = resolve_headers_with_env(&auth, &read_over_limit)
+                .await
+                .err()
+                .expect("oversized environment credentials must fail");
+            assert!(matches!(
+                error,
+                AuthError::EnvironmentValueTooLarge { var, max_bytes }
+                    if (var == "BEARER_KEY" || var == "HEADER_KEY")
+                        && max_bytes == MAX_ENV_VALUE_BYTES
+            ));
+        }
     }
 
     #[tokio::test]

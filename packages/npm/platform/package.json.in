@@ -1,0 +1,15 @@
+{
+  "name": "__PACKAGE_NAME__",
+  "version": "__VERSION__",
+  "description": "Native Ygg runtime for __TARGET__",
+  "license": "MIT",
+  "repository": "https://github.com/skaft-software/ygg",
+  "os": ["__OS__"],
+  "cpu": ["__CPU__"],
+  "files": [
+    "README.md",
+    "LICENSE",
+    "bin/",
+    "share/ygg/"
+  ]
+}

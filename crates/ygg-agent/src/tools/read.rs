@@ -10,9 +10,11 @@ use serde::Deserialize;
 use ygg_ai::{AudioFormat, Media, Mime, ToolDef};
 
 use crate::effect::ToolEffect;
+use crate::sandbox::RemoteReadRetryPolicy;
 use crate::secure_fs::{read_regular_file_bounded_by, SecureFileError};
 use crate::tool::{
-    content_hash, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput,
+    content_hash, CancellationToken, ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError,
+    ToolOutput,
 };
 use crate::tools::{
     clip_line, parse_args, validate_effect_path, MAX_FILE_BYTES, MAX_TOOL_PATH_BYTES,
@@ -248,7 +250,11 @@ impl Tool for ReadTool {
                         _ = cancellation.cancelled() => {
                             Err(ToolError::new("remote media read cancelled"))
                         }
-                        result = read_remote_media(url) => result,
+                        result = read_remote_media(
+                            url,
+                            &ctx.sandbox.remote_read_retry,
+                            cancellation.clone(),
+                        ) => result,
                     }
                 }
                 "http" | "https" => Err(ToolError::new(
@@ -565,7 +571,16 @@ fn remote_client(
     Ok(client)
 }
 
-async fn read_remote_media(mut url: reqwest::Url) -> Result<ToolOutput, ToolError> {
+enum RemoteAttemptError {
+    Retryable(ToolError),
+    Fatal(ToolError),
+}
+
+async fn read_remote_media(
+    mut url: reqwest::Url,
+    retry_policy: &RemoteReadRetryPolicy,
+    cancellation: CancellationToken,
+) -> Result<ToolOutput, ToolError> {
     let requested_display = display_remote_url(&url);
     let (host, literal_ip, endpoints) = validated_remote_endpoint(&url, &requested_display).await?;
     // `ClientBuilder::resolve` keys exact host spellings. Normalize the URL to
@@ -582,34 +597,79 @@ async fn read_remote_media(mut url: reqwest::Url) -> Result<ToolOutput, ToolErro
     // DNS change creates a different key rather than reusing an unvalidated
     // connection pool.
     let client = remote_client(&host, &endpoints, url.scheme() == "https")?;
+    let max_attempts = retry_policy.attempts();
+
+    for attempt in 1..=max_attempts {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::new("remote media read cancelled"));
+        }
+        match read_remote_media_attempt(&client, &url, &requested_display).await {
+            Ok(output) => return Ok(output),
+            Err(RemoteAttemptError::Fatal(error)) => return Err(error),
+            Err(RemoteAttemptError::Retryable(error)) if attempt == max_attempts => {
+                return Err(error);
+            }
+            Err(RemoteAttemptError::Retryable(_error)) => {
+                let delay = retry_policy.backoff_for_retry(attempt);
+                let completed = tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => false,
+                    _ = tokio::time::sleep(delay) => true,
+                };
+                if !completed {
+                    return Err(ToolError::new("remote media read cancelled"));
+                }
+            }
+        }
+    }
+
+    unreachable!("remote media retry loop always has at least one attempt")
+}
+
+async fn read_remote_media_attempt(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    requested_display: &str,
+) -> Result<ToolOutput, RemoteAttemptError> {
     let mut response = client
-        .get(url)
+        .get(url.clone())
         .header(reqwest::header::ACCEPT, "image/*, audio/*")
         .send()
         .await
         .map_err(|error| {
-            ToolError::new(format!(
+            let retryable =
+                error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+            let display = ToolError::new(format!(
                 "{requested_display}: request failed: {}",
                 error.without_url()
-            ))
+            ));
+            if retryable {
+                RemoteAttemptError::Retryable(display)
+            } else {
+                RemoteAttemptError::Fatal(display)
+            }
         })?;
     let response_display = display_remote_url(response.url());
-    if !response.status().is_success() {
-        return Err(ToolError::new(format!(
-            "{response_display}: HTTP {}",
-            response.status()
-        )));
+    let status = response.status();
+    if !status.is_success() {
+        let error = ToolError::new(format!("{response_display}: HTTP {status}"));
+        return Err(if retryable_remote_status(status) {
+            RemoteAttemptError::Retryable(error)
+        } else {
+            RemoteAttemptError::Fatal(error)
+        });
     }
 
     let extension_hint = media_kind_for_name(response.url().path());
-    let content_type_hint = response_media_kind(response.headers(), &response_display)?;
+    let content_type_hint = response_media_kind(response.headers(), &response_display)
+        .map_err(RemoteAttemptError::Fatal)?;
     if let Some(extension) = &extension_hint {
         if extension != &content_type_hint {
-            return Err(ToolError::new(format!(
+            return Err(RemoteAttemptError::Fatal(ToolError::new(format!(
                 "{response_display}: URL extension indicates {} but Content-Type is {}",
                 extension.media_type(),
                 content_type_hint.media_type()
-            )));
+            ))));
         }
     }
     let hinted_kind = content_type_hint;
@@ -618,11 +678,11 @@ async fn read_remote_media(mut url: reqwest::Url) -> Result<ToolOutput, ToolErro
         .content_length()
         .is_some_and(|length| length > byte_limit as u64)
     {
-        return Err(media_too_large_error(
+        return Err(RemoteAttemptError::Fatal(media_too_large_error(
             &response_display,
             byte_limit,
             response.content_length(),
-        ));
+        )));
     }
 
     let mut bytes = Vec::with_capacity(
@@ -632,28 +692,35 @@ async fn read_remote_media(mut url: reqwest::Url) -> Result<ToolOutput, ToolErro
             .min(byte_limit as u64) as usize,
     );
     while let Some(chunk) = response.chunk().await.map_err(|error| {
-        ToolError::new(format!(
+        RemoteAttemptError::Retryable(ToolError::new(format!(
             "{response_display}: response read failed: {}",
             error.without_url()
-        ))
+        )))
     })? {
         if bytes.len().saturating_add(chunk.len()) > byte_limit {
-            return Err(media_too_large_error(
+            return Err(RemoteAttemptError::Fatal(media_too_large_error(
                 &response_display,
                 byte_limit,
                 Some(bytes.len().saturating_add(chunk.len()) as u64),
-            ));
+            )));
         }
         bytes.extend_from_slice(&chunk);
     }
 
-    let kind =
-        validated_media_kind(&bytes, Some(&hinted_kind), &response_display)?.ok_or_else(|| {
-            ToolError::new(format!(
+    let kind = validated_media_kind(&bytes, Some(&hinted_kind), &response_display)
+        .map_err(RemoteAttemptError::Fatal)?
+        .ok_or_else(|| {
+            RemoteAttemptError::Fatal(ToolError::new(format!(
                 "{response_display}: remote reads accept supported image or audio content only"
-            ))
+            )))
         })?;
-    media_output(response_display, bytes, kind)
+    media_output(response_display, bytes, kind).map_err(RemoteAttemptError::Fatal)
+}
+
+fn retryable_remote_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 fn response_media_kind(
@@ -1163,6 +1230,34 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("cancelled"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn remote_read_retries_transient_http_failures_with_a_bounded_policy() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/transient.png"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(3)
+            .mount(&server)
+            .await;
+        let mut f = remote_fixture();
+        f.sandbox.remote_read_retry = crate::sandbox::RemoteReadRetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        };
+
+        let error = ReadTool
+            .execute(
+                json!({"path": format!("{}/transient.png", server.uri())}),
+                &f.ctx(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.message.contains("HTTP 503"), "{error}");
+        server.verify().await;
     }
 
     #[tokio::test]

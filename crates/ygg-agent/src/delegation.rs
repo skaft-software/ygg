@@ -299,6 +299,15 @@ pub enum DelegatedAgentStatus {
         /// Bounded visible output from the completed run.
         output: String,
     },
+    /// The latest task exhausted its host-owned turn budget.
+    LimitReached {
+        /// Bounded visible output accumulated before the turn budget ended.
+        output: String,
+        /// Number of turns completed when the budget was exhausted.
+        turn_count: u64,
+        /// Host-owned maximum number of turns for the run.
+        turn_limit: u64,
+    },
     /// The latest task was interrupted.
     Interrupted,
     /// The latest task failed.
@@ -322,6 +331,7 @@ impl DelegatedAgentStatus {
             Self::Pending => "pending",
             Self::Running => "running",
             Self::Completed { .. } => "completed",
+            Self::LimitReached { .. } => "limit_reached",
             Self::Interrupted => "interrupted",
             Self::Failed { .. } => "failed",
             Self::TimedOut => "timed_out",
@@ -1145,6 +1155,8 @@ struct AgentRecord {
     cost: Option<Cost>,
     cost_microdollars: Option<u64>,
     deadline_at_ms: Option<u64>,
+    /// Effective per-run turn ceiling retained for terminal evidence.
+    turn_limit: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1408,6 +1420,16 @@ impl DelegationManager {
                         Some("cancellation".to_owned()),
                         Some("worker was interrupted by the owner".to_owned()),
                     ),
+                    DelegatedAgentStatus::LimitReached {
+                        turn_count,
+                        turn_limit,
+                        ..
+                    } => (
+                        Some("limit".to_owned()),
+                        Some(format!(
+                            "worker exhausted its turn budget ({turn_count}/{turn_limit} turns)"
+                        )),
+                    ),
                     DelegatedAgentStatus::Shutdown => (
                         Some("cancellation".to_owned()),
                         Some("worker was shut down by its owning run".to_owned()),
@@ -1430,6 +1452,7 @@ impl DelegationManager {
                             DelegatedAgentStatus::Pending => "queued",
                             DelegatedAgentStatus::Running => "thinking",
                             DelegatedAgentStatus::Completed { .. } => "completed",
+                            DelegatedAgentStatus::LimitReached { .. } => "limit_reached",
                             DelegatedAgentStatus::Interrupted => "interrupted",
                             DelegatedAgentStatus::Failed { .. } => "failed",
                             DelegatedAgentStatus::TimedOut => "timed_out",
@@ -1935,6 +1958,10 @@ impl DelegationManager {
                 let _ = self.remove_team_file_if_exists(&session_path);
                 return Err(message);
             }
+            let turn_limit = extension_policy
+                .as_ref()
+                .and_then(|policy| policy.max_turns)
+                .or(self.template.max_turns);
             state.records.insert(
                 identity.id.clone(),
                 AgentRecord {
@@ -1981,6 +2008,7 @@ impl DelegationManager {
                         && self.template.model.spec.pricing.is_some())
                     .then_some(0),
                     deadline_at_ms,
+                    turn_limit,
                 },
             );
             state.total_agents += 1;
@@ -1988,6 +2016,10 @@ impl DelegationManager {
         };
 
         let result_policy = extension_policy.clone();
+        let result_turn_limit = result_policy
+            .as_ref()
+            .and_then(|policy| policy.max_turns)
+            .or(self.template.max_turns);
         let manager = Arc::clone(self);
         let worker_identity = identity.clone();
         tokio::spawn(async move {
@@ -2026,6 +2058,7 @@ impl DelegationManager {
             "created_at_ms": created_at_ms,
             "started_at_ms": Value::Null,
             "completed_at_ms": Value::Null,
+            "turn_limit": result_turn_limit,
             "deadline_at_ms": deadline_at_ms,
         }))
     }
@@ -2241,6 +2274,29 @@ impl DelegationManager {
                         self.request_shutdown_descendants(&identity.id);
                         retry_undelivered_task = false;
                         retry_pending_messages = 0;
+                    }
+                    WorkerOutcome::LimitReached {
+                        output,
+                        turn_count,
+                        turn_limit,
+                    } => {
+                        self.set_status(
+                            &identity.id,
+                            DelegatedAgentStatus::LimitReached {
+                                output: bounded_text(&output),
+                                turn_count,
+                                turn_limit,
+                            },
+                            true,
+                        );
+                        self.request_shutdown_descendants(&identity.id);
+                        queued_tasks
+                            .extend(deferred_follow_ups.into_iter().map(QueuedTask::FollowUp));
+                        // A max-turn run is a durable terminal completion, not
+                        // a retryable task failure. Follow-ups may explicitly
+                        // resume the same child session.
+                        retry_undelivered_task = task_restored;
+                        retry_pending_messages = retained_pending_messages;
                     }
                     WorkerOutcome::Failed(error) => {
                         self.set_status(
@@ -2613,6 +2669,10 @@ impl DelegationManager {
         let mut requested_shutdown = false;
         let mut requested_timeout = false;
         let mut requested_token_limit = false;
+        let turn_limit = extension_policy
+            .and_then(|policy| policy.max_turns)
+            .or(self.template.max_turns);
+        let mut turns_completed = 0_u64;
         let mut commands_open = true;
         enum Next {
             Event(Option<AgentEvent>),
@@ -2754,6 +2814,7 @@ impl DelegationManager {
                     ..
                 })) => {
                     self.update_agent_usage(&identity.id, usage, session_cost_microdollars, true);
+                    turns_completed = turns_completed.saturating_add(1);
                     if extension_policy.is_some_and(|policy| {
                         policy
                             .max_tokens
@@ -2788,9 +2849,12 @@ impl DelegationManager {
                             FinishReason::Completed => WorkerOutcome::Completed(output),
                             FinishReason::Aborted => WorkerOutcome::Interrupted,
                             FinishReason::Failed(error) => WorkerOutcome::Failed(error.to_string()),
-                            FinishReason::MaxTurns => {
-                                WorkerOutcome::Failed("maximum delegated turns reached".into())
-                            }
+                            FinishReason::MaxTurns => WorkerOutcome::LimitReached {
+                                output,
+                                turn_count: turns_completed,
+                                turn_limit: turn_limit
+                                    .expect("MaxTurns requires a configured delegated turn limit"),
+                            },
                         }
                     };
                 }
@@ -4125,7 +4189,9 @@ fn restore_undelivered_task(
         && match outcome {
             WorkerOutcome::Shutdown | WorkerOutcome::TimedOut => false,
             WorkerOutcome::Interrupted => matches!(&task, QueuedTask::FollowUp(_)),
-            WorkerOutcome::Completed(_) | WorkerOutcome::Failed(_) => true,
+            WorkerOutcome::LimitReached { .. }
+            | WorkerOutcome::Completed(_)
+            | WorkerOutcome::Failed(_) => true,
         };
     if !should_restore {
         return false;
@@ -4154,6 +4220,13 @@ impl WorkerExecution {
 
 enum WorkerOutcome {
     Completed(String),
+    /// The run exhausted its configured per-run turn budget after producing
+    /// the bounded output collected so far.
+    LimitReached {
+        output: String,
+        turn_count: u64,
+        turn_limit: u64,
+    },
     Interrupted,
     TimedOut,
     Failed(String),
@@ -4731,6 +4804,18 @@ fn status_message(path: &str, status: &DelegatedAgentStatus) -> String {
         DelegatedAgentStatus::Completed { output } => {
             format!("{path} completed:\n{output}")
         }
+        DelegatedAgentStatus::LimitReached {
+            output,
+            turn_count,
+            turn_limit,
+        } => {
+            let output = if output.is_empty() {
+                "no final answer was produced".to_owned()
+            } else {
+                format!("partial output:\n{output}")
+            };
+            format!("{path} reached its turn limit ({turn_count}/{turn_limit} turns); {output}")
+        }
         DelegatedAgentStatus::Failed { error } => format!("{path} failed: {error}"),
         DelegatedAgentStatus::Interrupted => format!("{path} was interrupted"),
         DelegatedAgentStatus::TimedOut => format!("{path} timed out"),
@@ -4758,6 +4843,7 @@ fn agent_record_value(record: &AgentRecord) -> Value {
             DelegatedAgentStatus::Pending => "queued",
             DelegatedAgentStatus::Running => "thinking",
             DelegatedAgentStatus::Completed { .. } => "completed",
+            DelegatedAgentStatus::LimitReached { .. } => "limit_reached",
             DelegatedAgentStatus::Interrupted => "interrupted",
             DelegatedAgentStatus::Failed { .. } => "failed",
             DelegatedAgentStatus::TimedOut => "timed_out",
@@ -4780,6 +4866,7 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "started_at_ms": record.started_at_ms,
         "completed_at_ms": record.completed_at_ms,
         "turn_count": record.turn_count,
+        "turn_limit": record.turn_limit,
         "tool_call_count": record.tool_call_count,
         "phase": phase,
         "tool_name": record.active_tools.values().next_back(),
@@ -5404,6 +5491,7 @@ mod tests {
                     cost: None,
                     cost_microdollars: None,
                     deadline_at_ms: None,
+                    turn_limit: None,
                 },
             );
             state.total_agents += 1;
@@ -5809,11 +5897,76 @@ mod tests {
                 cost: None,
                 cost_microdollars: None,
                 deadline_at_ms: None,
+                turn_limit: None,
             },
         );
         state.total_agents += 1;
         drop(state);
         (identity, command_rx)
+    }
+
+    #[test]
+    fn limit_reached_status_preserves_output_budget_and_parent_delivery() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = writable_manager(directory.path());
+        let (child, _command_rx) = insert_test_record(&manager, DelegatedAgentStatus::Running);
+        {
+            let mut state = manager.state.lock().unwrap();
+            let record = state.records.get_mut(&child.id).unwrap();
+            record.turn_count = 2;
+            record.turn_limit = Some(2);
+        }
+
+        assert!(manager.set_status(
+            &child.id,
+            DelegatedAgentStatus::LimitReached {
+                output: "partial answer".into(),
+                turn_count: 2,
+                turn_limit: 2,
+            },
+            true,
+        ));
+
+        let state = manager.state.lock().unwrap();
+        let record = &state.records[&child.id];
+        assert!(matches!(
+            &record.status,
+            DelegatedAgentStatus::LimitReached {
+                output,
+                turn_count: 2,
+                turn_limit: 2,
+            } if output == "partial answer"
+        ));
+        assert!(record.completed_at_ms.is_some());
+        assert_eq!(state.root_mailbox.len(), 1);
+        assert_eq!(
+            state.root_mailbox[0].message,
+            "/root/child reached its turn limit (2/2 turns); partial output:\npartial answer"
+        );
+        let listed = agent_record_value(record);
+        assert_eq!(listed["phase"], "limit_reached");
+        assert_eq!(listed["turn_count"], 2);
+        assert_eq!(listed["turn_limit"], 2);
+        assert_eq!(listed["status"]["state"], "limit_reached");
+        assert_eq!(listed["status"]["output"], "partial answer");
+        assert_eq!(listed["status"]["turn_count"], 2);
+        assert_eq!(listed["status"]["turn_limit"], 2);
+    }
+
+    #[test]
+    fn limit_reached_without_output_explains_terminal_delivery() {
+        let message = status_message(
+            "/root/child",
+            &DelegatedAgentStatus::LimitReached {
+                output: String::new(),
+                turn_count: 1,
+                turn_limit: 1,
+            },
+        );
+        assert_eq!(
+            message,
+            "/root/child reached its turn limit (1/1 turns); no final answer was produced"
+        );
     }
 
     #[test]
@@ -5979,6 +6132,7 @@ mod tests {
         let result = service.spawn("root-owner", request).unwrap();
 
         assert_eq!(result["policy"]["max_turns"], 4);
+        assert_eq!(result["turn_limit"], 4);
         assert_eq!(result["policy"]["max_tokens"], 48_000);
         assert_eq!(result["policy"]["max_cost_microdollars"], 125_000);
         binding.request_shutdown();
@@ -7236,6 +7390,7 @@ mod tests {
                     cost: None,
                     cost_microdollars: None,
                     deadline_at_ms: None,
+                    turn_limit: None,
                 },
             );
         }

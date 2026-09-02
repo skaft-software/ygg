@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -3810,6 +3811,148 @@ fn rendered_shell_captures(
     combined
 }
 
+fn resume_command_for_session(session: &Session, config: &crate::config::Config) -> Option<String> {
+    let id = crate::app::bootstrap::terminal_goal_session_id(session).ok()?;
+    let mut command = format!(
+        "To resume this session: ygg --resume {}",
+        posix_shell_quote(&id)
+    );
+
+    let session_dir = absolute_resume_path(&config.session_dir, &config.invocation_cwd);
+    let default_session_dir = absolute_resume_path(
+        &crate::config::default_session_dir(),
+        &config.invocation_cwd,
+    );
+    if session_dir != default_session_dir {
+        command.push_str(" --session-dir ");
+        command.push_str(&resume_scope_path(&session_dir, &config.invocation_cwd)?);
+    }
+    if config.workspace != config.invocation_cwd {
+        command.push_str(" --workspace ");
+        command.push_str(&resume_scope_path(
+            &config.workspace,
+            &config.invocation_cwd,
+        )?);
+    }
+    Some(command)
+}
+
+/// Quote one argument for interpretation by a POSIX shell.
+///
+/// Single quotes preserve every character except an embedded single quote. At
+/// each embedded quote, close the quoted section, emit the quote through an
+/// unquoted backslash escape, and reopen the quoted section.
+fn posix_shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn absolute_resume_path(path: &Path, cwd: &Path) -> PathBuf {
+    let path = if path.is_absolute() {
+        path.to_owned()
+    } else {
+        cwd.join(path)
+    };
+    let mut absolute = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => absolute.push(prefix.as_os_str()),
+            Component::RootDir => absolute.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                absolute.pop();
+            }
+            Component::Normal(component) => absolute.push(component),
+        }
+    }
+    absolute
+}
+
+fn resume_scope_path(path: &Path, cwd: &Path) -> Option<String> {
+    // Keep private absolute paths out of the notice. Resolve parent components
+    // inside the user's shell before passing the path to SessionStore, which
+    // deliberately rejects traversal components.
+    let relative = relative_resume_path(cwd, path)?;
+    let mut parents = Vec::new();
+    let mut suffix = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir if suffix.as_os_str().is_empty() => parents.push(".."),
+            Component::Normal(component) => suffix.push(component),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+
+    let base = if parents.is_empty() {
+        "\"$(pwd -P)/\"".to_owned()
+    } else {
+        let parents = parents.join("/");
+        format!("\"$(cd \"$(pwd -P)/{parents}\" && pwd -P)/\"")
+    };
+    let suffix = suffix.to_str()?;
+    if suffix.is_empty() {
+        return Some(base);
+    }
+    let suffix = suffix.replace('\'', "'\\''");
+    Some(format!("{base}'{suffix}'"))
+}
+
+fn relative_resume_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    let from = absolute_resume_path(from, from);
+    let to = absolute_resume_path(to, from.as_path());
+    let from = from.components().collect::<Vec<_>>();
+    let to = to.components().collect::<Vec<_>>();
+    let common = from
+        .iter()
+        .zip(to.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+
+    let mut relative = PathBuf::new();
+    for component in &from[common..] {
+        match component {
+            Component::Normal(_) => relative.push(".."),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    for component in &to[common..] {
+        match component {
+            Component::Normal(component) => relative.push(component),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        relative.push(".");
+    }
+    Some(relative)
+}
+
+fn print_resume_command(command: Option<&str>) {
+    // A coordinated signal is still a forced termination for the courtesy-line
+    // contract. The signal owner will apply the conventional exit status after
+    // frontend cleanup, so do not add output to that path.
+    if crate::tui::terminal::received_shutdown_signal().is_none() {
+        if let Some(command) = command {
+            crate::output::stdout_line(command);
+        }
+    }
+}
+
 async fn shutdown_for_exit(app: &mut App) {
     if crate::tui::terminal::received_shutdown_signal().is_some() {
         ygg_agent::extension_process::terminate_bash_process_groups(Duration::from_millis(400))
@@ -3870,7 +4013,7 @@ async fn run_interactive_without_model(
     launch: crate::app::bootstrap::LaunchSelection,
     shell: &mut InteractiveShell,
     input: &mut EventStream,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let mut boot = boot;
     let workspace = boot.config.workspace.clone();
     let mut prepared = boot.take_prepared_session();
@@ -3880,6 +4023,7 @@ async fn run_interactive_without_model(
     })
     .await?;
 
+    let resume_command = resume_command_for_session(&session, &boot.config);
     shell.set_identity("", "", "");
     shell.set_status_detail("no configured model · read-only session".to_owned());
     shell.set_workspace(workspace.clone());
@@ -3908,7 +4052,7 @@ async fn run_interactive_without_model(
         )
         .await?
         {
-            Idle::Quit => return Ok(()),
+            Idle::Quit => return Ok(resume_command),
             Idle::CycleThinking => {
                 shell.notice("thinking is unavailable until a model is configured");
                 shell.render();
@@ -3922,7 +4066,7 @@ async fn run_interactive_without_model(
                 shell.render();
             }
             Idle::Command(raw) => match commands::parse(&raw) {
-                Command::Quit => return Ok(()),
+                Command::Quit => return Ok(resume_command),
                 Command::Help(topic) => {
                     shell.show_overlay_text(commands::help_text(&workspace, topic.as_deref()));
                     shell.render();
@@ -4050,7 +4194,13 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     if boot.is_modeless() {
         let result = run_interactive_without_model(boot, launch, &mut shell, &mut input).await;
         shell.leave();
-        return result;
+        return match result {
+            Ok(resume_command) => {
+                print_resume_command(resume_command.as_deref());
+                Ok(())
+            }
+            Err(error) => Err(error),
+        };
     }
     let mut app = run_blocking_lifecycle(
         &mut shell,
@@ -4638,7 +4788,9 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             }
         }
     }
+    let resume_command = resume_command_for_session(app.agent.session(), &app.config);
     shell.leave();
+    print_resume_command(resume_command.as_deref());
     Ok(())
 }
 
@@ -4649,6 +4801,25 @@ mod tests {
 
     fn test_theme() -> crate::tui::theme::YggTheme {
         crate::tui::theme::test_theme()
+    }
+
+    #[test]
+    fn posix_shell_quote_round_trips_shell_sensitive_selector() {
+        let selector = "resume id;$(printf pwned);'\"$HOME\" * 雪";
+        let script = format!("set -- {}; printf '%s' \"$1\"", posix_shell_quote(selector));
+        let output = std::process::Command::new("sh")
+            .args(["-c", &script, "resume-test"])
+            .env_clear()
+            .env("HOME", "should-not-expand")
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run POSIX shell");
+        assert!(
+            output.status.success(),
+            "POSIX shell rejected quoted selector: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, selector.as_bytes());
     }
 
     #[test]

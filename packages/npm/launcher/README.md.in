@@ -1,0 +1,18 @@
+# Ygg npm launcher
+
+`@skaft-software/ygg` is a small, shell-only launcher for the native Ygg
+runtime. npm selects one exact-version platform package through
+`optionalDependencies`; the normal `ygg` and `ygg-host` paths immediately `exec`
+the selected native binary.
+
+The launcher does not run Node, access the network, download an archive, or
+execute an install lifecycle hook. Install it with scripts, audit, and funding
+requests disabled:
+
+```sh
+npm install --global --ignore-scripts --no-audit --no-fund @skaft-software/ygg@VERSION
+```
+
+GNU/Linux uses the glibc x64 package. macOS uses the arm64 or x64 package that
+matches the running executable. `ygg doctor` reports a missing `rg`
+prerequisite.

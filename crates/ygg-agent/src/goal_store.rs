@@ -716,9 +716,27 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
+
+    #[cfg(unix)]
+    fn wait_for_marker(path: &Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if path.is_file() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     fn assert_waits_for_other_handle<F>(root: &Path, operation: F)
     where
@@ -1086,5 +1104,93 @@ mod tests {
             state.status,
             GoalStatus::Complete | GoalStatus::Blocked
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn independent_processes_respect_goal_store_lock() {
+        const CHILD_ENV: &str = "YGG_GOAL_STORE_PROCESS_CHILD";
+        const ROOT_ENV: &str = "YGG_GOAL_STORE_PROCESS_ROOT";
+        const READY_ENV: &str = "YGG_GOAL_STORE_PROCESS_READY";
+        const START_ENV: &str = "YGG_GOAL_STORE_PROCESS_START";
+        const DONE_ENV: &str = "YGG_GOAL_STORE_PROCESS_DONE";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("missing child root"));
+            let ready = PathBuf::from(std::env::var_os(READY_ENV).expect("missing ready marker"));
+            let start = PathBuf::from(std::env::var_os(START_ENV).expect("missing start marker"));
+            let done = PathBuf::from(std::env::var_os(DONE_ENV).expect("missing done marker"));
+            let store = DurableGoalStore::open(&root).unwrap();
+
+            std::fs::write(&ready, b"opened").unwrap();
+            assert!(
+                wait_for_marker(&start, Duration::from_secs(5)),
+                "parent did not start the child transaction"
+            );
+            let state = store.record_turn("session").unwrap();
+            std::fs::write(
+                &done,
+                format!(
+                    "turns_used={} revision={}",
+                    state.turns_used, state.revision
+                ),
+            )
+            .unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let store = DurableGoalStore::open(root).unwrap();
+        store
+            .set("session", "record a process-boundary turn", Some(2))
+            .unwrap();
+
+        let ready = root.join(".child-ready");
+        let start = root.join(".child-start");
+        let done = root.join(".child-done");
+        let held = store.lock().unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "goal_store::tests::independent_processes_respect_goal_store_lock",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(ROOT_ENV, root.as_os_str())
+            .env(READY_ENV, ready.as_os_str())
+            .env(START_ENV, start.as_os_str())
+            .env(DONE_ENV, done.as_os_str())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let child_ready = wait_for_marker(&ready, Duration::from_secs(5));
+        std::fs::write(&start, b"start").unwrap();
+        let child_completed_while_locked =
+            child_ready && wait_for_marker(&done, Duration::from_millis(250));
+        drop(held);
+
+        let output = child.wait_with_output().unwrap();
+        let child_stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            child_ready,
+            "child did not reach the transaction boundary; stderr:\n{child_stderr}"
+        );
+        assert!(
+            !child_completed_while_locked,
+            "child completed while the parent held the goal-store lock"
+        );
+        assert!(
+            output.status.success(),
+            "child process failed; stderr:\n{child_stderr}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&done).unwrap(),
+            "turns_used=1 revision=2"
+        );
+        let state = store.get("session").unwrap().unwrap();
+        assert_eq!(state.turns_used, 1);
+        assert_eq!(state.revision, 2);
     }
 }

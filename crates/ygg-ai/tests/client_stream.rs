@@ -340,6 +340,7 @@ enum WebSocketBehavior {
     ConnectionLimit,
     RejectHandshake,
     Stall,
+    StallWithPongs,
 }
 
 struct TestResponsesServer {
@@ -441,7 +442,39 @@ async fn handle_test_responses_connection(
         match behavior {
             WebSocketBehavior::CloseBeforeEvents => return Ok(()),
             WebSocketBehavior::Stall => {
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::json!({
+                            "type": "response.created",
+                            "response": {"id": "resp-stall"}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                return Ok(());
+            }
+            WebSocketBehavior::StallWithPongs => {
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::json!({
+                            "type": "response.created",
+                            "response": {"id": "resp-stall"}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await?;
+                while let Some(message) = socket.next().await {
+                    match message? {
+                        WebSocketMessage::Ping(payload) => {
+                            socket.send(WebSocketMessage::Pong(payload)).await?;
+                        }
+                        WebSocketMessage::Close(_) => return Ok(()),
+                        _ => {}
+                    }
+                }
                 return Ok(());
             }
             WebSocketBehavior::Complete
@@ -621,11 +654,16 @@ async fn responses_websocket_connection_limit_retires_socket_and_falls_back() {
         .await
         .expect("provider connection limit must be surfaced")
         .expect_err("connection limit is a provider error, not a successful response");
+    let AiError::StreamFailure { inner, progress } = &error else {
+        panic!("expected annotated stream failure, got {error:?}");
+    };
     assert!(matches!(
-        error,
+        inner.as_ref(),
         AiError::Provider(provider)
             if provider.code.as_deref() == Some("websocket_connection_limit_reached")
     ));
+    assert!(progress.first_body_seen);
+    assert!(progress.last_event_ms.is_some());
     assert!(stream.next().await.is_none());
 
     // Retirement is authoritative before the provider error is published, so
@@ -700,11 +738,16 @@ async fn responses_websocket_failure_after_send_is_terminal() {
         .await
         .expect("post-send socket failure must be surfaced")
         .expect_err("post-send socket failure must not replay over HTTP");
+    let AiError::StreamFailure { inner, progress } = &error else {
+        panic!("expected annotated stream failure, got {error:?}");
+    };
     assert!(matches!(
-        error,
-        AiError::Transport(ref transport)
+        inner.as_ref(),
+        AiError::Transport(transport)
             if transport.phase == ygg_ai::TransportPhase::Body && !transport.timeout
     ));
+    assert!(!progress.first_body_seen);
+    assert_eq!(progress.last_event_ms, None);
     assert!(stream.next().await.is_none());
     let requests = server.requests().await;
     assert_eq!(requests.len(), 1);
@@ -712,32 +755,160 @@ async fn responses_websocket_failure_after_send_is_terminal() {
 }
 
 #[tokio::test]
-async fn responses_websocket_idle_timeout_after_send_is_terminal() {
+async fn responses_websocket_heartbeat_timeout_after_created_is_terminal() {
     let server =
         TestResponsesServer::start(WebSocketBehavior::Stall, fallback_responses_body()).await;
     let model = websocket_test_model(&server.base_url);
     let mut stream = AiClient::new()
-        .with_stream_timeouts(Duration::from_millis(10), Duration::from_millis(200))
+        .with_stream_timeouts(Duration::from_millis(100), Duration::from_millis(500))
         .stream(
             &model,
             responses_request(vec![user_message("timeout")], Some("session-timeout")),
         )
         .await
         .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Started { .. }))
+    ));
     let error = stream
         .next()
         .await
-        .expect("post-send idle timeout must be surfaced")
-        .expect_err("post-send idle timeout must not replay over HTTP");
+        .expect("post-send heartbeat timeout must be surfaced")
+        .expect_err("post-send heartbeat timeout must not replay over HTTP");
+    let AiError::StreamFailure { inner, progress } = &error else {
+        panic!("expected annotated stream failure, got {error:?}");
+    };
     assert!(matches!(
-        error,
-        AiError::Transport(ref transport)
+        inner.as_ref(),
+        AiError::Transport(transport)
             if transport.phase == ygg_ai::TransportPhase::Body && transport.timeout
     ));
+    assert!(progress.first_body_seen);
+    assert!(progress.last_event_ms.is_some());
     assert!(stream.next().await.is_none());
     let requests = server.requests().await;
     assert_eq!(requests.len(), 1);
     assert!(requests[0].get("transport").is_none());
+}
+
+#[tokio::test]
+async fn responses_websocket_heartbeat_failure_is_terminal_and_next_request_falls_back() {
+    let server =
+        TestResponsesServer::start(WebSocketBehavior::Stall, fallback_responses_body()).await;
+    let model = websocket_test_model(&server.base_url);
+    let client =
+        AiClient::new().with_stream_timeouts(Duration::from_millis(400), Duration::from_secs(1));
+    let mut stream = client
+        .stream(
+            &model,
+            responses_request(vec![user_message("half-open")], Some("session-heartbeat")),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Started { .. }))
+    ));
+
+    // The heartbeat interval and acknowledgement deadline are each one quarter
+    // of the response-idle bound. A peer that accepts `response.create` but
+    // never reads the Ping must fail before the ordinary 400 ms idle timeout.
+    let error = tokio::time::timeout(Duration::from_millis(350), stream.next())
+        .await
+        .expect("half-open WebSocket must fail before the response-idle timeout")
+        .expect("half-open WebSocket must report an error")
+        .expect_err("post-send heartbeat failure must not replay over HTTP");
+    let AiError::StreamFailure { inner, progress } = &error else {
+        panic!("expected annotated stream failure, got {error:?}");
+    };
+    let AiError::Transport(transport) = inner.as_ref() else {
+        panic!("expected transport failure, got {inner:?}");
+    };
+    assert_eq!(transport.phase, ygg_ai::TransportPhase::Body);
+    assert!(transport.timeout);
+    assert!(transport.message.contains("heartbeat"), "{transport:?}");
+    assert_eq!(progress.provider_events, 1);
+    assert_eq!(progress.decoded_events, 1);
+    assert_eq!(progress.content_bytes, 0);
+    assert_eq!(progress.buffered_bytes, 0);
+    assert!(progress.first_body_seen);
+    let last_event_ms = progress.last_event_ms.expect("response.created timing");
+    assert!(last_event_ms <= progress.elapsed_ms);
+    assert!(stream.next().await.is_none());
+
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 1, "heartbeat failure must not auto-replay");
+    assert!(requests[0].get("transport").is_none());
+
+    // The actor disables the failed pooled session before publishing the error,
+    // so a caller-owned explicit next request can safely use HTTP/SSE.
+    let mut fallback = client
+        .stream(
+            &model,
+            responses_request(
+                vec![user_message("retry explicitly")],
+                Some("session-heartbeat"),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(event) = fallback.next().await {
+        match event.unwrap() {
+            StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            StreamEvent::Finished(_) => break,
+            _ => {}
+        }
+    }
+    assert_eq!(text, "http");
+    let requests = server.requests().await;
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .any(|request| request["transport"] == "http"));
+}
+
+#[tokio::test]
+async fn responses_websocket_pongs_do_not_extend_response_idle_timeout() {
+    let server =
+        TestResponsesServer::start(WebSocketBehavior::StallWithPongs, fallback_responses_body())
+            .await;
+    let model = websocket_test_model(&server.base_url);
+    let mut stream = AiClient::new()
+        .with_stream_timeouts(Duration::from_millis(500), Duration::from_secs(1))
+        .stream(
+            &model,
+            responses_request(vec![user_message("wait")], Some("session-pongs")),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        stream.next().await,
+        Some(Ok(StreamEvent::Started { .. }))
+    ));
+
+    let error = tokio::time::timeout(Duration::from_millis(800), stream.next())
+        .await
+        .expect("responsive control path must still reach response idle timeout")
+        .expect("response idle timeout must report an error")
+        .expect_err("missing provider progress must fail the stream");
+    let AiError::StreamFailure { inner, progress } = &error else {
+        panic!("expected annotated stream failure, got {error:?}");
+    };
+    let AiError::Transport(transport) = inner.as_ref() else {
+        panic!("expected transport failure, got {inner:?}");
+    };
+    assert_eq!(transport.phase, ygg_ai::TransportPhase::Body);
+    assert!(transport.timeout);
+    assert!(
+        transport.message.contains("idle beyond its timeout"),
+        "control Pongs must not reset response progress: {transport:?}"
+    );
+    assert!(progress.first_body_seen);
+    assert!(progress.last_event_ms.is_some());
+    assert!(stream.next().await.is_none());
+    assert_eq!(server.requests().await.len(), 1);
 }
 
 #[tokio::test]
@@ -1095,6 +1266,10 @@ async fn inter_chunk_idle_timeout_applies_after_a_delayed_first_body() {
                             && transport.timeout
                 ) =>
             {
+                let AiError::StreamFailure { progress, .. } = error else {
+                    panic!("expected annotated stream failure");
+                };
+                assert!(progress.last_event_ms.is_some());
                 saw_idle_timeout = true;
                 break;
             }

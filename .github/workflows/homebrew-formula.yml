@@ -1,0 +1,257 @@
+name: Homebrew formula handoff
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing canonical binary release tag to render
+        required: true
+        type: string
+      publish_tap:
+        description: Open or update the protected Homebrew tap pull request
+        required: false
+        default: false
+        type: boolean
+      tap_repository:
+        description: Authorized Homebrew tap repository
+        required: false
+        default: skaft-software/homebrew-tap
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-formula-${{ inputs.release_tag || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  COSIGN_OIDC_ISSUER: https://token.actions.githubusercontent.com
+  WORKFLOW_REPOSITORY: ${{ github.repository }}
+
+jobs:
+  prepare:
+    name: Verify metadata and render formula
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      workflow_commit: ${{ steps.resolve.outputs.workflow_commit }}
+    steps:
+      - id: resolve
+        name: Resolve the immutable binary workflow run
+        shell: bash
+        env:
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          CURRENT_REF_TYPE: ${{ github.ref_type }}
+          CURRENT_REF_NAME: ${{ github.ref_name }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          release_tag=$INPUT_RELEASE_TAG
+          if [[ "$CURRENT_REF_TYPE" != tag || "$CURRENT_REF_NAME" != "ygg-binaries-$release_tag" ]]; then
+            echo "formula renders must run from ygg-binaries-$release_tag" >&2
+            exit 1
+          fi
+          workflow_tag=$CURRENT_REF_NAME
+          workflow_commit=$CURRENT_SHA
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release tag is not a stable canonical tag: $release_tag" >&2
+            exit 1
+          fi
+          if [[ ! "$workflow_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release workflow commit is not a full lowercase SHA" >&2
+            exit 1
+          fi
+          workflow_ref="$WORKFLOW_REPOSITORY/.github/workflows/release-ygg.yml@refs/tags/$workflow_tag"
+          {
+            echo "release_tag=$release_tag"
+            echo "version=${release_tag#v}"
+            echo "workflow_commit=$workflow_commit"
+            echo "workflow_ref=$workflow_ref"
+          } >> "$GITHUB_OUTPUT"
+      - name: Check out the exact release workflow tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
+        with:
+          cosign-release: v3.1.3
+      - name: Download and verify the signed immutable release handoff
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+          WORKFLOW_COMMIT: ${{ steps.resolve.outputs.workflow_commit }}
+          WORKFLOW_REF: ${{ steps.resolve.outputs.workflow_ref }}
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" \
+            --dir release-assets \
+            --clobber \
+            --pattern 'install-ygg.sh' \
+            --pattern 'install-ygg.sh.sigstore.json' \
+            --pattern 'ygg-*.tar.gz' \
+            --pattern 'ygg-*.tar.gz.sigstore.json' \
+            --pattern 'YGG_SHA256SUMS' \
+            --pattern 'YGG_SHA256SUMS.sigstore.json' \
+            --pattern 'YGG_RELEASE_METADATA.json' \
+            --pattern 'YGG_RELEASE_METADATA.json.sigstore.json'
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          cd release-assets
+          sha256sum --check YGG_SHA256SUMS
+          verify=(
+            --certificate-identity "https://github.com/$WORKFLOW_REF"
+            --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER"
+            --certificate-github-workflow-name "Ygg binary release"
+            --certificate-github-workflow-repository "$WORKFLOW_REPOSITORY"
+            --certificate-github-workflow-sha "$WORKFLOW_COMMIT"
+          )
+          for artifact in ./*.tar.gz ./install-ygg.sh ./YGG_SHA256SUMS ./YGG_RELEASE_METADATA.json; do
+            cosign verify-blob \
+              --bundle "${artifact}.sigstore.json" \
+              "${verify[@]}" \
+              "$artifact"
+          done
+          python3 ../scripts/generate-ygg-release-metadata.py \
+            "${RELEASE_TAG#v}" \
+            "$RELEASE_TAG" \
+            "$(git rev-parse "$RELEASE_TAG^{commit}")" \
+            "$WORKFLOW_COMMIT" \
+            "$WORKFLOW_REF" \
+            "$WORKFLOW_REPOSITORY" \
+            YGG_SHA256SUMS \
+            "$RUNNER_TEMP/recomputed-release-metadata.json"
+          cmp YGG_RELEASE_METADATA.json "$RUNNER_TEMP/recomputed-release-metadata.json"
+      - name: Render and validate Homebrew formula offline
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.resolve.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-homebrew-formula.py \
+            release-assets/YGG_RELEASE_METADATA.json \
+            --assets-dir release-assets \
+            --output "$RUNNER_TEMP/ygg.rb"
+          scripts/test-homebrew-formula.sh
+          ruby -c "$RUNNER_TEMP/ygg.rb"
+          test "$(grep -c '^class Ygg < Formula$' "$RUNNER_TEMP/ygg.rb")" = 1
+          grep -F "# Release tag: $RELEASE_TAG" "$RUNNER_TEMP/ygg.rb"
+          grep -F 'depends_on :macos' "$RUNNER_TEMP/ygg.rb"
+          grep -F 'depends_on "ripgrep"' "$RUNNER_TEMP/ygg.rb"
+          if rg -n 'Cargo\.toml|api\.github\.com|releases/latest' "$RUNNER_TEMP/ygg.rb" scripts/generate-homebrew-formula.py; then
+            echo "Homebrew handoff contains a mutable release source" >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/ygg.rb" homebrew-ygg.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: homebrew-formula
+          path: homebrew-ygg.rb
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-tap:
+    name: Open protected Homebrew tap pull request
+    needs: prepare
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_tap == true
+    runs-on: ubuntu-24.04
+    environment: stable-release-homebrew
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: homebrew-formula
+          path: formula-artifact
+      - name: Validate the configured tap before providing its token
+        shell: bash
+        env:
+          TAP_REPOSITORY: ${{ inputs.tap_repository }}
+        run: |
+          set -euo pipefail
+          test "$TAP_REPOSITORY" = "skaft-software/homebrew-tap" || {
+            echo "tap_repository is not the authorized Ygg tap" >&2
+            exit 1
+          }
+      - name: Check out the authorized tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: ${{ inputs.tap_repository }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+          persist-credentials: false
+      - name: Validate tap identity and create a review branch
+        shell: bash
+        env:
+          TAP_REPOSITORY: ${{ inputs.tap_repository }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RUN_ID: ${{ github.run_id }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$TAP_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || {
+            echo "tap_repository must be an owner/name pair" >&2
+            exit 1
+          }
+          test -f formula-artifact/homebrew-ygg.rb
+          test ! -L formula-artifact/homebrew-ygg.rb
+          ruby -c formula-artifact/homebrew-ygg.rb
+          cd tap
+          test "$(git config --get remote.origin.url)" != ""
+          formula_path=Formula/ygg.rb
+          if [[ -L Formula || ( -e Formula && ! -d Formula ) ]]; then
+            echo "tap Formula path must be a real directory" >&2
+            exit 1
+          fi
+          mkdir -p Formula
+          if [[ ! -d Formula || -L Formula ]]; then
+            echo "tap Formula path must be a real directory" >&2
+            exit 1
+          fi
+          if [[ -L "$formula_path" ]]; then
+            echo "tap formula path must not be a symlink" >&2
+            exit 1
+          fi
+          branch="ygg/v$VERSION"
+          if [[ ! "$branch" =~ ^ygg/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "computed tap branch is malformed" >&2
+            exit 1
+          fi
+          git config user.name "ygg-release[bot]"
+          git config user.email "ygg-release[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+            git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            git switch -c "$branch" --track "origin/$branch"
+          else
+            git switch -c "$branch"
+          fi
+          if [[ -L "$formula_path" ]]; then
+            echo "tap formula path must not be a symlink" >&2
+            exit 1
+          fi
+          # Copy only after selecting the review branch so reruns can update it
+          # without switching over uncommitted formula content.
+          cp ../formula-artifact/homebrew-ygg.rb "$formula_path"
+          if git diff --quiet -- Formula/ygg.rb; then
+            echo "tap already contains the exact formula"
+            exit 0
+          fi
+          git add -- Formula/ygg.rb
+          git commit -m "Update Ygg formula to $RELEASE_TAG"
+          : "${HOMEBREW_TAP_TOKEN:?HOMEBREW_TAP_TOKEN is required}"
+          # checkout intentionally leaves the fetch remote unauthenticated;
+          # provide the scoped tap credential only for this push.
+          git remote set-url --push origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/${TAP_REPOSITORY}.git"
+          git push --set-upstream origin "$branch"
+          git remote set-url --push origin "https://github.com/${TAP_REPOSITORY}.git"
+          GH_TOKEN="$HOMEBREW_TAP_TOKEN" \
+            gh pr create \
+            --repo "$TAP_REPOSITORY" \
+            --base main \
+            --head "$branch" \
+            --title "Update Ygg to $RELEASE_TAG" \
+            --body "Generated from the signed immutable Ygg release metadata for $RELEASE_TAG (workflow run $RUN_ID)."

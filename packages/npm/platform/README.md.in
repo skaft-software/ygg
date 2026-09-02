@@ -1,0 +1,14 @@
+# Ygg native runtime for __TARGET__
+
+This package contains the exact-version native `ygg` and `ygg-host` binaries
+for **__TARGET__**, together with Ygg's packaged `README.md`, `docs/`,
+`examples/`, and `sdk/` resources under `share/ygg/`.
+
+It is an implementation package selected by `@skaft-software/ygg`. Install the
+public launcher rather than selecting a platform package by hand. This package
+has no dependencies or lifecycle scripts and its binaries never resolve or
+download another package at runtime:
+
+```sh
+npm install --global --ignore-scripts --no-audit --no-fund @skaft-software/ygg@VERSION
+```

@@ -4,7 +4,7 @@ use crate::error::{AiError, DecodeError, Diagnostic, StreamProtocolError};
 use crate::pricing::Pricing;
 use crate::types::{
     AssistantMessage, AssistantPart, Media, ModelId, Protocol, ReasoningPart, ReasoningState,
-    Response, StopReason, ToolCall, ToolCallId, Usage,
+    Response, StopReason, ToolCall, ToolCallId, ToolDef, Usage,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -146,6 +146,12 @@ pub(crate) struct ResponseBuilder {
     pub(crate) model: ModelId,
     pub(crate) protocol: Protocol,
     pub(crate) pricing: Option<Pricing>,
+    /// The request's exact tool-definition snapshot. `None` is reserved for
+    /// direct schema-less codec fixtures; production assembly sets `Some`, even
+    /// when the request has no tools, so known response tools are validated
+    /// against the exact snapshot while unknown names remain available for
+    /// the agent's bounded unknown-tool recovery path.
+    pub(crate) tool_definitions: Option<Vec<ToolDef>>,
     pub(crate) response_id: Option<String>,
     /// Authoritative terminal OpenAI Responses output, if supplied.
     pub(crate) responses_output: Option<crate::responses::ResponsesOutput>,
@@ -213,6 +219,7 @@ impl ResponseBuilder {
             model,
             protocol,
             pricing,
+            tool_definitions: None,
             response_id: None,
             responses_output: None,
             text_buffers: HashMap::with_capacity(4),
@@ -241,6 +248,14 @@ impl ResponseBuilder {
             next_canonical_index: 0,
             started: false,
         }
+    }
+
+    /// Installs the exact request tool-definition snapshot used to validate
+    /// assembled calls. A failed schema check leaves the builder unchanged.
+    pub(crate) fn set_tool_definitions(&mut self, definitions: &[ToolDef]) -> Result<(), AiError> {
+        crate::json_repair::validate_tool_definitions(definitions).map_err(AiError::Decode)?;
+        self.tool_definitions = Some(definitions.to_vec());
+        Ok(())
     }
 
     /// Records a diagnostic from lossy translation.
@@ -495,6 +510,7 @@ impl ResponseBuilder {
     /// counters when strict normalization fails.
     fn normalize_tool_arguments(&mut self) -> Result<(), AiError> {
         let output_truncated = matches!(self.stop_reason, Some(StopReason::MaxTokens));
+        let tool_definitions = self.tool_definitions.as_deref();
         let mut discarded_truncated_arguments = false;
         for builder in self.tool_call_builders.values_mut() {
             let raw_arguments = if builder.arguments_json.trim().is_empty() {
@@ -502,13 +518,29 @@ impl ResponseBuilder {
             } else {
                 &builder.arguments_json
             };
-            match crate::json_repair::normalize_json_object(raw_arguments) {
-                Ok(arguments_json) => builder.arguments_json = arguments_json,
+            let discarded = match crate::json_repair::normalize_json_object(raw_arguments) {
+                Ok(arguments_json) => {
+                    builder.arguments_json = arguments_json;
+                    false
+                }
                 Err(_) if output_truncated => {
                     builder.arguments_json = "{}".to_owned();
                     discarded_truncated_arguments = true;
+                    true
                 }
                 Err(error) => return Err(AiError::Decode(error)),
+            };
+            if !discarded {
+                if let Some(definitions) = tool_definitions {
+                    let arguments = serde_json::from_str(&builder.arguments_json)
+                        .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+                    crate::json_repair::validate_tool_arguments(
+                        &builder.name,
+                        &arguments,
+                        definitions,
+                    )
+                    .map_err(AiError::Decode)?;
+                }
             }
         }
         if discarded_truncated_arguments {

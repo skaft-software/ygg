@@ -24,6 +24,9 @@ pub struct StreamProgress {
     pub first_body_seen: bool,
     /// Elapsed milliseconds from stream start until the failure.
     pub elapsed_ms: u64,
+    /// Elapsed milliseconds from stream start until the last provider event.
+    /// `None` means the stream failed before any provider event arrived.
+    pub last_event_ms: Option<u64>,
 }
 
 /// Main error type for all ygg-ai operations.
@@ -249,6 +252,17 @@ pub enum ConfigError {
     /// Environment variable not set.
     #[error("Missing environment variable: {0}")]
     MissingEnv(String),
+    /// Environment variable contained a value that is not valid Unicode.
+    #[error("Invalid environment variable: {0}")]
+    InvalidEnv(String),
+    /// Environment variable value exceeded the accepted byte limit.
+    #[error("Environment variable {var} exceeds the {max_bytes}-byte limit")]
+    EnvironmentValueTooLarge {
+        /// Name of the environment variable.
+        var: String,
+        /// Maximum accepted value size in bytes.
+        max_bytes: usize,
+    },
     /// Credential resolver is missing for dynamic auth.
     #[error("Missing credential resolver: {0}")]
     MissingCredentialResolver(String),
@@ -292,6 +306,14 @@ pub enum AuthError {
     /// An environment-backed credential was not available.
     #[error("Credential environment variable is missing: {0}")]
     MissingEnvironment(String),
+    /// An environment-backed credential exceeded the accepted byte limit.
+    #[error("Credential environment variable {var} exceeds the {max_bytes}-byte limit")]
+    EnvironmentValueTooLarge {
+        /// Name of the environment variable.
+        var: String,
+        /// Maximum accepted value size in bytes.
+        max_bytes: usize,
+    },
     /// A credential could not be represented as an HTTP header value.
     #[error("Credential contains invalid HTTP header bytes")]
     InvalidHeaderValue,
@@ -412,6 +434,29 @@ mod tests {
     }
 
     #[test]
+    fn test_environment_limit_errors_do_not_expose_values() {
+        let sample = "oversized-secret-value";
+        let config = ConfigError::EnvironmentValueTooLarge {
+            var: "YGG_API_KEY".to_owned(),
+            max_bytes: 4096,
+        };
+        let auth = AuthError::EnvironmentValueTooLarge {
+            var: "YGG_API_KEY".to_owned(),
+            max_bytes: 4096,
+        };
+        assert_eq!(
+            config.to_string(),
+            "Environment variable YGG_API_KEY exceeds the 4096-byte limit"
+        );
+        assert_eq!(
+            auth.to_string(),
+            "Credential environment variable YGG_API_KEY exceeds the 4096-byte limit"
+        );
+        assert!(!config.to_string().contains(sample));
+        assert!(!auth.to_string().contains(sample));
+    }
+
+    #[test]
     fn test_transport_error_preserves_phase() {
         let err = AiError::Transport(TransportError {
             phase: TransportPhase::ResponseHeaders,
@@ -496,6 +541,7 @@ mod tests {
                 buffered_bytes: 96,
                 first_body_seen: true,
                 elapsed_ms: 97321,
+                last_event_ms: Some(97_000),
             },
         };
         // Display delegates to the inner error so existing log lines stay
@@ -515,6 +561,7 @@ mod tests {
             buffered_bytes: 4,
             first_body_seen: true,
             elapsed_ms: 1200,
+            last_event_ms: Some(1_100),
         };
         let json = serde_json::to_string(&progress).unwrap();
         let back: StreamProgress = serde_json::from_str(&json).unwrap();

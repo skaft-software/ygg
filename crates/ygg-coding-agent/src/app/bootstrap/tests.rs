@@ -419,8 +419,46 @@ fn metadata_sparse_multimodal_model_ids_get_a_vision_fallback() {
     assert!(models[0].vision);
     assert!(model_id_implies_vision("gemini-2.5-pro"));
     assert!(model_id_implies_vision("anthropic/claude-sonnet-4-6"));
+    assert!(model_id_implies_vision("deepseek-v4-flash-vision-exp"));
+    assert!(!model_id_implies_vision("deepseek-v4-flash"));
     assert!(model_id_implies_vision("Qwen/Qwen2.5-VL-7B"));
     assert!(!model_id_implies_vision("Qwen/Qwen3-Coder-30B"));
+}
+
+#[test]
+fn deepseek_v4_discovery_uses_documented_limits_when_inventory_is_sparse() {
+    let response = serde_json::json!({
+        "data": [
+            {"id": "deepseek-v4-flash"},
+            {"id": "deepseek-v4-flash-vision-exp"},
+            {"id": "deepseek-v3"}
+        ]
+    });
+    let models = api_models_from_response(&response).unwrap();
+    assert!(models
+        .iter()
+        .find(|model| model.id == "deepseek-v4-flash-vision-exp")
+        .is_some_and(|model| model.vision));
+    let limits = models
+        .iter()
+        .map(|model| (model.id.as_str(), deepseek_discovered_limits(model)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(
+        limits["deepseek-v4-flash"],
+        (
+            DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+            DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS
+        )
+    );
+    assert_eq!(
+        limits["deepseek-v4-flash-vision-exp"],
+        (
+            DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+            DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS
+        )
+    );
+    assert_eq!(limits["deepseek-v3"], (128_000, 64_000));
 }
 
 #[test]

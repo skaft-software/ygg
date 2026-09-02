@@ -1692,11 +1692,23 @@ impl<'a> TUI<'a> {
         let prev_len = previous_len;
         // Frame lines currently on screen span [visible_start, prev_len).
         let visible_start = prev_len.saturating_sub(self.inline_bottom_row + 1);
-        if reanchor_viewport || prev_len == 0 || new_lines.len() <= visible_start {
-            // Reflow, an explicit logical-timeline replacement, or a frame
-            // shrink past the on-screen region invalidates every row
-            // assumption. Repaint the visible tail from home; history above
-            // stays in scrollback at its old wrap.
+        let removed_history = !reanchor_viewport && new_lines.len() <= visible_start;
+        if removed_history {
+            // A generic frame has no semantic cursor with which to prove that
+            // rows already in native history still belong to the new frame. A
+            // shrink that removes that prefix therefore needs destructive
+            // reconciliation rather than a tail repaint.
+            let has_image = previous_frame_has_image
+                || self.previous_frame.iter().any(|line| is_image_line(line))
+                || new_lines.iter().any(|line| is_image_line(line));
+            self.reset_inline_scrollback(new_lines, rows, has_image);
+            return;
+        }
+        if reanchor_viewport || prev_len == 0 {
+            // Reflow or an explicit logical-timeline replacement invalidates
+            // every row assumption. Repaint the visible tail from home;
+            // replacement timelines intentionally leave the old session's
+            // native history reachable.
             self.begin_synchronized_output();
             let erased_has_image = frame_change_hints.map_or_else(
                 || {
@@ -3882,6 +3894,54 @@ mod tests {
         assert!(output.contains("visible B updated"), "{output:?}");
         assert!(!output.contains('\n'), "{output:?}");
         assert!(!output.contains("new offscreen row"), "{output:?}");
+    }
+
+    #[test]
+    fn inline_scrollback_shrink_past_native_history_resets_and_replays_frame() {
+        const RESET: &str = "\x1b[0m\x1b]8;;\x1b\\";
+        let size = Rc::new(Cell::new((30, 4)));
+        let capabilities = crate::capabilities::TerminalCapabilities::interactive(
+            crate::capabilities::ColorDepth::Ansi16,
+            true,
+        );
+        let (terminal, clears, _, _, _, writes) = recording_terminal(size, capabilities);
+        let lines = Rc::new(RefCell::new(
+            (0..5)
+                .map(|index| format!("new row {index}"))
+                .collect::<Vec<_>>(),
+        ));
+        let mut tui = TUI::new(Box::new(terminal));
+        tui.set_inline_scrollback(true);
+        tui.add_child(Box::new(MutableLines(lines)));
+        tui.previous_frame = (0..8)
+            .map(|index| format!("old row {index}{RESET}"))
+            .collect();
+        tui.previous_size = Some((30, 4));
+        tui.first_render = false;
+        // Only the old frame's final three rows are still on screen. The new
+        // frame ends at the native-history seam and cannot be reconciled by a
+        // cursor-addressed tail repaint.
+        tui.inline_bottom_row = 2;
+        tui.running = true;
+
+        tui.request_render();
+
+        let output = writes.borrow().join("");
+        assert_eq!(clears.get(), 1, "history reset was required");
+        assert!(output.contains("\x1b[H\x1b[3J"), "{output:?}");
+        assert!(
+            !output.contains("old row"),
+            "old frame was replayed: {output:?}"
+        );
+        for index in 0..5 {
+            assert_eq!(
+                output.matches(&format!("new row {index}")).count(),
+                1,
+                "new row {index} was replayed exactly once: {output:?}",
+            );
+        }
+        assert_eq!(tui.inline_window_top, 1);
+        assert_eq!(tui.inline_bottom_row, 3);
     }
 
     #[test]

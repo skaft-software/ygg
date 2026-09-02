@@ -12,9 +12,9 @@ use crate::error::{
     AiError, DecodeError, HttpError, ProviderError, StreamProgress, StreamProtocolError,
     TransportError, TransportPhase,
 };
-use crate::responses_ws::ResponsesWsPool;
+use crate::responses_ws::{ResponsesWsLiveness, ResponsesWsPool};
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
-use crate::types::{Protocol, Request, Response};
+use crate::types::{Protocol, Request, Response, ToolDef};
 use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
@@ -190,6 +190,7 @@ fn annotate_stream_failure(
     builder: &ResponseBuilder,
     first_body_chunk: bool,
     started_at: Instant,
+    last_event_at: Option<Instant>,
 ) -> AiError {
     AiError::StreamFailure {
         inner: Box::new(inner),
@@ -200,6 +201,9 @@ fn annotate_stream_failure(
             buffered_bytes: builder.buffered_content_bytes,
             first_body_seen: !first_body_chunk,
             elapsed_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            last_event_ms: last_event_at.map(|event_at| {
+                u64::try_from(event_at.duration_since(started_at).as_millis()).unwrap_or(u64::MAX)
+            }),
         },
     }
 }
@@ -389,6 +393,7 @@ struct HttpStreamRequest {
     parts: crate::protocol::HttpRequestParts,
     headers: http::HeaderMap,
     requested_audio_format: Option<crate::types::AudioFormat>,
+    tool_definitions: Vec<ToolDef>,
     pre_send_diagnostics: Vec<crate::error::Diagnostic>,
     buffer_ambiguous_compatibility_content: bool,
     diagnostic_redactor: CredentialRedactor,
@@ -420,6 +425,7 @@ async fn stream_http(
         parts,
         mut headers,
         requested_audio_format,
+        tool_definitions,
         pre_send_diagnostics,
         buffer_ambiguous_compatibility_content,
         diagnostic_redactor,
@@ -548,6 +554,7 @@ async fn stream_http(
                 model_clone.spec.protocol,
                 model_clone.spec.pricing.clone()
             );
+            builder.set_tool_definitions(&tool_definitions)?;
             builder.set_buffer_ambiguous_compatibility_content(
                 buffer_ambiguous_compatibility_content,
             );
@@ -567,6 +574,7 @@ async fn stream_http(
             let mut successful_body_prefix = Vec::new();
             let mut first_body_chunk = true;
             let started_at = Instant::now();
+            let mut last_event_at = None;
             'read: loop {
                 let remaining = stream_deadline.saturating_sub(started_at.elapsed());
                 if remaining.is_zero() {
@@ -579,6 +587,7 @@ async fn stream_http(
                         &builder,
                         first_body_chunk,
                         started_at,
+                        last_event_at,
                     ))?;
                 }
                 let quiet_timeout = if first_body_chunk {
@@ -605,6 +614,7 @@ async fn stream_http(
                             &builder,
                             first_body_chunk,
                             started_at,
+                            last_event_at,
                         )
                     })?;
                 let Some(chunk_res) = chunk_res else {
@@ -616,6 +626,7 @@ async fn stream_http(
                         &builder,
                         first_body_chunk,
                         started_at,
+                        last_event_at,
                     )
                 })?;
                 first_body_chunk = false;
@@ -629,10 +640,17 @@ async fn stream_http(
                 }
 
                 let sse_events = sse_decoder.push(&chunk).map_err(|error| {
-                    annotate_stream_failure(AiError::Decode(error), &builder, first_body_chunk, started_at)
+                    annotate_stream_failure(
+                        AiError::Decode(error),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
                 })?;
                 if !sse_events.is_empty() {
                     provider_event_seen = true;
+                    last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
                 }
 
@@ -643,7 +661,13 @@ async fn stream_http(
                         Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
                     }
                     .map_err(|error| {
-                        annotate_stream_failure(error, &builder, first_body_chunk, started_at)
+                        annotate_stream_failure(
+                            error,
+                            &builder,
+                            first_body_chunk,
+                            started_at,
+                            last_event_at,
+                        )
                     })?;
                     for ev in stream_events {
                         let terminal = matches!(ev, StreamEvent::Finished(_));
@@ -662,10 +686,17 @@ async fn stream_http(
             if !terminal_seen {
                 if let Some(sse) =
                     sse_decoder.finish().map_err(|error| {
-                        annotate_stream_failure(AiError::Decode(error), &builder, first_body_chunk, started_at)
+                        annotate_stream_failure(
+                            AiError::Decode(error),
+                            &builder,
+                            first_body_chunk,
+                            started_at,
+                            last_event_at,
+                        )
                     })?
                 {
                     provider_event_seen = true;
+                    last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
                     let stream_events = match model_clone.spec.protocol {
                         Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
@@ -673,7 +704,13 @@ async fn stream_http(
                         Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
                     }
                     .map_err(|error| {
-                        annotate_stream_failure(error, &builder, first_body_chunk, started_at)
+                        annotate_stream_failure(
+                            error,
+                            &builder,
+                            first_body_chunk,
+                            started_at,
+                            last_event_at,
+                        )
                     })?;
                     for ev in stream_events {
                         yield ev;
@@ -689,6 +726,7 @@ async fn stream_http(
                         &builder,
                         first_body_chunk,
                         started_at,
+                        last_event_at,
                     ))?;
                 }
             }
@@ -737,10 +775,11 @@ async fn stream_http(
             matches!(model_clone.spec.protocol, Protocol::OpenAiChat),
             "non-streaming path is Chat-only",
         );
-        let mut response = crate::protocol::openai_chat::decode_response(
+        let mut response = crate::protocol::openai_chat::decode_response_with_tools(
             &model_clone,
             &body_bytes,
             requested_audio_format,
+            &tool_definitions,
         )
         .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
         response.diagnostics.extend(pre_send_diagnostics);
@@ -809,6 +848,7 @@ fn responses_websocket_stream(
     model: Model,
     mut events: mpsc::Receiver<Result<serde_json::Value, AiError>>,
     diagnostics: Vec<crate::error::Diagnostic>,
+    tool_definitions: Vec<ToolDef>,
     buffer_ambiguous_compatibility_content: bool,
     diagnostic_redactor: CredentialRedactor,
     stream_initial_timeout: Duration,
@@ -821,6 +861,7 @@ fn responses_websocket_stream(
             model.spec.protocol,
             model.spec.pricing.clone(),
         );
+        builder.set_tool_definitions(&tool_definitions)?;
         builder.set_buffer_ambiguous_compatibility_content(
             buffer_ambiguous_compatibility_content,
         );
@@ -831,6 +872,8 @@ fn responses_websocket_stream(
         let started_at = Instant::now();
         let mut terminal_seen = false;
         let mut emitted_event = false;
+        let mut first_provider_event = false;
+        let mut last_event_at = None;
         while !terminal_seen {
             let remaining = stream_deadline.saturating_sub(started_at.elapsed());
             let event_result = if remaining.is_zero() {
@@ -872,14 +915,28 @@ fn responses_websocket_stream(
                 Ok(event) => event,
                 Err(error) => {
                     events.close();
-                    Err(error)?
+                    Err(annotate_stream_failure(
+                        error,
+                        &builder,
+                        !first_provider_event,
+                        started_at,
+                        last_event_at,
+                    ))?
                 }
             };
+            first_provider_event = true;
+            last_event_at = Some(Instant::now());
             let data = match serde_json::to_string(&event) {
                 Ok(data) => data,
                 Err(error) => {
                     events.close();
-                    Err(AiError::Decode(DecodeError::Json(error.to_string())))?
+                    Err(annotate_stream_failure(
+                        AiError::Decode(DecodeError::Json(error.to_string())),
+                        &builder,
+                        !first_provider_event,
+                        started_at,
+                        last_event_at,
+                    ))?
                 }
             };
             let sse_event = crate::protocol::sse::SseEvent {
@@ -894,7 +951,13 @@ fn responses_websocket_stream(
                 Ok(decoded) => decoded,
                 Err(error) => {
                     events.close();
-                    Err(error)?
+                    Err(annotate_stream_failure(
+                        error,
+                        &builder,
+                        !first_provider_event,
+                        started_at,
+                        last_event_at,
+                    ))?
                 }
             };
             for event in decoded {
@@ -1069,7 +1132,13 @@ impl AiClient {
         let key = format!("{}:{}:{session_id}", model.endpoint.id.0, model.spec.id.0);
         let result = tokio::time::timeout(
             model.endpoint.timeout.min(DEFAULT_CONNECT_TIMEOUT),
-            self.responses_ws.prewarm(&key, parts.url, headers, body),
+            self.responses_ws.prewarm(
+                &key,
+                parts.url,
+                headers,
+                body,
+                ResponsesWsLiveness::for_response_idle(self.stream_idle_timeout),
+            ),
         )
         .await
         .map_err(|_| {
@@ -1095,6 +1164,7 @@ impl AiClient {
         // tool turns are normalized into valid canonical messages first.
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
+        let tool_definitions = req.tools.clone();
         // Ambiguous bare JSON must remain visible in the default strict stream.
         // Lossy mode is the explicit opt-in for holding it to EOF and
         // interpreting a provider's text as compatibility tool syntax.
@@ -1158,6 +1228,7 @@ impl AiClient {
             parts,
             headers,
             requested_audio_format,
+            tool_definitions,
             pre_send_diagnostics,
             buffer_ambiguous_compatibility_content,
             diagnostic_redactor: diagnostic_redactor.clone(),
@@ -1195,6 +1266,7 @@ impl AiClient {
                         fallback_request.parts.url.clone(),
                         ws_headers,
                         body,
+                        ResponsesWsLiveness::for_response_idle(self.stream_idle_timeout),
                     ),
                 )
                 .await;
@@ -1204,6 +1276,7 @@ impl AiClient {
                             model.clone(),
                             events,
                             fallback_request.pre_send_diagnostics.clone(),
+                            fallback_request.tool_definitions.clone(),
                             buffer_ambiguous_compatibility_content,
                             diagnostic_redactor,
                             self.stream_initial_timeout,
