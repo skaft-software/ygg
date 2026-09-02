@@ -1314,7 +1314,7 @@ describe("YggStore", () => {
         actorGeneration: 1,
         sequence: 2,
       });
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersToNextTimerAsync();
       expect(loads).toBe(2);
       expect(stalledSignal).toBeDefined();
 
@@ -1327,7 +1327,7 @@ describe("YggStore", () => {
           patch: { title: `live-${index}` },
         });
       }
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersToNextTimerAsync();
 
       const deferred = (
         store as unknown as {
@@ -1345,10 +1345,10 @@ describe("YggStore", () => {
 
       await vi.advanceTimersByTimeAsync(10_001);
       await vi.advanceTimersByTimeAsync(50);
-      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersToNextTimerAsync();
 
       expect(stalledSignal?.aborted).toBe(true);
-      expect(loads).toBe(4);
+      expect(loads).toBe(3);
       expect(store.selectedSession).toMatchObject({
         sequence: 400,
         title: "Authoritative recovery",
@@ -1408,7 +1408,10 @@ describe("YggStore", () => {
     });
 
     pending.resolve(replacement);
-    await vi.waitFor(() => expect(loads).toBe(3));
+    await vi.waitFor(() =>
+      expect(store.selectedSession?.sequence).toBe(2),
+    );
+    expect(loads).toBe(2);
     expect(store.selectedSession).toMatchObject({
       sequence: 2,
       title: "Authoritative replacement",
