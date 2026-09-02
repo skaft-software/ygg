@@ -2,7 +2,7 @@
 
 All notable changes to Ygg are documented here. This project follows Semantic Versioning while pre-1.0 APIs may evolve rapidly.
 
-## Unreleased
+## 0.6.6 — 2026-09-02
 
 ### Added
 
@@ -11,12 +11,36 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
   publishing/recovery gates.
 - Add an offline Homebrew formula generator and protected tap handoff driven by
   signed immutable release metadata.
+- Print an exact, shell-quoted session resume command after clean interactive
+  exits and shutdown signals.
 
 ### Changed
 
 - Cap authenticated Codex model and request budgeting at 272,000 tokens by
   default, matching Pi. Smaller provider windows remain authoritative while
   larger advertised maxima remain available as discovery metadata.
+- Preserve DeepSeek V4 discovery context and modality metadata instead of
+  replacing it with placeholder defaults.
+- Reuse the durable session catalog and an incremental transcript-search index
+  when Serve lists and searches session history.
+
+### Fixed
+
+- Bound environment credential reads, validate repaired tool arguments against
+  their selected schemas, and retry transient remote reads with bounded
+  backoff.
+- Detect half-open Responses WebSockets, report closure progress, and prevent
+  search subprocesses from stalling on saturated output pipes.
+- Classify subagent turn-limit settlement as bounded completion and preserve the
+  parent result.
+- Isolate repository clean filters from status refreshes and serialize durable
+  goal updates across independently opened processes.
+- Resolve and launch Serve's GitHub CLI through a hardened environment and clean
+  up its complete descendant process tree after cancellation or timeout.
+- Keep web session selection and stalled resynchronization monotonic and
+  bounded, without replaying stale snapshots over newer live state.
+- Reconcile inline terminal scrollback after long transcript shrinkage without
+  corrupting retained rows.
 
 ## 0.6.5 — 2026-08-30
 
