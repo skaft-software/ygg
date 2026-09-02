@@ -30,40 +30,38 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    parse_test_output, refresh_repository_context, ActiveCompaction, ActivityPhase,
-    ActivityPhaseSummary, ActorOwnerState, AgentRunPhase as ServeRunPhase, AgentRunTelemetry,
-    AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind, ArtifactRef,
-    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
-    AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery, CommandSuggestion,
-    CommandSuggestionKind, CompletedCompaction, CompletionReview, ContextCategory,
-    ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
-    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    isolate_process_group, parse_test_output, refresh_repository_context, ActiveCompaction,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AgentRunPhase as ServeRunPhase,
+    AgentRunTelemetry, AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind,
+    ArtifactRef, AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef,
+    AttachmentStore, AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery,
+    CommandSuggestion, CommandSuggestionKind, CompletedCompaction, CompletionReview,
+    ContextCategory, ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals,
+    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, ExtensionPresentation, FileChange, FileEntryId,
     FinalizeCompletion, FinalizeDecision, GoalAction, GoalState as ServeGoalState, GoalStore,
     GoalStoreError, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
     InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    isolate_process_group, LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing,
-    ModelInputPricingTier,
-    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProjectFileRead,
-    ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError, ProjectFileTree,
-    ProjectFileWrite, ProcessTree, ProjectId, ProjectRegistry, ProjectRegistryError, ProjectSummary,
-    PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary, RegistryProjectId,
-    RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot, RequestAnswer,
-    RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind,
-    SearchError, SemanticRole, ServiceError, SessionBranchEntry, SessionBranchEntryKind,
-    SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor, SessionDriver,
-    SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot,
-    SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId,
-    SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
-    SupervisorConfig, TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput,
-    TerminationSignal,
-    ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle,
-    ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus,
-    ToolKind, ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest,
-    TranscriptSearchResult, TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary,
-    TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity,
-    UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
+    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProcessTree,
+    ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError,
+    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError,
+    ProjectSummary, PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary,
+    RegistryProjectId, RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot,
+    RequestAnswer, RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument,
+    SearchDocumentKind, SearchError, SemanticRole, ServiceError, SessionBranchEntry,
+    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor,
+    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
+    SessionSnapshot, SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation,
+    SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
+    SupervisorConfig, TerminationSignal, TestCommandOutcome, TestCommandStatus, TestFramework,
+    TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
+    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
+    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
+    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
+    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
     MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
     PROTOCOL_VERSION,
 };
@@ -3635,10 +3633,7 @@ async fn query_github_pull_request_with_timeout_and_queued_permit(
     execute_github_pull_request_query(workspace, selector, executable, timeout).await
 }
 
-async fn terminate_github_process(
-    child: &mut tokio::process::Child,
-    process_tree: &ProcessTree,
-) {
+async fn terminate_github_process(child: &mut tokio::process::Child, process_tree: &ProcessTree) {
     process_tree.signal(TerminationSignal::Graceful);
     let graceful_deadline = Instant::now() + GITHUB_CLI_GRACE_PERIOD;
     while Instant::now() < graceful_deadline {
@@ -3693,7 +3688,7 @@ async fn execute_github_pull_request_query(
     let Ok(mut child) = command.spawn() else {
         return PullRequestObservation::Unavailable;
     };
-    let process_tree = ProcessTree::from_process_id(Some(child.id()));
+    let process_tree = ProcessTree::from_process_id(child.id());
     let Some(stdout) = child.stdout.take() else {
         terminate_github_process(&mut child, &process_tree).await;
         return PullRequestObservation::Unavailable;
@@ -13003,14 +12998,16 @@ mod tests {
             .unwrap();
         let process_exists = |pid: i32| {
             let result = unsafe { libc::kill(pid, 0) };
-            result == 0
-                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while process_exists(pid) && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert!(!process_exists(pid), "GitHub query descendant survived timeout cleanup");
+        assert!(
+            !process_exists(pid),
+            "GitHub query descendant survived timeout cleanup"
+        );
     }
 
     #[cfg(unix)]
