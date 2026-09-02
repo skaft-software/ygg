@@ -1,0 +1,22 @@
+{
+  "name": "@skaft-software/ygg",
+  "version": "__VERSION__",
+  "description": "Native Ygg coding agent launcher",
+  "license": "MIT",
+  "repository": "https://github.com/skaft-software/ygg",
+  "files": [
+    "README.md",
+    "LICENSE",
+    "bin/",
+    "lib/"
+  ],
+  "bin": {
+    "ygg": "bin/ygg",
+    "ygg-host": "bin/ygg-host"
+  },
+  "optionalDependencies": {
+    "@skaft-software/ygg-darwin-arm64": "__VERSION__",
+    "@skaft-software/ygg-darwin-x64": "__VERSION__",
+    "@skaft-software/ygg-linux-x64-gnu": "__VERSION__"
+  }
+}

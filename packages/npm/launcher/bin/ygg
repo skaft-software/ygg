@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+# npm may expose bin/ygg through a symlink in its global bin directory. Resolve
+# that link without changing the caller's cwd before handing off to the common
+# shell-only launcher.
+script=$0
+case "$script" in
+    /*) ;;
+    *) script=$(pwd -P)/$script ;;
+esac
+while [ -L "$script" ]; do
+    link=$(readlink "$script") || {
+        printf '%s\n' 'Ygg npm launcher could not resolve its executable path' >&2
+        exit 1
+    }
+    case "$link" in
+        /*) script=$link ;;
+        *) script=$(dirname "$script")/$link ;;
+    esac
+done
+script_directory=$(CDPATH= cd -P -- "$(dirname "$script")" 2>/dev/null && pwd -P) || {
+    printf '%s\n' 'Ygg npm launcher could not resolve its package directory' >&2
+    exit 1
+}
+exec "$script_directory/../lib/launch.sh" ygg "$@"

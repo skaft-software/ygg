@@ -1,0 +1,117 @@
+#!/bin/sh
+set -eu
+
+package_version="__VERSION__"
+
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
+command_name=${1-}
+case "$command_name" in
+    ygg|ygg-host) ;;
+    *) fail 'Ygg npm launcher received an invalid native command' ;;
+esac
+shift
+
+# npm exposes each bin entry through a symlink in its global bin directory.
+# Resolve it without changing the caller's working directory before locating
+# the package-local launcher.
+script=$0
+case "$script" in
+    /*) ;;
+    *) script=$(pwd -P)/$script ;;
+esac
+while [ -L "$script" ]; do
+    link=$(readlink "$script") || fail 'Ygg npm launcher could not resolve its executable path'
+    case "$link" in
+        /*) script=$link ;;
+        *) script=$(dirname "$script")/$link ;;
+    esac
+done
+launch_directory=$(CDPATH= cd -P -- "$(dirname "$script")" 2>/dev/null && pwd -P) || \
+    fail 'Ygg npm launcher could not resolve its package directory'
+launcher_root=$(CDPATH= cd -P -- "$launch_directory/.." 2>/dev/null && pwd -P) || \
+    fail 'Ygg npm launcher could not resolve its package root'
+[ -d "$launcher_root" ] && [ ! -L "$launcher_root" ] || \
+    fail 'Ygg npm launcher package root is not a real directory'
+
+operating_system=$(uname -s 2>/dev/null) || fail 'Ygg npm launcher requires uname'
+machine=$(uname -m 2>/dev/null) || fail 'Ygg npm launcher could not determine the CPU architecture'
+platform_package=
+case "$operating_system:$machine" in
+    Darwin:arm64|Darwin:aarch64)
+        platform_package='@skaft-software/ygg-darwin-arm64'
+        ;;
+    Darwin:x86_64|Darwin:amd64)
+        # Select the package matching the executable ABI. An x86_64 Ygg under
+        # Rosetta is still an x86_64 binary and must not exec arm64 code.
+        platform_package='@skaft-software/ygg-darwin-x64'
+        ;;
+    Linux:x86_64|Linux:amd64)
+        glibc_available=false
+        if command -v getconf >/dev/null 2>&1; then
+            glibc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null || true)
+            case "$glibc_version" in
+                glibc\ *|GNU\ libc\ *) glibc_available=true ;;
+            esac
+        fi
+        if [ "$glibc_available" != true ] && command -v ldd >/dev/null 2>&1; then
+            ldd_version=$(ldd --version 2>&1 || true)
+            case "$ldd_version" in
+                *glibc*|*GLIBC*|*'GNU libc'*|*'GNU C Library'*) glibc_available=true ;;
+            esac
+        fi
+        [ "$glibc_available" = true ] || \
+            fail 'Ygg npm package requires GNU libc on Linux; musl is not supported'
+        platform_package='@skaft-software/ygg-linux-x64-gnu'
+        ;;
+    Darwin:*) fail "Ygg npm package does not support macOS architecture: $machine" ;;
+    Linux:*) fail "Ygg npm package does not support Linux architecture: $machine" ;;
+    *) fail "Ygg npm package does not support operating system: $operating_system" ;;
+esac
+
+platform_name=${platform_package#*/}
+platform_root=
+# npm may nest optional dependencies below the public package or hoist them to
+# the sibling scope directory. Both layouts are explicit; there is no network
+# resolver or fallback package.
+for candidate in \
+    "$launcher_root/node_modules/$platform_package" \
+    "$launcher_root/../$platform_name"; do
+    if [ -d "$candidate" ] && [ ! -L "$candidate" ]; then
+        platform_root=$candidate
+        break
+    fi
+done
+[ -n "$platform_root" ] || \
+    fail "Ygg npm package is missing the selected platform runtime: $platform_package"
+
+for required in \
+    "$platform_root/package.json" \
+    "$platform_root/README.md" \
+    "$platform_root/LICENSE" \
+    "$platform_root/bin/$command_name" \
+    "$platform_root/share/ygg/.ygg-version" \
+    "$platform_root/share/ygg/README.md"; do
+    [ -f "$required" ] && [ ! -L "$required" ] || \
+        fail "Ygg npm platform package is incomplete: $platform_root"
+done
+for required_directory in \
+    "$platform_root/bin" \
+    "$platform_root/share/ygg" \
+    "$platform_root/share/ygg/docs" \
+    "$platform_root/share/ygg/examples" \
+    "$platform_root/share/ygg/sdk"; do
+    [ -d "$required_directory" ] && [ ! -L "$required_directory" ] || \
+        fail "Ygg npm platform package is incomplete: $platform_root"
+done
+[ -x "$platform_root/bin/$command_name" ] || \
+    fail "Ygg npm platform executable is not executable: $platform_root/bin/$command_name"
+[ "$(cat "$platform_root/share/ygg/.ygg-version")" = "$package_version" ] || \
+    fail "Ygg npm platform version does not match launcher version $package_version"
+
+# Do not print on the successful path: ygg-host stdout is a protocol stream.
+# exec preserves cwd, argv, environment, stdio, signal delivery, and status.
+exec "$platform_root/bin/$command_name" "$@"
