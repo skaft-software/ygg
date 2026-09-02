@@ -639,6 +639,7 @@ fn model_id_implies_vision(id: &str) -> bool {
         || id.contains("gpt-5.4")
         || id.contains("gpt-5.5")
         || id.contains("gpt-5.6")
+        || (id.contains("deepseek") && id.contains("vision"))
         || id.contains("codex-mini")
         || id.contains("qwen3.5")
         || id.contains("qwen3.6")
@@ -659,6 +660,31 @@ struct DiscoveredApiModel {
     tools: bool,
     vision: bool,
     audio: bool,
+}
+
+fn is_deepseek_v4_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id == "deepseek-v4" || id.starts_with("deepseek-v4-")
+}
+
+/// DeepSeek's sparse V4 inventory omits its documented limits. Preserve any
+/// explicit positive metadata, but use the embedded V4 limits instead of the
+/// generic placeholder when the provider leaves them out.
+fn deepseek_discovered_limits(model: &DiscoveredApiModel) -> (u64, u64) {
+    let (default_context_window, default_max_output_tokens) = if is_deepseek_v4_model(&model.id) {
+        (
+            DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
+            DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS,
+        )
+    } else {
+        (128_000, 64_000)
+    };
+    let context_window = model.context_window.unwrap_or(default_context_window);
+    let max_output_tokens = model
+        .max_output_tokens
+        .unwrap_or(default_max_output_tokens)
+        .min(context_window);
+    (context_window, max_output_tokens)
 }
 
 fn metadata_capability_flag(value: &serde_json::Value) -> Option<bool> {
@@ -1201,11 +1227,7 @@ fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Re
             Protocol::OpenAiChat,
         );
         let pricing = crate::providers::model_pricing(crate::providers::DEEPSEEK.id, &model.id);
-        let context_window = model.context_window.unwrap_or(128_000);
-        let max_output_tokens = model
-            .max_output_tokens
-            .unwrap_or(64_000)
-            .min(context_window);
+        let (context_window, max_output_tokens) = deepseek_discovered_limits(&model);
         catalog.register_model(ModelSpec {
             id: ModelId(format!("deepseek/{}", model.id)),
             endpoint: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
