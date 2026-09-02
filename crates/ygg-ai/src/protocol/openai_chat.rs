@@ -17,7 +17,7 @@ use crate::types::{
     AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioPayload, AudioVoice,
     ImageSource, Media, Message, OpenAiChatReasoningMode, OutputFormat, OutputModalities, Protocol,
     ProviderMediaRef, ReasoningConfig, ReasoningEffort, ReasoningPart, Request, Response,
-    StopReason, ToolCall, ToolCallId, ToolChoice, ToolResultPart, Usage, UserPart,
+    StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResultPart, Usage, UserPart,
 };
 use crate::validate::{normalize_request_reasoning, validate_request};
 
@@ -1041,11 +1041,35 @@ fn add_cache_control_to_instruction(
 }
 
 /// Decodes the non-streaming JSON response body from OpenAI Chat Completions.
+#[cfg(test)]
 pub(crate) fn decode_response(
     model: &crate::catalog::Model,
     body: &[u8],
     requested_audio_format: Option<AudioFormat>,
 ) -> Result<Response, AiError> {
+    decode_response_inner(model, body, requested_audio_format, None)
+}
+
+/// Decodes a completed response while validating calls against the exact
+/// tool-definition snapshot sent with the request.
+pub(crate) fn decode_response_with_tools(
+    model: &crate::catalog::Model,
+    body: &[u8],
+    requested_audio_format: Option<AudioFormat>,
+    tools: &[ToolDef],
+) -> Result<Response, AiError> {
+    decode_response_inner(model, body, requested_audio_format, Some(tools))
+}
+
+fn decode_response_inner(
+    model: &crate::catalog::Model,
+    body: &[u8],
+    requested_audio_format: Option<AudioFormat>,
+    tool_definitions: Option<&[ToolDef]>,
+) -> Result<Response, AiError> {
+    if let Some(tools) = tool_definitions {
+        crate::json_repair::validate_tool_definitions(tools).map_err(AiError::Decode)?;
+    }
     let resp: ChatCompletionsResponse = serde_json::from_slice(body)
         .map_err(|e| AiError::Decode(DecodeError::Json(e.to_string())))?;
 
@@ -1077,6 +1101,9 @@ pub(crate) fn decode_response(
                 // The completed body is already fully available, so enabling
                 // ambiguous compatibility recovery cannot hide streamed JSON.
                 fallback.set_buffer_ambiguous_compatibility_content(true);
+                if let Some(tools) = tool_definitions {
+                    fallback.set_tool_definitions(tools)?;
+                }
                 let mut ignored_events = Vec::new();
                 consume_qwen_xml_content(&mut ignored_events, &mut fallback, text)?;
                 flush_qwen_xml_pending(&mut ignored_events, &mut fallback)?;
@@ -1124,6 +1151,12 @@ pub(crate) fn decode_response(
         for tc in tcs {
             let arguments_json = crate::json_repair::normalize_json_object(&tc.function.arguments)
                 .map_err(AiError::Decode)?;
+            if let Some(tools) = tool_definitions {
+                let arguments = serde_json::from_str(&arguments_json)
+                    .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+                crate::json_repair::validate_tool_arguments(&tc.function.name, &arguments, tools)
+                    .map_err(AiError::Decode)?;
+            }
 
             content.push(AssistantPart::ToolCall(ToolCall {
                 id: ToolCallId(tc.id.clone()),

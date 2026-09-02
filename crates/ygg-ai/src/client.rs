@@ -14,7 +14,7 @@ use crate::error::{
 };
 use crate::responses_ws::{ResponsesWsLiveness, ResponsesWsPool};
 use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
-use crate::types::{Protocol, Request, Response};
+use crate::types::{Protocol, Request, Response, ToolDef};
 use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
@@ -393,6 +393,7 @@ struct HttpStreamRequest {
     parts: crate::protocol::HttpRequestParts,
     headers: http::HeaderMap,
     requested_audio_format: Option<crate::types::AudioFormat>,
+    tool_definitions: Vec<ToolDef>,
     pre_send_diagnostics: Vec<crate::error::Diagnostic>,
     buffer_ambiguous_compatibility_content: bool,
     diagnostic_redactor: CredentialRedactor,
@@ -424,6 +425,7 @@ async fn stream_http(
         parts,
         mut headers,
         requested_audio_format,
+        tool_definitions,
         pre_send_diagnostics,
         buffer_ambiguous_compatibility_content,
         diagnostic_redactor,
@@ -552,6 +554,7 @@ async fn stream_http(
                 model_clone.spec.protocol,
                 model_clone.spec.pricing.clone()
             );
+            builder.set_tool_definitions(&tool_definitions)?;
             builder.set_buffer_ambiguous_compatibility_content(
                 buffer_ambiguous_compatibility_content,
             );
@@ -772,10 +775,11 @@ async fn stream_http(
             matches!(model_clone.spec.protocol, Protocol::OpenAiChat),
             "non-streaming path is Chat-only",
         );
-        let mut response = crate::protocol::openai_chat::decode_response(
+        let mut response = crate::protocol::openai_chat::decode_response_with_tools(
             &model_clone,
             &body_bytes,
             requested_audio_format,
+            &tool_definitions,
         )
         .map_err(|error| sanitize_ai_error(&diagnostic_redactor, error))?;
         response.diagnostics.extend(pre_send_diagnostics);
@@ -844,6 +848,7 @@ fn responses_websocket_stream(
     model: Model,
     mut events: mpsc::Receiver<Result<serde_json::Value, AiError>>,
     diagnostics: Vec<crate::error::Diagnostic>,
+    tool_definitions: Vec<ToolDef>,
     buffer_ambiguous_compatibility_content: bool,
     diagnostic_redactor: CredentialRedactor,
     stream_initial_timeout: Duration,
@@ -856,6 +861,7 @@ fn responses_websocket_stream(
             model.spec.protocol,
             model.spec.pricing.clone(),
         );
+        builder.set_tool_definitions(&tool_definitions)?;
         builder.set_buffer_ambiguous_compatibility_content(
             buffer_ambiguous_compatibility_content,
         );
@@ -1158,6 +1164,7 @@ impl AiClient {
         // tool turns are normalized into valid canonical messages first.
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
+        let tool_definitions = req.tools.clone();
         // Ambiguous bare JSON must remain visible in the default strict stream.
         // Lossy mode is the explicit opt-in for holding it to EOF and
         // interpreting a provider's text as compatibility tool syntax.
@@ -1221,6 +1228,7 @@ impl AiClient {
             parts,
             headers,
             requested_audio_format,
+            tool_definitions,
             pre_send_diagnostics,
             buffer_ambiguous_compatibility_content,
             diagnostic_redactor: diagnostic_redactor.clone(),
@@ -1268,6 +1276,7 @@ impl AiClient {
                             model.clone(),
                             events,
                             fallback_request.pre_send_diagnostics.clone(),
+                            fallback_request.tool_definitions.clone(),
                             buffer_ambiguous_compatibility_content,
                             diagnostic_redactor,
                             self.stream_initial_timeout,
