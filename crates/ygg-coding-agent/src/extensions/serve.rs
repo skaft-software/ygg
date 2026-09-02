@@ -31,45 +31,44 @@ use ygg_ai::{
     ReasoningConfig, ToolCallId, ToolResultPart, UserPart,
 };
 use ygg_serve_backend::{
-    ActiveCompaction, ActivityPhase, ActivityPhaseSummary, ActorOwnerState,
-    AgentRunPhase as ServeRunPhase, AgentRunTelemetry,
-    AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind, ArtifactRef,
-    AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef, AttachmentStore,
-    AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery, CommandSuggestion,
-    CommandSuggestionKind, CompletedCompaction, CompletionReview, ContextCategory,
-    ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals, ContextUsage,
-    ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
+    isolate_process_group, parse_test_output, refresh_repository_context, ActiveCompaction,
+    ActivityPhase, ActivityPhaseSummary, ActorOwnerState, AgentRunPhase as ServeRunPhase,
+    AgentRunTelemetry, AgentRunTerminalState as ServeRunTerminalState, ArtifactId, ArtifactKind,
+    ArtifactRef, AttachmentError, AttachmentFingerprint, AttachmentPolicy, AttachmentRef,
+    AttachmentStore, AttentionState, AuthorityProfile, ColorScheme, CommandDiscovery,
+    CommandSuggestion, CommandSuggestionKind, CompletedCompaction, CompletionReview,
+    ContextCategory, ContextCategoryTotal, ContextCompactionReason, ContextStatus, ContextTotals,
+    ContextUsage, ConversationBranchOperation, ConversationBranchProvenance, CreateSessionRequest,
     DocumentReference, DocumentStore, DocumentStoreError, DriverCommandOutcome, DurableEntryId,
     EventPayload, EvidenceCoverage, ExtensionPresentation, FileChange, FileEntryId,
     FinalizeCompletion, FinalizeDecision, GoalAction, GoalState as ServeGoalState, GoalStore,
     GoalStoreError, HostCapabilities, HostDescriptor, HostId, HostService, InferenceRequest,
     InferenceRequestStore, InputModality, ItemDelta, ItemId, ItemLifecycle, ItemPayload,
-    LifetimeUsage, LoopbackConfig, LoopbackServer, MAX_ITEM_TEXT_BYTES,
-    MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES, ModelInputPricing,
-    ModelInputPricingTier, ModelSelection, ModelSummary, PROTOCOL_VERSION, PendingRequest,
-    PermanentDeleteConfirmation, ProcessTree, ProjectFileRead, ProjectFileSearchResult,
-    ProjectFileSystem, ProjectFileSystemError, ProjectFileTree, ProjectFileWrite, ProjectId,
-    ProjectRegistry, ProjectRegistryError, ProjectSummary, PromptInput, ProtocolValidation,
-    PullRequestState, PullRequestSummary, RegistryProjectId, RegistryProjectState,
-    RepositoryContextError, RepositoryContextSnapshot, RequestAnswer, RequestId, RequestKind,
-    RequestState, RunId, RuntimeId, SearchDocument, SearchDocumentKind, SearchError, SemanticRole,
-    ServiceError, SessionBranchEntry, SessionBranchEntryKind, SessionBranchGraph,
-    SessionCatalogState, SessionCommand, SessionCursor, SessionDriver, SessionId, SessionItem,
-    SessionLiveState, SessionRetention, SessionSeed, SessionSnapshot, SessionSummary,
-    SessionSupervisor, SkillSuggestion, SlashCommandInvocation, SourceId, SourceKind, SourceRef,
-    StoredAttachment, StoredResource, StructuredTestResults, SupervisorConfig, TerminationSignal,
-    TestCommandOutcome, TestCommandStatus, TestFramework, TestOutputInput, ThemeColor,
-    ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption, ThemeRoleStyle, ThemeSourceClass,
-    ThemeTypography, TimestampedEvent, ToolActivity, ToolActivityStatus, ToolKind,
-    ToolResultSummary, TranscriptSearchIndex, TranscriptSearchRequest, TranscriptSearchResult,
-    TrustedFileEntry, TrustedFileError, TrustedFileIndexSummary, TrustedFileRead,
-    TrustedFileSearchResult, TrustedProjectFiles, TurnId, UsageActivity, UsagePeriod,
-    UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery, isolate_process_group,
-    parse_test_output, refresh_repository_context,
+    LifetimeUsage, LoopbackConfig, LoopbackServer, ModelInputPricing, ModelInputPricingTier,
+    ModelSelection, ModelSummary, PendingRequest, PermanentDeleteConfirmation, ProcessTree,
+    ProjectFileRead, ProjectFileSearchResult, ProjectFileSystem, ProjectFileSystemError,
+    ProjectFileTree, ProjectFileWrite, ProjectId, ProjectRegistry, ProjectRegistryError,
+    ProjectSummary, PromptInput, ProtocolValidation, PullRequestState, PullRequestSummary,
+    RegistryProjectId, RegistryProjectState, RepositoryContextError, RepositoryContextSnapshot,
+    RequestAnswer, RequestId, RequestKind, RequestState, RunId, RuntimeId, SearchDocument,
+    SearchDocumentKind, SearchError, SemanticRole, ServiceError, SessionBranchEntry,
+    SessionBranchEntryKind, SessionBranchGraph, SessionCatalogState, SessionCommand, SessionCursor,
+    SessionDriver, SessionId, SessionItem, SessionLiveState, SessionRetention, SessionSeed,
+    SessionSnapshot, SessionSummary, SessionSupervisor, SkillSuggestion, SlashCommandInvocation,
+    SourceId, SourceKind, SourceRef, StoredAttachment, StoredResource, StructuredTestResults,
+    SupervisorConfig, TerminationSignal, TestCommandOutcome, TestCommandStatus, TestFramework,
+    TestOutputInput, ThemeColor, ThemeDensity, ThemeDto, ThemeId, ThemeMotion, ThemeOption,
+    ThemeRoleStyle, ThemeSourceClass, ThemeTypography, TimestampedEvent, ToolActivity,
+    ToolActivityStatus, ToolKind, ToolResultSummary, TranscriptSearchIndex,
+    TranscriptSearchRequest, TranscriptSearchResult, TrustedFileEntry, TrustedFileError,
+    TrustedFileIndexSummary, TrustedFileRead, TrustedFileSearchResult, TrustedProjectFiles, TurnId,
+    UsageActivity, UsagePeriod, UsageSnapshot, UsageStats, UsageStoreError, UserMessageDelivery,
+    MAX_ITEM_TEXT_BYTES, MAX_MODEL_INPUT_PRICING_TIERS, MAX_PROMPT_BYTES, MAX_TEST_OUTPUT_BYTES,
+    PROTOCOL_VERSION,
 };
 
-use crate::app::bootstrap::{LaunchSelection, SessionSelection, build_app, rebuild_app};
-use crate::app::{App, Reconfig, reasoning_label, supported_levels_with_subagents};
+use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
+use crate::app::{reasoning_label, supported_levels_with_subagents, App, Reconfig};
 use crate::commands;
 use crate::compaction::attempt_compaction;
 use crate::config::{self, Config};
@@ -11655,8 +11654,8 @@ mod tests {
     use ygg_ai::{AiError, AssistantMessage, Protocol, TransportPhase, UserMessage};
     use ygg_serve_backend::{
         AckDisposition, ActorConfig, ActorError, CatalogCursor, CommandId, DeviceId, HostBootstrap,
-        PROTOCOL_VERSION, SessionActorCore, SessionCommandEnvelope, SessionSupervisor,
-        SupervisorConfig, SupervisorError,
+        SessionActorCore, SessionCommandEnvelope, SessionSupervisor, SupervisorConfig,
+        SupervisorError, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -12189,12 +12188,10 @@ mod tests {
         drop(host);
 
         let mut reopened = YggHost::new(config).unwrap();
-        assert!(
-            reopened
-                .catalog
-                .resolve(&ModelId(historical_selection.model.clone()))
-                .is_ok()
-        );
+        assert!(reopened
+            .catalog
+            .resolve(&ModelId(historical_selection.model.clone()))
+            .is_ok());
         let advertised_model_count = reopened.models.len();
         reopened.models.retain(|model| {
             model.provider != historical_selection.provider
@@ -12576,19 +12573,17 @@ mod tests {
         let mut store = PullRequestStore::open(directory.path()).unwrap();
 
         store.delete_session(&session_id).unwrap();
-        assert!(
-            apply_pull_request_observation(
-                &mut store,
-                &session_id,
-                PullRequestObservation::Trackable {
-                    number: 124,
-                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
-                    state: PullRequestState::Ready,
-                },
-                20,
-            )
-            .is_err()
-        );
+        assert!(apply_pull_request_observation(
+            &mut store,
+            &session_id,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Ready,
+            },
+            20,
+        )
+        .is_err());
         assert_eq!(store.summary(&session_id), None);
         assert!(store.take_catalog_changes().is_empty());
     }
@@ -12698,19 +12693,17 @@ mod tests {
         let persisted_path = store.path.clone();
         store.path = directory.path().join("unreplaceable-directory");
         std::fs::create_dir(&store.path).unwrap();
-        assert!(
-            apply_pull_request_observation(
-                &mut store,
-                &session_id,
-                PullRequestObservation::Trackable {
-                    number: 124,
-                    url: "https://github.com/skaft-software/ygg/pull/124".into(),
-                    state: PullRequestState::Merged,
-                },
-                20,
-            )
-            .is_err()
-        );
+        assert!(apply_pull_request_observation(
+            &mut store,
+            &session_id,
+            PullRequestObservation::Trackable {
+                number: 124,
+                url: "https://github.com/skaft-software/ygg/pull/124".into(),
+                state: PullRequestState::Merged,
+            },
+            20,
+        )
+        .is_err());
         assert_eq!(
             store.summary(&session_id),
             Some(PullRequestSummary {
@@ -12909,7 +12902,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn github_cli_resolver_ignores_relative_and_workspace_local_fakes() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("workspace");
@@ -13695,11 +13688,9 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                 .trashed_at_ms,
             Some(41_000)
         );
-        assert!(
-            load_pending_session_deletions(&host.serve_state_dir)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -13835,13 +13826,12 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         .unwrap();
 
         assert!(sessions.path_by_id(session_id.as_str()).is_err());
-        assert!(
-            host.projects
-                .lock()
-                .unwrap()
-                .project_for_session(session_id.as_str())
-                .is_none()
-        );
+        assert!(host
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_none());
         assert_eq!(
             host.attachments
                 .as_ref()
@@ -13850,14 +13840,13 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                 .unwrap(),
             None
         );
-        assert!(
-            host.documents
-                .as_ref()
-                .unwrap()
-                .list_for_session(project_id.as_str(), session_id.as_str())
-                .unwrap()
-                .is_empty()
-        );
+        assert!(host
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
         assert_eq!(
             host.documents.as_ref().unwrap().get_for_session(
                 project_id.as_str(),
@@ -13866,31 +13855,27 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             ),
             Err(DocumentStoreError::NotFound)
         );
-        assert!(
-            host.resources
-                .as_ref()
-                .unwrap()
-                .content(&session_id, &resource.handle)
-                .is_err()
-        );
-        assert!(
-            host.resources
-                .as_ref()
-                .unwrap()
-                .run_record(&session_id, &run_entry)
-                .is_err()
-        );
+        assert!(host
+            .resources
+            .as_ref()
+            .unwrap()
+            .content(&session_id, &resource.handle)
+            .is_err());
+        assert!(host
+            .resources
+            .as_ref()
+            .unwrap()
+            .run_record(&session_id, &run_entry)
+            .is_err());
         assert_eq!(host.goals.get(&session_id).unwrap(), None);
         assert_eq!(
             host.pull_requests.lock().unwrap().summary(&session_id),
             None
         );
         assert_eq!(host.usage.lock().unwrap().lifetime().request_count, 1);
-        assert!(
-            load_pending_session_deletions(&host.serve_state_dir)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
 
         drop(host);
         let reopened = YggHost::new(config).unwrap();
@@ -13899,20 +13884,16 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             reopened.pull_requests.lock().unwrap().summary(&session_id),
             None
         );
-        assert!(
-            reopened
-                .documents
-                .as_ref()
-                .unwrap()
-                .list_for_session(project_id.as_str(), session_id.as_str())
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            load_pending_session_deletions(&reopened.serve_state_dir)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -13973,19 +13954,15 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         assert_eq!(metadata.trashed_at_ms, Some(76_000));
         assert!(sessions.path_by_id(session_id.as_str()).is_ok());
         assert!(!staged_metadata.exists());
-        assert!(
-            reopened
-                .projects
-                .lock()
-                .unwrap()
-                .project_for_session(session_id.as_str())
-                .is_some()
-        );
-        assert!(
-            load_pending_session_deletions(&reopened.serve_state_dir)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -14028,14 +14005,12 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].committed);
         assert!(reopened.goals.get(&session_id).unwrap().is_some());
-        assert!(
-            reopened
-                .projects
-                .lock()
-                .unwrap()
-                .project_for_session(session_id.as_str())
-                .is_some()
-        );
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
     }
 
     #[test]
@@ -14072,23 +14047,19 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         drop(deletion_guard);
 
         host.recover_pending_session_deletions();
-        assert!(
-            load_pending_session_deletions(&host.serve_state_dir)
+        assert!(load_pending_session_deletions(&host.serve_state_dir)
+            .unwrap()
+            .is_empty());
+        assert!(!sessions
+            .dir()
+            .join(".metadata")
+            .read_dir()
+            .unwrap()
+            .any(|entry| entry
                 .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !sessions
-                .dir()
-                .join(".metadata")
-                .read_dir()
-                .unwrap()
-                .any(|entry| entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".delete-locked-recovery-delete-"))
-        );
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".delete-locked-recovery-delete-")));
     }
 
     #[test]
@@ -14132,13 +14103,12 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         sessions
             .finish_permanent_delete(session_id.as_str())
             .unwrap();
-        assert!(
-            host.projects
-                .lock()
-                .unwrap()
-                .project_for_session(session_id.as_str())
-                .is_some()
-        );
+        assert!(host
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_some());
         let registry_project_id = RegistryProjectId::parse(project_id.as_str()).unwrap();
         host.projects
             .lock()
@@ -14148,28 +14118,22 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         drop(host);
 
         let reopened = YggHost::new(config).unwrap();
-        assert!(
-            reopened
-                .projects
-                .lock()
-                .unwrap()
-                .project_for_session(session_id.as_str())
-                .is_none()
-        );
-        assert!(
-            reopened
-                .documents
-                .as_ref()
-                .unwrap()
-                .list_for_session(project_id.as_str(), session_id.as_str())
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            load_pending_session_deletions(&reopened.serve_state_dir)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(reopened
+            .projects
+            .lock()
+            .unwrap()
+            .project_for_session(session_id.as_str())
+            .is_none());
+        assert!(reopened
+            .documents
+            .as_ref()
+            .unwrap()
+            .list_for_session(project_id.as_str(), session_id.as_str())
+            .unwrap()
+            .is_empty());
+        assert!(load_pending_session_deletions(&reopened.serve_state_dir)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -14838,15 +14802,13 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             .await
             .unwrap();
         assert!(!loaded.events.is_empty());
-        assert!(
-            driver
-                .command_discovery()
-                .await
-                .unwrap()
-                .skills
-                .iter()
-                .any(|skill| skill.id == "composer-skill" && skill.active)
-        );
+        assert!(driver
+            .command_discovery()
+            .await
+            .unwrap()
+            .skills
+            .iter()
+            .any(|skill| skill.id == "composer-skill" && skill.active));
 
         let unloaded = driver
             .dispatch(SessionCommand::InvokeSlashCommand {
@@ -14857,15 +14819,13 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             .await
             .unwrap();
         assert!(!unloaded.events.is_empty());
-        assert!(
-            driver
-                .command_discovery()
-                .await
-                .unwrap()
-                .skills
-                .iter()
-                .any(|skill| skill.id == "composer-skill" && !skill.active)
-        );
+        assert!(driver
+            .command_discovery()
+            .await
+            .unwrap()
+            .skills
+            .iter()
+            .any(|skill| skill.id == "composer-skill" && !skill.active));
 
         assert_eq!(
             driver
@@ -15161,13 +15121,11 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                 .map(ItemId::as_str),
             Some("item-call-branch-read")
         );
-        assert!(
-            restored
-                .snapshot
-                .items
-                .iter()
-                .any(|item| matches!(item.payload, ItemPayload::Source(_)))
-        );
+        assert!(restored
+            .snapshot
+            .items
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::Source(_))));
     }
 
     #[test]
@@ -15191,21 +15149,19 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             outside_tool.arguments.clone(),
             "secret",
         );
-        assert!(
-            project_tool_evidence(
-                &outside_session,
-                workspace.path(),
-                &registry,
-                &session_id,
-                &run_id,
-                &turn_id,
-                "call-outside",
-                &tool_item_id,
-                &outside_tool,
-                &ToolOutput::new("secret"),
-            )
-            .is_empty()
-        );
+        assert!(project_tool_evidence(
+            &outside_session,
+            workspace.path(),
+            &registry,
+            &session_id,
+            &run_id,
+            &turn_id,
+            "call-outside",
+            &tool_item_id,
+            &outside_tool,
+            &ToolOutput::new("secret"),
+        )
+        .is_empty());
 
         std::fs::write(workspace.path().join("notes.md"), b"after\nsecond\n").unwrap();
         let edit = projected_tool(
@@ -15289,21 +15245,19 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             &output,
         );
 
-        assert!(
-            project_tool_evidence(
-                &session,
-                workspace.path(),
-                &store,
-                &session_id,
-                &RunId::new("run-partial-evidence").unwrap(),
-                &TurnId::new("turn-partial-evidence").unwrap(),
-                "call-partial-write",
-                &ItemId::new("item-partial-evidence").unwrap(),
-                &tool,
-                &ToolOutput::new(output),
-            )
-            .is_empty()
-        );
+        assert!(project_tool_evidence(
+            &session,
+            workspace.path(),
+            &store,
+            &session_id,
+            &RunId::new("run-partial-evidence").unwrap(),
+            &TurnId::new("turn-partial-evidence").unwrap(),
+            "call-partial-write",
+            &ItemId::new("item-partial-evidence").unwrap(),
+            &tool,
+            &ToolOutput::new(output),
+        )
+        .is_empty());
 
         let replacement = store
             .register(
@@ -15416,11 +15370,9 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             &replaced,
             &ToolOutput::new(replaced_output),
         );
-        assert!(
-            replaced_events
-                .iter()
-                .all(|event| !matches!(event, EventPayload::ArtifactUpserted { .. }))
-        );
+        assert!(replaced_events
+            .iter()
+            .all(|event| !matches!(event, EventPayload::ArtifactUpserted { .. })));
         assert!(replaced_events.iter().any(|event| {
             matches!(
                 event,
@@ -15949,12 +15901,10 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             graph.head,
             Some(DurableEntryId::new(first.0.clone()).unwrap())
         );
-        assert!(
-            graph
-                .entries
-                .iter()
-                .any(|entry| entry.entry_id.as_str() == first.0)
-        );
+        assert!(graph
+            .entries
+            .iter()
+            .any(|entry| entry.entry_id.as_str() == first.0));
         graph.validate().unwrap();
     }
 
@@ -16485,11 +16435,9 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         )
         .unwrap();
         assert_eq!(projection.known_entries, session.entries().len());
-        assert!(
-            !live
-                .iter()
-                .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. }))
-        );
+        assert!(!live
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
         assert!(live.iter().any(|item| matches!(
             &item.payload,
             ItemPayload::RunOutcome {
@@ -16536,13 +16484,11 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         let public_snapshot = serde_json::to_string(&seed.snapshot).unwrap();
         assert!(!public_snapshot.contains(marker));
         assert!(public_snapshot.contains(diagnostic));
-        assert!(
-            !seed
-                .snapshot
-                .items
-                .iter()
-                .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. }))
-        );
+        assert!(!seed
+            .snapshot
+            .items
+            .iter()
+            .any(|item| matches!(item.payload, ItemPayload::AssistantMessage { .. })));
     }
 
     #[test]
@@ -16777,12 +16723,10 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         assert_eq!(redacted_search.target.as_deref(), Some("[redacted query]"));
         let public = serde_json::to_string(&redacted_search).unwrap();
         assert!(!public.contains(query_canary));
-        assert!(
-            redacted_search
-                .target
-                .as_deref()
-                .is_some_and(|target| target.len() <= 512)
-        );
+        assert!(redacted_search
+            .target
+            .as_deref()
+            .is_some_and(|target| target.len() <= 512));
 
         let outside = tempfile::tempdir().unwrap();
         let outside_cwd = semantic_tool_activity(
@@ -16961,12 +16905,10 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
         assert_eq!(review.warning_action_item_ids, vec![command_item]);
         assert_eq!(review.output_ids, vec![output_id]);
         assert_eq!(review.evidence_coverage, EvidenceCoverage::Partial);
-        assert!(
-            review
-                .phases
-                .iter()
-                .any(|phase| phase.phase == ActivityPhase::Verified && phase.failed_count == 1)
-        );
+        assert!(review
+            .phases
+            .iter()
+            .any(|phase| phase.phase == ActivityPhase::Verified && phase.failed_count == 1));
         review.validate().unwrap();
     }
 
@@ -17432,12 +17374,10 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
             .unwrap();
         assert_eq!(context.document_context_tokens, 41);
         assert_eq!(context.project_file_context_tokens, 15);
-        assert!(
-            items
-                .pending_user_items
-                .iter()
-                .all(|pending| pending.context_attributed)
-        );
+        assert!(items
+            .pending_user_items
+            .iter()
+            .all(|pending| pending.context_attributed));
     }
 
     #[test]
