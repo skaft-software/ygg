@@ -2,6 +2,9 @@
 
 use crate::error::{AuthError, ConfigError};
 
+/// Maximum number of bytes accepted from an environment variable.
+pub const MAX_ENV_VALUE_BYTES: usize = 4096;
+
 /// A wrapper for sensitive values (API keys, credentials) that prevents accidental exposure.
 ///
 /// It overrides `Debug` and `Display` to redact the underlying secret, and does not implement
@@ -33,12 +36,34 @@ impl From<&str> for Secret {
     }
 }
 
+/// Reads an environment variable while enforcing [`MAX_ENV_VALUE_BYTES`].
+///
+/// An unset variable returns `Ok(None)`. A value that is not valid Unicode
+/// returns [`ConfigError::InvalidEnv`], and an otherwise valid value over the
+/// byte limit returns [`ConfigError::EnvironmentValueTooLarge`].
+pub fn read_bounded_env(var: &str) -> Result<Option<String>, ConfigError> {
+    match std::env::var(var) {
+        Ok(value) if value.len() > MAX_ENV_VALUE_BYTES => {
+            Err(ConfigError::EnvironmentValueTooLarge {
+                var: var.to_owned(),
+                max_bytes: MAX_ENV_VALUE_BYTES,
+            })
+        }
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEnv(var.to_owned())),
+    }
+}
+
 impl Secret {
     /// Loads a secret from the environment.
     pub fn from_env(var: &str) -> Result<Self, ConfigError> {
-        match std::env::var(var) {
-            Ok(val) => Ok(Self::from(val)),
-            Err(_) => Err(ConfigError::MissingEnv(var.to_string())),
+        match read_bounded_env(var) {
+            Ok(Some(value)) => Ok(Self::from(value)),
+            Ok(None) | Err(ConfigError::InvalidEnv(_)) => {
+                Err(ConfigError::MissingEnv(var.to_owned()))
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -144,8 +169,8 @@ impl Auth {
     /// and dynamic credentials are usable by construction.
     pub fn is_configured(&self) -> bool {
         match self {
-            Self::BearerEnv { var } | Self::HeaderEnv { var, .. } => std::env::var(var)
-                .map(|value| !value.trim().is_empty())
+            Self::BearerEnv { var } | Self::HeaderEnv { var, .. } => Secret::from_env(var)
+                .map(|secret| !secret.expose().trim().is_empty())
                 .unwrap_or(false),
             Self::None | Self::Bearer(_) | Self::Header { .. } | Self::Dynamic(_) => true,
         }
@@ -258,6 +283,18 @@ impl CredentialRedactor {
     }
 }
 
+fn resolve_env_secret(var: &str) -> Result<Secret, AuthError> {
+    Secret::from_env(var).map_err(|error| match error {
+        ConfigError::MissingEnv(_) | ConfigError::InvalidEnv(_) => {
+            AuthError::MissingEnvironment(var.to_owned())
+        }
+        ConfigError::EnvironmentValueTooLarge { var, max_bytes } => {
+            AuthError::EnvironmentValueTooLarge { var, max_bytes }
+        }
+        _ => AuthError::Resolve,
+    })
+}
+
 /// Resolves authentication settings into concrete headers and a request-scoped
 /// credential redactor.
 pub(crate) async fn resolve_headers(auth: &Auth) -> Result<ResolvedHeaders, AuthError> {
@@ -282,21 +319,19 @@ pub(crate) async fn resolve_headers(auth: &Auth) -> Result<ResolvedHeaders, Auth
             headers.insert(name.clone(), val);
         }
         Auth::BearerEnv { var } => {
-            let val_str =
-                std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
-            redactor.insert(Secret::from(val_str.as_str()));
-            let bearer_str = format!("Bearer {}", val_str);
+            let secret = resolve_env_secret(var)?;
+            redactor.insert(secret.clone());
+            let bearer_str = format!("Bearer {}", secret.expose());
             let mut val = http::HeaderValue::from_str(&bearer_str)
                 .map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
             headers.insert(http::header::AUTHORIZATION, val);
         }
         Auth::HeaderEnv { name, var } => {
-            let val_str =
-                std::env::var(var).map_err(|_| AuthError::MissingEnvironment(var.clone()))?;
-            redactor.insert(Secret::from(val_str.as_str()));
-            let mut val =
-                http::HeaderValue::from_str(&val_str).map_err(|_| AuthError::InvalidHeaderValue)?;
+            let secret = resolve_env_secret(var)?;
+            redactor.insert(secret.clone());
+            let mut val = http::HeaderValue::from_str(secret.expose())
+                .map_err(|_| AuthError::InvalidHeaderValue)?;
             val.set_sensitive(true);
             headers.insert(name.clone(), val);
         }

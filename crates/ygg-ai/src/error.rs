@@ -252,6 +252,17 @@ pub enum ConfigError {
     /// Environment variable not set.
     #[error("Missing environment variable: {0}")]
     MissingEnv(String),
+    /// Environment variable contained a value that is not valid Unicode.
+    #[error("Invalid environment variable: {0}")]
+    InvalidEnv(String),
+    /// Environment variable value exceeded the accepted byte limit.
+    #[error("Environment variable {var} exceeds the {max_bytes}-byte limit")]
+    EnvironmentValueTooLarge {
+        /// Name of the environment variable.
+        var: String,
+        /// Maximum accepted value size in bytes.
+        max_bytes: usize,
+    },
     /// Credential resolver is missing for dynamic auth.
     #[error("Missing credential resolver: {0}")]
     MissingCredentialResolver(String),
@@ -295,6 +306,14 @@ pub enum AuthError {
     /// An environment-backed credential was not available.
     #[error("Credential environment variable is missing: {0}")]
     MissingEnvironment(String),
+    /// An environment-backed credential exceeded the accepted byte limit.
+    #[error("Credential environment variable {var} exceeds the {max_bytes}-byte limit")]
+    EnvironmentValueTooLarge {
+        /// Name of the environment variable.
+        var: String,
+        /// Maximum accepted value size in bytes.
+        max_bytes: usize,
+    },
     /// A credential could not be represented as an HTTP header value.
     #[error("Credential contains invalid HTTP header bytes")]
     InvalidHeaderValue,
