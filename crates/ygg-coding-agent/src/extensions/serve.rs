@@ -428,6 +428,7 @@ struct YggHost {
     goals: GoalStore,
     trusted_files: Arc<Mutex<HashMap<String, TrustedProjectFiles>>>,
     search_index: Arc<Mutex<TranscriptSearchIndex>>,
+    search_index_initialized: Arc<AtomicBool>,
     resources: Option<ygg_serve_backend::ResourceStore>,
     usage: Arc<Mutex<InferenceRequestStore>>,
     pull_requests: Arc<Mutex<PullRequestStore>>,
@@ -1268,6 +1269,7 @@ impl YggHost {
             goals,
             trusted_files: Arc::new(Mutex::new(HashMap::new())),
             search_index: Arc::new(Mutex::new(TranscriptSearchIndex::new())),
+            search_index_initialized: Arc::new(AtomicBool::new(false)),
             resources,
             usage: Arc::new(Mutex::new(usage)),
             pull_requests: Arc::new(Mutex::new(pull_requests)),
@@ -2803,6 +2805,7 @@ impl HostService for YggHost {
     ) -> Result<TranscriptSearchResult, ServiceError> {
         let projects = Arc::clone(&self.projects);
         let search_index = Arc::clone(&self.search_index);
+        let search_index_initialized = Arc::clone(&self.search_index_initialized);
         let base_config = self.config.clone();
         let catalog = self.catalog.clone();
         let fallback = self.default_selection()?;
@@ -2811,62 +2814,70 @@ impl HostService for YggHost {
         let request = request.clone();
         let authority = self.authority_ceiling();
         tokio::task::spawn_blocking(move || {
-            let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
-            let mut rebuilt = TranscriptSearchIndex::new();
-            for project in projects.list() {
-                let Ok(root) = projects.resolve_trusted_root(&project.id) else {
-                    continue;
-                };
-                let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
-                let bound = projects.sessions_for_project(&project.id);
-                let public_project_id =
-                    ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
-                let mut project_config = base_config.clone();
-                project_config.workspace = root.as_path().to_owned();
-                project_config.invocation_cwd = root.as_path().to_owned();
-                project_config.workspace_trusted = true;
-                for session_id_text in
-                    sessions.session_ids_newest_first(bound.iter().map(String::as_str))
-                {
-                    let Ok(session_id) = SessionId::new(session_id_text.clone()) else {
+            // Hold the index lock while the one-time historical rebuild runs so
+            // a concurrent run completion or deletion cannot be overwritten by
+            // the snapshot being installed. Subsequent searches never acquire
+            // the project registry lock or reopen session transcripts.
+            let mut search_index = search_index.lock().map_err(|_| ServiceError::Internal)?;
+            if !search_index_initialized.load(Ordering::Acquire) {
+                let projects = projects.lock().map_err(|_| ServiceError::Internal)?;
+                let mut rebuilt = TranscriptSearchIndex::new();
+                for project in projects.list() {
+                    let Ok(root) = projects.resolve_trusted_root(&project.id) else {
                         continue;
                     };
-                    let Ok(path) = sessions.path_by_id(&session_id_text) else {
-                        continue;
-                    };
-                    let Ok(session) = Session::open_read_only(&path) else {
-                        continue;
-                    };
-                    let Ok(Some(meta)) = sessions.meta_for_open_session(&session_id_text, &session)
-                    else {
-                        continue;
-                    };
-                    let selection = selection_from_session(&session, &catalog, &project_config)
-                        .unwrap_or_else(|_| fallback.clone());
-                    let seed = seed_from_session(
-                        &session,
-                        session_id.clone(),
-                        SessionSeedOptions {
-                            workspace: &project_config.workspace,
-                            project_id: Some(public_project_id.clone()),
-                            model: selection,
-                            authority,
-                            generation: 1,
-                            meta: Some(meta),
-                            attachment_store: attachments.as_ref(),
-                            resource_store: resources.as_ref(),
-                        },
-                    )?;
-                    rebuilt
-                        .replace_session(session_id.as_str(), search_documents_for_seed(&seed))
-                        .map_err(transcript_search_service_error)?;
+                    let sessions = SessionStore::new(&base_config.session_dir, root.as_path());
+                    let bound = projects.sessions_for_project(&project.id);
+                    let public_project_id =
+                        ProjectId::new(project.id.as_str()).map_err(|_| ServiceError::Internal)?;
+                    let mut project_config = base_config.clone();
+                    project_config.workspace = root.as_path().to_owned();
+                    project_config.invocation_cwd = root.as_path().to_owned();
+                    project_config.workspace_trusted = true;
+                    for session_id_text in
+                        sessions.session_ids_newest_first(bound.iter().map(String::as_str))
+                    {
+                        let Ok(session_id) = SessionId::new(session_id_text.clone()) else {
+                            continue;
+                        };
+                        let Ok(path) = sessions.path_by_id(&session_id_text) else {
+                            continue;
+                        };
+                        let Ok(session) = Session::open_read_only(&path) else {
+                            continue;
+                        };
+                        let Ok(Some(meta)) =
+                            sessions.meta_for_open_session(&session_id_text, &session)
+                        else {
+                            continue;
+                        };
+                        let selection = selection_from_session(&session, &catalog, &project_config)
+                            .unwrap_or_else(|_| fallback.clone());
+                        let seed = seed_from_session(
+                            &session,
+                            session_id.clone(),
+                            SessionSeedOptions {
+                                workspace: &project_config.workspace,
+                                project_id: Some(public_project_id.clone()),
+                                model: selection,
+                                authority,
+                                generation: 1,
+                                meta: Some(meta),
+                                attachment_store: attachments.as_ref(),
+                                resource_store: resources.as_ref(),
+                            },
+                        )?;
+                        rebuilt
+                            .replace_session(session_id.as_str(), search_documents_for_seed(&seed))
+                            .map_err(transcript_search_service_error)?;
+                    }
                 }
+                *search_index = rebuilt;
+                search_index_initialized.store(true, Ordering::Release);
             }
-            let result = rebuilt
+            search_index
                 .search_request(&request)
-                .map_err(transcript_search_service_error)?;
-            *search_index.lock().map_err(|_| ServiceError::Internal)? = rebuilt;
-            Ok(result)
+                .map_err(transcript_search_service_error)
         })
         .await
         .map_err(|_| ServiceError::Internal)?
@@ -11826,6 +11837,40 @@ mod tests {
         let mut driver = host.open_session(&session_id).await.unwrap();
         assert_eq!(driver.seed().summary.model, terminal_selection);
         driver.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_search_reuses_the_initialized_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = project_test_config(directory.path(), true);
+        config.workspace = config.workspace.canonicalize().unwrap();
+        config.invocation_cwd = config.workspace.clone();
+        let sessions = SessionStore::new(&config.session_dir, &config.workspace);
+        std::fs::create_dir_all(sessions.dir()).unwrap();
+        let mut session = Session::create(sessions.dir().join("search-session.jsonl")).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("searchable historical text".into())],
+            })))
+            .unwrap();
+        drop(session);
+
+        let host = YggHost::new(config).unwrap();
+        let request = TranscriptSearchRequest {
+            query: "historical".into(),
+            filter: Default::default(),
+            limit: 10,
+        };
+        let first = HostService::search_transcripts(&host, &request)
+            .await
+            .unwrap();
+        assert_eq!(first.hits.len(), 1);
+        assert!(host.search_index_initialized.load(Ordering::Acquire));
+
+        let second = HostService::search_transcripts(&host, &request)
+            .await
+            .unwrap();
+        assert_eq!(second, first);
     }
 
     #[tokio::test]
