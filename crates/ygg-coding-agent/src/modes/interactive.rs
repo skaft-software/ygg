@@ -3856,6 +3856,9 @@ fn absolute_resume_path(path: &Path, cwd: &Path) -> PathBuf {
 }
 
 fn resume_scope_path(path: &Path, cwd: &Path) -> Option<String> {
+    // Keep private absolute paths out of the notice. Resolve parent components
+    // inside the user's shell before passing the path to SessionStore, which
+    // deliberately rejects traversal components.
     let relative = relative_resume_path(cwd, path)?;
     let mut parents = Vec::new();
     let mut suffix = PathBuf::new();
