@@ -95,9 +95,11 @@ def validate_identity(
             fail(f"{label} commit is malformed")
     if repository != REPOSITORY:
         fail(f"repository is not the canonical Ygg repository: {repository}")
-    expected_prefix = f"{repository}/.github/workflows/release-ygg.yml@"
-    if not workflow_ref.startswith(expected_prefix):
-        fail(f"workflow ref is not the canonical release workflow: {workflow_ref}")
+    expected_workflow_ref = (
+        f"{repository}/.github/workflows/release-ygg.yml@refs/tags/ygg-binaries-{tag}"
+    )
+    if workflow_ref != expected_workflow_ref:
+        fail(f"workflow ref is not the immutable binary release workflow tag: {workflow_ref}")
 
 
 def write_atomic(path: pathlib.Path, payload: bytes) -> None:
