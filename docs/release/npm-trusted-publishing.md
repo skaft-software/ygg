@@ -50,6 +50,11 @@ environment. The workflow uses GitHub OIDC with `npm publish --provenance`; it
 must not use `NPM_TOKEN`, `NODE_AUTH_TOKEN`, a checked-in `.npmrc`, or another
 long-lived registry credential. The environment is the human approval boundary.
 
+Canonical binary tag runs leave npm publication disabled. Only after the four
+trusted publishers and cryptographic provenance verification are ready, dispatch
+`release-ygg.yml` from the exact canonical `vX.Y.Z` tag with `release_tag` set to
+that tag and `publish_npm=true`.
+
 The publication job pins npm CLI `11.5.1` (or a later explicitly reviewed
 version that supports trusted publishing) before it requests OIDC provenance.
 
