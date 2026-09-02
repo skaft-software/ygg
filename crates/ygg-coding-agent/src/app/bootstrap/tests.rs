@@ -21,7 +21,7 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
-fn codex_compaction_uses_the_full_window_by_default_and_allows_caps() {
+fn codex_compaction_respects_model_window_and_allows_smaller_caps() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = config(directory.path(), None);
     let catalog = base_model_catalog(true).unwrap();
@@ -846,14 +846,7 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
         let model = catalog.resolve(&ModelId((*model_id).into())).unwrap();
         assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
         assert_eq!(model.spec.protocol, Protocol::OpenAiResponses);
-        assert_eq!(
-            model.spec.limits.context_window,
-            if model_id.starts_with("gpt-5.6-") {
-                372_000
-            } else {
-                272_000
-            }
-        );
+        assert_eq!(model.spec.limits.context_window, 272_000);
         assert_eq!(model.spec.limits.max_output_tokens, 128_000);
         assert!(model.spec.pricing.is_some());
         assert!(!model.spec.cache.supports_long_retention);
@@ -868,7 +861,7 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
         );
     }
     let sol = catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
-    assert_eq!(crate::compaction::context_window(&sol), 372_000);
+    assert_eq!(crate::compaction::context_window(&sol), 272_000);
 
     // Pro is not in the fallback subscription catalog. Luna is included and
     // live account discovery can add or remove models independently of it.
@@ -1026,7 +1019,7 @@ fn codex_catalog_query_uses_the_implemented_schema_version() {
 }
 
 #[test]
-fn codex_discovery_accepts_account_catalog_and_uses_live_metadata() {
+fn codex_discovery_accepts_account_catalog_and_caps_live_context() {
     let body = serde_json::json!({
         "models": [
             {
@@ -1052,7 +1045,7 @@ fn codex_discovery_accepts_account_catalog_and_uses_live_metadata() {
         .iter()
         .find(|model| model.id == "gpt-5.6-luna")
         .unwrap();
-    assert_eq!(luna.context_window, 400_000);
+    assert_eq!(luna.context_window, CODEX_CONTEXT_WINDOW_CAP);
     assert_eq!(luna.max_context_window, 400_000);
     assert_eq!(luna.max_output_tokens, 150_000);
     assert_eq!(luna.min_effort, ygg_ai::ReasoningEffort::Low);
@@ -1122,7 +1115,7 @@ fn codex_discovery_never_exposes_ultra_without_complete_v2_metadata() {
 }
 
 #[test]
-fn codex_discovery_selects_default_or_max_window_from_oauth_plan() {
+fn codex_discovery_caps_default_and_max_plan_windows_at_272k() {
     let body = serde_json::json!({
         "models": [{
             "slug": "gpt-5.4",
@@ -1140,11 +1133,27 @@ fn codex_discovery_selects_default_or_max_window_from_oauth_plan() {
     );
     assert_eq!(
         codex_models_from_response(&body, Some(&pro)).unwrap()[0].context_window,
-        1_000_000
+        272_000
     );
     assert_eq!(
         codex_models_from_response(&body, Some(&pro_lite)).unwrap()[0].context_window,
-        1_000_000
+        272_000
+    );
+
+    let smaller_body = serde_json::json!({
+        "models": [{
+            "slug": "gpt-small-window",
+            "context_window": 128_000,
+            "max_context_window": 200_000
+        }]
+    });
+    assert_eq!(
+        codex_models_from_response(&smaller_body, Some(&plus)).unwrap()[0].context_window,
+        128_000
+    );
+    assert_eq!(
+        codex_models_from_response(&smaller_body, Some(&pro)).unwrap()[0].context_window,
+        200_000
     );
 }
 
@@ -1251,6 +1260,18 @@ fn codex_model_cache_fails_closed_when_stale_future_dated_or_incomplete() {
     assert!(load_codex_model_cache(&malformed, &claims).is_err());
 
     let valid_value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
+
+    let mut prior_schema = valid_value.clone();
+    prior_schema["version"] = serde_json::json!(CODEX_MODEL_CACHE_VERSION - 1);
+    let prior_schema_store =
+        crate::auth::codex::CredentialStore::new(directory.path().join("prior-schema.json"));
+    prior_schema_store
+        .save_model_cache(&serde_json::to_vec(&prior_schema).unwrap())
+        .unwrap();
+    assert!(load_codex_model_cache(&prior_schema_store, &claims)
+        .unwrap()
+        .is_none());
+
     let mut cases = Vec::new();
 
     let mut missing_delegation = valid_value.clone();

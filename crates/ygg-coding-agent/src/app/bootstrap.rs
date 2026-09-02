@@ -2850,12 +2850,12 @@ fn extract_ctx_from_model_entry(entry: &serde_json::Value) -> u64 {
 const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
+const CODEX_CONTEXT_WINDOW_CAP: u64 = 272_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
-/// Optional absolute active-context ceiling for Codex routes. There is no
-/// route default: the full provider-advertised window (872K, 1M on Pro) is
-/// available for in-context learning, and users can constrain the working
-/// set with `compaction.max_active_tokens` (for example 272_000).
-const CODEX_MODEL_CACHE_VERSION: u8 = 2;
+/// Codex retains the provider-advertised maximum as discovery metadata, while
+/// Ygg deliberately budgets requests against Pi's 272K working window. Smaller
+/// advertised windows remain authoritative.
+const CODEX_MODEL_CACHE_VERSION: u8 = 3;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
 // not Ygg's package version. Sending `0.1.0` causes the backend to filter out
@@ -3072,11 +3072,12 @@ fn codex_context_window_for_plan(
     max_context_window: u64,
     plan: Option<&crate::auth::codex::ChatGptPlan>,
 ) -> u64 {
-    if plan.is_some_and(crate::auth::codex::ChatGptPlan::uses_max_context_window) {
+    let selected = if plan.is_some_and(crate::auth::codex::ChatGptPlan::uses_max_context_window) {
         max_context_window
     } else {
         default_context_window
-    }
+    };
+    selected.min(CODEX_CONTEXT_WINDOW_CAP)
 }
 
 fn codex_model_limits(

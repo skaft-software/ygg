@@ -287,8 +287,9 @@ closed.
 
 Authenticated Codex discovery sends client version `0.147.0` and parses the
 provider's reasoning levels, `use_responses_lite`, and
-`multi_agent_version: "v2"`. Cache schema version 2 preserves those fields and
-is scoped to the authenticated account context. Only fresh, complete,
+`multi_agent_version: "v2"`. Cache schema version 3 preserves those fields and
+the 272K Codex request-window cap, and is scoped to the authenticated account
+context. Only fresh, complete,
 account-matched metadata is registered. Stale or future-dated cache entries are
 refreshed synchronously before online catalog construction; malformed,
 incomplete, duplicate, or inconsistent entries fail closed. Offline launches
