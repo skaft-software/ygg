@@ -60,7 +60,14 @@ first-body allowance, a five-minute inter-chunk idle allowance, and a one-hour
 overall body deadline. Optional error snippets use tighter two-second idle and
 five-second overall ceilings after the HTTP status is known. A preferred
 WebSocket falls back to HTTP when connection establishment fails before a
-generation frame could have been sent. A bounded body-disconnect retry is also
+generation frame could have been sent. During an active OpenAI Responses
+WebSocket generation, Ping/Pong probes run at most every fifteen seconds with
+at most a ten-second acknowledgement deadline (both shorten with a configured
+response-idle bound). A Pong proves only control-path liveness and never
+extends the provider-event idle deadline. A missed probe retires and disables
+the pooled socket before reporting a post-send body timeout, so it cannot
+silently replay the generation; a caller's explicit subsequent request follows
+the normal HTTP fallback path. A bounded body-disconnect retry is also
 allowed only before any text, reasoning, media, or tool generation is observed;
 post-send header timeouts and every failure after generation are terminal so
 provider work is never replayed ambiguously. A provider error reporting WebSocket
@@ -70,8 +77,9 @@ Once generation has been observed, every automatic retry path remains disabled.
 The coding product uses a
 fifteen-minute response-header default for built-in and custom routes; custom
 providers can override that startup allowance for their own cold-start profile.
-All of these are cancellable bounds, not a requirement to wait before cancelling
-a stalled request.
+Mid-stream failures retain bounded progress counters plus elapsed and
+last-provider-event timing for operational diagnosis. All of these are
+cancellable bounds, not a requirement to wait before cancelling a stalled request.
 
 Observed indices use a hash set and are sorted only during final assembly, keeping hostile many-part processing near-linear.
 

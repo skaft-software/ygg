@@ -24,12 +24,49 @@ const RESPONSES_WEBSOCKETS_BETA: &str = "responses_websockets=2026-02-06";
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECTION_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Normal liveness probes catch a lost route well before the five-minute
+/// response-progress deadline without burdening an otherwise idle socket.
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const DEFAULT_HEARTBEAT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Transport-liveness timing for one active Responses generation.
+///
+/// This deliberately scales down with a caller's response-idle bound so a
+/// shorter configured response timeout is not unexpectedly slower to detect a
+/// half-open socket. Pong traffic never reaches the response event channel and
+/// therefore cannot extend model-generation progress deadlines.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponsesWsLiveness {
+    interval: Duration,
+    acknowledgement_timeout: Duration,
+}
+
+impl ResponsesWsLiveness {
+    pub(crate) fn for_response_idle(response_idle_timeout: Duration) -> Self {
+        let fraction = (response_idle_timeout / 4).max(Duration::from_millis(1));
+        Self {
+            interval: DEFAULT_HEARTBEAT_INTERVAL.min(fraction),
+            acknowledgement_timeout: DEFAULT_HEARTBEAT_ACK_TIMEOUT.min(fraction),
+        }
+    }
+}
 
 fn transport_error(phase: TransportPhase, message: impl Into<String>) -> AiError {
     AiError::Transport(TransportError {
         phase,
         timeout: false,
         message: message.into(),
+    })
+}
+
+/// A post-send liveness failure is deliberately a body timeout. The request
+/// may already be executing remotely, so the agent's timeout policy must not
+/// transparently replay it.
+fn heartbeat_timeout(message: &'static str) -> AiError {
+    AiError::Transport(TransportError {
+        phase: TransportPhase::Body,
+        timeout: true,
+        message: message.to_owned(),
     })
 }
 
@@ -184,6 +221,7 @@ struct RequestCommand {
     body: Value,
     reply: mpsc::Sender<Result<Value, AiError>>,
     started: oneshot::Sender<Result<(), String>>,
+    liveness: ResponsesWsLiveness,
 }
 
 #[derive(Clone)]
@@ -348,6 +386,7 @@ impl ResponsesWsPool {
         url: Url,
         headers: http::HeaderMap,
         body: Value,
+        liveness: ResponsesWsLiveness,
     ) -> Result<mpsc::Receiver<Result<Value, AiError>>, AiError> {
         let connection = self.connect(key, url, headers).await?;
         let (reply, events) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
@@ -356,6 +395,7 @@ impl ResponsesWsPool {
             body,
             reply,
             started,
+            liveness,
         };
         if connection.sender.send(command).await.is_err() {
             connection.alive.store(false, Ordering::Release);
@@ -401,6 +441,7 @@ impl ResponsesWsPool {
         url: Url,
         headers: http::HeaderMap,
         mut body: Value,
+        liveness: ResponsesWsLiveness,
     ) -> Result<(), AiError> {
         let Some(object) = body.as_object_mut() else {
             return Err(crate::error::DecodeError::Json(
@@ -409,7 +450,9 @@ impl ResponsesWsPool {
             .into());
         };
         object.insert("generate".to_owned(), Value::Bool(false));
-        let mut events = self.request(Some(key), url, headers, body).await?;
+        let mut events = self
+            .request(Some(key), url, headers, body, liveness)
+            .await?;
         while let Some(event) = events.recv().await {
             let event = event?;
             if terminal_kind(&event).is_some() {
@@ -611,6 +654,15 @@ async fn run_connection<S>(
         let _ = command.started.send(Ok(()));
 
         let mut terminal = false;
+        // Heartbeats prove only that the transport path still carries control
+        // frames. They are intentionally kept out of `reply`, so the client
+        // continues to apply its independent model-response idle deadline.
+        let heartbeat = tokio::time::sleep(command.liveness.interval);
+        tokio::pin!(heartbeat);
+        let heartbeat_ack = tokio::time::sleep(Duration::from_secs(24 * 60 * 60));
+        tokio::pin!(heartbeat_ack);
+        let mut expected_pong: Option<tungstenite::Bytes> = None;
+        let mut heartbeat_sequence = 0_u64;
         loop {
             let message = tokio::select! {
                 biased;
@@ -621,6 +673,45 @@ async fn run_connection<S>(
                     alive.store(false, Ordering::Release);
                     disable_key(&state, key.as_deref()).await;
                     break 'actor;
+                }
+                _ = &mut heartbeat_ack, if expected_pong.is_some() => {
+                    // Retire before publishing the error: a later explicit
+                    // request must not race this half-open actor or reuse it.
+                    alive.store(false, Ordering::Release);
+                    disable_key(&state, key.as_deref()).await;
+                    let _ = command.reply.send(Err(heartbeat_timeout(
+                        "Responses WebSocket heartbeat acknowledgement timed out; network path may have been lost",
+                    ))).await;
+                    break 'actor;
+                }
+                _ = &mut heartbeat, if expected_pong.is_none() => {
+                    heartbeat_sequence = heartbeat_sequence.wrapping_add(1);
+                    let payload: tungstenite::Bytes = heartbeat_sequence.to_be_bytes().to_vec().into();
+                    let ping_result = tokio::select! {
+                        biased;
+                        _ = command.reply.closed() => {
+                            alive.store(false, Ordering::Release);
+                            disable_key(&state, key.as_deref()).await;
+                            break 'actor;
+                        }
+                        result = tokio::time::timeout(
+                            command.liveness.acknowledgement_timeout,
+                            socket.send(Message::Ping(payload.clone())),
+                        ) => result,
+                    };
+                    if !matches!(ping_result, Ok(Ok(()))) {
+                        alive.store(false, Ordering::Release);
+                        disable_key(&state, key.as_deref()).await;
+                        let _ = command.reply.send(Err(heartbeat_timeout(
+                            "Responses WebSocket heartbeat probe failed; network path may have been lost",
+                        ))).await;
+                        break 'actor;
+                    }
+                    expected_pong = Some(payload);
+                    heartbeat_ack.as_mut().reset(
+                        tokio::time::Instant::now() + command.liveness.acknowledgement_timeout,
+                    );
+                    continue;
                 }
                 message = socket.next() => message,
             };
@@ -733,11 +824,17 @@ async fn run_connection<S>(
                             disable_key(&state, key.as_deref()).await;
                             break 'actor;
                         }
-                        result = socket.send(Message::Pong(payload)) => result,
+                        result = tokio::time::timeout(
+                            command.liveness.acknowledgement_timeout,
+                            socket.send(Message::Pong(payload)),
+                        ) => result,
                     };
-                    if pong_result.is_err() {
+                    if !matches!(pong_result, Ok(Ok(()))) {
                         alive.store(false, Ordering::Release);
                         disable_key(&state, key.as_deref()).await;
+                        let _ = command.reply.send(Err(heartbeat_timeout(
+                            "Responses WebSocket control response failed; network path may have been lost",
+                        ))).await;
                         break 'actor;
                     }
                 }
@@ -753,7 +850,18 @@ async fn run_connection<S>(
                     disable_key(&state, key.as_deref()).await;
                     break 'actor;
                 }
-                Message::Pong(_) | Message::Frame(_) => {}
+                Message::Pong(payload) => {
+                    if expected_pong
+                        .as_ref()
+                        .is_some_and(|expected| expected == &payload)
+                    {
+                        expected_pong = None;
+                        heartbeat
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + command.liveness.interval);
+                    }
+                }
+                Message::Frame(_) => {}
             }
         }
         if !terminal {
@@ -939,6 +1047,7 @@ mod tests {
                     Url::parse("ws://127.0.0.1:1/").unwrap(),
                     http::HeaderMap::new(),
                     serde_json::json!({"model": "gpt", "input": []}),
+                    ResponsesWsLiveness::for_response_idle(Duration::from_secs(60)),
                 )
                 .await
             }
@@ -1037,6 +1146,7 @@ mod tests {
                 body: serde_json::json!({"model": "gpt", "input": []}),
                 reply,
                 started,
+                liveness: ResponsesWsLiveness::for_response_idle(Duration::from_secs(60)),
             })
             .await
             .unwrap();
