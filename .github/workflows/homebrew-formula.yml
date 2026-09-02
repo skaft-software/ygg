@@ -1,9 +1,6 @@
 name: Homebrew formula handoff
 
 on:
-  workflow_run:
-    workflows: [Ygg binary release]
-    types: [completed]
   workflow_dispatch:
     inputs:
       release_tag:
@@ -25,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: homebrew-formula-${{ github.event.workflow_run.head_branch || inputs.release_tag || github.run_id }}
+  group: homebrew-formula-${{ inputs.release_tag || github.run_id }}
   cancel-in-progress: false
 
 env:
@@ -35,10 +32,6 @@ env:
 jobs:
   prepare:
     name: Verify metadata and render formula
-    if: >-
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'success') ||
-      github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     outputs:
       release_tag: ${{ steps.resolve.outputs.release_tag }}
@@ -49,31 +42,19 @@ jobs:
         name: Resolve the immutable binary workflow run
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
           CURRENT_REF_TYPE: ${{ github.ref_type }}
           CURRENT_REF_NAME: ${{ github.ref_name }}
           CURRENT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [[ "$EVENT_NAME" == workflow_run ]]; then
-            workflow_tag=${RUN_HEAD_BRANCH:-}
-            workflow_commit=$RUN_HEAD_SHA
-            case "$workflow_tag" in
-              ygg-binaries-v*) release_tag=${workflow_tag#ygg-binaries-} ;;
-              *) echo "workflow run is not a binary release tag: $workflow_tag" >&2; exit 1 ;;
-            esac
-          else
-            release_tag=$INPUT_RELEASE_TAG
-            if [[ "$CURRENT_REF_TYPE" != tag || "$CURRENT_REF_NAME" != "ygg-binaries-$release_tag" ]]; then
-              echo "manual formula renders must run from ygg-binaries-$release_tag" >&2
-              exit 1
-            fi
-            workflow_tag=$CURRENT_REF_NAME
-            workflow_commit=$CURRENT_SHA
+          release_tag=$INPUT_RELEASE_TAG
+          if [[ "$CURRENT_REF_TYPE" != tag || "$CURRENT_REF_NAME" != "ygg-binaries-$release_tag" ]]; then
+            echo "formula renders must run from ygg-binaries-$release_tag" >&2
+            exit 1
           fi
+          workflow_tag=$CURRENT_REF_NAME
+          workflow_commit=$CURRENT_SHA
           if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "release tag is not a stable canonical tag: $release_tag" >&2
             exit 1
@@ -92,7 +73,6 @@ jobs:
       - name: Check out the exact release workflow tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ steps.resolve.outputs.workflow_commit }}
           fetch-depth: 0
           persist-credentials: false
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6

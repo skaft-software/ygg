@@ -45,9 +45,11 @@ A release candidate must first have a stable `vX.Y.Z` tag, a signed native
 checksum manifest, and a signed immutable metadata document. The Homebrew
 workflow downloads that exact metadata and its signature from the canonical
 release, verifies the Sigstore identity against the release workflow commit,
-and renders `Formula/ygg.rb` in a clean tap checkout. It then checks the
-formula diff and opens a protected tap pull request; it must never replace a
-formula directly on the default branch.
+and renders `Formula/ygg.rb` in a clean tap checkout. Formula rendering and tap
+publication require an explicit dispatch from the matching
+`ygg-binaries-vX.Y.Z` tooling tag; binary release completion alone never mutates
+the tap. The workflow then checks the formula diff and opens a protected tap
+pull request; it must never replace a formula directly on the default branch.
 
 The tap repository and its GitHub App/installation permission are deployment
 configuration, not source-controlled credentials. Configure them in the

@@ -356,9 +356,6 @@ def main(argv: Sequence[str]) -> int:
                 "artifact": item.artifact,
                 "name": item.name,
                 "version": version,
-                "compressed_bytes": path.stat().st_size,
-                "expanded_bytes": inspection.expanded_bytes,
-                "entries": len(inspection.members),
             }
         )
     report = {

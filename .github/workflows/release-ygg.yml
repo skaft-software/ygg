@@ -680,7 +680,6 @@ jobs:
       - name: Check out immutable release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.resolve.outputs.workflow_commit }}
           fetch-depth: 0
           path: source
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -796,7 +795,6 @@ jobs:
       - name: Check out immutable release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ needs.resolve.outputs.workflow_commit }}
           fetch-depth: 0
           path: source
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -1031,8 +1029,6 @@ jobs:
     steps:
       - name: Check out immutable verifier
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ needs.resolve.outputs.workflow_commit }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version-file: apps/web/.node-version
