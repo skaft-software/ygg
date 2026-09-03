@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AiError, ConfigError, DecodeError, ProviderError};
 use crate::protocol::sse::SseEvent;
 use crate::protocol::{
-    cache_control, cache_session_id, prompt_cache_key, Base64Bytes, CacheControl, HttpRequestParts,
-    WireImageUrl,
+    cache_control, cache_session_id, emit_event, prompt_cache_key, Base64Bytes, CacheControl,
+    HttpRequestParts, WireImageUrl,
 };
 use crate::stream::{
     OpenAiChatCompatibilityState, ResponseBuilder, StreamEvent, MAX_RESPONSE_PARTS,
@@ -17,7 +17,8 @@ use crate::types::{
     AssistantMessage, AssistantPart, AudioFormat, AudioMedia, AudioPayload, AudioVoice,
     ImageSource, Media, Message, OpenAiChatReasoningMode, OutputFormat, OutputModalities, Protocol,
     ProviderMediaRef, ReasoningConfig, ReasoningEffort, ReasoningPart, Request, Response,
-    StopReason, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResultPart, Usage, UserPart,
+    StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId, ToolChoice,
+    ToolDef, ToolResultPart, Usage, UserPart,
 };
 use crate::validate::{normalize_request_reasoning, validate_request};
 
@@ -1151,17 +1152,30 @@ fn decode_response_inner(
         for tc in tcs {
             let arguments_json = crate::json_repair::normalize_json_object(&tc.function.arguments)
                 .map_err(AiError::Decode)?;
-            if let Some(tools) = tool_definitions {
+            let argument_error = if let Some(tools) = tool_definitions {
                 let arguments = serde_json::from_str(&arguments_json)
                     .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
-                crate::json_repair::validate_tool_arguments(&tc.function.name, &arguments, tools)
-                    .map_err(AiError::Decode)?;
-            }
+                match crate::json_repair::validate_tool_arguments(
+                    &tc.function.name,
+                    &arguments,
+                    tools,
+                )
+                .map_err(AiError::Decode)?
+                {
+                    ToolArgumentValidation::SchemaMismatch => {
+                        Some(ToolCallArgumentError::SchemaMismatch)
+                    }
+                    ToolArgumentValidation::Valid | ToolArgumentValidation::UnknownTool => None,
+                }
+            } else {
+                None
+            };
 
             content.push(AssistantPart::ToolCall(ToolCall {
                 id: ToolCallId(tc.id.clone()),
                 name: tc.function.name.clone(),
                 arguments_json,
+                argument_error,
             }));
         }
     }
@@ -1243,16 +1257,6 @@ fn decode_response_inner(
         responses_output: None,
         diagnostics: Vec::new(),
     })
-}
-
-fn emit_event(
-    events: &mut Vec<StreamEvent>,
-    builder: &mut ResponseBuilder,
-    ev: StreamEvent,
-) -> Result<(), AiError> {
-    builder.on_event(&ev)?;
-    events.push(ev);
-    Ok(())
 }
 
 fn provider_error_from_stream_event(data: &str) -> Option<ProviderError> {
@@ -1841,7 +1845,14 @@ fn emit_compat_tool_call(
             delta: arguments_json,
         },
     )?;
-    emit_event(events, builder, StreamEvent::ToolCallEnd { index })
+    emit_event(
+        events,
+        builder,
+        StreamEvent::ToolCallEnd {
+            index,
+            argument_error: None,
+        },
+    )
 }
 
 fn emit_text_without_locked_marker(
@@ -2312,7 +2323,14 @@ fn close_open_parts(
         } else if builder.reasoning_text_buffers.contains_key(&idx) {
             emit_event(events, builder, StreamEvent::ReasoningEnd { index: idx })?;
         } else if builder.tool_call_builders.contains_key(&idx) {
-            emit_event(events, builder, StreamEvent::ToolCallEnd { index: idx })?;
+            emit_event(
+                events,
+                builder,
+                StreamEvent::ToolCallEnd {
+                    index: idx,
+                    argument_error: None,
+                },
+            )?;
         }
     }
     Ok(())
@@ -2731,6 +2749,7 @@ mod tests {
                         id: ToolCallId("call-1".into()),
                         name: "read".into(),
                         arguments_json: "{}".to_string(),
+                        argument_error: None,
                     })],
                     model: ModelId("test-model".into()),
                     protocol: Protocol::OpenAiChat,
@@ -2796,6 +2815,7 @@ mod tests {
                         id: ToolCallId("call-1".into()),
                         name: "read".into(),
                         arguments_json: "{}".to_string(),
+                        argument_error: None,
                     })],
                     model: ModelId("test-model".into()),
                     protocol: Protocol::OpenAiChat,
@@ -2915,6 +2935,7 @@ mod tests {
                             id: ToolCallId("call_1".to_string()),
                             name: "lookup".to_string(),
                             arguments_json: "{}".to_string(),
+                            argument_error: None,
                         }),
                     ],
                     model: model.spec.id.clone(),
@@ -3536,7 +3557,9 @@ mod fixture_tests {
         ResponseBuilder, StreamEvent, MAX_RESPONSE_CONTENT_BYTES, MAX_RESPONSE_EVENTS,
         MAX_TOOL_ARGUMENT_BYTES,
     };
-    use crate::types::{AssistantPart, AudioPayload, Media, Protocol, StopReason};
+    use crate::types::{
+        AssistantPart, AudioPayload, Media, Protocol, StopReason, ToolCallArgumentError, ToolDef,
+    };
 
     macro_rules! fx {
         ($name:literal) => {
@@ -3666,6 +3689,55 @@ mod fixture_tests {
         assert_eq!(
             tc.arguments_value().unwrap(),
             serde_json::json!({"pattern": "foo"})
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_mismatch_is_marked_before_tool_call_end() {
+        let model = harness::model(Protocol::OpenAiChat, None);
+        let tools = [ToolDef {
+            name: "grep".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "integer"}},
+                "required": ["pattern"],
+                "additionalProperties": false,
+            }),
+        }];
+        let events = harness::drive_with_tools(
+            &model,
+            decode_stream_event,
+            fx!("one_tool_call.sse"),
+            4,
+            &tools,
+        )
+        .await
+        .unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                StreamEvent::ToolCallEnd {
+                    argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                    ..
+                }
+            )),
+            "{events:#?}"
+        );
+        let call = harness::finished(&events)
+            .message
+            .content
+            .iter()
+            .find_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("schema-rejected call is retained");
+        assert_eq!(call.id.0, "call_a");
+        assert_eq!(call.arguments_json, r#"{"pattern":"foo"}"#);
+        assert_eq!(
+            call.argument_error,
+            Some(ToolCallArgumentError::SchemaMismatch)
         );
     }
 

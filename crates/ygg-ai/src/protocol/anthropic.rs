@@ -909,6 +909,7 @@ pub(crate) fn decode_stream_event(
                     builder,
                     StreamEvent::ToolCallEnd {
                         index: canonical_idx,
+                        argument_error: None,
                     },
                 )?;
             }
@@ -1460,7 +1461,9 @@ mod fixture_tests {
     use crate::error::{AiError, StreamProtocolError};
     use crate::protocol::harness;
     use crate::stream::StreamEvent;
-    use crate::types::{AssistantPart, Protocol, ReasoningStateKind, StopReason};
+    use crate::types::{
+        AssistantPart, Protocol, ReasoningStateKind, StopReason, ToolCallArgumentError, ToolDef,
+    };
 
     macro_rules! fx {
         ($name:literal) => {
@@ -1599,6 +1602,47 @@ mod fixture_tests {
         assert_eq!(
             tc.arguments_value().unwrap(),
             serde_json::json!({"pattern":"foo"})
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_mismatch_is_marked_before_tool_call_end() {
+        let model = harness::model(Protocol::AnthropicMessages, None);
+        let tools = [ToolDef {
+            name: "grep".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "integer"}},
+                "required": ["pattern"],
+                "additionalProperties": false,
+            }),
+        }];
+        let events =
+            harness::drive_with_tools(&model, decode_stream_event, fx!("tool_call.sse"), 0, &tools)
+                .await
+                .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd {
+                argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                ..
+            }
+        )));
+        let call = harness::finished(&events)
+            .message
+            .content
+            .iter()
+            .find_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("schema-rejected call is retained");
+        assert_eq!(call.id.0, "toolu_1");
+        assert_eq!(call.arguments_json, r#"{"pattern":"foo"}"#);
+        assert_eq!(
+            call.argument_error,
+            Some(ToolCallArgumentError::SchemaMismatch)
         );
     }
 

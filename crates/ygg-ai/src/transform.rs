@@ -582,6 +582,7 @@ mod tests {
             id: ToolCallId(id.to_string()),
             name: "read".to_string(),
             arguments_json: "{}".to_string(),
+            argument_error: None,
         })
     }
 

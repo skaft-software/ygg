@@ -827,7 +827,10 @@ async fn stream_http(
                             index: idx,
                             delta: tc.arguments_json.clone(),
                         };
-                        yield StreamEvent::ToolCallEnd { index: idx };
+                        yield StreamEvent::ToolCallEnd {
+                            index: idx,
+                            argument_error: tc.argument_error,
+                        };
                     }
                 }
             }
@@ -1095,6 +1098,7 @@ impl AiClient {
         };
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
+        crate::json_repair::validate_tool_definitions(&req.tools).map_err(AiError::Decode)?;
         let parts = crate::protocol::openai_responses::build_request(model, &req)?;
         let mut headers = http::HeaderMap::new();
         for (key, value) in &model.endpoint.default_headers {
@@ -1165,6 +1169,10 @@ impl AiClient {
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
         let tool_definitions = req.tools.clone();
+        // Reject malformed schemas before a provider request can consume them.
+        // The same immutable snapshot is retained by response assembly below.
+        crate::json_repair::validate_tool_definitions(&tool_definitions)
+            .map_err(AiError::Decode)?;
         // Ambiguous bare JSON must remain visible in the default strict stream.
         // Lossy mode is the explicit opt-in for holding it to EOF and
         // interpreting a provider's text as compatibility tool syntax.

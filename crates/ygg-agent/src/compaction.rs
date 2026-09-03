@@ -218,6 +218,11 @@ fn extract_file_operations(message: &Message, operations: &mut FileOperations) {
         let AssistantPart::ToolCall(call) = part else {
             continue;
         };
+        // These calls were rejected before dispatch, so their paths must not
+        // be represented as completed workspace operations in a handoff.
+        if call.argument_error.is_some() {
+            continue;
+        }
         let Ok(arguments) = call.arguments_value() else {
             continue;
         };
@@ -641,7 +646,7 @@ mod tests {
     use super::*;
     use ygg_ai::{
         AssistantMessage, AudioFormat, AudioMedia, AudioPayload, ModelId, Protocol, ToolCall,
-        ToolCallId, ToolResult, ToolResultPart,
+        ToolCallArgumentError, ToolCallId, ToolResult, ToolResultPart,
     };
 
     fn assistant(parts: Vec<AssistantPart>) -> Message {
@@ -650,6 +655,79 @@ mod tests {
             model: ModelId("test".into()),
             protocol: Protocol::OpenAiChat,
         })
+    }
+
+    fn file_call(
+        id: &str,
+        name: &str,
+        path: &str,
+        argument_error: Option<ToolCallArgumentError>,
+    ) -> AssistantPart {
+        AssistantPart::ToolCall(ToolCall {
+            id: ToolCallId(id.into()),
+            name: name.into(),
+            arguments_json: serde_json::json!({"path": path}).to_string(),
+            argument_error,
+        })
+    }
+
+    fn file_operation_messages() -> Vec<Message> {
+        let tool_result = |id: &str, is_error| {
+            let text = if is_error {
+                "schema rejected"
+            } else {
+                "executed"
+            };
+            UserPart::ToolResult(ToolResult {
+                tool_call_id: ToolCallId(id.into()),
+                content: vec![ToolResultPart::Text(text.into())],
+                is_error,
+                added_tool_names: None,
+            })
+        };
+        vec![
+            Message::User(UserMessage {
+                content: vec![UserPart::Text("update files".into())],
+            }),
+            assistant(vec![
+                file_call("read", "read", "src/read.rs", None),
+                file_call("write", "write", "src/write.rs", None),
+                file_call("edit", "edit", "src/edit.rs", None),
+                file_call(
+                    "rejected-read",
+                    "read",
+                    "src/rejected-read.rs",
+                    Some(ToolCallArgumentError::SchemaMismatch),
+                ),
+                file_call(
+                    "rejected-write",
+                    "write",
+                    "src/rejected-write.rs",
+                    Some(ToolCallArgumentError::SchemaMismatch),
+                ),
+                file_call(
+                    "rejected-edit",
+                    "edit",
+                    "src/rejected-edit.rs",
+                    Some(ToolCallArgumentError::SchemaMismatch),
+                ),
+            ]),
+            Message::User(UserMessage {
+                content: vec![
+                    tool_result("read", false),
+                    tool_result("write", false),
+                    tool_result("edit", false),
+                    tool_result("rejected-read", true),
+                    tool_result("rejected-write", true),
+                    tool_result("rejected-edit", true),
+                ],
+            }),
+        ]
+    }
+
+    fn assert_file_operation_details(details: &CompactionDetails) {
+        assert_eq!(details.read_files, vec!["src/read.rs"]);
+        assert_eq!(details.modified_files, vec!["src/edit.rs", "src/write.rs"]);
     }
 
     #[test]
@@ -754,6 +832,7 @@ mod tests {
                     id: ToolCallId("edit".into()),
                     name: "edit".into(),
                     arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                    argument_error: None,
                 })]),
                 Message::User(UserMessage {
                     content: vec![UserPart::ToolResult(ToolResult {
@@ -789,12 +868,40 @@ mod tests {
     }
 
     #[test]
+    fn normal_handoff_omits_schema_rejected_file_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut session = Session::create(directory.path().join("session.jsonl")).unwrap();
+        for message in file_operation_messages() {
+            session.append(EntryValue::Message(message)).unwrap();
+        }
+        let first_kept = session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("continue".into())],
+            })))
+            .unwrap();
+
+        let preparation = prepare_handoff(&session, &first_kept).unwrap();
+
+        assert_file_operation_details(&preparation.details);
+    }
+
+    #[test]
+    fn branch_handoff_omits_schema_rejected_file_operations() {
+        let preparation =
+            prepare_branch_handoff(file_operation_messages(), &CompactionDetails::default());
+
+        assert_eq!(preparation.messages.len(), 2, "tool results are omitted");
+        assert_file_operation_details(&preparation.details);
+    }
+
+    #[test]
     fn serialization_labels_calls_and_truncates_tool_results() {
         let messages = vec![
             assistant(vec![AssistantPart::ToolCall(ToolCall {
                 id: ToolCallId("call".into()),
                 name: "read".into(),
                 arguments_json: r#"{"path":"src/lib.rs"}"#.into(),
+                argument_error: None,
             })]),
             Message::User(UserMessage {
                 content: vec![UserPart::ToolResult(ToolResult {
@@ -853,11 +960,13 @@ mod tests {
                     id: ToolCallId("read".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"a.rs"}"#.into(),
+                    argument_error: None,
                 }),
                 AssistantPart::ToolCall(ToolCall {
                     id: ToolCallId("edit".into()),
                     name: "edit".into(),
                     arguments_json: r#"{"path":"same.rs","old":"a","new":"b"}"#.into(),
+                    argument_error: None,
                 }),
             ]),
             &mut operations,
@@ -901,16 +1010,19 @@ mod tests {
                     id: ToolCallId("read".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"a.rs"}"#.into(),
+                    argument_error: None,
                 }),
                 AssistantPart::ToolCall(ToolCall {
                     id: ToolCallId("edit".into()),
                     name: "edit".into(),
                     arguments_json: r#"{"path":"same.rs"}"#.into(),
+                    argument_error: None,
                 }),
                 AssistantPart::ToolCall(ToolCall {
                     id: ToolCallId("write".into()),
                     name: "write".into(),
                     arguments_json: r#"{"path":"b.rs"}"#.into(),
+                    argument_error: None,
                 }),
             ])))
             .unwrap();

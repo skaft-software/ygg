@@ -174,9 +174,16 @@ pub(crate) fn normalize_tool_call_id_owned(id: String) -> String {
 pub(crate) fn emit_event(
     events: &mut Vec<StreamEvent>,
     builder: &mut ResponseBuilder,
-    ev: StreamEvent,
+    mut ev: StreamEvent,
 ) -> Result<(), AiError> {
     builder.on_event(&ev)?;
+    if let StreamEvent::ToolCallEnd {
+        index,
+        argument_error,
+    } = &mut ev
+    {
+        *argument_error = builder.tool_call_argument_error(*index);
+    }
     events.push(ev);
     Ok(())
 }
@@ -303,7 +310,7 @@ pub(crate) mod harness {
     use crate::stream::{guard, ResponseBuilder, StreamEvent};
     use crate::types::{
         Capabilities, Endpoint, EndpointId, Modality, ModalitySet, ModelId, ModelLimits, ModelSpec,
-        Protocol, ReasoningCapability, ReasoningControl, Response,
+        Protocol, ReasoningCapability, ReasoningControl, Response, ToolDef,
     };
 
     /// A codec's per-event streaming decoder.
@@ -372,6 +379,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
         buffer_ambiguous_compatibility_content: bool,
+        tool_definitions: Option<&[ToolDef]>,
     ) -> (Vec<StreamEvent>, Option<AiError>) {
         let mut dec = SseDecoder::new();
         let mut builder = ResponseBuilder::new(
@@ -379,6 +387,11 @@ pub(crate) mod harness {
             model.spec.protocol,
             model.spec.pricing.clone(),
         );
+        if let Some(tool_definitions) = tool_definitions {
+            if let Err(error) = builder.set_tool_definitions(tool_definitions) {
+                return (Vec::new(), Some(error));
+            }
+        }
         builder.set_buffer_ambiguous_compatibility_content(buffer_ambiguous_compatibility_content);
         let mut out = Vec::new();
 
@@ -416,7 +429,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
     ) -> (Vec<StreamEvent>, Option<AiError>) {
-        drive_raw_configured(model, decode, data, chunk, false)
+        drive_raw_configured(model, decode, data, chunk, false, None)
     }
 
     /// Like [`drive_raw`] but pipes the events through [`guard`], surfacing
@@ -432,6 +445,20 @@ pub(crate) mod harness {
         collect_guarded(events, trailing_err).await
     }
 
+    /// Like [`drive`], but installs the immutable request schema snapshot used
+    /// by production response assembly.
+    pub(crate) async fn drive_with_tools(
+        model: &Model,
+        decode: DecodeFn,
+        data: &[u8],
+        chunk: usize,
+        tool_definitions: &[ToolDef],
+    ) -> Result<Vec<StreamEvent>, AiError> {
+        let (events, trailing_err) =
+            drive_raw_configured(model, decode, data, chunk, false, Some(tool_definitions));
+        collect_guarded(events, trailing_err).await
+    }
+
     /// Drives a codec with ambiguous content-tool compatibility explicitly
     /// enabled, mirroring a lossy production request.
     pub(crate) async fn drive_with_compatibility_buffering(
@@ -440,7 +467,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
     ) -> Result<Vec<StreamEvent>, AiError> {
-        let (events, trailing_err) = drive_raw_configured(model, decode, data, chunk, true);
+        let (events, trailing_err) = drive_raw_configured(model, decode, data, chunk, true, None);
         collect_guarded(events, trailing_err).await
     }
 

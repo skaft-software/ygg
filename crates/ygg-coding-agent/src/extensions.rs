@@ -4985,6 +4985,7 @@ context = true
                     id: ToolCallId("call-1".into()),
                     name: "read".into(),
                     arguments_json: "{}".into(),
+                    argument_error: None,
                 }),
                 AssistantPart::Text("answer".into()),
             ],

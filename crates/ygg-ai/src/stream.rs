@@ -4,7 +4,8 @@ use crate::error::{AiError, DecodeError, Diagnostic, StreamProtocolError};
 use crate::pricing::Pricing;
 use crate::types::{
     AssistantMessage, AssistantPart, Media, ModelId, Protocol, ReasoningPart, ReasoningState,
-    Response, StopReason, ToolCall, ToolCallId, ToolDef, Usage,
+    Response, StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId,
+    ToolDef, Usage,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -87,6 +88,11 @@ pub enum StreamEvent {
     ToolCallEnd {
         /// Canonical part index.
         index: usize,
+        /// Recoverable schema validation status for the completed call.
+        ///
+        /// Codecs emit `None`; stream assembly fills this after normalizing and
+        /// validating the completed arguments against the request snapshot.
+        argument_error: Option<ToolCallArgumentError>,
     },
 
     /// Self-contained multimodal media generated.
@@ -111,6 +117,11 @@ pub(crate) struct ToolCallBuilder {
     pub(crate) id: ToolCallId,
     pub(crate) name: String,
     pub(crate) arguments_json: String,
+    pub(crate) argument_error: Option<ToolCallArgumentError>,
+    /// True once arguments were normalized and schema-checked at an explicit
+    /// `ToolCallEnd`; malformed max-token output remains false for final
+    /// truncation handling.
+    pub(crate) arguments_normalized: bool,
 }
 
 /// Incremental state for the OpenAI Chat content-tool compatibility parser.
@@ -453,6 +464,8 @@ impl ResponseBuilder {
                         id: id.clone(),
                         name: name.clone(),
                         arguments_json: String::new(),
+                        argument_error: None,
+                        arguments_normalized: false,
                     },
                 );
             }
@@ -477,9 +490,16 @@ impl ResponseBuilder {
                 self.add_content_bytes(bytes.len())?;
                 self.media_parts.insert(*index, media.clone());
             }
-            StreamEvent::TextEnd { index }
-            | StreamEvent::ReasoningEnd { index }
-            | StreamEvent::ToolCallEnd { index } => {
+            StreamEvent::ToolCallEnd { index, .. } => {
+                // A completed, parseable call is schema-checked before this
+                // terminal event reaches consumers. This prevents downstream
+                // speculative execution from observing unchecked arguments.
+                // Unparseable output is deferred to `finish`: a MaxTokens
+                // terminal can safely retain its envelope with discarded args.
+                self.normalize_completed_tool_arguments(*index)?;
+                self.ended_indices.insert(*index);
+            }
+            StreamEvent::TextEnd { index } | StreamEvent::ReasoningEnd { index } => {
                 self.ended_indices.insert(*index);
             }
             StreamEvent::Usage(u) => {
@@ -500,7 +520,74 @@ impl ResponseBuilder {
         self.reasoning_states.insert(index, state);
     }
 
-    /// Normalize provider-generated tool arguments before consuming the builder.
+    fn apply_normalized_tool_arguments(
+        builder: &mut ToolCallBuilder,
+        arguments_json: String,
+        tool_definitions: Option<&[ToolDef]>,
+    ) -> Result<(), AiError> {
+        let argument_error = if let Some(definitions) = tool_definitions {
+            let arguments = serde_json::from_str(&arguments_json)
+                .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
+            match crate::json_repair::validate_tool_arguments(
+                &builder.name,
+                &arguments,
+                definitions,
+            )
+            .map_err(AiError::Decode)?
+            {
+                ToolArgumentValidation::SchemaMismatch => {
+                    Some(ToolCallArgumentError::SchemaMismatch)
+                }
+                ToolArgumentValidation::Valid | ToolArgumentValidation::UnknownTool => None,
+            }
+        } else {
+            None
+        };
+        builder.arguments_json = arguments_json;
+        builder.argument_error = argument_error;
+        builder.arguments_normalized = true;
+        Ok(())
+    }
+
+    /// Normalizes a parseable call at its explicit terminal event.
+    ///
+    /// A malformed value is deliberately deferred to [`Self::normalize_tool_arguments`]:
+    /// the eventual stop reason determines whether a max-token response may retain
+    /// the call envelope with discarded arguments. A parseable call, including a
+    /// schema mismatch, is marked before consumers can speculate on it.
+    fn normalize_completed_tool_arguments(&mut self, index: usize) -> Result<(), AiError> {
+        let tool_definitions = self.tool_definitions.as_deref();
+        let Some(builder) = self.tool_call_builders.get_mut(&index) else {
+            return Ok(());
+        };
+        if builder.arguments_normalized {
+            return Ok(());
+        }
+        let arguments_json = {
+            let raw_arguments = if builder.arguments_json.trim().is_empty() {
+                "{}"
+            } else {
+                builder.arguments_json.as_str()
+            };
+            match crate::json_repair::normalize_json_object(raw_arguments) {
+                Ok(arguments_json) => arguments_json,
+                Err(_) => return Ok(()),
+            }
+        };
+        Self::apply_normalized_tool_arguments(builder, arguments_json, tool_definitions)
+    }
+
+    /// Returns the schema-mismatch marker computed for an explicitly completed
+    /// streamed call. `None` also covers a call whose malformed arguments must
+    /// wait for final truncation handling.
+    pub(crate) fn tool_call_argument_error(&self, index: usize) -> Option<ToolCallArgumentError> {
+        self.tool_call_builders
+            .get(&index)
+            .and_then(|builder| builder.argument_error)
+    }
+
+    /// Normalizes unprocessed provider-generated tool arguments before consuming
+    /// the builder.
     ///
     /// A max-token terminal may cut a tool argument string in the middle. Keep
     /// the call envelope so the agent can pair it with a synthetic error result,
@@ -510,37 +597,31 @@ impl ResponseBuilder {
     /// counters when strict normalization fails.
     fn normalize_tool_arguments(&mut self) -> Result<(), AiError> {
         let output_truncated = matches!(self.stop_reason, Some(StopReason::MaxTokens));
-        let tool_definitions = self.tool_definitions.as_deref();
         let mut discarded_truncated_arguments = false;
-        for builder in self.tool_call_builders.values_mut() {
-            let raw_arguments = if builder.arguments_json.trim().is_empty() {
-                "{}"
-            } else {
-                &builder.arguments_json
-            };
-            let discarded = match crate::json_repair::normalize_json_object(raw_arguments) {
-                Ok(arguments_json) => {
-                    builder.arguments_json = arguments_json;
-                    false
+        {
+            let tool_definitions = self.tool_definitions.as_deref();
+            for builder in self.tool_call_builders.values_mut() {
+                if builder.arguments_normalized {
+                    continue;
                 }
-                Err(_) if output_truncated => {
-                    builder.arguments_json = "{}".to_owned();
-                    discarded_truncated_arguments = true;
-                    true
-                }
-                Err(error) => return Err(AiError::Decode(error)),
-            };
-            if !discarded {
-                if let Some(definitions) = tool_definitions {
-                    let arguments = serde_json::from_str(&builder.arguments_json)
-                        .map_err(|error| AiError::Decode(DecodeError::Json(error.to_string())))?;
-                    crate::json_repair::validate_tool_arguments(
-                        &builder.name,
-                        &arguments,
-                        definitions,
-                    )
-                    .map_err(AiError::Decode)?;
-                }
+                let raw_arguments = if builder.arguments_json.trim().is_empty() {
+                    "{}"
+                } else {
+                    builder.arguments_json.as_str()
+                };
+                let arguments_json = match crate::json_repair::normalize_json_object(raw_arguments)
+                {
+                    Ok(arguments_json) => arguments_json,
+                    Err(_) if output_truncated => {
+                        builder.arguments_json = "{}".to_owned();
+                        builder.argument_error = None;
+                        builder.arguments_normalized = true;
+                        discarded_truncated_arguments = true;
+                        continue;
+                    }
+                    Err(error) => return Err(AiError::Decode(error)),
+                };
+                Self::apply_normalized_tool_arguments(builder, arguments_json, tool_definitions)?;
             }
         }
         if discarded_truncated_arguments {
@@ -592,6 +673,7 @@ impl ResponseBuilder {
                     id: builder.id,
                     name: builder.name,
                     arguments_json: builder.arguments_json,
+                    argument_error: builder.argument_error,
                 }));
             } else if let Some(media) = self.media_parts.remove(&index) {
                 content.push(AssistantPart::Media(media));
@@ -726,7 +808,7 @@ where
                         _ => Err(AiError::StreamProtocol(StreamProtocolError::UnexpectedEvent(format!("ToolCallArgsDelta on index {}", index))))?,
                     }
                 }
-                StreamEvent::ToolCallEnd { index } => {
+                StreamEvent::ToolCallEnd { index, .. } => {
                     match part_states.get(index) {
                         Some(PartState::Streaming(PartKind::ToolCall)) => {
                             part_states.insert(*index, PartState::Completed);
@@ -903,10 +985,84 @@ mod tests {
             })
             .unwrap();
         builder
-            .on_event(&StreamEvent::ToolCallEnd { index: 0 })
+            .on_event(&StreamEvent::ToolCallEnd {
+                index: 0,
+                argument_error: None,
+            })
             .unwrap();
 
         assert!(builder.finish().is_err());
+    }
+
+    #[test]
+    fn schema_mismatch_marks_the_completed_event_and_retains_normalized_call() {
+        let definitions = [ToolDef {
+            name: "strict".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+                "required": ["count"],
+                "additionalProperties": false,
+            }),
+        }];
+        let mut builder = ResponseBuilder::new(
+            ModelId("test-model".to_string()),
+            Protocol::OpenAiChat,
+            None,
+        );
+        builder.set_tool_definitions(&definitions).unwrap();
+        let mut events = Vec::new();
+        crate::protocol::emit_event(
+            &mut events,
+            &mut builder,
+            StreamEvent::ToolCallStart {
+                index: 0,
+                id: ToolCallId("call-canonical".to_owned()),
+                name: "strict".to_owned(),
+            },
+        )
+        .unwrap();
+        crate::protocol::emit_event(
+            &mut events,
+            &mut builder,
+            StreamEvent::ToolCallArgsDelta {
+                index: 0,
+                delta: r#"{"unexpected":"provider-secret","count":"bad"}"#.to_owned(),
+            },
+        )
+        .unwrap();
+        crate::protocol::emit_event(
+            &mut events,
+            &mut builder,
+            StreamEvent::ToolCallEnd {
+                index: 0,
+                argument_error: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::ToolCallEnd {
+                argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                ..
+            })
+        ));
+        builder.set_stop_reason(StopReason::ToolUse);
+        let response = builder.finish().unwrap();
+        let AssistantPart::ToolCall(call) = &response.message.content[0] else {
+            panic!("expected retained tool call");
+        };
+        assert_eq!(call.id.0, "call-canonical");
+        assert_eq!(
+            call.arguments_json,
+            r#"{"count":"bad","unexpected":"provider-secret"}"#
+        );
+        assert_eq!(
+            call.argument_error,
+            Some(ToolCallArgumentError::SchemaMismatch)
+        );
     }
 
     #[test]
@@ -930,7 +1086,10 @@ mod tests {
             })
             .unwrap();
         builder
-            .on_event(&StreamEvent::ToolCallEnd { index: 0 })
+            .on_event(&StreamEvent::ToolCallEnd {
+                index: 0,
+                argument_error: None,
+            })
             .unwrap();
         builder.set_stop_reason(StopReason::MaxTokens);
 

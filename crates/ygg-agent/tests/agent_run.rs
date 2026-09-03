@@ -29,7 +29,7 @@ use ygg_ai::{
     AudioVoice, Auth, Capabilities, Endpoint, EndpointId, Media, Message, Modality, ModalitySet,
     Model, ModelId, ModelLimits, ModelSpec, OutputModalities, Pricing, Protocol,
     ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffortBudgets, TokenRate,
-    ToolCall, Usage, UserMessage, UserPart,
+    ToolCall, ToolCallArgumentError, Usage, UserMessage, UserPart,
 };
 
 const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 6;
@@ -2737,6 +2737,7 @@ async fn resumed_agent_reexecutes_only_missing_tool_results() {
                 id: ygg_ai::ToolCallId("crashed_call".into()),
                 name: "read".into(),
                 arguments_json: serde_json::json!({"path": "recover.txt"}).to_string(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -2790,6 +2791,7 @@ async fn restart_never_replays_a_mutating_tool_without_an_idempotency_contract()
                 id: ygg_ai::ToolCallId("possibly_committed".into()),
                 name: "unsafe_recovery".into(),
                 arguments_json: "{}".into(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -4482,6 +4484,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
                         id: ygg_ai::ToolCallId(format!("recover-{index}")),
                         name: "count_recovery".into(),
                         arguments_json: "{}".into(),
+                        argument_error: None,
                     })
                 })
                 .collect(),
@@ -4573,6 +4576,7 @@ async fn host_classification_overrides_a_safe_replay_claim() {
                 id: ygg_ai::ToolCallId("classified-recovery".into()),
                 name: "count_recovery".into(),
                 arguments_json: "{}".into(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -5368,6 +5372,47 @@ impl Tool for ClassifiedEffectProbe {
     }
 }
 
+struct SchemaMismatchBashProbe {
+    effect_calls: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SchemaMismatchBashProbe {
+    fn definition(&self) -> ygg_ai::ToolDef {
+        ygg_ai::ToolDef {
+            name: "bash".into(),
+            description: "Records schema-rejected speculative calls".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["pwd"]}
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+            }),
+        }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        self.effect_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolEffect::Pure)
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::new("must not execute"))
+    }
+}
+
 struct AdmissionHookProbe {
     before: Arc<AtomicUsize>,
     after: Arc<AtomicUsize>,
@@ -5395,6 +5440,273 @@ impl ToolCallHook for AdmissionHookProbe {
     ) {
         self.after.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+const SCHEMA_MISMATCH_ERROR: &str =
+    "tool call was not executed because its arguments do not satisfy the advertised schema; correct the arguments and try again";
+
+#[tokio::test]
+async fn schema_rejected_bash_is_never_speculated_or_executed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            // `ls` is otherwise a speculative reconnaissance command. The
+            // request schema accepts only `pwd`, so the stream marker must
+            // prevent both speculation and normal dispatch.
+            bodies: vec![
+                tool_turn(&[(
+                    "schema_rejected_bash",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+                text_turn("schema error received"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let effect_calls = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(SchemaMismatchBashProbe {
+        effect_calls: Arc::clone(&effect_calls),
+        executions: Arc::clone(&executions),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "schema rejection test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("try the rejected bash call").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolFinished {
+                id,
+                result: Err(error),
+                ..
+            } if id.0 == "schema_rejected_bash" => Some(error.message.as_str()),
+            _ => None,
+        })
+        .expect("schema rejection is surfaced as a tool error");
+    assert_eq!(error, SCHEMA_MISMATCH_ERROR);
+    assert!(!error.contains("ls"));
+    assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let call = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::Assistant(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    AssistantPart::ToolCall(call) if call.id.0 == "schema_rejected_bash" => {
+                        Some(call)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("schema-rejected call is durable");
+    assert_eq!(call.arguments_json, r#"{"command":"ls"}"#);
+    assert_eq!(
+        call.argument_error,
+        Some(ToolCallArgumentError::SchemaMismatch)
+    );
+    let result = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    UserPart::ToolResult(result)
+                        if result.tool_call_id.0 == "schema_rejected_bash" =>
+                    {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("paired rejection result is durable");
+    assert!(result.is_error);
+    let text = result
+        .content
+        .iter()
+        .find_map(|part| match part {
+            ygg_ai::ToolResultPart::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("static error text");
+    assert_eq!(text, SCHEMA_MISMATCH_ERROR);
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "one rejected-tool turn and one corrective turn"
+    );
+    assert!(requests[1].to_string().contains(SCHEMA_MISMATCH_ERROR));
+}
+
+#[tokio::test]
+async fn resumed_schema_rejection_skips_hooks_effects_and_replay() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![text_turn("resumed after schema rejection")],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    {
+        let mut session = Session::create(&session_path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("prior request".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ToolCall {
+                    id: ygg_ai::ToolCallId("persisted_schema_rejection".into()),
+                    name: "bash".into(),
+                    arguments_json: r#"{"command":"provider-secret-value"}"#.into(),
+                    argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                })],
+                model: ModelId("scripted".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+    }
+    let session = Session::open(&session_path).unwrap();
+    let persisted_call = session
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::Assistant(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    AssistantPart::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("reopened call");
+    assert_eq!(
+        persisted_call.argument_error,
+        Some(ToolCallArgumentError::SchemaMismatch)
+    );
+
+    let effect_calls = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(SchemaMismatchBashProbe {
+        effect_calls: Arc::clone(&effect_calls),
+        executions: Arc::clone(&executions),
+    });
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session,
+        system: "schema rejection resume test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("continue after restart").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolStarted { .. })));
+    assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+
+    let result = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    UserPart::ToolResult(result)
+                        if result.tool_call_id.0 == "persisted_schema_rejection" =>
+                    {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("recovered schema error result");
+    assert!(result.is_error);
+    let text = result
+        .content
+        .iter()
+        .find_map(|part| match part {
+            ygg_ai::ToolResultPart::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("static error text");
+    assert_eq!(text, SCHEMA_MISMATCH_ERROR);
+    assert!(!text.contains("provider-secret-value"));
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 1, "recovery must not replay the old POST");
+    assert!(requests[0].to_string().contains(SCHEMA_MISMATCH_ERROR));
 }
 
 #[tokio::test]

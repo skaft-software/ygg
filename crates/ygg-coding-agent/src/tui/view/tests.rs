@@ -2923,6 +2923,7 @@ fn resumed_session_restores_every_write_as_a_diff_panel() {
                         "content": format!("{path} contents\n"),
                     })
                     .to_string(),
+                    argument_error: None,
                 })],
                 model: ModelId("gpt-5.6-sol".into()),
                 protocol: Protocol::OpenAiResponses,
@@ -2966,11 +2967,13 @@ fn duplicate_hydrated_tool_call_ids_never_leave_a_running_card() {
                     id: ToolCallId("duplicate".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"first"}"#.into(),
+                    argument_error: None,
                 }),
                 AssistantPart::ToolCall(ToolCall {
                     id: ToolCallId("duplicate".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"second"}"#.into(),
+                    argument_error: None,
                 }),
             ],
             model: ModelId("test".into()),

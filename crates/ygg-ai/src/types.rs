@@ -701,6 +701,32 @@ pub enum ToolResultPart {
     Media(Media),
 }
 
+/// Recoverable validation failure retained with a completed tool call.
+///
+/// This marker is assigned only after the provider arguments have been parsed
+/// and normalized. It tells an agent to persist a paired error result instead
+/// of invoking the tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallArgumentError {
+    /// The normalized argument object does not satisfy the request's exact
+    /// tool-parameter schema.
+    SchemaMismatch,
+}
+
+/// Result of validating one normalized argument object against a tool snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolArgumentValidation {
+    /// The named tool exists and its schema accepts the arguments.
+    Valid,
+    /// The named tool exists but its schema rejects the arguments.
+    SchemaMismatch,
+    /// The named tool is absent from the snapshot, so no schema was available
+    /// to validate. The caller can retain the call for normal unknown-tool
+    /// recovery.
+    UnknownTool,
+}
+
 /// Call to a tool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -710,6 +736,11 @@ pub struct ToolCall {
     pub name: String,
     /// Raw JSON arguments string.
     pub arguments_json: String,
+    /// Recoverable validation failure found while assembling this completed
+    /// call. The canonical id and normalized arguments remain intact so a
+    /// durable error result can still be paired with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_error: Option<ToolCallArgumentError>,
 }
 
 impl ToolCall {
@@ -1389,6 +1420,7 @@ mod tests {
             id: ToolCallId("call_1".to_string()),
             name: "grep".to_string(),
             arguments_json: r#"{"pattern": "test"}"#.to_string(),
+            argument_error: None,
         };
         let parsed = tc.arguments_value().unwrap();
         assert_eq!(parsed["pattern"], "test");
@@ -1397,6 +1429,7 @@ mod tests {
             id: ToolCallId("call_2".to_string()),
             name: "grep".to_string(),
             arguments_json: r#""just a string""#.to_string(),
+            argument_error: None,
         };
         assert!(tc_invalid.arguments_value().is_err());
     }

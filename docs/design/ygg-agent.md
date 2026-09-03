@@ -9,14 +9,15 @@
 1. Streaming deltas are provisional and never enter the session.
 2. A complete assistant message is persisted before any emitted tool is executed.
 3. Each tool result is persisted immediately after its execution outcome is committed.
-4. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
-5. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
-6. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
-7. Optional telemetry is an observer outside the session ledger. When installed,
+4. A completed call marked schema-invalid by `ygg-ai`'s request snapshot receives a static bounded paired error; it never reaches speculative execution, effect classification, hooks, or the tool implementation.
+5. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
+6. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
+7. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
+8. Optional telemetry is an observer outside the session ledger. When installed,
    it receives an opaque run-start hook and coarse request/tool/compaction
    boundaries; it records hashes and bounded measurements, never raw prompts,
    arguments, results, or provider payloads.
-8. `Agent::prompt_without_tools` starts with a sticky tool-free policy.
+9. `Agent::prompt_without_tools` starts with a sticky tool-free policy.
    `RunControl::finish_now` persists its input at the next safe turn boundary and
    makes that policy sticky for the remainder of the run. Subsequent provider
    requests contain no tool schemas and set `ToolChoice::None`; calls emitted by

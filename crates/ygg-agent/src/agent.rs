@@ -16,8 +16,8 @@ use ygg_ai::{
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
     OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest,
     ResponsesInput, ResponsesOptions, ResponsesReplayItem, StopReason, StreamEvent, ToolCall,
-    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
-    PICODOLLARS_PER_MICRODOLLAR,
+    ToolCallArgumentError, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage,
+    UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
@@ -937,6 +937,31 @@ struct CompletedToolExecution {
     cancellation_won: bool,
 }
 
+/// Synthetic, secret-safe result for a normalized call rejected by the exact
+/// request schema. Keep this static: provider arguments may contain secrets.
+const SCHEMA_MISMATCH_TOOL_ERROR: &str =
+    "tool call was not executed because its arguments do not satisfy the advertised schema; correct the arguments and try again";
+
+fn rejected_argument_tool_error(error: ToolCallArgumentError) -> ToolError {
+    let message = match error {
+        ToolCallArgumentError::SchemaMismatch => SCHEMA_MISMATCH_TOOL_ERROR,
+    };
+    ToolError::new(message)
+}
+
+fn rejected_argument_tool_execution(error: ToolCallArgumentError) -> CompletedToolExecution {
+    let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+    CompletedToolExecution {
+        result: Err(rejected_argument_tool_error(error)),
+        duration: std::time::Duration::ZERO,
+        started_unix_ms: None,
+        finished_unix_ms: Some(crate::session::now_unix_millis()),
+        progress_rx,
+        progress_sink: ToolProgressSink::live(progress_tx),
+        cancellation_won: false,
+    }
+}
+
 fn effect_is_repeatable_observation(effect: ToolEffect) -> bool {
     matches!(effect, ToolEffect::Pure | ToolEffect::WorkspaceRead)
 }
@@ -1169,6 +1194,12 @@ impl SpeculativeBash {
         if let Some(partial) = self.partial.get_mut(&index) {
             partial.args_json.push_str(delta);
         }
+    }
+
+    /// Drops an unchecked or schema-rejected partial call before it can enter
+    /// the speculative execution path.
+    fn discard(&mut self, index: usize) {
+        self.partial.remove(&index);
     }
 
     /// Completes a tracked call: parses the accumulated arguments and removes
@@ -1922,7 +1953,10 @@ fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError
         .into_iter()
         .filter(|call| !persisted.contains(&call.id));
     for call in unresolved {
-        let text = cancelled_tool_error().message;
+        let text = match call.argument_error {
+            Some(argument_error) => rejected_argument_tool_error(argument_error).message,
+            None => cancelled_tool_error().message,
+        };
         session.append(EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::ToolResult(ToolResult {
                 tool_call_id: call.id,
@@ -4725,7 +4759,11 @@ impl Agent {
         let effect_broker = self.effect_broker.clone();
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         for (call_index, call) in unresolved {
-            let result = if call_index >= MAX_TOOL_CALLS_PER_TURN {
+            let result = if let Some(argument_error) = call.argument_error {
+                // A schema-rejected call was never admitted for execution in
+                // the live path; retain that fact across a restart as well.
+                Err(rejected_argument_tool_error(argument_error))
+            } else if call_index >= MAX_TOOL_CALLS_PER_TURN {
                 Err(ToolError::new(
                     "tool call skipped: per-turn tool-call limit reached",
                 ))
@@ -5585,12 +5623,21 @@ impl Agent {
                                 attempt_saw_generation = true;
                                 speculative_bash.note_args_delta(index, &delta);
                             }
-                            StreamEvent::ToolCallEnd { index } => {
+                            StreamEvent::ToolCallEnd {
+                                index,
+                                argument_error,
+                            } => {
                                 attempt_saw_generation = true;
+                                // `ygg-ai` validates completed parseable calls
+                                // against the immutable request snapshot before
+                                // emitting this event. A rejected call must
+                                // never reach even read-only speculation.
+                                if argument_error.is_some() {
+                                    speculative_bash.discard(index);
                                 // Speculative bash: start shallow read-only
                                 // commands while generation continues, so
                                 // their latency hides inside streaming time.
-                                if tool_call_hooks.is_empty() {
+                                } else if !answer_only && tool_call_hooks.is_empty() {
                                     if let Some((call_id, arguments)) =
                                         speculative_bash.complete(index)
                                     {
@@ -5985,7 +6032,8 @@ impl Agent {
                     && calls.len() > 1
                     && calls.len() <= MAX_TOOL_CALLS_PER_TURN
                     && calls.iter().all(|call| {
-                        call.arguments_value().is_ok_and(|arguments| {
+                        call.argument_error.is_none()
+                            && call.arguments_value().is_ok_and(|arguments| {
                             tool_map.get(&call.name).is_some_and(|tool| {
                                 tool.concurrency() == ToolConcurrency::Parallel
                                     && tool
@@ -6072,6 +6120,7 @@ impl Agent {
                 // no-progress loop; only compare against earlier responses.
                 let batch_fingerprints: Vec<(String, String)> = calls
                     .iter()
+                    .filter(|call| call.argument_error.is_none())
                     .filter_map(|call| {
                         call.arguments_value().ok().map(|args| {
                             (
@@ -6084,13 +6133,18 @@ impl Agent {
 
                 // ── Commit tool results in emitted order ───────────────────
                 for (call_index, call) in calls.into_iter().enumerate() {
+                    let argument_error = call.argument_error;
                     let parsed = call.arguments_value();
-                    let call_fingerprint = parsed.as_ref().ok().map(|args| {
-                        (
-                            call.name.clone(),
-                            tool_call_arguments_fingerprint(&call.name, args),
-                        )
-                    });
+                    let call_fingerprint = if argument_error.is_none() {
+                        parsed.as_ref().ok().map(|args| {
+                            (
+                                call.name.clone(),
+                                tool_call_arguments_fingerprint(&call.name, args),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     let repeated_recently = call_fingerprint.as_ref().map_or(0, |fingerprint| {
                         recent_tool_calls
                             .iter()
@@ -6117,7 +6171,7 @@ impl Agent {
                         // result only on an exact argument match with the
                         // authoritative call; otherwise cancel it and fall
                         // through to normal serial execution.
-                        preexecuted = if output_truncated {
+                        preexecuted = if output_truncated || argument_error.is_some() {
                             let _ = speculative_bash.take_matched(&call.id, None).await;
                             None
                         } else {
@@ -6134,7 +6188,13 @@ impl Agent {
                         cancellation_won,
                         started_unix_ms,
                         finished_unix_ms,
-                    } = if let Some(execution) = preexecuted {
+                    } = if let Some(argument_error) = argument_error {
+                        // Do not classify effects, run hooks, or invoke the
+                        // tool for a call already rejected by the request's
+                        // schema snapshot. The paired static error is durable
+                        // and safe to show back to the model.
+                        rejected_argument_tool_execution(argument_error)
+                    } else if let Some(execution) = preexecuted {
                         execution
                     } else {
                         // Create a fresh progress channel for every sequential
@@ -8061,6 +8121,7 @@ mod tests {
                         id: ygg_ai::ToolCallId(index.into()),
                         name: "read".into(),
                         arguments_json: "{}".into(),
+                        argument_error: None,
                     })],
                     model: ModelId("test".into()),
                     protocol: Protocol::AnthropicMessages,

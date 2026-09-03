@@ -1332,6 +1332,7 @@ mod tests {
                     id: ToolCallId(id.into()),
                     name: "read".into(),
                     arguments_json: "{\"path\":\"src/lib.rs\"}".into(),
+                    argument_error: None,
                 })],
                 model: ModelId("m".into()),
                 protocol: Protocol::OpenAiChat,

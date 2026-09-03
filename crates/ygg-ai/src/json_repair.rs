@@ -182,11 +182,15 @@ pub(crate) fn validate_tool_definitions(
 }
 
 /// Validate one normalized call against the exact request tool-definition snapshot.
+///
+/// Schema mismatches are a completed, recoverable provider output: callers
+/// retain the call and pair it with a bounded tool error. Malformed schemas and
+/// validation work-limit exhaustion remain fatal decode errors.
 pub(crate) fn validate_tool_arguments(
     tool_name: &str,
     arguments: &serde_json::Value,
     tools: &[crate::types::ToolDef],
-) -> Result<(), DecodeError> {
+) -> Result<crate::types::ToolArgumentValidation, DecodeError> {
     if tools.len() > MAX_SCHEMA_TOOLS {
         return Err(bounded_error(
             "tool argument schema validation failed",
@@ -214,7 +218,7 @@ pub(crate) fn validate_tool_arguments(
         // no schema to validate or typed tool to invoke in this case; treating
         // the provider response as a decode failure would prevent that normal
         // recovery path.
-        return Ok(());
+        return Ok(crate::types::ToolArgumentValidation::UnknownTool);
     };
 
     let mut schema_budget = ValidationBudget::default();
@@ -225,9 +229,51 @@ pub(crate) fn validate_tool_arguments(
         &mut schema_budget,
     )
     .map_err(|detail| bounded_error("tool argument schema validation failed", detail))?;
-    let mut value_budget = ValidationBudget::default();
-    validate_value(schema, arguments, "$", 0, &mut value_budget)
-        .map_err(|detail| bounded_error("tool argument validation failed", detail))
+
+    let mut value_budget = ValueValidationBudget::default();
+    match validate_value(schema, arguments, "$", 0, &mut value_budget) {
+        Ok(()) => Ok(crate::types::ToolArgumentValidation::Valid),
+        Err(ValueValidationFailure::Mismatch) => {
+            Ok(crate::types::ToolArgumentValidation::SchemaMismatch)
+        }
+        Err(ValueValidationFailure::Unsafe(detail)) => {
+            Err(bounded_error("tool argument validation failed", detail))
+        }
+    }
+}
+
+/// Value-validation errors deliberately distinguish a normal schema mismatch
+/// from a resource-bound or invariant failure. Only the former is safe to
+/// return to the model as a paired tool error.
+enum ValueValidationFailure {
+    Mismatch,
+    Unsafe(&'static str),
+}
+
+/// Independent budget for untrusted argument values. Schema validation has its
+/// own budget because a valid schema may be used for many calls in one response.
+struct ValueValidationBudget {
+    remaining: usize,
+}
+
+impl Default for ValueValidationBudget {
+    fn default() -> Self {
+        Self {
+            remaining: MAX_SCHEMA_NODES,
+        }
+    }
+}
+
+impl ValueValidationBudget {
+    fn consume(&mut self) -> Result<(), ValueValidationFailure> {
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or(ValueValidationFailure::Unsafe(
+                "validation work limit exceeded",
+            ))?;
+        Ok(())
+    }
 }
 
 fn validate_schema(
@@ -414,15 +460,17 @@ fn validate_value(
     value: &serde_json::Value,
     path: &str,
     depth: usize,
-    budget: &mut ValidationBudget,
-) -> Result<(), String> {
+    budget: &mut ValueValidationBudget,
+) -> Result<(), ValueValidationFailure> {
     if depth > MAX_SCHEMA_DEPTH {
-        return Err(format!("validation depth exceeds {MAX_SCHEMA_DEPTH}"));
+        return Err(ValueValidationFailure::Unsafe(
+            "validation nesting limit exceeded",
+        ));
     }
-    budget.consume(path)?;
-    let object = schema
-        .as_object()
-        .ok_or_else(|| "validated schema node must be an object".to_owned())?;
+    budget.consume()?;
+    let object = schema.as_object().ok_or(ValueValidationFailure::Unsafe(
+        "validated schema node is malformed",
+    ))?;
     if let Some(expected) = object.get("type") {
         let matches = match expected {
             serde_json::Value::String(name) => value_matches_type(value, name),
@@ -430,30 +478,34 @@ fn validate_value(
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .any(|name| value_matches_type(value, name)),
-            _ => false,
+            _ => {
+                return Err(ValueValidationFailure::Unsafe(
+                    "validated type is malformed",
+                ))
+            }
         };
         if !matches {
-            return Err(format!("{path} does not match declared type"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if let Some(values) = object.get("enum").and_then(serde_json::Value::as_array) {
         let mut matches = false;
         for candidate in values {
-            budget.consume(path)?;
+            budget.consume()?;
             if candidate == value {
                 matches = true;
                 break;
             }
         }
         if !matches {
-            return Err(format!("{path} is not one of the declared enum values"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if object
         .get("const")
         .is_some_and(|constant| constant != value)
     {
-        return Err(format!("{path} does not match const"));
+        return Err(ValueValidationFailure::Mismatch);
     }
     if let Some(branches) = object.get("allOf").and_then(serde_json::Value::as_array) {
         for branch in branches {
@@ -463,38 +515,46 @@ fn validate_value(
     if let Some(branches) = object.get("anyOf").and_then(serde_json::Value::as_array) {
         let mut matches = false;
         for branch in branches {
-            if validate_value(branch, value, path, depth + 1, budget).is_ok() {
-                matches = true;
-                break;
+            match validate_value(branch, value, path, depth + 1, budget) {
+                Ok(()) => {
+                    matches = true;
+                    break;
+                }
+                Err(ValueValidationFailure::Mismatch) => {}
+                Err(error @ ValueValidationFailure::Unsafe(_)) => return Err(error),
             }
         }
         if !matches {
-            return Err(format!("{path} does not match anyOf"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if let Some(branches) = object.get("oneOf").and_then(serde_json::Value::as_array) {
         let mut matches = 0_u8;
         for branch in branches {
-            if validate_value(branch, value, path, depth + 1, budget).is_ok() {
-                matches = matches.saturating_add(1);
-                if matches > 1 {
-                    break;
+            match validate_value(branch, value, path, depth + 1, budget) {
+                Ok(()) => {
+                    matches = matches.saturating_add(1);
+                    if matches > 1 {
+                        break;
+                    }
                 }
+                Err(ValueValidationFailure::Mismatch) => {}
+                Err(error @ ValueValidationFailure::Unsafe(_)) => return Err(error),
             }
         }
         if matches != 1 {
-            return Err(format!("{path} does not match exactly one oneOf branch"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if let Some(value_object) = value.as_object() {
         if let Some(required) = object.get("required").and_then(serde_json::Value::as_array) {
             for name in required {
-                budget.consume(path)?;
-                let name = name
-                    .as_str()
-                    .ok_or_else(|| "validated required entry must be a string".to_owned())?;
+                budget.consume()?;
+                let name = name.as_str().ok_or(ValueValidationFailure::Unsafe(
+                    "validated required property is malformed",
+                ))?;
                 if !value_object.contains_key(name) {
-                    return Err(format!("{}.{} is required", path, bounded_text(name, 128)));
+                    return Err(ValueValidationFailure::Mismatch);
                 }
             }
         }
@@ -502,20 +562,22 @@ fn validate_value(
             .get("properties")
             .and_then(serde_json::Value::as_object);
         for (name, child) in value_object {
-            budget.consume(path)?;
+            budget.consume()?;
             let child_path = schema_path(path, name);
             if let Some(child_schema) = properties.and_then(|properties| properties.get(name)) {
                 validate_value(child_schema, child, &child_path, depth + 1, budget)?;
             } else if let Some(additional) = object.get("additionalProperties") {
                 match additional {
-                    serde_json::Value::Bool(false) => {
-                        return Err(format!("{child_path} is not allowed"))
-                    }
+                    serde_json::Value::Bool(false) => return Err(ValueValidationFailure::Mismatch),
                     serde_json::Value::Bool(true) => {}
                     serde_json::Value::Object(_) => {
                         validate_value(additional, child, &child_path, depth + 1, budget)?;
                     }
-                    _ => return Err("validated additionalProperties is malformed".to_owned()),
+                    _ => {
+                        return Err(ValueValidationFailure::Unsafe(
+                            "validated additionalProperties is malformed",
+                        ));
+                    }
                 }
             }
         }
@@ -525,14 +587,14 @@ fn validate_value(
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|minimum| count < minimum)
         {
-            return Err(format!("{path} has too few properties"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("maxProperties")
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|maximum| count > maximum)
         {
-            return Err(format!("{path} has too many properties"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if let Some(value_array) = value.as_array() {
@@ -547,14 +609,14 @@ fn validate_value(
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|minimum| count < minimum)
         {
-            return Err(format!("{path} has too few items"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("maxItems")
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|maximum| count > maximum)
         {
-            return Err(format!("{path} has too many items"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("uniqueItems")
@@ -563,11 +625,14 @@ fn validate_value(
         {
             let mut unique = HashSet::new();
             for item in value_array {
-                budget.consume(path)?;
-                let encoded = serde_json::to_vec(item)
-                    .map_err(|error| format!("cannot encode {path} item: {error}"))?;
+                budget.consume()?;
+                let encoded = serde_json::to_vec(item).map_err(|_| {
+                    ValueValidationFailure::Unsafe(
+                        "cannot encode value while validating uniqueItems",
+                    )
+                })?;
                 if !unique.insert(encoded) {
-                    return Err(format!("{path} contains duplicate items"));
+                    return Err(ValueValidationFailure::Mismatch);
                 }
             }
         }
@@ -579,14 +644,14 @@ fn validate_value(
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|minimum| count < minimum)
         {
-            return Err(format!("{path} is shorter than minLength"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("maxLength")
             .and_then(serde_json::Value::as_u64)
             .is_some_and(|maximum| count > maximum)
         {
-            return Err(format!("{path} is longer than maxLength"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     if let Some(number) = value.as_f64() {
@@ -595,28 +660,28 @@ fn validate_value(
             .and_then(serde_json::Value::as_f64)
             .is_some_and(|minimum| number < minimum)
         {
-            return Err(format!("{path} violates minimum"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("maximum")
             .and_then(serde_json::Value::as_f64)
             .is_some_and(|maximum| number > maximum)
         {
-            return Err(format!("{path} violates maximum"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("exclusiveMinimum")
             .and_then(serde_json::Value::as_f64)
             .is_some_and(|minimum| number <= minimum)
         {
-            return Err(format!("{path} violates exclusiveMinimum"));
+            return Err(ValueValidationFailure::Mismatch);
         }
         if object
             .get("exclusiveMaximum")
             .and_then(serde_json::Value::as_f64)
             .is_some_and(|maximum| number >= maximum)
         {
-            return Err(format!("{path} violates exclusiveMaximum"));
+            return Err(ValueValidationFailure::Mismatch);
         }
     }
     Ok(())
@@ -990,13 +1055,19 @@ mod tests {
             serde_json::json!({"path": "README.md", "offset": 0}),
             serde_json::json!({"path": "README.md", "unexpected": true}),
             serde_json::json!({"path": 7}),
+            serde_json::json!({}),
         ] {
-            assert!(validate_tool_arguments("read", &invalid, &tools).is_err());
+            assert_eq!(
+                validate_tool_arguments("read", &invalid, &tools).unwrap(),
+                crate::types::ToolArgumentValidation::SchemaMismatch,
+            );
         }
-        assert!(validate_tool_arguments("read", &serde_json::json!({}), &tools).is_err());
         // Unknown names are preserved for the agent dispatcher to report as a
         // tool result so the model can recover on its next turn.
-        assert!(validate_tool_arguments("no_such_tool", &arguments, &tools).is_ok());
+        assert_eq!(
+            validate_tool_arguments("no_such_tool", &arguments, &tools).unwrap(),
+            crate::types::ToolArgumentValidation::UnknownTool,
+        );
     }
 
     #[test]
@@ -1023,6 +1094,37 @@ mod tests {
             }),
         }])
         .is_err());
+    }
+
+    #[test]
+    fn value_validation_work_exhaustion_is_fatal_and_secret_free() {
+        let tools = [crate::types::ToolDef {
+            name: "bounded".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            }),
+        }];
+        validate_tool_definitions(&tools).unwrap();
+        // Each property consumes work in the object and child-schema passes,
+        // so this remains a fatal resource-bound failure rather than a normal
+        // schema mismatch.
+        let arguments = serde_json::Value::Object(
+            (0..MAX_SCHEMA_NODES)
+                .map(|index| {
+                    (
+                        format!("field_{index}"),
+                        serde_json::Value::String("provider-secret-value".to_owned()),
+                    )
+                })
+                .collect(),
+        );
+        let error = validate_tool_arguments("bounded", &arguments, &tools).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("validation work limit exceeded"));
+        assert!(!message.contains("provider-secret-value"));
+        assert!(message.len() <= MAX_SCHEMA_ERROR_BYTES);
     }
 
     #[test]

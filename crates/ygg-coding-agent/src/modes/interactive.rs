@@ -5017,6 +5017,7 @@ mod tests {
                             "content": "pub fn worker() {}\n",
                         })
                         .to_string(),
+                        argument_error: None,
                     })],
                     model: ygg_ai::ModelId("worker-test".into()),
                     protocol: ygg_ai::Protocol::OpenAiChat,

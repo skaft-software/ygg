@@ -75,9 +75,25 @@ pub use types::{
     ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OutputFormat, OutputModalities,
     Protocol, ProviderMediaRef, ReasoningCapability, ReasoningConfig, ReasoningControl,
     ReasoningEffort, ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState,
-    ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason, ToolCall, ToolCallId,
-    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason,
+    ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId, ToolChoice, ToolDef,
+    ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
+
+/// Validates normalized arguments against the exact tool-definition snapshot.
+///
+/// A completed JSON object that merely violates a valid schema returns
+/// [`ToolArgumentValidation::SchemaMismatch`]. Malformed schemas and bounded
+/// validation failures return a fatal [`DecodeError`]. Unknown tool names are
+/// retained as [`ToolArgumentValidation::UnknownTool`] so callers can produce
+/// their normal unknown-tool result.
+pub fn validate_tool_arguments(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: &[ToolDef],
+) -> Result<ToolArgumentValidation, DecodeError> {
+    json_repair::validate_tool_arguments(tool_name, arguments, tools)
+}
 
 /// Strictness for cross-protocol / capability degradation.
 ///

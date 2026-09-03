@@ -43,7 +43,7 @@ inferred from a model name, endpoint label, or authentication plan.
 
 ## Stream contract
 
-A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, and unbalanced parts are errors. Malformed tool arguments are also errors unless an authoritative max-token terminal proves the output was truncated; that case retains only the call envelope with empty arguments so the agent can pair a non-executing error result and continue safely.
+A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, and unbalanced parts are errors. Completed parseable tool arguments are normalized and checked against the immutable request schema snapshot before their `ToolCallEnd`: an ordinary schema mismatch remains a canonical call marked for a bounded paired error, while malformed schemas, malformed arguments, and validation-limit failures are errors. An authoritative max-token terminal is the sole malformed-argument exception: it retains only the call envelope with empty arguments so the agent can pair a non-executing error result and continue safely.
 
 The response builder enforces absolute limits before appending:
 

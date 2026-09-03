@@ -111,6 +111,7 @@ fn test_cross_protocol_canonical_immutability() {
         id: ToolCallId("call_1".to_string()),
         name: "test_tool".to_string(),
         arguments_json: "{}".to_string(),
+        argument_error: None,
     };
 
     let tool_result = ToolResult {
@@ -216,6 +217,7 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
                         id: ToolCallId("call_missing".to_string()),
                         name: "lookup".to_string(),
                         arguments_json: "{}".to_string(),
+                        argument_error: None,
                     })],
                     model: model.spec.id.clone(),
                     protocol,
