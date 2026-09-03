@@ -8453,6 +8453,12 @@ async fn project_agent_event(
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
         }
+        AgentEvent::ToolPolicyDecision { .. } => {
+            // The Serve protocol currently has no policy-decision item or
+            // delta. ToolFinished still projects the corresponding denial;
+            // keep this explicit so adding agent-side policy provenance does
+            // not silently change the graphical projection contract.
+        }
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
         }

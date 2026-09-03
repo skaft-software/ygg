@@ -156,15 +156,24 @@ A consuming rebuild drops the old Agent before reopening its session, so only
 one append handle owns a session file. Every Agent also receives a product-owned
 `EffectBroker`. Its default uses `UnsafeHost`, where authoritatively classified
 effects use the current user's host authority subject to the remaining tool and
-sandbox gates. `--safe-mode` selects `ControlledBashApproval`, where workspace
-mutation and every `bash` process call are approved interactively while other
-ambient host/process, network, delegation, and extension effects remain denied.
-Executable-extension startup is gated separately at the product boundary: even
-enabled, trusted extensions are discovered but never launched under `--safe-mode`.
-Delegated children inherit the same broker policy through the root's delegation
-template.
+sandbox gates. `effect_policy` / `YGG_EFFECT_POLICY` / `--effect-policy` select
+`controlled_bash_approval`, `controlled`, or `unsafe_host`; a trusted project may
+tighten, but not relax, the global profile, while environment and CLI use normal
+precedence. `--safe-mode` conflicts with `--effect-policy` and selects
+`ControlledBashApproval`, where workspace mutation and every `bash` process call
+are approved interactively while other ambient host/process, network, delegation,
+and extension effects remain denied. Invalid profile errors are generic and never
+echo the supplied value. Executable-extension startup is gated separately at the
+product boundary: even enabled, trusted extensions are discovered but never
+launched under `--safe-mode`. Delegated children inherit the same broker policy
+through the root's delegation template.
 
 For explicit capability/orchestration boundaries (search vs browser vs computer use, hosted vs in-harness delegation, trust/cwd/approval/sandbox inheritance, and scope non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
+
+Serve currently has no policy-decision item in its graphical protocol, so its
+projection intentionally ignores `ToolPolicyDecision`; the matching
+`ToolFinished` remains visible. Exposing policy evidence there requires an
+explicit Serve protocol addition rather than silently changing the projection.
 
 The coding host creates an extension-only V2 delegation manager whenever the
 trusted, enabled `ygg-subagents` extension successfully negotiates its
@@ -178,6 +187,10 @@ enforces execution, isolation, provenance, limits, and cancellation;
 `ygg-ai` only reports the provider capability. Delegated children inherit the
 root's approved extensions, sandbox, model/reasoning and cache settings,
 compaction/completion/output policy, retry and turn bounds, and cost ceiling.
+Their bounded status, spawn/list result, and durable spawn record include the
+same effective tool-policy snapshot plus source-only parent-inherited versus
+child-override orchestration provenance; they never expose paths, environment
+values, approval material, extension identities, or model arguments.
 During an active interactive run, the product schedules one nonblocking
 owner-scoped subagent status refresh every 250 ms, reduces the resulting fenced
 semantic snapshot, and renders the complete bounded worker roster as one

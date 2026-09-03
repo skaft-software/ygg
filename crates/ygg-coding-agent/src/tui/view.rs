@@ -2241,6 +2241,10 @@ impl InteractiveShell {
                     state.register_active_event(index);
                 }
             }
+            // The tool panel retains the model-facing failure text; detailed
+            // policy diagnostics are intentionally available through telemetry
+            // and the native host protocol instead of the transcript.
+            AgentEvent::ToolPolicyDecision { .. } => {}
             AgentEvent::ToolProgress { id, progress } => {
                 let index = state.tool_panels.get(id).copied();
                 let refreshes_compact_tail = matches!(

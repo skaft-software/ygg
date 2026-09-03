@@ -21,9 +21,11 @@ use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
 use crate::events::{
-    AgentEvent, DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason,
+    AgentEvent, DelegationOrchestrationProvenance, DelegationPolicySource,
+    DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason,
 };
 use crate::extension::ExtensionHost;
+use crate::sandbox::EffectiveToolPolicy;
 use crate::secure_fs::{self, SecureFileError};
 use crate::session::{Session, SessionError};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -374,6 +376,21 @@ pub(crate) struct ExtensionAgentSessionPolicy {
     /// wall-clock kill; the worker can still be interrupted or stopped.
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
+}
+
+fn child_orchestration_provenance(
+    extension_policy: Option<&ExtensionAgentSessionPolicy>,
+) -> DelegationOrchestrationProvenance {
+    let mut provenance =
+        DelegationOrchestrationProvenance::all(DelegationPolicySource::ParentInherited);
+    if extension_policy.is_some() {
+        // Extension-owned children receive a host-validated standard-tool
+        // snapshot and explicit child-run limits. The sandbox, broker,
+        // environment, cwd, and executable trust stay parent-owned.
+        provenance.tool_scope = DelegationPolicySource::ChildOverride;
+        provenance.execution_limits = DelegationPolicySource::ChildOverride;
+    }
+    provenance
 }
 
 impl ExtensionAgentSessionPolicy {
@@ -1140,6 +1157,8 @@ struct AgentRecord {
     mailbox_delivery: Option<MailboxDeliveryPlan>,
     resource_owner: Option<String>,
     extension_policy: Option<ExtensionAgentSessionPolicy>,
+    effective_tool_policy: EffectiveToolPolicy,
+    orchestration_provenance: DelegationOrchestrationProvenance,
     extension_principal: Option<String>,
     extension_profile: Option<String>,
     extension_idempotency_key: Option<String>,
@@ -1322,6 +1341,8 @@ enum ProvenanceEvent<'a> {
         session: Option<&'a Path>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_reference: Option<&'a str>,
+        effective_tool_policy: &'a EffectiveToolPolicy,
+        orchestration_provenance: &'a DelegationOrchestrationProvenance,
     },
     AgentStatus {
         timestamp_ms: u128,
@@ -1473,6 +1494,8 @@ impl DelegationManager {
                     elapsed_ms: elapsed_end.saturating_sub(started),
                     failure_class: failure_class_for_child,
                     failure_reason: failure_reason_for_child,
+                    effective_tool_policy: record.effective_tool_policy.clone(),
+                    orchestration_provenance: record.orchestration_provenance.clone(),
                     session: delegated_session_reference(&record.session_path),
                 }
             })
@@ -1805,6 +1828,11 @@ impl DelegationManager {
                 };
             }
         }
+        let orchestration_provenance = child_orchestration_provenance(extension_policy.as_ref());
+        let effective_tool_policy = self
+            .template
+            .sandbox
+            .effective_tool_policy(self.template.effect_broker.policy());
         let initial_task = message;
         if owner.depth >= self.config.limits.max_depth {
             return Err(format!(
@@ -1916,6 +1944,8 @@ impl DelegationManager {
                     .is_none()
                     .then_some(session_path.as_path()),
                 session_reference: extension_session_reference.as_deref(),
+                effective_tool_policy: &effective_tool_policy,
+                orchestration_provenance: &orchestration_provenance,
             }) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -1981,6 +2011,8 @@ impl DelegationManager {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: extension_policy.clone(),
+                    effective_tool_policy: effective_tool_policy.clone(),
+                    orchestration_provenance: orchestration_provenance.clone(),
                     extension_principal: extension_provenance
                         .as_ref()
                         .map(|provenance| provenance.principal.clone()),
@@ -2055,6 +2087,8 @@ impl DelegationManager {
                 .and_then(|provenance| provenance.fingerprint.as_deref()),
             "status": "pending",
             "policy": result_policy,
+            "effective_tool_policy": effective_tool_policy,
+            "orchestration_provenance": orchestration_provenance,
             "created_at_ms": created_at_ms,
             "started_at_ms": Value::Null,
             "completed_at_ms": Value::Null,
@@ -4859,6 +4893,8 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "session": record.session_path,
         "status": record.status,
         "policy": record.extension_policy,
+        "effective_tool_policy": record.effective_tool_policy,
+        "orchestration_provenance": record.orchestration_provenance,
         "profile": record.extension_profile,
         "idempotency_key": record.extension_idempotency_key,
         "fingerprint": record.extension_fingerprint,
@@ -5115,6 +5151,11 @@ mod tests {
         .is_none());
     }
 
+    fn test_effective_tool_policy() -> EffectiveToolPolicy {
+        crate::SandboxConfig::new("/workspace")
+            .effective_tool_policy(crate::EffectPolicy::Controlled)
+    }
+
     fn test_extension_policy() -> ExtensionAgentSessionPolicy {
         ExtensionAgentSessionPolicy {
             tools: vec!["read".into(), "search".into()],
@@ -5312,6 +5353,22 @@ mod tests {
         assert!(spawned.revision > first.revision);
         assert_eq!(child.tool_use_count, 0);
         assert_eq!(child.task_name, "explore");
+        assert_eq!(
+            child.effective_tool_policy.effect_policy.value,
+            crate::EffectPolicy::Controlled
+        );
+        assert_eq!(
+            child.orchestration_provenance.approval_authority,
+            DelegationPolicySource::ParentInherited
+        );
+        assert_eq!(
+            child.orchestration_provenance.tool_scope,
+            DelegationPolicySource::ChildOverride
+        );
+        assert_eq!(
+            child.orchestration_provenance.execution_limits,
+            DelegationPolicySource::ChildOverride
+        );
 
         manager.update_agent_tool_started(
             &agent_id,
@@ -5476,6 +5533,10 @@ mod tests {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: None,
+                    effective_tool_policy: test_effective_tool_policy(),
+                    orchestration_provenance: DelegationOrchestrationProvenance::all(
+                        DelegationPolicySource::ParentInherited,
+                    ),
                     extension_principal: None,
                     extension_profile: None,
                     extension_idempotency_key: None,
@@ -5882,6 +5943,10 @@ mod tests {
                 mailbox_delivery: None,
                 resource_owner: None,
                 extension_policy: None,
+                effective_tool_policy: test_effective_tool_policy(),
+                orchestration_provenance: DelegationOrchestrationProvenance::all(
+                    DelegationPolicySource::ParentInherited,
+                ),
                 extension_principal: None,
                 extension_profile: None,
                 extension_idempotency_key: None,
@@ -6158,6 +6223,42 @@ mod tests {
         first_request.policy.max_tokens = Some(64_000);
         first_request.policy.max_cost_microdollars = Some(500_000);
         let first = service.spawn("root-owner", first_request).unwrap();
+        assert_eq!(
+            first["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["sandbox"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["effect_policy"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["approval_authority"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["environment"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["working_directory"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["extension_trust"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         let mut second_request =
             test_extension_spawn("second", None, None, "second bounded task", "second-key");
         second_request.policy.max_tokens = Some(64_000);
@@ -6230,6 +6331,22 @@ mod tests {
             .unwrap();
         assert_eq!(record["task_name"], "first");
         assert_eq!(record["policy"]["tools"], json!(["read", "search"]));
+        assert_eq!(
+            record["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["approval_authority"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         assert_eq!(record["turn_count"], 2);
         assert_eq!(record["tool_call_count"], 3);
         assert_eq!(record["phase"], "using_tool");
@@ -6293,6 +6410,26 @@ mod tests {
         assert_eq!(persisted["extension_profile"], "review");
         assert_eq!(persisted["extension_idempotency_key"], "first-key");
         assert_eq!(persisted["extension_fingerprint"], "f".repeat(64));
+        assert_eq!(
+            persisted["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["sandbox"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["extension_trust"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         assert!(persisted["session_reference"]
             .as_str()
             .is_some_and(|reference| reference.starts_with("agent-session:")));
@@ -7375,6 +7512,10 @@ mod tests {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: None,
+                    effective_tool_policy: test_effective_tool_policy(),
+                    orchestration_provenance: DelegationOrchestrationProvenance::all(
+                        DelegationPolicySource::ParentInherited,
+                    ),
                     extension_principal: None,
                     extension_profile: None,
                     extension_idempotency_key: None,

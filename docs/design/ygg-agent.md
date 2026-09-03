@@ -37,9 +37,25 @@ already-running executable.
 
 Workspace-mutation approval creates a random, short-lived capability bound to the canonical intent digest. Tokens are atomically single-use, stored by one-way verifier, redacted in debug output, and never supplied to tools. Dispatch reserves admission before `before_tool_call`, then commits and consumes the exact grant only after all hooks pass and immediately before calling `Tool::execute`. Hook denial or cancellation drops and revokes an uncommitted reservation; cancellation after commit cannot restore it. `after_tool_call` runs only for a committed effect.
 
-Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A denied call is returned to the provider as a paired tool error without invoking hooks or executable code.
+Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A broker or argument denial is returned to the provider as a paired tool error before hooks or executable code; a trusted hook may veto an otherwise admitted call before dispatch.
 
 The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `ControlledBashApproval` (selected by `--safe-mode`) confirms every `bash` call. The default `UnsafeHost` policy lets classified command and process effects use ambient host authority.
+
+`ToolPolicyDecision` is secret-safe host evidence emitted after `ToolStarted` and
+before its matching `ToolFinished`. An allowed decision is finalized only after
+trusted hooks and reservation commit succeed, not when a reservation is first
+created. Stable denials distinguish `secondary_hook_denied`,
+`effect_reservation_commit_denied`, and `invalid_tool_arguments`; their
+model-visible messages never include hook, parser, broker, argument, or approval
+details.
+
+Each decision carries an `EffectiveToolPolicy` snapshot. `effect_policy`,
+`workspace_confinement`, `allow_edit`, `allow_write`, `allow_process`,
+`allow_shell`, `shell_path`, `bash_timeout_ms`, `max_output_bytes`, and
+`allow_remote_read` are `{ value, source }` values. `shell_path.value.selection`
+is only one of `configured`, `system_bash`, `path_bash`, `sh_fallback`, or
+`unavailable`, derived by the same resolver used for Bash execution; it contains
+neither a path nor a digest.
 
 ## Sessions
 
@@ -80,6 +96,16 @@ compatibility mode. Children
 can message peers, steer active work, queue messages for an idle worker, receive
 follow-up runs, wait without lost notifications, and spawn within the remaining
 depth and concurrency bounds.
+
+Each child snapshot, `agent_sessions` spawn/list result, and durable spawn record
+also includes its `effective_tool_policy` and bounded
+`orchestration_provenance`. The latter records only `parent_inherited` or
+`child_override` for sandbox, effect policy, approval authority, environment,
+working directory, extension trust, tool scope, and execution limits. An
+extension-requested child scope or limit is a host-validated `child_override`;
+it does not transfer sandbox, broker, approval, environment, cwd, or trust
+control to the extension. No paths, environment values, approval tokens,
+extension identifiers, or model arguments are included.
 
 The default team limit is ten concurrent agents including the root, depth two,
 and thirty-two total agents during each owning run. Host

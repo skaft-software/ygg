@@ -39,6 +39,12 @@ Telemetry records:
 - `tool_started` and `tool_finished` — tool name, hashed arguments, elapsed and
   result sizes, repeated-call count, status, known built-in state changes, and
   a conservative no-progress streak. Arguments and results are not retained.
+- `tool_policy_decision` — hashed tool-call identity, allowed/denied effect
+  admission, stable denial code when denied, and effective capability/limit
+  values with their source layers. Raw command arguments, workspace paths, and
+  shell paths are not retained; shell resolution is only the non-correlating
+  `configured`, `system_bash`, `path_bash`, `sh_fallback`, or `unavailable`
+  selection label.
 - `compaction_started` and `compaction_finished` — reason and durable outcome.
 - `candidate_rejected`, `steering_delivered`, `follow_up_delivered`, and
   `delegation_updated` — control-flow accounting.

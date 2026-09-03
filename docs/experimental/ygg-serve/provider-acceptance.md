@@ -112,7 +112,12 @@ The workflow builds `ygg-host` from that checkout and invokes
 2. The exact production `provider:model` selected for native audio consumes an
    integrity-pinned spoken-code WAV attachment and correctly transcribes the
    code, which is not present in the model prompt.
-3. Every route obeys the bounded host protocol lifecycle, sequence, scope, and
+3. Each non-audio route proves the protocol-v1 controlled, host-request policy
+   snapshot; registers only `read`; and emits one matching, secret-safe policy
+   decision before each registered call finishes. The required successful canary
+   decision is `workspace_read` authorized by `policy`; an audio route with no
+   tools is the only policy-evidence exemption.
+4. Every route obeys the bounded host protocol lifecycle, sequence, scope, and
    terminal-event contract.
 
 Provider stderr is discarded, the child receives an allowlisted environment,

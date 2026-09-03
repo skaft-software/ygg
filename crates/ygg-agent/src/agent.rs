@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -30,10 +30,13 @@ use crate::delegation::{
     enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
     DelegationRuntimeSettings, DelegationTemplate,
 };
-use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
+use crate::effect::{
+    EffectBroker, EffectIntent, EffectReservation, ToolEffect, ToolPolicyDenialCode,
+};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
+    ToolPolicyDecision,
 };
 use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
 use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
@@ -925,6 +928,9 @@ struct TerminalActionReceipt {
 
 struct CompletedToolExecution {
     result: Result<ToolOutput, ToolError>,
+    /// Host-owned effect admission result, absent only when the call never
+    /// reached a registered tool's effect boundary.
+    policy_decision: Option<ToolPolicyDecision>,
     /// Wall time taken for the call.
     duration: std::time::Duration,
     /// Unix milliseconds just before the tool's effects were admitted
@@ -949,10 +955,24 @@ fn rejected_argument_tool_error(error: ToolCallArgumentError) -> ToolError {
     ToolError::new(message)
 }
 
-fn rejected_argument_tool_execution(error: ToolCallArgumentError) -> CompletedToolExecution {
+fn rejected_argument_tool_execution(
+    error: ToolCallArgumentError,
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+) -> CompletedToolExecution {
     let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
     CompletedToolExecution {
         result: Err(rejected_argument_tool_error(error)),
+        // The exact request schema rejected this call before tool effect
+        // classification. Still expose the host-owned pre-admission denial so
+        // policy diagnostics remain complete without exposing provider args.
+        policy_decision: Some(policy_decision(
+            sandbox,
+            broker,
+            None,
+            None,
+            Some(ToolPolicyDenialCode::InvalidToolArguments),
+        )),
         duration: std::time::Duration::ZERO,
         started_unix_ms: None,
         finished_unix_ms: Some(crate::session::now_unix_millis()),
@@ -960,6 +980,108 @@ fn rejected_argument_tool_execution(error: ToolCallArgumentError) -> CompletedTo
         progress_sink: ToolProgressSink::live(progress_tx),
         cancellation_won: false,
     }
+}
+
+struct ToolEffectAdmission {
+    intent: EffectIntent,
+    reservation: EffectReservation,
+    effect: ToolEffect,
+}
+
+struct ToolEffectAdmissionError {
+    error: ToolError,
+    decision: ToolPolicyDecision,
+}
+
+fn policy_decision(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+    authorization: Option<crate::effect::EffectAuthorization>,
+    denial_code: Option<ToolPolicyDenialCode>,
+) -> ToolPolicyDecision {
+    ToolPolicyDecision {
+        effect,
+        allowed: authorization.is_some(),
+        authorization,
+        denial_code,
+        policy: sandbox.effective_tool_policy(broker.policy()),
+    }
+}
+
+fn denied_tool_policy(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+    denial_code: ToolPolicyDenialCode,
+    message: impl Into<String>,
+) -> (ToolError, ToolPolicyDecision) {
+    let decision = policy_decision(sandbox, broker, effect, None, Some(denial_code));
+    let error = ToolError::policy_denied(denial_code, message);
+    (error, decision)
+}
+
+/// Classify pre-admission argument parsing failures without retaining provider
+/// argument text in an error result or diagnostic.
+fn invalid_tool_arguments_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        None,
+        ToolPolicyDenialCode::InvalidToolArguments,
+        "invalid tool arguments",
+    )
+}
+
+/// Classify a trusted hook veto without exposing hook-provided text to the model.
+fn secondary_hook_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        effect,
+        ToolPolicyDenialCode::SecondaryHookDenied,
+        "tool call denied by host policy",
+    )
+}
+
+/// Classify a reservation that was invalidated between admission and dispatch.
+fn effect_reservation_commit_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: ToolEffect,
+    error: &crate::effect::EffectBrokerError,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        Some(effect),
+        error.policy_denial_code(),
+        "effect reservation could not be committed",
+    )
+}
+
+/// Replace an earlier broker admission with a later trusted tool-boundary
+/// denial, such as a resolved symlink escaping workspace confinement.
+fn apply_execution_policy_denial(
+    policy_decision: &mut Option<ToolPolicyDecision>,
+    result: &Result<ToolOutput, ToolError>,
+) {
+    let (Some(decision), Err(error)) = (policy_decision, result) else {
+        return;
+    };
+    let Some(denial_code) = error.policy_denial_code() else {
+        return;
+    };
+    decision.allowed = false;
+    decision.authorization = None;
+    decision.denial_code = Some(denial_code);
 }
 
 fn effect_is_repeatable_observation(effect: ToolEffect) -> bool {
@@ -978,8 +1100,16 @@ async fn reserve_tool_effect(
     generation: u64,
     request_id: &ygg_ai::ToolCallId,
     interactive: bool,
-) -> Result<(EffectIntent, EffectReservation), ToolError> {
-    let effect = tool.effect(arguments, context)?;
+) -> Result<ToolEffectAdmission, ToolEffectAdmissionError> {
+    let effect = tool.effect(arguments, context).map_err(|error| {
+        let denial_code = error
+            .policy_denial_code()
+            .unwrap_or(ToolPolicyDenialCode::InvalidToolArguments);
+        ToolEffectAdmissionError {
+            decision: policy_decision(context.sandbox, broker, None, None, Some(denial_code)),
+            error,
+        }
+    })?;
     let intent = EffectIntent::new(
         principal,
         run_id,
@@ -989,12 +1119,40 @@ async fn reserve_tool_effect(
         effect,
         arguments,
     )
-    .map_err(|error| ToolError::new(error.to_string()))?;
+    .map_err(|error| {
+        let denial_code = error.policy_denial_code();
+        ToolEffectAdmissionError {
+            decision: policy_decision(
+                context.sandbox,
+                broker,
+                Some(effect),
+                None,
+                Some(denial_code),
+            ),
+            error: ToolError::new(error.to_string()),
+        }
+    })?;
     let reservation = broker
         .reserve(&intent, interactive.then_some(&context.progress))
         .await
-        .map_err(|error| ToolError::new(error.to_string()))?;
-    Ok((intent, reservation))
+        .map_err(|error| {
+            let denial_code = error.policy_denial_code();
+            ToolEffectAdmissionError {
+                decision: policy_decision(
+                    context.sandbox,
+                    broker,
+                    Some(effect),
+                    None,
+                    Some(denial_code),
+                ),
+                error: ToolError::new(error.to_string()),
+            }
+        })?;
+    Ok(ToolEffectAdmission {
+        intent,
+        reservation,
+        effect,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1042,14 +1200,17 @@ async fn execute_parallel_tool_call(
         false,
     )
     .await;
-    let mut reservation = None;
-    let mut hook_denial = match admission {
-        Ok(admission) => {
-            reservation = Some(admission);
-            None
+    let (mut reservation, effect, mut decision, admission_error) = match admission {
+        Ok(ToolEffectAdmission {
+            intent,
+            reservation: effect_reservation,
+            effect,
+        }) => (Some((intent, effect_reservation)), Some(effect), None, None),
+        Err(ToolEffectAdmissionError { error, decision }) => {
+            (None, None, Some(decision), Some(error))
         }
-        Err(error) => Some(error),
     };
+    let mut hook_denial = None;
     if reservation.is_some() {
         for hook in hooks {
             if let Err(error) = hook.before_tool_call(name, &arguments, &tool_ctx).await {
@@ -1061,11 +1222,20 @@ async fn execute_parallel_tool_call(
 
     let mut committed = false;
     let mut cancellation_won = false;
-    let result = if let Some(error) = hook_denial {
+    let result = if let Some(error) = admission_error {
         if cancellation.is_cancelled() {
             cancellation_won = true;
             Err(cancelled_tool_error())
         } else {
+            Err(error)
+        }
+    } else if hook_denial.is_some() {
+        if cancellation.is_cancelled() {
+            cancellation_won = true;
+            Err(cancelled_tool_error())
+        } else {
+            let (error, hook_decision) = secondary_hook_denial(sandbox, broker, effect);
+            decision = Some(hook_decision);
             Err(error)
         }
     } else if cancellation.is_cancelled() {
@@ -1079,6 +1249,7 @@ async fn execute_parallel_tool_call(
             cancellation_won = true;
             return CompletedToolExecution {
                 result: Err(cancelled_tool_error()),
+                policy_decision: decision,
                 progress_rx,
                 progress_sink,
                 cancellation_won,
@@ -1091,8 +1262,24 @@ async fn execute_parallel_tool_call(
             .take()
             .expect("successful admission retains its exact reservation");
         match effect_reservation.commit(&intent) {
-            Err(error) => Err(ToolError::new(error.to_string())),
-            Ok(_receipt) => {
+            Err(error) => {
+                let (error, commit_decision) = effect_reservation_commit_denial(
+                    sandbox,
+                    broker,
+                    effect.expect("successful admission retains an effect classification"),
+                    &error,
+                );
+                decision = Some(commit_decision);
+                Err(error)
+            }
+            Ok(receipt) => {
+                decision = Some(policy_decision(
+                    sandbox,
+                    broker,
+                    effect,
+                    Some(receipt.authorization()),
+                    None,
+                ));
                 committed = true;
                 started_unix_ms = Some(crate::session::now_unix_millis());
                 let execute = tool.execute(execute_arguments, &tool_ctx);
@@ -1125,6 +1312,7 @@ async fn execute_parallel_tool_call(
 
     CompletedToolExecution {
         result,
+        policy_decision: decision,
         progress_rx,
         progress_sink,
         cancellation_won,
@@ -1290,6 +1478,7 @@ fn spawn_speculative_execution(
                     mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
                 CompletedToolExecution {
                     result: Err(cancelled_tool_error()),
+                    policy_decision: None,
                     progress_rx,
                     progress_sink: ToolProgressSink::live(progress_tx),
                     cancellation_won: true,
@@ -1662,7 +1851,13 @@ fn annotate_repeated_tool_result(
         Err(error) if serde_json::from_str::<serde_json::Value>(&error.message).is_ok() => {
             Err(error)
         }
-        Err(error) => Err(ToolError::new(format!("{}{}", error.message, annotation))),
+        Err(error) => {
+            let message = format!("{}{}", error.message, annotation);
+            match error.policy_denial_code() {
+                Some(code) => Err(ToolError::policy_denied(code, message)),
+                None => Err(ToolError::new(message)),
+            }
+        }
     }
 }
 
@@ -6182,6 +6377,7 @@ impl Agent {
                     }
                     let CompletedToolExecution {
                         result,
+                        mut policy_decision,
                         duration,
                         mut progress_rx,
                         progress_sink,
@@ -6193,7 +6389,11 @@ impl Agent {
                         // tool for a call already rejected by the request's
                         // schema snapshot. The paired static error is durable
                         // and safe to show back to the model.
-                        rejected_argument_tool_execution(argument_error)
+                        rejected_argument_tool_execution(
+                            argument_error,
+                            &sandbox,
+                            &effect_broker,
+                        )
                     } else if let Some(execution) = preexecuted {
                         execution
                     } else {
@@ -6206,6 +6406,7 @@ impl Agent {
                         let start = std::time::Instant::now();
                         let started_at = Arc::new(AtomicU64::new(u64::MAX));
                         let started_at_marker = Arc::clone(&started_at);
+                        let policy_decision_slot = Arc::new(Mutex::new(None));
                         let result: Result<ToolOutput, ToolError> = if answer_only {
                             Err(ToolError::new(format!(
                                 "tool call `{}` was not executed: the user requested an immediate final answer without tools",
@@ -6228,8 +6429,13 @@ impl Agent {
                             (None, _) => {
                                 Err(ToolError::new(format!("unknown tool: {}", call.name)))
                             }
-                            (Some(_), Err(e)) => {
-                                Err(ToolError::new(format!("invalid tool arguments: {e}")))
+                            (Some(_), Err(_)) => {
+                                let (error, decision) =
+                                    invalid_tool_arguments_denial(&sandbox, &effect_broker);
+                                *policy_decision_slot
+                                    .lock()
+                                    .expect("policy decision slot is not poisoned") = Some(decision);
+                                Err(error)
                             }
                             (Some(tool), Ok(args)) => {
                                 let active_skills = session
@@ -6250,8 +6456,9 @@ impl Agent {
                                 let hook_arguments = args.clone();
                                 let effect_committed = Arc::new(AtomicBool::new(false));
                                 let committed_marker = Arc::clone(&effect_committed);
+                                let policy_decision_marker = Arc::clone(&policy_decision_slot);
                                 let operation = async {
-                                    let (intent, effect_reservation) = reserve_tool_effect(
+                                    let admission = reserve_tool_effect(
                                         &effect_broker,
                                         tool.as_ref(),
                                         &call.name,
@@ -6263,21 +6470,71 @@ impl Agent {
                                         &call.id,
                                         true,
                                     )
-                                    .await?;
+                                    .await;
+                                    let ToolEffectAdmission {
+                                        intent,
+                                        reservation: effect_reservation,
+                                        effect,
+                                    } = match admission {
+                                        Ok(admission) => admission,
+                                        Err(ToolEffectAdmissionError { error, decision }) => {
+                                            *policy_decision_marker
+                                                .lock()
+                                                .expect("policy decision slot is not poisoned") =
+                                                Some(decision);
+                                            return Err(error);
+                                        }
+                                    };
                                     for hook in &tool_call_hooks {
-                                        hook.before_tool_call(
-                                            &call.name,
-                                            &hook_arguments,
-                                            &tool_ctx,
-                                        )
-                                        .await?;
+                                        if let Err(_) = hook
+                                            .before_tool_call(
+                                                &call.name,
+                                                &hook_arguments,
+                                                &tool_ctx,
+                                            )
+                                            .await
+                                        {
+                                            if tool_ctx.cancellation.is_cancelled() {
+                                                return Err(cancelled_tool_error());
+                                            }
+                                            let (error, decision) = secondary_hook_denial(
+                                                &sandbox,
+                                                &effect_broker,
+                                                Some(effect),
+                                            );
+                                            *policy_decision_marker
+                                                .lock()
+                                                .expect("policy decision slot is not poisoned") =
+                                                Some(decision);
+                                            return Err(error);
+                                        }
                                     }
                                     if tool_ctx.cancellation.is_cancelled() {
                                         return Err(cancelled_tool_error());
                                     }
-                                    effect_reservation
-                                        .commit(&intent)
-                                        .map_err(|error| ToolError::new(error.to_string()))?;
+                                    let receipt = effect_reservation.commit(&intent).map_err(|error| {
+                                        let (error, decision) = effect_reservation_commit_denial(
+                                            &sandbox,
+                                            &effect_broker,
+                                            effect,
+                                            &error,
+                                        );
+                                        *policy_decision_marker
+                                            .lock()
+                                            .expect("policy decision slot is not poisoned") =
+                                            Some(decision);
+                                        error
+                                    })?;
+                                    *policy_decision_marker
+                                        .lock()
+                                        .expect("policy decision slot is not poisoned") =
+                                        Some(policy_decision(
+                                            &sandbox,
+                                            &effect_broker,
+                                            Some(effect),
+                                            Some(receipt.authorization()),
+                                            None,
+                                        ));
                                     committed_marker.store(true, Ordering::Release);
                                     started_at_marker
                                         .store(crate::session::now_unix_millis(), Ordering::Release);
@@ -6381,11 +6638,16 @@ impl Agent {
                             }
                         }
                         };
+                        let policy_decision = policy_decision_slot
+                            .lock()
+                            .expect("policy decision slot is not poisoned")
+                            .take();
                         let started_at_value = started_at.load(Ordering::Acquire);
                         let started_unix_ms =
                             (started_at_value != u64::MAX).then_some(started_at_value);
                         CompletedToolExecution {
                             result,
+                            policy_decision,
                             duration: start.elapsed(),
                             started_unix_ms,
                             finished_unix_ms: Some(crate::session::now_unix_millis()),
@@ -6399,6 +6661,21 @@ impl Agent {
                     } else {
                         result
                     };
+
+                    apply_execution_policy_denial(&mut policy_decision, &result);
+
+                    // Emit policy metadata before the durable result commit: a
+                    // session-write failure must not hide a decision already
+                    // made for this exact call.
+                    if let Some(decision) = policy_decision {
+                        let ev = AgentEvent::ToolPolicyDecision {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            decision,
+                        };
+                        notify_observers(&observers, &ev);
+                        yield ev;
+                    }
 
                     // ── COMMIT BOUNDARY ──────────────────────────────────
                     // Tool::execute resolved (or an immediate error was
@@ -6747,6 +7024,7 @@ mod tests {
                 mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
             CompletedToolExecution {
                 result: Ok(ToolOutput::new(text)),
+                policy_decision: None,
                 duration: std::time::Duration::ZERO,
                 started_unix_ms: None,
                 finished_unix_ms: None,
@@ -6843,6 +7121,107 @@ mod tests {
         let original = r#"{"timed_out":false,"messages":[]}"#;
         let result = annotate_repeated_tool_result(Ok(ToolOutput::new(original)), 2).unwrap();
         assert_eq!(result.text, original);
+    }
+
+    #[test]
+    fn malformed_registered_arguments_create_a_secret_safe_policy_denial() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::new(workspace.path());
+        let broker = EffectBroker::new(crate::effect::EffectPolicy::Controlled);
+        let sensitive_argument = "sensitive-argument-marker";
+        let call = ToolCall {
+            id: ygg_ai::ToolCallId("call_malformed".into()),
+            name: "bash".into(),
+            arguments_json: format!(r#"{{"command":"{sensitive_argument}""#),
+        };
+        assert!(call.arguments_value().is_err());
+
+        let (error, decision) = invalid_tool_arguments_denial(&sandbox, &broker);
+
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::InvalidToolArguments)
+        );
+        assert_eq!(error.message, "invalid tool arguments");
+        assert_eq!(decision.effect, None);
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::InvalidToolArguments)
+        );
+        let diagnostic = serde_json::to_string(&decision).unwrap();
+        assert!(!diagnostic.contains(sensitive_argument));
+        assert!(!error.message.contains(sensitive_argument));
+    }
+
+    #[test]
+    fn reservation_commit_rejection_keeps_final_policy_denied() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::new(workspace.path());
+        let broker = EffectBroker::new(crate::effect::EffectPolicy::Controlled);
+        let (error, decision) = effect_reservation_commit_denial(
+            &sandbox,
+            &broker,
+            ToolEffect::WorkspaceMutation,
+            &crate::effect::EffectBrokerError::GrantRejected,
+        );
+
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::EffectReservationCommitDenied)
+        );
+        assert_eq!(error.message, "effect reservation could not be committed");
+        assert_eq!(decision.effect, Some(ToolEffect::WorkspaceMutation));
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::EffectReservationCommitDenied)
+        );
+    }
+
+    #[test]
+    fn execution_policy_denial_replaces_prior_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut decision = Some(ToolPolicyDecision {
+            effect: Some(ToolEffect::WorkspaceRead),
+            allowed: true,
+            authorization: Some(crate::effect::EffectAuthorization::Policy),
+            denial_code: None,
+            policy: SandboxConfig::new(workspace.path())
+                .effective_tool_policy(crate::effect::EffectPolicy::Controlled),
+        });
+        let result: Result<ToolOutput, ToolError> = Err(ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            "path escapes the workspace",
+        ));
+
+        apply_execution_policy_denial(&mut decision, &result);
+
+        let decision = decision.unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
+    }
+
+    #[test]
+    fn repeated_tool_annotation_preserves_policy_denial_code() {
+        let error = annotate_repeated_tool_result(
+            Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::WorkspaceConfinement,
+                "path escapes the workspace",
+            )),
+            REPEATED_TOOL_CALL_THRESHOLD,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
     }
 
     #[test]

@@ -459,11 +459,14 @@ by default, with the access value shown in bold red. Launching with
 The model-visible schema and executable registry are built from the same final
 allowlist. A disabled tool cannot remain advertised to the model. Registration
 does not itself authorize an effect: the default policy (`UnsafeHost`) gives
-authoritatively classified effects the Ygg process's ambient host authority, subject
-to the existing tool and sandbox gates. `--safe-mode` selects
-`ControlledBashApproval`, requiring workspace-mutation approval and one-shot approval
-for every `bash` process call while denying other ambient host effects. Unknown
-effects always fail closed.
+authoritatively classified effects the Ygg process's ambient host authority,
+subject to the existing tool and sandbox gates. Set `effect_policy`,
+`YGG_EFFECT_POLICY`, or `--effect-policy` to `controlled_bash_approval`,
+`controlled`, or `unsafe_host`; a trusted project may tighten but not relax the
+global profile. `--safe-mode` selects `ControlledBashApproval`, conflicts with
+`--effect-policy`, and requires workspace-mutation approval plus one-shot
+approval for every `bash` process call while denying other ambient host effects.
+Unknown effects always fail closed.
 
 `--safe-mode` requires confirmation for every `bash` host process call and keeps
 workspace reads/mutations controlled. Without it, an enabled, trusted executable
@@ -493,6 +496,8 @@ In the default full-access mode, `bash` runs with the authority of the
 current operating-system user. Like Pi, it passes every complete command to one
 selected shell with `-c`; on Unix Ygg uses an explicit `shell_path` first, then
 `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult `$SHELL`.
+Secret-safe policy diagnostics report only the selected branch (`configured`,
+`system_bash`, `path_bash`, or `sh_fallback`), never a shell path or digest.
 `--no-process` and `--no-shell` remain equivalent authority gates. Use
 `--safe-mode` to require approval for each action.
 For untrusted repositories, use a container, VM, or restricted account; see
@@ -748,6 +753,8 @@ color = "auto"
 mouse = "auto"
 plain = false
 
+# unsafe_host is the default. A trusted project may only tighten this profile.
+effect_policy = "unsafe_host"
 # ygg defaults to full host access. Pass --safe-mode to require approval
 # for each action. This capability setting independently keeps paths local.
 allow_external_paths = false
@@ -779,15 +786,19 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_EFFECT_POLICY`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 Telemetry is opt-in and separate from durable sessions. `--telemetry PATH` writes
 owner-only `ygg.telemetry.v1` JSONL records for run boundaries, model request
 latency/TTFT, disjoint input/cache/output usage, retries, tool timings and
-repetition signals, compaction outcomes, and terminal status. It hashes the
-prompt identity and tool arguments instead of recording raw prompts, arguments,
-results, or provider payloads. See [docs/benchmarks/README.md](docs/benchmarks/README.md) for
-the schema and measurement methodology.
+repetition signals, secret-safe policy admission decisions, compaction outcomes,
+and terminal status. Policy decisions identify the allowed/denied effect, stable
+denial code, and effective policy values with their configuration-source layer;
+the shell is only a non-correlating resolution branch, never a path or digest.
+Telemetry hashes the prompt identity and tool arguments instead of recording raw
+prompts, arguments, results, or provider payloads. See
+[docs/benchmarks/README.md](docs/benchmarks/README.md) for the
+schema and measurement methodology.
 
 For renderer diagnostics, `YGG_TUI_WRITE_LOG=/path/to/ansi.log` captures the
 raw ANSI stream written by the interactive TUI. An existing directory creates a
@@ -810,7 +821,7 @@ warning. New configuration should use `reasoning` alone.
 | Session | `--continue`, `--resume`, `--fork`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--effect-policy`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes`, `--telemetry` |
 | Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
 | Pi compatibility | `pi install <PATH>`, `pi list` |

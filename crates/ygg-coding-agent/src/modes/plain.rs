@@ -374,7 +374,10 @@ async fn run_prompt(
                         )?;
                         tools.insert(id.clone(), (name.clone(), args.clone()));
                     }
-                    AgentEvent::ToolProgress { .. } => {}
+                    // Policy details are available in telemetry and the
+                    // headless host protocol; plain output keeps the existing
+                    // concise tool lifecycle and model-facing failure text.
+                    AgentEvent::ToolPolicyDecision { .. } | AgentEvent::ToolProgress { .. } => {}
                     AgentEvent::ToolFinished { id, result, .. } => {
                         let (name, args) = tools
                             .remove(id)

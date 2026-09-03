@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ygg_agent::{
-    EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
+    EffectPolicy, EffectiveToolPolicy, SandboxConfig, ToolPolicyProvenance,
+    DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
 };
 
 pub use crate::tui::terminal::ColorMode;
@@ -92,6 +93,8 @@ pub struct SandboxPolicy {
     pub shell_path: Option<PathBuf>,
     pub bash_timeout_secs: u64,
     pub max_output_bytes: usize,
+    /// Source labels for the secret-safe effective policy diagnostic.
+    pub policy_provenance: ToolPolicyProvenance,
 }
 
 impl Default for SandboxPolicy {
@@ -110,6 +113,7 @@ impl Default for SandboxPolicy {
             shell_path: None,
             bash_timeout_secs: 120,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            policy_provenance: ToolPolicyProvenance::default(),
         }
     }
 }
@@ -248,7 +252,19 @@ impl SandboxPolicy {
         sandbox.shell_path = self.shell_path.clone();
         sandbox.bash_timeout = Duration::from_secs(self.bash_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
+        sandbox.policy_provenance = self.policy_provenance;
         sandbox
+    }
+
+    /// Resolve the safe policy metadata exposed by telemetry and headless
+    /// diagnostics without disclosing configured path values.
+    pub fn effective_tool_policy(
+        &self,
+        workspace: &Path,
+        effect_policy: EffectPolicy,
+    ) -> EffectiveToolPolicy {
+        self.to_sandbox_config(workspace)
+            .effective_tool_policy(effect_policy)
     }
 }
 

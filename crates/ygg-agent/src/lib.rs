@@ -128,13 +128,14 @@ pub use delegation::{
 };
 pub use effect::{
     EffectAuthorization, EffectBroker, EffectBrokerError, EffectGrantToken, EffectIntent,
-    EffectPolicy, EffectReceipt, ToolEffect, EFFECT_POLICY_VERSION, MAX_EFFECT_GRANTS,
-    MAX_EFFECT_GRANT_TTL, MAX_EFFECT_INTENT_BYTES,
+    EffectPolicy, EffectReceipt, ToolEffect, ToolPolicyDenialCode, EFFECT_POLICY_VERSION,
+    MAX_EFFECT_GRANTS, MAX_EFFECT_GRANT_TTL, MAX_EFFECT_INTENT_BYTES,
 };
 pub use events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
-    DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason, OutputChannel,
-    QueueDeliveryMode,
+    DelegationOrchestrationProvenance, DelegationPolicySource, DelegationTelemetryChild,
+    DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
+    ToolPolicyDecision,
 };
 pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
 pub use extension_policy::{
@@ -199,7 +200,10 @@ pub use goal_store::{
     MAX_GOAL_TURN_BUDGET,
 };
 pub use input::{InputPart, UserInput};
-pub use sandbox::{SandboxConfig, DEFAULT_MAX_OUTPUT_BYTES};
+pub use sandbox::{
+    EffectivePolicyValue, EffectiveToolPolicy, PolicyValueSource, SandboxConfig, ShellPathSummary,
+    ShellSelection, ToolPolicyProvenance, DEFAULT_MAX_OUTPUT_BYTES,
+};
 pub use session::{
     Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRecord,
     SessionRunOutcome, SessionRunOutcomeStatus, UsageRecord, UsageRecordKind,

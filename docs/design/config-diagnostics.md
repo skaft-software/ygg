@@ -26,6 +26,26 @@ Normal value precedence remains:
 Diagnostics are collected from each loaded TOML layer before values are merged,
 so an overridden typo is still reported with its original source.
 
+### Effect-policy selection
+
+`effect_policy` selects the host-owned effect-admission profile. Its canonical
+values are `controlled_bash_approval`, `controlled`, and `unsafe_host`, ordered
+from most to least restrictive. The coding product defaults to `unsafe_host`;
+`--safe-mode` instead selects `controlled_bash_approval` and cannot be combined
+with `--effect-policy`.
+
+Set the profile in global or trusted project TOML as `effect_policy = "…"`, in
+the environment as `YGG_EFFECT_POLICY`, or on the command line with
+`--effect-policy`. Environment and CLI layers use ordinary precedence and may
+replace a prior profile. A trusted project may only retain or tighten the global
+profile; it cannot relax one. Invalid values fail with a bounded generic
+message that does not repeat the supplied value.
+
+The secret-safe effective-policy snapshot records the final profile as
+`{ value, source }`. The source is `default`, `config`, `environment`, `cli`, or
+`host_request`; this source identifies the layer that selected the parent
+policy, not a delegated child's inheritance relationship.
+
 ## Unknown keys
 
 TOML is deserialized with `serde_ignored`. Each unknown path is normalized,

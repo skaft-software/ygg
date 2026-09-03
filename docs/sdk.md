@@ -174,7 +174,9 @@ or deleted.
 
 A successful run normally emits:
 
-1. `accepted` with the resolved model, native session path, and registered tools;
+1. `accepted` with the resolved model, native session path, registered tools, and
+   a secret-safe `effective_tool_policy` snapshot. Its values include capability
+   limits and source layers; it excludes raw workspace and shell paths.
 2. `started`;
 3. zero or more streaming events;
 4. `settled`; and
@@ -184,11 +186,25 @@ Streaming events currently include:
 
 - `model_delta` and `output_media`;
 - `provider_retry` and `candidate_rejected`;
-- `tool_start`, `tool_progress`, and `tool_finish`;
+- `tool_start`, `tool_policy`, `tool_progress`, and `tool_finish`; `tool_policy`
+  carries secret-safe allowed/denied admission metadata and stable denial codes,
+  never command contents or raw shell paths;
 - `model_step` usage/cost accounting;
 - `steering_delivered` and `follow_up_delivered`;
 - `compaction_start` and `compaction_finish`; and
 - `extension_notification`.
+
+`accepted.data.effective_tool_policy` and `tool_policy.data.decision.policy`
+share the same schema. `effect_policy`, `workspace_confinement`, `allow_edit`,
+`allow_write`, `allow_process`, `allow_shell`, `shell_path`, `bash_timeout_ms`,
+`max_output_bytes`, and `allow_remote_read` are each
+`{ "value": ..., "source": ... }`, with a source of `default`, `config`,
+`environment`, `cli`, or `host_request`. `shell_path.value` reports only
+`{ "selection": "configured" | "system_bash" | "path_bash" | "sh_fallback" |
+"unavailable" }`; it contains no shell path, digest, or cross-run identifier.
+A decision contains an optional effect, `allowed`, `authorization` when allowed,
+and a stable `denial_code` when denied. Allowed evidence is emitted only after
+all host hooks and reservation commit gates complete.
 
 `final_result.data` contains `status`, `output`, `error`, `filesChanged`,
 `toolCalls`, `steps`, and `sessionFile`. Status is `completed`, `blocked`, or

@@ -93,7 +93,8 @@ impl ToolEffect {
 }
 
 /// Deterministic broker policy selected by the trusted host.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectPolicy {
     /// Allow pure computation and workspace reads, require an exact one-shot
     /// approval for workspace mutation and potentially auto-approved known-safe
@@ -109,8 +110,79 @@ pub enum EffectPolicy {
     UnsafeHost,
 }
 
+impl std::str::FromStr for EffectPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "controlled" => Ok(Self::Controlled),
+            "controlled_bash_approval" | "controlled-bash-approval" => {
+                Ok(Self::ControlledBashApproval)
+            }
+            "unsafe_host" | "unsafe-host" => Ok(Self::UnsafeHost),
+            _ => Err(
+                "invalid effect policy; use controlled, controlled_bash_approval, or unsafe_host"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+/// Stable machine-readable code for a tool-policy denial.
+///
+/// These values are intentionally separate from model-facing [`ToolError`]
+/// wording. New codes may be added, but an existing serialized spelling is a
+/// diagnostic contract and must not be renamed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPolicyDenialCode {
+    /// A path shape or resolved target escaped workspace-only confinement.
+    WorkspaceConfinement,
+    /// The edit capability gate is disabled.
+    EditDisabled,
+    /// The write capability gate is disabled.
+    WriteDisabled,
+    /// Process execution is disabled.
+    ProcessDisabled,
+    /// Shell execution is disabled.
+    ShellDisabled,
+    /// Direct HTTPS media reads are disabled.
+    RemoteReadDisabled,
+    /// The tool did not provide a trusted effect classification.
+    EffectUnknown,
+    /// Controlled policy disallows a host read.
+    EffectHostReadDenied,
+    /// Controlled policy disallows a host mutation.
+    EffectHostMutationDenied,
+    /// Controlled policy disallows native process execution.
+    EffectNativeProcessDenied,
+    /// Controlled policy disallows network I/O.
+    EffectNetworkDenied,
+    /// Controlled policy disallows delegation.
+    EffectDelegationDenied,
+    /// Controlled policy disallows executable extensions.
+    EffectExtensionDenied,
+    /// The effect needs interactive approval but no authority source exists.
+    ApprovalUnavailable,
+    /// The approval authority rejected the exact effect.
+    ApprovalDenied,
+    /// The effect intent failed boundary validation.
+    InvalidEffectIntent,
+    /// The canonical effect intent exceeded its bounded size.
+    EffectIntentTooLarge,
+    /// The effect broker could not complete admission safely.
+    EffectBrokerUnavailable,
+    /// A secondary host hook rejected the otherwise classified tool call.
+    SecondaryHookDenied,
+    /// A reserved effect could no longer be committed immediately before dispatch.
+    EffectReservationCommitDenied,
+    /// The tool could not classify the supplied arguments.
+    InvalidToolArguments,
+}
+
 /// Why an admitted effect was authorized.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EffectAuthorization {
     /// The deterministic policy allowed the effect without escalation.
     Policy,
@@ -811,6 +883,42 @@ pub enum EffectBrokerError {
     GrantRejected,
 }
 
+impl EffectBrokerError {
+    /// Map an admission failure to the stable diagnostic code that explains it
+    /// without carrying its model-facing text or any intent contents.
+    pub(crate) fn policy_denial_code(&self) -> ToolPolicyDenialCode {
+        match self {
+            Self::InvalidIntent(_) => ToolPolicyDenialCode::InvalidEffectIntent,
+            Self::IntentTooLarge { .. } => ToolPolicyDenialCode::EffectIntentTooLarge,
+            Self::Denied { effect, .. } => match effect {
+                ToolEffect::Unknown => ToolPolicyDenialCode::EffectUnknown,
+                ToolEffect::HostRead => ToolPolicyDenialCode::EffectHostReadDenied,
+                ToolEffect::HostMutation => ToolPolicyDenialCode::EffectHostMutationDenied,
+                ToolEffect::HostProcess => ToolPolicyDenialCode::EffectNativeProcessDenied,
+                ToolEffect::Network => ToolPolicyDenialCode::EffectNetworkDenied,
+                ToolEffect::Delegation => ToolPolicyDenialCode::EffectDelegationDenied,
+                ToolEffect::Extension => ToolPolicyDenialCode::EffectExtensionDenied,
+                // These are not denied by the current policy, but preserve a
+                // fail-closed diagnostic if a future policy adds such a rule.
+                ToolEffect::Pure | ToolEffect::WorkspaceRead | ToolEffect::WorkspaceMutation => {
+                    ToolPolicyDenialCode::EffectBrokerUnavailable
+                }
+            },
+            Self::ApprovalUnavailable { .. } => ToolPolicyDenialCode::ApprovalUnavailable,
+            Self::ApprovalDenied { .. } => ToolPolicyDenialCode::ApprovalDenied,
+            // A reservation can be invalidated after its initial admission
+            // (for example, when a one-shot human grant expires while a hook
+            // runs). Keep that final admission boundary distinguishable from a
+            // generic broker failure.
+            Self::GrantRejected => ToolPolicyDenialCode::EffectReservationCommitDenied,
+            Self::InvalidGrantTtl
+            | Self::GrantCapacity
+            | Self::EntropyUnavailable
+            | Self::GrantStoreUnavailable => ToolPolicyDenialCode::EffectBrokerUnavailable,
+        }
+    }
+}
+
 fn validate_identifier(label: &str, value: &str) -> Result<(), EffectBrokerError> {
     if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.chars().any(char::is_control)
     {
@@ -1172,6 +1280,90 @@ mod tests {
 
     fn duplicate_token(token: &EffectGrantToken) -> EffectGrantToken {
         EffectGrantToken::parse(token.as_str().to_owned()).unwrap()
+    }
+
+    #[test]
+    fn policy_denial_codes_have_stable_wire_spellings() {
+        let cases = [
+            (
+                ToolPolicyDenialCode::WorkspaceConfinement,
+                "workspace_confinement",
+            ),
+            (ToolPolicyDenialCode::EditDisabled, "edit_disabled"),
+            (ToolPolicyDenialCode::WriteDisabled, "write_disabled"),
+            (ToolPolicyDenialCode::ProcessDisabled, "process_disabled"),
+            (ToolPolicyDenialCode::ShellDisabled, "shell_disabled"),
+            (
+                ToolPolicyDenialCode::RemoteReadDisabled,
+                "remote_read_disabled",
+            ),
+            (ToolPolicyDenialCode::EffectUnknown, "effect_unknown"),
+            (
+                ToolPolicyDenialCode::EffectHostReadDenied,
+                "effect_host_read_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectHostMutationDenied,
+                "effect_host_mutation_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectNativeProcessDenied,
+                "effect_native_process_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectNetworkDenied,
+                "effect_network_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectDelegationDenied,
+                "effect_delegation_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectExtensionDenied,
+                "effect_extension_denied",
+            ),
+            (
+                ToolPolicyDenialCode::ApprovalUnavailable,
+                "approval_unavailable",
+            ),
+            (ToolPolicyDenialCode::ApprovalDenied, "approval_denied"),
+            (
+                ToolPolicyDenialCode::InvalidEffectIntent,
+                "invalid_effect_intent",
+            ),
+            (
+                ToolPolicyDenialCode::EffectIntentTooLarge,
+                "effect_intent_too_large",
+            ),
+            (
+                ToolPolicyDenialCode::EffectBrokerUnavailable,
+                "effect_broker_unavailable",
+            ),
+            (
+                ToolPolicyDenialCode::SecondaryHookDenied,
+                "secondary_hook_denied",
+            ),
+            (
+                ToolPolicyDenialCode::EffectReservationCommitDenied,
+                "effect_reservation_commit_denied",
+            ),
+            (
+                ToolPolicyDenialCode::InvalidToolArguments,
+                "invalid_tool_arguments",
+            ),
+        ];
+
+        for (code, expected) in cases {
+            assert_eq!(serde_json::to_value(code).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn reservation_commit_rejection_has_a_stable_policy_code() {
+        assert_eq!(
+            EffectBrokerError::GrantRejected.policy_denial_code(),
+            ToolPolicyDenialCode::EffectReservationCommitDenied
+        );
     }
 
     #[test]

@@ -22,7 +22,8 @@ use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EffectBroker, EffectPolicy,
     EntryId, EntryValue, ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream,
     QueueDeliveryMode, ReplaySafety, RunControl, SandboxConfig, Session, Tool, ToolCallHook,
-    ToolConcurrency, ToolContext, ToolEffect, ToolError, ToolOutput, UsageRecordKind, UserInput,
+    ToolConcurrency, ToolContext, ToolEffect, ToolError, ToolOutput, ToolPolicyDenialCode,
+    UsageRecordKind, UserInput,
 };
 use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
@@ -5340,6 +5341,7 @@ async fn complete_surfaces_unsupported_reasoning_as_err() {
 struct ClassifiedEffectProbe {
     name: &'static str,
     effect: ToolEffect,
+    concurrency: ToolConcurrency,
     executions: Arc<AtomicUsize>,
 }
 
@@ -5363,6 +5365,10 @@ impl Tool for ClassifiedEffectProbe {
         _ctx: &ToolContext<'_>,
     ) -> Result<ToolEffect, ToolError> {
         Ok(self.effect)
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        self.concurrency
     }
 
     async fn execute(
@@ -5443,6 +5449,150 @@ impl ToolCallHook for AdmissionHookProbe {
     ) {
         self.after.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+struct DenyingAdmissionHook {
+    before: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+
+const HOOK_DENIAL_SECRET: &str = "secondary-hook-secret-marker";
+
+#[async_trait::async_trait]
+impl ToolCallHook for DenyingAdmissionHook {
+    async fn before_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _context: &ToolContext<'_>,
+    ) -> Result<(), ToolError> {
+        self.before.fetch_add(1, Ordering::SeqCst);
+        Err(ToolError::new(HOOK_DENIAL_SECRET))
+    }
+
+    async fn after_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _output: &str,
+        _is_error: bool,
+        _context: &ToolContext<'_>,
+    ) {
+        self.after.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+async fn assert_secondary_hook_denials(parallel: bool) {
+    let server = MockServer::start().await;
+    let calls = if parallel {
+        vec![
+            ("call_parallel_one", "pure_probe", serde_json::json!({})),
+            ("call_parallel_two", "pure_probe", serde_json::json!({})),
+        ]
+    } else {
+        vec![("call_serial", "pure_probe", serde_json::json!({}))]
+    };
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![tool_turn(&calls), text_turn("hook denial observed")],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(ClassifiedEffectProbe {
+        name: "pure_probe",
+        effect: ToolEffect::Pure,
+        concurrency: if parallel {
+            ToolConcurrency::Parallel
+        } else {
+            ToolConcurrency::Sequential
+        },
+        executions: Arc::clone(&executions),
+    });
+    extensions.tool_call_hook(DenyingAdmissionHook {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "secondary admission hook test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::Controlled),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("attempt probes").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    for (id, _, _) in &calls {
+        let decision = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolPolicyDecision {
+                    id: event_id,
+                    decision,
+                    ..
+                } if event_id.0 == *id => Some(decision),
+                _ => None,
+            })
+            .expect("secondary hook denial must be policy-visible");
+        assert_eq!(decision.effect, Some(ToolEffect::Pure));
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::SecondaryHookDenied)
+        );
+        assert!(!serde_json::to_string(decision)
+            .unwrap()
+            .contains(HOOK_DENIAL_SECRET));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolFinished { id: event_id, result: Err(error), .. }
+                if event_id.0 == *id
+                    && error.message == "tool call denied by host policy"
+                    && !error.message.contains(HOOK_DENIAL_SECRET)
+        )));
+        let started = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolStarted { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        let decided = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        let finished = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolFinished { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        assert!(started < decided && decided < finished);
+    }
+    assert_eq!(before.load(Ordering::SeqCst), calls.len());
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn secondary_hook_denials_are_policy_visible_in_serial_and_parallel_paths() {
+    assert_secondary_hook_denials(false).await;
+    assert_secondary_hook_denials(true).await;
 }
 
 const SCHEMA_MISMATCH_ERROR: &str =
@@ -5776,6 +5926,7 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
         extensions.tool(ClassifiedEffectProbe {
             name,
             effect,
+            concurrency: ToolConcurrency::Sequential,
             executions: Arc::clone(&executions),
         });
     }
@@ -5844,6 +5995,104 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
+    let decisions = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolPolicyDecision { id, decision, .. } => Some((id.0.as_str(), decision)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(decisions.len(), calls.len());
+    for (id, effect, denial_code) in [
+        (
+            "call_host_read",
+            ToolEffect::HostRead,
+            ToolPolicyDenialCode::EffectHostReadDenied,
+        ),
+        (
+            "call_network",
+            ToolEffect::Network,
+            ToolPolicyDenialCode::EffectNetworkDenied,
+        ),
+        (
+            "call_search",
+            ToolEffect::HostProcess,
+            ToolPolicyDenialCode::EffectNativeProcessDenied,
+        ),
+        (
+            "call_host_mutation",
+            ToolEffect::HostMutation,
+            ToolPolicyDenialCode::EffectHostMutationDenied,
+        ),
+        (
+            "call_delegation",
+            ToolEffect::Delegation,
+            ToolPolicyDenialCode::EffectDelegationDenied,
+        ),
+        (
+            "call_extension",
+            ToolEffect::Extension,
+            ToolPolicyDenialCode::EffectExtensionDenied,
+        ),
+        (
+            "call_unknown",
+            ToolEffect::Unknown,
+            ToolPolicyDenialCode::EffectUnknown,
+        ),
+    ] {
+        let decision = decisions.get(id).expect("policy decision for denied call");
+        assert_eq!(decision.effect, Some(effect), "{id}");
+        assert!(!decision.allowed, "{id}");
+        assert_eq!(decision.authorization, None, "{id}");
+        assert_eq!(decision.denial_code, Some(denial_code), "{id}");
+        assert_eq!(
+            decision.policy.effect_policy.value,
+            EffectPolicy::Controlled,
+            "{id}"
+        );
+    }
+    let approved = decisions
+        .get("call_process")
+        .expect("policy decision for approved command");
+    assert_eq!(approved.effect, Some(ToolEffect::HostProcess));
+    assert!(approved.allowed);
+    assert!(approved.authorization.is_some());
+    assert_eq!(approved.denial_code, None);
+    assert!(approved.policy.allow_process.value);
+    assert!(approved.policy.allow_shell.value);
+
+    for &call_id in decisions.keys() {
+        let started = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolStarted { id, .. } if id.0 == call_id),
+            )
+            .expect("ToolStarted before policy decision");
+        let decided = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id, .. } if id.0 == call_id))
+            .expect("ToolPolicyDecision");
+        let finished = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolFinished { id, .. } if id.0 == call_id),
+            )
+            .expect("ToolFinished after policy decision");
+        assert!(
+            started < decided && decided < finished,
+            "invalid lifecycle for {call_id}"
+        );
+    }
+    let decisions_json = decisions
+        .values()
+        .map(|decision| serde_json::to_string(decision).unwrap())
+        .collect::<String>();
+    assert!(!decisions_json.contains(external_file.to_str().unwrap()));
+    assert!(!decisions_json.contains(external_write.to_str().unwrap()));
+    assert!(!decisions_json.contains(bash_marker.to_str().unwrap()));
+    assert!(!decisions_json.contains("forbidden"));
+    assert!(!decisions_json.contains("https://example.com/image.png"));
+
     for id in [
         "call_host_read",
         "call_network",
@@ -6042,6 +6291,7 @@ async fn unsafe_host_still_denies_unknown_tools_before_hooks() {
     extensions.tool(ClassifiedEffectProbe {
         name: "unknown_probe",
         effect: ToolEffect::Unknown,
+        concurrency: ToolConcurrency::Sequential,
         executions: Arc::clone(&executions),
     });
     extensions.tool_call_hook(AdmissionHookProbe {

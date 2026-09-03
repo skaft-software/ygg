@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ygg_agent::{
-    AgentEvent, EntryValue, InputPart, OutputChannel, Session, ToolProgress, UserInput,
+    AgentEvent, EntryValue, InputPart, OutputChannel, PolicyValueSource, Session,
+    ToolPolicyProvenance, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantMessage, AssistantPart, AudioFormat, Auth, CacheRetention, Capabilities, Endpoint,
@@ -843,6 +844,10 @@ async fn run_request(
                 "resolved_model": app.model.spec.id.0,
                 "session_file": session_path,
                 "registered_tools": app.agent.registered_tool_names(),
+                "effective_tool_policy": app.config.sandbox.effective_tool_policy(
+                    &app.config.workspace,
+                    app.config.effect_policy,
+                ),
                 "extensions": app.executable_extensions.summaries(),
             }),
         )
@@ -1011,6 +1016,18 @@ async fn run_request(
                             "toolCallId": id.0,
                             "toolName": name,
                             "input": args,
+                        }),
+                    )
+                    .await?;
+            }
+            AgentEvent::ToolPolicyDecision { id, name, decision } => {
+                emitter
+                    .emit(
+                        "tool_policy",
+                        serde_json::json!({
+                            "toolCallId": id.0,
+                            "toolName": name,
+                            "decision": decision,
                         }),
                     )
                     .await?;
@@ -1265,6 +1282,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
     // workspace-relative under that effect policy.
     let mut sandbox = SandboxPolicy {
         allow_external_paths: false,
+        policy_provenance: ToolPolicyProvenance::all(PolicyValueSource::HostRequest),
         ..SandboxPolicy::default()
     };
     if !request.allow_file_mutation {
@@ -2098,6 +2116,10 @@ mod tests {
 
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
         assert!(!config.sandbox.allow_external_paths);
+        assert_eq!(
+            config.sandbox.policy_provenance,
+            ToolPolicyProvenance::all(PolicyValueSource::HostRequest)
+        );
     }
 
     #[test]

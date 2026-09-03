@@ -6,8 +6,62 @@ use serde::Serialize;
 use ygg_ai::{AssistantMessage, Cost, Media, ToolCallId, Usage};
 
 use crate::agent::AgentError;
+use crate::effect::{EffectAuthorization, ToolEffect, ToolPolicyDenialCode};
+use crate::sandbox::EffectiveToolPolicy;
 use crate::session::EntryId;
 use crate::tool::{ToolError, ToolOutput, ToolProgress};
+
+/// Whether a delegated child inherited an orchestration setting or supplied a
+/// host-admitted child-session override.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationPolicySource {
+    /// The child uses the parent-owned setting unchanged.
+    ParentInherited,
+    /// The child-session policy explicitly narrowed this setting.
+    ChildOverride,
+}
+
+/// Bounded source-only provenance for a delegated child's host-owned runtime.
+///
+/// This records orchestration inheritance separately from the configuration
+/// layer that selected the parent value. It never contains paths, environment
+/// values, approval tokens, extension identifiers, or model arguments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DelegationOrchestrationProvenance {
+    /// Source for the child sandbox capability gates.
+    pub sandbox: DelegationPolicySource,
+    /// Source for the effect-broker policy.
+    pub effect_policy: DelegationPolicySource,
+    /// Source for exact human-grant/approval authority.
+    pub approval_authority: DelegationPolicySource,
+    /// Source for the child process environment policy.
+    pub environment: DelegationPolicySource,
+    /// Source for the workspace and default working directory.
+    pub working_directory: DelegationPolicySource,
+    /// Source for executable-extension trust.
+    pub extension_trust: DelegationPolicySource,
+    /// Source for the installed tool scope.
+    pub tool_scope: DelegationPolicySource,
+    /// Source for child wall-time, token, cost, and output limits.
+    pub execution_limits: DelegationPolicySource,
+}
+
+impl DelegationOrchestrationProvenance {
+    /// Attribute every child orchestration setting to one source.
+    pub const fn all(source: DelegationPolicySource) -> Self {
+        Self {
+            sandbox: source,
+            effect_policy: source,
+            approval_authority: source,
+            environment: source,
+            working_directory: source,
+            extension_trust: source,
+            tool_scope: source,
+            execution_limits: source,
+        }
+    }
+}
 
 /// A bounded, host-owned live view of one delegated child.
 ///
@@ -55,6 +109,10 @@ pub struct DelegationTelemetryChild {
     pub failure_class: Option<String>,
     /// Bounded authoritative terminal failure reason, when applicable.
     pub failure_reason: Option<String>,
+    /// Effective inherited capability gates and policy-layer provenance.
+    pub effective_tool_policy: EffectiveToolPolicy,
+    /// Parent inheritance versus child-session override provenance.
+    pub orchestration_provenance: DelegationOrchestrationProvenance,
     /// Opaque host-owned child transcript reference.
     pub session: Option<String>,
 }
@@ -74,6 +132,30 @@ pub struct DelegationTelemetrySnapshot {
     pub failure_reason: Option<String>,
     /// Bounded machine-readable class for `failure_reason`.
     pub failure_class: Option<String>,
+}
+
+/// Secret-safe result of the host-owned tool admission check.
+///
+/// The decision never contains model arguments, tool output, host paths, shell
+/// paths, credentials, or provider payloads. `authorization` is present only
+/// when `allowed` is true; `denial_code` is present only when it is false.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolPolicyDecision {
+    /// The trusted effect classification, absent when the tool rejected the
+    /// call before classification could complete (for example, an argument or
+    /// capability gate).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ToolEffect>,
+    /// Whether this exact call passed effect admission.
+    pub allowed: bool,
+    /// The authority that admitted the effect.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<EffectAuthorization>,
+    /// Stable denial code, intentionally distinct from model-facing error text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub denial_code: Option<ToolPolicyDenialCode>,
+    /// Effective capability gates, limits, and configuration-layer provenance.
+    pub policy: EffectiveToolPolicy,
 }
 
 /// Events emitted by a [`Run`](crate::Run).
@@ -188,6 +270,21 @@ pub enum AgentEvent {
         /// The parsed tool arguments (`null` when they failed to parse; the
         /// parse failure is then reported in the matching `ToolFinished`).
         args: serde_json::Value,
+    },
+
+    /// The tool's host-owned admission decision.
+    ///
+    /// Emitted once after [`ToolStarted`](Self::ToolStarted) and before its
+    /// matching [`ToolFinished`](Self::ToolFinished). Unlike tool output, the
+    /// decision is secret-safe diagnostic metadata and is never persisted as a
+    /// model-visible session entry.
+    ToolPolicyDecision {
+        /// The provider-assigned tool call ID.
+        id: ToolCallId,
+        /// The tool name.
+        name: String,
+        /// The safe admission decision and effective policy snapshot.
+        decision: ToolPolicyDecision,
     },
 
     /// Live progress from a running tool.

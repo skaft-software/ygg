@@ -7,7 +7,7 @@ use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 use ygg_ai::ToolDef;
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 use crate::tool::{ReplaySafety, Tool, ToolConcurrency, ToolContext, ToolError, ToolOutput};
 use crate::tools::{clip_line, parse_args, validate_effect_path};
 
@@ -103,8 +103,16 @@ impl Tool for SearchTool {
         arguments: &serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolEffect, ToolError> {
-        if !(ctx.sandbox.allow_process && ctx.sandbox.allow_shell) {
-            return Err(ToolError::new(
+        if !ctx.sandbox.allow_process {
+            return Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::ProcessDisabled,
+                "error not_permitted\nsearch requires command execution \
+                 (allow_process=true and allow_shell=true)",
+            ));
+        }
+        if !ctx.sandbox.allow_shell {
+            return Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::ShellDisabled,
                 "error not_permitted\nsearch requires command execution \
                  (allow_process=true and allow_shell=true)",
             ));
@@ -626,11 +634,25 @@ mod tests {
         assert_eq!(SearchTool.concurrency(), ToolConcurrency::Sequential);
 
         fixture.sandbox.allow_process = false;
-        assert!(SearchTool
+        let error = SearchTool
             .effect(&json!({"query": "needle"}), &fixture.ctx())
-            .unwrap_err()
-            .to_string()
-            .contains("allow_process=true"));
+            .unwrap_err();
+        assert!(error.to_string().contains("allow_process=true"));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::ProcessDisabled)
+        );
+
+        fixture.sandbox.allow_process = true;
+        fixture.sandbox.allow_shell = false;
+        let error = SearchTool
+            .effect(&json!({"query": "needle"}), &fixture.ctx())
+            .unwrap_err();
+        assert!(error.to_string().contains("allow_shell=true"));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::ShellDisabled)
+        );
     }
 
     #[test]

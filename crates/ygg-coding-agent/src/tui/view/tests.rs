@@ -107,6 +107,16 @@ impl sexy_tui_rs::Terminal for EmulatedTerminal {
     }
 }
 
+fn test_effective_tool_policy() -> ygg_agent::EffectiveToolPolicy {
+    ygg_agent::SandboxConfig::new(".").effective_tool_policy(ygg_agent::EffectPolicy::Controlled)
+}
+
+fn inherited_delegation_provenance() -> ygg_agent::DelegationOrchestrationProvenance {
+    ygg_agent::DelegationOrchestrationProvenance::all(
+        ygg_agent::DelegationPolicySource::ParentInherited,
+    )
+}
+
 fn emulated_shell(
     theme: YggTheme,
     width: u16,
@@ -8608,6 +8618,8 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
             elapsed_ms: 42_000,
             failure_class: reason.map(|_| "provider_failure".into()),
             failure_reason: reason.map(str::to_owned),
+            effective_tool_policy: test_effective_tool_policy(),
+            orchestration_provenance: inherited_delegation_provenance(),
             session: Some("agent-session:opaque".into()),
         }
     };
@@ -8762,6 +8774,8 @@ fn hydrating_a_replacement_session_clears_subagent_activity() {
             elapsed_ms: 500,
             failure_class: None,
             failure_reason: None,
+            effective_tool_policy: test_effective_tool_policy(),
+            orchestration_provenance: inherited_delegation_provenance(),
             session: Some("agent-session:opaque".into()),
         }],
         total_cost_microdollars: Some(1),
@@ -8802,6 +8816,8 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
         elapsed_ms: 500,
         failure_class: None,
         failure_reason: None,
+        effective_tool_policy: test_effective_tool_policy(),
+        orchestration_provenance: inherited_delegation_provenance(),
         session: Some("agent-session:opaque".into()),
     };
 
@@ -8897,6 +8913,8 @@ fn subagent_activity_renders_complete_roster_in_both_disclosure_modes() {
         elapsed_ms: 500,
         failure_class: None,
         failure_reason: None,
+        effective_tool_policy: test_effective_tool_policy(),
+        orchestration_provenance: inherited_delegation_provenance(),
         session: Some("agent-session:opaque".into()),
     };
     let render = |shell: &InteractiveShell| {

@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use ygg_ai::ToolDef;
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 use crate::secure_fs::{PreparedMutation, SecureFileError};
 use crate::tool::{content_hash, Tool, ToolContext, ToolError, ToolOutput};
 use crate::tools::{
@@ -67,7 +67,8 @@ impl Tool for WriteTool {
         ctx: &ToolContext<'_>,
     ) -> Result<ToolEffect, ToolError> {
         if !ctx.sandbox.allow_write {
-            return Err(ToolError::new(
+            return Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::WriteDisabled,
                 "error not_permitted\nwrite is disabled by sandbox policy (allow_write=false)",
             ));
         }
@@ -394,6 +395,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.message.contains("not_permitted"), "{err}");
+        assert_eq!(
+            err.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WriteDisabled)
+        );
         assert!(!f.workspace.join("x.txt").exists());
     }
 

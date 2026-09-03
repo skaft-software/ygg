@@ -24,6 +24,120 @@ MAX_HOST_BYTES = 256 * 1024 * 1024
 PROCESS_TIMEOUT_SECONDS = 180
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 SAFE_MODEL_ID = re.compile(r"^[A-Za-z0-9_.:/@+-]{1,256}$")
+SAFE_TOOL_CALL_ID = re.compile(r"^[A-Za-z0-9_.:/@+|=-]+$")
+SAFE_TOOL_NAME = re.compile(r"^[a-z0-9_.-]{1,128}$")
+MAX_TOOL_CALL_ID_BYTES = 512
+POLICY_EFFECTS = {
+    "pure",
+    "workspace_read",
+    "host_read",
+    "workspace_mutation",
+    "host_mutation",
+    "host_process",
+    "network",
+    "delegation",
+    "extension",
+    "unknown",
+}
+POLICY_AUTHORIZATIONS = {"policy", "human_grant"}
+POLICY_DENIAL_CODES = {
+    "workspace_confinement",
+    "edit_disabled",
+    "write_disabled",
+    "process_disabled",
+    "shell_disabled",
+    "remote_read_disabled",
+    "effect_unknown",
+    "effect_host_read_denied",
+    "effect_host_mutation_denied",
+    "effect_native_process_denied",
+    "effect_network_denied",
+    "effect_delegation_denied",
+    "effect_extension_denied",
+    "approval_unavailable",
+    "approval_denied",
+    "invalid_effect_intent",
+    "effect_intent_too_large",
+    "effect_broker_unavailable",
+    "secondary_hook_denied",
+    "effect_reservation_commit_denied",
+    "invalid_tool_arguments",
+}
+POLICY_VALUE_SOURCES = {"default", "config", "environment", "cli", "host_request"}
+EFFECTIVE_TOOL_POLICY_FIELDS = {
+    "effect_policy",
+    "workspace_confinement",
+    "allow_edit",
+    "allow_write",
+    "allow_process",
+    "allow_shell",
+    "shell_path",
+    "bash_timeout_ms",
+    "max_output_bytes",
+    "allow_remote_read",
+}
+BOOLEAN_POLICY_FIELDS = {
+    "workspace_confinement",
+    "allow_edit",
+    "allow_write",
+    "allow_process",
+    "allow_shell",
+    "allow_remote_read",
+}
+SHELL_SELECTIONS = {
+    "configured",
+    "system_bash",
+    "path_bash",
+    "sh_fallback",
+    "unavailable",
+}
+HOST_REQUEST_SHELL_SELECTIONS = SHELL_SELECTIONS - {"configured"}
+MAX_BASH_TIMEOUT_MS = 3_600_000
+MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
+FIXED_HOST_REQUEST_BOOLEAN_POLICY = {
+    "workspace_confinement": True,
+    "allow_edit": False,
+    "allow_write": False,
+    "allow_process": False,
+    "allow_shell": False,
+    "allow_remote_read": False,
+}
+FIXED_HOST_REQUEST_BASH_TIMEOUT_MS = 120_000
+FIXED_HOST_REQUEST_MAX_OUTPUT_BYTES = 50 * 1024
+FIXED_NON_AUDIO_REGISTERED_TOOLS = frozenset({"read"})
+EFFECT_BOUND_DENIAL_CODES = {
+    "effect_unknown": "unknown",
+    "effect_host_read_denied": "host_read",
+    "effect_host_mutation_denied": "host_mutation",
+    "effect_native_process_denied": "host_process",
+    "effect_network_denied": "network",
+    "effect_delegation_denied": "delegation",
+    "effect_extension_denied": "extension",
+}
+EFFECTLESS_DENIAL_CODES = {
+    "workspace_confinement",
+    "edit_disabled",
+    "write_disabled",
+    "process_disabled",
+    "shell_disabled",
+    "remote_read_disabled",
+    "invalid_tool_arguments",
+}
+CLASSIFIED_DENIAL_CODES = {
+    "invalid_effect_intent",
+    "effect_intent_too_large",
+    "effect_broker_unavailable",
+    "approval_unavailable",
+    "approval_denied",
+    "secondary_hook_denied",
+    "effect_reservation_commit_denied",
+}
+TOOL_LIFECYCLE_EVENT_TYPES = {
+    "tool_start",
+    "tool_progress",
+    "tool_policy",
+    "tool_finish",
+}
 RUN_EVENT_TYPES = {
     "accepted",
     "started",
@@ -36,6 +150,7 @@ RUN_EVENT_TYPES = {
     "compaction_start",
     "compaction_finish",
     "tool_start",
+    "tool_policy",
     "tool_progress",
     "tool_finish",
     "candidate_rejected",
@@ -64,6 +179,21 @@ class Route:
     api_key: str
     provider_mode: str
     audio: bool = False
+
+
+@dataclass(frozen=True)
+class PolicyDecision:
+    effect: str | None
+    allowed: bool
+    authorization: str | None
+    denial_code: str | None
+
+
+@dataclass
+class ActiveTool:
+    name: str
+    registered: bool
+    decision: PolicyDecision | None = None
 
 
 def required_environment(name: str) -> str:
@@ -136,6 +266,330 @@ def parse_events(payload: bytes) -> list[dict[str, object]]:
     return events
 
 
+def exact_policy_object(
+    value: object, expected_fields: set[str], error: str
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise AcceptanceError(error)
+    return value
+
+
+def tool_call_id(value: object) -> str:
+    if (
+        not isinstance(value, str)
+        or SAFE_TOOL_CALL_ID.fullmatch(value) is None
+        or len(value) > MAX_TOOL_CALL_ID_BYTES
+    ):
+        raise AcceptanceError("host tool-policy identity was malformed")
+    return value
+
+
+def tool_name(value: object) -> str:
+    if not isinstance(value, str) or SAFE_TOOL_NAME.fullmatch(value) is None:
+        raise AcceptanceError("host tool-policy identity was malformed")
+    return value
+
+
+def validate_effective_tool_policy(value: object) -> dict[str, object]:
+    policy = exact_policy_object(
+        value,
+        EFFECTIVE_TOOL_POLICY_FIELDS,
+        "host tool-policy effective policy was not secret-safe",
+    )
+    values: dict[str, dict[str, object]] = {}
+    for field in EFFECTIVE_TOOL_POLICY_FIELDS:
+        values[field] = exact_policy_object(
+            policy[field],
+            {"value", "source"},
+            "host tool-policy provenance was not secret-safe",
+        )
+        source = values[field]["source"]
+        if not isinstance(source, str) or source not in POLICY_VALUE_SOURCES:
+            raise AcceptanceError("host tool-policy provenance was malformed")
+
+    effect_policy = values["effect_policy"]["value"]
+    if not isinstance(effect_policy, str) or effect_policy not in {
+        "controlled",
+        "controlled_bash_approval",
+        "unsafe_host",
+    }:
+        raise AcceptanceError("host tool-policy effective policy was malformed")
+    for field in BOOLEAN_POLICY_FIELDS:
+        if type(values[field]["value"]) is not bool:
+            raise AcceptanceError("host tool-policy effective policy was malformed")
+
+    shell = exact_policy_object(
+        values["shell_path"]["value"],
+        {"selection"},
+        "host tool-policy effective policy was not secret-safe",
+    )
+    selection = shell["selection"]
+    if not isinstance(selection, str) or selection not in SHELL_SELECTIONS:
+        raise AcceptanceError("host tool-policy effective policy was malformed")
+
+    bash_timeout_ms = values["bash_timeout_ms"]["value"]
+    if (
+        type(bash_timeout_ms) is not int
+        or not 1_000 <= bash_timeout_ms <= MAX_BASH_TIMEOUT_MS
+    ):
+        raise AcceptanceError("host tool-policy effective policy was malformed")
+    max_output_bytes = values["max_output_bytes"]["value"]
+    if (
+        type(max_output_bytes) is not int
+        or not 1_024 <= max_output_bytes <= MAX_TOOL_OUTPUT_BYTES
+    ):
+        raise AcceptanceError("host tool-policy effective policy was malformed")
+    return policy
+
+
+def validate_fixed_host_request_policy(policy: dict[str, object]) -> None:
+    for field in EFFECTIVE_TOOL_POLICY_FIELDS:
+        if policy[field]["source"] != "host_request":
+            raise AcceptanceError("host tool-policy provenance did not match the request")
+    if policy["effect_policy"]["value"] != "controlled":
+        raise AcceptanceError("host tool-policy mode did not match the request")
+    for field, expected in FIXED_HOST_REQUEST_BOOLEAN_POLICY.items():
+        if policy[field]["value"] is not expected:
+            raise AcceptanceError("host tool-policy capabilities did not match the request")
+    if policy["bash_timeout_ms"]["value"] != FIXED_HOST_REQUEST_BASH_TIMEOUT_MS:
+        raise AcceptanceError("host tool-policy limits did not match the request")
+    if policy["max_output_bytes"]["value"] != FIXED_HOST_REQUEST_MAX_OUTPUT_BYTES:
+        raise AcceptanceError("host tool-policy limits did not match the request")
+    if policy["shell_path"]["value"]["selection"] not in HOST_REQUEST_SHELL_SELECTIONS:
+        raise AcceptanceError("host tool-policy shell selection did not match the request")
+
+
+def validate_registered_tools(value: object) -> frozenset[str]:
+    if not isinstance(value, list):
+        raise AcceptanceError("host registered-tool set was malformed")
+    names = [tool_name(name) for name in value]
+    if len(names) != len(set(names)):
+        raise AcceptanceError("host registered-tool set was malformed")
+    registered = frozenset(names)
+    if registered != FIXED_NON_AUDIO_REGISTERED_TOOLS:
+        raise AcceptanceError("host registered-tool set did not match the request")
+    return registered
+
+
+def validate_denial_correlation(effect: str | None, denial_code: str) -> None:
+    if effect is None:
+        if denial_code not in EFFECTLESS_DENIAL_CODES:
+            raise AcceptanceError("host tool-policy denial did not match its effect")
+        return
+    expected_effect = EFFECT_BOUND_DENIAL_CODES.get(denial_code)
+    if expected_effect is not None:
+        if effect != expected_effect:
+            raise AcceptanceError("host tool-policy denial did not match its effect")
+        return
+    if denial_code == "workspace_confinement":
+        if effect not in {"workspace_read", "workspace_mutation"}:
+            raise AcceptanceError("host tool-policy denial did not match its effect")
+        return
+    if denial_code in CLASSIFIED_DENIAL_CODES and effect != "unknown":
+        return
+    raise AcceptanceError("host tool-policy denial did not match its effect")
+
+
+def validate_tool_policy_event(
+    value: object, effective_policy: dict[str, object]
+) -> tuple[str, str, PolicyDecision]:
+    data = exact_policy_object(
+        value,
+        {"toolCallId", "toolName", "decision"},
+        "host tool-policy event was not secret-safe",
+    )
+    call_id = tool_call_id(data["toolCallId"])
+    name = tool_name(data["toolName"])
+    raw_decision = data["decision"]
+    if not isinstance(raw_decision, dict) or type(raw_decision.get("allowed")) is not bool:
+        raise AcceptanceError("host tool-policy decision was malformed")
+    allowed = raw_decision["allowed"]
+    effect: str | None
+    authorization: str | None
+    denial_code: str | None
+    if allowed:
+        decision = exact_policy_object(
+            raw_decision,
+            {"effect", "allowed", "authorization", "policy"},
+            "host tool-policy event was not secret-safe",
+        )
+        effect = decision["effect"]
+        authorization = decision["authorization"]
+        denial_code = None
+        if (
+            not isinstance(effect, str)
+            or effect not in POLICY_EFFECTS - {"unknown"}
+            or not isinstance(authorization, str)
+            or authorization not in POLICY_AUTHORIZATIONS
+        ):
+            raise AcceptanceError("host tool-policy decision was malformed")
+    else:
+        decision = raw_decision
+        decision_fields = set(decision)
+        if decision_fields not in (
+            {"allowed", "denial_code", "policy"},
+            {"effect", "allowed", "denial_code", "policy"},
+        ):
+            raise AcceptanceError("host tool-policy event was not secret-safe")
+        denial_code = decision.get("denial_code")
+        if not isinstance(denial_code, str) or denial_code not in POLICY_DENIAL_CODES:
+            raise AcceptanceError("host tool-policy decision was malformed")
+        effect = None
+        if "effect" in decision:
+            effect = decision["effect"]
+            if not isinstance(effect, str) or effect not in POLICY_EFFECTS:
+                raise AcceptanceError("host tool-policy decision was malformed")
+        authorization = None
+        validate_denial_correlation(effect, denial_code)
+
+    policy = validate_effective_tool_policy(decision["policy"])
+    if policy != effective_policy:
+        raise AcceptanceError("host tool-policy did not match the effective run policy")
+    return call_id, name, PolicyDecision(effect, allowed, authorization, denial_code)
+
+
+def validate_read_decision(decision: PolicyDecision) -> None:
+    if decision.allowed:
+        if decision.effect != "workspace_read" or decision.authorization != "policy":
+            raise AcceptanceError("host read tool-policy decision did not match the request")
+        return
+    if decision.effect is None:
+        if decision.denial_code not in {
+            "invalid_tool_arguments",
+            "workspace_confinement",
+            "remote_read_disabled",
+        }:
+            raise AcceptanceError("host read tool-policy denial did not match the request")
+        return
+    if decision.effect != "workspace_read" or decision.denial_code not in {
+        "workspace_confinement",
+        "invalid_effect_intent",
+        "effect_intent_too_large",
+        "effect_broker_unavailable",
+        "secondary_hook_denied",
+        "effect_reservation_commit_denied",
+    }:
+        raise AcceptanceError("host read tool-policy denial did not match the request")
+
+
+def validate_tool_policy_lifecycle(run_events: list[dict[str, object]]) -> None:
+    active_tools: dict[str, ActiveTool] = {}
+    completed_tools: set[str] = set()
+    effective_policy: dict[str, object] | None = None
+    registered_tools: frozenset[str] | None = None
+    accepted = False
+    started = False
+    settled = False
+    successful_read_calls = 0
+    for event in run_events:
+        event_type = event["type"]
+        if event_type == "accepted":
+            if accepted or started:
+                raise AcceptanceError("host tool-policy acceptance lifecycle was malformed")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise AcceptanceError("host tool-policy acceptance lifecycle was malformed")
+            effective_policy = validate_effective_tool_policy(
+                data.get("effective_tool_policy")
+            )
+            validate_fixed_host_request_policy(effective_policy)
+            registered_tools = validate_registered_tools(data.get("registered_tools"))
+            accepted = True
+            continue
+        if event_type == "started":
+            if not accepted or started or settled:
+                raise AcceptanceError("host tool-policy acceptance lifecycle was malformed")
+            started = True
+            continue
+        if event_type == "settled":
+            if not accepted or not started or settled:
+                raise AcceptanceError("host tool-policy acceptance lifecycle was malformed")
+            if active_tools:
+                raise AcceptanceError("host tool-policy call did not finish")
+            settled = True
+            continue
+        if event_type == "tool_start":
+            if not accepted or not started or settled or registered_tools is None:
+                raise AcceptanceError("host tool-policy appeared outside the run lifecycle")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise AcceptanceError("host tool-policy tool lifecycle was malformed")
+            call_id = tool_call_id(data.get("toolCallId"))
+            name = tool_name(data.get("toolName"))
+            if call_id in active_tools or call_id in completed_tools:
+                raise AcceptanceError("host tool-policy tool identity was reused")
+            active_tools[call_id] = ActiveTool(name, name in registered_tools)
+            continue
+        if event_type == "tool_progress":
+            if not accepted or not started or settled:
+                raise AcceptanceError("host tool-policy appeared outside the run lifecycle")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise AcceptanceError("host tool-policy tool lifecycle was malformed")
+            call_id = tool_call_id(data.get("toolCallId"))
+            tool = active_tools.get(call_id)
+            if (
+                tool is None
+                or not tool.registered
+                or tool.decision is not None and not tool.decision.allowed
+            ):
+                raise AcceptanceError("host tool-policy tool lifecycle was misordered")
+            continue
+        if event_type == "tool_policy":
+            if not accepted or not started or settled or effective_policy is None:
+                raise AcceptanceError("host tool-policy appeared outside the run lifecycle")
+            call_id, name, decision = validate_tool_policy_event(
+                event.get("data"), effective_policy
+            )
+            tool = active_tools.get(call_id)
+            if (
+                tool is None
+                or not tool.registered
+                or tool.name != name
+                or tool.decision is not None
+            ):
+                raise AcceptanceError("host tool-policy tool lifecycle was misordered")
+            validate_read_decision(decision)
+            tool.decision = decision
+            continue
+        if event_type == "tool_finish":
+            if not accepted or not started or settled:
+                raise AcceptanceError("host tool-policy appeared outside the run lifecycle")
+            data = event.get("data")
+            if not isinstance(data, dict):
+                raise AcceptanceError("host tool-policy tool lifecycle was malformed")
+            call_id = tool_call_id(data.get("toolCallId"))
+            ok = data.get("ok")
+            if type(ok) is not bool:
+                raise AcceptanceError("host tool-policy tool lifecycle was malformed")
+            tool = active_tools.pop(call_id, None)
+            if tool is None:
+                raise AcceptanceError("host tool-policy tool lifecycle was misordered")
+            if not tool.registered:
+                if ok:
+                    raise AcceptanceError("host unregistered tool call unexpectedly succeeded")
+                completed_tools.add(call_id)
+                continue
+            decision = tool.decision
+            if decision is None:
+                raise AcceptanceError("host registered tool call lacked a policy decision")
+            if not decision.allowed and ok:
+                raise AcceptanceError("host denied tool-policy call did not fail")
+            if tool.name == "read" and decision.allowed and ok:
+                successful_read_calls += 1
+            completed_tools.add(call_id)
+
+    if not accepted or not started or not settled:
+        raise AcceptanceError("host tool-policy acceptance lifecycle was malformed")
+    if successful_read_calls == 0:
+        raise AcceptanceError("host did not prove a successful read tool-policy decision")
+
+
+def validate_audio_toolless_lifecycle(run_events: list[dict[str, object]]) -> None:
+    if any(event["type"] in TOOL_LIFECYCLE_EVENT_TYPES for event in run_events):
+        raise AcceptanceError("host audio route unexpectedly emitted a tool lifecycle")
+
+
 def validate_exchange(
     events: list[dict[str, object]],
     hello_request_id: str,
@@ -205,6 +659,10 @@ def validate_exchange(
         raise AcceptanceError("host lacks required provider-acceptance capabilities")
     if not run_events or not terminal[request_id]:
         raise AcceptanceError("host run protocol was incomplete")
+    if require_audio:
+        validate_audio_toolless_lifecycle(run_events)
+    else:
+        validate_tool_policy_lifecycle(run_events)
     return run_events
 
 

@@ -1492,6 +1492,9 @@ impl EventTranslator {
                     "args": args
                 }))?;
             }
+            // Keep the Pi-compatible RPC event vocabulary unchanged. Native
+            // host clients receive this secret-safe diagnostic as `tool_policy`.
+            AgentEvent::ToolPolicyDecision { .. } => {}
             AgentEvent::ToolProgress { id, progress } => {
                 if let Some((name, args, accumulated)) = self.tools.get_mut(&id.0) {
                     match progress {

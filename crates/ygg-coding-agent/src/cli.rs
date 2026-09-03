@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use ygg_agent::{EffectPolicy, PolicyValueSource, ToolPolicyProvenance};
 use ygg_ai::ModelId;
 
 use crate::app::bootstrap::resolve_model_id;
@@ -200,8 +201,12 @@ pub struct Cli {
     #[arg(long = "workspace-trusted", alias = "trust-workspace")]
     pub workspace_trusted: bool,
     /// Require approval for every bash call and keep host effects controlled.
-    #[arg(long = "safe-mode", alias = "safe")]
+    #[arg(long = "safe-mode", alias = "safe", conflicts_with = "effect_policy")]
     pub safe_mode: bool,
+    /// Host-owned tool-effect admission profile: controlled,
+    /// controlled_bash_approval, or unsafe_host.
+    #[arg(long, value_name = "POLICY")]
+    pub effect_policy: Option<String>,
     /// Load only these tools (comma-separated).
     #[arg(long, value_name = "NAMES", value_delimiter = ',', num_args = 1..)]
     pub tools: Option<Vec<String>>,
@@ -267,6 +272,7 @@ struct CompactionLayer {
 struct ConfigLayer {
     model: Option<String>,
     reasoning: Option<String>,
+    effect_policy: Option<String>,
     reasoning_mode: Option<String>,
     cache_retention: Option<String>,
     theme: Option<String>,
@@ -308,6 +314,7 @@ impl ConfigLayer {
         }
         override_some!(model);
         override_some!(reasoning);
+        override_some!(effect_policy);
         override_some!(reasoning_mode);
         override_some!(cache_retention);
         override_some!(theme);
@@ -383,6 +390,26 @@ impl ConfigLayer {
                 *current = Some(current.map_or(project, |current| current.min(project)));
             }
         }
+        fn effect_policy_rank(value: &str) -> Option<u8> {
+            match value.parse::<EffectPolicy>().ok()? {
+                EffectPolicy::ControlledBashApproval => Some(0),
+                EffectPolicy::Controlled => Some(1),
+                EffectPolicy::UnsafeHost => Some(2),
+            }
+        }
+        fn tighten_effect_policy(current: &mut Option<String>, project: Option<String>) {
+            let Some(project) = project else {
+                return;
+            };
+            let current_rank = current.as_deref().and_then(effect_policy_rank).unwrap_or(2);
+            match effect_policy_rank(&project) {
+                Some(project_rank) if project_rank <= current_rank => *current = Some(project),
+                Some(_) => {}
+                // Preserve malformed values so normal configuration validation
+                // reports them instead of treating a project typo as absent.
+                None => *current = Some(project),
+            }
+        }
 
         tighten_bool(
             &mut self.allow_external_paths,
@@ -423,6 +450,7 @@ impl ConfigLayer {
         // user-level decision and can never be granted by project config.
         let trusted_extensions = self.trusted_extensions.clone();
         project.trusted_extensions = None;
+        tighten_effect_policy(&mut self.effect_policy, project.effect_policy.take());
         self.merge(project);
         self.trusted_extensions = trusted_extensions;
     }
@@ -745,6 +773,7 @@ struct LoadedConfigLayer {
 const CONFIG_KEYS: &[&str] = &[
     "model",
     "reasoning",
+    "effect_policy",
     "reasoning_mode",
     "cache_retention",
     "theme",
@@ -1009,6 +1038,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
         reasoning: env_value("YGG_REASONING"),
+        effect_policy: env_value("YGG_EFFECT_POLICY"),
         reasoning_mode: env_value("YGG_REASONING_MODE"),
         cache_retention: env_value("YGG_CACHE_RETENTION")
             .or_else(|| env_value("PI_CACHE_RETENTION")),
@@ -1063,6 +1093,16 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer::default())
 }
 
+fn policy_value_source(environment_set: bool, config_set: bool) -> PolicyValueSource {
+    if environment_set {
+        PolicyValueSource::Environment
+    } else if config_set {
+        PolicyValueSource::Config
+    } else {
+        PolicyValueSource::Default
+    }
+}
+
 fn build_config_with_global_path(
     cli: Cli,
     cwd: &Path,
@@ -1095,6 +1135,7 @@ fn build_config_with_global_path(
         LoadedConfigLayer::default()
     };
     let environment = environment_layer()?;
+    let policy_environment = environment.clone();
     let extension_activation_overridden = project.values.enabled_extensions.is_some()
         || environment.enabled_extensions.is_some()
         || !cli.enable_extensions.is_empty();
@@ -1142,13 +1183,70 @@ fn build_config_with_global_path(
         None => config::MouseMode::Auto,
     };
     let system_prompt = cli.system_prompt.or(values.system_prompt);
-    let effect_policy = if cli.safe_mode {
-        ygg_agent::EffectPolicy::ControlledBashApproval
+    let effect_policy_source = if cli.safe_mode || cli.effect_policy.is_some() {
+        PolicyValueSource::Cli
     } else {
-        ygg_agent::EffectPolicy::UnsafeHost
+        policy_value_source(
+            policy_environment.effect_policy.is_some(),
+            values.effect_policy.is_some(),
+        )
+    };
+    let effect_policy = if cli.safe_mode {
+        EffectPolicy::ControlledBashApproval
+    } else {
+        cli.effect_policy
+            .as_deref()
+            .or(values.effect_policy.as_deref())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: String| anyhow::anyhow!(error))?
+            .unwrap_or(EffectPolicy::UnsafeHost)
     };
 
+    let offline_source = policy_value_source(
+        policy_environment.offline.is_some(),
+        values.offline.is_some(),
+    );
     let mut sandbox = SandboxPolicy::default();
+    sandbox.policy_provenance = ToolPolicyProvenance {
+        effect_policy: effect_policy_source,
+        workspace_confinement: policy_value_source(
+            policy_environment.allow_external_paths.is_some(),
+            values.allow_external_paths.is_some(),
+        ),
+        allow_edit: policy_value_source(
+            policy_environment.allow_edit.is_some(),
+            values.allow_edit.is_some(),
+        ),
+        allow_write: policy_value_source(
+            policy_environment.allow_write.is_some(),
+            values.allow_write.is_some(),
+        ),
+        allow_process: policy_value_source(
+            policy_environment.allow_process.is_some(),
+            values.allow_process.is_some(),
+        ),
+        allow_shell: policy_value_source(
+            policy_environment.allow_shell.is_some(),
+            values.allow_shell.is_some(),
+        ),
+        shell_path: policy_value_source(
+            policy_environment.shell_path.is_some(),
+            values.shell_path.is_some(),
+        ),
+        bash_timeout: policy_value_source(
+            policy_environment.bash_timeout_secs.is_some(),
+            values.bash_timeout_secs.is_some(),
+        ),
+        max_output_bytes: policy_value_source(
+            policy_environment.max_output_bytes.is_some(),
+            values.max_output_bytes.is_some(),
+        ),
+        allow_remote_read: policy_value_source(
+            policy_environment.allow_remote_read.is_some(),
+            values.allow_remote_read.is_some(),
+        ),
+    };
     if let Some(value) = values.allow_external_paths {
         sandbox.allow_external_paths = value;
     }
@@ -1179,41 +1277,58 @@ fn build_config_with_global_path(
     if cli.no_edit {
         sandbox.allow_edit = false;
         sandbox.allow_write = false;
+        sandbox.policy_provenance.allow_edit = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_write = PolicyValueSource::Cli;
     }
     if cli.no_write {
         sandbox.allow_write = false;
+        sandbox.policy_provenance.allow_write = PolicyValueSource::Cli;
     }
     if cli.no_process || cli.no_shell {
         // Arbitrary process execution has shell-equivalent authority; these
         // flags are aliases at the enforcement boundary.
         sandbox.allow_process = false;
         sandbox.allow_shell = false;
+        sandbox.policy_provenance.allow_process = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_shell = PolicyValueSource::Cli;
     }
     if cli.allow_shell {
         sandbox.allow_process = true;
         sandbox.allow_shell = true;
+        sandbox.policy_provenance.allow_process = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_shell = PolicyValueSource::Cli;
     }
     if cli.allow_remote_read {
         sandbox.allow_remote_read = true;
+        sandbox.policy_provenance.allow_remote_read = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.shell_path {
         sandbox.shell_path = Some(value);
+        sandbox.policy_provenance.shell_path = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.bash_timeout_secs {
         sandbox.bash_timeout_secs = value;
+        sandbox.policy_provenance.bash_timeout = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.max_output_bytes {
         sandbox.max_output_bytes = value;
+        sandbox.policy_provenance.max_output_bytes = PolicyValueSource::Cli;
     }
     let offline = cli.offline || values.offline.unwrap_or(false);
     if offline {
         sandbox.allow_remote_read = false;
+        sandbox.policy_provenance.allow_remote_read = if cli.offline {
+            PolicyValueSource::Cli
+        } else {
+            offline_source
+        };
     }
     if effect_policy != ygg_agent::EffectPolicy::UnsafeHost {
         // External-path classification cannot remain stable between admission
         // and execution. Keep controlled operations workspace-relative so the
         // broker's workspace/host distinction fails closed.
         sandbox.allow_external_paths = false;
+        sandbox.policy_provenance.workspace_confinement = effect_policy_source;
     }
     sandbox.bash_timeout_secs = sandbox.bash_timeout_secs.clamp(1, 3_600);
     sandbox.max_output_bytes = sandbox.max_output_bytes.clamp(1_024, 1024 * 1024);
@@ -1430,6 +1545,7 @@ mod tests {
             trust_extensions: vec![],
             workspace_trusted: false,
             safe_mode: false,
+            effect_policy: None,
             tools: None,
             exclude_tools: vec![],
             no_tools: false,
@@ -1506,6 +1622,82 @@ mod tests {
     }
 
     #[test]
+    fn policy_value_source_prefers_environment_over_config() {
+        assert_eq!(
+            policy_value_source(false, false),
+            PolicyValueSource::Default
+        );
+        assert_eq!(policy_value_source(false, true), PolicyValueSource::Config);
+        assert_eq!(
+            policy_value_source(true, false),
+            PolicyValueSource::Environment
+        );
+        assert_eq!(
+            policy_value_source(true, true),
+            PolicyValueSource::Environment
+        );
+    }
+
+    #[test]
+    fn effective_policy_provenance_tracks_config_and_cli_precedence() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(
+            &global,
+            r#"
+effect_policy = "controlled"
+allow_external_paths = false
+allow_edit = false
+allow_write = false
+allow_process = false
+allow_shell = false
+allow_remote_read = true
+shell_path = "/opt/config/bash"
+bash_timeout_secs = 30
+max_output_bytes = 4096
+"#,
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.allow_shell = true;
+        cli.bash_timeout_secs = Some(45);
+        cli.max_output_bytes = Some(8192);
+
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        let policy = config
+            .sandbox
+            .effective_tool_policy(&config.workspace, config.effect_policy);
+
+        assert_eq!(
+            policy.workspace_confinement.source,
+            PolicyValueSource::Config
+        );
+        assert_eq!(policy.workspace_confinement.value, true);
+        assert_eq!(policy.effect_policy.value, EffectPolicy::Controlled);
+        assert_eq!(policy.effect_policy.source, PolicyValueSource::Config);
+        assert!(!policy.allow_edit.value);
+        assert_eq!(policy.allow_edit.source, PolicyValueSource::Config);
+        assert!(!policy.allow_write.value);
+        assert_eq!(policy.allow_write.source, PolicyValueSource::Config);
+        assert_eq!(policy.allow_process.source, PolicyValueSource::Cli);
+        assert_eq!(policy.allow_process.value, true);
+        assert_eq!(policy.allow_shell.source, PolicyValueSource::Cli);
+        assert_eq!(policy.allow_shell.value, true);
+        assert_eq!(policy.shell_path.source, PolicyValueSource::Config);
+        assert_eq!(
+            policy.shell_path.value.selection,
+            ygg_agent::ShellSelection::Configured
+        );
+        assert_eq!(policy.bash_timeout_ms.source, PolicyValueSource::Cli);
+        assert_eq!(policy.bash_timeout_ms.value, 45_000);
+        assert_eq!(policy.max_output_bytes.source, PolicyValueSource::Cli);
+        assert_eq!(policy.max_output_bytes.value, 8192);
+        assert_eq!(policy.allow_remote_read.source, PolicyValueSource::Config);
+        assert!(policy.allow_remote_read.value);
+    }
+
+    #[test]
     fn telemetry_path_resolves_relative_to_invocation_directory() {
         let directory = cwd();
         let mut cli = base();
@@ -1571,6 +1763,74 @@ mod tests {
     }
 
     #[test]
+    fn effect_policy_layers_respect_project_tightening_and_cli_override() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "effect_policy = 'controlled'\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        let project = directory.path().join(".ygg/config.toml");
+        std::fs::write(&project, "effect_policy = 'unsafe_host'\n").unwrap();
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.effect_policy, EffectPolicy::Controlled);
+        assert_eq!(
+            config
+                .sandbox
+                .effective_tool_policy(&config.workspace, config.effect_policy)
+                .effect_policy
+                .source,
+            PolicyValueSource::Config
+        );
+
+        std::fs::write(&project, "effect_policy = 'controlled_bash_approval'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(
+            config.effect_policy,
+            EffectPolicy::ControlledBashApproval,
+            "a trusted project may tighten the global profile"
+        );
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        cli.effect_policy = Some("unsafe_host".into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.effect_policy, EffectPolicy::UnsafeHost);
+        assert_eq!(
+            config
+                .sandbox
+                .effective_tool_policy(&config.workspace, config.effect_policy)
+                .effect_policy
+                .source,
+            PolicyValueSource::Cli
+        );
+    }
+
+    #[test]
+    fn environment_effect_policy_layer_overrides_config() {
+        let mut values = ConfigLayer {
+            effect_policy: Some("controlled".into()),
+            ..ConfigLayer::default()
+        };
+        values.merge(ConfigLayer {
+            effect_policy: Some("unsafe_host".into()),
+            ..ConfigLayer::default()
+        });
+
+        assert_eq!(values.effect_policy.as_deref(), Some("unsafe_host"));
+        assert_eq!(
+            policy_value_source(true, values.effect_policy.is_some()),
+            PolicyValueSource::Environment
+        );
+    }
+
+    #[test]
     fn effect_policy_is_full_access_by_default_and_yolo_is_removed() {
         let directory = cwd();
         let mut cli = base();
@@ -1596,6 +1856,23 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ygg", "--safe"]).unwrap();
         assert!(cli.safe_mode);
+        assert!(
+            Cli::try_parse_from(["ygg", "--safe-mode", "--effect-policy", "unsafe_host",]).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_effect_policy_is_secret_safe() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.effect_policy = Some("sensitive-invalid-policy-value".into());
+
+        let error = config_with_empty_global(cli, directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid effect policy"));
+        assert!(!error.contains("sensitive-invalid-policy-value"));
     }
 
     #[test]

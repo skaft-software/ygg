@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use ygg_ai::{Media, ToolDef};
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 use crate::sandbox::{self, SandboxConfig};
 /// Whether an unresolved call may be executed automatically after reopening a
 /// session whose previous process stopped before persisting its result.
@@ -582,14 +582,14 @@ impl ToolContext<'_> {
     /// paths, `~/…`, parent components, and external symlinks.
     pub fn resolve_existing(&self, path: &str) -> Result<PathBuf, ToolError> {
         sandbox::resolve_existing(self.workspace, path, self.sandbox.allow_external_paths)
-            .map_err(ToolError::new)
+            .map_err(path_resolution_tool_error)
     }
 
     /// Resolves a local path for creation. Relative paths use the workspace as
     /// their base; external path access follows the host's sandbox policy.
     pub fn resolve_create(&self, path: &str) -> Result<PathBuf, ToolError> {
         sandbox::resolve_create(self.workspace, path, self.sandbox.allow_external_paths)
-            .map_err(ToolError::new)
+            .map_err(path_resolution_tool_error)
     }
 
     /// Returns a stable display spelling without changing the path used for
@@ -615,6 +615,17 @@ impl ToolContext<'_> {
             .await
             .map_err(|_| ToolError::new("Session channel closed without response"))?
             .map_err(ToolError::new)
+    }
+}
+
+fn path_resolution_tool_error(error: sandbox::SandboxPathError) -> ToolError {
+    if error.is_workspace_confinement() {
+        ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            error.to_string(),
+        )
+    } else {
+        ToolError::new(error.to_string())
     }
 }
 
@@ -1158,6 +1169,9 @@ impl ToolOutput {
 pub struct ToolError {
     /// Compact description of the failure, written for the model.
     pub message: String,
+    /// Stable machine-readable policy reason, kept separate from model-facing
+    /// error wording and never serialized into a tool result.
+    policy_denial_code: Option<ToolPolicyDenialCode>,
 }
 
 impl ToolError {
@@ -1165,7 +1179,23 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            policy_denial_code: None,
         }
+    }
+
+    /// Creates a model-facing error that also carries a stable policy code for
+    /// secret-safe diagnostics.
+    pub fn policy_denied(code: ToolPolicyDenialCode, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            policy_denial_code: Some(code),
+        }
+    }
+
+    /// Stable policy code associated with this error, if it was denied at a
+    /// tool capability boundary.
+    pub(crate) fn policy_denial_code(&self) -> Option<ToolPolicyDenialCode> {
+        self.policy_denial_code
     }
 }
 
@@ -1186,6 +1216,22 @@ pub fn content_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_resolution_denials_keep_a_stable_policy_code() {
+        let error = path_resolution_tool_error(sandbox::SandboxPathError::WorkspaceConfinement(
+            "path escapes the workspace".into(),
+        ));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
+
+        let error = path_resolution_tool_error(sandbox::SandboxPathError::Other(
+            "path does not exist".into(),
+        ));
+        assert_eq!(error.policy_denial_code(), None);
+    }
 
     #[test]
     fn content_hash_is_deterministic_and_content_sensitive() {
