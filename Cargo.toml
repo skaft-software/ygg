@@ -5,6 +5,7 @@ members = [
     "crates/ygg-ai",
     "crates/ygg-agent",
     "crates/ygg-coding-agent",
+    "crates/ygg-migrate-types",
 ]
 exclude = ["extensions/ygg-serve"]
 

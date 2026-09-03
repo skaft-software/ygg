@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "source_agent": "pi",
+  "models": [
+    {
+      "outcome": "mapped",
+      "path": "settings.model",
+      "value": {
+        "provider": "openai",
+        "model": "gpt-4.1"
+      }
+    }
+  ],
+  "skills": [
+    {
+      "outcome": "mapped",
+      "path": "skills/review/SKILL.md",
+      "value": {
+        "name": "review",
+        "content": "Review changes before merging."
+      }
+    },
+    {
+      "outcome": "unmapped",
+      "diagnostic": {
+        "path": "skills/legacy/SKILL.md",
+        "severity": "warning",
+        "reason": "legacy skill front matter has no v1 mapping"
+      }
+    }
+  ],
+  "mcp_servers": [
+    {
+      "outcome": "mapped",
+      "path": "mcp.filesystem",
+      "value": {
+        "name": "filesystem",
+        "transport": {
+          "kind": "stdio",
+          "command": "npx",
+          "args": [
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/workspace"
+          ]
+        }
+      }
+    }
+  ],
+  "permissions": [
+    {
+      "outcome": "mapped",
+      "path": "permissions.write",
+      "value": {
+        "capability": "write",
+        "decision": "ask"
+      }
+    }
+  ],
+  "diagnostics": [
+    {
+      "path": "settings.theme",
+      "severity": "warning",
+      "reason": "themes are not part of the MigratedSetup v1 schema"
+    }
+  ]
+}
