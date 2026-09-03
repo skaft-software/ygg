@@ -90,4 +90,4 @@ tar = "0.4"
 [dev-dependencies]
 tokio-test = "0.4"
 vt100 = "0.15.2"
-wiremock = "=0.6.4"
+wiremock = "=0.6.5"
