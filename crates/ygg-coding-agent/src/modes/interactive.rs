@@ -2646,7 +2646,8 @@ async fn subagents_view(
     }
     let mut selected_node_id = None::<String>;
     loop {
-        let notices = app.executable_extensions.drain_events();
+        let mut notices = app.executable_extensions.drain_events();
+        notices.extend(app.synchronize_extension_provider_catalog());
         let Some((title, entries)) = subagent_view_entries(&app.executable_extensions) else {
             for notice in notices {
                 shell.notice(notice);
@@ -2706,7 +2707,9 @@ async fn subagents_view(
 
         // Revalidate the stable node and typed reference against the newest
         // accepted presentation revision immediately before opening it.
-        for notice in app.executable_extensions.drain_events() {
+        let mut notices = app.executable_extensions.drain_events();
+        notices.extend(app.synchronize_extension_provider_catalog());
+        for notice in notices {
             shell.notice(notice);
         }
         let Some((_, current_entries)) = subagent_view_entries(&app.executable_extensions) else {
@@ -3720,10 +3723,11 @@ async fn run_idle_command(
             shell.show_overlay_text(app.executable_extensions.inspect_text());
         }
         Command::Extensions(commands::ExtensionsSubcommand::Reload) => {
-            let messages = await_lifecycle(shell, input, "reloading extensions…", async {
+            let mut messages = await_lifecycle(shell, input, "reloading extensions…", async {
                 Ok(app.executable_extensions.reload().await)
             })
             .await?;
+            messages.extend(app.synchronize_extension_provider_catalog());
             if messages.is_empty() {
                 shell.notice("no running executable extensions to reload");
             } else {
@@ -3733,6 +3737,7 @@ async fn run_idle_command(
         }
         Command::Extensions(commands::ExtensionsSubcommand::Inspect { reference }) => {
             let _ = app.executable_extensions.drain_events();
+            app.synchronize_extension_provider_catalog();
             let principal = app
                 .executable_extensions
                 .presentation_session_reference_principal(&reference);

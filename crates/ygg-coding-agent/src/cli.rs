@@ -2135,6 +2135,7 @@ pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pi::PiBridgeApiVersion;
 
     fn cwd() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -3772,6 +3773,43 @@ max_output_bytes = 4096
                 }
             })
         ));
+    }
+
+    #[test]
+    fn pi_install_selects_api_03_only_when_explicit() {
+        let default =
+            Cli::try_parse_from(["ygg", "pi", "install", "./private-extension.ts"]).unwrap();
+        let explicit = Cli::try_parse_from([
+            "ygg",
+            "pi",
+            "install",
+            "./private-extension.ts",
+            "--api-version",
+            "0.3",
+        ])
+        .unwrap();
+        let Some(TopLevelCommand::Pi {
+            command:
+                PiCommand::Install {
+                    api_version: default_api_version,
+                    ..
+                },
+        }) = default.command
+        else {
+            panic!("expected default pi install command");
+        };
+        let Some(TopLevelCommand::Pi {
+            command:
+                PiCommand::Install {
+                    api_version: explicit_api_version,
+                    ..
+                },
+        }) = explicit.command
+        else {
+            panic!("expected explicit pi install command");
+        };
+        assert_eq!(default_api_version, PiBridgeApiVersion::V02);
+        assert_eq!(explicit_api_version, PiBridgeApiVersion::V03);
     }
 
     #[test]

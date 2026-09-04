@@ -6,12 +6,31 @@ import os
 import shutil
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 try:
-    from .helpers import BridgeProcess, FAKE_PI, FIXTURES, NODE
+    from .helpers import (
+        BridgeProcess,
+        FAKE_PI,
+        FIXTURES,
+        NODE,
+        PROVIDER_EXTENSION,
+        PROVIDER_HEADERS_HOOK_EXTENSION,
+        UNSAFE_PROVIDER_EXTENSION,
+        v03_contract,
+    )
 except ImportError:  # unittest discovery imports this file as a top-level module.
-    from helpers import BridgeProcess, FAKE_PI, FIXTURES, NODE
+    from helpers import (
+        BridgeProcess,
+        FAKE_PI,
+        FIXTURES,
+        NODE,
+        PROVIDER_EXTENSION,
+        PROVIDER_HEADERS_HOOK_EXTENSION,
+        UNSAFE_PROVIDER_EXTENSION,
+        v03_contract,
+    )
 
 
 def single_file_source_fingerprint(path: Path) -> str:
@@ -717,6 +736,540 @@ class BridgeProtocolTests(unittest.TestCase):
             )
             self.assertEqual(-32000, response["error"]["code"])
             self.assertIn("ctx.newSession", response["error"]["message"])
+
+
+@unittest.skipUnless(NODE, "node is required for the API 0.3 bridge subprocess tests")
+class Api03ProviderBridgeTests(unittest.TestCase):
+    def provider_bridge(self) -> tuple[BridgeProcess, list[dict], list[dict]]:
+        bridge = BridgeProcess(extension=PROVIDER_EXTENSION, api_version="0.3")
+        catalog_requests: list[dict] = []
+        auth_requests: list[dict] = []
+
+        def catalog(message: dict) -> dict:
+            catalog_requests.append(message)
+            if message["method"] == "providers/unregister":
+                return {
+                    "revision": len(catalog_requests),
+                    "provider_ids": [],
+                    "model_ids": [],
+                }
+            return {
+                "revision": len(catalog_requests),
+                "provider_ids": ["fixture-provider"],
+                "model_ids": ["fixture-provider/fixture-model"],
+            }
+
+        def authorization(message: dict) -> dict:
+            auth_requests.append(message)
+            # Deliberately return a lease: the bridge may receive it from the
+            # host but must never retain or expose it to the Pi adapter.
+            return {"status": "ready", "lease": "host/only=fixture:lease"}
+
+        bridge.handlers["providers/register"] = catalog
+        bridge.handlers["providers/update"] = catalog
+        bridge.handlers["providers/unregister"] = catalog
+        bridge.handlers["provider/auth/request"] = authorization
+        bridge.handlers["provider/auth/revoke"] = authorization
+        return bridge, catalog_requests, auth_requests
+
+    @staticmethod
+    def v03_tool(bridge: BridgeProcess, name: str) -> dict:
+        return bridge.request(
+            "tool/call",
+            {
+                "name": "pi",
+                "arguments": {"tool_name": name, "arguments": {}},
+                "context": {},
+            },
+        )
+
+    @staticmethod
+    def wait_for_provider_ready(
+        bridge: BridgeProcess, catalog_requests: list[dict], auth_requests: list[dict]
+    ) -> None:
+        bridge.wait_for(
+            lambda _messages: catalog_requests[0] if catalog_requests else None,
+            description="initial provider registration",
+        )
+        bridge.wait_for(
+            lambda _messages: auth_requests[0] if auth_requests else None,
+            description="initial provider authorization",
+        )
+
+    def test_api_03_selects_host_owned_provider_catalog_and_auth(self) -> None:
+        bridge, catalog_requests, auth_requests = self.provider_bridge()
+        with bridge:
+            initialized = bridge.initialize()
+            self.assertEqual("0.3", initialized["api_version"])
+            self.assertEqual("ygg-canonical-json-v1", initialized["contract"]["encoding"])
+            self.assertIn("provider_stream", initialized["contract"]["capabilities"])
+            self.assertIn("pi", {tool["name"] for tool in initialized["tools"]})
+
+            registration = bridge.wait_for(
+                lambda _messages: catalog_requests[0] if catalog_requests else None,
+                description="initial API 0.3 provider registration",
+            )
+            params = registration["params"]
+            self.assertEqual("fixture-provider", params["provider"]["id"])
+            self.assertEqual(
+                {"id", "label", "auth"}, set(params["provider"])
+            )
+            self.assertEqual(
+                {"kind": "host_credential", "subject": "fixture-credential"},
+                params["provider"]["auth"],
+            )
+            self.assertEqual(
+                {"id", "api_name", "protocol", "context_window", "max_output_tokens", "capabilities", "display_name"},
+                set(params["models"][0]),
+            )
+            self.assertNotIn("yggStream", json.dumps(params))
+            self.assertNotIn("baseUrl", json.dumps(params))
+
+            authorization = bridge.wait_for(
+                lambda _messages: auth_requests[0] if auth_requests else None,
+                description="host-owned provider authorization request",
+            )
+            self.assertEqual("authorize", authorization["params"]["action"])
+            self.assertFalse(authorization["params"]["interactive"])
+            self.assertNotIn("lease", authorization["params"])
+
+    def test_api_03_tool_dispatcher_bounds_pi_content_parts(self) -> None:
+        bridge, catalog_requests, auth_requests = self.provider_bridge()
+        with bridge:
+            bridge.initialize()
+            self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+            response = self.v03_tool(bridge, "fixture_provider_many_parts")
+            self.assertEqual(-32012, response["error"]["code"])
+            self.assertEqual("extension resource exhausted", response["error"]["message"])
+
+    def test_provider_stream_translates_events_without_leases_and_runs_safe_hooks(self) -> None:
+        bridge, catalog_requests, auth_requests = self.provider_bridge()
+        with bridge:
+            bridge.initialize()
+            self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+            unsafe_request = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "authority-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"headers": {"authorization": "must-not-reach-pi"}},
+                },
+            )
+            self.assertEqual(-32602, unsafe_request["error"]["code"])
+            self.assertNotIn("must-not-reach-pi", json.dumps(unsafe_request))
+            mutated_hook_request = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "mutated-hook-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"fixture_unsafe_mutation": True},
+                },
+            )
+            self.assertEqual(-32602, mutated_hook_request["error"]["code"])
+            self.assertNotIn("must-not-reach-pi-adapter", json.dumps(mutated_hook_request))
+            response = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "fixture-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"prompt": "hello"},
+                    "authorization_lease": "host/only=fixture:lease",
+                },
+            )
+            self.assertEqual({"stream_id": "fixture-stream", "accepted": True}, response["result"])
+            events = bridge.wait_for(
+                lambda messages: [
+                    message["params"]
+                    for message in messages
+                    if message.get("method") == "provider/event"
+                    and message.get("params", {}).get("stream_id") == "fixture-stream"
+                    and message.get("params", {}).get("kind") == "finished"
+                ],
+                description="finished provider event",
+            )
+            stream_events = [
+                message["params"]
+                for message in bridge.messages
+                if message.get("method") == "provider/event"
+                and message.get("params", {}).get("stream_id") == "fixture-stream"
+            ]
+            self.assertTrue(events)
+            self.assertEqual(
+                [
+                    "started",
+                    "text_start",
+                    "text_delta",
+                    "text_end",
+                    "tool_call_start",
+                    "tool_call_args_delta",
+                    "tool_call_end",
+                    "usage",
+                    "finished",
+                ],
+                [event["kind"] for event in stream_events],
+            )
+            self.assertEqual(
+                "hooked:hello",
+                next(event["payload"]["delta"] for event in stream_events if event["kind"] == "text_delta"),
+            )
+            self.assertEqual(list(range(len(stream_events))), [event["sequence"] for event in stream_events])
+            self.assertNotIn("host/only=fixture:lease", json.dumps(stream_events))
+
+            direct_response = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "direct-fixture-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"direct": True},
+                },
+            )
+            self.assertEqual(
+                {"stream_id": "direct-fixture-stream", "accepted": True}, direct_response["result"]
+            )
+            direct_finished = bridge.wait_for(
+                lambda messages: next(
+                    (
+                        message["params"]
+                        for message in messages
+                        if message.get("method") == "provider/event"
+                        and message.get("params", {}).get("stream_id") == "direct-fixture-stream"
+                        and message.get("params", {}).get("kind") == "finished"
+                    ),
+                    None,
+                ),
+                description="finished direct API 0.3-shaped provider event",
+            )
+            self.assertEqual("end_turn", direct_finished["payload"]["stop_reason"])
+            self.assertEqual(4, direct_finished["sequence"])
+
+            hook_status = self.v03_tool(bridge, "fixture_provider_hook_status")
+            self.assertEqual("200", hook_status["result"]["content"][0]["text"])
+            self.assertIsNone(hook_status["result"]["metadata"])
+
+    def test_provider_refresh_unsafe_mutation_and_shutdown_cleanup_are_explicit(self) -> None:
+        bridge, catalog_requests, auth_requests = self.provider_bridge()
+        with bridge:
+            bridge.initialize()
+            self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+            updated = self.v03_tool(bridge, "fixture_provider_update")
+            self.assertEqual("provider updated", updated["result"]["content"][0]["text"])
+            bridge.wait_for(
+                lambda _messages: next(
+                    (item for item in catalog_requests if item["method"] == "providers/update"), None
+                ),
+                description="provider update",
+            )
+            refresh = bridge.wait_for(
+                lambda _messages: next(
+                    (item for item in auth_requests if item["params"]["action"] == "refresh"), None
+                ),
+                description="provider authorization refresh",
+            )
+            self.assertEqual("fixture-provider", refresh["params"]["provider_id"])
+
+            unsafe = self.v03_tool(bridge, "fixture_provider_unsafe")
+            self.assertEqual(-32602, unsafe["error"]["code"])
+            self.assertEqual("invalid params", unsafe["error"]["message"])
+            self.assertNotIn("must-not-cross", json.dumps(unsafe))
+            self.assertFalse(
+                any(
+                    item["params"].get("provider", {}).get("id") == "unsafe-provider"
+                    for item in catalog_requests
+                )
+            )
+
+            unregistered = self.v03_tool(bridge, "fixture_provider_unregister")
+            self.assertEqual("provider unregistered", unregistered["result"]["content"][0]["text"])
+            bridge.wait_for(
+                lambda _messages: next(
+                    (item for item in catalog_requests if item["method"] == "providers/unregister"), None
+                ),
+                description="provider unregister",
+            )
+            unavailable = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "retired-provider-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"prompt": "retired"},
+                },
+            )
+            self.assertFalse(unavailable["result"]["accepted"])
+
+            shutdown = bridge.request("shutdown")
+            self.assertEqual("shutdown", shutdown["result"]["terminal"])
+            self.assertTrue(
+                any(item["method"] == "providers/unregister" for item in catalog_requests)
+            )
+            self.assertTrue(
+                any(item["params"]["action"] == "revoke" for item in auth_requests)
+            )
+
+    def test_provider_cancellation_uses_notification_and_cleans_stream_state(self) -> None:
+        bridge, catalog_requests, auth_requests = self.provider_bridge()
+        with bridge:
+            bridge.initialize()
+            self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+            response = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "held-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"hold": True, "prompt": "wait"},
+                },
+            )
+            self.assertTrue(response["result"]["accepted"])
+            bridge.wait_for(
+                lambda messages: next(
+                    (
+                        message
+                        for message in messages
+                        if message.get("method") == "provider/event"
+                        and message.get("params", {}).get("stream_id") == "held-stream"
+                        and message.get("params", {}).get("kind") == "text_delta"
+                    ),
+                    None,
+                ),
+                description="held provider stream progress",
+            )
+            bridge.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "provider/cancel",
+                    "params": {"stream_id": "held-stream", "reason": "fixture cancellation"},
+                }
+            )
+            deadline = time.monotonic() + 2.0
+            cancellation_status: dict | None = None
+            while time.monotonic() < deadline:
+                cancellation_status = self.v03_tool(bridge, "fixture_provider_cancel_status")
+                if cancellation_status.get("result", {}).get("content", [{}])[0].get("text") == "true":
+                    break
+                time.sleep(0.02)
+            self.assertIsNotNone(cancellation_status)
+            self.assertEqual("true", cancellation_status["result"]["content"][0]["text"])
+            reopened = bridge.request(
+                "provider/stream",
+                {
+                    "stream_id": "held-stream",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"hold": True, "prompt": "reopened"},
+                },
+            )
+            self.assertTrue(reopened["result"]["accepted"])
+            bridge.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "provider/cancel",
+                    "params": {"stream_id": "held-stream", "reason": "fixture teardown"},
+                }
+            )
+            self.assertFalse(
+                any(
+                    message.get("method") == "provider/event"
+                    and message.get("params", {}).get("stream_id") == "held-stream"
+                    and message.get("params", {}).get("kind") == "finished"
+                    for message in bridge.messages
+                )
+            )
+
+    def test_provider_stream_cancellation_does_not_wait_for_pending_catalog_sync(self) -> None:
+        # Leave the initial authorization response outstanding, then cancel an
+        # inbound stream request. Its cancellation must not be held behind the
+        # unrelated host-owned authorization exchange.
+        with BridgeProcess(extension=PROVIDER_EXTENSION, api_version="0.3") as bridge:
+            bridge.initialize()
+            registration = bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "providers/register"),
+                    None,
+                ),
+                description="initial provider registration awaiting a manual response",
+            )
+            bridge.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": registration["id"],
+                    "result": {
+                        "revision": 1,
+                        "provider_ids": ["fixture-provider"],
+                        "model_ids": ["fixture-provider/fixture-model"],
+                    },
+                }
+            )
+            authorization = bridge.wait_for(
+                lambda messages: next(
+                    (
+                        message
+                        for message in messages
+                        if message.get("method") == "provider/auth/request"
+                    ),
+                    None,
+                ),
+                description="provider authorization awaiting a manual response",
+            )
+
+            bridge.handlers["providers/unregister"] = lambda _message: {
+                "revision": 2,
+                "provider_ids": [],
+                "model_ids": [],
+            }
+            bridge.handlers["provider/auth/revoke"] = lambda _message: {"status": "revoked"}
+            stream_id = bridge.send_request(
+                "provider/stream",
+                {
+                    "stream_id": "cancel-before-auth",
+                    "provider_id": "fixture-provider",
+                    "model_id": "fixture-model",
+                    "request": {"prompt": "wait"},
+                },
+            )
+            bridge.send(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "$/cancelRequest",
+                    "params": {"id": stream_id},
+                }
+            )
+            cancelled = bridge.wait_response(stream_id, timeout=1.0)
+            self.assertEqual(-32800, cancelled["error"]["code"])
+            self.assertEqual("request cancelled", cancelled["error"]["message"])
+
+            # Release the initial synchronization so graceful shutdown can
+            # revoke and unregister the retained host publication obligation.
+            bridge.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": authorization["id"],
+                    "result": {"status": "ready"},
+                }
+            )
+
+    def test_provider_replacement_and_unregistration_cancel_active_streams(self) -> None:
+        for mutation_tool in ("fixture_provider_update", "fixture_provider_unregister"):
+            with self.subTest(mutation_tool=mutation_tool):
+                bridge, catalog_requests, auth_requests = self.provider_bridge()
+                with bridge:
+                    bridge.initialize()
+                    self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+                    stream_id = f"{mutation_tool}-stream"
+                    accepted = bridge.request(
+                        "provider/stream",
+                        {
+                            "stream_id": stream_id,
+                            "provider_id": "fixture-provider",
+                            "model_id": "fixture-model",
+                            "request": {"hold": True, "prompt": "wait"},
+                        },
+                    )
+                    self.assertTrue(accepted["result"]["accepted"])
+                    bridge.wait_for(
+                        lambda messages: next(
+                            (
+                                message
+                                for message in messages
+                                if message.get("method") == "provider/event"
+                                and message.get("params", {}).get("stream_id") == stream_id
+                                and message.get("params", {}).get("kind") == "text_delta"
+                            ),
+                            None,
+                        ),
+                        description="provider stream before declaration mutation",
+                    )
+                    mutation = self.v03_tool(bridge, mutation_tool)
+                    self.assertNotIn("error", mutation)
+                    deadline = time.monotonic() + 2.0
+                    cancellation_status: dict | None = None
+                    while time.monotonic() < deadline:
+                        cancellation_status = self.v03_tool(bridge, "fixture_provider_cancel_status")
+                        if cancellation_status.get("result", {}).get("content", [{}])[0].get("text") == "true":
+                            break
+                        time.sleep(0.02)
+                    self.assertIsNotNone(cancellation_status)
+                    self.assertEqual("true", cancellation_status["result"]["content"][0]["text"])
+                    self.assertFalse(
+                        any(
+                            message.get("method") == "provider/event"
+                            and message.get("params", {}).get("stream_id") == stream_id
+                            and message.get("params", {}).get("kind") == "finished"
+                            for message in bridge.messages
+                        )
+                    )
+
+    def test_api_03_admission_limit_rejects_excess_and_cancels_queued_tools(self) -> None:
+        with BridgeProcess(api_version="0.3") as bridge:
+            bridge.initialize(contract=v03_contract(providers=False))
+            params = {
+                "name": "pi",
+                "arguments": {"tool_name": "fixture_hold", "arguments": {}},
+                "context": {},
+            }
+            active_ids = [bridge.send_request("tool/call", params) for _ in range(4)]
+            rejected = bridge.wait_response(bridge.send_request("tool/call", params))
+            self.assertEqual(-32012, rejected["error"]["code"])
+            self.assertEqual("extension resource exhausted", rejected["error"]["message"])
+            for request_id in active_ids:
+                bridge.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "$/cancelRequest",
+                        "params": {"id": request_id},
+                    }
+                )
+            for request_id in active_ids:
+                response = bridge.wait_response(request_id)
+                self.assertEqual(-32800, response["error"]["code"])
+                self.assertEqual("request cancelled", response["error"]["message"])
+
+    def test_provider_mutations_and_header_hooks_fail_when_not_representable(self) -> None:
+        with BridgeProcess(extension=UNSAFE_PROVIDER_EXTENSION, api_version="0.3") as bridge:
+            response = bridge.request(
+                "initialize", bridge.initialization_params(contract=v03_contract())
+            )
+            self.assertEqual(-32602, response["error"]["code"])
+            self.assertEqual("invalid params", response["error"]["message"])
+            self.assertNotIn("must-not-cross", json.dumps(response))
+
+        with BridgeProcess(extension=PROVIDER_HEADERS_HOOK_EXTENSION, api_version="0.3") as bridge:
+            response = bridge.request(
+                "initialize", bridge.initialization_params(contract=v03_contract())
+            )
+            self.assertEqual(-32602, response["error"]["code"])
+            self.assertEqual("invalid params", response["error"]["message"])
+
+        with BridgeProcess(extension=PROVIDER_EXTENSION, api_version="0.3") as bridge:
+            response = bridge.request(
+                "initialize", bridge.initialization_params(contract=v03_contract(providers=False))
+            )
+            self.assertEqual(-32011, response["error"]["code"])
+            self.assertEqual("extension capability mismatch", response["error"]["message"])
+
+    def test_api_03_rejects_invalid_params_and_noncanonical_input_framing(self) -> None:
+        with BridgeProcess(api_version="0.3") as bridge:
+            bridge.initialize()
+            invalid = bridge.request(
+                "tool/call",
+                {"name": "fixture_echo", "arguments": {}, "context": {}, "extra": True},
+            )
+            self.assertEqual(-32602, invalid["error"]["code"])
+            self.assertEqual("invalid params", invalid["error"]["message"])
+
+        with BridgeProcess(api_version="0.3") as bridge:
+            bridge.initialize()
+            # Object-key order is intentionally not canonical (jsonrpc before id).
+            bridge.send_raw(
+                b'{"jsonrpc":"2.0","id":99,"method":"shutdown","params":{}}\n'
+            )
+            bridge.process.wait(timeout=2.0)
+            self.assertEqual(1, bridge.process.returncode)
+            self.assertTrue(any("not canonical JSON" in line for line in bridge.stderr))
 
 
 if __name__ == "__main__":

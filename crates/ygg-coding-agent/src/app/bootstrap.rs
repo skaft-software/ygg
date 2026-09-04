@@ -17,10 +17,10 @@ use ygg_agent::{
     EffectBroker, EntryValue, ExtensionHost, GoalDriver, Session, SkillRegistry, TelemetryObserver,
 };
 use ygg_ai::{
-    AgentDelegation, AiClient, Auth, Capabilities, Endpoint, EndpointId, ModalitySet, Model,
-    ModelCatalog, ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, Pricing, PricingTier,
-    Protocol, ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningMode, TokenRate,
-    ToolDef,
+    AgentDelegation, AiClient, Auth, CacheCompatibility, Capabilities, Endpoint, EndpointId,
+    EndpointTransport, ModalitySet, Model, ModelCatalog, ModelId, ModelLimits, ModelSpec,
+    OpenAiChatReasoningMode, Pricing, PricingTier, Protocol, ReasoningCapability, ReasoningConfig,
+    ReasoningControl, ReasoningMode, RequestRuntime, TokenRate, ToolDef,
 };
 
 use crate::app::{
@@ -28,7 +28,7 @@ use crate::app::{
     normalize_reasoning_selection_for_model_with_subagents, thinking_to_reasoning, App,
 };
 use crate::config::{CompactionMode, Config, ResumeSelector};
-use crate::extensions::{ExecutableExtensions, SUBAGENTS_EXTENSION_NAME};
+use crate::extensions::{ExecutableExtensions, ExtensionProviderRuntime, SUBAGENTS_EXTENSION_NAME};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
@@ -46,6 +46,10 @@ pub struct Bootstrap {
     pub catalog: ModelCatalog,
     pub sessions: SessionStore,
     pub client: AiClient,
+    provider_runtime: ExtensionProviderRuntime,
+    /// Activated extension host retained while provider declarations are needed
+    /// to resolve the user's first model selection.
+    prestarted_extensions: RefCell<Option<(ExtensionHost, ExecutableExtensions)>>,
     /// Session opened while resolving resume provenance. Keeping it here
     /// avoids replaying the same JSONL file a second time in `build_app`.
     prepared_session: RefCell<Option<Session>>,
@@ -55,6 +59,49 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
+    /// Starts enabled extensions once when their API 0.3 declarations are
+    /// required to resolve an otherwise unknown initial model.
+    ///
+    /// The temporary session is deliberately not a user session: provider
+    /// discovery must not create or mutate a session before launch validation
+    /// succeeds. The started host is retained and rebound by `build_app`.
+    fn preflight_extension_providers(&self) -> anyhow::Result<()> {
+        if self.prestarted_extensions.borrow().is_some() {
+            return Ok(());
+        }
+
+        let temporary = tempfile::tempdir()
+            .context("could not create temporary extension-provider bootstrap session")?;
+        let session = Session::create(temporary.path().join("provider-bootstrap.jsonl"))
+            .context("could not create temporary extension-provider bootstrap session")?;
+        let model = extension_provider_bootstrap_model(&self.catalog);
+        let (host, mut extensions) = configured_extensions_with_runtime_manager(
+            &self.config,
+            &session,
+            &model,
+            &self.config.reasoning,
+            &self.sessions,
+            None,
+            self.provider_runtime.clone(),
+        )?;
+        // Populate a throwaway copy now so callers can validate/select the
+        // projected models. `build_app` repeats this against its owned catalog.
+        let mut catalog = self.catalog.clone();
+        extensions.synchronize_provider_catalog(&mut catalog, &self.client);
+        *self.prestarted_extensions.borrow_mut() = Some((host, extensions));
+        Ok(())
+    }
+
+    /// Returns a selection catalog that includes ready host-owned provider
+    /// routes without exposing extension declarations as catalog authority.
+    fn catalog_with_extension_providers(&self) -> ModelCatalog {
+        let mut catalog = self.catalog.clone();
+        if let Some((_, extensions)) = self.prestarted_extensions.borrow_mut().as_mut() {
+            extensions.synchronize_provider_catalog(&mut catalog, &self.client);
+        }
+        catalog
+    }
+
     /// Supply an already-open session for the next launch.
     ///
     /// Hosts use this to keep authorization bound to a caller-opened file
@@ -73,6 +120,56 @@ impl Bootstrap {
 
     pub(crate) fn is_modeless(&self) -> bool {
         self.modeless.get()
+    }
+}
+
+/// Supplies extension initialization with a safe local model snapshot before a
+/// provider declaration has made the user's requested model resolvable.
+fn extension_provider_bootstrap_model(catalog: &ModelCatalog) -> Model {
+    if let Some(model) = catalog
+        .models()
+        .next()
+        .and_then(|specification| catalog.resolve(&specification.id).ok())
+    {
+        return model;
+    }
+
+    let endpoint = Arc::new(Endpoint {
+        id: EndpointId("extension-provider-bootstrap".to_owned()),
+        base_url: url::Url::parse("http://127.0.0.1:9/")
+            .expect("fixed extension-provider bootstrap URL is valid"),
+        auth: Auth::None,
+        default_headers: http::HeaderMap::new(),
+        transport: EndpointTransport::Http,
+        runtime: RequestRuntime::default(),
+        timeout: Duration::from_secs(30),
+    });
+    Model {
+        spec: Arc::new(ModelSpec {
+            id: ModelId("extension-provider-bootstrap".to_owned()),
+            endpoint: endpoint.id.clone(),
+            api_name: "extension-provider-bootstrap".to_owned(),
+            display_name: None,
+            protocol: Protocol::OpenAiChat,
+            capabilities: Capabilities {
+                input_modalities: ModalitySet::none(),
+                output_modalities: ModalitySet::none(),
+                tools: true,
+                parallel_tool_calls: false,
+                reasoning: None,
+                responses_lite: false,
+                agent_delegation: None,
+                structured_output: false,
+                deferred_tool_loading: false,
+            },
+            limits: ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 16_000,
+            },
+            pricing: None,
+            cache: CacheCompatibility::default(),
+        }),
+        endpoint,
     }
 }
 
@@ -3754,6 +3851,8 @@ pub fn bootstrap(config: Config) -> anyhow::Result<Bootstrap> {
         catalog,
         sessions,
         client,
+        provider_runtime: ExtensionProviderRuntime::default(),
+        prestarted_extensions: RefCell::new(None),
         prepared_session: RefCell::new(None),
         modeless: std::cell::Cell::new(false),
     })
@@ -4071,8 +4170,14 @@ pub async fn resolve_launch_interactive(
         })
         .await?;
     *boot.prepared_session.borrow_mut() = prepared;
-    let no_configured_model = !boot.config.model_explicit && boot.catalog.models().next().is_none();
-    let pick_model = should_pick_interactive_model(&boot.config, &boot.catalog, model.as_ref());
+    // Provider declarations are only available after API 0.3 extension
+    // activation; perform that boundary before presenting a model picker.
+    if !boot.config.enabled_extensions.is_empty() {
+        boot.preflight_extension_providers()?;
+    }
+    let catalog = boot.catalog_with_extension_providers();
+    let no_configured_model = !boot.config.model_explicit && catalog.models().next().is_none();
+    let pick_model = should_pick_interactive_model(&boot.config, &catalog, model.as_ref());
     let model = if no_configured_model {
         boot.enter_modeless_mode();
         shell.notice("no configured model; opening session read-only");
@@ -4084,9 +4189,9 @@ pub async fn resolve_launch_interactive(
             Some(_) => {
                 shell.notice("selected model is unavailable; select a configured model");
                 shell.render();
-                model_picker(shell, input, &boot.catalog).await?
+                model_picker(shell, input, &catalog).await?
             }
-            None => model_picker(shell, input, &boot.catalog).await?,
+            None => model_picker(shell, input, &catalog).await?,
         }
     };
     Ok(LaunchSelection {
@@ -4118,16 +4223,24 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
         }
     };
     let (model, reasoning, reasoning_mode) = launch_configuration(boot, &session)?;
+    let catalog = if model
+        .as_ref()
+        .is_some_and(|model| boot.catalog.resolve(model).is_err())
+    {
+        boot.preflight_extension_providers()?;
+        boot.catalog_with_extension_providers()
+    } else {
+        boot.catalog.clone()
+    };
     let model = model.ok_or_else(|| {
-        let mut models = boot
-            .catalog
+        let mut models = catalog
             .models()
             .map(|model| model.id.0.clone())
             .collect::<Vec<_>>();
         models.sort();
         let diagnosis = match crate::provider_setup::ProviderSetupService::<
             crate::provider_setup::HttpSetupProbe,
-        >::readiness(&boot.catalog, None)
+        >::readiness(&catalog, None)
         {
             crate::provider_setup::ProviderSetupState::NoProvider => {
                 "no provider is configured; run `ygg setup --yes` for an explicitly selected OpenAI-compatible endpoint".to_owned()
@@ -4142,16 +4255,15 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
             models.join(", ")
         )
     })?;
-    if boot.catalog.resolve(&model).is_err() {
-        let mut available = boot
-            .catalog
+    if catalog.resolve(&model).is_err() {
+        let mut available = catalog
             .models()
             .map(|model| model.id.0.clone())
             .collect::<Vec<_>>();
         available.sort();
         let diagnosis = crate::provider_setup::ProviderSetupService::<
             crate::provider_setup::HttpSetupProbe,
-        >::readiness(&boot.catalog, Some(&model));
+        >::readiness(&catalog, Some(&model));
         anyhow::bail!(
             "{diagnosis}; run `ygg setup --yes` or choose an available model (available: {})",
             available.join(", ")
@@ -4246,6 +4358,23 @@ fn validate_explicit_tool_policy(
     }
 }
 
+fn apply_extension_tool_policy(host: &mut ExtensionHost, config: &Config, model: &Model) {
+    let tool_config = config.clone();
+    let model_supports_tools = model.spec.capabilities.tools;
+    host.set_tool_policy(move |name| model_supports_tools && tool_config.tool_available(name));
+    host.finalize_tool_surface();
+}
+
+fn configured_extension_host(config: &Config, model: &Model) -> anyhow::Result<ExtensionHost> {
+    let mut host = ExtensionHost::new();
+    host.load(&CoreTools);
+    apply_extension_tool_policy(&mut host, config, model);
+    if let Some(path) = config.telemetry.as_deref() {
+        host.observe(TelemetryObserver::new(path, env!("CARGO_PKG_VERSION"))?);
+    }
+    Ok(host)
+}
+
 #[cfg(test)]
 fn configured_extensions(
     config: &Config,
@@ -4254,7 +4383,15 @@ fn configured_extensions(
     reasoning: &ReasoningConfig,
     sessions: &SessionStore,
 ) -> anyhow::Result<(ExtensionHost, ExecutableExtensions)> {
-    configured_extensions_with_runtime_manager(config, session, model, reasoning, sessions, None)
+    configured_extensions_with_runtime_manager(
+        config,
+        session,
+        model,
+        reasoning,
+        sessions,
+        None,
+        ExtensionProviderRuntime::default(),
+    )
 }
 
 fn configured_extensions_with_runtime_manager(
@@ -4264,18 +4401,10 @@ fn configured_extensions_with_runtime_manager(
     reasoning: &ReasoningConfig,
     sessions: &SessionStore,
     runtime_manager: Option<ExtensionRuntimeManager>,
+    provider_runtime: ExtensionProviderRuntime,
 ) -> anyhow::Result<(ExtensionHost, ExecutableExtensions)> {
-    let mut extensions = ExtensionHost::new();
-    extensions.load(&CoreTools);
-    let tool_config = config.clone();
-    let model_supports_tools = model.spec.capabilities.tools;
-    extensions
-        .set_tool_policy(move |name| model_supports_tools && tool_config.tool_available(name));
-    extensions.finalize_tool_surface();
-    if let Some(path) = config.telemetry.as_deref() {
-        extensions.observe(TelemetryObserver::new(path, env!("CARGO_PKG_VERSION"))?);
-    }
-    let executable_extensions = ExecutableExtensions::discover_and_start_with_runtime_manager(
+    let mut extensions = configured_extension_host(config, model)?;
+    let executable_extensions = ExecutableExtensions::discover_and_start_with_provider_runtime(
         config,
         session,
         model,
@@ -4283,6 +4412,7 @@ fn configured_extensions_with_runtime_manager(
         sessions,
         &mut extensions,
         runtime_manager,
+        provider_runtime,
     );
     Ok((extensions, executable_extensions))
 }
@@ -4406,13 +4536,19 @@ pub(crate) fn build_app_with_runtime_manager(
 ) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
-        catalog,
+        mut catalog,
         sessions,
         client,
+        provider_runtime,
+        prestarted_extensions,
         prepared_session,
         modeless: _,
     } = boot;
     let mut system = system;
+    let mut prestarted_extensions = prestarted_extensions.into_inner();
+    if let Some((_, extensions)) = prestarted_extensions.as_mut() {
+        extensions.synchronize_provider_catalog(&mut catalog, &client);
+    }
     let model = catalog.resolve(&launch.model)?;
     let compact_model = config
         .compaction
@@ -4441,14 +4577,32 @@ pub(crate) fn build_app_with_runtime_manager(
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) = configured_extensions_with_runtime_manager(
-        &config,
-        &session,
-        &model,
-        &requested_reasoning,
-        &sessions,
-        runtime_manager,
-    )?;
+    let (extensions, mut executable_extensions) =
+        if let Some((mut extensions, mut executable_extensions)) = prestarted_extensions.take() {
+            apply_extension_tool_policy(&mut extensions, &config, &model);
+            executable_extensions.transition_active_session(
+                &session,
+                &model,
+                &requested_reasoning,
+                &sessions,
+            );
+            // Preflight must not activate interactive lifecycle work before the
+            // final App owns the session driver.
+            executable_extensions.deactivate_session_lifecycle_driver();
+            executable_extensions.synchronize_provider_catalog(&mut catalog, &client);
+            (extensions, executable_extensions)
+        } else {
+            configured_extensions_with_runtime_manager(
+                &config,
+                &session,
+                &model,
+                &requested_reasoning,
+                &sessions,
+                runtime_manager,
+                provider_runtime,
+            )?
+        };
+    executable_extensions.synchronize_provider_catalog(&mut catalog, &client);
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);
@@ -4562,8 +4716,9 @@ pub fn rebuild_app(
     new_reasoning_mode: Option<ReasoningMode>,
     selection: Option<SessionSelection>,
 ) -> anyhow::Result<App> {
+    app.synchronize_extension_provider_catalog();
     let mut config = app.config.clone();
-    let catalog = app.catalog.clone();
+    let mut catalog = app.catalog.clone();
     let sessions = app.sessions.clone();
     let client = app.client.clone();
     let model = app.model.clone();
@@ -4641,6 +4796,8 @@ pub fn rebuild_app(
     // survive the compatible rebuild.
     let mut released_extensions = std::mem::take(&mut app.executable_extensions);
     let runtime_manager = released_extensions.runtime_manager();
+    let provider_runtime = released_extensions.provider_runtime();
+    released_extensions.clear_provider_catalog(&mut catalog, &client);
     released_extensions.release_binding_blocking();
     let released_extensions = ReleasedExtensionBindingCleanup::new(released_extensions);
     drop(app);
@@ -4682,14 +4839,16 @@ pub fn rebuild_app(
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) = configured_extensions_with_runtime_manager(
+    let (extensions, mut executable_extensions) = configured_extensions_with_runtime_manager(
         &config,
         &session,
         &model,
         &requested_reasoning,
         &sessions,
         runtime_manager,
+        provider_runtime,
     )?;
+    executable_extensions.synchronize_provider_catalog(&mut catalog, &client);
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);

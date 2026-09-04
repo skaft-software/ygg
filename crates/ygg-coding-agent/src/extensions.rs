@@ -15,6 +15,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
@@ -47,10 +48,17 @@ use ygg_agent::extension_runtime::{
 };
 use ygg_agent::{
     Agent, CancellationToken, ExtensionHost, ExtensionPolicyDecision,
-    ExtensionPresentationSnapshot, PostMutationContext, PostMutationKind, PostMutationRescan,
-    PostMutationState, Session, ToolProgress, ToolProgressSink,
+    ExtensionPresentationSnapshot, ExtensionProviderAuthorizationPolicy,
+    ExtensionProviderAuthorizationStatus, ExtensionProviderOwner, ExtensionProviderRegistry,
+    PostMutationContext, PostMutationKind, PostMutationRescan, PostMutationState, Session,
+    ToolProgress, ToolProgressSink,
 };
-use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
+use ygg_ai::{
+    AiClient, AssistantMessage, AssistantPart, Auth, CacheCompatibility, Capabilities, Endpoint,
+    EndpointId, EndpointTransport, Message, Model, ModelCatalog, ModelId, ModelLimits, ModelSpec,
+    OpenAiChatReasoningMode, Protocol, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffort, RequestRuntime, ToolCallId,
+};
 
 use crate::config::{Config, Mode};
 use crate::resource_resolver::{
@@ -948,8 +956,311 @@ async fn execute_shortcut_headless(
     }
 }
 
+/// Product-owned authorization boundary for API 0.3 extension providers.
+///
+/// The coding agent does not currently expose a credential or OAuth setup
+/// surface for extension providers. Explicitly park those routes instead of
+/// allowing an extension declaration to imply credential authority. The
+/// registry handles unauthenticated providers without consulting this policy.
+#[derive(Default)]
+struct CodingAgentProviderAuthorizationPolicy;
+
+impl ExtensionProviderAuthorizationPolicy for CodingAgentProviderAuthorizationPolicy {
+    fn authorize(
+        &self,
+        _owner: &ExtensionProviderOwner,
+        _provider: &ygg_agent::extension_api_v03::ProviderDefinition,
+        request: &ygg_agent::extension_api_v03::ProviderAuthorizationRequest,
+    ) -> ygg_agent::extension_api_v03::ProviderAuthorizationResult {
+        ygg_agent::extension_api_v03::ProviderAuthorizationResult {
+            status: if request.action == "revoke" {
+                "revoked"
+            } else {
+                "unavailable"
+            }
+            .to_owned(),
+            lease: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProviderCatalogProjection {
+    revision: Option<usize>,
+    routes: BTreeMap<String, EndpointId>,
+}
+
+/// Shared owner for extension-provider declarations and their local catalog
+/// projection. The registry itself stores only secret-free declarations; this
+/// product layer synthesizes opaque local endpoints and host stream routes.
+#[derive(Clone)]
+pub(crate) struct ExtensionProviderRuntime {
+    registry: Arc<ExtensionProviderRegistry>,
+    projection: Arc<Mutex<ProviderCatalogProjection>>,
+}
+
+impl Default for ExtensionProviderRuntime {
+    fn default() -> Self {
+        Self {
+            registry: Arc::new(ExtensionProviderRegistry::with_authorization_policy(
+                Arc::new(CodingAgentProviderAuthorizationPolicy),
+            )),
+            projection: Arc::new(Mutex::new(ProviderCatalogProjection::default())),
+        }
+    }
+}
+
+impl ExtensionProviderRuntime {
+    fn registry(&self) -> Arc<ExtensionProviderRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Reconciles ready provider declarations into the local model catalog.
+    ///
+    /// Each synthesized endpoint is fenced by the owner instance and process
+    /// generation. A replacement or authorization revocation therefore removes
+    /// the old model and host stream transport before a newer route is made
+    /// selectable. Extension-declared URLs, headers, credentials, and leases
+    /// never enter this projection.
+    fn synchronize(
+        &self,
+        catalog: &mut ModelCatalog,
+        client: &AiClient,
+        processes: &[ExtensionProcess],
+    ) -> Vec<String> {
+        let (revision, entries) = self.registry.snapshot();
+        let desired = entries
+            .iter()
+            .filter(|entry| entry.authorization == ExtensionProviderAuthorizationStatus::Ready)
+            .flat_map(|entry| {
+                entry.models.iter().filter_map(|model| {
+                    extension_provider_protocol(&model.protocol)
+                        .map(|_| extension_provider_model_id(&entry.provider.id, &model.id).0)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut projection = self
+            .projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = projection.revision == Some(revision)
+            && projection.routes.keys().collect::<BTreeSet<_>>()
+                == desired.iter().collect::<BTreeSet<_>>()
+            && projection.routes.iter().all(|(model, endpoint)| {
+                catalog
+                    .resolve(&ModelId(model.clone()))
+                    .is_ok_and(|registered| registered.endpoint.id == *endpoint)
+            });
+        if current {
+            return Vec::new();
+        }
+
+        for (model, endpoint) in std::mem::take(&mut projection.routes) {
+            let model = ModelId(model);
+            catalog.remove_model_if_endpoint(&model, &endpoint);
+            client.remove_host_stream_transport(&endpoint);
+            catalog.remove_endpoint_if_unused(&endpoint);
+        }
+
+        let mut diagnostics = Vec::new();
+        for entry in entries {
+            if entry.authorization != ExtensionProviderAuthorizationStatus::Ready {
+                continue;
+            }
+            let Some(process) = processes.iter().find(|process| {
+                process.extension_instance_id() == entry.owner.extension_instance_id
+                    && process.health_snapshot().generation == entry.owner.generation
+                    && process.is_running()
+            }) else {
+                diagnostics.push(format!(
+                    "warning: extension provider {:?} has no live owning process",
+                    entry.provider.id
+                ));
+                continue;
+            };
+
+            for provider_model in entry.models {
+                let Some(protocol) = extension_provider_protocol(&provider_model.protocol) else {
+                    diagnostics.push(format!(
+                        "warning: extension provider {:?} model {:?} declares an unsupported protocol",
+                        entry.provider.id, provider_model.id
+                    ));
+                    continue;
+                };
+                let Some(route) = self
+                    .registry
+                    .resolve(&entry.provider.id, &provider_model.id)
+                else {
+                    continue;
+                };
+                if route.owner != entry.owner || route.model != provider_model {
+                    continue;
+                }
+
+                let model_id = extension_provider_model_id(&entry.provider.id, &provider_model.id);
+                if catalog.resolve(&model_id).is_ok() {
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} conflicts with an existing catalog model",
+                        model_id.0
+                    ));
+                    continue;
+                }
+                let endpoint_id = extension_provider_endpoint_id(
+                    &entry.owner,
+                    &entry.provider.id,
+                    &provider_model.id,
+                );
+                if catalog.has_endpoint(&endpoint_id) {
+                    diagnostics.push(
+                        "warning: extension provider endpoint identity conflicts with an existing catalog endpoint"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+                let (Ok(context_window), Ok(max_output_tokens)) = (
+                    u64::try_from(provider_model.context_window),
+                    u64::try_from(provider_model.max_output_tokens),
+                ) else {
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} has token limits outside the local catalog range",
+                        model_id.0
+                    ));
+                    continue;
+                };
+                let endpoint = Endpoint {
+                    id: endpoint_id.clone(),
+                    // This inert local URL is required by ModelCatalog's
+                    // endpoint invariant. AiClient dispatches the registered
+                    // host transport before any HTTP codec can inspect it.
+                    base_url: url::Url::parse("http://127.0.0.1:9/")
+                        .expect("fixed extension-provider endpoint URL is valid"),
+                    auth: Auth::None,
+                    default_headers: http::HeaderMap::new(),
+                    transport: EndpointTransport::Http,
+                    runtime: RequestRuntime::default(),
+                    timeout: Duration::from_secs(30),
+                };
+                if catalog.register_endpoint(endpoint).is_err() {
+                    diagnostics.push(
+                        "warning: extension provider endpoint could not be registered".to_owned(),
+                    );
+                    continue;
+                }
+                let _ =
+                    catalog.set_endpoint_label(endpoint_id.clone(), entry.provider.label.clone());
+                let specification = ModelSpec {
+                    id: model_id.clone(),
+                    endpoint: endpoint_id.clone(),
+                    api_name: provider_model.api_name.clone(),
+                    display_name: provider_model.display_name.clone(),
+                    protocol,
+                    capabilities: extension_provider_capabilities(&provider_model.capabilities),
+                    limits: ModelLimits {
+                        context_window,
+                        max_output_tokens,
+                    },
+                    pricing: None,
+                    cache: CacheCompatibility {
+                        supports_long_retention: false,
+                        send_session_id_header: false,
+                        send_session_affinity_headers: false,
+                        session_affinity_format: None,
+                        cache_control_format: None,
+                        supports_cache_control_on_tools: false,
+                    },
+                };
+                if catalog.register_model(specification).is_err() {
+                    catalog.remove_endpoint_if_unused(&endpoint_id);
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} could not be registered",
+                        model_id.0
+                    ));
+                    continue;
+                }
+                client.register_host_stream_transport(
+                    endpoint_id.clone(),
+                    process.provider_stream_transport(entry.provider.id.clone(), provider_model.id),
+                );
+                projection.routes.insert(model_id.0, endpoint_id);
+            }
+        }
+        projection.revision = Some(revision);
+        diagnostics
+    }
+
+    /// Removes only routes this runtime previously projected, including their
+    /// host-stream transport registrations.
+    fn clear(&self, catalog: &mut ModelCatalog, client: &AiClient) {
+        let mut projection = self
+            .projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (model, endpoint) in std::mem::take(&mut projection.routes) {
+            catalog.remove_model_if_endpoint(&ModelId(model), &endpoint);
+            client.remove_host_stream_transport(&endpoint);
+            catalog.remove_endpoint_if_unused(&endpoint);
+        }
+        projection.revision = None;
+    }
+}
+
+fn extension_provider_model_id(provider_id: &str, model_id: &str) -> ModelId {
+    ModelId(format!("{provider_id}/{model_id}"))
+}
+
+fn extension_provider_endpoint_id(
+    owner: &ExtensionProviderOwner,
+    provider_id: &str,
+    model_id: &str,
+) -> EndpointId {
+    let mut digest = Sha256::new();
+    digest.update(b"ygg-coding-agent-extension-provider-endpoint-v1\0");
+    digest.update(owner.extension_instance_id.as_bytes());
+    digest.update([0]);
+    digest.update(owner.generation.to_le_bytes());
+    digest.update(provider_id.as_bytes());
+    digest.update([0]);
+    digest.update(model_id.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    EndpointId(format!("extension-provider-{}", &digest[..32]))
+}
+
+fn extension_provider_protocol(protocol: &str) -> Option<Protocol> {
+    match protocol {
+        "openai_chat" => Some(Protocol::OpenAiChat),
+        "openai_responses" => Some(Protocol::OpenAiResponses),
+        "anthropic_messages" => Some(Protocol::AnthropicMessages),
+        _ => None,
+    }
+}
+
+fn extension_provider_capabilities(
+    capabilities: &ygg_agent::extension_api_v03::ProviderModelCapabilities,
+) -> Capabilities {
+    Capabilities {
+        input_modalities: Default::default(),
+        output_modalities: Default::default(),
+        tools: capabilities.tools,
+        parallel_tool_calls: capabilities.parallel_tool_calls,
+        reasoning: capabilities.reasoning.then_some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: false,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::Standard,
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::High,
+        }),
+        responses_lite: false,
+        agent_delegation: None,
+        structured_output: capabilities.structured_output,
+        deferred_tool_loading: false,
+    }
+}
+
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
+    provider_runtime: ExtensionProviderRuntime,
     runtime_manager: Option<ExtensionRuntimeManager>,
     runtime_binding: Option<ExtensionSessionBinding>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
@@ -1214,6 +1525,7 @@ impl Default for ExecutableExtensions {
         let (background_tx, background_rx) = mpsc::channel(BACKGROUND_UPDATE_CAPACITY);
         Self {
             processes: Vec::new(),
+            provider_runtime: ExtensionProviderRuntime::default(),
             runtime_manager: None,
             runtime_binding: None,
             receivers: Vec::new(),
@@ -1350,6 +1662,32 @@ impl ExecutableExtensions {
         sessions: &SessionStore,
         host: &mut ExtensionHost,
         runtime_manager: Option<ExtensionRuntimeManager>,
+    ) -> Self {
+        Self::discover_and_start_with_provider_runtime(
+            config,
+            session,
+            model,
+            reasoning,
+            sessions,
+            host,
+            runtime_manager,
+            ExtensionProviderRuntime::default(),
+        )
+    }
+
+    /// Discovers and starts extensions using one product-owned provider runtime.
+    ///
+    /// Bootstrap and rebuild pass the same value through this seam so API 0.3
+    /// declarations keep their process-owner fences while the App is replaced.
+    pub(crate) fn discover_and_start_with_provider_runtime(
+        config: &Config,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+        host: &mut ExtensionHost,
+        runtime_manager: Option<ExtensionRuntimeManager>,
+        provider_runtime: ExtensionProviderRuntime,
     ) -> Self {
         let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
         let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
@@ -1503,6 +1841,7 @@ impl ExecutableExtensions {
                 let workspace = config.workspace.clone();
                 let state = host_state.clone();
                 let session_lifecycle_service = session_lifecycle_service.clone();
+                let provider_registry = provider_runtime.registry();
                 let subagents_tool_available =
                     model.spec.capabilities.tools && config.tool_available("subagent_spawn");
                 let extension_flag_values = config.extension_flag_values.clone();
@@ -1533,6 +1872,7 @@ impl ExecutableExtensions {
                                 } else {
                                     None
                                 };
+                            runtime.provider_registry = Some(provider_registry.clone());
                             runtime
                         })
                         .await;
@@ -1685,6 +2025,7 @@ impl ExecutableExtensions {
 
         let mut extensions = Self::default();
         extensions.processes = processes;
+        extensions.provider_runtime = provider_runtime;
         extensions.runtime_manager = managed_runtime;
         extensions.runtime_binding = runtime_binding;
         extensions.receivers = receivers;
@@ -1707,6 +2048,32 @@ impl ExecutableExtensions {
     /// transferring process ownership to a session object.
     pub fn runtime_manager(&self) -> Option<ExtensionRuntimeManager> {
         self.runtime_manager.clone()
+    }
+
+    /// Returns the shared product provider runtime retained across App rebuilds.
+    pub(crate) fn provider_runtime(&self) -> ExtensionProviderRuntime {
+        self.provider_runtime.clone()
+    }
+
+    /// Projects the current registry snapshot into this App's local catalog.
+    ///
+    /// Callers own the catalog/client mutation boundary; executable extensions
+    /// retain only declarations and process handles.
+    pub(crate) fn synchronize_provider_catalog(
+        &mut self,
+        catalog: &mut ModelCatalog,
+        client: &AiClient,
+    ) -> Vec<String> {
+        let diagnostics = self
+            .provider_runtime
+            .synchronize(catalog, client, &self.processes);
+        self.diagnostics.extend(diagnostics.clone());
+        diagnostics
+    }
+
+    /// Withdraws this host's provider projection before its processes stop.
+    pub(crate) fn clear_provider_catalog(&mut self, catalog: &mut ModelCatalog, client: &AiClient) {
+        self.provider_runtime.clear(catalog, client);
     }
 
     /// Enables requests only after an interactive application has a safely

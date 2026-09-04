@@ -2634,6 +2634,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         app.agent.set_system_prompt(app.system.clone());
         if finish.shutdown_requested() {
             let _ = app.executable_extensions.drain_events();
+            app.synchronize_extension_provider_catalog();
             let extension_presentations = app.executable_extensions.presentation_views();
             output.send(json!({
                 "type": "extension_presentations",
@@ -2662,6 +2663,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
             }
         }
         let _ = app.executable_extensions.drain_events();
+        app.synchronize_extension_provider_catalog();
         let extension_presentations = app.executable_extensions.presentation_views();
         output.send(json!({
             "type": "extension_presentations",

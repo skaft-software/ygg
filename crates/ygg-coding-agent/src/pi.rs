@@ -6,7 +6,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ygg_agent::extension_process::{
@@ -14,7 +14,7 @@ use ygg_agent::extension_process::{
     ExtensionLifecycleProfile, ExtensionManifest, ExtensionRuntimeSettings,
     ExtensionRuntimeSharing, ExtensionUiSurface, ManifestContributions,
 };
-use ygg_agent::EXTENSION_API_VERSION_0_2;
+use ygg_agent::{EXTENSION_API_VERSION_0_2, EXTENSION_API_VERSION_0_3};
 
 const BRIDGE_VERSION: &str = "0.3.0";
 const SUPPORTED_PI_VERSION: &str = "0.84.4";
@@ -56,6 +56,34 @@ const SUPPORTED_LOCK_FILES: [&str; 5] = [
     "bun.lockb",
 ];
 
+/// The host extension contract selected for a generated Pi bridge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum PiBridgeApiVersion {
+    /// Preserve the established Pi tool/command compatibility bridge.
+    #[default]
+    #[value(name = "0.2")]
+    V02,
+    /// Enable only the secret-free, host-owned API 0.3 provider bridge.
+    #[value(name = "0.3")]
+    V03,
+}
+
+impl PiBridgeApiVersion {
+    fn extension_api_version(self) -> &'static str {
+        match self {
+            Self::V02 => EXTENSION_API_VERSION_0_2,
+            Self::V03 => EXTENSION_API_VERSION_0_3,
+        }
+    }
+
+    fn argument(self) -> &'static str {
+        match self {
+            Self::V02 => "0.2",
+            Self::V03 => "0.3",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FingerprintLimits {
     max_files: usize,
@@ -87,6 +115,9 @@ pub enum PiCommand {
         /// Exact @earendil-works/pi-coding-agent package root for bridge profile 0.84.4.
         #[arg(long, value_name = "DIR")]
         pi_package: Option<PathBuf>,
+        /// Generate against API 0.2 (default) or the host-owned API 0.3 provider contract.
+        #[arg(long, value_enum, default_value = "0.2")]
+        api_version: PiBridgeApiVersion,
         /// Ygg extension root used for the generated compatibility link.
         #[arg(long, value_name = "DIR")]
         extension_root: Option<PathBuf>,
@@ -402,6 +433,7 @@ pub fn run(command: PiCommand, invocation_cwd: &Path) -> anyhow::Result<()> {
             name,
             pi_home,
             pi_package,
+            api_version,
             extension_root,
         } => {
             let plan = compile_requested_plan(
@@ -412,7 +444,12 @@ pub fn run(command: PiCommand, invocation_cwd: &Path) -> anyhow::Result<()> {
                 pi_package.as_deref(),
                 invocation_cwd,
             )?;
-            publish_plan(&plan, extension_root.as_deref(), invocation_cwd)
+            publish_plan_for_api(
+                &plan,
+                extension_root.as_deref(),
+                invocation_cwd,
+                api_version,
+            )
         }
         PiCommand::Plan {
             source,
@@ -506,6 +543,27 @@ fn install_sources(
     requested_extension_root: Option<&Path>,
     invocation_cwd: &Path,
 ) -> anyhow::Result<()> {
+    install_sources_for_api(
+        requested_sources,
+        requested_name,
+        requested_pi_home,
+        requested_pi_package,
+        requested_extension_root,
+        invocation_cwd,
+        PiBridgeApiVersion::V02,
+    )
+}
+
+#[cfg(test)]
+fn install_sources_for_api(
+    requested_sources: &[PathBuf],
+    requested_name: Option<&str>,
+    requested_pi_home: Option<&Path>,
+    requested_pi_package: Option<&Path>,
+    requested_extension_root: Option<&Path>,
+    invocation_cwd: &Path,
+    api_version: PiBridgeApiVersion,
+) -> anyhow::Result<()> {
     let (source, additional_sources) = requested_sources
         .split_first()
         .ok_or_else(|| anyhow::anyhow!("at least one Pi extension source is required"))?;
@@ -517,7 +575,7 @@ fn install_sources(
         requested_pi_package,
         invocation_cwd,
     )?;
-    publish_plan(&plan, requested_extension_root, invocation_cwd)
+    publish_plan_for_api(&plan, requested_extension_root, invocation_cwd, api_version)
 }
 
 fn compile_requested_plan(
@@ -627,6 +685,20 @@ fn publish_plan(
     requested_extension_root: Option<&Path>,
     invocation_cwd: &Path,
 ) -> anyhow::Result<()> {
+    publish_plan_for_api(
+        plan,
+        requested_extension_root,
+        invocation_cwd,
+        PiBridgeApiVersion::V02,
+    )
+}
+
+fn publish_plan_for_api(
+    plan: &PiAggregatePlan,
+    requested_extension_root: Option<&Path>,
+    invocation_cwd: &Path,
+    api_version: PiBridgeApiVersion,
+) -> anyhow::Result<()> {
     // This is intentionally repeated immediately before writing a discoverable package.
     preflight_plan(plan)?;
     let extension_root = resolve_extension_root(requested_extension_root, invocation_cwd)?;
@@ -687,6 +759,7 @@ fn publish_plan(
         &manifest_path,
         &aggregate_digest,
         &link_identity,
+        api_version,
     )?;
     let manifest_text = toml::to_string_pretty(&manifest)?;
     let evidence_text =
@@ -864,6 +937,7 @@ fn manifest_for_plan(
     manifest_path: &Path,
     aggregate_digest: &str,
     link_identity: &str,
+    api_version: PiBridgeApiVersion,
 ) -> anyhow::Result<ExtensionManifest> {
     if plan.sources.is_empty() || plan.sources.len() > MAX_AGGREGATE_SOURCES {
         anyhow::bail!(
@@ -875,6 +949,10 @@ fn manifest_for_plan(
     let bridge_text = path_to_utf8(bridge_path, "Pi bridge path")?;
     let runtime_path = path_to_utf8(&plan.pi_runtime.path, "Pi runtime path")?;
     let manifest_text = path_to_utf8(manifest_path, "Pi link manifest path")?;
+    // Ygg stages the selected entrypoint bytes before execution. On Unix,
+    // staging a dynamically linked `node` binary can break loader-relative
+    // library paths, so stage the trusted bridge script and let its env shebang
+    // resolve Node from Ygg's sanitized PATH instead.
     let entrypoint_command = if cfg!(unix) {
         bridge_text.to_owned()
     } else {
@@ -915,6 +993,8 @@ fn manifest_for_plan(
         link_identity.to_owned(),
         "--ygg-version".to_owned(),
         plan.ygg_version.clone(),
+        "--api-version".to_owned(),
+        api_version.argument().to_owned(),
         "--command".to_owned(),
         plan.name.clone(),
     ]);
@@ -922,9 +1002,7 @@ fn manifest_for_plan(
     Ok(ExtensionManifest {
         name: plan.name.clone(),
         version: BRIDGE_VERSION.to_owned(),
-        // Pi's event/UI/runtime surfaces are API 0.2. The adjacent evidence
-        // sidecar is canonicalized through API 0.3 for the runtime-manager seam.
-        api_version: EXTENSION_API_VERSION_0_2.to_owned(),
+        api_version: api_version.extension_api_version().to_owned(),
         requires_ygg: Some(format!("={YGG_VERSION}")),
         description: Some(format!(
             "Pinned Pi compatibility aggregate for {} ordered source(s)",
@@ -937,28 +1015,49 @@ fn manifest_for_plan(
         },
         capabilities: ExtensionCapabilities {
             filesystem: ExtensionFilesystemAccess::Unrestricted,
-            process: true,
-            network: true,
+            process: api_version == PiBridgeApiVersion::V02,
+            // API 0.3 provider declarations receive no network authority;
+            // the host owns credentials, endpoints, and provider transport.
+            network: api_version == PiBridgeApiVersion::V02,
             secrets: Vec::new(),
             environment: Vec::new(),
         },
         contributes: ManifestContributions {
-            tools: Vec::new(),
-            commands: vec![plan.name.clone()],
+            tools: if api_version == PiBridgeApiVersion::V03 {
+                // API 0.3 has a fixed initial tool catalog. The bridge exposes
+                // this declared dispatcher and resolves Pi's runtime tool name
+                // inside its canonical arguments.
+                vec![plan.name.clone()]
+            } else {
+                Vec::new()
+            },
+            commands: if api_version == PiBridgeApiVersion::V02 {
+                vec![plan.name.clone()]
+            } else {
+                Vec::new()
+            },
             shortcuts: Vec::new(),
-            hooks: vec![
-                ExtensionHook::AfterResponse,
-                ExtensionHook::BeforeToolCall,
-                ExtensionHook::AfterToolCall,
-            ],
-            ui: vec![ExtensionUiSurface::Status],
+            hooks: if api_version == PiBridgeApiVersion::V02 {
+                vec![
+                    ExtensionHook::AfterResponse,
+                    ExtensionHook::BeforeToolCall,
+                    ExtensionHook::AfterToolCall,
+                ]
+            } else {
+                Vec::new()
+            },
+            ui: if api_version == PiBridgeApiVersion::V02 {
+                vec![ExtensionUiSurface::Status]
+            } else {
+                Vec::new()
+            },
             flags: Vec::new(),
-            context: true,
+            context: api_version == PiBridgeApiVersion::V02,
             tool_renderers: Vec::new(),
-            notifications: true,
-            confirmations: true,
+            notifications: api_version == PiBridgeApiVersion::V02,
+            confirmations: api_version == PiBridgeApiVersion::V02,
             presentation: false,
-            providers: false,
+            providers: api_version == PiBridgeApiVersion::V03,
         },
         // An aggregate is one exact ordered bridge invocation. Its generated
         // arguments carry every locked source fingerprint, so the runtime
@@ -2575,6 +2674,7 @@ mod tests {
             &trust.manifest_path,
             &record.aggregate_digest,
             &record.link_identity,
+            PiBridgeApiVersion::V02,
         )
         .unwrap();
         assert_eq!(manifest.version, BRIDGE_VERSION);
@@ -2627,6 +2727,44 @@ mod tests {
     }
 
     #[test]
+    fn api_03_manifest_selects_only_host_owned_provider_contracts() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("provider.mjs");
+        fs::write(&source, b"export default () => {};\n").unwrap();
+        let source = canonical(&source);
+        let plan = test_plan(&temp, std::slice::from_ref(&source), "pi-provider");
+        let trust = test_trust(&temp, "pi-provider");
+        let record = link_record_from_plan(&plan, trust.clone()).unwrap();
+        let manifest = manifest_for_plan(
+            &plan,
+            &canonical(temp.path()).join("link/bridge.mjs"),
+            &trust.manifest_path,
+            &record.aggregate_digest,
+            &record.link_identity,
+            PiBridgeApiVersion::V03,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.api_version, EXTENSION_API_VERSION_0_3);
+        assert!(!manifest.capabilities.process);
+        assert!(!manifest.capabilities.network);
+        assert!(manifest.contributes.providers);
+        assert_eq!(manifest.contributes.tools, vec!["pi-provider".to_owned()]);
+        assert!(manifest.contributes.commands.is_empty());
+        assert!(manifest.contributes.hooks.is_empty());
+        assert!(manifest.contributes.ui.is_empty());
+        assert!(!manifest.contributes.context);
+        assert!(!manifest.contributes.notifications);
+        assert!(!manifest.contributes.confirmations);
+        assert!(manifest
+            .entrypoint
+            .args
+            .windows(2)
+            .any(|args| args == ["--api-version", "0.3"]));
+        manifest.validate().unwrap();
+    }
+
+    #[test]
     fn aggregate_lock_and_manifest_preserve_source_order_and_detect_changes() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("first.ts");
@@ -2655,6 +2793,7 @@ mod tests {
             &trust.manifest_path,
             &record.aggregate_digest,
             &record.link_identity,
+            PiBridgeApiVersion::V02,
         )
         .unwrap();
         assert_eq!(

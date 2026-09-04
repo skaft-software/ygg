@@ -4,13 +4,28 @@ This is the human view of the canonical machine-readable [0.84.4 ledger](profile
 
 ## Claim and status vocabulary
 
-**Current claim:** `dogfood_conformance`. The executable fixture suite proves declared bridge behavior and explicit safe divergences. It does **not** claim byte-for-byte Pi TUI, provider, OAuth, or full real-runtime equivalence.
+**Current claim:** `dogfood_conformance`. The executable fixture suite proves declared bridge behavior and explicit safe divergences. It does **not** claim byte-for-byte Pi TUI, full provider/OAuth, or full real-runtime equivalence.
 
 - **passing** — the declared host-visible bridge behavior is exercised.
 - **safe divergence** — behavior is reduced or rejected visibly, with the named dogfood decision below; no call is silently accepted as equivalent.
 - **known dogfood bug** — reserved for a bounded, named defect with the same release decision requirement.
 
 All non-passing rows below use decision `pi-0.84.4-dogfood-explicit-safe-divergence`: current dogfood branch only; release approval is required before a broader equivalence claim.
+
+## API 0.3 provider bridge
+
+API `0.2` remains the default and does not gain provider behavior. The
+constrained provider bridge is selected only by `ygg pi install SOURCE
+--api-version 0.3`. Its manifest contributes `providers` and one fixed
+aggregate Pi-tool dispatcher, while omitting legacy commands, UI, context,
+notification, confirmation, process, and network contributions.
+
+The API `0.3` provider rows below remain **safe divergences**, not `passing`:
+they are exercised by checked-in deterministic fake-Pi protocol fixtures. The
+bridge sends secret-free catalog declarations and bounded semantic requests;
+Ygg retains credentials and authorization leases. Endpoint, header, API-key,
+transport, callback, and OAuth payload authority are rejected or withheld.
+The fixture coverage is not a real-runtime provider-parity claim.
 
 ## Executable inventory
 
@@ -37,9 +52,9 @@ All non-passing rows below use decision `pi-0.84.4-dogfood-explicit-safe-diverge
 | `session_before_tree` | safe divergence | `events:session_before_tree` | Event registration is diagnosed explicitly because session_before_tree is not emitted by the bounded bridge. |
 | `session_tree` | safe divergence | `events:session_tree` | Event registration is diagnosed explicitly because session_tree is not emitted by the bounded bridge. |
 | `context` | safe divergence | `events:context` | Bounded additions become Ygg context; canonical history replacement remains host-owned. |
-| `before_provider_request` | safe divergence | `events:before_provider_request` | Event registration is diagnosed explicitly because before_provider_request is not emitted by the bounded bridge. |
-| `before_provider_headers` | safe divergence | `events:before_provider_headers` | Event registration is diagnosed explicitly because before_provider_headers is not emitted by the bounded bridge. |
-| `after_provider_response` | safe divergence | `events:after_provider_response` | Event registration is diagnosed explicitly because after_provider_response is not emitted by the bounded bridge. |
+| `before_provider_request` | safe divergence | `events:before_provider_request` | API `0.3` only: bounded canonical semantic request transforms are applied; envelope-level endpoint, credential, header, transport, callback, and OAuth authority are rejected. |
+| `before_provider_headers` | safe divergence | `events:before_provider_headers` | API `0.3` explicitly rejects this hook because request and response headers remain host-owned authority. |
+| `after_provider_response` | safe divergence | `events:after_provider_response` | API `0.3` only: receives reduced status with an empty header object; raw response headers and body remain host-owned. |
 | `before_agent_start` | safe divergence | `events:before_agent_start` | Bounded system/message additions become host context suffixes. |
 | `agent_start` | safe divergence | `events:agent_start` | Emitted from turn/started with the bridge lifecycle payload. |
 | `agent_end` | safe divergence | `events:agent_end` | Emitted after response settlement with reduced messages. |
@@ -88,8 +103,8 @@ All non-passing rows below use decision `pi-0.84.4-dogfood-explicit-safe-diverge
 | `setModel` | safe divergence | `extension_api:setModel` | Model mutation remains host-owned and errors explicitly. |
 | `getThinkingLevel` | safe divergence | `extension_api:getThinkingLevel` | Derives a read-only level from the host reasoning snapshot. |
 | `setThinkingLevel` | safe divergence | `extension_api:setThinkingLevel` | Reasoning mutation remains host-owned and errors explicitly. |
-| `registerProvider` | safe divergence | `extension_api:registerProvider` | Provider and OAuth registration are rejected; no credential or network proxy is implicit. |
-| `unregisterProvider` | safe divergence | `extension_api:unregisterProvider` | Provider mutation is rejected explicitly. |
+| `registerProvider` | safe divergence | `extension_api:registerProvider` | API `0.3` only: secret-free declarations, supported model protocols, catalog publication/update, host authorization status/refresh, canonical streaming, cancellation, and replacement cleanup are bridged. Credentials, endpoints, headers, transports, callbacks, OAuth payloads, and unsupported mutations are rejected or retained by Ygg. |
+| `unregisterProvider` | safe divergence | `extension_api:unregisterProvider` | API `0.3` only: removes local routability, cancels active streams, requests host authorization revocation, and queues host catalog cleanup. Failed host acknowledgement remains inspectable and fail-closed. |
 | `events.emit` | safe divergence | `extension_api:events.emit` | Event bus is shared only by sources in the same bridge process. |
 | `events.on` | safe divergence | `extension_api:events.on` | Event bus is shared only by sources in the same bridge process. |
 
@@ -300,10 +315,12 @@ integrity-verified unchanged-source full gate.
 The current bridge does not consume `host.pi_compat`, emit `pi/*` child methods,
 or accept `shortcut/trigger`. Shortcut routing, CLI/flag projection, session
 control, root-session messaging, widget/editor transport, and the remaining Pi
-bridge surfaces are deliberately deferred. Provider/OAuth registration,
-arbitrary component rendering, terminal ownership, model mutation, session-tree
-mutation, and shutdown remain explicit safe divergences. The bridge does not
-proxy credentials or grant new shell/network authority.
+bridge surfaces are deliberately deferred. Outside the explicit API `0.3`
+provider mode, provider/OAuth registration remains an explicit safe divergence;
+even in that mode callbacks, credential payloads, endpoint/header/transport
+authority, arbitrary component rendering, terminal ownership, model mutation,
+session-tree mutation, and shutdown remain explicit safe divergences. The bridge
+does not proxy credentials or grant new shell/network authority.
 
 ## Integrity-verified unchanged-source full gate
 
@@ -333,10 +350,12 @@ fails closed rather than becoming a best-effort load.
 
 Published packages include `pi-runtime-evidence.json`, canonicalized with Ygg's
 API 0.3 metadata helper. It records static aggregate selection, integrity, and
-trust-binding evidence for a future runtime manager. It is not a Pi API 0.3
-process protocol, does not provide lazy activation/workspace/reload semantics,
-and does not change any status in the matrices above; live bridge protocol
-coverage remains API 0.2.
+trust-binding evidence for a future runtime manager. The sidecar itself is not
+a Pi API 0.3 process protocol and does not provide lazy
+activation/workspace/reload semantics. API `0.2` links retain API `0.2` live
+bridge coverage. An aggregate explicitly installed with `--api-version 0.3`
+instead launches the constrained provider contract described above; it does not
+enable lifecycle, migration, session, or dynamic-command support.
 
 `ygg pi rollback NAME` is intentionally non-destructive: it only moves a
 validated generated package out of discovery into a rollback directory. It does
@@ -349,7 +368,11 @@ A broader Pi-equivalence release needs a separately approved decision for every
 safe divergence, real-runtime evidence from the full gate, generated API and
 API 0.1/0.2 regression checks, restart/trust/source-change/sanitized-environment
 coverage, and a deliberate decision on the 33 TUI audit rows and provider/OAuth
-boundary. The deferred shortcut, CLI/flag, session-control, and Pi bridge
-remainder lanes require their own bounded contracts and tests before their
-statuses can change. Until then this profile remains honestly named dogfood
-conformance.
+boundary. The constrained API `0.3` provider bridge additionally needs exact
+pinned-runtime and real-host evidence for declaration/catalog acknowledgement,
+authorization status/refresh, semantic request hooks, canonical streaming,
+cancellation, replacement/unregister cleanup, and rejection of credential,
+endpoint, header, transport, callback, and OAuth payload authority. The deferred
+shortcut, CLI/flag, session-control, and Pi bridge remainder lanes require their
+own bounded contracts and tests before their statuses can change. Until then this
+profile remains honestly named dogfood conformance.

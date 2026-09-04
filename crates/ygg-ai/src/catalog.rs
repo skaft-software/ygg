@@ -260,6 +260,34 @@ impl ModelCatalog {
         self.endpoints.contains_key(id)
     }
 
+    /// Removes a model only when it still belongs to the supplied endpoint.
+    ///
+    /// Dynamic host-owned catalogs use this fence to avoid deleting a model
+    /// which another catalog source registered under the same identifier.
+    pub fn remove_model_if_endpoint(&mut self, id: &ModelId, endpoint: &EndpointId) -> bool {
+        let belongs_to_endpoint = self
+            .models
+            .get(id)
+            .is_some_and(|model| &model.endpoint == endpoint);
+        if belongs_to_endpoint {
+            self.models.remove(id);
+        }
+        belongs_to_endpoint
+    }
+
+    /// Removes an endpoint only when no remaining model uses it.
+    ///
+    /// Returns `true` when an endpoint was removed. Endpoint labels are
+    /// removed with the endpoint so a future registration cannot inherit a
+    /// stale presentation label.
+    pub fn remove_endpoint_if_unused(&mut self, id: &EndpointId) -> bool {
+        if self.models.values().any(|model| &model.endpoint == id) {
+            return false;
+        }
+        self.endpoint_labels.remove(id);
+        self.endpoints.remove(id).is_some()
+    }
+
     /// Removes models whose endpoint has no usable credentials.
     ///
     /// Endpoints are retained because they may be shared with models registered

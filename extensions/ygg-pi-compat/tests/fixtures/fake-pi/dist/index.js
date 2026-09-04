@@ -8,10 +8,82 @@ import { pathToFileURL } from "node:url";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const fixtureMode = process.env.YGG_PI_FIXTURE_MODE ?? "";
+const fixtureApiVersion = process.env.YGG_PI_FIXTURE_API_VERSION ?? "0.2";
 const fixtureEvents = (process.env.YGG_PI_FIXTURE_EVENTS ?? "")
   .split(",")
   .map((event) => event.trim())
   .filter(Boolean);
+let fixtureCancellationObserved = false;
+
+function fixtureModeForPath(path) {
+  const value = String(path ?? "");
+  if (value.endsWith("unsafe-provider-extension.mjs")) return "unsafe-provider";
+  if (value.endsWith("provider-headers-hook-extension.mjs")) return "provider-headers-hook";
+  if (value.endsWith("provider-extension.mjs")) return "provider";
+  return fixtureMode || "default";
+}
+
+async function* fixtureProviderStream({ request, signal }) {
+  if (request.direct === true) {
+    yield { kind: "started", payload: { response_id: "fixture-direct-response" } };
+    yield { kind: "text_start", payload: { index: 0 } };
+    yield { kind: "text_delta", payload: { index: 0, delta: "direct" } };
+    yield { kind: "text_end", payload: { index: 0 } };
+    // The Pi spelling is normalized even for an API 0.3-shaped adapter event.
+    yield { kind: "finished", payload: { stop_reason: "stop" } };
+    return;
+  }
+  yield { type: "start", partial: { responseId: "fixture-response" } };
+  yield { type: "text_start", contentIndex: 0 };
+  yield {
+    type: "text_delta",
+    contentIndex: 0,
+    delta: `${request.fixture_hook === true ? "hooked" : "unhooked"}:${request.prompt ?? ""}`,
+  };
+  if (request.hold === true) {
+    await new Promise((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", resolve, { once: true });
+    });
+    fixtureCancellationObserved = signal.aborted;
+    return;
+  }
+  yield { type: "text_end", contentIndex: 0 };
+  yield {
+    type: "toolcall_start",
+    contentIndex: 1,
+    toolCall: { type: "toolCall", id: "fixture-call", name: "fixture_echo", arguments: { value: "tool" } },
+  };
+  yield { type: "toolcall_delta", contentIndex: 1, delta: "{\"value\":\"tool\"}" };
+  yield {
+    type: "toolcall_end",
+    contentIndex: 1,
+    toolCall: { type: "toolCall", id: "fixture-call", name: "fixture_echo", arguments: { value: "tool" } },
+  };
+  yield {
+    type: "done",
+    reason: "stop",
+    message: { usage: { input: 2, output: 3, cacheRead: 1, cacheWrite: 0, totalTokens: 5 } },
+  };
+}
+
+function fixtureProviderConfig(revision = 1) {
+  return {
+    name: revision === 1 ? "Fixture provider" : "Fixture provider refreshed",
+    api: "openai-completions",
+    yggAuth: { kind: "host_credential", subject: "fixture-credential" },
+    models: [
+      {
+        id: "fixture-model",
+        name: revision === 1 ? "Fixture model" : "Fixture model refreshed",
+        contextWindow: 8192,
+        maxTokens: revision === 1 ? 1024 : 2048,
+        reasoning: false,
+      },
+    ],
+    yggStream: fixtureProviderStream,
+  };
+}
 
 function makeTool(name, execute) {
   return {
@@ -44,11 +116,14 @@ export function createEventBus() {
   };
 }
 
-function fixtureExtension(path) {
+function fixtureExtension(path, mode) {
   const registration = fixtureMode === "registration";
+  const handlers = new Map(fixtureEvents.map((event) => [event, []]));
+  if (mode === "provider-headers-hook") handlers.set("before_provider_headers", [() => {}]);
   return {
     path,
-    handlers: new Map(fixtureEvents.map((event) => [event, []])),
+    fixtureMode: mode,
+    handlers,
     shortcuts: registration ? new Map([["ctrl+alt+p", {}]]) : new Map(),
     flags: registration ? new Map([["plan", { default: false }]]) : new Map(),
     messageRenderers: registration ? new Map([["fixture", {}]]) : new Map(),
@@ -77,7 +152,7 @@ export async function discoverAndLoadExtensions(paths, _cwd, _agentDir, eventBus
       if (typeof module.installFakePiAggregate === "function") {
         await module.installFakePiAggregate({ eventBus, runtime });
       }
-      extensions.push(fixtureExtension(path));
+      extensions.push(fixtureExtension(path, fixtureModeForPath(path)));
     } catch (error) {
       errors.push({ path, error });
     }
@@ -97,6 +172,9 @@ export class ExtensionRunner {
     this.commandContext = null;
     this.errorHandler = null;
     this.providerBindings = null;
+    this.providerActions = null;
+    this.providerAfterStatus = null;
+    this.fixtureMode = extensions[0]?.fixtureMode ?? (fixtureMode || "default");
     this.flagValues = new Map();
     this.localEvents = new Map();
     this.tools = [
@@ -120,6 +198,16 @@ export class ExtensionRunner {
         return { content: [{ type: "text", text: "complete" }] };
       }),
     ];
+    if (fixtureApiVersion === "0.3") {
+      this.tools.push(makeTool("fixture_hold", async (_id, _input, signal) => {
+        await new Promise((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", resolve, { once: true });
+        });
+        if (signal.aborted) throw new Error("fixture hold cancelled");
+        return { content: [{ type: "text", text: "fixture hold released" }] };
+      }));
+    }
     if (this.runtime?.aggregate?.loadOrder.length) {
       this.tools.push(
         makeTool("aggregate_state", async () => ({
@@ -131,12 +219,53 @@ export class ExtensionRunner {
         }),
       );
     }
+    if (this.fixtureMode === "provider") {
+      this.tools.push(
+        makeTool("fixture_provider_update", async () => {
+          this.providerActions.registerProvider("fixture-provider", fixtureProviderConfig(2));
+          return { content: [{ type: "text", text: "provider updated" }] };
+        }),
+        makeTool("fixture_provider_unregister", async () => {
+          this.providerActions.unregisterProvider("fixture-provider");
+          return { content: [{ type: "text", text: "provider unregistered" }] };
+        }),
+        makeTool("fixture_provider_unsafe", async () => {
+          this.providerActions.registerProvider("unsafe-provider", {
+            ...fixtureProviderConfig(1),
+            baseUrl: "https://must-not-cross-the-host-boundary.invalid",
+          });
+          return { content: [{ type: "text", text: "unexpected" }] };
+        }),
+        makeTool("fixture_provider_hook_status", async () => ({
+          content: [{ type: "text", text: String(this.providerAfterStatus) }],
+        })),
+        makeTool("fixture_provider_cancel_status", async () => ({
+          content: [{ type: "text", text: String(fixtureCancellationObserved) }],
+        })),
+        makeTool("fixture_provider_many_parts", async () => ({
+          content: Array.from({ length: 257 }, (_unused, index) => ({
+            type: "text",
+            text: `part ${index}`,
+          })),
+        })),
+      );
+    }
   }
 
-  bindCore(actions, contextActions, providerBindings) {
+  bindCore(actions, contextActions, providerActions) {
     this.actions = actions;
     this.contextActions = contextActions;
-    this.providerBindings = providerBindings;
+    // Retain the historical name for API 0.2 public-surface probes.
+    this.providerBindings = providerActions;
+    this.providerActions = providerActions;
+    if (this.fixtureMode === "provider") {
+      providerActions.registerProvider("fixture-provider", fixtureProviderConfig(1));
+    } else if (this.fixtureMode === "unsafe-provider") {
+      providerActions.registerProvider("unsafe-provider", {
+        ...fixtureProviderConfig(1),
+        apiKey: "must-not-cross-the-host-boundary",
+      });
+    }
   }
 
   bindCommandContext(context) {
@@ -149,6 +278,23 @@ export class ExtensionRunner {
 
   onError(handler) {
     this.errorHandler = handler;
+  }
+
+  async emitBeforeProviderRequest(request) {
+    if (this.fixtureMode !== "provider") return request;
+    if (request.fixture_unsafe_mutation === true) {
+      request.authorizationHeader = "must-not-reach-pi-adapter";
+      return undefined;
+    }
+    return { ...request, fixture_hook: true };
+  }
+
+  async emitAfterProviderResponse(status, headers) {
+    if (this.fixtureMode !== "provider") return;
+    if (headers === undefined || Object.keys(headers).length !== 0) {
+      throw new Error("provider response headers crossed the fixture boundary");
+    }
+    this.providerAfterStatus = status;
   }
 
   getAllRegisteredTools() {
@@ -406,8 +552,13 @@ export class ExtensionRunner {
   }
 
   async emitToolResult(event) {
-    this.ui.notify("event:tool_result:start");
-    this.ui.notify(`terminal:tool_result:${event.toolCallId}`);
+    // API 0.3 deliberately does not select notification surfaces. Preserve
+    // API 0.2 lifecycle assertions without turning provider tool calls into
+    // unsupported UI calls.
+    if (this.fixtureMode === "default") {
+      this.ui.notify("event:tool_result:start");
+      this.ui.notify(`terminal:tool_result:${event.toolCallId}`);
+    }
     const result = event.input?.value === "transform"
       ? {
           ...event,
@@ -417,7 +568,7 @@ export class ExtensionRunner {
           usage: { input: 1, output: 2 },
         }
       : undefined;
-    this.ui.notify("event:tool_result:end");
+    if (this.fixtureMode === "default") this.ui.notify("event:tool_result:end");
     return result;
   }
 

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Callable
@@ -18,7 +19,43 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 BRIDGE = ROOT / "bridge.mjs"
 FAKE_PI = FIXTURES / "fake-pi"
 FIXTURE_EXTENSION = FIXTURES / "fixture-extension.mjs"
+PROVIDER_EXTENSION = FIXTURES / "provider-extension.mjs"
+UNSAFE_PROVIDER_EXTENSION = FIXTURES / "unsafe-provider-extension.mjs"
+PROVIDER_HEADERS_HOOK_EXTENSION = FIXTURES / "provider-headers-hook-extension.mjs"
 NODE = shutil.which("node")
+
+
+def v03_contract(*, providers: bool = True, max_frame_bytes: int = 1_048_576) -> dict[str, Any]:
+    """Load the generated API 0.3 host offer used by the real runtime.
+
+    Provider-less fixtures retain every unrelated optional host service so the
+    bridge regression covers selecting only its supported core subset.
+    """
+    sdk_python = ROOT.parents[1] / "sdk" / "python"
+    if str(sdk_python) not in sys.path:
+        sys.path.insert(0, str(sdk_python))
+    from ygg_extension import api_v03
+
+    contract = api_v03.host_offer(max_frame_bytes, 4).to_wire()
+    if not providers:
+        provider_capabilities = {"provider_auth", "provider_catalog", "provider_stream"}
+        provider_methods = {
+            "provider/auth/request",
+            "provider/auth/revoke",
+            "provider/cancel",
+            "provider/event",
+            "provider/stream",
+            "providers/register",
+            "providers/unregister",
+            "providers/update",
+        }
+        contract["optional_capabilities"] = [
+            value for value in contract["optional_capabilities"] if value not in provider_capabilities
+        ]
+        contract["optional_methods"] = [
+            value for value in contract["optional_methods"] if value not in provider_methods
+        ]
+    return contract
 
 
 LOCK_FILES = ("package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lockb")
@@ -143,12 +180,17 @@ class BridgeProcess:
         agent_dir: Path | None = None,
         manifest_path: Path | None = None,
         ygg_version: str = "0.6.7",
+        api_version: str = "0.2",
     ) -> None:
         if NODE is None:
             raise RuntimeError("node is unavailable")
+        if api_version not in {"0.2", "0.3"}:
+            raise ValueError(f"unsupported test API version {api_version}")
+        self.api_version = api_version
         environment = os.environ.copy()
         environment.pop("YGG_PI_FIXTURE_MODE", None)
         environment.pop("YGG_PI_FIXTURE_EVENTS", None)
+        environment["YGG_PI_FIXTURE_API_VERSION"] = api_version
         if fixture_mode is not None:
             environment["YGG_PI_FIXTURE_MODE"] = fixture_mode
         if fixture_events is not None:
@@ -156,7 +198,7 @@ class BridgeProcess:
         selected_extensions = [Path(item).resolve() for item in (extensions or [extension])]
         selected_agent_dir = Path(agent_dir or (ROOT / ".test-pi-agent")).absolute()
         selected_manifest = Path(manifest_path or (FIXTURES / "extension.toml")).absolute()
-        command = [NODE, str(BRIDGE)]
+        command = [NODE, str(BRIDGE), "--api-version", api_version]
         for selected in selected_extensions:
             command.extend(["--extension", str(selected)])
         if strict_identity:
@@ -259,10 +301,21 @@ class BridgeProcess:
 
     def send(self, message: dict[str, Any]) -> None:
         assert self.process.stdin is not None
-        line = json.dumps(message, separators=(",", ":")) + "\n"
+        line = (
+            json.dumps(message, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            if self.api_version == "0.3"
+            else json.dumps(message, separators=(",", ":"))
+        ) + "\n"
         with self._write_lock:
             self.process.stdin.write(line)
             self.process.stdin.flush()
+
+    def send_raw(self, frame: bytes) -> None:
+        """Write an exact protocol frame for byte-level API 0.3 framing tests."""
+        assert self.process.stdin is not None
+        with self._write_lock:
+            self.process.stdin.buffer.write(frame)
+            self.process.stdin.buffer.flush()
 
     def send_request(self, method: str, params: dict[str, Any] | None = None) -> int:
         request_id = self._next_id
@@ -318,18 +371,50 @@ class BridgeProcess:
                     )
                 self._condition.wait(min(remaining, 0.05))
 
-    def initialize(
+    def initialization_params(
         self,
         *optional_features: str,
         host: dict[str, Any] | None = None,
+        contract: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        response = self.request(
-            "initialize",
-            {
-                "workspace": str(ROOT),
-                "host": host or {},
-                "protocol": {"optional_features": list(optional_features)},
-                **(
+        params: dict[str, Any] = {"workspace": str(ROOT), "host": host or {}}
+        if self.api_version == "0.3":
+            params.update(
+                {
+                    "api_version": "0.3",
+                    "ygg_version": self.ygg_version,
+                    "extension": {
+                        "name": self.command_name,
+                        "version": "fixture",
+                        "manifest_path": str(self.manifest_path),
+                        "source": "explicit",
+                    },
+                    "capabilities": {
+                        "filesystem": "none",
+                        "process": False,
+                        "network": False,
+                        "secrets": [],
+                        "environment": [],
+                    },
+                    "contributes": {
+                        "tools": [self.command_name],
+                        "commands": [],
+                        "hooks": [],
+                        "ui": [],
+                        "context": False,
+                        "tool_renderers": [],
+                        "notifications": False,
+                        "confirmations": False,
+                        "providers": True,
+                    },
+                    "flag_values": [],
+                    "contract": contract or v03_contract(),
+                }
+            )
+        else:
+            params["protocol"] = {"optional_features": list(optional_features)}
+            if self.strict_identity:
+                params.update(
                     {
                         "ygg_version": self.ygg_version,
                         "extension": {
@@ -339,10 +424,18 @@ class BridgeProcess:
                             "source": "explicit",
                         },
                     }
-                    if self.strict_identity
-                    else {}
-                ),
-            },
+                )
+        return params
+
+    def initialize(
+        self,
+        *optional_features: str,
+        host: dict[str, Any] | None = None,
+        contract: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        response = self.request(
+            "initialize",
+            self.initialization_params(*optional_features, host=host, contract=contract),
         )
         if "error" in response:
             raise AssertionError(f"initialize failed: {response}")

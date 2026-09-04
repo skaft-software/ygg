@@ -498,10 +498,19 @@ impl App {
     pub fn current_tool_schema_tokens(&self) -> u64 {
         crate::app::bootstrap::tool_schema_reserve(&self.agent.registered_tool_definitions())
     }
+
+    /// Synchronizes secret-free API 0.3 provider declarations at a product
+    /// catalog boundary after extension activity has been observed.
+    pub fn synchronize_extension_provider_catalog(&mut self) -> Vec<String> {
+        self.executable_extensions
+            .synchronize_provider_catalog(&mut self.catalog, &self.client)
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.executable_extensions
+            .clear_provider_catalog(&mut self.catalog, &self.client);
         // The catalog is disposable: shutdown must never fail because this
         // best-effort projection could not be refreshed.
         let _ = self

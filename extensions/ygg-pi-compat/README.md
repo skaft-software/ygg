@@ -28,10 +28,10 @@ link identity. The bridge verifies the identity before the Pi loader runs and
 rechecks runtime integrity afterward. `ygg pi list` marks legacy, changed, or
 otherwise stale links; it never claims that a link is trusted.
 
-The live Pi process protocol remains API `0.2`. Every published aggregate also
-has a canonical API `0.3` `pi-runtime-evidence.json` sidecar containing static
-selection and integrity evidence for a future runtime manager. It deliberately
-does not claim API `0.3` lifecycle or dynamic-command support.
+The live Pi process protocol defaults to API `0.2`. Every published aggregate
+also has a canonical API `0.3` `pi-runtime-evidence.json` sidecar containing
+static selection and integrity evidence for a future runtime manager. That
+sidecar alone does not enable API `0.3` lifecycle or dynamic-command support.
 
 Generated links remain inert until separately enabled and trusted. Dependency,
 build, and cache directories are excluded from source fingerprints; supported
@@ -51,10 +51,29 @@ bound independently.
   behavior; and
 - host session-name and reasoning snapshots where Ygg already supplies them.
 
-Unsupported APIs fail explicitly. The bridge does not silently emulate provider
-registration, session/tree mutation, compaction control, root-agent messaging,
-active-tool policy mutation, arbitrary Pi components/editors/widgets, terminal
-input, or provider payload hooks.
+## API 0.3 provider mode
+
+Provider support is an explicit opt-in: run `ygg pi install SOURCE --api-version
+0.3`. API `0.2` remains the default, and existing API `0.2` links are never
+upgraded in place. An API `0.3` link declares only host-owned `providers` and
+one fixed aggregate Pi-tool dispatcher; it omits the legacy command, UI,
+context, notification, confirmation, process, and network contributions.
+
+In this mode, bounded secret-free `registerProvider` and `unregisterProvider`
+declarations are synchronized to Ygg's API `0.3` catalog. Ygg performs host
+authorization and retains credentials and authorization leases. The bridge
+passes only canonical semantic request JSON, secret-free catalog metadata, and
+a generic cancellation signal to the extension's `yggStream` adapter. It
+rejects endpoint/base-URL, headers, API keys, transport, callback, and OAuth
+payload authority rather than forwarding it. Safe semantic
+`before_provider_request` transforms and reduced `after_provider_response`
+status hooks are supported; `before_provider_headers` is explicitly rejected
+because headers remain host-owned.
+
+Outside that opt-in mode, provider registration and provider payload hooks fail
+explicitly. The bridge does not silently emulate session/tree mutation,
+compaction control, root-agent messaging, active-tool policy mutation,
+arbitrary Pi components/editors/widgets, or terminal input.
 
 The scanner is pinned to Pi 0.84.4's public event, registration, action, and UI
 names. Unknown APIs fail closed instead of being labeled bridge-compatible.
@@ -92,7 +111,10 @@ as real-runtime proof. The real-Pi suite covers the official hello example and
 an unchanged `plan-mode` load plus `/todos` smoke. It does not claim plan-mode
 behavioral parity: flags, shortcuts, active-tool overlays, session entries,
 root messages, editor/widget transport, and durable custom entries remain
-explicitly rejected release blockers.
+explicitly rejected release blockers. API `0.3` provider cases use the
+checked-in deterministic fake Pi loader for catalog, authorization, hooks,
+streaming, cancellation, mutation, and cleanup assertions; they are fixture
+evidence, not a real-runtime provider-parity claim.
 
 The bridge uses the selected Pi package's own loader and does not install npm
 dependencies. `ygg pi plan --pi-package DIR` validates and records an exact
