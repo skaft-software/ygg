@@ -13,7 +13,7 @@ use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use ygg_agent::extension_api_v03::MAX_JSON_RPC_ID_BYTES;
 #[cfg(unix)]
-use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch, ProcessGroupGuard};
+use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch};
 use ygg_agent::extension_process::{
     ExtensionInputRequest, ExtensionSessionLifecycleError, ExtensionSessionLifecycleOperation,
     ExtensionSessionLifecycleRequest, MAX_EXTENSION_TERMINAL_INPUT_BYTES,
