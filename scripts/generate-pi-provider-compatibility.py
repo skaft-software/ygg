@@ -8,7 +8,7 @@ import json
 import pathlib
 import sys
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -50,56 +50,96 @@ def markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\n", " ")
 
 
-def validate_fixture(value: Any, context: str) -> dict[str, str]:
-    fixture = require_object(value, context)
-    require_keys(
-        fixture,
-        {
-            "registration",
-            "model_id",
-            "protocol",
-            "endpoint_id",
-            "auth_presentation",
-            "base_url",
-            "environment_variable",
-        },
-        context,
-    )
-    result = {
-        key: require_string(
-            raw,
-            f"{context}.{key}",
-            allow_empty=key == "environment_variable" and fixture["registration"] == "subscription",
-        )
-        for key, raw in fixture.items()
-    }
-    if result["registration"] not in {"discovered", "static", "subscription"}:
-        fail(f"{context}.registration is unknown")
-    if result["protocol"] not in {
-        "anthropic_messages",
-        "openai_chat",
-        "openai_responses",
-    }:
-        fail(f"{context}.protocol is unknown")
-    if result["auth_presentation"] not in {"api_key_header", "bearer", "dynamic"}:
-        fail(f"{context}.auth_presentation is unknown")
-    parsed = urlsplit(result["base_url"])
+def validate_fixture_base_url(value: str, context: str) -> None:
+    parsed = urlsplit(value)
     if (
         parsed.scheme != "https"
         or not parsed.netloc
         or parsed.hostname is None
         or parsed.username is not None
         or parsed.password is not None
-        or parsed.query
         or parsed.fragment
         or not parsed.path.endswith("/")
     ):
-        fail(f"{context}.base_url must be a credential-free HTTPS base URL ending in /")
+        fail(f"{context} must be a credential-free HTTPS base URL ending in /")
+    if parsed.query:
+        query = parse_qsl(parsed.query, keep_blank_values=True)
+        if (
+            len(query) != 1
+            or query[0][0] != "api-version"
+            or not query[0][1]
+            or len(query[0][1]) > 96
+            or not all(
+                character.isascii()
+                and (character.isalnum() or character in "-.")
+                for character in query[0][1]
+            )
+        ):
+            fail(f"{context} may carry only one bounded api-version query")
+
+
+def validate_fixture(value: Any, context: str) -> dict[str, str]:
+    fixture = require_object(value, context)
+    required = {
+        "registration",
+        "model_id",
+        "protocol",
+        "endpoint_id",
+        "auth_presentation",
+        "base_url",
+        "environment_variable",
+    }
+    optional = {"auth_header", "configured_base_url"}
+    require_keys_with_optional(fixture, required, optional, context)
+
+    result = {
+        key: require_string(
+            raw,
+            f"{context}.{key}",
+            allow_empty=key == "environment_variable",
+        )
+        for key, raw in fixture.items()
+    }
+    if result["registration"] not in {"configured", "discovered", "static", "subscription"}:
+        fail(f"{context}.registration is unknown")
+    if result["protocol"] not in {
+        "anthropic_messages",
+        "bedrock_converse",
+        "google_generative_ai",
+        "openai_chat",
+        "openai_responses",
+    }:
+        fail(f"{context}.protocol is unknown")
+    if result["auth_presentation"] not in {
+        "api_key_header",
+        "aws_sigv4",
+        "bearer",
+        "cloudflare_ai_gateway",
+        "dynamic",
+        "google_api_key_header",
+        "header",
+    }:
+        fail(f"{context}.auth_presentation is unknown")
+    if result["auth_presentation"] == "header":
+        if "auth_header" not in result:
+            fail(f"{context}.auth_header is required for header auth")
+    elif "auth_header" in result:
+        fail(f"{context}.auth_header is only valid for header auth")
+
+    validate_fixture_base_url(result["base_url"], f"{context}.base_url")
+    if "configured_base_url" in result:
+        validate_fixture_base_url(
+            result["configured_base_url"], f"{context}.configured_base_url"
+        )
+
     if result["registration"] == "subscription":
         if result["auth_presentation"] != "dynamic" or result["environment_variable"]:
             fail(f"{context} subscription auth must be dynamic and credential-free")
-    elif result["auth_presentation"] == "dynamic" or not result["environment_variable"]:
-        fail(f"{context} environment auth needs a credential presentation and environment variable")
+    elif result["auth_presentation"] == "dynamic":
+        if result["environment_variable"]:
+            fail(f"{context} dynamic auth must be credential-lifecycle-owned")
+    elif not result["environment_variable"]:
+        fail(f"{context} non-dynamic auth needs an environment variable")
     return result
 
 
@@ -246,7 +286,8 @@ def render(inventory: dict[str, Any]) -> str:
             wire = decision["fixture"]
             compatibility = (
                 f"`{wire['protocol']}` via `{wire['endpoint_id']}` at "
-                f"`{wire['base_url']}` ({wire['auth_presentation']})"
+                f"`{wire.get('configured_base_url', wire['base_url'])}` "
+                f"({wire['auth_presentation']})"
             )
             if kind == "declared_subset":
                 excluded = ", ".join(f"`{value}`" for value in decision["excluded_surfaces"])

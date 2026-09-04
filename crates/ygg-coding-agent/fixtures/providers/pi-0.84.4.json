@@ -40,13 +40,21 @@
     {
       "id": "amazon-bedrock",
       "label": "Amazon Bedrock",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "amazon-bedrock-unsupported-decision",
-        "missing_primitive": "Pi-specific Bedrock route/model/credential evidence and deterministic request fixture",
-        "release_blocker": "#246",
-        "legacy_declaration": "bedrock"
+        "kind": "declared",
+        "fixture_id": "amazon-bedrock-declaration-route",
+        "provider_id": "bedrock",
+        "fixture": {
+          "registration": "static",
+          "model_id": "anthropic.claude-3-7-sonnet-20250219-v1:0",
+          "protocol": "bedrock_converse",
+          "endpoint_id": "bedrock",
+          "auth_presentation": "aws_sigv4",
+          "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/",
+          "environment_variable": "AWS_ACCESS_KEY_ID"
+        },
+        "note": "Pi's amazon-bedrock id maps to Ygg's bedrock declaration; the fixture covers native ConverseStream framing and SigV4 request signing."
       }
     },
     {
@@ -82,13 +90,23 @@
     {
       "id": "azure-openai-responses",
       "label": "Azure OpenAI Responses",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "azure-openai-responses-unsupported-decision",
-        "missing_primitive": "Pi-specific Azure resource/deployment/API-version route evidence and deterministic request fixture",
-        "release_blocker": "#247",
-        "legacy_declaration": "azure-openai"
+        "kind": "declared",
+        "fixture_id": "azure-openai-responses-declaration-route",
+        "provider_id": "azure-openai",
+        "fixture": {
+          "registration": "configured",
+          "model_id": "production-gpt",
+          "protocol": "openai_responses",
+          "endpoint_id": "azure-openai",
+          "auth_presentation": "header",
+          "auth_header": "api-key",
+          "base_url": "https://azure.openai.com/openai/?api-version=2025-04-01-preview",
+          "configured_base_url": "https://enterprise-resource.openai.azure.com/openai/?api-version=2025-04-01-preview",
+          "environment_variable": "AZURE_OPENAI_API_KEY"
+        },
+        "note": "Pi's azure-openai-responses id maps to Ygg's configured azure-openai declaration; the fixture preserves the deployment route and api-version query."
       }
     },
     {
@@ -113,25 +131,41 @@
     {
       "id": "cloudflare-ai-gateway",
       "label": "Cloudflare AI Gateway",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "cloudflare-ai-gateway-unsupported-decision",
-        "missing_primitive": "Pi-specific Cloudflare AI Gateway multi-protocol route/auth evidence and deterministic request fixture",
-        "release_blocker": "#251",
-        "legacy_declaration": "cloudflare-ai-gateway"
+        "kind": "declared",
+        "fixture_id": "cloudflare-ai-gateway-declaration-route",
+        "provider_id": "cloudflare-ai-gateway",
+        "fixture": {
+          "registration": "static",
+          "model_id": "gpt-4o",
+          "protocol": "openai_responses",
+          "endpoint_id": "cloudflare-ai-gateway-openai",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "base_url": "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/",
+          "environment_variable": "CLOUDFLARE_API_KEY"
+        },
+        "note": "The fixture substitutes non-secret account and gateway identifiers and exercises the declared OpenAI gateway base path and cf-aig authorization header."
       }
     },
     {
       "id": "cloudflare-workers-ai",
       "label": "Cloudflare Workers AI",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "cloudflare-workers-ai-unsupported-decision",
-        "missing_primitive": "Pi-specific Cloudflare Workers AI request/stream/auth evidence and deterministic request fixture",
-        "release_blocker": "#250",
-        "legacy_declaration": "cloudflare-workers-ai"
+        "kind": "declared",
+        "fixture_id": "cloudflare-workers-ai-declaration-route",
+        "provider_id": "cloudflare-workers-ai",
+        "fixture": {
+          "registration": "static",
+          "model_id": "@cf/openai/gpt-oss-120b",
+          "protocol": "openai_chat",
+          "endpoint_id": "cloudflare-workers-ai",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/",
+          "environment_variable": "CLOUDFLARE_API_KEY"
+        },
+        "note": "The fixture substitutes a non-secret account identifier and exercises the documented OpenAI-compatible Workers AI route."
       }
     },
     {
@@ -186,25 +220,41 @@
     {
       "id": "google",
       "label": "Google Generative AI",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "google-unsupported-decision",
-        "missing_primitive": "Pi-specific Google Generative AI request/stream/auth evidence and deterministic request fixture",
-        "release_blocker": "#244",
-        "legacy_declaration": "gemini"
+        "kind": "declared",
+        "fixture_id": "google-declaration-route",
+        "provider_id": "gemini",
+        "fixture": {
+          "registration": "static",
+          "model_id": "gemini-2.5-flash",
+          "protocol": "google_generative_ai",
+          "endpoint_id": "gemini",
+          "auth_presentation": "google_api_key_header",
+          "base_url": "https://generativelanguage.googleapis.com/v1beta/",
+          "environment_variable": "GEMINI_API_KEY"
+        },
+        "note": "Pi's google id maps to Ygg's gemini declaration and native generateContent codec."
       }
     },
     {
       "id": "google-vertex",
       "label": "Google Vertex AI",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "google-vertex-unsupported-decision",
-        "missing_primitive": "Pi-specific Vertex ADC/project/location route evidence and deterministic request fixture",
-        "release_blocker": "#248",
-        "legacy_declaration": "vertex"
+        "kind": "declared",
+        "fixture_id": "google-vertex-declaration-route",
+        "provider_id": "vertex",
+        "fixture": {
+          "registration": "static",
+          "model_id": "gemini-2.5-flash",
+          "protocol": "google_generative_ai",
+          "endpoint_id": "vertex",
+          "auth_presentation": "dynamic",
+          "base_url": "https://us-central1-aiplatform.googleapis.com/v1/projects/placeholder/locations/us-central1/publishers/google/",
+          "environment_variable": ""
+        },
+        "note": "Pi's google-vertex id maps to Ygg's vertex declaration; its credential is Application Default Credentials rather than an environment API key."
       }
     },
     {
@@ -305,13 +355,26 @@
     {
       "id": "mistral",
       "label": "Mistral",
-      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
       "decision": {
-        "kind": "unsupported",
-        "fixture_id": "mistral-unsupported-decision",
-        "missing_primitive": "Mistral Conversations request/stream codec and deterministic Pi fixture",
+        "kind": "declared_subset",
+        "fixture_id": "mistral-declaration-route",
+        "provider_id": "mistral",
+        "fixture": {
+          "registration": "static",
+          "model_id": "mistral-small-latest",
+          "protocol": "openai_chat",
+          "endpoint_id": "mistral",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.mistral.ai/v1/",
+          "environment_variable": "MISTRAL_API_KEY"
+        },
+        "excluded_surfaces": [
+          "Pi Mistral Conversations request/stream surface"
+        ],
+        "missing_primitive": "Mistral Conversations request/stream codec",
         "release_blocker": "#245",
-        "legacy_declaration": "mistral"
+        "note": "The declared Chat Completions routes retain Mistral request and reasoning conventions; the distinct Pi Conversations surface is not claimed."
       }
     },
     {
