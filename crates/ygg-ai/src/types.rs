@@ -110,7 +110,7 @@ pub enum Protocol {
 }
 
 /// Preferred transport for streaming provider responses.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointTransport {
     /// Use the provider's ordinary HTTP/SSE transport.
@@ -119,6 +119,71 @@ pub enum EndpointTransport {
     /// Prefer WebSocket when the protocol implements it, with HTTP/SSE as a
     /// compatibility fallback.
     WebSocketPreferred,
+}
+
+/// Per-endpoint request-runtime behavior that is independent of the wire codec.
+///
+/// A provider declaration selects an existing [`Protocol`] codec and may opt
+/// into transport behavior documented by that endpoint. This keeps provider
+/// identity out of the request loop: a new provider using an existing API
+/// family needs data, not a client branch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestRuntime {
+    /// Encoding applied to a complete request body before it is sent.
+    #[serde(default)]
+    pub body_encoding: RequestBodyEncoding,
+    /// Responses-family behavior selected by the endpoint declaration.
+    #[serde(default)]
+    pub responses_profile: ResponsesRuntimeProfile,
+}
+
+/// Endpoint behavior for an existing OpenAI Responses codec.
+///
+/// This is intentionally endpoint data rather than a provider identifier: a
+/// provider using the standard Responses codec can select a documented runtime
+/// profile without adding a branch to the codec or client loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesRuntimeProfile {
+    /// Public OpenAI Responses behavior.
+    #[default]
+    Default,
+    /// ChatGPT Codex subscription behavior over the existing Responses codec.
+    Codex,
+}
+
+impl ResponsesRuntimeProfile {
+    /// Whether WebSocket requests require the private Responses beta marker.
+    pub const fn sends_websocket_beta_header(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether Responses text should request the profile's low verbosity.
+    pub const fn uses_low_verbosity(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether this endpoint accepts the richer compact request envelope.
+    pub const fn supports_rich_compact_schema(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether the endpoint rejects `max_output_tokens` outright.
+    pub const fn omits_max_output_tokens(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
+/// Content encoding supported by an endpoint's request runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestBodyEncoding {
+    /// Send the codec-produced body without a content encoding.
+    #[default]
+    Identity,
+    /// Compress the codec-produced body with Zstandard and set
+    /// `Content-Encoding: zstd`.
+    Zstd,
 }
 
 /// Endpoint configuration for connecting to a provider.
@@ -134,6 +199,8 @@ pub struct Endpoint {
     pub default_headers: http::HeaderMap,
     /// Preferred response transport.
     pub transport: EndpointTransport,
+    /// Endpoint-specific request runtime selected by the provider declaration.
+    pub runtime: RequestRuntime,
     /// Maximum time to send a request and receive response headers. Streaming
     /// body idle and overall deadlines are owned by [`crate::AiClient`].
     pub timeout: std::time::Duration,
@@ -147,6 +214,7 @@ impl std::fmt::Debug for Endpoint {
             .field("auth", &self.auth)
             .field("default_headers", &"<redacted>")
             .field("transport", &self.transport)
+            .field("runtime", &self.runtime)
             .field("timeout", &self.timeout)
             .finish()
     }

@@ -540,6 +540,7 @@ fn scripted_model(uri: &str) -> Model {
             auth: Auth::bearer("test-key"),
             default_headers: http::HeaderMap::new(),
             transport: ygg_ai::EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(60),
         }),
     }

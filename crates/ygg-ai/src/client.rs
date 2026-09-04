@@ -302,22 +302,20 @@ fn provider_error_from_success_body(body: &[u8]) -> Option<ProviderError> {
     })
 }
 
-/// Compress the private ChatGPT Codex Responses request body.
+/// Apply the request runtime selected by the endpoint declaration.
 ///
-/// This is deliberately endpoint-specific. OpenAI-compatible gateways do not
-/// uniformly accept request `Content-Encoding`, while the Codex SSE endpoint
-/// explicitly supports zstd. Compression failure is only an optimization miss:
-/// preserve the valid uncompressed request instead of failing the model turn.
-///
-/// The zstd work runs on the blocking thread pool so multi-hundred-KB request
-/// bodies never stall the async runtime worker.
+/// Codecs produce canonical bodies. Endpoint declarations independently opt
+/// into documented transport behavior, so providers sharing a codec never need
+/// a provider-name branch here. Compression failure is only an optimization
+/// miss: preserve the valid uncompressed request instead of failing the model
+/// turn. The zstd work runs on the blocking thread pool so multi-hundred-KB
+/// request bodies never stall the async runtime worker.
 async fn prepare_request_body(
-    endpoint_id: &crate::types::EndpointId,
-    protocol: Protocol,
+    runtime: crate::types::RequestRuntime,
     headers: &mut http::HeaderMap,
     body: bytes::Bytes,
 ) -> bytes::Bytes {
-    if endpoint_id.0 != "openai-codex" || protocol != Protocol::OpenAiResponses {
+    if runtime.body_encoding != crate::types::RequestBodyEncoding::Zstd {
         return body;
     }
 
@@ -430,13 +428,8 @@ async fn stream_http(
         buffer_ambiguous_compatibility_content,
         diagnostic_redactor,
     } = request;
-    let request_body = prepare_request_body(
-        &model.endpoint.id,
-        model.spec.protocol,
-        &mut headers,
-        parts.body.clone(),
-    )
-    .await;
+    let request_body =
+        prepare_request_body(model.endpoint.runtime, &mut headers, parts.body.clone()).await;
 
     // 3. Send the HTTP request
     let builder = http
@@ -1125,7 +1118,12 @@ impl AiClient {
                 headers.append(key.clone(), value);
             }
         }
-        if model.endpoint.id.0 == "openai-codex" {
+        if model
+            .endpoint
+            .runtime
+            .responses_profile
+            .sends_websocket_beta_header()
+        {
             headers.insert(
                 http::HeaderName::from_static("openai-beta"),
                 http::HeaderValue::from_static(ResponsesWsPool::beta_header_value()),
@@ -1257,7 +1255,12 @@ impl AiClient {
             let websocket_key = session_key
                 .map(|session| format!("{}:{}:{session}", model.endpoint.id.0, model.spec.id.0));
             let mut ws_headers = fallback_request.headers.clone();
-            if model.endpoint.id.0 == "openai-codex" {
+            if model
+                .endpoint
+                .runtime
+                .responses_profile
+                .sends_websocket_beta_header()
+            {
                 ws_headers.insert(
                     http::HeaderName::from_static("openai-beta"),
                     http::HeaderValue::from_static(ResponsesWsPool::beta_header_value()),
@@ -1343,7 +1346,11 @@ impl AiClient {
             ))
             .into());
         }
-        let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+        let rich_codex_schema = model
+            .endpoint
+            .runtime
+            .responses_profile
+            .supports_rich_compact_schema()
             || model.spec.cache.session_affinity_format
                 == Some(crate::types::SessionAffinityFormat::Codex)
             || model.spec.capabilities.responses_lite;
@@ -1542,12 +1549,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn codex_responses_body_is_zstd_compressed_and_other_routes_are_untouched() {
+    async fn declared_request_runtime_compresses_without_provider_identity() {
         let original = bytes::Bytes::from(vec![b'a'; 128 * 1024]);
         let mut headers = http::HeaderMap::new();
         let compressed = prepare_request_body(
-            &crate::types::EndpointId("openai-codex".to_owned()),
-            Protocol::OpenAiResponses,
+            crate::types::RequestRuntime {
+                body_encoding: crate::types::RequestBodyEncoding::Zstd,
+                ..crate::types::RequestRuntime::default()
+            },
             &mut headers,
             original.clone(),
         )
@@ -1561,8 +1570,7 @@ mod tests {
 
         let mut generic_headers = http::HeaderMap::new();
         let generic = prepare_request_body(
-            &crate::types::EndpointId("openai".to_owned()),
-            Protocol::OpenAiResponses,
+            crate::types::RequestRuntime::default(),
             &mut generic_headers,
             original.clone(),
         )

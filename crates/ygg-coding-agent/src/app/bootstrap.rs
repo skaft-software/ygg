@@ -31,8 +31,7 @@ use crate::extensions::{ExecutableExtensions, SUBAGENTS_EXTENSION_NAME};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
-    ModelDiscovery, ModelFilter, ProviderPreset, StaticModelPreset, BUILTIN_PROVIDERS,
-    MINIMAX_MODELS, OPENCODE_MODELS,
+    ModelDiscovery, ModelFilter, ProviderDeclaration, ProviderRoute, BUILTIN_PROVIDER_DECLARATIONS,
 };
 use crate::resources::{format_skills_for_prompt, FileSystemSkillRegistry};
 use crate::session_store::SessionStore;
@@ -146,13 +145,12 @@ fn agent_compaction_mode(mode: CompactionMode) -> AgentCompactionMode {
     }
 }
 
-const DEEPSEEK_ENDPOINT_ID: &str = "deepseek";
 const DEEPSEEK_MODEL_ID: &str = "deepseek-v4-pro";
-const DEEPSEEK_DEFAULT_BASE_URL: &str = "https://api.deepseek.com/v1/";
 const DEEPSEEK_DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 // Only a local capacity reserve; it never becomes an implicit request cap.
 const DEEPSEEK_DEFAULT_MAX_OUTPUT_TOKENS: u64 = 384_000;
 
+#[cfg(test)]
 const OPENCODE_ANTHROPIC_ENDPOINT_ID: &str = "opencode-anthropic";
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 // A provider may spend minutes queueing or processing a large prompt before
@@ -197,6 +195,7 @@ fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
     optional_env_value(name, ygg_ai::auth::read_bounded_env(name))
 }
 
+#[cfg(test)]
 fn required_env_value(
     name: &str,
     value: Result<Option<String>, ygg_ai::ConfigError>,
@@ -205,10 +204,6 @@ fn required_env_value(
         Some(value) => Ok(value),
         None => Err(anyhow::anyhow!("environment variable {name} not found")),
     }
-}
-
-fn required_env(name: &str) -> anyhow::Result<String> {
-    required_env_value(name, ygg_ai::auth::read_bounded_env(name))
 }
 
 fn strict_env_value(
@@ -901,34 +896,28 @@ fn has_api_model(catalog: &ModelCatalog, endpoint: &str, api_name: &str) -> bool
         .any(|model| model.endpoint.0 == endpoint && model.api_name == api_name)
 }
 
-fn bearer_headers(token: &str) -> anyhow::Result<http::HeaderMap> {
-    let mut headers = http::HeaderMap::new();
-    let mut value = http::HeaderValue::from_str(&format!("Bearer {token}"))?;
-    value.set_sensitive(true);
-    headers.insert(http::header::AUTHORIZATION, value);
+fn declaration_discovery_headers(
+    declaration: &ProviderDeclaration,
+    credential: &crate::providers::EnvironmentCredential,
+) -> anyhow::Result<http::HeaderMap> {
+    let route = declaration.inventory_route().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} provider declaration has no discovery route",
+            declaration.id
+        )
+    })?;
+    let mut headers = crate::providers::environment_discovery_headers(route, credential)?;
+    add_declared_headers(&mut headers, declaration)?;
     Ok(headers)
 }
 
-fn build_headers(entries: &[(&'static str, &'static str)]) -> anyhow::Result<http::HeaderMap> {
-    let mut headers = http::HeaderMap::new();
-    for (name, value) in entries {
-        headers.insert(
-            http::HeaderName::from_bytes(name.as_bytes())?,
-            http::HeaderValue::from_str(value)?,
-        );
-    }
-    Ok(headers)
-}
-
-fn add_headers(
+fn add_declared_headers(
     target: &mut http::HeaderMap,
-    entries: &[(&'static str, &'static str)],
+    declaration: &ProviderDeclaration,
 ) -> anyhow::Result<()> {
-    for (name, value) in entries {
-        target.insert(
-            http::HeaderName::from_bytes(name.as_bytes())?,
-            http::HeaderValue::from_str(value)?,
-        );
+    let headers = crate::providers::public_headers(declaration.extra_headers)?;
+    for (name, value) in &headers {
+        target.insert(name.clone(), value.clone());
     }
     Ok(())
 }
@@ -969,75 +958,64 @@ fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
     }
 }
 
-fn discovered_preset_binding(
-    preset: &ProviderPreset,
+fn discovered_preset_binding<'a>(
+    declaration: &'a ProviderDeclaration,
     model_id: &str,
-) -> Option<(&'static str, Protocol)> {
-    // models.dev and some stale inventories expose this unsupported alias,
-    // but OpenAI's APIs reject it. Keep the provider-specific variants.
-    if preset.id == crate::providers::OPENAI.id && model_id == "gpt-5.6" {
-        return None;
-    }
-    if preset.id != crate::providers::OPENCODE.id {
-        return Some((
-            preset.id,
-            crate::providers::discovered_protocol(preset.id, model_id, preset.protocol),
-        ));
-    }
-    if model_id.starts_with("gemini-") {
-        return None;
-    }
-    if model_id.starts_with("claude-")
-        || (model_id.starts_with("qwen3.") && model_id.ends_with("-plus"))
-    {
-        return Some((OPENCODE_ANTHROPIC_ENDPOINT_ID, Protocol::AnthropicMessages));
-    }
-    if model_id.starts_with("gpt-") || model_id.starts_with("codex-") {
-        return Some((preset.id, Protocol::OpenAiResponses));
-    }
-    Some((preset.id, Protocol::OpenAiChat))
+) -> Option<&'a ProviderRoute> {
+    declaration.route_for_model(model_id)
 }
 
 fn register_openai_compatible_models(
     catalog: &mut ModelCatalog,
-    preset: &ProviderPreset,
+    declaration: &ProviderDeclaration,
     filter: ModelFilter,
-    api_key: &str,
+    credential: &crate::providers::EnvironmentCredential,
 ) -> anyhow::Result<()> {
-    let models_url = url::Url::parse(preset.base_url)?.join("models")?;
-    let mut headers = bearer_headers(api_key)?;
-    add_headers(&mut headers, preset.extra_headers)?;
-    let body = if preset.id == crate::providers::OPENCODE.id {
-        cached_provider_inventory_or_schedule(preset.id, models_url.to_string(), headers, api_key)
-    } else {
-        cached_provider_inventory(preset.id, models_url.to_string(), headers, api_key)?
+    let models_url = url::Url::parse(declaration.base_url)?.join("models")?;
+    let headers = declaration_discovery_headers(declaration, credential)?;
+    let body = match declaration.inventory_cache {
+        crate::providers::InventoryCacheMode::Supplemental => {
+            cached_provider_inventory_or_schedule(
+                declaration.id,
+                models_url.to_string(),
+                headers,
+                credential.value(),
+            )
+        }
+        crate::providers::InventoryCacheMode::Required => cached_provider_inventory(
+            declaration.id,
+            models_url.to_string(),
+            headers,
+            credential.value(),
+        )?,
     };
     let Some(body) = body else {
         return Ok(());
     };
     for model in api_models_from_response(&body)? {
-        let catalog_id = format!("{}/{}", preset.id, model.id);
-        let Some((endpoint_id, protocol)) = discovered_preset_binding(preset, &model.id) else {
+        let api_name = model.id.as_str();
+        let catalog_id = format!("{}/{}", declaration.id, api_name);
+        let Some(route) = discovered_preset_binding(declaration, api_name) else {
             continue;
         };
-        if !model_filter_matches(filter, &model.id)
-            || has_api_model(catalog, endpoint_id, &model.id)
+        if !model_filter_matches(filter, api_name)
+            || has_api_model(catalog, route.endpoint_id, api_name)
             || has_model_id(catalog, &catalog_id)
         {
             continue;
         }
-        let reasoning = discovered_model_supports_reasoning(protocol, &model.id);
+        let protocol = route.protocol;
+        let reasoning = discovered_model_supports_reasoning(protocol, api_name);
         let context_window = model.context_window.unwrap_or(128_000);
         let max_output_tokens = model
             .max_output_tokens
             .unwrap_or(32_768)
             .min(context_window);
         let mut input_modalities = if model.vision
-            || model_id_implies_vision(&model.id)
-            || ((preset.id == "openai" || preset.id == crate::providers::OPENCODE.id)
-                && (model.id.starts_with("gpt-4o")
-                    || model.id.starts_with("gpt-4.1")
-                    || model.id.starts_with("gpt-5")))
+            || model_id_implies_vision(api_name)
+            || declaration
+                .discovery_capabilities
+                .gpt_vision_fallback(api_name)
         {
             ModalitySet::none().with(ygg_ai::Modality::Image)
         } else {
@@ -1048,15 +1026,12 @@ fn register_openai_compatible_models(
         if model.audio && protocol == Protocol::OpenAiChat {
             input_modalities = input_modalities.with(ygg_ai::Modality::Audio);
         }
-        let cache = crate::providers::cache_compatibility(preset.id, &model.id, protocol);
-        let pricing = crate::providers::model_pricing(preset.id, &model.id);
-        catalog.register_model(ModelSpec {
-            id: ModelId(catalog_id),
-            endpoint: EndpointId(endpoint_id.into()),
-            api_name: model.id,
-            display_name: None,
-            protocol,
-            capabilities: Capabilities {
+        crate::providers::register_discovered_model(
+            catalog,
+            declaration,
+            api_name,
+            None,
+            Capabilities {
                 input_modalities,
                 output_modalities: ModalitySet::none(),
                 tools: model.tools,
@@ -1073,40 +1048,47 @@ fn register_openai_compatible_models(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: protocol != Protocol::OpenAiChat,
-
                 deferred_tool_loading: false,
             },
-            limits: ModelLimits {
+            ModelLimits {
                 context_window,
                 max_output_tokens,
             },
-            pricing,
-            cache,
-        })?;
+            None,
+        )?;
     }
     Ok(())
 }
 
 fn register_anthropic_compatible_models(
     catalog: &mut ModelCatalog,
-    preset: &ProviderPreset,
-    api_key: &str,
+    declaration: &ProviderDeclaration,
+    filter: ModelFilter,
+    credential: &crate::providers::EnvironmentCredential,
 ) -> anyhow::Result<()> {
-    let mut headers = build_headers(&[("anthropic-version", "2023-06-01")])?;
-    let mut key_value = http::HeaderValue::from_str(api_key)?;
-    key_value.set_sensitive(true);
-    headers.insert(http::HeaderName::from_static("x-api-key"), key_value);
-    add_headers(&mut headers, preset.extra_headers)?;
-    let models_url = url::Url::parse(preset.base_url)?.join("models?limit=1000")?;
-    let Some(body) =
-        cached_provider_inventory(preset.id, models_url.to_string(), headers, api_key)?
+    let mut headers = declaration_discovery_headers(declaration, credential)?;
+    headers.insert(
+        http::HeaderName::from_static("anthropic-version"),
+        http::HeaderValue::from_static("2023-06-01"),
+    );
+    let models_url = url::Url::parse(declaration.base_url)?.join("models?limit=1000")?;
+    let Some(body) = cached_provider_inventory(
+        declaration.id,
+        models_url.to_string(),
+        headers,
+        credential.value(),
+    )?
     else {
         return Ok(());
     };
     for model in api_models_from_response(&body)? {
-        let catalog_id = format!("{}/{}", preset.id, model.id);
-        if (preset.id == "anthropic" && !model.id.starts_with("claude-"))
-            || has_api_model(catalog, preset.id, &model.id)
+        let api_name = model.id.as_str();
+        let catalog_id = format!("{}/{}", declaration.id, api_name);
+        let Some(route) = declaration.route_for_model(api_name) else {
+            continue;
+        };
+        if !model_filter_matches(filter, api_name)
+            || has_api_model(catalog, route.endpoint_id, api_name)
             || has_model_id(catalog, &catalog_id)
         {
             continue;
@@ -1116,20 +1098,15 @@ fn register_anthropic_compatible_models(
             .max_output_tokens
             .unwrap_or(64_000)
             .min(context_window);
-        let cache = crate::providers::cache_compatibility(
-            preset.id,
-            &model.id,
-            Protocol::AnthropicMessages,
-        );
-        let pricing = crate::providers::model_pricing(preset.id, &model.id);
-        catalog.register_model(ModelSpec {
-            id: ModelId(catalog_id),
-            endpoint: EndpointId(preset.id.into()),
-            api_name: model.id,
-            display_name: None,
-            protocol: Protocol::AnthropicMessages,
-            capabilities: Capabilities {
-                input_modalities: if model.vision || preset.id == "anthropic" {
+        crate::providers::register_discovered_model(
+            catalog,
+            declaration,
+            api_name,
+            None,
+            Capabilities {
+                input_modalities: if model.vision
+                    || declaration.discovery_capabilities.assumes_image_input()
+                {
                     ModalitySet::none().with(ygg_ai::Modality::Image)
                 } else {
                     ModalitySet::none()
@@ -1143,23 +1120,21 @@ fn register_anthropic_compatible_models(
                 responses_lite: false,
                 agent_delegation: None,
                 structured_output: true,
-
                 deferred_tool_loading: false,
             },
-            limits: ModelLimits {
+            ModelLimits {
                 context_window,
                 max_output_tokens,
             },
-            pricing,
-            cache,
-        })?;
+            None,
+        )?;
     }
     Ok(())
 }
 
-fn deepseek_base_url() -> anyhow::Result<url::Url> {
-    let configured = optional_env("YGG_DEEPSEEK_BASE_URL")?
-        .unwrap_or_else(|| DEEPSEEK_DEFAULT_BASE_URL.to_owned());
+fn deepseek_base_url(declaration: &ProviderDeclaration) -> anyhow::Result<url::Url> {
+    let configured =
+        optional_env("YGG_DEEPSEEK_BASE_URL")?.unwrap_or_else(|| declaration.base_url.to_owned());
     let normalized = if configured.ends_with('/') {
         configured
     } else {
@@ -1179,31 +1154,37 @@ fn deepseek_limit(name: &str, default: u64) -> anyhow::Result<u64> {
         .map_err(|error| anyhow::anyhow!("invalid {name}: {error}"))
 }
 
-fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
-    // Unit tests retain this deterministic fallback without ambient credentials;
-    // runtime callers reach it only after the preset resolves DEEPSEEK_API_KEY.
-    let endpoint_id = EndpointId(DEEPSEEK_ENDPOINT_ID.into());
+fn declared_deepseek_route(declaration: &ProviderDeclaration) -> anyhow::Result<&ProviderRoute> {
+    declaration
+        .route_for_model(DEEPSEEK_MODEL_ID)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} declaration has no route for the DeepSeek fallback model",
+                declaration.id
+            )
+        })
+}
+
+fn register_deepseek_v4_pro(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+) -> anyhow::Result<()> {
+    let route = declared_deepseek_route(declaration)?;
+    let endpoint_id = EndpointId(route.endpoint_id.into());
     if !catalog.has_endpoint(&endpoint_id) {
-        catalog.register_endpoint(Endpoint {
-            id: endpoint_id.clone(),
-            base_url: deepseek_base_url()?,
-            auth: Auth::bearer_env("DEEPSEEK_API_KEY"),
-            default_headers: http::HeaderMap::new(),
-            transport: ygg_ai::EndpointTransport::Http,
-            timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
-        })?;
+        anyhow::bail!(
+            "{} declaration endpoint must be registered before fallback models",
+            declaration.id
+        );
     }
     if has_model_id(catalog, DEEPSEEK_MODEL_ID) {
         return Ok(());
     }
     let api_name =
         optional_env("YGG_DEEPSEEK_MODEL")?.unwrap_or_else(|| DEEPSEEK_MODEL_ID.to_owned());
-    let cache = crate::providers::cache_compatibility(
-        crate::providers::DEEPSEEK.id,
-        &api_name,
-        Protocol::OpenAiChat,
-    );
-    let pricing = crate::providers::model_pricing(crate::providers::DEEPSEEK.id, &api_name);
+    let cache =
+        crate::providers::cache_compatibility(declaration.compatibility, &api_name, route.protocol);
+    let pricing = crate::providers::pricing_for(declaration, &api_name);
     let context_window = deepseek_limit(
         "YGG_DEEPSEEK_CONTEXT_WINDOW",
         DEEPSEEK_DEFAULT_CONTEXT_WINDOW,
@@ -1217,10 +1198,10 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
     }
     catalog.register_model(ModelSpec {
         id: ModelId(DEEPSEEK_MODEL_ID.into()),
-        endpoint: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
+        endpoint: endpoint_id,
         api_name,
         display_name: None,
-        protocol: Protocol::OpenAiChat,
+        protocol: route.protocol,
         capabilities: Capabilities {
             input_modalities: ModalitySet::none(),
             output_modalities: ModalitySet::none(),
@@ -1251,38 +1232,37 @@ fn register_deepseek_v4_pro(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Result<()> {
-    let key = required_env("DEEPSEEK_API_KEY")?;
-    let url = deepseek_base_url()?.join("models")?.to_string();
-    let Some(body) = cached_provider_inventory(
-        crate::providers::DEEPSEEK.id,
-        url,
-        bearer_headers(&key)?,
-        &key,
-    )?
+fn register_discovered_deepseek_models(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+    credential: &crate::providers::EnvironmentCredential,
+    base_url: &url::Url,
+) -> anyhow::Result<()> {
+    let discovery_route = declared_deepseek_route(declaration)?;
+    let url = base_url.join("models")?.to_string();
+    let mut headers = crate::providers::environment_discovery_headers(discovery_route, credential)?;
+    add_declared_headers(&mut headers, declaration)?;
+    let Some(body) = cached_provider_inventory(declaration.id, url, headers, credential.value())?
     else {
         return Ok(());
     };
     for model in api_models_from_response(&body)? {
-        if has_api_model(catalog, DEEPSEEK_ENDPOINT_ID, &model.id) {
+        let api_name = model.id.as_str();
+        let Some(route) = declaration.route_for_model(api_name) else {
+            continue;
+        };
+        if has_api_model(catalog, route.endpoint_id, api_name) {
             continue;
         }
         let supports_reasoning =
-            model.id.contains("reason") || model.id.contains("r1") || model.id.contains("v4");
-        let cache = crate::providers::cache_compatibility(
-            crate::providers::DEEPSEEK.id,
-            &model.id,
-            Protocol::OpenAiChat,
-        );
-        let pricing = crate::providers::model_pricing(crate::providers::DEEPSEEK.id, &model.id);
+            api_name.contains("reason") || api_name.contains("r1") || api_name.contains("v4");
         let (context_window, max_output_tokens) = deepseek_discovered_limits(&model);
-        catalog.register_model(ModelSpec {
-            id: ModelId(format!("deepseek/{}", model.id)),
-            endpoint: EndpointId(DEEPSEEK_ENDPOINT_ID.into()),
-            api_name: model.id,
-            display_name: None,
-            protocol: Protocol::OpenAiChat,
-            capabilities: Capabilities {
+        crate::providers::register_discovered_model(
+            catalog,
+            declaration,
+            api_name,
+            None,
+            Capabilities {
                 input_modalities: if model.vision {
                     ModalitySet::none().with(ygg_ai::Modality::Image)
                 } else {
@@ -1306,35 +1286,35 @@ fn register_discovered_deepseek_models(catalog: &mut ModelCatalog) -> anyhow::Re
 
                 deferred_tool_loading: false,
             },
-            limits: ModelLimits {
+            ModelLimits {
                 context_window,
                 max_output_tokens,
             },
-            pricing,
-            cache,
-        })?;
+            None,
+        )?;
     }
     Ok(())
 }
 
 /// Populate OpenRouter from its live inventory while retaining provider-specific
 /// capability and pricing metadata.
-fn register_openrouter_models_for_preset(
+fn register_openrouter_models(
     catalog: &mut ModelCatalog,
-    preset: &ProviderPreset,
-    api_key: &str,
+    declaration: &ProviderDeclaration,
+    credential: &crate::providers::EnvironmentCredential,
 ) -> anyhow::Result<()> {
-    let models_url = url::Url::parse(preset.base_url)?.join("models")?;
+    let models_url = url::Url::parse(declaration.base_url)?.join("models")?;
+    let headers = declaration_discovery_headers(declaration, credential)?;
     let Some(body) = cached_provider_inventory(
-        preset.id,
+        declaration.id,
         models_url.to_string(),
-        bearer_headers(api_key)?,
-        api_key,
+        headers,
+        credential.value(),
     )?
     else {
         return Ok(());
     };
-    for model in openrouter_models_from_response(&body)? {
+    for model in openrouter_models_from_response(declaration, &body)? {
         if !has_model_id(catalog, &model.id.0) {
             catalog.register_model(model)?;
         }
@@ -1452,7 +1432,10 @@ fn openrouter_pricing(entry: &serde_json::Value) -> Option<Pricing> {
     })
 }
 
-fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<Vec<ModelSpec>> {
+fn openrouter_models_from_response(
+    declaration: &ProviderDeclaration,
+    body: &serde_json::Value,
+) -> anyhow::Result<Vec<ModelSpec>> {
     let entries = body
         .get("data")
         .and_then(serde_json::Value::as_array)
@@ -1501,12 +1484,15 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                 })
             });
 
+        let Some(route) = declaration.route_for_model(api_name) else {
+            continue;
+        };
         models.push(ModelSpec {
-            id: ModelId(format!("{}/{api_name}", crate::providers::OPENROUTER.id)),
-            endpoint: EndpointId(crate::providers::OPENROUTER.id.into()),
+            id: ModelId(format!("{}/{api_name}", declaration.id)),
+            endpoint: EndpointId(route.endpoint_id.into()),
             api_name: api_name.into(),
             display_name: None,
-            protocol: Protocol::OpenAiChat,
+            protocol: route.protocol,
             capabilities: Capabilities {
                 input_modalities,
                 output_modalities: ModalitySet::none(),
@@ -1531,13 +1517,12 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
                 context_window,
                 max_output_tokens,
             },
-            pricing: openrouter_pricing(entry).or_else(|| {
-                ygg_ai::model_metadata::model_pricing(crate::providers::OPENROUTER.id, api_name)
-            }),
+            pricing: openrouter_pricing(entry)
+                .or_else(|| crate::providers::pricing_for(declaration, api_name)),
             cache: crate::providers::cache_compatibility(
-                crate::providers::OPENROUTER.id,
+                declaration.compatibility,
                 api_name,
-                Protocol::OpenAiChat,
+                route.protocol,
             ),
         });
     }
@@ -1545,166 +1530,52 @@ fn openrouter_models_from_response(body: &serde_json::Value) -> anyhow::Result<V
     Ok(models)
 }
 
-fn resolve_first_env(
-    names: &'static [&'static str],
-) -> anyhow::Result<Option<(&'static str, String)>> {
-    for name in names {
-        let Some(value) = optional_env(name)? else {
-            continue;
-        };
-        if !value.trim().is_empty() {
-            return Ok(Some((*name, value)));
-        }
-    }
-    Ok(None)
-}
-
-fn preset_auth(protocol: Protocol, api_key_env: &'static str) -> Auth {
-    if protocol == Protocol::AnthropicMessages {
-        Auth::header_env(http::HeaderName::from_static("x-api-key"), api_key_env)
-    } else {
-        Auth::bearer_env(api_key_env)
-    }
-}
-
-fn register_preset_endpoint(
+fn try_register_declaration(
     catalog: &mut ModelCatalog,
-    preset: &ProviderPreset,
-    api_key_env: &'static str,
+    declaration: &ProviderDeclaration,
 ) -> anyhow::Result<()> {
-    let endpoint_id = EndpointId(preset.id.into());
-    if catalog.has_endpoint(&endpoint_id) {
-        return Ok(());
-    }
-    catalog.register_endpoint(Endpoint {
-        id: endpoint_id,
-        base_url: url::Url::parse(preset.base_url)?,
-        auth: preset_auth(preset.protocol, api_key_env),
-        default_headers: build_headers(preset.extra_headers)?,
-        transport: ygg_ai::EndpointTransport::Http,
-        timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
+    declaration.validate().map_err(|error| {
+        anyhow::anyhow!("invalid {} provider declaration: {error}", declaration.id)
     })?;
-    Ok(())
-}
-
-fn static_model_reasoning(model: &StaticModelPreset) -> Option<ReasoningCapability> {
-    model.reasoning.then_some(ReasoningCapability {
-        control: ReasoningControl::Effort,
-        exposes_text: true,
-        preserves_state: model.protocol != Protocol::OpenAiChat,
-        effort_budgets: None,
-        openai_chat_mode: if model.protocol == Protocol::OpenAiChat
-            && model.id.starts_with("deepseek-")
-        {
-            OpenAiChatReasoningMode::DeepSeekThinking
-        } else {
-            OpenAiChatReasoningMode::Standard
-        },
-        min_effort: ygg_ai::ReasoningEffort::Minimal,
-        max_effort: model.max_reasoning_effort,
-    })
-}
-
-fn register_static_models(
-    catalog: &mut ModelCatalog,
-    provider_id: &str,
-    models: &[StaticModelPreset],
-) -> anyhow::Result<()> {
-    for model in models {
-        let catalog_id = format!("{provider_id}/{}", model.id);
-        if has_model_id(catalog, &catalog_id) {
-            continue;
-        }
-        let endpoint = if provider_id == crate::providers::OPENCODE.id
-            && model.protocol == Protocol::AnthropicMessages
-        {
-            OPENCODE_ANTHROPIC_ENDPOINT_ID
-        } else {
-            provider_id
-        };
-        catalog.register_model(ModelSpec {
-            id: ModelId(catalog_id),
-            endpoint: EndpointId(endpoint.into()),
-            api_name: model.id.into(),
-            display_name: Some(model.name.into()),
-            protocol: model.protocol,
-            capabilities: Capabilities {
-                input_modalities: if model.vision {
-                    ModalitySet::none().with(ygg_ai::Modality::Image)
-                } else {
-                    ModalitySet::none()
-                },
-                output_modalities: ModalitySet::none(),
-                tools: true,
-                parallel_tool_calls: model.protocol != Protocol::OpenAiChat,
-                reasoning: static_model_reasoning(model),
-                responses_lite: false,
-                agent_delegation: None,
-                structured_output: model.protocol != Protocol::OpenAiChat,
-
-                deferred_tool_loading: false,
-            },
-            limits: ModelLimits {
-                context_window: model.context_window,
-                max_output_tokens: model.max_output_tokens,
-            },
-            pricing: crate::providers::model_pricing(provider_id, model.id),
-            cache: crate::providers::cache_compatibility(provider_id, model.id, model.protocol),
-        })?;
-    }
-    Ok(())
-}
-
-fn register_opencode(
-    catalog: &mut ModelCatalog,
-    preset: &ProviderPreset,
-    api_key_env: &'static str,
-) -> anyhow::Result<()> {
-    let anthropic_endpoint = EndpointId(OPENCODE_ANTHROPIC_ENDPOINT_ID.into());
-    if !catalog.has_endpoint(&anthropic_endpoint) {
-        // Pi's Anthropic SDK appends /v1/messages to /zen. Ygg joins only the
-        // final method path, so both protocol endpoints use the versioned URL.
-        catalog.register_endpoint(Endpoint {
-            id: anthropic_endpoint,
-            base_url: url::Url::parse(preset.base_url)?,
-            auth: preset_auth(Protocol::AnthropicMessages, api_key_env),
-            default_headers: build_headers(preset.extra_headers)?,
-            transport: ygg_ai::EndpointTransport::Http,
-            timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
-        })?;
-    }
-    register_static_models(catalog, preset.id, OPENCODE_MODELS)
-}
-
-fn try_register_preset(catalog: &mut ModelCatalog, preset: &ProviderPreset) -> anyhow::Result<()> {
-    let Some((api_key_env, api_key)) = resolve_first_env(preset.api_key_env)? else {
+    let Some(credential) = crate::providers::resolve_environment(declaration)? else {
         return Ok(());
     };
 
-    if preset.id == crate::providers::DEEPSEEK.id {
-        register_deepseek_v4_pro(catalog)?;
-        register_discovered_deepseek_models(catalog)?;
+    if matches!(declaration.model_discovery, ModelDiscovery::DeepSeekModels) {
+        let base_url = deepseek_base_url(declaration)?;
+        crate::providers::register_environment_endpoints_at_base_url(
+            catalog,
+            declaration,
+            &credential,
+            &base_url,
+            PROVIDER_RESPONSE_HEADER_TIMEOUT,
+        )?;
+        register_deepseek_v4_pro(catalog, declaration)?;
+        register_discovered_deepseek_models(catalog, declaration, &credential, &base_url)?;
         return Ok(());
     }
 
-    register_preset_endpoint(catalog, preset, api_key_env)?;
-    if preset.id == crate::providers::OPENCODE.id {
-        register_opencode(catalog, preset, api_key_env)?;
-    } else if preset.id == crate::providers::MINIMAX.id {
-        register_static_models(catalog, preset.id, MINIMAX_MODELS)?;
-    }
+    crate::providers::register_environment_endpoints(
+        catalog,
+        declaration,
+        &credential,
+        PROVIDER_RESPONSE_HEADER_TIMEOUT,
+    )?;
+    crate::providers::register_static_models(catalog, declaration)?;
 
-    match preset.model_discovery {
+    match declaration.model_discovery {
         ModelDiscovery::Static | ModelDiscovery::None => {}
         ModelDiscovery::OpenAiModels { filter } => {
-            register_openai_compatible_models(catalog, preset, filter, &api_key)?;
+            register_openai_compatible_models(catalog, declaration, filter, &credential)?;
         }
-        ModelDiscovery::AnthropicModels => {
-            register_anthropic_compatible_models(catalog, preset, &api_key)?;
+        ModelDiscovery::AnthropicModels { filter } => {
+            register_anthropic_compatible_models(catalog, declaration, filter, &credential)?;
         }
         ModelDiscovery::OpenRouterModels => {
-            register_openrouter_models_for_preset(catalog, preset, &api_key)?;
+            register_openrouter_models(catalog, declaration, &credential)?;
         }
+        ModelDiscovery::DeepSeekModels => unreachable!("handled before endpoint registration"),
+        ModelDiscovery::CodexSubscription => {}
     }
     Ok(())
 }
@@ -1731,47 +1602,47 @@ fn merge_provider_catalog(target: &mut ModelCatalog, source: ModelCatalog) -> an
 /// interval instead of one interval per configured account.
 fn register_configured_presets_parallel(catalog: &mut ModelCatalog) {
     let mut jobs = Vec::new();
-    for preset in BUILTIN_PROVIDERS {
-        match resolve_first_env(preset.api_key_env) {
+    for declaration in BUILTIN_PROVIDER_DECLARATIONS {
+        match crate::providers::resolve_environment(declaration) {
             Ok(Some(_)) => {}
             Ok(None) => continue,
             Err(error) => {
                 // An invalid/oversized optional credential must not become a
                 // request, but one unusable provider must not block other
                 // configured providers from starting.
-                crate::output::stderr!("warning: {} unavailable: {error}", preset.name);
+                crate::output::stderr!("warning: {} unavailable: {error}", declaration.name);
                 continue;
             }
         }
-        let preset = *preset;
+        let declaration = *declaration;
         match std::thread::Builder::new()
-            .name(format!("ygg-{}-catalog", preset.id))
+            .name(format!("ygg-{}-catalog", declaration.id))
             .spawn(move || {
                 let mut provider_catalog = ModelCatalog::default();
-                try_register_preset(&mut provider_catalog, &preset)?;
+                try_register_declaration(&mut provider_catalog, &declaration)?;
                 Ok::<_, anyhow::Error>(provider_catalog)
             }) {
-            Ok(handle) => jobs.push((preset, handle)),
+            Ok(handle) => jobs.push((declaration, handle)),
             Err(error) => crate::output::stderr!(
                 "warning: could not start {} model discovery: {error}",
-                preset.name
+                declaration.name
             ),
         }
     }
 
-    for (preset, job) in jobs {
+    for (declaration, job) in jobs {
         match job.join() {
             Ok(Ok(provider_catalog)) => {
                 if let Err(error) = merge_provider_catalog(catalog, provider_catalog) {
-                    crate::output::stderr!("warning: {} unavailable: {error}", preset.name);
+                    crate::output::stderr!("warning: {} unavailable: {error}", declaration.name);
                 }
             }
             Ok(Err(error)) => {
-                crate::output::stderr!("warning: {} unavailable: {error}", preset.name)
+                crate::output::stderr!("warning: {} unavailable: {error}", declaration.name)
             }
             Err(_) => crate::output::stderr!(
                 "warning: {} unavailable: model discovery thread panicked",
-                preset.name
+                declaration.name
             ),
         }
     }
@@ -2552,6 +2423,7 @@ fn register_custom_openai_provider(
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: startup_timeout,
     })?;
     let label = provider.label.trim();
@@ -3190,80 +3062,6 @@ fn codex_max_effort(model_id: &str) -> ygg_ai::ReasoningEffort {
     }
 }
 
-fn codex_pricing(model_id: &str) -> Option<Pricing> {
-    let (input, output, cache_read, cache_write, tier) = match model_id {
-        "gpt-5.3-codex-spark" => (1_750_000, 14_000_000, 175_000, 0, None),
-        "gpt-5.4" => (
-            2_500_000,
-            15_000_000,
-            250_000,
-            0,
-            Some((5_000_000, 22_500_000, 500_000, 0)),
-        ),
-        "gpt-5.4-mini" => (750_000, 4_500_000, 75_000, 0, None),
-        "gpt-5.4-pro" | "gpt-5.5-pro" => (
-            30_000_000,
-            180_000_000,
-            0,
-            0,
-            Some((60_000_000, 270_000_000, 0, 0)),
-        ),
-        "gpt-5.5" => (
-            5_000_000,
-            30_000_000,
-            500_000,
-            0,
-            Some((10_000_000, 45_000_000, 1_000_000, 0)),
-        ),
-        // GPT-5.6 uses OpenAI's published standard costs, which are well below
-        // the older catalog estimates (Pi 0.84.4 pinned these as authoritative).
-        "gpt-5.6-luna" => (
-            200_000,
-            1_200_000,
-            20_000,
-            250_000,
-            Some((400_000, 1_800_000, 40_000, 500_000)),
-        ),
-        "gpt-5.6-sol" => (
-            5_000_000,
-            30_000_000,
-            500_000,
-            6_250_000,
-            Some((10_000_000, 45_000_000, 1_000_000, 12_500_000)),
-        ),
-        "gpt-5.6-terra" => (
-            2_000_000,
-            12_000_000,
-            200_000,
-            2_500_000,
-            Some((4_000_000, 18_000_000, 400_000, 5_000_000)),
-        ),
-        _ => return None,
-    };
-    let tiers = tier
-        .map(|(input, output, cache_read, cache_write)| PricingTier {
-            // Pi's source catalog expresses this as "above 272000".
-            min_input_tokens: 272_001,
-            input: Some(TokenRate(input)),
-            output: Some(TokenRate(output)),
-            cache_read: Some(TokenRate(cache_read)),
-            cache_write_5m: Some(TokenRate(cache_write)),
-            cache_write_1h: None,
-            reasoning: None,
-        })
-        .into_iter()
-        .collect();
-    Some(Pricing {
-        input: TokenRate(input),
-        output: TokenRate(output),
-        cache_read: TokenRate(cache_read),
-        cache_write_5m: TokenRate(cache_write),
-        cache_write_1h: None,
-        reasoning: None,
-        tiers,
-    })
-}
-
 /// Current Codex vision-capable families. The Codex backend's inventory does
 /// not reliably include modality metadata, so keep this capability aligned
 /// with the provider's published model contract instead of defaulting every
@@ -3364,7 +3162,7 @@ fn fallback_codex_models(
 }
 
 fn codex_models_url() -> anyhow::Result<url::Url> {
-    let mut url = url::Url::parse(crate::auth::codex::BACKEND_BASE_URL)?.join("models")?;
+    let mut url = url::Url::parse(crate::providers::CODEX.base_url)?.join("models")?;
     url.query_pairs_mut()
         .append_pair("client_version", CODEX_MODELS_CLIENT_VERSION);
     Ok(url)
@@ -3380,14 +3178,11 @@ fn discover_codex_models(
         runtime.block_on(async move {
             let resolver = crate::auth::codex::CodexResolver::new(store);
             let (mut headers, claims) = resolver.discovery_headers().await?;
-            headers.insert(
-                http::HeaderName::from_static("openai-beta"),
-                http::HeaderValue::from_static("responses=experimental"),
-            );
-            headers.insert(
-                http::HeaderName::from_static("originator"),
-                http::HeaderValue::from_static(crate::auth::codex::ORIGINATOR),
-            );
+            let static_headers =
+                crate::providers::public_headers(crate::providers::CODEX.extra_headers)?;
+            for (name, value) in &static_headers {
+                headers.insert(name.clone(), value.clone());
+            }
             headers.insert(
                 http::header::USER_AGENT,
                 http::HeaderValue::from_str(&codex_user_agent())?,
@@ -3429,6 +3224,17 @@ fn register_openai_codex(
     offline: bool,
 ) -> anyhow::Result<()> {
     use crate::auth::codex;
+
+    let declaration = &crate::providers::CODEX;
+    declaration.validate().map_err(|error| {
+        anyhow::anyhow!("invalid {} provider declaration: {error}", declaration.id)
+    })?;
+    let route = declaration.inventory_route().ok_or_else(|| {
+        anyhow::anyhow!(
+            "{} provider declaration has no subscription route",
+            declaration.id
+        )
+    })?;
 
     let Some(initial_claims) = codex::usable_subscription_claims(&store)? else {
         return Ok(());
@@ -3488,29 +3294,22 @@ fn register_openai_codex(
     };
     let resolver = std::sync::Arc::new(codex::CodexResolver::new(store));
 
-    let mut default_headers = http::HeaderMap::new();
-    default_headers.insert(
-        http::HeaderName::from_static("openai-beta"),
-        http::HeaderValue::from_static("responses=experimental"),
-    );
-    default_headers.insert(
-        http::HeaderName::from_static("originator"),
-        http::HeaderValue::from_static(codex::ORIGINATOR),
-    );
+    let mut default_headers = crate::providers::public_headers(declaration.extra_headers)?;
     default_headers.insert(
         http::header::USER_AGENT,
         http::HeaderValue::from_str(&codex_user_agent())?,
     );
 
     catalog.register_endpoint(Endpoint {
-        id: EndpointId(codex::ENDPOINT_ID.into()),
-        base_url: url::Url::parse(codex::BACKEND_BASE_URL)?,
+        id: EndpointId(route.endpoint_id.into()),
+        base_url: url::Url::parse(declaration.base_url)?,
         auth: Auth::dynamic(resolver),
         default_headers,
-        // Prefer the cached Responses WebSocket. AiClient retains the
-        // durable HTTP/SSE path as a conservative fallback for unavailable or
+        // The declaration prefers the cached Responses WebSocket. AiClient
+        // retains HTTP/SSE as a conservative fallback for unavailable or
         // provider-rejected sockets.
-        transport: ygg_ai::EndpointTransport::WebSocketPreferred,
+        transport: route.transport,
+        runtime: route.runtime,
         timeout: PROVIDER_RESPONSE_HEADER_TIMEOUT,
     })?;
 
@@ -3519,23 +3318,25 @@ fn register_openai_codex(
         // already owns one, namespace only the colliding entry instead of
         // rejecting the account's entire live catalog.
         let catalog_id = if catalog.resolve(&ModelId(model.id.clone())).is_ok() {
-            ModelId(format!("codex/{}", model.id))
+            ModelId(format!("{}/{}", declaration.id, model.id))
         } else {
             ModelId(model.id.clone())
         };
-        let pricing = codex_pricing(&model.id).or_else(|| {
-            // Codex uses OpenAI's model identities; use the provider-scoped
-            // models.dev rate for newly added identities when no Codex-specific
-            // tier override exists.
-            ygg_ai::model_metadata::model_pricing("openai", &model.id)
-        });
+        let pricing = crate::providers::pricing_for(declaration, &model.id);
         let supports_image_input = codex_supports_image_input(&model.id);
+        // The declaration keeps application session identity separate from the
+        // resolver's credential/account routing.
+        let cache = crate::providers::cache_compatibility(
+            declaration.compatibility,
+            &model.id,
+            route.protocol,
+        );
         catalog.register_model(ModelSpec {
             id: catalog_id,
-            endpoint: EndpointId(codex::ENDPOINT_ID.into()),
+            endpoint: EndpointId(route.endpoint_id.into()),
             api_name: model.id,
             display_name: None,
-            protocol: Protocol::OpenAiResponses,
+            protocol: route.protocol,
             capabilities: Capabilities {
                 input_modalities: if supports_image_input {
                     ModalitySet::none().with(ygg_ai::Modality::Image)
@@ -3565,15 +3366,7 @@ fn register_openai_codex(
                 max_output_tokens: model.max_output_tokens,
             },
             pricing,
-            // Keep the application session ID consistent across the Responses
-            // cache key and Codex's hyphenated affinity headers. The resolver
-            // only owns credentials/account routing, never session identity.
-            cache: ygg_ai::CacheCompatibility {
-                supports_long_retention: false,
-                send_session_id_header: false,
-                session_affinity_format: Some(ygg_ai::SessionAffinityFormat::Codex),
-                ..ygg_ai::CacheCompatibility::default()
-            },
+            cache,
         })?;
     }
     Ok(())
@@ -3591,7 +3384,20 @@ fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
     if cfg!(test) {
         // Tests keep the historical deterministic DeepSeek fixture and never
         // use ambient credentials or contact provider discovery endpoints.
-        register_deepseek_v4_pro(&mut catalog)?;
+        let declaration = &crate::providers::DEEPSEEK;
+        let credential = crate::providers::EnvironmentCredential::for_test(
+            "DEEPSEEK_API_KEY",
+            "test-deepseek-key",
+        );
+        let base_url = deepseek_base_url(declaration)?;
+        crate::providers::register_environment_endpoints_at_base_url(
+            &mut catalog,
+            declaration,
+            &credential,
+            &base_url,
+            PROVIDER_RESPONSE_HEADER_TIMEOUT,
+        )?;
+        register_deepseek_v4_pro(&mut catalog, declaration)?;
     } else if !offline {
         register_configured_presets_parallel(&mut catalog);
     }

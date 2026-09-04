@@ -1369,6 +1369,7 @@ fn register_inline_model(
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: std::time::Duration::from_secs(30),
     })?;
     let context_window = request.context_window_tokens.unwrap_or(262_144).max(1);

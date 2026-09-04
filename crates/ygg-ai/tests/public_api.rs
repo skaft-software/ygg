@@ -12,10 +12,11 @@ use ygg_ai::{
     ModelLimits, ModelSpec, OutputFormat, OutputModalities, Pricing, PricingError, PricingTier,
     Protocol, ProviderError, ProviderMediaRef, ReasoningCapability, ReasoningConfig,
     ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningPart, ReasoningState,
-    ReasoningStateKind, Request, ResolvedCredential, Response, ResponseStream, Secret, StopReason,
-    StreamEvent, StreamProtocolError, TokenRate, ToolCall, ToolCallId, ToolChoice, ToolDef,
-    ToolResult, ToolResultPart, TransportError, TransportPhase, UnsupportedError, Usage,
-    UserMessage, UserPart, ValidationError,
+    ReasoningStateKind, Request, RequestBodyEncoding, RequestRuntime, ResolvedCredential, Response,
+    ResponseStream, ResponsesRuntimeProfile, Secret, StopReason, StreamEvent, StreamProtocolError,
+    TokenRate, ToolCall, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart,
+    TransportError, TransportPhase, UnsupportedError, Usage, UserMessage, UserPart,
+    ValidationError,
 };
 
 // A compile-time proof that every public re-export above is nameable. Referencing
@@ -54,6 +55,7 @@ fn test_public_api_secret_redaction_proof() {
         auth,
         default_headers: http::HeaderMap::new(),
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: std::time::Duration::from_secs(30),
     };
     let ep_debug = format!("{:?}", ep);

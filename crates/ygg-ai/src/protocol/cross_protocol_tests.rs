@@ -88,6 +88,7 @@ fn make_model(
         auth: Auth::none(),
         default_headers: http::HeaderMap::new(),
         transport: crate::types::EndpointTransport::Http,
+        runtime: crate::types::RequestRuntime::default(),
         timeout: std::time::Duration::from_secs(10),
     };
 

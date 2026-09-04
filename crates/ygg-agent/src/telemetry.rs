@@ -1029,6 +1029,7 @@ mod tests {
                 auth: ygg_ai::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: EndpointTransport::Http,
+                runtime: ygg_ai::RequestRuntime::default(),
                 timeout: Duration::from_secs(1),
             }),
         }

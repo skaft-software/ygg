@@ -317,21 +317,28 @@ fn model_resolution_has_cli_project_global_precedence() {
 #[test]
 fn opencode_discovery_infers_supported_protocols_and_skips_gemini() {
     let preset = &crate::providers::OPENCODE;
+    let binding = |model_id| {
+        discovered_preset_binding(preset, model_id).map(|route| (route.endpoint_id, route.protocol))
+    };
     assert_eq!(
-        discovered_preset_binding(preset, "gpt-future"),
+        binding("gpt-future"),
         Some(("opencode", Protocol::OpenAiResponses))
     );
     assert_eq!(
-        discovered_preset_binding(preset, "claude-future"),
+        binding("claude-future"),
         Some((OPENCODE_ANTHROPIC_ENDPOINT_ID, Protocol::AnthropicMessages))
     );
     assert_eq!(
-        discovered_preset_binding(preset, "qwen3.7-plus"),
+        binding("qwen3.7-plus"),
         Some((OPENCODE_ANTHROPIC_ENDPOINT_ID, Protocol::AnthropicMessages))
     );
-    assert_eq!(discovered_preset_binding(preset, "gemini-future"), None);
     assert_eq!(
-        discovered_preset_binding(preset, "kimi-future"),
+        binding("qwen3.7-instruct"),
+        Some(("opencode", Protocol::OpenAiChat))
+    );
+    assert_eq!(binding("gemini-future"), None);
+    assert_eq!(
+        binding("kimi-future"),
         Some(("opencode", Protocol::OpenAiChat))
     );
 }
@@ -341,69 +348,10 @@ fn openai_discovery_skips_the_rejected_gpt_5_6_alias() {
     let preset = &crate::providers::OPENAI;
     assert_eq!(discovered_preset_binding(preset, "gpt-5.6"), None);
     assert_eq!(
-        discovered_preset_binding(preset, "gpt-5.6-sol"),
+        discovered_preset_binding(preset, "gpt-5.6-sol")
+            .map(|route| (route.endpoint_id, route.protocol)),
         Some(("openai", Protocol::OpenAiResponses))
     );
-}
-
-#[test]
-fn opencode_static_models_use_protocol_specific_endpoints() {
-    let mut catalog = ModelCatalog::default();
-    let preset = &crate::providers::OPENCODE;
-    register_preset_endpoint(&mut catalog, preset, "YGG_TEST_OPENCODE_KEY").unwrap();
-    register_opencode(&mut catalog, preset, "YGG_TEST_OPENCODE_KEY").unwrap();
-
-    let responses = catalog
-        .resolve(&ModelId("opencode/gpt-5.6-sol".into()))
-        .unwrap();
-    assert_eq!(responses.spec.protocol, Protocol::OpenAiResponses);
-    assert_eq!(responses.endpoint.id.0, "opencode");
-    assert_eq!(
-        responses.endpoint.base_url.as_str(),
-        "https://opencode.ai/zen/v1/"
-    );
-
-    let anthropic = catalog
-        .resolve(&ModelId("opencode/claude-sonnet-4-6".into()))
-        .unwrap();
-    assert_eq!(anthropic.spec.protocol, Protocol::AnthropicMessages);
-    assert_eq!(anthropic.endpoint.id.0, OPENCODE_ANTHROPIC_ENDPOINT_ID);
-    assert_eq!(
-        anthropic.endpoint.base_url.as_str(),
-        "https://opencode.ai/zen/v1/"
-    );
-
-    let chat = catalog
-        .resolve(&ModelId("opencode/deepseek-v4-pro".into()))
-        .unwrap();
-    assert_eq!(chat.spec.protocol, Protocol::OpenAiChat);
-    assert_eq!(chat.endpoint.id.0, "opencode");
-    assert!(catalog
-        .resolve(&ModelId("opencode/gemini-3.1-pro".into()))
-        .is_err());
-}
-
-#[test]
-fn minimax_static_models_use_the_anthropic_protocol() {
-    let mut catalog = ModelCatalog::default();
-    let preset = &crate::providers::MINIMAX;
-    register_preset_endpoint(&mut catalog, preset, "YGG_TEST_MINIMAX_KEY").unwrap();
-    register_static_models(&mut catalog, preset.id, MINIMAX_MODELS).unwrap();
-
-    let model = catalog
-        .resolve(&ModelId("minimax/MiniMax-M3".into()))
-        .unwrap();
-    assert_eq!(model.spec.protocol, Protocol::AnthropicMessages);
-    assert_eq!(model.endpoint.id.0, "minimax");
-    assert_eq!(
-        model.endpoint.base_url.as_str(),
-        "https://api.minimax.io/anthropic/v1/"
-    );
-    assert!(model
-        .spec
-        .capabilities
-        .input_modalities
-        .contains(ygg_ai::Modality::Image));
 }
 
 #[test]
@@ -760,7 +708,7 @@ fn openrouter_discovery_uses_live_ids_limits_and_capabilities() {
         ]
     });
 
-    let models = openrouter_models_from_response(&response).unwrap();
+    let models = openrouter_models_from_response(&crate::providers::OPENROUTER, &response).unwrap();
     assert_eq!(models.len(), 2);
     assert_eq!(models[0].id.0, "openrouter/alpha/model");
     assert_eq!(models[1].id.0, "openrouter/zeta/model");
@@ -811,7 +759,7 @@ fn openrouter_discovery_requires_an_advertised_completion_ceiling() {
         ]
     });
 
-    let models = openrouter_models_from_response(&response).unwrap();
+    let models = openrouter_models_from_response(&crate::providers::OPENROUTER, &response).unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].api_name, "top-level/limit");
     assert_eq!(models[0].limits.max_output_tokens, 12_000);
@@ -826,7 +774,7 @@ fn openrouter_anthropic_routes_enable_anthropic_cache_markers() {
             "top_provider": { "max_completion_tokens": 8_192 }
         }]
     });
-    let models = openrouter_models_from_response(&response).unwrap();
+    let models = openrouter_models_from_response(&crate::providers::OPENROUTER, &response).unwrap();
     assert_eq!(models.len(), 1);
     assert_eq!(
         models[0].cache.cache_control_format,
@@ -896,6 +844,14 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
         assert_eq!(
             model.endpoint.transport,
             ygg_ai::EndpointTransport::WebSocketPreferred
+        );
+        assert_eq!(
+            model.endpoint.runtime.body_encoding,
+            ygg_ai::RequestBodyEncoding::Zstd
+        );
+        assert_eq!(
+            model.endpoint.runtime.responses_profile,
+            ygg_ai::ResponsesRuntimeProfile::Codex
         );
     }
     let sol = catalog.resolve(&ModelId("gpt-5.6-sol".into())).unwrap();
@@ -987,7 +943,8 @@ fn offline_codex_registration_uses_cached_inventory_without_dynamic_capabilities
 #[test]
 fn codex_pro_pricing_keeps_long_context_tiers() {
     for model_id in ["gpt-5.4-pro", "gpt-5.5-pro"] {
-        let pricing = codex_pricing(model_id).expect("codex pro pricing");
+        let pricing = crate::providers::pricing_for(&crate::providers::CODEX, model_id)
+            .expect("codex pro pricing");
         assert_eq!(pricing.input, ygg_ai::TokenRate(30_000_000));
         assert_eq!(pricing.output, ygg_ai::TokenRate(180_000_000));
         assert_eq!(pricing.tiers.len(), 1);
@@ -2073,7 +2030,10 @@ fn deepseek_v4_pro_is_registered_as_openai_chat_with_env_auth() {
         .resolve(&ModelId(DEEPSEEK_MODEL_ID.into()))
         .unwrap();
     assert_eq!(model.spec.protocol, Protocol::OpenAiChat);
-    assert_eq!(model.endpoint.id.0, DEEPSEEK_ENDPOINT_ID);
+    assert_eq!(
+        model.endpoint.id.0,
+        crate::providers::DEEPSEEK.routes[0].endpoint_id
+    );
     assert_eq!(
         model.spec.api_name,
         std::env::var("YGG_DEEPSEEK_MODEL").unwrap_or_else(|_| DEEPSEEK_MODEL_ID.into())

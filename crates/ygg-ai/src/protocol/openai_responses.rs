@@ -302,7 +302,12 @@ fn map_responses_text(
             strict: schema.strict,
         }),
     };
-    let verbosity = (model.endpoint.id.0 == "openai-codex").then_some("low");
+    let verbosity = model
+        .endpoint
+        .runtime
+        .responses_profile
+        .uses_low_verbosity()
+        .then_some("low");
     (text_format.is_some() || verbosity.is_some()).then_some(ResponsesTextConfig {
         format: text_format,
         verbosity,
@@ -326,7 +331,11 @@ pub(crate) fn build_compact_request(
     // currently exposes a narrower schema and may reject these extra fields.
     let responses_lite = model.spec.capabilities.responses_lite;
     let reasoning = normalize_reasoning_config(reasoning, &model.spec.capabilities);
-    let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+    let rich_codex_schema = model
+        .endpoint
+        .runtime
+        .responses_profile
+        .supports_rich_compact_schema()
         || model.spec.cache.session_affinity_format
             == Some(crate::types::SessionAffinityFormat::Codex)
         || responses_lite;
@@ -815,14 +824,16 @@ pub(crate) fn build_request(
     // Only forward an explicit caller cap. The Responses API treats this as
     // optional, and the ChatGPT Codex backend rejects it outright
     // (`{"detail":"Unsupported parameter: max_output_tokens"}`), so we never
-    // synthesize a default from the local capacity limit. Additionally, the
-    // Codex endpoint (ID "openai-codex") does not support this parameter at
-    // all, so we always omit it for that endpoint.
-    let max_output_tokens = if model.endpoint.id.0 == "openai-codex" {
-        None
-    } else {
-        req.max_output_tokens
-    };
+    // synthesize a default from the local capacity limit. Subscription
+    // endpoints that reject this parameter select omission through runtime
+    // metadata rather than a codec-side provider identity check.
+    let max_output_tokens = (!model
+        .endpoint
+        .runtime
+        .responses_profile
+        .omits_max_output_tokens())
+    .then_some(req.max_output_tokens)
+    .flatten();
 
     let responses_options = req.responses.as_ref();
     let raw_input = responses_options.and_then(|options| options.input.as_ref());
@@ -1645,7 +1656,8 @@ mod tests {
     use crate::types::{
         Capabilities, Endpoint, EndpointId, ImageMedia, ImageSource, JsonSchemaFormat, Media,
         Message, ModalitySet, ModelId, ModelLimits, ModelSpec, OutputFormat, OutputModalities,
-        ProviderMediaRef, ReasoningConfig, Request, ToolChoice, UserMessage, UserPart,
+        ProviderMediaRef, ReasoningConfig, Request, ResponsesRuntimeProfile, ToolChoice,
+        UserMessage, UserPart,
     };
     use crate::CompatibilityMode;
     use std::sync::Arc;
@@ -1723,6 +1735,7 @@ mod tests {
             auth: crate::auth::Auth::none(),
             default_headers: http::HeaderMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout: std::time::Duration::from_secs(30),
         };
 
@@ -2328,12 +2341,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_wire_defaults_to_low_verbosity_and_gates_parallel_tools() {
+    fn declared_responses_runtime_defaults_to_low_verbosity_and_gates_parallel_tools() {
         let mut model = make_test_model(false);
-        Arc::make_mut(&mut model.endpoint).id = EndpointId("openai-codex".to_owned());
-        let spec = Arc::make_mut(&mut model.spec);
-        spec.endpoint = EndpointId("openai-codex".to_owned());
-        spec.capabilities.parallel_tool_calls = false;
+        Arc::make_mut(&mut model.endpoint).runtime.responses_profile =
+            ResponsesRuntimeProfile::Codex;
+        Arc::make_mut(&mut model.spec)
+            .capabilities
+            .parallel_tool_calls = false;
 
         let mut req = user_req(
             vec![UserPart::Text("hello".to_string())],

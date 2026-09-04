@@ -78,6 +78,7 @@ async fn live_openai_compatible_inline_png_reaches_the_model() {
             auth: Auth::bearer(api_key),
             default_headers: headers,
             transport: EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(120),
         }),
     };

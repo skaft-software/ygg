@@ -40,6 +40,9 @@ pub struct EndpointConfig {
     /// Preferred response transport.
     #[serde(default)]
     pub transport: crate::types::EndpointTransport,
+    /// Endpoint-specific request runtime behavior selected by a provider declaration.
+    #[serde(default)]
+    pub runtime: crate::types::RequestRuntime,
     /// Maximum time to send a request and receive response headers, in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -428,6 +431,7 @@ fn translate_endpoint(
         auth,
         default_headers,
         transport: cfg.transport,
+        runtime: cfg.runtime,
         timeout: std::time::Duration::from_secs(cfg.timeout_secs),
     })
 }
@@ -461,6 +465,7 @@ mod tests {
                 auth: crate::auth::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(300),
             })
             .unwrap();
@@ -502,6 +507,7 @@ mod tests {
                 auth: crate::auth::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(1),
             })
             .unwrap();
@@ -516,6 +522,7 @@ mod tests {
                 )),
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(1),
             })
             .unwrap();
@@ -656,6 +663,7 @@ mod tests {
             auth: AuthConfig::None,
             default_headers: BTreeMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout_secs: 10,
         }];
 
@@ -679,6 +687,7 @@ mod tests {
             auth: AuthConfig::None,
             default_headers: BTreeMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout_secs: 10,
         }];
         let cfg_slash = CatalogConfig {
@@ -706,6 +715,7 @@ mod tests {
                 },
                 default_headers,
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout_secs: 10,
             }],
             models: vec![],
@@ -740,6 +750,7 @@ mod tests {
                 },
                 default_headers: BTreeMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout_secs: 10,
             }],
             models: vec![],

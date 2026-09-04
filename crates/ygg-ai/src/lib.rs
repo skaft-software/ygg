@@ -75,9 +75,10 @@ pub use types::{
     ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OutputFormat, OutputModalities,
     Protocol, ProviderMediaRef, ReasoningCapability, ReasoningConfig, ReasoningControl,
     ReasoningEffort, ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState,
-    ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason,
-    ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId, ToolChoice, ToolDef,
-    ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    ReasoningStateKind, Request, RequestBodyEncoding, RequestRuntime, Response,
+    ResponsesRuntimeProfile, SessionAffinityFormat, StopReason, ToolArgumentValidation, ToolCall,
+    ToolCallArgumentError, ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage,
+    UserMessage, UserPart,
 };
 
 /// Validates normalized arguments against the exact tool-definition snapshot.

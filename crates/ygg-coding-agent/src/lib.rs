@@ -22,6 +22,14 @@ mod pi;
 mod presentation;
 mod prompts;
 mod providers;
+/// Credential-free provider definition and canonical catalog contribution API.
+pub mod provider {
+    pub use crate::providers::{
+        builtin_provider_definitions, CompatibilityProfile, PricingProfile, ProviderAccess,
+        ProviderAvailability, ProviderCatalogContributor, ProviderCatalogKind, ProviderDefinition,
+        ProviderDefinitionError, ProviderDiagnostic, ProviderRouteDefinition,
+    };
+}
 mod resource_resolver;
 mod resources;
 mod session_catalog;
