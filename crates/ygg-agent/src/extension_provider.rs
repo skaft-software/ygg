@@ -409,11 +409,11 @@ impl ExtensionProviderRegistry {
             .providers
             .get(&provider_id)
             .map_or(0, |record| record.models.len());
-        let next_providers = state
-            .providers
-            .contains_key(&provider_id)
-            .then_some(state.providers.len())
-            .unwrap_or_else(|| state.providers.len().saturating_add(1));
+        let next_providers = if state.providers.contains_key(&provider_id) {
+            state.providers.len()
+        } else {
+            state.providers.len().saturating_add(1)
+        };
         if next_providers > api_v03::MAX_PROVIDERS {
             return Err(ExtensionProviderRegistryError::ResourceExhausted(
                 "providers",
@@ -786,16 +786,15 @@ mod tests {
         let mut authenticated = provider();
         authenticated.auth.kind = "host_credential".into();
         authenticated.auth.subject = Some("fixture".into());
-        assert!(matches!(
-            registry.update(
+        assert!(registry
+            .update(
                 owner(1),
                 api_v03::ProviderUpdateParams {
                     provider: authenticated,
                     models: vec![model()],
                 },
-            ),
-            Ok(_)
-        ));
+            )
+            .is_ok());
         assert!(registry.resolve("fixture", "model").is_none());
     }
 }

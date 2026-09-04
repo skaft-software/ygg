@@ -1299,6 +1299,13 @@ impl ExecutableExtensions {
     /// Product bootstrap uses [`Self::discover_and_start_with_runtime_manager`]
     /// to retain compatible workspace services across an App rebuild. This
     /// wrapper preserves the direct construction seam used by focused tests.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the direct construction seam is exercised only by unit tests"
+        )
+    )]
     pub fn discover_and_start(
         config: &Config,
         session: &Session,
@@ -3126,6 +3133,10 @@ impl ExecutableExtensions {
     /// invoke this method because it writes nothing. A real ingestion path must
     /// pass the same stable ID on retry and call this only after commit or a
     /// completed rollback.
+    #[expect(
+        dead_code,
+        reason = "Pi migration remains dry-run-only until a committing ingestion path exists"
+    )]
     pub async fn notify_migration_ingested(
         &mut self,
         mutation_id: impl Into<String>,
@@ -3151,6 +3162,10 @@ impl ExecutableExtensions {
     ///
     /// The queue contains no raw paths or contents and is bounded independently
     /// of extension event/progress channels.
+    #[expect(
+        dead_code,
+        reason = "no committed product mutation path consumes deferred rescan requests yet"
+    )]
     pub fn take_post_mutation_rescans(&mut self) -> Vec<PostMutationRescan> {
         self.pending_post_mutation_rescans.drain(..).collect()
     }

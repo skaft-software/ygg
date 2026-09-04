@@ -20,6 +20,15 @@ use super::contract::{valid_public_header, ProviderDeclaration, ProviderRoute};
 use super::models::{static_models, StaticModelPreset};
 use super::pricing::pricing_for;
 
+/// Discovery metadata contributed for one declared provider model.
+pub(crate) struct DiscoveredModelMetadata<'a> {
+    pub api_name: &'a str,
+    pub display_name: Option<String>,
+    pub capabilities: Capabilities,
+    pub limits: ModelLimits,
+    pub pricing: Option<ygg_ai::Pricing>,
+}
+
 /// Register every unique route endpoint for an environment-authenticated
 /// declaration.
 pub(crate) fn register_environment_endpoints(
@@ -201,11 +210,13 @@ pub(crate) fn register_discovered_model(
         catalog,
         declaration,
         route,
-        api_name,
-        display_name,
-        capabilities,
-        limits,
-        pricing,
+        DiscoveredModelMetadata {
+            api_name,
+            display_name,
+            capabilities,
+            limits,
+            pricing,
+        },
     )
 }
 
@@ -217,12 +228,15 @@ pub(crate) fn register_discovered_model_at_route(
     catalog: &mut ModelCatalog,
     declaration: &ProviderDeclaration,
     route: &ProviderRoute,
-    api_name: &str,
-    display_name: Option<String>,
-    capabilities: Capabilities,
-    limits: ModelLimits,
-    pricing: Option<ygg_ai::Pricing>,
+    metadata: DiscoveredModelMetadata<'_>,
 ) -> anyhow::Result<()> {
+    let DiscoveredModelMetadata {
+        api_name,
+        display_name,
+        capabilities,
+        limits,
+        pricing,
+    } = metadata;
     if !declaration.routes.contains(route) {
         anyhow::bail!("discovery route is not declared by the provider");
     }

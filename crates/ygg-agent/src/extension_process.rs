@@ -8945,10 +8945,16 @@ struct ProviderFinishedPayload {
 }
 
 enum DecodedProviderStreamEvent {
-    Emit(StreamEvent),
+    Emit(Box<StreamEvent>),
     Finish(StopReason),
     Heartbeat,
     Error,
+}
+
+impl DecodedProviderStreamEvent {
+    fn emit(event: StreamEvent) -> Self {
+        Self::Emit(Box::new(event))
+    }
 }
 
 enum ProviderStreamWait {
@@ -8976,32 +8982,32 @@ fn decode_provider_stream_event(
     match event.kind.as_str() {
         "started" => {
             let payload: ProviderStartedPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::Started {
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::Started {
                 response_id: payload.response_id,
             }))
         }
         "text_start" => {
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextStart {
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::TextStart {
                 index: payload.index,
             }))
         }
         "text_delta" => {
             let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextDelta {
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::TextDelta {
                 index: payload.index,
                 delta: payload.delta,
             }))
         }
         "text_end" => {
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextEnd {
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::TextEnd {
                 index: payload.index,
             }))
         }
         "reasoning_start" => {
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(
+            Ok(DecodedProviderStreamEvent::emit(
                 StreamEvent::ReasoningStart {
                     index: payload.index,
                 },
@@ -9009,7 +9015,7 @@ fn decode_provider_stream_event(
         }
         "reasoning_delta" => {
             let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(
+            Ok(DecodedProviderStreamEvent::emit(
                 StreamEvent::ReasoningDelta {
                     index: payload.index,
                     delta: payload.delta,
@@ -9018,7 +9024,7 @@ fn decode_provider_stream_event(
         }
         "reasoning_end" => {
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(
+            Ok(DecodedProviderStreamEvent::emit(
                 StreamEvent::ReasoningEnd {
                     index: payload.index,
                 },
@@ -9029,7 +9035,7 @@ fn decode_provider_stream_event(
             if payload.id.is_empty() || payload.name.is_empty() {
                 return Err(invalid_provider_stream_event());
             }
-            Ok(DecodedProviderStreamEvent::Emit(
+            Ok(DecodedProviderStreamEvent::emit(
                 StreamEvent::ToolCallStart {
                     index: payload.index,
                     id: ToolCallId(payload.id),
@@ -9039,7 +9045,7 @@ fn decode_provider_stream_event(
         }
         "tool_call_args_delta" => {
             let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(
+            Ok(DecodedProviderStreamEvent::emit(
                 StreamEvent::ToolCallArgsDelta {
                     index: payload.index,
                     delta: payload.delta,
@@ -9048,14 +9054,14 @@ fn decode_provider_stream_event(
         }
         "tool_call_end" => {
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::ToolCallEnd {
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::ToolCallEnd {
                 index: payload.index,
                 argument_error: None,
             }))
         }
         "usage" => {
             let payload: ProviderUsagePayload = decode_provider_stream_payload(payload)?;
-            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::Usage(
+            Ok(DecodedProviderStreamEvent::emit(StreamEvent::Usage(
                 payload.into(),
             )))
         }
@@ -9150,6 +9156,7 @@ fn extension_provider_response_stream(
             assembler.observe_transport_event()?;
             match decode_provider_stream_event(event)? {
                 DecodedProviderStreamEvent::Emit(event) => {
+                    let event = *event;
                     assembler.push(event.clone())?;
                     yield event;
                 }

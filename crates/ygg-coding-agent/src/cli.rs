@@ -341,6 +341,8 @@ struct RegisteredExtensionFlag {
     negative_argument_id: Option<String>,
 }
 
+type ExtensionFlagValues = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
 #[derive(Default)]
 struct ExtensionFlagBootstrap {
     workspace: Option<PathBuf>,
@@ -439,12 +441,14 @@ fn extension_flag_bootstrap(args: &[OsString]) -> Option<ExtensionFlagBootstrap>
 
 fn bootstrap_extension_config(args: &[OsString], cwd: &Path) -> Option<Config> {
     let bootstrap = extension_flag_bootstrap(args)?;
-    let mut cli = Cli::default();
-    cli.workspace = bootstrap.workspace;
-    cli.extension_dirs = bootstrap.extension_dirs;
-    cli.enable_extensions = bootstrap.enable_extensions;
-    cli.trust_extensions = bootstrap.trust_extensions;
-    cli.workspace_trusted = bootstrap.workspace_trusted;
+    let cli = Cli {
+        workspace: bootstrap.workspace,
+        extension_dirs: bootstrap.extension_dirs,
+        enable_extensions: bootstrap.enable_extensions,
+        trust_extensions: bootstrap.trust_extensions,
+        workspace_trusted: bootstrap.workspace_trusted,
+        ..Cli::default()
+    };
     build_config_for_extension_flags(cli, cwd).ok()
 }
 
@@ -555,8 +559,8 @@ fn supplied_by_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
 fn resolve_extension_flag_values(
     matches: &clap::ArgMatches,
     registered: &[RegisteredExtensionFlag],
-) -> anyhow::Result<BTreeMap<String, BTreeMap<String, serde_json::Value>>> {
-    let mut values = BTreeMap::<String, BTreeMap<String, serde_json::Value>>::new();
+) -> anyhow::Result<ExtensionFlagValues> {
+    let mut values: ExtensionFlagValues = BTreeMap::new();
     for flag in registered {
         let value = match flag.declaration.kind {
             ExtensionFlagType::Boolean if supplied_by_command_line(matches, &flag.argument_id) => {
@@ -688,7 +692,7 @@ fn parse_static_or_exit(args: Vec<OsString>) -> Cli {
 pub(crate) fn parse_with_extension_flags(
     args: Vec<OsString>,
     cwd: &Path,
-) -> anyhow::Result<(Cli, BTreeMap<String, BTreeMap<String, serde_json::Value>>)> {
+) -> anyhow::Result<(Cli, ExtensionFlagValues)> {
     let static_args = args.clone();
     let declarations = bootstrap_extension_config(&args, cwd)
         .map(|config| crate::extensions::selected_extension_flag_declarations(&config))

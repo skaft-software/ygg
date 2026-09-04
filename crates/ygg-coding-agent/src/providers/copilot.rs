@@ -632,11 +632,13 @@ impl CopilotProvider {
                 &mut staged,
                 &COPILOT_DECLARATION,
                 route,
-                &model.id,
-                model.display_name,
-                model.capabilities,
-                model.limits,
-                None,
+                super::catalog::DiscoveredModelMetadata {
+                    api_name: &model.id,
+                    display_name: model.display_name,
+                    capabilities: model.capabilities,
+                    limits: model.limits,
+                    pricing: None,
+                },
             )
             .map_err(|_| CopilotAvailabilityError::InvalidModelMetadata)?;
         }

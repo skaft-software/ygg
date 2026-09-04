@@ -1551,9 +1551,7 @@ mod tests {
             "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture-openai-responses\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
         );
-        const GOOGLE: &str = concat!(
-            "data: {\"responseId\":\"fixture-google\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fixture\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n",
-        );
+        const GOOGLE: &str = "data: {\"responseId\":\"fixture-google\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"fixture\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n";
 
         match protocol {
             "anthropic_messages" => FixtureStreamResponse {

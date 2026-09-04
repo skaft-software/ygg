@@ -2399,16 +2399,18 @@ struct ProviderRetryDecision {
     additional_delay: Duration,
 }
 
-async fn provider_retry_decision(
-    hooks: &[Arc<dyn ProviderRetryHook>],
-    run_id: &str,
-    resource_owner: &str,
-    attempt: usize,
-    max_attempts: usize,
-    host_delay: Duration,
-    kind: ProviderRetryKind,
-    abort: &AbortFlag,
-) -> ProviderRetryDecision {
+struct ProviderRetryRequest<'a> {
+    hooks: &'a [Arc<dyn ProviderRetryHook>],
+    context: ProviderRetryContext,
+    abort: &'a AbortFlag,
+}
+
+async fn provider_retry_decision(request: ProviderRetryRequest<'_>) -> ProviderRetryDecision {
+    let ProviderRetryRequest {
+        hooks,
+        context,
+        abort,
+    } = request;
     if abort.is_set() {
         return ProviderRetryDecision {
             proceed: false,
@@ -2416,14 +2418,6 @@ async fn provider_retry_decision(
         };
     }
     let deadline = tokio::time::Instant::now() + PROVIDER_RETRY_HOOK_BUDGET;
-    let context = ProviderRetryContext {
-        run_id: run_id.to_owned(),
-        resource_owner: resource_owner.to_owned(),
-        attempt,
-        max_attempts,
-        host_delay,
-        kind,
-    };
     let mut additional_delay = Duration::ZERO;
     for hook in hooks {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -5641,16 +5635,18 @@ impl Agent {
                                 break Ok(None);
                             }
                             let host_delay = retry_after(&error, stream_retries);
-                            let retry_decision = provider_retry_decision(
-                                &provider_retry_hooks,
-                                &effect_run_id,
-                                &resource_owner,
-                                stream_retries.saturating_add(1),
-                                retry_limit,
-                                host_delay,
-                                ProviderRetryKind::BeforeGeneration,
-                                &abort,
-                            )
+                            let retry_decision = provider_retry_decision(ProviderRetryRequest {
+                                hooks: &provider_retry_hooks,
+                                context: ProviderRetryContext {
+                                    run_id: effect_run_id.clone(),
+                                    resource_owner: resource_owner.clone(),
+                                    attempt: stream_retries.saturating_add(1),
+                                    max_attempts: retry_limit,
+                                    host_delay,
+                                    kind: ProviderRetryKind::BeforeGeneration,
+                                },
+                                abort: &abort,
+                            })
                             .await;
                             if !retry_decision.proceed {
                                 if abort.is_set() {
@@ -5806,16 +5802,18 @@ impl Agent {
                                 && retryable_stream_start(&error);
                             let host_delay = retry_after(&error, stream_retries);
                             let retry_decision = if retry_candidate {
-                                provider_retry_decision(
-                                    &provider_retry_hooks,
-                                    &effect_run_id,
-                                    &resource_owner,
-                                    stream_retries.saturating_add(1),
-                                    MAX_PROVIDER_RETRIES,
-                                    host_delay,
-                                    ProviderRetryKind::StreamStart,
-                                    &abort,
-                                )
+                                provider_retry_decision(ProviderRetryRequest {
+                                    hooks: &provider_retry_hooks,
+                                    context: ProviderRetryContext {
+                                        run_id: effect_run_id.clone(),
+                                        resource_owner: resource_owner.clone(),
+                                        attempt: stream_retries.saturating_add(1),
+                                        max_attempts: MAX_PROVIDER_RETRIES,
+                                        host_delay,
+                                        kind: ProviderRetryKind::StreamStart,
+                                    },
+                                    abort: &abort,
+                                })
                                 .await
                             } else {
                                 ProviderRetryDecision {
@@ -5941,16 +5939,18 @@ impl Agent {
                                     break 'consume Err(FinishReason::Aborted);
                                 }
                                 let host_delay = retry_after(&error, stream_retries);
-                                let retry_decision = provider_retry_decision(
-                                    &provider_retry_hooks,
-                                    &effect_run_id,
-                                    &resource_owner,
-                                    stream_retries.saturating_add(1),
-                                    retry_limit,
-                                    host_delay,
-                                    ProviderRetryKind::StreamStart,
-                                    &abort,
-                                )
+                                let retry_decision = provider_retry_decision(ProviderRetryRequest {
+                                    hooks: &provider_retry_hooks,
+                                    context: ProviderRetryContext {
+                                        run_id: effect_run_id.clone(),
+                                        resource_owner: resource_owner.clone(),
+                                        attempt: stream_retries.saturating_add(1),
+                                        max_attempts: retry_limit,
+                                        host_delay,
+                                        kind: ProviderRetryKind::StreamStart,
+                                    },
+                                    abort: &abort,
+                                })
                                 .await;
                                 if !retry_decision.proceed {
                                     if abort.is_set() {
