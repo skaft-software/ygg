@@ -42,6 +42,14 @@ class ExtensionApiV03ConformanceTests(unittest.TestCase):
         self.assertEqual(tool_result.structured_content.kind, "value")
         self.assertEqual(tool_result.structured_content.value, {"value": "hello"})
         api.validate_cancel_request_params(api.parse_cancel_request_params(self.fixture("cancel-request-params")))
+        api.parse_session_create_params(self.fixture("session-create-params"))
+        api.parse_session_fork_params(self.fixture("session-fork-params"))
+        api.parse_session_switch_params(self.fixture("session-switch-params"))
+        api.parse_session_reload_params(self.fixture("session-reload-params"))
+        self.assertEqual(
+            api.parse_session_lifecycle_result(self.fixture("session-lifecycle-result")).session_id,
+            "2026-03-16-0001",
+        )
         api.validate_shutdown_params(api.parse_shutdown_params(self.fixture("shutdown-params")))
         api.validate_shutdown_result(api.parse_shutdown_result(self.fixture("shutdown-result")))
         api.validate_error_object(api.parse_error_object(self.fixture("error-data-absent")))
@@ -76,6 +84,31 @@ class ExtensionApiV03ConformanceTests(unittest.TestCase):
         self.assertEqual(offer.limits.max_frame_bytes, api.MAX_FRAME_BYTES)
         self.assertEqual(offer.limits.max_concurrent_requests, api.MAX_CONCURRENT_REQUESTS)
         negotiated = api.negotiate(offer, api.select_required(offer))
+        unbound_lifecycle_offer = api.ContractOffer(
+            schema=offer.schema,
+            encoding=offer.encoding,
+            required_capabilities=offer.required_capabilities,
+            optional_capabilities=[],
+            required_methods=offer.required_methods,
+            optional_methods=[],
+            limits=offer.limits,
+        )
+        api.validate_offer(unbound_lifecycle_offer)
+        self.assertEqual(
+            self.error_code(
+                lambda: api.negotiate(
+                    unbound_lifecycle_offer,
+                    api.ContractSelection(
+                        schema=offer.schema,
+                        encoding=offer.encoding,
+                        capabilities=[*offer.required_capabilities, "session_lifecycle"],
+                        methods=[*offer.required_methods, "session/create"],
+                        limits=offer.limits,
+                    ),
+                )
+            ),
+            -32011,
+        )
         api.require_method(negotiated, "initialize", "host_to_extension")
         self.assertEqual(
             self.error_code(lambda: api.require_method(negotiated, "future/call", "host_to_extension")),

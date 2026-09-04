@@ -5028,6 +5028,36 @@ impl Agent {
         })
     }
 
+    /// Replaces the durable active session at an idle boundary.
+    ///
+    /// Active V2 delegation owns session-scoped child resources, so callers
+    /// must rebuild that runtime instead of retargeting it in place.
+    pub fn replace_session_at_idle(&mut self, session: Session) -> Result<(), AgentError> {
+        if self.delegation.is_some() {
+            return Err(AgentError::Delegation(
+                "active session changes require a rebuild while V2 delegation is enabled".into(),
+            ));
+        }
+        if self
+            .last_run_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.dropped.load(Ordering::Acquire))
+        {
+            // Match `Drop`: preserve an interrupted old session before its
+            // owner is replaced.
+            persist_pending_cancellations(&mut self.session)?;
+        }
+        let resource_owner = session.resource_owner_key();
+        self.session_id = resource_owner.clone();
+        self.resource_owner = resource_owner;
+        self.session = session;
+        self.last_run_lifecycle = None;
+        // This is a one-shot transcript projection for a future prompt in the
+        // old session, not a durable cross-session setting.
+        self.prompt_display_text = None;
+        Ok(())
+    }
+
     /// Mutable access to the session for history operations between runs
     /// (checkout, manual compaction, config entries).
     pub fn session_mut(&mut self) -> &mut Session {
@@ -7265,6 +7295,45 @@ mod tests {
         assert_eq!(context.tool_call_count, 0);
         assert_eq!(context.reasoning_part_count, 0);
         assert_eq!(context.media_part_count, 0);
+    }
+
+    #[test]
+    fn idle_session_replacement_updates_the_durable_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.jsonl");
+        let replacement_path = directory.path().join("replacement.jsonl");
+        let first = Session::create(&first_path).unwrap();
+        let replacement = Session::create(&replacement_path).unwrap();
+        let replacement_owner = replacement.resource_owner_key();
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let mut agent = Agent::new(AgentConfig {
+            client: AiClient::new(),
+            model,
+            session: first,
+            system: "system".into(),
+            sandbox: SandboxConfig::new(directory.path()),
+            effect_broker: EffectBroker::default(),
+            extensions: ExtensionHost::new(),
+            max_turns: Some(1),
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
+            cache_retention: CacheRetention::Short,
+            session_id: None,
+        })
+        .unwrap();
+        let first_owner = agent.resource_owner.clone();
+        agent.set_prompt_display_text(Some("old session draft".into()));
+
+        agent.replace_session_at_idle(replacement).unwrap();
+
+        assert_eq!(agent.session().path(), replacement_path);
+        assert_eq!(agent.resource_owner, replacement_owner);
+        assert_eq!(agent.session_id, replacement_owner);
+        assert_eq!(agent.prompt_display_text, None);
+        assert_ne!(agent.resource_owner, first_owner);
     }
 
     #[test]

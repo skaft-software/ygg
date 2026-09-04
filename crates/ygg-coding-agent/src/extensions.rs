@@ -32,10 +32,12 @@ use ygg_agent::extension_process::{
     ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
     ExtensionLifecycleOutcome, ExtensionManifest, ExtensionPolicy,
     ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
-    ExtensionRuntimeConfig, ExtensionSource, ExtensionTerminalInput, ExtensionTerminalResize,
-    ExtensionTrust, ExtensionUiContribution, ExtensionUiSurface, ExtensionWidgetPlacement,
-    ShortcutDefinition, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
-    EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
+    ExtensionRuntimeConfig, ExtensionRuntimeSharing, ExtensionSessionLifecycleReceiver,
+    ExtensionSessionLifecycleRequest, ExtensionSessionLifecycleService, ExtensionSource,
+    ExtensionTerminalInput, ExtensionTerminalResize, ExtensionTrust, ExtensionUiContribution,
+    ExtensionUiSurface, ExtensionWidgetPlacement, ShortcutDefinition, ToolRenderRequest,
+    ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
+    EXTENSION_API_VERSION_0_3, EXTENSION_FEATURE_AGENT_SESSIONS,
     EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES, MAX_EXTENSION_UI_LINES,
 };
@@ -50,7 +52,7 @@ use ygg_agent::{
 };
 use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
 };
@@ -126,8 +128,23 @@ const MAX_PROJECTED_EXTENSION_UI_LINES: usize = if MAX_EXTENSION_UI_ENTRIES > MA
 } else {
     MAX_EXTENSION_UI_LINES
 };
+const SESSION_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
 const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: safe mode denies extension process startup; rerun without --safe-mode only inside OS-level isolation";
 static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The active-session driver is dispatched only by the interactive idle loop.
+/// Other frontends must not advertise an operation they cannot settle safely.
+fn active_session_lifecycle_enabled(config: &Config) -> bool {
+    matches!(&config.mode, Mode::Interactive)
+}
+
+/// A lifecycle driver belongs to exactly one interactive session, so it may
+/// only be injected into an isolated API 0.3 process. Shared and legacy
+/// processes must never retain a binding-specific reverse service.
+fn extension_session_lifecycle_eligible(descriptor: &DiscoveredExtension) -> bool {
+    descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3
+        && descriptor.manifest.runtime.sharing == ExtensionRuntimeSharing::Isolated
+}
 
 #[derive(serde::Serialize)]
 struct BeforePromptHookPayload<'a> {
@@ -956,6 +973,8 @@ pub struct ExecutableExtensions {
     input_cancellations: VecDeque<PendingInputCancellation>,
     input_tasks: Vec<JoinHandle<()>>,
     policy_supervisors: Vec<JoinHandle<()>>,
+    session_lifecycle_service: Option<ExtensionSessionLifecycleService>,
+    session_lifecycle_receiver: Option<ExtensionSessionLifecycleReceiver>,
     session_id: Option<String>,
     resource_owner: Option<String>,
     session_started_at: Instant,
@@ -1218,6 +1237,8 @@ impl Default for ExecutableExtensions {
             input_cancellations: VecDeque::new(),
             input_tasks: Vec::new(),
             policy_supervisors: Vec::new(),
+            session_lifecycle_service: None,
+            session_lifecycle_receiver: None,
             session_id: None,
             resource_owner: None,
             session_started_at: Instant::now(),
@@ -1444,6 +1465,18 @@ impl ExecutableExtensions {
             .cloned()
             .collect::<Vec<_>>();
 
+        let (session_lifecycle_service, session_lifecycle_receiver) =
+            if active_session_lifecycle_enabled(config)
+                && startable.iter().any(extension_session_lifecycle_eligible)
+            {
+                let (service, receiver) =
+                    ExtensionSessionLifecycleService::channel(SESSION_LIFECYCLE_QUEUE_CAPACITY)
+                        .expect("fixed session lifecycle queue capacity is bounded");
+                (Some(service), Some(receiver))
+            } else {
+                (None, None)
+            };
+
         // Discovery remains static. Catalog construction reads bounded source
         // identity only; the durable manager is the sole owner allowed to
         // activate a process after policy/trust gates have admitted it.
@@ -1469,6 +1502,7 @@ impl ExecutableExtensions {
             if let Some(manager) = managed_runtime.clone() {
                 let workspace = config.workspace.clone();
                 let state = host_state.clone();
+                let session_lifecycle_service = session_lifecycle_service.clone();
                 let subagents_tool_available =
                     model.spec.capabilities.tools && config.tool_available("subagent_spawn");
                 let extension_flag_values = config.extension_flag_values.clone();
@@ -1493,6 +1527,12 @@ impl ExecutableExtensions {
                             runtime.agent_sessions = entry.descriptor.manifest.name
                                 == SUBAGENTS_EXTENSION_NAME
                                 && subagents_tool_available;
+                            runtime.session_lifecycle =
+                                if extension_session_lifecycle_eligible(&entry.descriptor) {
+                                    session_lifecycle_service.clone()
+                                } else {
+                                    None
+                                };
                             runtime
                         })
                         .await;
@@ -1651,6 +1691,8 @@ impl ExecutableExtensions {
         extensions.shortcuts = shortcuts;
         extensions.summaries = summaries;
         extensions.diagnostics.extend(diagnostics);
+        extensions.session_lifecycle_service = session_lifecycle_service;
+        extensions.session_lifecycle_receiver = session_lifecycle_receiver;
         extensions.session_id = host_state.session_id.clone();
         extensions.resource_owner = Some(session.resource_owner_key());
         extensions.start_policy_supervisors();
@@ -1665,6 +1707,28 @@ impl ExecutableExtensions {
     /// transferring process ownership to a session object.
     pub fn runtime_manager(&self) -> Option<ExtensionRuntimeManager> {
         self.runtime_manager.clone()
+    }
+
+    /// Enables requests only after an interactive application has a safely
+    /// bound active session. Startup and rebuild leave the queue inactive.
+    pub fn activate_session_lifecycle_driver(&self) {
+        if let Some(service) = &self.session_lifecycle_service {
+            service.activate();
+        }
+    }
+
+    /// Fences queued work before shutdown or replacement of the owning app.
+    pub fn deactivate_session_lifecycle_driver(&self) {
+        if let Some(service) = &self.session_lifecycle_service {
+            service.deactivate();
+        }
+    }
+
+    /// Takes one current active-session request at an interactive idle boundary.
+    pub fn next_session_lifecycle_request(&mut self) -> Option<ExtensionSessionLifecycleRequest> {
+        self.session_lifecycle_receiver
+            .as_mut()
+            .and_then(ExtensionSessionLifecycleReceiver::try_next)
     }
 
     pub fn bind_agent_sessions(&self, agent: &Agent) -> anyhow::Result<usize> {
@@ -2179,6 +2243,66 @@ impl ExecutableExtensions {
             );
         }
         lines.join("\n")
+    }
+
+    /// Settles the old observational session boundary, updates every live
+    /// process snapshot, starts observation for the replacement session, and
+    /// fences queued active-session mutations from the previous snapshot. The
+    /// active agent has already changed by the time this is called.
+    pub fn transition_active_session(
+        &mut self,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+    ) {
+        if self.session_lifecycle_started {
+            let outcome = ExtensionLifecycleOutcome::Completed;
+            if let Some(resource_owner) = self.resource_owner.clone() {
+                let processes = self.processes.clone();
+                match block_on_runtime(async move {
+                    settle_session_hooks_all(&processes, &resource_owner, outcome).await
+                }) {
+                    Ok(messages) => self.diagnostics.extend(messages),
+                    Err(error) => self.diagnostics.push(format!(
+                        "warning: extension session hooks could not settle: {error}"
+                    )),
+                }
+            }
+            if let Some(session_id) = self.session_id.clone() {
+                let processes = self.processes.clone();
+                let event = ExtensionLifecycleEvent::SessionSettled {
+                    session_id,
+                    run_id: None,
+                    outcome,
+                    duration_ms: duration_millis(self.session_started_at.elapsed()),
+                    reason: Some("active session changed".into()),
+                };
+                match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await })
+                {
+                    Ok(messages) => self.diagnostics.extend(messages),
+                    Err(error) => self.diagnostics.push(format!(
+                        "warning: extension session lifecycle could not settle: {error}"
+                    )),
+                }
+            }
+            self.session_lifecycle_started = false;
+        }
+        self.last_lifecycle_outcome = None;
+        // Contributions and owner-scoped presentation are observations of the
+        // old active session and must not bleed into the replacement.
+        self.pending_context = PendingContext::default();
+        self.session_id = host_state(session, model, reasoning, sessions).session_id;
+        self.resource_owner = Some(session.resource_owner_key());
+        let active_owner = self.resource_owner.as_deref();
+        self.presentations.retain(|_, view| {
+            view.resource_owner.is_none() || view.resource_owner.as_deref() == active_owner
+        });
+        self.refresh_host_state(session, model, reasoning, sessions);
+        self.start_session_lifecycle();
+        // The session changed in place, so requests admitted against the old
+        // snapshot must not run against this replacement.
+        self.activate_session_lifecycle_driver();
     }
 
     pub fn refresh_host_state(
@@ -3204,6 +3328,10 @@ impl ExecutableExtensions {
     /// deliberately left with the runtime manager so a compatible replacement
     /// App can bind them without a stop/restart gap.
     pub async fn release_binding(&mut self) {
+        // A replacement App must not inherit work queued against the old
+        // owner. Isolated lifecycle processes are stopped below; shared and
+        // legacy processes never receive this service.
+        self.deactivate_session_lifecycle_driver();
         self.cancel_background_work();
         self.settle_session_lifecycle().await;
         for process in &self.processes {
@@ -4028,6 +4156,7 @@ impl ExecutableExtensions {
 
 impl Drop for ExecutableExtensions {
     fn drop(&mut self) {
+        self.deactivate_session_lifecycle_driver();
         self.cancel_background_work();
         if !self.processes.is_empty() {
             // Mode error paths still pass through this boundary. In the normal
@@ -4810,6 +4939,69 @@ args = ["--keep", "--experimental-streamable-http-mcp"]
         assert_eq!(presentations["fixture-extension"].snapshot.revision, 0);
     }
 
+    #[test]
+    fn active_session_transition_discards_old_context_and_owner_presentations() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = Session::create(directory.path().join("old.jsonl")).unwrap();
+        let replacement = Session::create(directory.path().join("replacement.jsonl")).unwrap();
+        let old_owner = old.resource_owner_key();
+        let replacement_owner = replacement.resource_owner_key();
+        let sessions = SessionStore::new(&directory.path().join("sessions"), directory.path());
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let snapshot: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.session_id = Some("old".into());
+        extensions.resource_owner = Some(old_owner.clone());
+        extensions
+            .pending_context
+            .try_push(ContextContribution {
+                label: "old context".into(),
+                content: "must not reach the replacement".into(),
+                placement: ContextPlacement::PromptSuffix,
+            })
+            .unwrap();
+        extensions.presentations.insert(
+            "old-owner".into(),
+            ExtensionPresentationView {
+                extension: "fixture-extension".into(),
+                generation: 1,
+                extension_instance_id: "instance".into(),
+                resource_owner: Some(old_owner),
+                snapshot: snapshot.clone(),
+            },
+        );
+        extensions.presentations.insert(
+            "global".into(),
+            ExtensionPresentationView {
+                extension: "fixture-extension".into(),
+                generation: 1,
+                extension_instance_id: "instance".into(),
+                resource_owner: None,
+                snapshot,
+            },
+        );
+
+        extensions.transition_active_session(
+            &replacement,
+            &model,
+            &ReasoningConfig::Off,
+            &sessions,
+        );
+
+        assert!(extensions.pending_context.entries.is_empty());
+        assert_eq!(extensions.pending_context.retained_bytes, 0);
+        assert_eq!(
+            extensions.resource_owner.as_deref(),
+            Some(replacement_owner.as_str())
+        );
+        assert!(!extensions.presentations.contains_key("old-owner"));
+        assert!(extensions.presentations.contains_key("global"));
+    }
+
     fn write_extension_manifest(directory: &Path, name: &str, description: &str) {
         std::fs::create_dir_all(directory).unwrap();
         std::fs::write(
@@ -4916,6 +5108,22 @@ flags = [{{ name = {flag:?}, type = "boolean", default = false }}]
                 .collect::<Vec<_>>(),
             vec![("flag-trusted", "trusted-option")]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_session_lifecycle_is_offered_only_to_interactive_frontends() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = executable_extension_config(temp.path(), temp.path(), "fixture");
+        assert!(active_session_lifecycle_enabled(&config));
+
+        config.mode = crate::config::Mode::Print {
+            prompt: "one-shot".into(),
+        };
+        assert!(!active_session_lifecycle_enabled(&config));
+
+        config.mode = crate::config::Mode::Rpc;
+        assert!(!active_session_lifecycle_enabled(&config));
     }
 
     #[cfg(unix)]

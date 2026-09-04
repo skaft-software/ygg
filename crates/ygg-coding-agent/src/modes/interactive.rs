@@ -11,10 +11,13 @@ use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
-use ygg_agent::extension_process::ExtensionInputRequest;
-use ygg_agent::extension_process::MAX_EXTENSION_TERMINAL_INPUT_BYTES;
+use ygg_agent::extension_api_v03::MAX_JSON_RPC_ID_BYTES;
 #[cfg(unix)]
-use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch};
+use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch, ProcessGroupGuard};
+use ygg_agent::extension_process::{
+    ExtensionInputRequest, ExtensionSessionLifecycleError, ExtensionSessionLifecycleOperation,
+    ExtensionSessionLifecycleRequest, MAX_EXTENSION_TERMINAL_INPUT_BYTES,
+};
 use ygg_agent::{
     analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
     GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session, ToolProgress,
@@ -22,8 +25,8 @@ use ygg_agent::{
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
-    build_app, effective_compaction_threshold_fraction, estimate_text_tokens, rebuild_app,
-    resolve_launch_interactive, Bootstrap,
+    build_app, effective_compaction_threshold_fraction, estimate_text_tokens, open_launch_session,
+    rebuild_app, resolve_launch_interactive, terminal_goal_session_id, Bootstrap, SessionSelection,
 };
 use crate::app::{
     apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
@@ -226,10 +229,10 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
     queue.push_back(action);
 }
 
-#[derive(Debug)]
 enum Idle {
     Submit(ComposedInput),
     Command(String),
+    SessionLifecycle(ExtensionSessionLifecycleRequest),
     GoalContinuation,
     CycleThinking,
     Quit,
@@ -432,6 +435,14 @@ where
                 }
             } => return Ok(Idle::GoalContinuation),
             _ = extension_tick.tick() => {
+                // A modal is an in-progress interactive action, not a safe
+                // active-session replacement boundary. Keep the bounded
+                // request queued until the frontend returns to its prompt.
+                if !shell.has_panel() && !shell.has_overlay() {
+                    if let Some(request) = executable_extensions.next_session_lifecycle_request() {
+                        return Ok(Idle::SessionLifecycle(request));
+                    }
+                }
                 if apply_extension_background(shell, executable_extensions) {
                     shell.render();
                 }
@@ -1913,6 +1924,8 @@ async fn reload_resources(
     shell.set_theme(theme);
     shell.set_runtime_config(app.config.clone());
     shell.hydrate(app.agent.session())?;
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     update_status(shell, &app);
     Ok(app)
 }
@@ -2849,6 +2862,8 @@ async fn checkout_entry(
         return Err(error);
     }
     update_status(shell, &app);
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     shell.notice(format!(
         "checked out entry {display_id}; future messages will create a branch"
     ));
@@ -2867,7 +2882,179 @@ async fn transition(
     .await?;
     shell.hydrate(app.agent.session())?;
     update_status(shell, &app);
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     Ok(app)
+}
+
+fn bounded_extension_session_id(session_id: String) -> anyhow::Result<String> {
+    if session_id.len() > MAX_JSON_RPC_ID_BYTES {
+        anyhow::bail!("session identifier exceeds the API 0.3 result bound");
+    }
+    Ok(session_id)
+}
+
+fn session_id_for_path(path: &Path) -> anyhow::Result<String> {
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("session path has no valid identifier"))?;
+    bounded_extension_session_id(session_id)
+}
+
+async fn create_extension_session(
+    app: &App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<String> {
+    let path = app.sessions.new_path(&crate::modes::timestamp());
+    run_blocking_lifecycle(shell, input, "creating session…", move || {
+        let mut prepared = None;
+        let session = open_launch_session(&mut prepared, SessionSelection::CreateNew(path))?;
+        bounded_extension_session_id(terminal_goal_session_id(&session)?)
+    })
+    .await
+}
+
+async fn fork_extension_session(
+    app: &App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<String> {
+    let sessions = app.sessions.clone();
+    let source_path = app.agent.session().path().to_owned();
+    let destination = sessions.new_path(&crate::modes::timestamp());
+    let checkpoint = app.agent.session().head();
+    run_blocking_lifecycle(shell, input, "forking session…", move || {
+        let path = fork_active_session(&sessions, &source_path, destination, checkpoint.as_ref())?;
+        session_id_for_path(&path)
+    })
+    .await
+}
+
+async fn open_extension_session(
+    path: PathBuf,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    label: &'static str,
+) -> anyhow::Result<Session> {
+    run_blocking_lifecycle(shell, input, label, move || {
+        let mut prepared = None;
+        open_launch_session(&mut prepared, SessionSelection::OpenExisting(path))
+    })
+    .await
+}
+
+fn replace_extension_active_session(app: &mut App, session: Session) -> anyhow::Result<String> {
+    let session_id = bounded_extension_session_id(terminal_goal_session_id(&session)?)?;
+    app.agent.replace_session_at_idle(session)?;
+    app.goal_session_id = session_id.clone();
+    let goal_store: Arc<dyn ygg_agent::GoalStore> = app.goal_store.clone();
+    app.goal_driver = ygg_agent::GoalDriver::new(goal_store, session_id.clone());
+    app.executable_extensions.transition_active_session(
+        app.agent.session(),
+        &app.model,
+        &app.reasoning,
+        &app.sessions,
+    );
+    Ok(session_id)
+}
+
+async fn switch_extension_session(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: &ExtensionSessionLifecycleRequest,
+    session_id: String,
+) -> anyhow::Result<Option<String>> {
+    let path = app.sessions.path_by_id(&session_id)?;
+    let session = open_extension_session(path, shell, input, "switching session…").await?;
+    if request.is_cancelled() {
+        return Ok(None);
+    }
+    replace_extension_active_session(app, session).map(Some)
+}
+
+async fn reload_extension_session(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: &ExtensionSessionLifecycleRequest,
+) -> anyhow::Result<Option<String>> {
+    let path = app.agent.session().path().to_owned();
+    let session = open_extension_session(path, shell, input, "reloading session…").await?;
+    if request.is_cancelled() {
+        return Ok(None);
+    }
+    replace_extension_active_session(app, session).map(Some)
+}
+
+async fn execute_extension_session_lifecycle(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: ExtensionSessionLifecycleRequest,
+) -> bool {
+    if request.is_cancelled() {
+        return false;
+    }
+    let operation = request.operation().clone();
+    let mut result = match operation.clone() {
+        ExtensionSessionLifecycleOperation::Create => {
+            create_extension_session(app, shell, input).await.map(Some)
+        }
+        ExtensionSessionLifecycleOperation::Fork => {
+            fork_extension_session(app, shell, input).await.map(Some)
+        }
+        ExtensionSessionLifecycleOperation::Switch { session_id } => {
+            switch_extension_session(app, shell, input, &request, session_id).await
+        }
+        ExtensionSessionLifecycleOperation::Reload => {
+            reload_extension_session(app, shell, input, &request).await
+        }
+    };
+    let active_session_operation = match &operation {
+        ExtensionSessionLifecycleOperation::Switch { .. }
+        | ExtensionSessionLifecycleOperation::Reload => true,
+        ExtensionSessionLifecycleOperation::Create | ExtensionSessionLifecycleOperation::Fork => {
+            false
+        }
+    };
+    let active_session_replaced =
+        active_session_operation && result.as_ref().is_ok_and(|session_id| session_id.is_some());
+    if active_session_replaced {
+        // A cancelled response must not leave the visible transcript bound to
+        // the discarded session, so hydrate before observing cancellation.
+        if let Err(error) = shell.hydrate(app.agent.session()) {
+            result = Err(error);
+        }
+    }
+    if request.is_cancelled() {
+        return active_session_replaced;
+    }
+    let method = match operation {
+        ExtensionSessionLifecycleOperation::Create => "create",
+        ExtensionSessionLifecycleOperation::Fork => "fork",
+        ExtensionSessionLifecycleOperation::Switch { .. } => "switch",
+        ExtensionSessionLifecycleOperation::Reload => "reload",
+    };
+    match result {
+        Ok(Some(session_id)) => {
+            request.respond(Ok(session_id));
+            request_extension_ui(shell, app);
+            update_status(shell, app);
+            shell.notice(format!("extension session {method} completed"));
+        }
+        Ok(None) => return false,
+        Err(error) => {
+            request.respond(Err(ExtensionSessionLifecycleError::Failed));
+            shell.error(format!("extension session {method} failed: {error:#}"));
+        }
+    }
+    shell.render();
+    active_session_replaced
 }
 
 async fn pick_session_path(
@@ -4217,6 +4404,9 @@ async fn run_interactive_without_model(
                 shell.render();
             }
             Idle::GoalContinuation => unreachable!("model-less mode has no goal deadline"),
+            Idle::SessionLifecycle(request) => {
+                request.respond(Err(ExtensionSessionLifecycleError::Unavailable));
+            }
             Idle::Submit(_) => {
                 shell.error(
                     "no configured model; set an API key and restart before submitting prompts"
@@ -4850,6 +5040,8 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
     }
     let mut startup_input = startup_prompt.map(ComposedInput::from_text);
     shell.hydrate(app.agent.session())?;
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     update_status(&mut shell, &app);
     request_extension_ui(&mut shell, &mut app);
     shell.render();
@@ -4881,6 +5073,18 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
             Idle::Quit => {
                 shutdown_for_exit(&mut app).await;
                 break;
+            }
+            Idle::SessionLifecycle(request) => {
+                let active_session_replaced =
+                    execute_extension_session_lifecycle(&mut app, &mut shell, &mut input, request)
+                        .await;
+                if active_session_replaced {
+                    // Replacement installs a fresh GoalDriver. Re-arm it from
+                    // the current durable session instead of letting a stale
+                    // deadline target the discarded driver.
+                    goal_deadline = recovered_goal_deadline(&app)?;
+                    next_prompt_source = GoalTurnSource::User;
+                }
             }
             Idle::GoalContinuation => {
                 goal_deadline = None;
@@ -5552,6 +5756,58 @@ mod tests {
         assert_eq!(messages[1].text, "second prompt");
         assert!(messages[2].whole_conversation);
         assert_eq!(messages[2].entry_id, session.head().unwrap().0);
+    }
+
+    #[test]
+    fn extension_lifecycle_fork_copies_the_active_head_and_records_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions =
+            crate::session_store::SessionStore::new(&directory.path().join("sessions"), &workspace);
+        let source_path = sessions.new_path("2026-03-16");
+        let mut prepared = None;
+        let mut source = open_launch_session(
+            &mut prepared,
+            SessionSelection::CreateNew(source_path.clone()),
+        )
+        .unwrap();
+        let head = source
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("current head".into())],
+                },
+            )))
+            .unwrap();
+        drop(source);
+
+        let destination = sessions.new_path("2026-03-17");
+        let fork_path =
+            fork_active_session(&sessions, &source_path, destination, Some(&head)).unwrap();
+        let fork = Session::open(&fork_path).unwrap();
+        let source_id = session_id_for_path(&source_path).unwrap();
+        let fork_id = session_id_for_path(&fork_path).unwrap();
+
+        assert_eq!(fork.head(), Some(head.clone()));
+        assert!(fork.entry(&head).is_some());
+        let metadata = sessions.load_metadata(&fork_id).unwrap();
+        assert_eq!(
+            metadata.forked_from_session_id.as_deref(),
+            Some(source_id.as_str())
+        );
+        assert_eq!(
+            metadata.forked_from_entry_id.as_deref(),
+            Some(head.0.as_str())
+        );
+    }
+
+    #[test]
+    fn extension_lifecycle_session_ids_fit_the_generated_result_bound() {
+        assert_eq!(
+            bounded_extension_session_id("x".repeat(MAX_JSON_RPC_ID_BYTES)).unwrap(),
+            "x".repeat(MAX_JSON_RPC_ID_BYTES)
+        );
+        assert!(bounded_extension_session_id("x".repeat(MAX_JSON_RPC_ID_BYTES + 1)).is_err());
     }
 
     #[test]

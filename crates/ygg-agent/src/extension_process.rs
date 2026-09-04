@@ -199,6 +199,10 @@ static NEXT_EXTENSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// generation. IDs are never reusable inside the generation, preventing a
 /// delayed frontend answer from targeting a later request with the same ID.
 pub const MAX_EXTENSION_CHILD_REQUEST_IDS_PER_GENERATION: usize = 65_536;
+/// Maximum queued active-host session lifecycle requests shared by trusted
+/// executable extensions. The product drains this queue only at an idle
+/// boundary.
+pub const MAX_EXTENSION_SESSION_LIFECYCLE_QUEUE: usize = 16;
 const MAX_LIFECYCLE_REASON_BYTES: usize = 4 * 1024;
 /// A declared session hook is a bounded lifecycle finalizer, never a request-path interceptor.
 const SESSION_HOOK_DEADLINE: Duration = Duration::from_millis(250);
@@ -3796,6 +3800,173 @@ impl ExtensionOperationToken {
     }
 }
 
+/// One requested mutation of the active host session.
+///
+/// These operations deliberately target the product's active session, unlike
+/// the API 0.2 `agent/*` service which manages extension-owned child sessions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtensionSessionLifecycleOperation {
+    /// Create a durable session without switching to it.
+    Create,
+    /// Fork the active durable session without switching to the fork.
+    Fork,
+    /// Make an existing workspace session active.
+    Switch {
+        /// Opaque, schema-bounded session identifier.
+        session_id: String,
+    },
+    /// Reopen the active session from its durable descriptor.
+    Reload,
+}
+
+/// Terminal disposition supplied by the product's active-session driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtensionSessionLifecycleError {
+    /// The interactive active-session driver is not safely bound.
+    Unavailable,
+    /// The bounded operation reached the idle driver but failed.
+    Failed,
+}
+
+struct SessionLifecycleDriverState {
+    active: AtomicBool,
+    epoch: AtomicU64,
+}
+
+/// Sender half of the bounded active-session lifecycle service.
+///
+/// A product constructs this before process startup, offers it only to API 0.3
+/// peers, and activates it after the current application/session is safe to
+/// mutate. Deactivation fences queued work from a previous app generation.
+#[derive(Clone)]
+pub struct ExtensionSessionLifecycleService {
+    sender: mpsc::Sender<ExtensionSessionLifecycleRequest>,
+    state: Arc<SessionLifecycleDriverState>,
+}
+
+/// Receiver half held exclusively by the product's idle-boundary driver.
+pub struct ExtensionSessionLifecycleReceiver {
+    receiver: mpsc::Receiver<ExtensionSessionLifecycleRequest>,
+    state: Arc<SessionLifecycleDriverState>,
+}
+
+/// A single admitted request awaiting an active-session outcome.
+pub struct ExtensionSessionLifecycleRequest {
+    operation: ExtensionSessionLifecycleOperation,
+    epoch: u64,
+    response: oneshot::Sender<Result<String, ExtensionSessionLifecycleError>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLifecycleSubmitError {
+    Unavailable,
+    Full,
+}
+
+impl ExtensionSessionLifecycleService {
+    /// Constructs a bounded service and its sole product-owned receiver.
+    pub fn channel(
+        capacity: usize,
+    ) -> Result<(Self, ExtensionSessionLifecycleReceiver), &'static str> {
+        if capacity == 0 || capacity > MAX_EXTENSION_SESSION_LIFECYCLE_QUEUE {
+            return Err("session lifecycle queue capacity is outside its bounded range");
+        }
+        let (sender, receiver) = mpsc::channel(capacity);
+        let state = Arc::new(SessionLifecycleDriverState {
+            active: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
+        });
+        Ok((
+            Self {
+                sender,
+                state: Arc::clone(&state),
+            },
+            ExtensionSessionLifecycleReceiver { receiver, state },
+        ))
+    }
+
+    /// Enables admission for the currently bound active application/session.
+    pub fn activate(&self) {
+        self.state.epoch.fetch_add(1, Ordering::AcqRel);
+        self.state.active.store(true, Ordering::Release);
+    }
+
+    /// Rejects future work and fences queued work from the prior binding.
+    pub fn deactivate(&self) {
+        self.state.active.store(false, Ordering::Release);
+        self.state.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn try_submit(
+        &self,
+        operation: ExtensionSessionLifecycleOperation,
+    ) -> Result<
+        oneshot::Receiver<Result<String, ExtensionSessionLifecycleError>>,
+        SessionLifecycleSubmitError,
+    > {
+        if !self.state.active.load(Ordering::Acquire) {
+            return Err(SessionLifecycleSubmitError::Unavailable);
+        }
+        let epoch = self.state.epoch.load(Ordering::Acquire);
+        if !self.state.active.load(Ordering::Acquire) {
+            return Err(SessionLifecycleSubmitError::Unavailable);
+        }
+        let (response, receiver) = oneshot::channel();
+        let request = ExtensionSessionLifecycleRequest {
+            operation,
+            epoch,
+            response,
+        };
+        match self.sender.try_send(request) {
+            Ok(()) => Ok(receiver),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(SessionLifecycleSubmitError::Full),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(SessionLifecycleSubmitError::Unavailable)
+            }
+        }
+    }
+}
+
+impl ExtensionSessionLifecycleReceiver {
+    /// Returns the next live request. Stale, deactivated, and cancelled requests
+    /// are terminalized without exposing them to a replacement app binding.
+    pub fn try_next(&mut self) -> Option<ExtensionSessionLifecycleRequest> {
+        loop {
+            let request = match self.receiver.try_recv() {
+                Ok(request) => request,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    return None
+                }
+            };
+            let current = self.state.active.load(Ordering::Acquire)
+                && self.state.epoch.load(Ordering::Acquire) == request.epoch;
+            if current && !request.response.is_closed() {
+                return Some(request);
+            }
+            let _ = request
+                .response
+                .send(Err(ExtensionSessionLifecycleError::Unavailable));
+        }
+    }
+}
+
+impl ExtensionSessionLifecycleRequest {
+    /// Returns the requested operation. The product must settle the request once.
+    pub fn operation(&self) -> &ExtensionSessionLifecycleOperation {
+        &self.operation
+    }
+
+    /// Returns whether protocol cancellation or process shutdown already won.
+    pub fn is_cancelled(&self) -> bool {
+        self.response.is_closed()
+    }
+
+    /// Delivers exactly one product outcome to the extension process.
+    pub fn respond(self, result: Result<String, ExtensionSessionLifecycleError>) {
+        let _ = self.response.send(result);
+    }
+}
+
 /// Runtime knobs for one executable extension process.
 #[derive(Clone)]
 pub struct ExtensionRuntimeConfig {
@@ -3808,6 +3979,10 @@ pub struct ExtensionRuntimeConfig {
     /// Offer the optional host-owned child model-session service. The product
     /// must bind an enabled delegation runtime before the service is usable.
     pub agent_sessions: bool,
+    /// Optional bounded API 0.3 active-session lifecycle driver. It is offered
+    /// only when configured; it remains inactive until the product binds a safe
+    /// interactive idle boundary. Legacy processes never retain this service.
+    pub session_lifecycle: Option<ExtensionSessionLifecycleService>,
     /// Offer single-use approval redemption. A trusted frontend can issue a
     /// capability with [`ExtensionProcess::respond_to_policy_approval`].
     pub approvals: bool,
@@ -3858,6 +4033,10 @@ impl std::fmt::Debug for ExtensionRuntimeConfig {
                 &self.flag_values.keys().collect::<Vec<_>>(),
             )
             .field("agent_sessions", &self.agent_sessions)
+            .field(
+                "session_lifecycle_configured",
+                &self.session_lifecycle.is_some(),
+            )
             .field("approvals", &self.approvals)
             .field("secret_broker_configured", &self.secret_broker.is_some())
             .field(
@@ -3890,6 +4069,7 @@ impl ExtensionRuntimeConfig {
             host_state: ExtensionHostState::default(),
             flag_values: BTreeMap::new(),
             agent_sessions: false,
+            session_lifecycle: None,
             approvals: false,
             secret_broker: None,
             provider_registry: None,
@@ -3911,6 +4091,7 @@ impl ExtensionRuntimeConfig {
 #[derive(Clone, Copy, Debug, Default)]
 struct OfferedHostServices {
     agent_sessions: bool,
+    session_lifecycle: bool,
     approvals: bool,
     secrets: bool,
 }
@@ -4053,6 +4234,14 @@ pub mod methods {
     pub const CANCEL_REQUEST: &str = "$/cancelRequest";
     /// Request-scoped ephemeral progress.
     pub const PROGRESS: &str = "$/progress";
+    /// Extension request to create a durable active-host session.
+    pub const SESSION_CREATE: &str = "session/create";
+    /// Extension request to fork the active host session.
+    pub const SESSION_FORK: &str = "session/fork";
+    /// Extension request to reopen the active host session from disk.
+    pub const SESSION_RELOAD: &str = "session/reload";
+    /// Extension request to switch the active host session.
+    pub const SESSION_SWITCH: &str = "session/switch";
     /// Extension-to-host user notification.
     pub const NOTIFICATION: &str = "notification";
     /// Extension-to-host interactive confirmation request.
@@ -9481,6 +9670,13 @@ async fn spawn_connection(
     let draining = Arc::new(AtomicBool::new(false));
     let tombstones = Arc::new(StdMutex::new(RequestTombstones::default()));
     let api_v03_contract = Arc::new(StdRwLock::new(None));
+    // Keep active-host lifecycle authority out of every legacy process even
+    // when a generic caller supplied a runtime service configuration.
+    let session_lifecycle = if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3 {
+        config.session_lifecycle.clone()
+    } else {
+        None
+    };
     let (protocol_max_message_bytes, api_v03_max_frame_bytes) =
         if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3 {
             let max_frame_bytes = config
@@ -9558,6 +9754,7 @@ async fn spawn_connection(
         Arc::clone(&tool_catalog),
         catalog_updates,
         delegation_service,
+        session_lifecycle.clone(),
         approval_store,
         config.secret_broker.clone(),
         ExtensionIdentity {
@@ -9632,6 +9829,7 @@ async fn spawn_connection(
     artifact_guard.disarm();
     let offered_host_services = OfferedHostServices {
         agent_sessions: config.agent_sessions,
+        session_lifecycle: session_lifecycle.is_some(),
         approvals: config.approvals,
         secrets: config.secret_broker.is_some()
             && !descriptor.manifest.capabilities.secrets.is_empty(),
@@ -9660,7 +9858,13 @@ async fn spawn_connection(
     }
 
     let api_v03_offer = (descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3)
-        .then(|| api_v03::host_offer(api_v03_max_frame_bytes, config.max_pending_requests))
+        .then(|| {
+            api_v03_host_offer_for_services(
+                api_v03_max_frame_bytes,
+                config.max_pending_requests,
+                offered_host_services.session_lifecycle,
+            )
+        })
         .transpose()
         .map_err(api_v03_protocol_error)?;
     let extension_identity = ExtensionIdentity {
@@ -9885,6 +10089,25 @@ fn resolve_entrypoint_command(
         command: configured,
         _staging: None,
     })
+}
+
+fn api_v03_host_offer_for_services(
+    max_frame_bytes: usize,
+    max_pending_requests: usize,
+    session_lifecycle: bool,
+) -> Result<api_v03::ContractOffer, api_v03::ContractError> {
+    let mut offer = api_v03::host_offer(max_frame_bytes, max_pending_requests)?;
+    if !session_lifecycle {
+        offer
+            .optional_capabilities
+            .retain(|capability| capability != "session_lifecycle");
+        offer.optional_methods.retain(|method| {
+            api_v03::method_spec(method)
+                .is_none_or(|specification| specification.capability != "session_lifecycle")
+        });
+    }
+    api_v03::validate_offer(&offer)?;
+    Ok(offer)
 }
 
 fn api_v03_protocol_error(error: api_v03::ContractError) -> ExtensionRuntimeError {
@@ -11273,6 +11496,7 @@ struct ProtocolReadState {
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
+    session_lifecycle: Option<ExtensionSessionLifecycleService>,
     approval_store: Arc<ExtensionApprovalStore>,
     secret_broker: Option<Arc<dyn ExtensionSecretBroker>>,
     extension_identity: ExtensionIdentity,
@@ -11447,6 +11671,273 @@ fn queue_agent_session_operation(
             );
             let _ = events.send(ExtensionEvent::Diagnostic { message });
             settle_child_request(&child_requests, &request_id);
+        }
+        drop(worker);
+    });
+    Ok(())
+}
+
+fn api_v03_session_lifecycle_success(
+    request_id: &ExtensionRequestId,
+    session_id: String,
+) -> Result<serde_json::Value, String> {
+    let result = api_v03::SessionLifecycleResult { session_id };
+    let result = serde_json::to_value(result).map_err(|error| error.to_string())?;
+    api_v03::parse_session_lifecycle_result(result.clone()).map_err(|error| error.to_string())?;
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": result,
+    });
+    api_v03::parse_json_rpc_envelope(response.clone()).map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
+fn api_v03_session_lifecycle_error(
+    request_id: &ExtensionRequestId,
+    semantic: &str,
+    reason: &str,
+) -> Result<serde_json::Value, String> {
+    let error = api_v03::error_object(semantic, Some(serde_json::json!({ "reason": reason })))
+        .map_err(|error| error.to_string())?;
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": error,
+    });
+    api_v03::parse_json_rpc_envelope(response.clone()).map_err(|error| error.to_string())?;
+    Ok(response)
+}
+
+fn api_v03_session_lifecycle_submit_error(
+    request_id: &ExtensionRequestId,
+    error: SessionLifecycleSubmitError,
+) -> Result<serde_json::Value, String> {
+    match error {
+        SessionLifecycleSubmitError::Unavailable => api_v03_session_lifecycle_error(
+            request_id,
+            "internal_error",
+            "active-session lifecycle service is unavailable",
+        ),
+        SessionLifecycleSubmitError::Full => api_v03_session_lifecycle_error(
+            request_id,
+            "resource_exhausted",
+            "active-session lifecycle queue is full",
+        ),
+    }
+}
+
+/// Canonically serialize and atomically admit one API 0.3 child response. This
+/// mirrors the connection-owned response path instead of using the legacy
+/// best-effort writer queue, so cancellation cannot race a second terminal
+/// response into the stream.
+async fn queue_api_v03_child_response(
+    child_requests: &ChildRequests,
+    request_id: &ExtensionRequestId,
+    writer: &mpsc::Sender<WriterFrame>,
+    frame_limit: &Arc<ProtocolFrameLimit>,
+    response: serde_json::Value,
+) -> Result<ChildResponseAdmission, String> {
+    api_v03::parse_json_rpc_envelope(response.clone()).map_err(|error| error.to_string())?;
+    let mut line = api_v03::canonical_json(&response)
+        .map_err(|error| error.to_string())?
+        .into_bytes();
+    line.push(b'\n');
+    if !frame_limit.accepts_message_bytes(line.len()) {
+        line.fill(0);
+        return Err(format!(
+            "API 0.3 session lifecycle response exceeded {} bytes",
+            frame_limit.max_message_bytes()
+        ));
+    }
+    let line = ZeroizingBytes(line);
+    loop {
+        let response_state = {
+            let children = lock_std_mutex(child_requests);
+            let Some(child) = children.get(request_id) else {
+                return Ok(ChildResponseAdmission::AlreadySettled);
+            };
+            Arc::clone(&child.response_state)
+        };
+        match response_state.state.compare_exchange(
+            CHILD_ACTIVE,
+            CHILD_RESPONDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                let mut claim = ChildResponseClaim {
+                    child_requests: Arc::clone(child_requests),
+                    id: request_id.clone(),
+                    response_state,
+                    admitted: false,
+                    // This path is API 0.3-only. A response-admission failure
+                    // resets the child to active; its owner settles it rather
+                    // than emitting a noncanonical best-effort cancellation.
+                    abort_cancel: None,
+                };
+                let (completed, completion) = oneshot::channel();
+                let admission = writer.send(WriterFrame {
+                    line: line.0.clone(),
+                    state: Arc::new(AtomicU8::new(FRAME_QUEUED)),
+                    completion: Some(completed),
+                });
+                tokio::pin!(admission);
+                tokio::select! {
+                    biased;
+                    _ = host_shutdown_requested() => {
+                        return Err("host is shutting down".into());
+                    }
+                    result = tokio::time::timeout(CONFIRMATION_RESPONSE_TIMEOUT, &mut admission) => {
+                        result
+                            .map_err(|_| "API 0.3 session lifecycle response admission timed out".to_owned())?
+                            .map_err(|_| "extension writer closed".to_owned())?;
+                    }
+                }
+                // Writer admission is the sole terminal outcome boundary.
+                claim.mark_admitted();
+                let completed = tokio::select! {
+                    biased;
+                    _ = host_shutdown_requested() => {
+                        return Err("host is shutting down".into());
+                    }
+                    result = tokio::time::timeout(CONFIRMATION_RESPONSE_TIMEOUT, completion) => {
+                        result
+                            .map_err(|_| "API 0.3 session lifecycle response write timed out".to_owned())?
+                            .map_err(|_| "extension writer closed".to_owned())?
+                            .map_err(|error| pending_error(error).to_string())?;
+                    }
+                };
+                let _ = completed;
+                return Ok(ChildResponseAdmission::Queued);
+            }
+            Err(CHILD_RESPONDING) => {
+                let changed = response_state.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if response_state.state.load(Ordering::Acquire) == CHILD_RESPONDING {
+                    changed.await;
+                }
+            }
+            Err(CHILD_SETTLED) => return Ok(ChildResponseAdmission::AlreadySettled),
+            Err(_) => unreachable!("child response state has a fixed representation"),
+        }
+    }
+}
+
+async fn deliver_api_v03_session_lifecycle_response(
+    child_requests: ChildRequests,
+    request_id: ExtensionRequestId,
+    writer: mpsc::Sender<WriterFrame>,
+    frame_limit: Arc<ProtocolFrameLimit>,
+    health: Arc<StdRwLock<ConnectionHealth>>,
+    events: broadcast::Sender<ExtensionEvent>,
+    response: serde_json::Value,
+) {
+    if let Err(message) = queue_api_v03_child_response(
+        &child_requests,
+        &request_id,
+        &writer,
+        &frame_limit,
+        response,
+    )
+    .await
+    {
+        update_health(
+            &health,
+            ExtensionHealthState::Degraded,
+            Some(message.clone()),
+        );
+        let _ = events.send(ExtensionEvent::Diagnostic { message });
+        settle_child_request(&child_requests, &request_id);
+    }
+}
+
+fn queue_api_v03_session_lifecycle_operation(
+    state: &ProtocolReadState,
+    request_id: ExtensionRequestId,
+    operation: ExtensionSessionLifecycleOperation,
+) -> Result<(), String> {
+    let registered = register_unparented_api_v03_child_request(state, request_id.clone())?;
+    let response_state = registered.response_state;
+    let writer = state.writer.clone();
+    let frame_limit = Arc::clone(&state.frame_limit);
+    let child_requests = Arc::clone(&state.child_requests);
+    let health = Arc::clone(&state.health);
+    let events = state.events.clone();
+    let worker = state.child_work_slots.clone().try_acquire_owned();
+    let submission = match worker.as_ref() {
+        Ok(_) => state
+            .session_lifecycle
+            .as_ref()
+            .map(|service| service.try_submit(operation))
+            .unwrap_or(Err(SessionLifecycleSubmitError::Unavailable)),
+        Err(_) => Err(SessionLifecycleSubmitError::Full),
+    };
+
+    let Ok(worker) = worker else {
+        let response =
+            api_v03_session_lifecycle_submit_error(&request_id, SessionLifecycleSubmitError::Full)?;
+        tokio::spawn(deliver_api_v03_session_lifecycle_response(
+            child_requests,
+            request_id,
+            writer,
+            frame_limit,
+            health,
+            events,
+            response,
+        ));
+        return Ok(());
+    };
+
+    tokio::spawn(async move {
+        let response = match submission {
+            Ok(receiver) => {
+                let result = tokio::select! {
+                    biased;
+                    _ = child_response_settled(response_state) => return,
+                    result = receiver => result.unwrap_or(Err(ExtensionSessionLifecycleError::Unavailable)),
+                };
+                match result {
+                    Ok(session_id) => api_v03_session_lifecycle_success(&request_id, session_id),
+                    Err(ExtensionSessionLifecycleError::Unavailable) => {
+                        api_v03_session_lifecycle_error(
+                            &request_id,
+                            "internal_error",
+                            "active-session lifecycle service is unavailable",
+                        )
+                    }
+                    Err(ExtensionSessionLifecycleError::Failed) => api_v03_session_lifecycle_error(
+                        &request_id,
+                        "internal_error",
+                        "active-session lifecycle operation failed",
+                    ),
+                }
+            }
+            Err(error) => api_v03_session_lifecycle_submit_error(&request_id, error),
+        };
+        match response {
+            Ok(response) => {
+                deliver_api_v03_session_lifecycle_response(
+                    child_requests,
+                    request_id,
+                    writer,
+                    frame_limit,
+                    health,
+                    events,
+                    response,
+                )
+                .await;
+            }
+            Err(message) => {
+                update_health(
+                    &health,
+                    ExtensionHealthState::Degraded,
+                    Some(message.clone()),
+                );
+                let _ = events.send(ExtensionEvent::Diagnostic { message });
+                settle_child_request(&child_requests, &request_id);
+            }
         }
         drop(worker);
     });
@@ -11650,6 +12141,7 @@ async fn read_protocol_stdout<R>(
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
+    session_lifecycle: Option<ExtensionSessionLifecycleService>,
     approval_store: Arc<ExtensionApprovalStore>,
     secret_broker: Option<Arc<dyn ExtensionSecretBroker>>,
     extension_identity: ExtensionIdentity,
@@ -11690,6 +12182,7 @@ async fn read_protocol_stdout<R>(
         tool_catalog,
         catalog_updates,
         delegation_service,
+        session_lifecycle,
         approval_store,
         secret_broker,
         extension_identity,
@@ -12326,6 +12819,48 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 let event = api_v03::parse_provider_stream_event(params)
                     .map_err(|_| "invalid API 0.3 provider stream event".to_owned())?;
                 dispatch_provider_stream_event(state, event)?;
+            }
+            methods::SESSION_CREATE => {
+                let id = parse_child_request_id(object, methods::SESSION_CREATE)?;
+                api_v03::parse_session_create_params(params)
+                    .map_err(|error| format!("invalid API 0.3 session/create request: {error}"))?;
+                queue_api_v03_session_lifecycle_operation(
+                    state,
+                    id,
+                    ExtensionSessionLifecycleOperation::Create,
+                )?;
+            }
+            methods::SESSION_FORK => {
+                let id = parse_child_request_id(object, methods::SESSION_FORK)?;
+                api_v03::parse_session_fork_params(params)
+                    .map_err(|error| format!("invalid API 0.3 session/fork request: {error}"))?;
+                queue_api_v03_session_lifecycle_operation(
+                    state,
+                    id,
+                    ExtensionSessionLifecycleOperation::Fork,
+                )?;
+            }
+            methods::SESSION_RELOAD => {
+                let id = parse_child_request_id(object, methods::SESSION_RELOAD)?;
+                api_v03::parse_session_reload_params(params)
+                    .map_err(|error| format!("invalid API 0.3 session/reload request: {error}"))?;
+                queue_api_v03_session_lifecycle_operation(
+                    state,
+                    id,
+                    ExtensionSessionLifecycleOperation::Reload,
+                )?;
+            }
+            methods::SESSION_SWITCH => {
+                let id = parse_child_request_id(object, methods::SESSION_SWITCH)?;
+                let params = api_v03::parse_session_switch_params(params)
+                    .map_err(|error| format!("invalid API 0.3 session/switch request: {error}"))?;
+                queue_api_v03_session_lifecycle_operation(
+                    state,
+                    id,
+                    ExtensionSessionLifecycleOperation::Switch {
+                        session_id: params.session_id,
+                    },
+                )?;
             }
             methods::POLICY_EVALUATE => {
                 require_feature(state, EXTENSION_FEATURE_POLICY_INTENTS)?;
@@ -13190,6 +13725,19 @@ fn reject_unparented_child_request(
     delivery.map(|_| ())
 }
 
+fn register_unparented_api_v03_child_request(
+    state: &ProtocolReadState,
+    id: ExtensionRequestId,
+) -> Result<RegisteredChildRequest, String> {
+    if read_std_lock(&state.protocol).version != EXTENSION_API_VERSION_0_3 {
+        return Err("active-session lifecycle requests require extension API 0.3".into());
+    }
+    // API 0.3 session lifecycle requests are intentionally host-session scoped,
+    // not children of a host tool request. They retain normal child-ID and
+    // exactly-once response admission so $/cancelRequest can still win safely.
+    insert_child_request(state, id, None, None)
+}
+
 fn register_child_request(
     state: &ProtocolReadState,
     id: ExtensionRequestId,
@@ -14004,6 +14552,7 @@ confirmations = true
                 tool_catalog: Arc::new(StdRwLock::new(Vec::new())),
                 catalog_updates,
                 delegation_service: Arc::new(StdRwLock::new(None)),
+                session_lifecycle: None,
                 approval_store: Arc::new(ExtensionApprovalStore::new()),
                 secret_broker: None,
                 extension_identity: ExtensionIdentity {
@@ -14055,6 +14604,187 @@ confirmations = true
             extension_instance_id: "instance-test".into(),
             process_generation: 1,
         }
+    }
+
+    #[test]
+    fn api_v03_session_lifecycle_offer_is_conditional_on_a_bound_driver() {
+        let unavailable = api_v03_host_offer_for_services(1024, 4, false).unwrap();
+        assert!(unavailable
+            .optional_capabilities
+            .iter()
+            .all(|capability| capability != "session_lifecycle"));
+        assert!(unavailable.optional_methods.iter().all(|method| {
+            api_v03::method_spec(method)
+                .is_none_or(|specification| specification.capability != "session_lifecycle")
+        }));
+        api_v03::validate_offer(&unavailable).unwrap();
+
+        let available = api_v03_host_offer_for_services(1024, 4, true).unwrap();
+        assert!(available
+            .optional_capabilities
+            .iter()
+            .any(|capability| capability == "session_lifecycle"));
+        assert_eq!(
+            available
+                .optional_methods
+                .iter()
+                .filter(|method| {
+                    api_v03::method_spec(method).is_some_and(|specification| {
+                        specification.capability == "session_lifecycle"
+                    })
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn session_lifecycle_service_is_bounded_and_epoch_fenced() {
+        assert!(ExtensionSessionLifecycleService::channel(0).is_err());
+        assert!(ExtensionSessionLifecycleService::channel(
+            MAX_EXTENSION_SESSION_LIFECYCLE_QUEUE + 1
+        )
+        .is_err());
+
+        let (service, mut receiver) = ExtensionSessionLifecycleService::channel(1).unwrap();
+        assert!(matches!(
+            service.try_submit(ExtensionSessionLifecycleOperation::Create),
+            Err(SessionLifecycleSubmitError::Unavailable)
+        ));
+
+        service.activate();
+        let stale = service
+            .try_submit(ExtensionSessionLifecycleOperation::Fork)
+            .unwrap();
+        assert!(matches!(
+            service.try_submit(ExtensionSessionLifecycleOperation::Reload),
+            Err(SessionLifecycleSubmitError::Full)
+        ));
+        service.deactivate();
+        assert!(receiver.try_next().is_none());
+        assert_eq!(
+            stale.await.unwrap(),
+            Err(ExtensionSessionLifecycleError::Unavailable)
+        );
+
+        service.activate();
+        let completed = service
+            .try_submit(ExtensionSessionLifecycleOperation::Switch {
+                session_id: "safe-session".into(),
+            })
+            .unwrap();
+        let request = receiver.try_next().expect("active request");
+        assert_eq!(
+            request.operation(),
+            &ExtensionSessionLifecycleOperation::Switch {
+                session_id: "safe-session".into(),
+            }
+        );
+        request.respond(Ok("safe-session".into()));
+        assert_eq!(completed.await.unwrap(), Ok("safe-session".into()));
+    }
+
+    #[tokio::test]
+    async fn api_v03_session_lifecycle_dispatch_validates_and_settles_canonically() {
+        let (events, _receiver) = broadcast::channel(8);
+        let (mut state, mut frames) =
+            protocol_read_state_for_test(ManifestContributions::default(), events);
+        let (service, mut receiver) = ExtensionSessionLifecycleService::channel(1).unwrap();
+        service.activate();
+        let offer = api_v03_host_offer_for_services(1024, 4, true).unwrap();
+        let mut selection = api_v03::select_required(&offer).unwrap();
+        selection.capabilities.push("session_lifecycle".into());
+        selection.methods.extend(
+            [
+                methods::SESSION_CREATE,
+                methods::SESSION_FORK,
+                methods::SESSION_RELOAD,
+                methods::SESSION_SWITCH,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let contract = api_v03::negotiate(&offer, &selection).unwrap();
+        *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
+            version: EXTENSION_API_VERSION_0_3.into(),
+            features: contract.capabilities.clone(),
+            max_concurrent_requests: contract.limits.max_concurrent_requests,
+            lifecycle_events: BTreeSet::new(),
+        };
+        *write_std_lock(&state.api_v03_contract) = Some(contract);
+        state.session_lifecycle = Some(service);
+
+        let cases = vec![
+            (
+                "create-request",
+                methods::SESSION_CREATE,
+                serde_json::json!({}),
+                ExtensionSessionLifecycleOperation::Create,
+                "created-session",
+            ),
+            (
+                "fork-request",
+                methods::SESSION_FORK,
+                serde_json::json!({}),
+                ExtensionSessionLifecycleOperation::Fork,
+                "forked-session",
+            ),
+            (
+                "reload-request",
+                methods::SESSION_RELOAD,
+                serde_json::json!({}),
+                ExtensionSessionLifecycleOperation::Reload,
+                "reloaded-session",
+            ),
+            (
+                "switch-request",
+                methods::SESSION_SWITCH,
+                serde_json::json!({"session_id": "target-session"}),
+                ExtensionSessionLifecycleOperation::Switch {
+                    session_id: "target-session".into(),
+                },
+                "target-session",
+            ),
+        ];
+        for (request_id, method, params, expected_operation, result_session_id) in cases {
+            let request = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            });
+            let request = api_v03::canonical_json(&request).unwrap();
+            handle_protocol_line(request.as_bytes(), &state).unwrap();
+            let request = receiver.try_next().expect("session lifecycle request");
+            assert_eq!(request.operation(), &expected_operation);
+            request.respond(Ok(result_session_id.into()));
+
+            let mut frame = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+                .await
+                .expect("response frame deadline")
+                .expect("response frame");
+            let response = serde_json::from_slice::<serde_json::Value>(
+                frame.line.strip_suffix(&[b'\n']).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(response["result"]["session_id"], result_session_id);
+            frame
+                .completion
+                .take()
+                .expect("response completion")
+                .send(Ok(()))
+                .unwrap();
+        }
+
+        let malformed = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "bad-switch-request",
+            "method": methods::SESSION_SWITCH,
+            "params": {},
+        });
+        let malformed = api_v03::canonical_json(&malformed).unwrap();
+        let error = handle_protocol_line(malformed.as_bytes(), &state).unwrap_err();
+        assert!(error.contains("invalid API 0.3 session/switch request"));
     }
 
     #[derive(Clone)]

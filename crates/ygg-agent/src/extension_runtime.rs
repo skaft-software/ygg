@@ -1798,7 +1798,11 @@ impl ExtensionSessionBinding {
                 );
                 return Err(ExtensionRuntimeManagerError::UnverifiedSharedSource);
             }
-            if config.agent_sessions || config.approvals || config.secret_broker.is_some() {
+            if config.agent_sessions
+                || config.session_lifecycle.is_some()
+                || config.approvals
+                || config.secret_broker.is_some()
+            {
                 return Err(ExtensionRuntimeManagerError::SharedServiceUnsupported);
             }
             // Shared process initialization must not cache the first binding's
@@ -2413,6 +2417,35 @@ done
             "started"
         );
         second.release().await;
+        manager.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_runtime_rejects_active_session_lifecycle_service() {
+        let temporary = tempfile::tempdir().unwrap();
+        let descriptor = descriptor(
+            temporary.path(),
+            "workspace-service",
+            ExtensionLifecycleProfile::WorkspaceService,
+        );
+        let catalog = ExtensionRuntimeCatalog::from_descriptors([descriptor]);
+        let manager = ExtensionRuntimeManager::new(
+            ExtensionRuntimeDomain::ordinary(temporary.path()).unwrap(),
+        );
+        manager.replace_catalog(catalog).await;
+        let binding = manager.bind_session("session-a").unwrap();
+        let (service, _receiver) =
+            crate::extension_process::ExtensionSessionLifecycleService::channel(1).unwrap();
+        let mut config = ExtensionRuntimeConfig::new(temporary.path());
+        config.session_lifecycle = Some(service);
+
+        assert!(matches!(
+            binding.activate("workspace-service", config).await,
+            Err(ExtensionRuntimeManagerError::SharedServiceUnsupported)
+        ));
+        assert!(!temporary.path().join("starts").exists());
+        binding.release().await;
         manager.shutdown().await;
     }
 

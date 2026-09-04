@@ -37,6 +37,14 @@ api.validateToolCallResult(toolResult);
 assert.equal(toolResult.structured_content.kind, "value");
 assert.deepEqual(toolResult.structured_content.value, { value: "hello" });
 api.validateCancelRequestParams(api.parseCancelRequestParams(readFixture("cancel-request-params")));
+api.parseSessionCreateParams(readFixture("session-create-params"));
+api.parseSessionForkParams(readFixture("session-fork-params"));
+api.parseSessionSwitchParams(readFixture("session-switch-params"));
+api.parseSessionReloadParams(readFixture("session-reload-params"));
+assert.equal(
+  api.parseSessionLifecycleResult(readFixture("session-lifecycle-result")).session_id,
+  "2026-03-16-0001",
+);
 api.validateShutdownParams(api.parseShutdownParams(readFixture("shutdown-params")));
 api.validateShutdownResult(api.parseShutdownResult(readFixture("shutdown-result")));
 api.validateErrorObject(api.parseErrorObject(readFixture("error-data-absent")));
@@ -64,6 +72,22 @@ const offer = api.hostOffer(api.MAX_FRAME_BYTES * 2, api.MAX_CONCURRENT_REQUESTS
 assert.equal(offer.limits.max_frame_bytes, api.MAX_FRAME_BYTES);
 assert.equal(offer.limits.max_concurrent_requests, api.MAX_CONCURRENT_REQUESTS);
 const negotiated = api.negotiate(offer, api.selectRequired(offer));
+const unboundLifecycleOffer = {
+  ...offer,
+  optional_capabilities: [],
+  optional_methods: [],
+};
+api.validateOffer(unboundLifecycleOffer);
+assert.equal(
+  errorCode(() => api.negotiate(unboundLifecycleOffer, {
+    schema: offer.schema,
+    encoding: offer.encoding,
+    capabilities: [...offer.required_capabilities, "session_lifecycle"],
+    methods: [...offer.required_methods, "session/create"],
+    limits: offer.limits,
+  })),
+  -32011,
+);
 api.requireMethod(negotiated, "initialize", "host_to_extension");
 assert.equal(errorCode(() => api.requireMethod(negotiated, "future/call", "host_to_extension")), -32601);
 assert.equal(errorCode(() => api.requireMethod(negotiated, "context/collect", "host_to_extension")), -32601);

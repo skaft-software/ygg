@@ -9,12 +9,14 @@ use ygg_agent::extension_api_v03::{
     bundle_supports_api_version, canonical_frame, canonical_json, error_object, host_offer,
     legacy_adapter, negotiate, parse_cancel_request_params, parse_disposition, parse_error_object,
     parse_initialize_request, parse_initialize_response, parse_json_rpc_envelope,
-    parse_shutdown_params, parse_shutdown_result, parse_tool_call_params, parse_tool_call_result,
-    require_method, runtime_supports_api_version, validate_cancel_request_params,
-    validate_disposition, validate_error_object, validate_initialize_request,
-    validate_initialize_response, validate_offer, CancelRequestParams, ContractOffer,
-    ContractSelection, Disposition, ErrorObject, JsonRpcId, MethodDirection, Presence,
-    ProtocolLimits, API_VERSION, CANONICAL_ENCODING, SCHEMA_ID,
+    parse_session_create_params, parse_session_fork_params, parse_session_lifecycle_result,
+    parse_session_reload_params, parse_session_switch_params, parse_shutdown_params,
+    parse_shutdown_result, parse_tool_call_params, parse_tool_call_result, require_method,
+    runtime_supports_api_version, validate_cancel_request_params, validate_disposition,
+    validate_error_object, validate_initialize_request, validate_initialize_response,
+    validate_offer, CancelRequestParams, ContractOffer, ContractSelection, Disposition,
+    ErrorObject, JsonRpcId, MethodDirection, Presence, ProtocolLimits, API_VERSION,
+    CANONICAL_ENCODING, MAX_JSON_RPC_ID_BYTES, SCHEMA_ID,
 };
 
 fn fixture_directory() -> std::path::PathBuf {
@@ -66,6 +68,11 @@ fn generated_models_cover_foundation_shapes_presence_and_envelopes() {
     parse_tool_call_params(fixture("tool-call-params")).unwrap();
     parse_tool_call_result(fixture("tool-call-result")).unwrap();
     parse_cancel_request_params(fixture("cancel-request-params")).unwrap();
+    parse_session_create_params(fixture("session-create-params")).unwrap();
+    parse_session_fork_params(fixture("session-fork-params")).unwrap();
+    parse_session_switch_params(fixture("session-switch-params")).unwrap();
+    parse_session_reload_params(fixture("session-reload-params")).unwrap();
+    parse_session_lifecycle_result(fixture("session-lifecycle-result")).unwrap();
     parse_shutdown_params(fixture("shutdown-params")).unwrap();
     parse_shutdown_result(fixture("shutdown-result")).unwrap();
     validate_error_object(&parse_error_object(fixture("error-data-absent")).unwrap()).unwrap();
@@ -105,6 +112,23 @@ fn generated_models_cover_foundation_shapes_presence_and_envelopes() {
         }))),
         -32011
     );
+    assert_eq!(
+        error_code(parse_session_create_params(json!({"unexpected":true}))),
+        -32602
+    );
+    assert_eq!(error_code(parse_session_switch_params(json!({}))), -32602);
+    assert_eq!(
+        error_code(parse_session_switch_params(json!({
+            "session_id": "x".repeat(MAX_JSON_RPC_ID_BYTES + 1),
+        }))),
+        -32012
+    );
+    assert_eq!(
+        error_code(parse_session_lifecycle_result(json!({
+            "session_id": "x".repeat(MAX_JSON_RPC_ID_BYTES + 1),
+        }))),
+        -32012
+    );
 }
 
 #[test]
@@ -123,6 +147,20 @@ fn contract_versions_and_canonical_bounds_fail_closed() {
     };
     let negotiated = negotiate(&offer, &selection).expect("required contract negotiation");
     require_method(&negotiated, "initialize", MethodDirection::HostToExtension).unwrap();
+
+    let mut unbound_offer = offer.clone();
+    unbound_offer.optional_capabilities.clear();
+    unbound_offer.optional_methods.clear();
+    validate_offer(&unbound_offer).unwrap();
+    let mut unbound_selection = selection.clone();
+    unbound_selection
+        .capabilities
+        .push("session_lifecycle".into());
+    unbound_selection.methods.push("session/create".into());
+    assert_eq!(
+        error_code(negotiate(&unbound_offer, &unbound_selection)),
+        -32011
+    );
     assert_eq!(
         error_code(require_method(
             &negotiated,

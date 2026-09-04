@@ -259,6 +259,12 @@
       "status": "foundation"
     },
     {
+      "name": "session_lifecycle",
+      "description": "Bounded extension requests to create, fork, switch, or reload a host session.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
       "name": "tool_call",
       "description": "Bounded host-to-extension model tool invocation.",
       "host_offer": "required",
@@ -417,6 +423,50 @@
       "status": "foundation",
       "params": "ProviderUpdateParams",
       "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/create",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionCreateParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/fork",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionForkParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/reload",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionReloadParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/switch",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionSwitchParams",
+      "result": "SessionLifecycleResult",
       "terminal": "result_or_error",
       "notification": false
     },
@@ -982,6 +1032,47 @@
           "presence": "optional",
           "nullable": false,
           "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "SessionCreateParams",
+      "description": "Empty parameters for creating one durable host session without switching to it.",
+      "fields": []
+    },
+    {
+      "name": "SessionForkParams",
+      "description": "Empty parameters for forking the active host session at its current durable head without switching to it.",
+      "fields": []
+    },
+    {
+      "name": "SessionSwitchParams",
+      "description": "Bounded opaque identifier of a session in the active workspace to make active.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        }
+      ]
+    },
+    {
+      "name": "SessionReloadParams",
+      "description": "Empty parameters for reopening the active host session from disk.",
+      "fields": []
+    },
+    {
+      "name": "SessionLifecycleResult",
+      "description": "Terminal successful session-lifecycle result containing the affected session identifier.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
         }
       ]
     },
@@ -2105,6 +2196,30 @@
       "value": {
         "terminal": "cancelled",
         "reason": "user"
+      }
+    },
+    {
+      "name": "session-create-params",
+      "value": {}
+    },
+    {
+      "name": "session-fork-params",
+      "value": {}
+    },
+    {
+      "name": "session-switch-params",
+      "value": {
+        "session_id": "2026-03-16-0001"
+      }
+    },
+    {
+      "name": "session-reload-params",
+      "value": {}
+    },
+    {
+      "name": "session-lifecycle-result",
+      "value": {
+        "session_id": "2026-03-16-0001"
       }
     },
     {

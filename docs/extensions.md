@@ -69,11 +69,17 @@ Three exact manifest-selected protocol versions are implemented:
   the generated [API `0.3` reference](extensions/API-0.3-REFERENCE.md); it is
   not an implicit upgrade of either legacy wire. It also supports the optional,
   declared `session_start`/`session_end` cleanup pair described below and alone
-  can receive manifest-declared CLI values during initialization.
+  can receive manifest-declared CLI values during initialization. Its optional
+  `session_lifecycle` capability is advertised only when the interactive product
+  configures an active-session driver, which admits work only after a safe
+  active-session binding. `session/create` and `session/fork` return durable
+  IDs without switching; `session/switch` is limited to an existing workspace
+  session ID, and `session/reload` rereads the active durable session at an idle
+  boundary.
 
 API `0.2` remains the stateful transport foundation for existing trusted daily
 use within those boundaries. API `0.3` adds no operating-system sandbox or
-moves a domain capability into the host.
+implicit access beyond negotiated host capabilities.
 
 Pi migration is capability-oriented rather than a promise to reproduce Pi's
 in-process ABI. `ygg migrate pi --dry-run` inventories package resources and
