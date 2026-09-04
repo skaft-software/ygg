@@ -400,6 +400,13 @@ child-session service; the coding product does not expose a parallel native
 collaboration tool surface. Ygg still does not infer Ultra, collaboration, or
 Responses Lite from a model name or subscription plan; missing or unusable
 account-scoped metadata falls back conservatively.
+
+GitHub Copilot is intentionally **not** a `ygg --login` or configuration preset.
+An embedding Rust application can own GitHub device login, OAuth storage,
+exchange, refresh, and its vetted inference origin through the credential-safe SDK seam;
+the standalone CLI and NDJSON `ygg-host` do not accept Copilot credentials or
+surface incomplete Copilot models. See [host-owned GitHub Copilot](docs/sdk.md#host-owned-github-copilot).
+
 ### Use custom OpenAI-compatible providers
 
 For a first local model, launch interactive `ygg` with no configured model and

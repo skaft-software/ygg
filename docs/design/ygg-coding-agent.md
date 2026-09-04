@@ -369,6 +369,31 @@ parallel-tool-call bit. This product layer only discovers and propagates the
 capability; it does not reconstruct the wire format or infer support from the
 endpoint identity.
 
+## Host-owned GitHub Copilot
+
+GitHub Copilot is deliberately a host-owned provider rather than a generated
+CLI preset. `CopilotHost` retains GitHub device-flow/OAuth credentials, token
+exchange/refresh state, discovery transport, and any durable storage; Ygg
+receives only a bounded device-display payload, safe availability result,
+credential-free model metadata, and a short-lived in-memory inference session.
+The public provider definition contains only route and setup metadata, and the
+normal environment-backed bootstrap skips host-owned discovery entirely.
+
+An embedding host explicitly binds a vetted origin root and calls
+`CopilotProvider::register_models`. Registration checks availability, exchanges
+a session, bounds and validates the authenticated inventory, selects Chat or
+Responses routes from each model's declared protocol, rejects other protocols,
+stages it, and fails closed on an existing route/model identity. Dynamic
+credentials and headers remain behind
+`ygg_ai::Auth::Dynamic`; they are sensitive request headers and never enter
+provider definitions, catalog model metadata, logs, or persistence. The resolver
+serializes exchange/refresh and refreshes before its short-lived session expires.
+
+The standalone CLI and NDJSON host intentionally provide no Copilot login or
+configuration path. GitHub OAuth endpoint behavior, Enterprise policy, and live
+integration testing remain embedding-host responsibilities; the product covers
+only deterministic fake-host/transport behavior.
+
 ## Authentication
 
 Codex OAuth credentials live in an owner-only directory and file. Writes use a

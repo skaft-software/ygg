@@ -9,6 +9,7 @@ mod auth;
 mod catalog;
 mod compatibility;
 mod contract;
+mod copilot;
 mod models;
 mod pricing;
 mod vertex;
@@ -17,6 +18,11 @@ pub use contract::{
     CompatibilityProfile, PricingProfile, ProviderAccess, ProviderAvailability,
     ProviderCatalogContributor, ProviderCatalogKind, ProviderDefinition, ProviderDefinitionError,
     ProviderDiagnostic, ProviderRouteDefinition,
+};
+pub use copilot::{
+    CopilotAvailabilityError, CopilotCredentialScheme, CopilotDeviceLogin,
+    CopilotDeviceLoginStatus, CopilotDynamicHeader, CopilotEndpoint, CopilotHost, CopilotModel,
+    CopilotProvider, CopilotSession,
 };
 
 /// Return generated built-in and subscription provider definitions without
@@ -33,9 +39,10 @@ pub(crate) use auth::{
     resolve_environment, EnvironmentCredential,
 };
 pub(crate) use catalog::{
-    public_headers, register_discovered_model, register_dynamic_endpoints_at_base_url,
-    register_environment_endpoints, register_environment_endpoints_at_base_url,
-    register_private_endpoints_at_base_url, register_static_models,
+    public_headers, register_discovered_model, register_discovered_model_at_route,
+    register_dynamic_endpoints_at_base_url, register_environment_endpoints,
+    register_environment_endpoints_at_base_url, register_private_endpoints_at_base_url,
+    register_static_models,
 };
 pub(crate) use compatibility::cache_compatibility;
 pub(crate) use contract::{

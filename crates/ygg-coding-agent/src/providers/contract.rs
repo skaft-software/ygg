@@ -36,15 +36,24 @@ pub enum ProviderAuthentication {
         /// Stable login selector shown in setup diagnostics.
         login: &'static str,
     },
+    /// An embedding host owns sign-in and supplies a dynamic request credential.
+    ///
+    /// This keeps host-managed OAuth state out of Ygg's command-line login and
+    /// credential stores while still making the setup boundary explicit.
+    HostOwned {
+        /// Stable host integration identifier shown in setup diagnostics.
+        integration: &'static str,
+    },
 }
 
 impl ProviderAuthentication {
     pub(crate) fn environment_variables(self) -> Option<&'static [&'static str]> {
         match self {
             Self::Environment { variables } => Some(variables),
-            Self::Aws { .. } | Self::ApplicationDefaultCredentials | Self::Subscription { .. } => {
-                None
-            }
+            Self::Aws { .. }
+            | Self::ApplicationDefaultCredentials
+            | Self::Subscription { .. }
+            | Self::HostOwned { .. } => None,
         }
     }
 }
@@ -71,6 +80,11 @@ pub enum ModelDiscovery {
     DeepSeekModels,
     /// Query the authenticated Codex subscription catalog.
     CodexSubscription,
+    /// Ask an embedding host for an authenticated subscription inventory.
+    ///
+    /// The host owns the OAuth state and transport; declarations only define
+    /// the credential-free route and codec families.
+    HostOwnedSubscription,
     /// Do not populate models automatically.
     None,
 }
@@ -376,6 +390,14 @@ impl ProviderDeclaration {
         None
     }
 
+    /// Resolve a provider-advertised codec family to a declared route.
+    ///
+    /// Host-owned discovery uses this when each returned model carries its
+    /// protocol explicitly instead of relying on a model-name heuristic.
+    pub(crate) fn route_for_protocol(&self, protocol: Protocol) -> Option<&ProviderRoute> {
+        self.routes.iter().find(|route| route.protocol == protocol)
+    }
+
     /// Route whose declared fallback authentication is used for model
     /// inventory discovery.
     pub(crate) fn inventory_route(&self) -> Option<&ProviderRoute> {
@@ -402,6 +424,9 @@ impl ProviderDeclaration {
                 }
                 ProviderAuthentication::Subscription { login } => ProviderAccess::Subscription {
                     login: login.to_owned(),
+                },
+                ProviderAuthentication::HostOwned { integration } => ProviderAccess::HostOwned {
+                    integration: integration.to_owned(),
                 },
             },
             catalog: ProviderCatalogKind::from(self.model_discovery),
@@ -496,7 +521,15 @@ impl ProviderDeclaration {
                     "provider subscription login declaration is invalid",
                 ));
             }
-            ProviderAuthentication::Subscription { .. } => {}
+            ProviderAuthentication::HostOwned { integration }
+                if !valid_provider_identifier(integration) =>
+            {
+                return Err(ProviderDefinitionError::new(
+                    "provider host integration declaration is invalid",
+                ));
+            }
+            ProviderAuthentication::Subscription { .. }
+            | ProviderAuthentication::HostOwned { .. } => {}
         }
         if self.routes.is_empty() {
             return Err(ProviderDefinitionError::new("provider has no routes"));
@@ -550,7 +583,8 @@ impl ProviderDeclaration {
                     EndpointAuthPresentation::AwsSigV4
                 ) | (
                     ProviderAuthentication::ApplicationDefaultCredentials
-                        | ProviderAuthentication::Subscription { .. },
+                        | ProviderAuthentication::Subscription { .. }
+                        | ProviderAuthentication::HostOwned { .. },
                     EndpointAuthPresentation::Dynamic
                 )
             );
@@ -760,6 +794,11 @@ pub enum ProviderAccess {
         /// Login selector.
         login: String,
     },
+    /// An embedding host owns sign-in, token storage, and refresh.
+    HostOwned {
+        /// Stable identifier for the embedding integration.
+        integration: String,
+    },
     /// A custom credential configuration owns setup.
     Custom,
     /// An extension owns setup and credentials.
@@ -798,7 +837,9 @@ impl From<ModelDiscovery> for ProviderCatalogKind {
             }
             ModelDiscovery::AnthropicModels { .. } => Self::AnthropicCompatible,
             ModelDiscovery::OpenRouterModels => Self::OpenRouter,
-            ModelDiscovery::CodexSubscription => Self::Subscription,
+            ModelDiscovery::CodexSubscription | ModelDiscovery::HostOwnedSubscription => {
+                Self::Subscription
+            }
             ModelDiscovery::None => Self::None,
         }
     }
@@ -861,14 +902,17 @@ impl ProviderDiagnostic {
     /// Construct a subscription-login diagnostic from a credential-free
     /// declaration.
     pub fn login_required(definition: &ProviderDefinition) -> Self {
-        let login = match definition.authentication() {
-            ProviderAccess::Subscription { login } => login.as_str(),
-            _ => "provider",
+        let action = match definition.authentication() {
+            ProviderAccess::Subscription { login } => format!("run ygg --login {login}"),
+            ProviderAccess::HostOwned { integration } => {
+                format!("complete {integration} sign-in in the embedding host")
+            }
+            _ => "complete provider sign-in".to_owned(),
         };
         Self {
             provider_id: definition.id().to_owned(),
             provider_label: definition.label().to_owned(),
-            action: bounded_setup_text(&format!("run ygg --login {login}")),
+            action: bounded_setup_text(&action),
         }
     }
 
@@ -1715,8 +1759,8 @@ mod tests {
                     Duration::from_secs(1),
                 )
             }
-            ProviderAuthentication::Subscription { .. } => {
-                panic!("{fixture_id}: subscription fixtures do not register a local endpoint")
+            ProviderAuthentication::Subscription { .. } | ProviderAuthentication::HostOwned { .. } => {
+                panic!("{fixture_id}: subscription and host-owned fixtures do not register a local endpoint")
             }
         }
         .unwrap_or_else(|error| panic!("{fixture_id}: endpoint registration failed: {error}"));

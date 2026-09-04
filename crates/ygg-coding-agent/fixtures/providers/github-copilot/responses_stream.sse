@@ -1,0 +1,9 @@
+data: {"type":"response.created","response":{"id":"copilot-response-1"}}
+
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"msg_1","type":"message"}}
+
+data: {"type":"response.output_text.delta","output_index":0,"delta":"hello from Responses"}
+
+data: {"type":"response.output_text.done","output_index":0}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":8,"output_tokens":4,"total_tokens":12}}}

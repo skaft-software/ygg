@@ -26,8 +26,11 @@ mod providers;
 /// Credential-free provider definition and canonical catalog contribution API.
 pub mod provider {
     pub use crate::providers::{
-        builtin_provider_definitions, CompatibilityProfile, PricingProfile, ProviderAccess,
-        ProviderAvailability, ProviderCatalogContributor, ProviderCatalogKind, ProviderDefinition,
+        builtin_provider_definitions, CompatibilityProfile, CopilotAvailabilityError,
+        CopilotCredentialScheme, CopilotDeviceLogin, CopilotDeviceLoginStatus,
+        CopilotDynamicHeader, CopilotEndpoint, CopilotHost, CopilotModel, CopilotProvider,
+        CopilotSession, PricingProfile, ProviderAccess, ProviderAvailability,
+        ProviderCatalogContributor, ProviderCatalogKind, ProviderDefinition,
         ProviderDefinitionError, ProviderDiagnostic, ProviderRouteDefinition,
     };
 }

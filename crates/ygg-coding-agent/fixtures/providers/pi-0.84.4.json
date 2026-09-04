@@ -209,12 +209,13 @@
     {
       "id": "github-copilot",
       "label": "GitHub Copilot",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "The embedding-only Ygg seam has deterministic fake Chat/Responses stream fixtures, but that is neither exact Pi 0.84.4 package evidence nor live GitHub OAuth validation.",
       "decision": {
         "kind": "unsupported",
-        "fixture_id": "github-copilot-unsupported-decision",
-        "missing_primitive": "Copilot OAuth token refresh and dynamic request-header lifecycle",
-        "release_blocker": "#249"
+        "fixture_id": "github-copilot-host-owned-seam-decision",
+        "missing_primitive": "Exact Pi 0.84.4 Copilot route/auth evidence and live GitHub OAuth endpoint validation",
+        "release_blocker": "#249",
+        "note": "The host-owned seam keeps device login, exchange, refresh, and dynamic headers in an embedding host; it is not a built-in CLI or configuration preset."
       }
     },
     {

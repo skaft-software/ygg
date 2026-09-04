@@ -194,13 +194,42 @@ pub(crate) fn register_discovered_model(
     limits: ModelLimits,
     pricing: Option<ygg_ai::Pricing>,
 ) -> anyhow::Result<()> {
+    let Some(route) = declaration.route_for_model(api_name) else {
+        return Ok(());
+    };
+    register_discovered_model_at_route(
+        catalog,
+        declaration,
+        route,
+        api_name,
+        display_name,
+        capabilities,
+        limits,
+        pricing,
+    )
+}
+
+/// Register discovery-produced metadata using an explicitly selected declared
+/// route. This is used when the authenticated inventory carries protocol
+/// metadata per model, so callers never infer protocol from a provider name or
+/// a model-id heuristic.
+pub(crate) fn register_discovered_model_at_route(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+    route: &ProviderRoute,
+    api_name: &str,
+    display_name: Option<String>,
+    capabilities: Capabilities,
+    limits: ModelLimits,
+    pricing: Option<ygg_ai::Pricing>,
+) -> anyhow::Result<()> {
+    if !declaration.routes.contains(route) {
+        anyhow::bail!("discovery route is not declared by the provider");
+    }
     let catalog_id = format!("{}/{}", declaration.id, api_name);
     if has_model_id(catalog, &catalog_id) {
         return Ok(());
     }
-    let Some(route) = declaration.route_for_model(api_name) else {
-        return Ok(());
-    };
     catalog.register_model(ModelSpec {
         id: ModelId(catalog_id),
         endpoint: EndpointId(route.endpoint_id.into()),

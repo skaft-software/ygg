@@ -1737,7 +1737,11 @@ fn try_register_declaration(
         ProviderAuthentication::Aws { .. } => {
             unreachable!("AWS provider declarations require a runtime configuration")
         }
-        ProviderAuthentication::Subscription { .. } => Ok(()),
+        // Host-owned credentials can only enter through an explicit embedding
+        // integration; preset bootstrap must never synthesize that authority.
+        ProviderAuthentication::Subscription { .. } | ProviderAuthentication::HostOwned { .. } => {
+            Ok(())
+        }
     }
 }
 
@@ -1783,7 +1787,9 @@ fn try_register_environment_declaration(
             register_openrouter_models(catalog, declaration, &credential)?;
         }
         ModelDiscovery::DeepSeekModels => unreachable!("handled before endpoint registration"),
-        ModelDiscovery::CodexSubscription => {}
+        // Host-owned subscription discovery is registered by its embedding
+        // integration, never by the environment-backed preset bootstrap.
+        ModelDiscovery::CodexSubscription | ModelDiscovery::HostOwnedSubscription => {}
     }
     Ok(())
 }
@@ -1825,7 +1831,10 @@ fn declaration_is_configured(declaration: &ProviderDeclaration) -> anyhow::Resul
             ProviderAuthentication::ApplicationDefaultCredentials => {
                 Ok(crate::providers::resolve_application_default_credentials()?.is_some())
             }
-            ProviderAuthentication::Subscription { .. } => Ok(false),
+            // A host-owned integration must call CopilotProvider explicitly;
+            // environment/configuration bootstrap has no authority to enable it.
+            ProviderAuthentication::Subscription { .. }
+            | ProviderAuthentication::HostOwned { .. } => Ok(false),
             ProviderAuthentication::Aws { .. } => {
                 unreachable!("AWS provider declarations require a runtime configuration")
             }

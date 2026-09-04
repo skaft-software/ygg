@@ -8,6 +8,11 @@ use ygg_sdk::provider::{
 fn generated_builtin_definitions_are_credential_free() {
     let definitions = builtin_provider_definitions();
     assert_eq!(definitions.len(), 31);
+    // Host-owned Copilot remains deliberately absent until an embedding host
+    // completes discovery; it is not a generated CLI/configuration preset.
+    assert!(!definitions
+        .iter()
+        .any(|definition| definition.id() == "github-copilot"));
 
     let rendered = format!("{definitions:?}");
     assert!(!rendered.contains("https://"));

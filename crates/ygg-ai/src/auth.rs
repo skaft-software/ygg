@@ -83,6 +83,30 @@ impl Secret {
         secret_from_bounded_env(var, read_bounded_env(var))
     }
 
+    /// Whether this secret is empty or contains only ASCII/Unicode whitespace.
+    ///
+    /// This reveals no credential bytes and lets embedding integrations reject
+    /// an unusable secret at their setup boundary.
+    pub fn is_empty(&self) -> bool {
+        self.0.trim().is_empty()
+    }
+
+    /// Whether this secret fits within a caller-selected byte limit.
+    ///
+    /// This reveals only whether a bounded transport/storage boundary can
+    /// accept the value, never any credential bytes.
+    pub fn fits_within_bytes(&self, maximum: usize) -> bool {
+        self.0.len() <= maximum
+    }
+
+    /// Whether this secret can be sent as an HTTP header value.
+    ///
+    /// The result permits host-owned authentication integrations to reject bad
+    /// session material before it reaches a request or diagnostic boundary.
+    pub fn is_valid_http_header_value(&self) -> bool {
+        http::HeaderValue::from_str(&self.0).is_ok()
+    }
+
     /// Expose the underlying secret value. This is crate-private.
     pub(crate) fn expose(&self) -> &str {
         &self.0

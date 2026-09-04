@@ -87,6 +87,40 @@ is advertised only when both the model and selected wire protocol support native
 audio input. It is not an operating-system network sandbox and does not prevent
 a later run from calling its selected provider.
 
+### Host-owned GitHub Copilot
+
+GitHub Copilot is an embedding-only Rust integration. It is deliberately absent
+from `ygg --login`, environment/configuration provider setup, and the NDJSON
+`ygg-host` protocol: those surfaces cannot safely own the host's GitHub OAuth
+state. A standalone Ygg catalog therefore never advertises Copilot models.
+
+A Rust embedding application implements `ygg_sdk::provider::CopilotHost`, owns
+all device-flow/OAuth state and durable credential storage itself, and constructs
+`CopilotProvider` with an explicit `CopilotEndpoint`. The host can display the
+bounded `CopilotDeviceLogin` data returned by `begin_device_login`, poll until
+it reports `Authorized`, then call `register_models`. Registration checks host
+availability, exchanges a short-lived inference session, obtains the
+credential-free authenticated inventory, validates every model, and adds all
+routes atomically. Any login, exchange, discovery, validation, or catalog
+collision failure leaves Copilot models out of the picker.
+
+The host must provide a vetted HTTPS inference origin root (literal loopback
+HTTP is allowed only for deterministic tests; path/query/userinfo are rejected),
+short-lived `CopilotSession` values, and explicit `Protocol` metadata for every
+discovered model. `OpenAiChat` uses the Chat Completions route and
+`OpenAiResponses` uses the Responses route; other protocols are rejected and
+model names never select a codec. The request resolver exchanges when no
+session is installed and refreshes a session within its safety skew. Session
+credentials and dynamic headers remain in memory behind `Auth::Dynamic`, are
+marked sensitive on requests, redact from diagnostics, and are not part of
+provider definitions, catalog metadata, or persistence. Hosts must likewise
+keep credential values out of model IDs and display labels.
+
+This seam does not implement GitHub's live OAuth endpoints, GitHub Enterprise
+endpoint policy, or an interactive CLI flow. Those are intentionally
+host-owned; use the Rust SDK integration when a host can implement and test
+that policy.
+
 ## Run requests
 
 Required run fields are `run_id`, `workspace`, `model`, and `prompt`:
