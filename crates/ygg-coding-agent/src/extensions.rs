@@ -39,6 +39,10 @@ use ygg_agent::extension_process::{
     EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES, MAX_EXTENSION_UI_LINES,
 };
+use ygg_agent::extension_runtime::{
+    ExtensionRuntimeActivationOutcome, ExtensionRuntimeCatalog, ExtensionRuntimeDomain,
+    ExtensionRuntimeManager, ExtensionSessionBinding,
+};
 use ygg_agent::{
     Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
 };
@@ -405,6 +409,8 @@ pub struct ExtensionSummary {
     pub telemetry_schema: Option<String>,
     pub compatibility: String,
     pub health: Option<ExtensionHealthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ygg_agent::extension_runtime::ExtensionRuntimeStatus>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
     pub hooks: Vec<ExtensionHook>,
@@ -861,6 +867,8 @@ async fn execute_shortcut_headless(
 
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
+    runtime_manager: Option<ExtensionRuntimeManager>,
+    runtime_binding: Option<ExtensionSessionBinding>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
     shortcuts: Vec<RegisteredExtensionShortcut>,
     summaries: Vec<ExtensionSummary>,
@@ -1113,6 +1121,8 @@ impl Default for ExecutableExtensions {
         let (background_tx, background_rx) = mpsc::channel(BACKGROUND_UPDATE_CAPACITY);
         Self {
             processes: Vec::new(),
+            runtime_manager: None,
+            runtime_binding: None,
             receivers: Vec::new(),
             shortcuts: Vec::new(),
             summaries: Vec::new(),
@@ -1175,6 +1185,11 @@ enum ExtensionBackgroundUpdate {
 }
 
 impl ExecutableExtensions {
+    /// Discovers and starts extensions with a fresh ordinary-host runtime manager.
+    ///
+    /// Product bootstrap uses [`Self::discover_and_start_with_runtime_manager`]
+    /// to retain compatible workspace services across an App rebuild. This
+    /// wrapper preserves the direct construction seam used by focused tests.
     pub fn discover_and_start(
         config: &Config,
         session: &Session,
@@ -1182,6 +1197,22 @@ impl ExecutableExtensions {
         reasoning: &ReasoningConfig,
         sessions: &SessionStore,
         host: &mut ExtensionHost,
+    ) -> Self {
+        Self::discover_and_start_with_runtime_manager(
+            config, session, model, reasoning, sessions, host, None,
+        )
+    }
+
+    /// Discovers a static catalog, binds the current session, and activates
+    /// eager lifecycle profiles through the supplied durable manager.
+    pub fn discover_and_start_with_runtime_manager(
+        config: &Config,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+        host: &mut ExtensionHost,
+        runtime_manager: Option<ExtensionRuntimeManager>,
     ) -> Self {
         let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
         let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
@@ -1291,61 +1322,95 @@ impl ExecutableExtensions {
             .cloned()
             .collect::<Vec<_>>();
 
-        let starts = if startable.is_empty() {
-            Vec::new()
-        } else {
-            let workspace = config.workspace.clone();
-            let state = host_state.clone();
-            let subagents_tool_available =
-                model.spec.capabilities.tools && config.tool_available("subagent_spawn");
-            match block_on_runtime(async move {
-                let starts = FuturesUnordered::new();
-                for (index, descriptor) in startable.into_iter().enumerate() {
-                    let name = descriptor.manifest.name.clone();
-                    let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
-                    runtime.host_state = state.clone();
-                    runtime.agent_sessions =
-                        name == SUBAGENTS_EXTENSION_NAME && subagents_tool_available;
-                    starts.push(async move {
-                        (
-                            index,
-                            name,
-                            ExtensionProcess::start(descriptor, runtime).await,
-                        )
-                    });
-                }
-                let mut completed = Vec::new();
-                tokio::pin!(starts);
-                while let Some((index, name, start)) = starts.next().await {
-                    if let Ok(process) = &start {
-                        // Attach only the live catalog immediately. A fast
-                        // dynamic child must not wait behind a slow sibling's
-                        // independent initialization deadline, while observer
-                        // and hook registration still follows discovery order.
-                        process.register_dynamic_tool_catalog(host);
-                    }
-                    completed.push((index, name, start));
-                }
-                completed.sort_by_key(|(index, _, _)| *index);
-                for (_, _, start) in &completed {
-                    if let Ok(process) = start {
-                        host.load(process);
-                    }
-                }
-                completed
-                    .into_iter()
-                    .map(|(_, name, start)| (name, start))
-                    .collect::<Vec<_>>()
-            }) {
-                Ok(starts) => starts,
-                Err(error) => {
-                    diagnostics.push(format!(
-                        "error: executable extensions could not start: {error}"
-                    ));
-                    Vec::new()
+        // Discovery remains static. Catalog construction reads bounded source
+        // identity only; the durable manager is the sole owner allowed to
+        // activate a process after policy/trust gates have admitted it.
+        let catalog = ExtensionRuntimeCatalog::from_descriptors(descriptors.clone());
+        diagnostics.extend(catalog.diagnostics().iter().map(|diagnostic| {
+            format!(
+                "warning: extension {:?}: runtime catalog {}",
+                diagnostic.extension, diagnostic.message
+            )
+        }));
+        let mut managed_runtime = runtime_manager;
+        let mut runtime_binding = None;
+        let mut starts = Vec::<(String, Result<ExtensionProcess, String>)>::new();
+        if !descriptors.is_empty() || managed_runtime.is_some() {
+            if managed_runtime.is_none() {
+                match ExtensionRuntimeDomain::ordinary(&config.workspace) {
+                    Ok(domain) => managed_runtime = Some(ExtensionRuntimeManager::new(domain)),
+                    Err(error) => diagnostics.push(format!(
+                        "error: executable extension runtime domain could not be created: {error}"
+                    )),
                 }
             }
-        };
+            if let Some(manager) = managed_runtime.clone() {
+                let workspace = config.workspace.clone();
+                let state = host_state.clone();
+                let subagents_tool_available =
+                    model.spec.capabilities.tools && config.tool_available("subagent_spawn");
+                let owner = session.resource_owner_key();
+                let startable_names = startable
+                    .iter()
+                    .map(|descriptor| descriptor.manifest.name.clone())
+                    .collect::<Vec<_>>();
+                match block_on_runtime(async move {
+                    manager.replace_catalog(catalog).await;
+                    let binding = manager
+                        .bind_session(owner)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let starts = binding
+                        .activate_eager(startable_names, |entry| {
+                            let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
+                            runtime.host_state = state.clone();
+                            runtime.agent_sessions = entry.descriptor.manifest.name
+                                == SUBAGENTS_EXTENSION_NAME
+                                && subagents_tool_available;
+                            runtime
+                        })
+                        .await;
+                    Ok::<_, anyhow::Error>((binding, starts))
+                }) {
+                    Ok(Ok((binding, activations))) => {
+                        runtime_binding = Some(binding);
+                        for activation in activations {
+                            let name = activation.extension;
+                            match (activation.outcome, activation.process) {
+                                (ExtensionRuntimeActivationOutcome::Ready, Some(process)) => {
+                                    starts.push((name, Ok(process)));
+                                }
+                                (outcome, _) => starts.push((
+                                    name,
+                                    Err(match outcome {
+                                        ExtensionRuntimeActivationOutcome::Inactive => {
+                                            "extension is not eligible for activation".to_owned()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::StaleSource => {
+                                            "extension source changed before activation".to_owned()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::ResourceExhausted(error) => {
+                                            error.to_string()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::Failed(failure) => {
+                                            format!("runtime startup {failure:?}")
+                                        }
+                                        ExtensionRuntimeActivationOutcome::Ready => {
+                                            "runtime activation returned no process".to_owned()
+                                        }
+                                    }),
+                                )),
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => diagnostics.push(format!(
+                        "error: executable extensions could not bind to the runtime manager: {error}"
+                    )),
+                    Err(error) => diagnostics.push(format!(
+                        "error: executable extensions could not start: {error}"
+                    )),
+                }
+            }
+        }
 
         let mut processes = Vec::new();
         let mut receivers = Vec::new();
@@ -1366,9 +1431,26 @@ impl ExecutableExtensions {
             }
         }
 
+// Register tool catalogs before observers/hooks so all live processes
+        // have a host-owned dynamic group. A compatible shared process was
+        // detached from the previous App binding before this point.
+        for process in &processes {
+            process.register_dynamic_tool_catalog(host);
+        }
+        for process in &processes {
+            host.load(process);
+        }
+
         let (shortcuts, shortcut_diagnostics) = register_extension_shortcuts(&processes);
         diagnostics.extend(shortcut_diagnostics);
 
+        let runtime_statuses = managed_runtime
+            .as_ref()
+            .map(ExtensionRuntimeManager::statuses)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|status| (status.provenance.extension.clone(), status))
+            .collect::<BTreeMap<_, _>>();
         let summaries = descriptors
             .into_iter()
             .map(|descriptor| {
@@ -1415,6 +1497,7 @@ impl ExecutableExtensions {
                     telemetry_schema,
                     compatibility,
                     health,
+                    runtime: runtime_statuses.get(&descriptor.manifest.name).cloned(),
                     tools: contributions
                         .map(|value| value.tools.iter().map(|tool| tool.name.clone()).collect())
                         .unwrap_or_else(|| descriptor.manifest.contributes.tools.clone()),
@@ -1435,6 +1518,8 @@ impl ExecutableExtensions {
 
         let mut extensions = Self::default();
         extensions.processes = processes;
+        extensions.runtime_manager = managed_runtime;
+        extensions.runtime_binding = runtime_binding;
         extensions.receivers = receivers;
         extensions.shortcuts = shortcuts;
         extensions.summaries = summaries;
@@ -1444,6 +1529,15 @@ impl ExecutableExtensions {
         extensions.start_policy_supervisors();
         extensions.start_session_lifecycle();
         extensions
+    }
+
+    /// Returns the durable process-fleet owner, if discovery created one.
+    ///
+    /// App rebuilds retain this exact manager and only replace their session
+    /// binding, which allows a compatible workspace service to survive without
+    /// transferring process ownership to a session object.
+    pub fn runtime_manager(&self) -> Option<ExtensionRuntimeManager> {
+        self.runtime_manager.clone()
     }
 
     pub fn bind_agent_sessions(&self, agent: &Agent) -> anyhow::Result<usize> {
@@ -1741,8 +1835,17 @@ impl ExecutableExtensions {
 
     /// Returns discovery metadata with live protocol-health snapshots overlaid.
     pub fn summaries(&self) -> Vec<ExtensionSummary> {
+        let runtime_statuses = self
+            .runtime_manager
+            .as_ref()
+            .map(ExtensionRuntimeManager::statuses)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|status| (status.provenance.extension.clone(), status))
+            .collect::<BTreeMap<_, _>>();
         let mut summaries = self.summaries.clone();
         for summary in &mut summaries {
+            summary.runtime = runtime_statuses.get(&summary.name).cloned();
             let Some(process) = self
                 .processes
                 .iter()
@@ -1950,7 +2053,11 @@ impl ExecutableExtensions {
     ) {
         let state = host_state(session, model, reasoning, sessions);
         for process in &self.processes {
-            process.set_host_state(state.clone());
+            if process.descriptor().manifest.runtime.sharing
+                == ygg_agent::extension_process::ExtensionRuntimeSharing::Isolated
+            {
+                process.set_host_state(state.clone());
+            }
         }
     }
 
@@ -2764,11 +2871,7 @@ impl ExecutableExtensions {
         while self.background_rx.try_recv().is_ok() {}
     }
 
-    /// Gracefully stop every extension. Each protocol shutdown has its own
-    /// hard timeout in `ExtensionProcess`; the outer timeout prevents a
-    /// broken extension from delaying terminal restoration indefinitely.
-    pub async fn shutdown(&mut self) {
-        self.cancel_background_work();
+    async fn settle_session_lifecycle(&mut self) {
         if self.session_lifecycle_started {
             if let Some(session_id) = self.session_id.clone() {
                 let diagnostics = notify_lifecycle_all(
@@ -2788,10 +2891,30 @@ impl ExecutableExtensions {
             }
             self.session_lifecycle_started = false;
         }
-        let processes = self.processes.clone();
-        let shutdowns =
-            futures_util::future::join_all(processes.iter().map(ExtensionProcess::shutdown));
-        let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, shutdowns).await;
+    }
+
+    /// Releases this App/session's attachment to the durable process fleet.
+    ///
+    /// Isolated profiles are stopped. Explicitly shared workspace services are
+    /// deliberately left with the runtime manager so a compatible replacement
+    /// App can bind them without a stop/restart gap.
+    pub async fn release_binding(&mut self) {
+        self.cancel_background_work();
+        self.settle_session_lifecycle().await;
+        for process in &self.processes {
+            process.detach_dynamic_tool_catalog();
+        }
+        if let Some(binding) = self.runtime_binding.take() {
+            // `ExtensionProcess::shutdown` is individually bounded. Do not
+            // cancel binding release midway: a dropped release future has
+            // already closed the binding and must finish detaching its keys.
+            binding.release().await;
+        } else {
+            let processes = self.processes.clone();
+            let shutdowns =
+                futures_util::future::join_all(processes.iter().map(ExtensionProcess::shutdown));
+            let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, shutdowns).await;
+        }
         self.processes.clear();
         self.receivers.clear();
         for summary in &mut self.summaries {
@@ -2799,15 +2922,61 @@ impl ExecutableExtensions {
         }
     }
 
-    /// Synchronous rebuild boundary used by the app constructor. Interactive
-    /// rebuilds run on Ygg's multi-thread runtime, so this retains graceful
-    /// protocol shutdown instead of dropping extension children.
+    /// Synchronous App rebuild boundary that preserves the durable manager.
+    pub fn release_binding_blocking(&mut self) {
+        let _ = block_on_runtime(self.release_binding());
+    }
+
+    /// Gracefully stops every runtime owned by this host after releasing the
+    /// current session binding. Each protocol shutdown has its own hard timeout
+    /// in `ExtensionProcess`; the outer timeout prevents terminal restoration
+    /// from being delayed indefinitely.
+    pub async fn shutdown(&mut self) {
+        self.release_binding().await;
+        if let Some(manager) = self.runtime_manager.take() {
+            let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, manager.shutdown()).await;
+        }
+    }
+
+    /// Synchronous terminal shutdown boundary.
     pub fn shutdown_blocking(&mut self) {
         let _ = block_on_runtime(self.shutdown());
     }
 
     pub async fn reload(&mut self) -> Vec<String> {
         self.cancel_background_work();
+        if let Some(manager) = self.runtime_manager.clone() {
+            let names = self
+                .processes
+                .iter()
+                .map(|process| process.descriptor().manifest.name.clone())
+                .collect::<BTreeSet<_>>();
+            let reloads = futures_util::future::join_all(names.into_iter().map(|name| {
+                let manager = manager.clone();
+                async move { (name.clone(), manager.reload(&name).await) }
+            }))
+            .await;
+            let mut messages = Vec::new();
+            for (name, results) in reloads {
+                for result in results {
+                    match result {
+                        Ok(report) => messages.push(format!(
+                            "reloaded {name} (generation {}, previous shutdown {})",
+                            report.generation,
+                            if report.previous_shutdown_graceful {
+                                "clean"
+                            } else {
+                                "forced"
+                            }
+                        )),
+                        Err(error) => messages.push(format!("unable to reload {name}: {error}")),
+                    }
+                }
+            }
+            self.start_policy_supervisors();
+            messages.extend(self.drain_events());
+            return messages;
+        }
         let reloads = self.processes.iter().cloned().map(|process| async move {
             let name = process.descriptor().manifest.name.clone();
             (name, process.reload().await)

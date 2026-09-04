@@ -18,6 +18,9 @@ use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
+use ygg_agent::extension_runtime::{
+    ExtensionRuntimeDomain, ExtensionRuntimeManager, ExtensionTrustDomain,
+};
 use ygg_agent::{
     AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
     ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, GoalDecision, GoalDriver,
@@ -67,7 +70,9 @@ use ygg_serve_backend::{
     PROTOCOL_VERSION,
 };
 
-use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
+use crate::app::bootstrap::{
+    build_app_with_runtime_manager, rebuild_app, LaunchSelection, SessionSelection,
+};
 use crate::app::{reasoning_label, supported_levels_with_subagents, App, Reconfig};
 use crate::commands;
 use crate::compaction::attempt_compaction;
@@ -6287,6 +6292,30 @@ async fn shutdown_worker_app(app: &mut Option<App>) {
     }
 }
 
+fn serve_runtime_manager(plan: &WorkerPlan) -> anyhow::Result<ExtensionRuntimeManager> {
+    // Serve never reuses the ordinary-host partition. Hashing both stable
+    // project identity and the finite authority profile provides an explicit,
+    // path-free trust partition while the runtime domain independently binds
+    // the canonical workspace.
+    let project = plan
+        .project_id
+        .as_ref()
+        .map(|project| project.as_str())
+        .unwrap_or("unbound");
+    let project_digest = format!("{:x}", Sha256::digest(project.as_bytes()));
+    let authority = format!("{:?}", plan.authority);
+    let authority_digest = format!("{:x}", Sha256::digest(authority.as_bytes()));
+    let trust = ExtensionTrustDomain::new(format!(
+        "serve-{}-{}",
+        &project_digest[..32],
+        &authority_digest[..32]
+    ))
+    .map_err(anyhow::Error::msg)?;
+    let domain =
+        ExtensionRuntimeDomain::serve(&plan.config.workspace, trust).map_err(anyhow::Error::msg)?;
+    Ok(ExtensionRuntimeManager::new(domain))
+}
+
 fn build_worker_app(plan: &mut WorkerPlan) -> anyhow::Result<App> {
     let mut config = plan.config.clone();
     config.resume = match &plan.launch.session {
@@ -6307,7 +6336,12 @@ fn build_worker_app(plan: &mut WorkerPlan) -> anyhow::Result<App> {
     {
         boot.set_prepared_session(session);
     }
-    build_app(boot, plan.launch.clone(), system)
+    build_app_with_runtime_manager(
+        boot,
+        plan.launch.clone(),
+        system,
+        Some(serve_runtime_manager(plan)?),
+    )
 }
 
 fn command_name_is_claimed_by_builtin(name: &str) -> bool {

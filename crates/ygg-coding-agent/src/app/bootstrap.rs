@@ -10,6 +10,7 @@ use anyhow::Context;
 use crossterm::event::EventStream;
 use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
+use ygg_agent::extension_runtime::ExtensionRuntimeManager;
 use ygg_agent::secure_fs::{create_regular_file_for_append, open_regular_file_for_append};
 use ygg_agent::{
     Agent, AgentCompactionMode, AgentConfig, CoreTools, DelegationConfig, DurableGoalStore,
@@ -4236,12 +4237,24 @@ fn validate_explicit_tool_policy(
     }
 }
 
+#[cfg(test)]
 fn configured_extensions(
     config: &Config,
     session: &Session,
     model: &Model,
     reasoning: &ReasoningConfig,
     sessions: &SessionStore,
+) -> anyhow::Result<(ExtensionHost, ExecutableExtensions)> {
+    configured_extensions_with_runtime_manager(config, session, model, reasoning, sessions, None)
+}
+
+fn configured_extensions_with_runtime_manager(
+    config: &Config,
+    session: &Session,
+    model: &Model,
+    reasoning: &ReasoningConfig,
+    sessions: &SessionStore,
+    runtime_manager: Option<ExtensionRuntimeManager>,
 ) -> anyhow::Result<(ExtensionHost, ExecutableExtensions)> {
     let mut extensions = ExtensionHost::new();
     extensions.load(&CoreTools);
@@ -4253,13 +4266,14 @@ fn configured_extensions(
     if let Some(path) = config.telemetry.as_deref() {
         extensions.observe(TelemetryObserver::new(path, env!("CARGO_PKG_VERSION"))?);
     }
-    let executable_extensions = ExecutableExtensions::discover_and_start(
+    let executable_extensions = ExecutableExtensions::discover_and_start_with_runtime_manager(
         config,
         session,
         model,
         reasoning,
         sessions,
         &mut extensions,
+        runtime_manager,
     );
     Ok((extensions, executable_extensions))
 }
@@ -4366,7 +4380,21 @@ pub(crate) fn open_launch_session(
     }
 }
 
+/// Builds an App with a fresh ordinary-host extension runtime manager.
 pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> anyhow::Result<App> {
+    build_app_with_runtime_manager(boot, launch, system, None)
+}
+
+/// Builds an App using an explicit host-owned extension runtime manager.
+///
+/// Serve supplies a separately trust-partitioned manager through this seam;
+/// ordinary callers retain the historical local-host domain via [`build_app`].
+pub(crate) fn build_app_with_runtime_manager(
+    boot: Bootstrap,
+    launch: LaunchSelection,
+    system: String,
+    runtime_manager: Option<ExtensionRuntimeManager>,
+) -> anyhow::Result<App> {
     let Bootstrap {
         mut config,
         catalog,
@@ -4404,8 +4432,14 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions)?;
+    let (extensions, executable_extensions) = configured_extensions_with_runtime_manager(
+        &config,
+        &session,
+        &model,
+        &requested_reasoning,
+        &sessions,
+        runtime_manager,
+    )?;
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);
@@ -4478,6 +4512,36 @@ pub fn build_app(boot: Bootstrap, launch: LaunchSelection, system: String) -> an
         goal_driver,
         goal_session_id,
     })
+}
+
+struct ReleasedExtensionBindingCleanup {
+    extensions: Option<ExecutableExtensions>,
+}
+
+impl ReleasedExtensionBindingCleanup {
+    fn new(extensions: ExecutableExtensions) -> Self {
+        Self {
+            extensions: Some(extensions),
+        }
+    }
+
+    fn disarm(mut self) {
+        // The replacement App now owns a clone of the same manager. Dropping
+        // the released wrapper is intentional: its process list is empty, so
+        // its normal Drop path cannot terminate the shared fleet.
+        self.extensions.take();
+    }
+}
+
+impl Drop for ReleasedExtensionBindingCleanup {
+    fn drop(&mut self) {
+        if let Some(mut extensions) = self.extensions.take() {
+            // Once the original binding has been released, any later rebuild
+            // error has no App left to own terminal fleet shutdown. Do not
+            // leave a workspace service behind on this failure path.
+            extensions.shutdown_blocking();
+        }
+    }
 }
 
 /// Recreate the Agent at an idle boundary. Taking `App` by value guarantees the
@@ -4563,7 +4627,13 @@ pub fn rebuild_app(
     }
     // Do not tear down the working agent or its executable extensions until
     // the complete candidate route and reasoning configuration is known valid.
-    app.executable_extensions.shutdown_blocking();
+    // Keep the host-level runtime manager, but release the old App binding so
+    // only an explicitly workspace-shared, content-identical process can
+    // survive the compatible rebuild.
+    let mut released_extensions = std::mem::take(&mut app.executable_extensions);
+    let runtime_manager = released_extensions.runtime_manager();
+    released_extensions.release_binding_blocking();
+    let released_extensions = ReleasedExtensionBindingCleanup::new(released_extensions);
     drop(app);
     let mut session = match selection {
         Some(SessionSelection::CreateNew(path)) => {
@@ -4603,8 +4673,14 @@ pub fn rebuild_app(
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, executable_extensions) =
-        configured_extensions(&config, &session, &model, &requested_reasoning, &sessions)?;
+    let (extensions, executable_extensions) = configured_extensions_with_runtime_manager(
+        &config,
+        &session,
+        &model,
+        &requested_reasoning,
+        &sessions,
+        runtime_manager,
+    )?;
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);
@@ -4656,6 +4732,7 @@ pub fn rebuild_app(
     agent.finalize_tool_surface();
     let system_tokens = estimate_text_tokens(agent.system_prompt());
 
+    released_extensions.disarm();
     Ok(App {
         agent,
         model,

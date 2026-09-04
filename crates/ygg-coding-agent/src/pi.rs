@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use ygg_agent::extension_process::{
     ExtensionCapabilities, ExtensionEntrypoint, ExtensionFilesystemAccess, ExtensionHook,
-    ExtensionManifest, ExtensionUiSurface, ManifestContributions,
+    ExtensionLifecycleProfile, ExtensionManifest, ExtensionRuntimeSettings,
+    ExtensionRuntimeSharing, ExtensionUiSurface, ManifestContributions,
 };
 use ygg_agent::EXTENSION_API_VERSION_0_2;
 
@@ -956,6 +957,17 @@ fn manifest_for_plan(
             notifications: true,
             confirmations: true,
             presentation: false,
+        },
+        // An aggregate is one exact ordered bridge invocation. Its generated
+        // arguments carry every locked source fingerprint, so the runtime
+        // catalog's complete manifest digest cannot pool a subset/reordering.
+        runtime: if sources.len() > 1 {
+            ExtensionRuntimeSettings {
+                lifecycle: ExtensionLifecycleProfile::PiAggregate,
+                sharing: ExtensionRuntimeSharing::Workspace,
+            }
+        } else {
+            ExtensionRuntimeSettings::default()
         },
     })
 }

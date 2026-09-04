@@ -190,7 +190,43 @@ tool_renderers = ["git_status"]
 notifications = true
 confirmations = true
 presentation = true # API 0.2 frontend-neutral activity/list/tree/detail snapshots
+
+# Optional. Omitting this preserves the legacy isolated resident process.
+[runtime]
+lifecycle = "workspace_service"
+sharing = "workspace"
 ```
+
+### Runtime lifecycle and sharing
+
+Discovery builds a bounded static catalog and never launches an entrypoint. The
+host runtime manager activates only profiles admitted by the host's existing
+enablement, trust, effect-policy, and process-policy gates.
+
+`[runtime]` is optional and defaults to `lifecycle = "legacy_resident"` plus
+`sharing = "isolated"`, preserving existing manifests. Valid lifecycle values
+are `legacy_resident`, `lazy_resident`, `oneshot`, `session`,
+`workspace_service`, `always`, and `pi_aggregate`.
+
+- `legacy_resident` and `session` start with an admitted session binding;
+  `session` and every isolated resident stop when that binding is released.
+- `lazy_resident` is cataloged but starts only after explicit host activation.
+  It may be isolated or explicitly workspace shared.
+- `oneshot` is isolated and stops when its admitted operation settles.
+- `workspace_service`, `always`, and `pi_aggregate` require
+  `sharing = "workspace"`; their manager-owned process may survive a compatible
+  App/session rebuild until the host shuts down or the catalog changes.
+
+Workspace sharing is never inferred from an extension name or language. It
+requires a canonical workspace, an explicit host trust partition, manifest
+opt-in, a matching content digest, and a directly verified local entrypoint.
+Ordinary and Serve hosts use disjoint trust partitions; Serve also separates
+project and authority profiles. PATH-only commands are allowed for isolated
+legacy compatibility but cannot be shared. API `0.1` does not carry
+resource-owner fences and is therefore always isolated. A source or catalog
+change retires a shared runtime fail-closed. Runtime status and
+`resource_exhausted` outcomes expose only extension and digest provenance; they
+do not expose workspace paths, trust inputs, child stderr, or secrets.
 
 Bare entrypoint commands are first resolved beside the manifest, then through
 `PATH`. Arguments are passed directly without a shell. The child working

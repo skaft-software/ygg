@@ -80,6 +80,7 @@ pub mod extension_api_v03;
 pub mod extension_policy;
 pub mod extension_presentation;
 pub mod extension_process;
+pub mod extension_runtime;
 pub mod extension_secret;
 pub mod goal_driver;
 pub mod goal_store;

@@ -1151,6 +1151,90 @@ pub fn force_kill_registered_process_groups() {
     }
 }
 
+/// Lifecycle ownership selected by an executable-extension manifest.
+///
+/// Profiles are deliberately independent from an extension implementation
+/// language. A runtime manager may share only profiles that also opt into an
+/// explicit workspace sharing scope and whose content digest matches.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionLifecycleProfile {
+    /// Preserve the API 0.1/0.2 resident-process behavior. This is the
+    /// manifest default and is isolated to the current session binding.
+    #[default]
+    LegacyResident,
+    /// Start only when a caller explicitly activates the catalog entry, then
+    /// retain the resident process according to its explicit sharing scope.
+    LazyResident,
+    /// Start for one admitted operation and stop at its settlement boundary.
+    #[serde(rename = "oneshot", alias = "one_shot")]
+    OneShot,
+    /// Start with a session binding and stop when that binding is released.
+    Session,
+    /// A workspace-scoped service. It must opt into `sharing = "workspace"`.
+    WorkspaceService,
+    /// Start when the entry is eligible and retain it for the host lifetime.
+    /// It must opt into `sharing = "workspace"`.
+    Always,
+    /// One exact ordered Pi source aggregate. It must opt into
+    /// `sharing = "workspace"`; individual Pi sources are never pooled.
+    PiAggregate,
+}
+
+/// Explicit scope in which a lifecycle profile may share one process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionRuntimeSharing {
+    /// Do not share this process across session bindings.
+    #[default]
+    Isolated,
+    /// Permit sharing only after the runtime manager matches canonical
+    /// workspace, explicit trust domain, and complete content digest.
+    Workspace,
+}
+
+/// Optional runtime-manager settings from `[runtime]` in `extension.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionRuntimeSettings {
+    /// Selected process lifecycle profile.
+    #[serde(default)]
+    pub lifecycle: ExtensionLifecycleProfile,
+    /// Explicit sharing scope. Sharing is never inferred from implementation
+    /// language or a matching extension name.
+    #[serde(default)]
+    pub sharing: ExtensionRuntimeSharing,
+}
+
+impl ExtensionRuntimeSettings {
+    fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        let requires_workspace_sharing = matches!(
+            self.lifecycle,
+            ExtensionLifecycleProfile::WorkspaceService
+                | ExtensionLifecycleProfile::Always
+                | ExtensionLifecycleProfile::PiAggregate
+        );
+        if requires_workspace_sharing && self.sharing != ExtensionRuntimeSharing::Workspace {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "runtime lifecycle requires explicit sharing = \"workspace\"".into(),
+            ));
+        }
+        if matches!(
+            self.lifecycle,
+            ExtensionLifecycleProfile::LegacyResident
+                | ExtensionLifecycleProfile::OneShot
+                | ExtensionLifecycleProfile::Session
+        ) && self.sharing != ExtensionRuntimeSharing::Isolated
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "legacy_resident, oneshot, and session runtimes must use sharing = \"isolated\""
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Parsed `extension.toml` metadata.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1179,6 +1263,9 @@ pub struct ExtensionManifest {
     /// Typed contribution points declared by the extension.
     #[serde(default)]
     pub contributes: ManifestContributions,
+    /// Optional process-fleet lifecycle and explicit sharing policy.
+    #[serde(default)]
+    pub runtime: ExtensionRuntimeSettings,
 }
 
 impl ExtensionManifest {
@@ -1241,6 +1328,7 @@ impl ExtensionManifest {
 
     /// Validates identifiers, versions, launch data, and contribution lists.
     pub fn validate(&self) -> Result<(), ExtensionRuntimeError> {
+        self.runtime.validate()?;
         validate_identifier("extension name", &self.name, false)?;
         semver::Version::parse(&self.version).map_err(|error| {
             ExtensionRuntimeError::InvalidManifest(format!(
@@ -1253,6 +1341,13 @@ impl ExtensionManifest {
                 extension: self.api_version.clone(),
                 host: "0.1, 0.2, or 0.3".into(),
             });
+        }
+        if self.runtime.sharing == ExtensionRuntimeSharing::Workspace
+            && self.api_version == EXTENSION_API_VERSION_0_1
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "workspace sharing requires extension API 0.2 or 0.3 resource-owner fences".into(),
+            ));
         }
         if let Some(requires_ygg) = &self.requires_ygg {
             let requirement = semver::VersionReq::parse(requires_ygg).map_err(|error| {
@@ -3253,6 +3348,10 @@ pub struct ExtensionRuntimeConfig {
     pub cancellation_grace: Duration,
     /// Retention window for cancelled request IDs and late-reply diagnosis.
     pub tombstone_ttl: Duration,
+    /// Whether this process owns its legacy per-process restart supervisor.
+    /// A host-level runtime manager disables this and provides one durable
+    /// supervisor for the governed fleet instead.
+    pub supervise: bool,
 }
 
 impl std::fmt::Debug for ExtensionRuntimeConfig {
@@ -3271,6 +3370,7 @@ impl std::fmt::Debug for ExtensionRuntimeConfig {
             .field("writer_queue_capacity", &self.writer_queue_capacity)
             .field("cancellation_grace", &self.cancellation_grace)
             .field("tombstone_ttl", &self.tombstone_ttl)
+            .field("supervise", &self.supervise)
             .finish()
     }
 }
@@ -3291,6 +3391,7 @@ impl ExtensionRuntimeConfig {
             writer_queue_capacity: DEFAULT_WRITER_QUEUE,
             cancellation_grace: DEFAULT_CANCELLATION_GRACE,
             tombstone_ttl: DEFAULT_TOMBSTONE_TTL,
+            supervise: true,
         }
     }
 }
@@ -3985,7 +4086,9 @@ impl ExtensionProcess {
             Arc::downgrade(&process.inner),
             catalog_update_rx,
         ));
-        tokio::spawn(supervise_extension(Arc::downgrade(&process.inner)));
+        if process.inner.config.supervise {
+            tokio::spawn(supervise_extension(Arc::downgrade(&process.inner)));
+        }
         Ok(process)
     }
 
@@ -5489,6 +5592,18 @@ impl Extension for ExtensionProcess {
 }
 
 impl ExtensionProcess {
+    /// Removes this process's live tool group from its current host.
+    ///
+    /// A host-level runtime manager calls this at an idle App/session rebuild
+    /// before attaching the still-running process to the replacement host. It
+    /// never stops the process and therefore cannot cancel independently owned
+    /// workspace-service work.
+    pub fn detach_dynamic_tool_catalog(&self) {
+        if let Some(registration) = lock_std_mutex(&self.inner.dynamic_tool_registration).take() {
+            registration.remove();
+        }
+    }
+
     /// Attaches the live tool catalog before the process's ordered observer and
     /// hook registration. Product startup uses this narrow first phase so a
     /// fast child can publish while a slower sibling is still initializing;
@@ -12672,6 +12787,44 @@ confirmations = true
         assert_eq!(manifest.contributes.ui, vec![ExtensionUiSurface::Status]);
         assert!(manifest.contributes.context);
         assert!(manifest.contributes.confirmations);
+        assert_eq!(manifest.runtime, ExtensionRuntimeSettings::default());
+    }
+
+    #[test]
+    fn manifest_runtime_profiles_require_explicit_safe_sharing() {
+        let workspace_service = VALID_MANIFEST
+            .replace("api_version = \"0.1\"", "api_version = \"0.2\"")
+            .replace(
+                "\n[entrypoint]",
+                "\n[runtime]\nlifecycle = \"workspace_service\"\nsharing = \"workspace\"\n\n[entrypoint]",
+            );
+        assert!(ExtensionManifest::parse(&workspace_service).is_ok());
+
+        let legacy_api =
+            workspace_service.replace("api_version = \"0.2\"", "api_version = \"0.1\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&legacy_api),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("requires extension API 0.2")
+        ));
+
+        let isolated_service =
+            workspace_service.replace("sharing = \"workspace\"", "sharing = \"isolated\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&isolated_service),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("requires explicit sharing")
+        ));
+
+        let shared_legacy = workspace_service.replace(
+            "lifecycle = \"workspace_service\"",
+            "lifecycle = \"legacy_resident\"",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&shared_legacy),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("must use sharing = \"isolated\"")
+        ));
     }
 
     #[test]
