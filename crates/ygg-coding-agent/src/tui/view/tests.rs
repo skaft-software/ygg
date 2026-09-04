@@ -2231,6 +2231,40 @@ fn terminal_native_prompt_stays_within_every_viewport() {
 }
 
 #[test]
+fn narrow_composer_clips_an_oversized_grapheme_without_losing_the_cursor() {
+    for width in [3, 4] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, 8);
+        shell.state.borrow_mut().editor.set_text("界");
+
+        let rendered = render_shell(&shell.state.borrow(), width);
+        assert!(
+            rendered
+                .iter()
+                .all(|line| visible_width(line) <= usize::from(width)),
+            "{width}: {rendered:?}"
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|line| line.matches(CURSOR_MARKER).count())
+                .sum::<usize>(),
+            1,
+            "{width}: {rendered:?}"
+        );
+        let cursor_line = rendered
+            .iter()
+            .find(|line| line.contains(CURSOR_MARKER))
+            .expect("focused composer cursor");
+        let cursor_byte = cursor_line.find(CURSOR_MARKER).expect("cursor marker byte");
+        assert!(
+            visible_width(&cursor_line[..cursor_byte]) < usize::from(width),
+            "{width}: {cursor_line:?}"
+        );
+    }
+}
+
+#[test]
 fn composer_geometry_keeps_full_rows_and_visual_edges_in_one_grid() {
     for (chrome, width) in [("boxed", 12), ("framed", 12), ("shaded", 12), ("boxed", 8)] {
         let mut shell = InteractiveShell::test_shell();
@@ -2340,7 +2374,14 @@ fn native_hardware_cursor_stays_inside_full_composer_rows() {
         positions
     }
 
-    for (chrome, width) in [("boxed", 12), ("framed", 12), ("shaded", 12), ("boxed", 8)] {
+    for (chrome, width) in [
+        ("boxed", 1),
+        ("boxed", 2),
+        ("boxed", 12),
+        ("framed", 12),
+        ("shaded", 12),
+        ("boxed", 8),
+    ] {
         let mut theme = crate::tui::theme::test_theme();
         if chrome != "boxed" {
             theme.override_token("composer", chrome);
@@ -2394,7 +2435,7 @@ fn composer_projection_cache_reuses_an_unchanged_large_draft_and_refreshes_on_ch
         let projection = state.composer_editor_projection(geometry);
         let expected_rows = (256_usize * 1024).div_ceil(geometry.text_width());
         assert_eq!(projection.line_count(), expected_rows);
-        let _visible_row = projection.visible_row(projection.cursor_row(), CURSOR_MARKER);
+        let _visible_row = projection.visible_row(projection.cursor_row(), CURSOR_MARKER, 80);
         let cache = state.composer_editor_cache.borrow();
         let entry = cache.as_ref().expect("projection populated the cache");
         assert_eq!(entry.text_width(), geometry.text_width());
@@ -2415,6 +2456,31 @@ fn composer_projection_cache_reuses_an_unchanged_large_draft_and_refreshes_on_ch
     assert_eq!(
         first_cache, second_cache,
         "unchanged draft rebuilt its layout"
+    );
+
+    shell.state.borrow_mut().editor.set_cursor(0);
+    let cursor_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let projection = state.composer_editor_projection(geometry);
+        assert_eq!(projection.cursor_row(), 0);
+        assert!(
+            projection
+                .visible_row(0, CURSOR_MARKER, geometry.text_width())
+                .starts_with(CURSOR_MARKER),
+            "cursor-only refresh did not update the structured projection"
+        );
+        let source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("cursor refresh retained the cache")
+            .source();
+        source
+    };
+    assert_eq!(
+        first_cache, cursor_cache,
+        "cursor movement should retain the text-keyed display cache"
     );
 
     shell.apply_edit(EditAction::Char('y'));

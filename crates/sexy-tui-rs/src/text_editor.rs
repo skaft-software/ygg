@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
+use std::sync::Arc;
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -78,7 +79,10 @@ impl TextEditorVisualLine {
 /// Visual wrapping and cursor placement for a [`TextEditor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEditorLayout {
-    lines: Vec<TextEditorVisualLine>,
+    // Visual rows are immutable for one text/width pair. Keeping them shared
+    // makes cursor-only layouts and projections cheap without retaining a
+    // second full copy of a large draft's row table.
+    lines: Arc<[TextEditorVisualLine]>,
     cursor_row: usize,
     cursor: usize,
     wrap_width: usize,
@@ -88,7 +92,7 @@ impl TextEditorLayout {
     /// Visual rows in source order. Every offset is a grapheme boundary.
     #[must_use]
     pub fn lines(&self) -> &[TextEditorVisualLine] {
-        &self.lines
+        self.lines.as_ref()
     }
 
     /// Index of the visual row owning the cursor.
@@ -260,7 +264,7 @@ impl TextEditorProjection {
 #[derive(Clone, Debug)]
 struct LayoutCache {
     wrap_width: usize,
-    layout: TextEditorLayout,
+    lines: Arc<[TextEditorVisualLine]>,
 }
 
 /// An owned UTF-8 multiline buffer with a grapheme-safe cursor.
@@ -288,9 +292,12 @@ pub struct TextEditor {
     /// The column selected before a vertical move into a shorter row. It stays
     /// sticky for repeated vertical moves and is reset by non-vertical edits.
     preferred_column: Option<usize>,
-    /// Monotonic local identity for applications that cache a transformed
-    /// display projection without scanning the complete draft every frame.
+    /// Monotonic local identity changed by either text or cursor mutation.
     revision: u64,
+    /// Monotonic local identity changed only when source text changes. Layout
+    /// rows and an application's transformed display map can reuse this across
+    /// cursor movement.
+    text_revision: u64,
     cached_layout: RefCell<Option<LayoutCache>>,
 }
 
@@ -301,6 +308,7 @@ impl Default for TextEditor {
             cursor: 0,
             preferred_column: None,
             revision: 0,
+            text_revision: 0,
             cached_layout: RefCell::new(None),
         }
     }
@@ -323,6 +331,7 @@ impl TextEditor {
             cursor,
             preferred_column: None,
             revision: 0,
+            text_revision: 0,
             cached_layout: RefCell::new(None),
         }
     }
@@ -351,6 +360,15 @@ impl TextEditor {
         self.revision
     }
 
+    /// Monotonic local revision changed only by text mutations.
+    ///
+    /// This lets embeddings retain a transformed display map and wrapped row
+    /// table while updating the structured cursor projection independently.
+    #[must_use]
+    pub fn text_revision(&self) -> u64 {
+        self.text_revision
+    }
+
     /// Return whether the buffer has no text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -367,13 +385,16 @@ impl TextEditor {
     pub fn set_text(&mut self, text: impl Into<String>) {
         let text = text.into();
         let cursor = text.len();
-        let changed = self.text != text || self.cursor != cursor;
+        let text_changed = self.text != text;
+        let cursor_changed = self.cursor != cursor;
         self.text = text;
         self.cursor = cursor;
         self.preferred_column = None;
-        if changed {
+        if text_changed {
             self.invalidate_layout();
-            self.touch();
+            self.touch_text();
+        } else if cursor_changed {
+            self.touch_cursor();
         }
     }
 
@@ -389,8 +410,7 @@ impl TextEditor {
         self.cursor = cursor;
         self.preferred_column = None;
         if changed {
-            self.invalidate_layout();
-            self.touch();
+            self.touch_cursor();
         }
     }
 
@@ -407,13 +427,16 @@ impl TextEditor {
     /// Take the owned buffer, leaving an empty editor with cursor zero.
     #[must_use]
     pub fn take_text(&mut self) -> String {
-        let had_state = !self.text.is_empty() || self.cursor != 0;
+        let text_changed = !self.text.is_empty();
+        let cursor_changed = self.cursor != 0;
         self.cursor = 0;
         self.preferred_column = None;
         let text = std::mem::take(&mut self.text);
-        if had_state {
+        if text_changed {
             self.invalidate_layout();
-            self.touch();
+            self.touch_text();
+        } else if cursor_changed {
+            self.touch_cursor();
         }
         text
     }
@@ -435,6 +458,7 @@ impl TextEditor {
 
         let removed = range.end - range.start;
         let inserted = replacement.len();
+        let text_changed = &self.text[range.clone()] != replacement;
         let next_cursor = if self.cursor < range.start {
             self.cursor
         } else if range.start == range.end && self.cursor == range.start {
@@ -447,7 +471,7 @@ impl TextEditor {
             range.start + inserted
         };
         self.text.replace_range(range, replacement);
-        self.finish_after_edit(next_cursor);
+        self.finish_after_edit(next_cursor, text_changed);
         true
     }
 
@@ -481,27 +505,34 @@ impl TextEditor {
     }
 
     /// Return the visual layout for the current text and cursor.
+    ///
+    /// Cursor-only calls reuse the cached visual rows for this width. The
+    /// returned layout is still an owned value, but its immutable row table is
+    /// shared with prior layouts rather than cloned.
     #[must_use]
     pub fn layout(&self, wrap_width: usize) -> TextEditorLayout {
         let wrap_width = normalize_wrap_width(wrap_width);
-        if let Some(cache) = self.cached_layout.borrow().as_ref() {
-            if cache.wrap_width == wrap_width {
-                return cache.layout.clone();
-            }
-        }
-
-        let layout = Self::layout_for(&self.text, self.cursor, wrap_width);
-        *self.cached_layout.borrow_mut() = Some(LayoutCache {
-            wrap_width,
-            layout: layout.clone(),
-        });
-        layout
+        let cached_lines =
+            self.cached_layout.borrow().as_ref().and_then(|cache| {
+                (cache.wrap_width == wrap_width).then(|| Arc::clone(&cache.lines))
+            });
+        let lines = if let Some(lines) = cached_lines {
+            lines
+        } else {
+            let lines = Arc::from(visual_lines(&self.text, wrap_width));
+            *self.cached_layout.borrow_mut() = Some(LayoutCache {
+                wrap_width,
+                lines: Arc::clone(&lines),
+            });
+            lines
+        };
+        layout_from_lines(&self.text, self.cursor, wrap_width, lines)
     }
 
     /// Return a marker-free structured projection for the current text.
     #[must_use]
     pub fn projection(&self, wrap_width: usize) -> TextEditorProjection {
-        projection_for_layout(&self.text, self.layout(wrap_width))
+        project_layout(&self.text, self.layout(wrap_width))
     }
 
     /// Layout arbitrary safe display text with the same editor rules.
@@ -512,15 +543,25 @@ impl TextEditor {
     #[must_use]
     pub fn layout_for(text: &str, cursor: usize, wrap_width: usize) -> TextEditorLayout {
         let wrap_width = normalize_wrap_width(wrap_width);
-        let cursor = clamp_to_grapheme_boundary(text, cursor);
-        let lines = visual_lines(text, wrap_width);
-        let cursor_row = cursor_row(&lines, cursor);
-        TextEditorLayout {
-            lines,
-            cursor_row,
-            cursor,
-            wrap_width,
-        }
+        let lines = Arc::from(visual_lines(text, wrap_width));
+        layout_from_lines(text, cursor, wrap_width, lines)
+    }
+
+    /// Build a projection for `cursor` from a compatible existing layout.
+    ///
+    /// `layout` must have been made from the same safe display text and width.
+    /// Reusing it avoids re-wrapping an unchanged transformed draft when only
+    /// its source cursor changes.
+    #[must_use]
+    pub fn projection_for_layout(
+        text: &str,
+        layout: &TextEditorLayout,
+        cursor: usize,
+    ) -> TextEditorProjection {
+        project_layout(
+            text,
+            layout_from_lines(text, cursor, layout.wrap_width, Arc::clone(&layout.lines)),
+        )
     }
 
     /// Build a marker-free structured projection for arbitrary safe display
@@ -532,7 +573,7 @@ impl TextEditor {
     /// marker themselves rather than searching rendered source strings.
     #[must_use]
     pub fn projection_for(text: &str, cursor: usize, wrap_width: usize) -> TextEditorProjection {
-        projection_for_layout(text, Self::layout_for(text, cursor, wrap_width))
+        project_layout(text, Self::layout_for(text, cursor, wrap_width))
     }
 
     fn insert_text(&mut self, text: &str) -> bool {
@@ -540,7 +581,7 @@ impl TextEditor {
             return false;
         }
         self.text.insert_str(self.cursor, text);
-        self.finish_after_edit(self.cursor + text.len());
+        self.finish_after_edit(self.cursor + text.len(), true);
         true
     }
 
@@ -550,7 +591,7 @@ impl TextEditor {
         }
         let previous = previous_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(previous..self.cursor, "");
-        self.finish_after_edit(previous);
+        self.finish_after_edit(previous, true);
         true
     }
 
@@ -560,7 +601,7 @@ impl TextEditor {
         }
         let next = next_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..next, "");
-        self.finish_after_edit(self.cursor);
+        self.finish_after_edit(self.cursor, true);
         true
     }
 
@@ -609,8 +650,7 @@ impl TextEditor {
             return false;
         }
         self.cursor = cursor;
-        self.invalidate_layout();
-        self.touch();
+        self.touch_cursor();
         true
     }
 
@@ -623,11 +663,17 @@ impl TextEditor {
         changed
     }
 
-    fn finish_after_edit(&mut self, intended_cursor: usize) {
-        self.cursor = ceil_to_grapheme_boundary(&self.text, intended_cursor);
+    fn finish_after_edit(&mut self, intended_cursor: usize, text_changed: bool) {
+        let cursor = ceil_to_grapheme_boundary(&self.text, intended_cursor);
+        let cursor_changed = self.cursor != cursor;
+        self.cursor = cursor;
         self.preferred_column = None;
-        self.invalidate_layout();
-        self.touch();
+        if text_changed {
+            self.invalidate_layout();
+            self.touch_text();
+        } else if cursor_changed {
+            self.touch_cursor();
+        }
     }
 
     fn finish_after_motion(&mut self, cursor: usize) {
@@ -636,12 +682,16 @@ impl TextEditor {
         self.cursor = cursor;
         self.preferred_column = None;
         if changed {
-            self.invalidate_layout();
-            self.touch();
+            self.touch_cursor();
         }
     }
 
-    fn touch(&mut self) {
+    fn touch_text(&mut self) {
+        self.revision = self.revision.saturating_add(1);
+        self.text_revision = self.text_revision.saturating_add(1);
+    }
+
+    fn touch_cursor(&mut self) {
         self.revision = self.revision.saturating_add(1);
     }
 
@@ -784,15 +834,43 @@ fn visual_lines(text: &str, wrap_width: usize) -> Vec<TextEditorVisualLine> {
     lines
 }
 
+fn layout_from_lines(
+    text: &str,
+    cursor: usize,
+    wrap_width: usize,
+    lines: Arc<[TextEditorVisualLine]>,
+) -> TextEditorLayout {
+    let cursor = clamp_to_grapheme_boundary(text, cursor);
+    TextEditorLayout {
+        cursor_row: cursor_row(lines.as_ref(), cursor),
+        lines,
+        cursor,
+        wrap_width,
+    }
+}
+
 fn cursor_row(lines: &[TextEditorVisualLine], cursor: usize) -> usize {
-    lines
-        .iter()
-        .position(|line| {
-            (line.start == line.end && cursor == line.start)
-                || (cursor >= line.start && cursor < line.end)
-        })
-        .or_else(|| lines.iter().rposition(|line| cursor == line.end))
-        .unwrap_or(0)
+    if lines.is_empty() {
+        return 0;
+    }
+
+    // Rows are source-ordered. A binary search handles large unchanged drafts
+    // without scanning every wrapped row when only the cursor changes.
+    let candidate = lines
+        .partition_point(|line| line.start <= cursor)
+        .saturating_sub(1);
+    let line = &lines[candidate];
+    if (line.start == line.end && cursor == line.start)
+        || (cursor >= line.start && cursor < line.end)
+        || cursor == line.end
+    {
+        return candidate;
+    }
+
+    // A hard newline is intentionally outside adjacent rows. Its preceding
+    // grapheme boundary belongs to this preceding visual row; no row scan is
+    // needed after the binary lookup.
+    candidate
 }
 
 fn column_at(text: &str, line: &TextEditorVisualLine, cursor: usize) -> usize {
@@ -815,7 +893,7 @@ fn offset_at_column(text: &str, line: &TextEditorVisualLine, target: usize) -> u
     offset
 }
 
-fn projection_for_layout(text: &str, layout: TextEditorLayout) -> TextEditorProjection {
+fn project_layout(text: &str, layout: TextEditorLayout) -> TextEditorProjection {
     let row = layout.cursor_row.min(layout.lines.len().saturating_sub(1));
     let line = &layout.lines[row];
     let offset =
@@ -1087,6 +1165,29 @@ mod tests {
                 .line(editor.text(), projection.cursor().row())
                 .is_some());
         }
+    }
+
+    #[test]
+    fn cursor_only_layouts_share_rows_and_keep_a_separate_text_revision() {
+        let mut editor = TextEditor::with_text("alpha beta gamma");
+        let first = editor.layout(6);
+        let revision = editor.revision();
+        let text_revision = editor.text_revision();
+
+        editor.set_cursor(0);
+        let second = editor.layout(6);
+        assert!(Arc::ptr_eq(&first.lines, &second.lines));
+        assert_eq!(editor.revision(), revision + 1);
+        assert_eq!(editor.text_revision(), text_revision);
+
+        let projection = TextEditor::projection_for_layout(editor.text(), &second, 5);
+        assert!(Arc::ptr_eq(&second.lines, &projection.layout().lines));
+        assert_eq!(projection.cursor().offset(), 5);
+
+        assert!(editor.apply(TextEditAction::Char('!'), 6));
+        let changed = editor.layout(6);
+        assert!(!Arc::ptr_eq(&second.lines, &changed.lines));
+        assert_eq!(editor.text_revision(), text_revision + 1);
     }
 
     #[test]

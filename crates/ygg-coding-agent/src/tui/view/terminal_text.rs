@@ -288,8 +288,9 @@ pub(super) fn sanitize_extension_tool_render_segments(
 
 /// A grapheme-safe mapping from the editable source buffer to a safe layout
 /// buffer. The layout buffer retains literal tabs so [`WidthPolicy`] can apply
-/// tab stops at the visual row where the tab is painted; [`Self::terminal_row`]
-/// expands those tabs only when materializing a visible terminal row.
+/// tab stops at the visual row where the tab is painted;
+/// [`Self::terminal_row_bounded`] expands those tabs only when materializing a
+/// visible terminal row.
 #[derive(Clone, Debug)]
 pub(crate) struct EditorDisplayMap {
     layout_text: String,
@@ -351,7 +352,8 @@ impl EditorDisplayMap {
     }
 
     /// Safe text used for layout. It can contain literal tabs, so it must be
-    /// materialized through [`Self::terminal_row`] before terminal output.
+    /// materialized through [`Self::terminal_row_bounded`] before terminal
+    /// output.
     #[must_use]
     pub(crate) fn layout_text(&self) -> &str {
         &self.layout_text
@@ -382,18 +384,25 @@ impl EditorDisplayMap {
         self.boundaries[index].source
     }
 
-    /// Materialize one already-laid-out visible row for terminal output.
+    /// Materialize one row without splitting a grapheme or overflowing
+    /// `max_columns` text cells.
     ///
     /// `cursor` is an optional layout-text byte offset in `start..=end`. The
     /// caller owns the trusted marker and focus policy; this method never
     /// derives a cursor from source content.
+    ///
+    /// The trusted cursor marker is zero-cell terminal chrome and is retained
+    /// even when an oversized source grapheme cannot fit. In that case its
+    /// location is clamped to the last materialized text boundary rather than
+    /// being dropped by a later generic string truncator.
     #[must_use]
-    pub(crate) fn terminal_row(
+    pub(crate) fn terminal_row_bounded(
         &self,
         start: usize,
         end: usize,
         cursor: Option<usize>,
         cursor_marker: &str,
+        max_columns: usize,
     ) -> String {
         let Some(row) = self.layout_text.get(start..end) else {
             return String::new();
@@ -401,23 +410,33 @@ impl EditorDisplayMap {
         let cursor = cursor.filter(|offset| *offset >= start && *offset <= end);
         let mut rendered = String::with_capacity(row.len().saturating_add(cursor_marker.len()));
         let mut column = 0usize;
+        let mut inserted_cursor = false;
         if cursor == Some(start) {
             rendered.push_str(cursor_marker);
+            inserted_cursor = true;
         }
         let policy = WidthPolicy::default();
         for (relative, grapheme) in row.grapheme_indices(true) {
             let offset = start + relative;
+            let width = policy.grapheme_width(grapheme, column);
+            if column.saturating_add(width) > max_columns {
+                break;
+            }
             if grapheme == "\t" {
-                let width = policy.grapheme_width(grapheme, column);
                 rendered.push_str(&" ".repeat(width));
-                column = column.saturating_add(width);
             } else {
                 rendered.push_str(grapheme);
-                column = column.saturating_add(policy.grapheme_width(grapheme, column));
             }
+            column = column.saturating_add(width);
             if cursor == Some(offset + grapheme.len()) {
                 rendered.push_str(cursor_marker);
+                inserted_cursor = true;
             }
+        }
+        if cursor.is_some() && !inserted_cursor {
+            // The cursor was after text that could not fit. Keep its trusted
+            // token at the clipped row edge; an embedding reserves its cell.
+            rendered.push_str(cursor_marker);
         }
         rendered
     }
@@ -616,7 +635,7 @@ mod tests {
             .grapheme_indices(true)
             .any(|(offset, _)| offset == safe_cursor));
         assert_eq!(
-            map.terminal_row(0, safe.len(), Some(safe_cursor), "<cursor>"),
+            map.terminal_row_bounded(0, safe.len(), Some(safe_cursor), "<cursor>", usize::MAX),
             "before ␛<cursor>[31m after"
         );
     }
@@ -644,13 +663,73 @@ mod tests {
     }
 
     #[test]
+    fn composer_display_map_keeps_complex_grapheme_boundaries_safe() {
+        let source = "e\u{301}👩‍💻❤\u{fe0f}🇦🇧界\t\x1b\u{0301}\r\n";
+        let source_boundaries = source
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(source.len()))
+            .collect::<Vec<_>>();
+        let map = EditorDisplayMap::from_source(source);
+        let display_boundaries = map
+            .layout_text()
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(map.layout_text().len()))
+            .collect::<Vec<_>>();
+
+        let mut previous_display = 0;
+        for source in source_boundaries.iter().copied() {
+            let display = map.source_to_display(source);
+            assert!(display_boundaries.contains(&display));
+            assert!(display >= previous_display);
+            assert!(source_boundaries.contains(&map.display_to_source(display)));
+            previous_display = display;
+        }
+    }
+
+    #[test]
     fn composer_display_map_expands_tabs_only_in_the_visible_row() {
         let map = EditorDisplayMap::from_source("ab\tc");
         assert_eq!(map.layout_text(), "ab\tc");
-        assert_eq!(map.terminal_row(0, 4, None, ""), "ab  c");
+        assert_eq!(
+            map.terminal_row_bounded(0, 4, None, "", usize::MAX),
+            "ab  c"
+        );
 
         let map = EditorDisplayMap::from_source("x\t");
-        assert_eq!(map.terminal_row(0, 2, Some(2), "<cursor>"), "x   <cursor>");
+        assert_eq!(
+            map.terminal_row_bounded(0, 2, Some(2), "<cursor>", usize::MAX),
+            "x   <cursor>"
+        );
+    }
+
+    #[test]
+    fn bounded_composer_rows_clip_before_wide_graphemes_and_keep_the_cursor() {
+        let map = EditorDisplayMap::from_source("a界b");
+        let cursor = "a界".len();
+        let row = map.terminal_row_bounded(
+            0,
+            map.layout_text().len(),
+            Some(cursor),
+            sexy_tui_rs::CURSOR_MARKER,
+            2,
+        );
+        assert_eq!(row, format!("a{}", sexy_tui_rs::CURSOR_MARKER));
+        assert_eq!(
+            sexy_tui_rs::visible_width(&row.replace(sexy_tui_rs::CURSOR_MARKER, "")),
+            1
+        );
+
+        let map = EditorDisplayMap::from_source("界a");
+        let row = map.terminal_row_bounded(
+            0,
+            map.layout_text().len(),
+            Some("界".len()),
+            sexy_tui_rs::CURSOR_MARKER,
+            2,
+        );
+        assert_eq!(row, format!("界{}", sexy_tui_rs::CURSOR_MARKER));
     }
 
     #[test]
@@ -658,11 +737,12 @@ mod tests {
         let source = format!("source {} token", sexy_tui_rs::CURSOR_MARKER);
         let map = EditorDisplayMap::from_source(&source);
         assert!(!map.layout_text().contains(sexy_tui_rs::CURSOR_MARKER));
-        let row = map.terminal_row(
+        let row = map.terminal_row_bounded(
             0,
             map.layout_text().len(),
             Some(map.layout_text().len()),
             sexy_tui_rs::CURSOR_MARKER,
+            usize::MAX,
         );
         assert_eq!(row.matches(sexy_tui_rs::CURSOR_MARKER).count(), 1);
         assert!(row.contains("source ␛_pi:c␇ token"));

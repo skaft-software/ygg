@@ -41,8 +41,10 @@ chrome, and padding reservations. It must not expose mutable buffer access or
 reimplement grapheme movement around the generic model. `TextEditorProjection`
 keeps cursor coordinates separate from source content; Ygg inserts its trusted
 hardware-cursor marker from those coordinates and may suppress it when a panel
-owns focus. Cache a transformed projection by `TextEditor::revision()` and that
-same chrome-aware text width, then materialize only visible rows.
+owns focus. Cache transformed display text and visual rows by
+`TextEditor::text_revision()` and that same chrome-aware text width; refresh the
+structured cursor projection on cursor-only motion, then materialize only
+visible rows.
 
 ## Replace generic duplicates
 

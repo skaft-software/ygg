@@ -684,8 +684,9 @@ pub(crate) struct ShellState {
     /// Reusable text model for the normal composer draft and cursor.
     pub(crate) editor: TextEditor,
     /// Cached app-owned display mapping and generic visual layout for the
-    /// active composer source. It is invalidated by the editor revision, tool
-    /// prompt revision, or chrome-aware text width.
+    /// active composer source. It is invalidated by the editor text revision,
+    /// tool prompt revision, or chrome-aware text width; cursor motion updates
+    /// only the structured projection over the shared rows.
     composer_editor_cache: RefCell<Option<ComposerEditorCache>>,
     /// Sticky desired visual column while moving vertically through the
     /// composer. Horizontal/edit actions clear it.
@@ -861,7 +862,7 @@ impl ShellState {
                 prompt.len(),
             ),
             None => (
-                ComposerEditorSource::Draft(self.editor.revision()),
+                ComposerEditorSource::Draft(self.editor.text_revision()),
                 self.editor.text(),
                 self.editor.cursor(),
             ),
@@ -877,6 +878,12 @@ impl ShellState {
                 .replace(Some(ComposerEditorCache::new(
                     source, text, cursor, text_width,
                 )));
+        } else {
+            self.composer_editor_cache
+                .borrow_mut()
+                .as_mut()
+                .expect("composer editor cache is initialized")
+                .refresh_cursor(cursor);
         }
         Ref::map(self.composer_editor_cache.borrow(), |cache| {
             cache

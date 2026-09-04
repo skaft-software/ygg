@@ -9,6 +9,9 @@ use crate::presentation::compact_context_limit;
 use crate::tui::layout::PresentationLayout;
 use crate::tui::view::{fit_line, footer_width, EditorDisplayMap, FooterSegment};
 
+/// Keep one physical cell after every laid-out text row for the terminal cursor.
+const CURSOR_CELL_RESERVATION: usize = 1;
+
 fn composer_cursor_marker(state: &super::view::ShellState) -> &'static str {
     if state.panel.is_some() {
         ""
@@ -28,7 +31,10 @@ pub(crate) enum ComposerEditorSource {
 
 /// One transformed display layout for the current source and text-cell width.
 pub(crate) struct ComposerEditorCache {
+    // Text identity and width own the expensive display-map/wrap work. Cursor
+    // motion updates only the structured projection over those shared rows.
     source: ComposerEditorSource,
+    source_cursor: usize,
     text_width: usize,
     projection: ComposerEditorProjection,
 }
@@ -43,6 +49,7 @@ impl ComposerEditorCache {
     ) -> Self {
         Self {
             source,
+            source_cursor: cursor,
             text_width,
             projection: ComposerEditorProjection::new(text, cursor, text_width),
         }
@@ -51,6 +58,13 @@ impl ComposerEditorCache {
     #[must_use]
     pub(crate) fn matches(&self, source: ComposerEditorSource, text_width: usize) -> bool {
         self.source == source && self.text_width == text_width
+    }
+
+    pub(crate) fn refresh_cursor(&mut self, source_cursor: usize) {
+        if self.source_cursor != source_cursor {
+            self.source_cursor = source_cursor;
+            self.projection.set_source_cursor(source_cursor);
+        }
     }
 
     #[must_use]
@@ -92,6 +106,13 @@ impl ComposerEditorProjection {
         }
     }
 
+    fn set_source_cursor(&mut self, source_cursor: usize) {
+        let display_cursor = self.display.source_to_display(source_cursor);
+        let layout = self.projection.layout().clone();
+        self.projection =
+            TextEditor::projection_for_layout(self.display.layout_text(), &layout, display_cursor);
+    }
+
     #[must_use]
     pub(crate) fn line_count(&self) -> usize {
         self.projection.lines().len()
@@ -103,14 +124,24 @@ impl ComposerEditorProjection {
     }
 
     #[must_use]
-    pub(crate) fn visible_row(&self, row: usize, cursor_marker: &str) -> String {
+    pub(crate) fn visible_row(
+        &self,
+        row: usize,
+        cursor_marker: &str,
+        max_text_width: usize,
+    ) -> String {
         let Some(line) = self.projection.lines().get(row) else {
             return String::new();
         };
         let cursor = (row == self.projection.cursor_row() && !cursor_marker.is_empty())
             .then(|| self.projection.cursor().offset());
-        self.display
-            .terminal_row(line.start(), line.visible_end(), cursor, cursor_marker)
+        self.display.terminal_row_bounded(
+            line.start(),
+            line.visible_end(),
+            cursor,
+            cursor_marker,
+            max_text_width,
+        )
     }
 
     #[must_use]
@@ -193,9 +224,9 @@ fn composer_inner_width(theme: &super::theme::YggTheme, frame_width: u16) -> u16
 }
 
 /// One chrome-aware geometry decision for editor movement, sizing, layout, and
-/// rendering. The prompt glyph, its gap, and one spare hardware-cursor cell are
-/// always reserved, even while a panel suppresses the marker, so focus changes
-/// never reflow a draft.
+/// rendering. The prompt glyph, its gap, continuation indentation, and one
+/// spare hardware-cursor cell are always reserved, even while a panel
+/// suppresses the marker, so focus changes never reflow a draft.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ComposerEditorGeometry {
     inner_width: usize,
@@ -220,7 +251,7 @@ pub(crate) fn composer_editor_geometry(
     width: u16,
 ) -> ComposerEditorGeometry {
     const PROMPT_GAP: usize = 1;
-    const CURSOR_CELL: usize = 1;
+    const CONTINUATION_PREFIX: usize = 2;
 
     let presentation = PresentationLayout::new(&state.theme, width);
     let compact = usize::from(width) < 12;
@@ -233,13 +264,25 @@ pub(crate) fn composer_editor_geometry(
         ))
     };
     let prompt_and_gap = visible_width(state.theme.glyph("prompt")).saturating_add(PROMPT_GAP);
+    let text_prefix = prompt_and_gap.max(CONTINUATION_PREFIX);
     let text_width = inner_width
-        .saturating_sub(prompt_and_gap.saturating_add(CURSOR_CELL))
+        .saturating_sub(text_prefix.saturating_add(CURSOR_CELL_RESERVATION))
         .max(1);
     ComposerEditorGeometry {
         inner_width,
         text_width,
     }
+}
+
+/// Text cells a specific painted row can materialize without consuming the
+/// hardware-cursor reservation. The generic layout keeps a minimum width of
+/// one cell, while this may intentionally be zero on a three-column terminal.
+fn materialized_text_width(geometry: ComposerEditorGeometry, prefix: &str) -> usize {
+    geometry.text_width().min(
+        geometry
+            .inner_width()
+            .saturating_sub(visible_width(prefix).saturating_add(CURSOR_CELL_RESERVATION)),
+    )
 }
 
 /// Render composer content inside the shared horizontal inset. Plain boxed
@@ -257,7 +300,7 @@ fn render_composer_box(
 ) -> Vec<String> {
     let terminal_width = usize::from(width);
     if terminal_width < 4 {
-        return render_plain_content(state, width, editor);
+        return render_plain_content(state, width, geometry, editor);
     }
 
     let theme = &state.theme;
@@ -380,7 +423,11 @@ fn render_composer_box(
             } else {
                 "  ".to_owned()
             };
-            let row = editor.visible_row(index, cursor_marker);
+            let row = editor.visible_row(
+                index,
+                cursor_marker,
+                materialized_text_width(geometry, &prefix),
+            );
             rendered.push(render_row(&format!("{prefix}{row}")));
         }
 
@@ -418,6 +465,7 @@ fn render_composer_box(
 fn render_plain_content(
     state: &super::view::ShellState,
     width: u16,
+    geometry: ComposerEditorGeometry,
     editor: &ComposerEditorProjection,
 ) -> Vec<String> {
     let marker = state.theme.bold(
@@ -429,8 +477,13 @@ fn render_plain_content(
     if editor.layout_text().is_empty() {
         return vec![fit_line(&format!("{cursor_marker}{marker}"), width)];
     }
-    let row = editor.visible_row(editor.cursor_row(), cursor_marker);
-    vec![fit_line(&format!("{marker} {row}"), width)]
+    let prefix = format!("{marker} ");
+    let row = editor.visible_row(
+        editor.cursor_row(),
+        cursor_marker,
+        materialized_text_width(geometry, &prefix),
+    );
+    vec![fit_line(&format!("{prefix}{row}"), width)]
 }
 
 // ---------------------------------------------------------------------------
@@ -837,13 +890,6 @@ pub fn render_composer_surface(
 ) -> Vec<String> {
     let w = usize::from(width);
     let geometry = composer_editor_geometry(state, width);
-    // The same cache and text-cell width drive height calculation, visual
-    // movement, and paint. Rendering then borrows only the viewport rows.
-    let visual_lines = state
-        .composer_editor_projection(geometry)
-        .line_count()
-        .max(1);
-    let content_rows = composer_content_rows(state.size.1, visual_lines);
 
     if w < 3 {
         // There is no room for both prompt chrome and draft text. Put the
@@ -852,7 +898,7 @@ pub fn render_composer_surface(
         let cursor_marker = composer_cursor_marker(state);
         let mut lines = if cursor_marker.is_empty() {
             let editor = state.composer_editor_projection(geometry);
-            render_plain_content(state, width, &editor)
+            render_plain_content(state, width, geometry, &editor)
         } else {
             let prompt = state.theme.bold(
                 &state
@@ -865,14 +911,19 @@ pub fn render_composer_surface(
         return lines;
     }
 
+    // One borrowed projection drives height calculation and painting. This
+    // avoids a second cache lookup/projection refresh for every normal frame.
+    let editor = state.composer_editor_projection(geometry);
+    let visual_lines = editor.line_count().max(1);
+    let content_rows = composer_content_rows(state.size.1, visual_lines);
+
     if w < 12 {
-        return render_compact(state, width, now, content_rows, geometry);
+        return render_compact(state, width, now, content_rows, geometry, &editor);
     }
 
     let mut lines = Vec::with_capacity(content_rows + 4);
 
     // Unified inset frame with stable Ygg-owned focus rules.
-    let editor = state.composer_editor_projection(geometry);
     lines.append(&mut render_composer_box(
         state,
         width,
@@ -895,6 +946,7 @@ fn render_compact(
     now: Instant,
     content_rows: usize,
     geometry: ComposerEditorGeometry,
+    editor: &ComposerEditorProjection,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let plan = PresentationLayout::new(&state.theme, width);
@@ -908,7 +960,6 @@ fn render_compact(
         .theme
         .bold(&state.theme.model_fg(state.model_lab, marker));
     let cursor_marker = composer_cursor_marker(state);
-    let editor = state.composer_editor_projection(geometry);
 
     if editor.layout_text().is_empty() {
         lines.push(fit_line(
@@ -931,12 +982,17 @@ fn render_compact(
     }
 
     for index in start..end {
-        let prefix = if index == 0 {
-            format!("{padding}{marker_s} ")
+        let content_prefix = if index == 0 {
+            format!("{marker_s} ")
         } else {
-            format!("{padding}  ")
+            "  ".to_owned()
         };
-        let row = editor.visible_row(index, cursor_marker);
+        let prefix = format!("{padding}{content_prefix}");
+        let row = editor.visible_row(
+            index,
+            cursor_marker,
+            materialized_text_width(geometry, &content_prefix),
+        );
         lines.push(fit_line(&format!("{prefix}{row}"), width));
     }
     append_status_footer(&mut lines, state, width, now);

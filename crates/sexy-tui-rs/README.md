@@ -322,9 +322,10 @@ chrome, attach files, choose focus, or submit a draft. Sanitize only at the
 application's render boundary. When that boundary renders a transformed safe
 copy rather than the source buffer, keep an application-owned grapheme-safe
 source/display map and use `TextEditor::layout_for` or
-`TextEditor::projection_for` with the matching mapped display cursor. The
-editor's `revision()` is a local cache key for an embedding application's
-transformed projection; it changes on text and cursor mutations.
+`TextEditor::projection_for` with the matching mapped display cursor.
+`text_revision()` is a local cache key for transformed display text and visual
+rows; `revision()` also changes on cursor motion when an embedding caches cursor
+metadata separately.
 
 ## Components and TUI
 
