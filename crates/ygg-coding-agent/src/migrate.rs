@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Parser};
 
+mod migration_import;
+
 const MAX_SETTINGS_BYTES: usize = 1024 * 1024;
 const MAX_PACKAGES: usize = 256;
 const MAX_PATTERNS: usize = 1024;
@@ -55,6 +57,51 @@ pub enum MigrationCommand {
         #[arg(long = "npm-root", value_name = "DIR")]
         npm_roots: Vec<PathBuf>,
     },
+    /// Apply a bounded, host-owned import from a supported source setup.
+    Import {
+        #[command(subcommand)]
+        command: MigrationImportCommand,
+    },
+    /// Restore one retained migration backup after verifying destination state.
+    Restore {
+        /// Backup directory printed by a migration import.
+        #[arg(value_name = "BACKUP")]
+        backup: PathBuf,
+        /// Overwrite targets changed after the import.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Internal API 0.3 migration adapter process entrypoint.
+    #[command(hide = true)]
+    Adapter {
+        #[command(subcommand)]
+        command: MigrationAdapterCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum MigrationImportCommand {
+    /// Import a Pi setup through the read-only typed adapter.
+    Pi {
+        /// Explicit Pi source directory. Without it, standard macOS/Linux locations are checked.
+        #[arg(long, value_name = "DIR")]
+        source: Option<PathBuf>,
+        /// Accept current-entry conflicts without an interactive prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Validate, normalize, and report changes without writing destination files.
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit a non-secret machine-readable import summary.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum MigrationAdapterCommand {
+    /// Pi's bounded read-only migration adapter.
+    Pi,
 }
 
 #[derive(Clone, Debug)]
@@ -464,6 +511,13 @@ pub fn run(command: MigrationCommand, invocation_cwd: &Path) -> anyhow::Result<(
             }
             Ok(())
         }
+        MigrationCommand::Import { command } => {
+            migration_import::run_import(command, invocation_cwd)
+        }
+        MigrationCommand::Restore { backup, yes } => {
+            migration_import::run_restore(backup, yes, invocation_cwd)
+        }
+        MigrationCommand::Adapter { command } => migration_import::run_adapter(command),
     }
 }
 

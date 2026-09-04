@@ -697,18 +697,18 @@ fn write_config_atomically(
     })
 }
 
-fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _config_lock = config_update_lock(path)?;
-
-    let original = match std::fs::read_to_string(path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let content = original.as_deref().unwrap_or_default();
+/// Render one structural user-config key update without writing it.
+///
+/// Migration ingestion uses this same persistence transformation inside its
+/// larger compare-and-swap transaction, while interactive callers retain the
+/// ordinary locked write path below.
+pub(crate) fn render_persisted_key_update(
+    key: &str,
+    value: &str,
+    original: Option<&str>,
+    path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let content = original.unwrap_or_default();
     let mut document = if content.trim().is_empty() {
         toml_edit::DocumentMut::new()
     } else {
@@ -720,7 +720,30 @@ fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow
     // Structural TOML editing avoids partial-key matches and orphaned lines
     // from multiline values while retaining the user's comments and layout.
     document[key] = toml_edit::value(value);
-    let new_content = document.to_string();
+    Ok(document.to_string())
+}
+
+/// Render the normal global model persistence update without writing it.
+pub(crate) fn render_model_persistence_update(
+    original: Option<&str>,
+    path: &std::path::Path,
+    model: &str,
+) -> anyhow::Result<String> {
+    render_persisted_key_update("model", model, original, path)
+}
+
+fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _config_lock = config_update_lock(path)?;
+
+    let original = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let new_content = render_persisted_key_update(key, value, original.as_deref(), path)?;
 
     // Atomic write: write to a unique sibling temp file then rename over the
     // real path so a crash or concurrent config writer cannot leave a partial

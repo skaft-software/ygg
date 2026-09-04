@@ -99,6 +99,48 @@
       "value": 256,
       "description": "Maximum UTF-8 bytes in a string JSON-RPC identifier.",
       "negotiated": false
+    },
+    {
+      "name": "max_migration_items",
+      "value": 128,
+      "description": "Maximum source items in one migration adapter category.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_path_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in a migration source-root or source-relative path.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_name_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in one migration model, skill, or server name.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_skill_bytes",
+      "value": 131072,
+      "description": "Maximum UTF-8 bytes in one migrated skill payload.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_command_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in one migrated stdio command.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_argument_bytes",
+      "value": 16384,
+      "description": "Maximum UTF-8 bytes in one migrated stdio argument.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_diagnostic_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in one migration diagnostic reason.",
+      "negotiated": false
     }
   ],
   "capabilities": [
@@ -125,6 +167,12 @@
       "description": "Host lifecycle observations for extension cleanup.",
       "host_offer": "unavailable",
       "status": "deferred"
+    },
+    {
+      "name": "migration.adapter.v1",
+      "description": "Bounded read-only setup detection and import conversion for host-owned migration ingestion.",
+      "host_offer": "optional",
+      "status": "foundation"
     },
     {
       "name": "request_cancellation",
@@ -182,6 +230,28 @@
       "params": "InitializeRequest",
       "result": "InitializeResponse",
       "terminal": "initialized",
+      "notification": false
+    },
+    {
+      "name": "migration/detect",
+      "direction": "host_to_extension",
+      "capability": "migration.adapter.v1",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "MigrationDetectParams",
+      "result": "MigrationDetectResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "migration/import",
+      "direction": "host_to_extension",
+      "capability": "migration.adapter.v1",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "MigrationImportParams",
+      "result": "MigrationImportResult",
+      "terminal": "result_or_error",
       "notification": false
     },
     {
@@ -726,6 +796,220 @@
       ]
     },
     {
+      "name": "MigrationDiagnostic",
+      "description": "A bounded non-secret diagnostic emitted while a migration adapter reads a source setup.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "severity",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "warning",
+            "error"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_diagnostic_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationDetectParams",
+      "description": "Host-authorized source root for read-only migration detection.",
+      "fields": [
+        {
+          "name": "source_root",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationDetectResult",
+      "description": "Bounded result of read-only migration source detection. Config paths are source-relative.",
+      "fields": [
+        {
+          "name": "detected",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "config_paths",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "diagnostics",
+          "type": "MigrationDiagnostic[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        }
+      ]
+    },
+    {
+      "name": "MigrationImportParams",
+      "description": "Host-authorized source root and previously detected source-relative config paths for read-only conversion.",
+      "fields": [
+        {
+          "name": "source_root",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "config_paths",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_path_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationModel",
+      "description": "A non-secret source model selection with its source-relative provenance path.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "provider",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationSkill",
+      "description": "A bounded source skill payload with its source-relative provenance path.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "content",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_skill_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationMcpServer",
+      "description": "A non-secret local stdio MCP declaration. Environment variables, headers, credentials, and working directories are intentionally absent.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "command",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_command_bytes"
+        },
+        {
+          "name": "args",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_argument_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationImportResult",
+      "description": "Bounded typed migration conversion. The adapter never returns credentials, environment values, headers, or permission grants.",
+      "fields": [
+        {
+          "name": "models",
+          "type": "MigrationModel[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "skills",
+          "type": "MigrationSkill[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "mcp_servers",
+          "type": "MigrationMcpServer[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "diagnostics",
+          "type": "MigrationDiagnostic[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        }
+      ]
+    },
+    {
       "name": "ErrorObject",
       "description": "Bounded JSON-RPC error object using an API 0.3 error-table code. Its data field preserves absent versus explicit null.",
       "fields": [
@@ -919,14 +1203,19 @@
             "request_cancellation",
             "tool_call"
           ],
-          "optional_capabilities": [],
+          "optional_capabilities": [
+            "migration.adapter.v1"
+          ],
           "required_methods": [
             "$/cancelRequest",
             "initialize",
             "shutdown",
             "tool/call"
           ],
-          "optional_methods": [],
+          "optional_methods": [
+            "migration/detect",
+            "migration/import"
+          ],
           "limits": {
             "max_frame_bytes": 1048576,
             "max_concurrent_requests": 4,
@@ -1144,6 +1433,48 @@
           "β": "two",
           "a": "one"
         }
+      }
+    },
+    {
+      "name": "migration-detect-params",
+      "value": {
+        "source_root": "/home/alice/.pi/agent"
+      }
+    },
+    {
+      "name": "migration-import-result",
+      "value": {
+        "models": [
+          {
+            "path": "settings.json",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5"
+          }
+        ],
+        "skills": [
+          {
+            "path": "skills/review/SKILL.md",
+            "name": "review",
+            "content": "Review changes."
+          }
+        ],
+        "mcp_servers": [
+          {
+            "path": "settings.json",
+            "name": "docs",
+            "command": "docs-mcp",
+            "args": [
+              "--stdio"
+            ]
+          }
+        ],
+        "diagnostics": [
+          {
+            "path": "settings.json",
+            "severity": "warning",
+            "reason": "MCP environment entries were not imported."
+          }
+        ]
       }
     }
   ],

@@ -22,11 +22,53 @@ ygg migrate pi --dry-run --project /path/to/project
 ygg migrate pi --dry-run --json > pi-migration.json
 ```
 
-All current invocations are dry runs; `--dry-run` makes that intent explicit and
-keeps scripts compatible with a future separately authorized apply stage. The
-command exits before normal Ygg configuration, provider discovery, session
+The scanner invocation is always a dry run; `--dry-run` makes that intent
+explicit. It exits before normal Ygg configuration, provider discovery, session
 startup, extension startup, or model bootstrap. It therefore consumes zero
 model tokens.
+
+## Import portable setup data
+
+A separate, opt-in command imports the portable subset of a Pi setup. It does
+not change the existing scanner behavior:
+
+```console
+ygg migrate import pi --dry-run
+ygg migrate import pi --source /path/to/pi/agent --dry-run --json
+ygg migrate import pi --source /path/to/pi/agent
+ygg migrate import pi --source /path/to/pi/agent --yes
+```
+
+Without `--source`, the importer checks `PI_CODING_AGENT_DIR`, then the standard
+Pi agent locations. It runs Ygg's built-in, read-only API 0.3 adapter rather
+than executing Pi packages or a user-selected adapter command. The host owns
+all destination decisions and writes.
+
+The importer can select a model already known to Ygg, copy portable skills into
+`~/.ygg/skills/`, and add local stdio MCP declarations to `~/.ygg/mcp.json`.
+Every imported skill is wrapped in host-authored frontmatter with
+`disable-model-invocation: true`; every imported MCP server has `enabled: false`
+and `required: false`. Review and explicitly enable either resource only after
+inspecting it.
+
+Credentials, MCP environment values, headers, working directories, and Pi
+permission decisions are never copied. Unsupported models and transports are
+reported as skipped. The command never writes the Pi source setup, contacts a
+network service, starts an imported MCP server, starts an extension, or invokes
+a model.
+
+Imports track the hashes they own in `~/.ygg/migrations/pi-state.json`. A
+changed destination is a conflict and requires an interactive confirmation or
+`--yes`; `--dry-run` performs the same validation without writing anything.
+Before an import changes a destination, it creates a private backup under
+`~/.ygg/backups/migrate/` and prints its path. Restore it only when the current
+destination still matches the import:
+
+```console
+ygg migrate restore ~/.ygg/backups/migrate/IMPORT-DIRECTORY
+# Explicitly overwrite a destination changed after import:
+ygg migrate restore ~/.ygg/backups/migrate/IMPORT-DIRECTORY --yes
+```
 
 ## Link a compatible extension
 
@@ -248,10 +290,10 @@ The intended promise is:
 > compatible subset through an explicitly trusted bridge, and identify exactly
 > what still requires a port.
 
-Today the zero-token scanner and explicitly trusted, pinned compatibility links
-are implemented. The bridge runs a tested subset of Pi 0.84.4 tools, commands,
-dialogs, context, and lifecycle behavior; explicit ordered source sets can share
-one locked runtime. Deterministic resource apply, exact replacement recipes,
-automatic whole-setup selection, session/provider mutation, and arbitrary Pi
-component parity remain unfinished and are reported rather than silently
-emulated.
+Today the zero-token scanner, limited host-owned portable import, and explicitly
+trusted, pinned compatibility links are implemented. The bridge runs a tested
+subset of Pi 0.84.4 tools, commands, dialogs, context, and lifecycle behavior;
+explicit ordered source sets can share one locked runtime. Exact replacement
+recipes, automatic whole-setup selection, session/provider mutation, and
+arbitrary Pi component parity remain unfinished and are reported rather than
+silently emulated.
