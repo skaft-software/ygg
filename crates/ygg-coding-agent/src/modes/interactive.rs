@@ -12,9 +12,9 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
 use ygg_agent::extension_process::ExtensionInputRequest;
-#[cfg(unix)]
-use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::extension_process::MAX_EXTENSION_TERMINAL_INPUT_BYTES;
+#[cfg(unix)]
+use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch};
 use ygg_agent::{
     analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
     GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session, ToolProgress,
@@ -4981,8 +4981,6 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
                     // Spawn the child process with piped output.
                     let mut process = tokio::process::Command::new("sh");
                     process
-                        .arg("-c")
-                        .arg(&cmd)
                         .current_dir(&workspace)
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
@@ -4990,6 +4988,23 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
                         .kill_on_drop(true);
                     #[cfg(unix)]
                     process.process_group(0);
+                    #[cfg(unix)]
+                    let launch = match BashProcessLaunch::prepare(&mut process, &cmd) {
+                        Ok(launch) => launch,
+                        Err(error) => {
+                            shell.finalize_shell(
+                                &shell_id,
+                                format!("failed to prepare lifecycle supervision: {error}"),
+                                -1,
+                            );
+                            shell.render();
+                            continue;
+                        }
+                    };
+                    #[cfg(unix)]
+                    process.arg("-c").arg(launch.source());
+                    #[cfg(not(unix))]
+                    process.arg("-c").arg(&cmd);
                     let mut child = match process.spawn() {
                         Ok(child) => child,
                         Err(error) => {
@@ -5003,7 +5018,19 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
                         }
                     };
                     #[cfg(unix)]
-                    let group_guard = ProcessGroupGuard::bash(child.id());
+                    let (group_guard, handoff) = match launch.register(child.id()).await {
+                        Ok(registered) => registered,
+                        Err(error) => {
+                            let _ = child.wait().await;
+                            shell.finalize_shell(
+                                &shell_id,
+                                format!("failed to register lifecycle supervision: {error}"),
+                                -1,
+                            );
+                            shell.render();
+                            continue;
+                        }
+                    };
 
                     let mut stdout_pipe = child.stdout.take();
                     let mut stderr_pipe = child.stderr.take();
@@ -5025,6 +5052,13 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
                     let stdout_updates = output_tx.clone();
                     let stderr_updates = output_tx;
                     let work = async {
+                        #[cfg(unix)]
+                        let (_, _, status) = tokio::join!(
+                            drain_shell_pipe(&mut stdout_pipe, &stdout_capture, &stdout_updates,),
+                            drain_shell_pipe(&mut stderr_pipe, &stderr_capture, &stderr_updates,),
+                            wait_for_bash_process(&mut child, handoff),
+                        );
+                        #[cfg(not(unix))]
                         let (_, _, status) = tokio::join!(
                             drain_shell_pipe(&mut stdout_pipe, &stdout_capture, &stdout_updates,),
                             drain_shell_pipe(&mut stderr_pipe, &stderr_capture, &stderr_updates,),

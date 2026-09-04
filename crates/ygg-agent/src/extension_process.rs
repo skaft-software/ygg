@@ -10,7 +10,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::ExitStatus;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock, Weak};
@@ -21,6 +27,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify, Semaphore};
 use ygg_ai::{
@@ -343,6 +351,14 @@ struct ProcessSnapshot {
     identity: ProcessIdentity,
     parent_pid: i32,
     process_group_id: i32,
+    is_zombie: bool,
+}
+
+#[cfg(unix)]
+impl ProcessSnapshot {
+    fn is_live(self) -> bool {
+        !self.is_zombie
+    }
 }
 
 #[cfg(unix)]
@@ -512,6 +528,26 @@ impl ProcessGroupGuard {
         unregister_process_group(process_group_id, self.registration_id);
     }
 
+    #[cfg(unix)]
+    fn has_root_identity(&self, root: ProcessIdentity) -> bool {
+        let process_group_id = self.process_group_id.load(Ordering::Acquire);
+        let Some(process_group_id) = valid_process_group_id(process_group_id) else {
+            return false;
+        };
+        lock_std_mutex(&REGISTERED_PROCESS_GROUPS)
+            .get(&process_group_id)
+            .is_some_and(|entry| {
+                entry.registration_id == self.registration_id
+                    && entry.kind == RegisteredProcessKind::Bash
+                    && entry.root == Some(root)
+            })
+    }
+
+    #[cfg(unix)]
+    fn refresh_bash_descendants(&self) {
+        refresh_registered_descendants();
+    }
+
     /// Transfers a successfully reaped direct `bash` child to the centralized
     /// descendant supervisor. The registry entry remains live until the group
     /// disappears naturally, the run is cancelled, the original execution
@@ -598,6 +634,233 @@ impl ProcessGroupGuard {
     }
 }
 
+#[cfg(unix)]
+const BASH_LAUNCH_READY: u8 = b'L';
+#[cfg(unix)]
+const BASH_HANDOFF_READY: u8 = b'H';
+#[cfg(unix)]
+const BASH_HANDOFF_ACK: u8 = b'A';
+/// POSIX `sh` implementations commonly support only single-digit redirections.
+#[cfg(unix)]
+const BASH_CONTROL_FD: RawFd = 9;
+
+/// Gates a shell source until its process identity is registered, then adds a
+/// completion handshake before its leader exits.
+///
+/// The handshake keeps the direct shell alive while the process registry scans
+/// its descendants. That captures a child which has left the original process
+/// group with `setsid` before macOS can lose its parent relationship.
+#[cfg(unix)]
+pub struct BashProcessLaunch {
+    control: UnixStream,
+    child_control: Option<OwnedFd>,
+    control_fd_reservation: Option<OwnedFd>,
+    source: String,
+}
+
+#[cfg(unix)]
+impl BashProcessLaunch {
+    /// Configures `command` to start `source` only after registration.
+    pub fn prepare(command: &mut Command, source: &str) -> std::io::Result<Self> {
+        let (parent, child) = StdUnixStream::pair()?;
+        let parent = move_control_fd_out_of_stdio(parent)?;
+        let child = move_control_fd_out_of_stdio(child)?;
+        parent.set_nonblocking(true)?;
+        let control = UnixStream::from_std(parent)?;
+        let parent_fd = control.as_raw_fd();
+        set_close_on_exec(parent_fd)?;
+        let child_fd = child.as_raw_fd();
+        set_close_on_exec(child_fd)?;
+        // SAFETY: `child` owns this newly created descriptor. Keeping it open
+        // in the parent until spawn makes it available to the post-fork child;
+        // `register` closes the parent copy before it releases the source gate.
+        let child_control = unsafe { OwnedFd::from_raw_fd(child.into_raw_fd()) };
+        let control_fd_reservation = reserve_bash_control_fd(child_control.as_raw_fd())?;
+        // SAFETY: the closure runs after fork and only closes the parent's
+        // endpoint before clearing CLOEXEC on the child's endpoint. The shell
+        // itself blocks on the generated source gate after it has exec'd, so
+        // `Command::spawn` can still return its PID to the parent.
+        unsafe {
+            command
+                .pre_exec(move || prepare_bash_process_exec(parent_fd, child_fd, BASH_CONTROL_FD));
+        }
+        Ok(Self {
+            control,
+            child_control: Some(child_control),
+            control_fd_reservation,
+            source: format!(
+                "IFS= read -r __ygg_bash_launch <&{BASH_CONTROL_FD}\n[ \"$__ygg_bash_launch\" = 'L' ] || exit 127\n__ygg_bash_handoff() {{\n    __ygg_bash_status=$?\n    trap - 0\n    printf 'H' >&{BASH_CONTROL_FD}\n    IFS= read -r __ygg_bash_handoff_ack <&{BASH_CONTROL_FD}\n    exit \"$__ygg_bash_status\"\n}}\ntrap '__ygg_bash_handoff' 0\n{source}\n"
+            ),
+        })
+    }
+
+    /// Returns the shell source with registry gates and handoff trap appended.
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    /// Registers the gated direct child, releases its source gate, and returns
+    /// the guard and handoff receiver used while waiting for the child.
+    pub async fn register(
+        mut self,
+        pid: Option<u32>,
+    ) -> std::io::Result<(ProcessGroupGuard, BashProcessHandoff)> {
+        drop(self.child_control.take());
+        drop(self.control_fd_reservation.take());
+        let pid =
+            pid.ok_or_else(|| std::io::Error::other("spawned shell did not expose a process ID"))?;
+        let root = if PROCESS_IDENTITY_TRACKING_AVAILABLE {
+            let pid_i32 = i32::try_from(pid).map_err(|_| {
+                std::io::Error::other("spawned shell process ID does not fit in i32")
+            })?;
+            // The shell is blocked at the first generated source instruction,
+            // so a missing identity means we cannot safely establish ownership.
+            // Dropping `self` makes the source gate fail before any user command
+            // can run.
+            Some(process_identity(pid_i32).ok_or_else(|| {
+                std::io::Error::other("could not establish the spawned shell process identity")
+            })?)
+        } else {
+            // Other Unix targets retain the existing process-group fallback.
+            None
+        };
+        let guard = ProcessGroupGuard::bash(Some(pid));
+        if let Some(root) = root {
+            // Registration takes a second identity snapshot. Requiring it to
+            // match prevents a PID reuse between the pre-release check and
+            // registry bind from granting this execution authority over a
+            // replacement process.
+            if !guard.has_root_identity(root) {
+                return Err(std::io::Error::other(
+                    "could not register the spawned shell process identity",
+                ));
+            }
+        }
+        guard.refresh_bash_descendants();
+        self.control.write_all(&[BASH_LAUNCH_READY, b'\n']).await?;
+        Ok((
+            guard,
+            BashProcessHandoff {
+                control: self.control,
+            },
+        ))
+    }
+}
+
+/// Receives the shell-completion signal that keeps the leader alive while its
+/// descendants are captured by the process registry.
+#[cfg(unix)]
+pub struct BashProcessHandoff {
+    control: UnixStream,
+}
+
+#[cfg(unix)]
+impl BashProcessHandoff {
+    async fn capture_descendants(mut self) {
+        let mut ready = [0_u8; 1];
+        if self.control.read_exact(&mut ready).await.is_err() || ready[0] != BASH_HANDOFF_READY {
+            return;
+        }
+        refresh_registered_descendants();
+        let _ = self.control.write_all(&[BASH_HANDOFF_ACK, b'\n']).await;
+    }
+}
+
+/// Waits for a direct shell child while servicing its registry handoff.
+///
+/// If the shell reaches its completion trap, it cannot exit until this function
+/// captures descendants and acknowledges it. A shell that exits or `exec`s
+/// before the trap retains the existing post-exit scan fallback.
+#[cfg(unix)]
+pub async fn wait_for_bash_process(
+    child: &mut Child,
+    handoff: BashProcessHandoff,
+) -> std::io::Result<ExitStatus> {
+    let handoff = handoff.capture_descendants();
+    tokio::pin!(handoff);
+    tokio::select! {
+        biased;
+        _ = &mut handoff => child.wait().await,
+        status = child.wait() => status,
+    }
+}
+
+#[cfg(unix)]
+fn move_control_fd_out_of_stdio(stream: StdUnixStream) -> std::io::Result<StdUnixStream> {
+    if stream.as_raw_fd() > libc::STDERR_FILENO {
+        return Ok(stream);
+    }
+    // SAFETY: `stream` owns the source descriptor. F_DUPFD creates an
+    // independent descriptor at or above 3, so child stdio setup cannot
+    // overwrite the control channel before the shell executes.
+    let duplicate = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_DUPFD, 3) };
+    if duplicate == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    drop(stream);
+    // SAFETY: `duplicate` was returned by fcntl above and is now owned here.
+    Ok(unsafe { StdUnixStream::from_raw_fd(duplicate) })
+}
+
+#[cfg(unix)]
+fn reserve_bash_control_fd(child_fd: RawFd) -> std::io::Result<Option<OwnedFd>> {
+    // Keep FD 9 occupied across `Command::spawn` so its internal exec-status
+    // pipe cannot be allocated there and then overwritten by the child-side
+    // `dup2`. If FD 9 was already occupied, it already provides that reserve.
+    let duplicate = unsafe { libc::fcntl(child_fd, libc::F_DUPFD, BASH_CONTROL_FD) };
+    if duplicate == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned this owned duplicate. Its Drop closes it on both
+    // the success and error paths below.
+    let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+    if duplicate.as_raw_fd() != BASH_CONTROL_FD {
+        return Ok(None);
+    }
+    set_close_on_exec(duplicate.as_raw_fd())?;
+    Ok(Some(duplicate))
+}
+
+#[cfg(unix)]
+fn set_close_on_exec(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: `fd` is owned by the newly created socket pair and remains valid
+    // for this process while the `UnixStream` value is alive.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the descriptor and flags were read above. Keeping the parent
+    // copy close-on-exec prevents unrelated concurrent spawns from inheriting
+    // the handoff endpoint.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_bash_process_exec(
+    parent_fd: RawFd,
+    child_fd: RawFd,
+    control_fd: RawFd,
+) -> std::io::Result<()> {
+    // SAFETY: this runs in the post-fork child and uses only async-signal-safe
+    // descriptor operations. The raw parent descriptor is closed only in this
+    // child; the parent keeps its Tokio stream. `dup2` reserves a descriptor
+    // accepted by POSIX `sh` implementations before the shell executes.
+    unsafe {
+        let _ = libc::close(parent_fd);
+        if child_fd != control_fd && libc::dup2(child_fd, control_fd) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let flags = libc::fcntl(control_fd, libc::F_GETFD);
+        if flags == -1 || libc::fcntl(control_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
         self.terminate_now();
@@ -609,6 +872,7 @@ fn linux_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let fields = stat.get(stat.rfind(") ")?.saturating_add(2)..)?;
     let fields = fields.split_ascii_whitespace().collect::<Vec<_>>();
+    let is_zombie = fields.first()?.as_bytes() == b"Z";
     let parent_pid = fields.get(1)?.parse().ok()?;
     let process_group_id = fields.get(2)?.parse().ok()?;
     let start_time = fields.get(19)?.parse::<u128>().ok()?;
@@ -616,6 +880,7 @@ fn linux_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
         identity: ProcessIdentity { pid, start_time },
         parent_pid,
         process_group_id,
+        is_zombie,
     })
 }
 
@@ -628,6 +893,7 @@ fn process_snapshots() -> Vec<ProcessSnapshot> {
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
         .filter_map(linux_process_snapshot)
+        .filter(|snapshot| snapshot.is_live())
         .collect()
 }
 
@@ -664,6 +930,7 @@ fn apple_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
         identity: ProcessIdentity { pid, start_time },
         parent_pid,
         process_group_id,
+        is_zombie: info.pbi_status == libc::SZOMB,
     })
 }
 
@@ -730,6 +997,9 @@ fn process_snapshots() -> Vec<ProcessSnapshot> {
         let Some(snapshot) = apple_process_snapshot(pid) else {
             continue;
         };
+        if !snapshot.is_live() {
+            continue;
+        }
         pending.extend(apple_related_pids(pid, true));
         snapshots.push(snapshot);
     }
@@ -776,7 +1046,9 @@ fn process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
 
 #[cfg(unix)]
 fn process_identity(pid: i32) -> Option<ProcessIdentity> {
-    process_snapshot(pid).map(|snapshot| snapshot.identity)
+    process_snapshot(pid)
+        .filter(|snapshot| snapshot.is_live())
+        .map(|snapshot| snapshot.identity)
 }
 
 #[cfg(unix)]
@@ -832,7 +1104,8 @@ fn refresh_registered_descendants() {
         if snapshots_by_pid.contains_key(&identity.pid) {
             continue;
         }
-        let Some(snapshot) = process_snapshot(identity.pid) else {
+        let Some(snapshot) = process_snapshot(identity.pid).filter(|snapshot| snapshot.is_live())
+        else {
             continue;
         };
         snapshots_by_pid.insert(identity.pid, snapshot);
@@ -993,7 +1266,9 @@ fn signal_identity(identity: ProcessIdentity, signal: i32) {
 fn signal_registered_targets(targets: &RegisteredProcessTargets, signal: i32) {
     let group_is_bound = targets.identities().any(|identity| {
         process_snapshot(identity.pid).is_some_and(|snapshot| {
-            snapshot.identity == identity && snapshot.process_group_id == targets.process_group_id
+            snapshot.is_live()
+                && snapshot.identity == identity
+                && snapshot.process_group_id == targets.process_group_id
         })
     });
     if group_is_bound
@@ -1025,7 +1300,7 @@ fn registered_process_is_alive(process_group_id: i32, registration_id: u64) -> b
     };
     let mut identities = targets.identities().peekable();
     if identities.peek().is_none() {
-        return process_group_is_alive(process_group_id);
+        return !PROCESS_IDENTITY_TRACKING_AVAILABLE && process_group_is_alive(process_group_id);
     }
     identities.any(process_identity_is_alive)
 }
@@ -1104,6 +1379,17 @@ fn process_reaper_loop() {
 #[cfg(all(test, unix))]
 pub(crate) fn process_group_registered_for_test(process_group_id: i32) -> bool {
     lock_std_mutex(&REGISTERED_PROCESS_GROUPS).contains_key(&process_group_id)
+}
+
+/// Test diagnostic that treats tracked zombies as exited, unlike `kill(pid, 0)`.
+#[cfg(all(test, unix))]
+pub(crate) fn process_is_live_for_test(pid: i32) -> bool {
+    if PROCESS_IDENTITY_TRACKING_AVAILABLE {
+        process_identity(pid).is_some()
+    } else {
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 #[cfg(unix)]
@@ -17221,6 +17507,7 @@ sleep 30
             },
             parent_pid: 1,
             process_group_id: 900,
+            is_zombie: false,
         };
         let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
 
@@ -17272,6 +17559,7 @@ sleep 30
             },
             parent_pid: 1,
             process_group_id: 900,
+            is_zombie: false,
         };
         let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
 
@@ -17318,6 +17606,7 @@ sleep 30
             },
             parent_pid: 1,
             process_group_id: 900,
+            is_zombie: false,
         };
         let snapshots_by_pid = BTreeMap::from([(unrelated.identity.pid, unrelated)]);
 
@@ -17355,6 +17644,40 @@ sleep 30
 
         signal_identity(identity, libc::SIGKILL);
         child.wait().expect("reap fixture");
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn zombie_processes_are_not_live_identities() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn zombie fixture");
+        let pid = i32::try_from(child.id()).expect("fixture pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let snapshot = loop {
+            if let Some(snapshot) = process_snapshot(pid).filter(|snapshot| snapshot.is_zombie) {
+                break Some(snapshot);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        child.wait().expect("reap zombie fixture");
+
+        let snapshot = snapshot.expect("fixture process never reported as a zombie");
+        assert!(!snapshot.is_live());
+        assert_eq!(process_identity(pid), None);
+        assert!(
+            !process_is_live_for_test(pid),
+            "zombies must not keep lifecycle diagnostics alive"
+        );
     }
 
     #[cfg(unix)]
@@ -18000,8 +18323,7 @@ command = "test"
 
     #[cfg(unix)]
     fn process_id_exists(pid: i32) -> bool {
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        process_is_live_for_test(pid)
     }
 
     fn minimal_manifest(name: &str, command: &str) -> ExtensionManifest {

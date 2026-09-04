@@ -27,7 +27,7 @@ use ygg_ai::ToolDef;
 
 use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 #[cfg(unix)]
-use crate::extension_process::ProcessGroupGuard;
+use crate::extension_process::{wait_for_bash_process, BashProcessLaunch};
 #[cfg(unix)]
 use crate::sandbox::resolve_shell;
 use crate::tool::{OutputStream, Tool, ToolContext, ToolError, ToolOutput, ToolProgressSink};
@@ -192,7 +192,6 @@ impl BashTool {
 
         let shell = resolve_shell(ctx.sandbox.shell_path.as_deref()).path;
         let mut command = tokio::process::Command::new(&shell);
-        command.arg("-c").arg(&args.command);
 
         // Honour the per-call timeout when present, bounded by sandbox max.
         let effective_timeout = match args.timeout_ms {
@@ -226,6 +225,13 @@ impl BashTool {
         // can terminate the whole tree, not just the direct child.
         #[cfg(unix)]
         command.process_group(0);
+        let launch = BashProcessLaunch::prepare(&mut command, &args.command).map_err(|error| {
+            ToolError::new(format!(
+                "error spawn\nfailed to prepare shell {} for lifecycle supervision: {error}",
+                shell.display()
+            ))
+        })?;
+        command.arg("-c").arg(launch.source());
 
         let start = Instant::now();
         let mut child = command.spawn().map_err(|e| {
@@ -234,7 +240,16 @@ impl BashTool {
                 shell.display()
             ))
         })?;
-        let guard = ProcessGroupGuard::bash(child.id());
+        let (guard, handoff) = match launch.register(child.id()).await {
+            Ok(registered) => registered,
+            Err(error) => {
+                let _ = child.wait().await;
+                return Err(ToolError::new(format!(
+                    "error spawn\nfailed to register shell {} for lifecycle supervision: {error}",
+                    shell.display()
+                )));
+            }
+        };
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
@@ -262,7 +277,7 @@ impl BashTool {
                     &stderr_progress,
                     OutputStream::Stderr
                 ),
-                child.wait(),
+                wait_for_bash_process(&mut child, handoff),
             );
             (out, err, status)
         };
@@ -568,8 +583,7 @@ mod tests {
     }
 
     fn process_is_alive(pid: i32) -> bool {
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        crate::extension_process::process_is_live_for_test(pid)
     }
 
     async fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
@@ -698,7 +712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirected_background_descendant_remains_supervised_after_leader_exit() {
+    async fn detached_setsid_descendant_remains_supervised_after_leader_exit() {
         let f = fixture();
         let mut sandbox = f.sandbox.clone();
         sandbox.bash_timeout = Duration::from_secs(2);
@@ -717,7 +731,11 @@ mod tests {
         let output = BashTool
             .execute(
                 json!({
-                    "command": "printf '%s' $$ > leader.pid; sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' $! > descendant.pid"
+                    "command": r#"printf '%s' $$ > leader.pid
+mkfifo descendant.ready
+python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); os.write(os.open(sys.argv[2], os.O_WRONLY), b"ready\n"); time.sleep(30)' descendant.pid descendant.ready </dev/null >/dev/null 2>&1 &
+IFS= read -r _ < descendant.ready
+rm descendant.ready"#
                 }),
                 &ctx,
             )
