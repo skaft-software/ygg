@@ -78,6 +78,148 @@ pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
     out
 }
 
+fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = chars.next() {
+        if character.is_ascii() && (0x40..=0x7e).contains(&(character as u8)) {
+            break;
+        }
+        if character == '\u{009c}' {
+            break;
+        }
+        if character == '\x1b' {
+            // A malformed CSI can contain another control introducer. Consume
+            // that complete control too instead of allowing its bytes to fall
+            // back into visible metadata.
+            let _ = consume_escape_sequence(chars);
+        }
+    }
+}
+
+fn consume_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = chars.next() {
+        match character {
+            // BEL is an OSC terminator. Treating it as a terminator for every
+            // ECMA-48 string type is intentionally conservative: metadata
+            // must never turn a malformed DCS/APC payload into terminal text.
+            '\x07' | '\u{009c}' => break,
+            '\x1b' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                break;
+            }
+            '\x1b' => {
+                let _ = consume_escape_sequence(chars);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Consume the remainder of a 7-bit escape sequence.
+///
+/// A non-ASCII follower is not an ECMA-48 final byte, so returning it lets the
+/// ordinary-cell caller retain harmless user text after discarding the raw ESC.
+fn consume_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+    let next = chars.next()?;
+    match next {
+        '[' => consume_csi(chars),
+        '\u{009b}' => consume_csi(chars),
+        // OSC, DCS, SOS, PM, and APC all carry arbitrary bytes until BEL/ST.
+        ']' | 'P' | 'X' | '^' | '_' => consume_control_string(chars),
+        '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+            consume_control_string(chars)
+        }
+        '\\' => {}
+        intermediate
+            if intermediate.is_ascii() && (0x20..=0x2f).contains(&(intermediate as u8)) =>
+        {
+            while chars.peek().is_some_and(|character| {
+                character.is_ascii() && (0x20..=0x2f).contains(&(*character as u8))
+            }) {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|character| {
+                character.is_ascii() && (0x30..=0x7e).contains(&(*character as u8))
+            }) {
+                chars.next();
+            }
+        }
+        final_byte if final_byte.is_ascii() => {}
+        visible if !visible.is_control() => return Some(visible),
+        _ => {}
+    }
+    None
+}
+
+fn push_ordinary_control(out: &mut String, character: char, unicode: bool) {
+    let replacement = match character {
+        '\x00' => {
+            if unicode {
+                "␀"
+            } else {
+                "[NUL]"
+            }
+        }
+        '\x07' => {
+            if unicode {
+                "␇"
+            } else {
+                "[BEL]"
+            }
+        }
+        '\r' => {
+            if unicode {
+                "␍"
+            } else {
+                "[CR]"
+            }
+        }
+        '\x1b' => {
+            if unicode {
+                "␛"
+            } else {
+                "[ESC]"
+            }
+        }
+        _ if unicode => "·",
+        _ => "[CTL]",
+    };
+    out.push_str(replacement);
+}
+
+/// Sanitize untrusted ordinary-surface metadata into one display cell.
+///
+/// This parser consumes complete and malformed 7-bit/C1 CSI and string
+/// controls before width measurement or theme styling. Newlines cannot inject
+/// a row; visible control diagnostics use only ASCII fallbacks when Unicode is
+/// disabled. It intentionally does not preserve ANSI because callers apply
+/// trusted theme styling only after this boundary.
+pub(crate) fn sanitize_ordinary_surface_cell(raw: &str, unicode: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\x1b' => {
+                if let Some(visible) = consume_escape_sequence(&mut chars) {
+                    out.push(visible);
+                }
+            }
+            '\u{009b}' => consume_csi(&mut chars),
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                consume_control_string(&mut chars)
+            }
+            '\n' => out.push(' '),
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                out.push(' ');
+            }
+            '\t' => out.push_str("    "),
+            control if control.is_control() => push_ordinary_control(&mut out, control, unicode),
+            visible => out.push(visible),
+        }
+    }
+    out
+}
+
 /// Project carriage-return progress into the terminal-visible text state.
 /// CRLF remains a newline; a bare CR replaces the current logical line instead
 /// of retaining every intermediate progress frame and allowing it to wrap.
@@ -249,6 +391,69 @@ mod tests {
         assert_eq!(sanitize_for_terminal("before\x1b[38;5"), "before");
         // C1 forms are stripped with their parameters too.
         assert_eq!(sanitize_for_terminal("a\u{009b}31m"), "a");
+    }
+
+    #[test]
+    fn ordinary_surface_cells_consume_complete_and_malformed_terminal_controls() {
+        let complete_sequences = [
+            ("before\x1b[31mred\x1b[0mafter", "beforeredafter"),
+            ("before\u{009b}31mred\u{009b}0mafter", "beforeredafter"),
+            ("before\x1b\u{009b}31mredafter", "beforeredafter"),
+            ("before\x1b]0;forged-title\x07after", "beforeafter"),
+            ("before\u{009d}0;forged-title\u{009c}after", "beforeafter"),
+            ("before\x1bPprivate-data\x1b\\after", "beforeafter"),
+            ("before\u{0090}private-data\u{009c}after", "beforeafter"),
+            ("before\x1bXignored\x1b\\after", "beforeafter"),
+            ("before\x1b^ignored\x1b\\after", "beforeafter"),
+            ("before\x1b_ignored\x1b\\after", "beforeafter"),
+            ("before\u{0098}ignored\u{009c}after", "beforeafter"),
+            ("before\u{009e}ignored\u{009c}after", "beforeafter"),
+            ("before\u{009f}ignored\u{009c}after", "beforeafter"),
+        ];
+        for (raw, expected) in complete_sequences {
+            for unicode in [true, false] {
+                let sanitized = sanitize_ordinary_surface_cell(raw, unicode);
+                assert_eq!(sanitized, expected, "{raw:?}, unicode={unicode}");
+                assert!(
+                    !sanitized.chars().any(char::is_control),
+                    "control survived: {raw:?} -> {sanitized:?}"
+                );
+                assert!(
+                    !sanitized.contains('\x1b'),
+                    "escape survived: {raw:?} -> {sanitized:?}"
+                );
+                if !unicode {
+                    assert!(
+                        sanitized.is_ascii(),
+                        "ASCII cell leaked Unicode: {sanitized:?}"
+                    );
+                }
+            }
+        }
+
+        // An unterminated introducer consumes the remainder rather than letting
+        // parameter or string bytes regain terminal meaning in an ordinary row.
+        for raw in [
+            "before\x1b[38;5",
+            "before\u{009b}?25",
+            "before\x1b]8;;https://example.invalid",
+            "before\x1bPpayload",
+            "before\u{009d}payload",
+        ] {
+            for unicode in [true, false] {
+                assert_eq!(
+                    sanitize_ordinary_surface_cell(raw, unicode),
+                    "before",
+                    "{raw:?}"
+                );
+            }
+        }
+
+        let unicode = sanitize_ordinary_surface_cell("a\x07b\nc\r\nd\rex\tz\x00q\x01e", true);
+        assert_eq!(unicode, "a␇b c d␍ex    z␀q·e");
+        let ascii = sanitize_ordinary_surface_cell("a\x07b\nc\r\nd\rex\tz\x00q\x01e", false);
+        assert_eq!(ascii, "a[BEL]b c d[CR]ex    z[NUL]q[CTL]e");
+        assert!(ascii.is_ascii());
     }
 
     #[test]

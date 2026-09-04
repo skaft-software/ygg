@@ -413,7 +413,7 @@ fn panel_key_kind(
 /// Open a select-list panel with no descriptions.
 fn open_select_panel(shell: &mut InteractiveShell, items: &[&str]) {
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: items.iter().map(|item| item.to_string()).collect(),
         descriptions: vec![None; items.len()],
         selected: 0,
@@ -497,10 +497,10 @@ fn session_picker_panel_handles_scope_filter_and_selection_outbox() {
         panic!("session picker should be open");
     };
     assert!(!picker.confirming_delete);
-    assert_eq!(
-        picker.message.as_ref().map(|(message, _)| message.as_str()),
-        Some("Cannot delete the currently active session")
-    );
+    let OrdinarySurfaceLifecycle::RecoverableError(status) = &picker.surface.lifecycle else {
+        panic!("current-session delete should set a recoverable-error lifecycle");
+    };
+    assert_eq!(status.text, "cannot delete the currently active session");
     drop(state);
 
     // Clear the named/filter state and select the second row.
@@ -710,7 +710,7 @@ fn confirmation_panel_shows_shared_detail_and_unfiltered_actions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Approve one exact `bash` tool effect?".into(),
+        surface: OrdinarySurfaceMetadata::new("Approve one exact `bash` tool effect?"),
         items: vec!["Deny".into(), "Approve".into()],
         descriptions: vec![
             Some("effect: host_process sha256: 85bc9fe8cfaf7c550880d65882f7c4142c8374875c976c58d1dd724a7f16e609".into()),
@@ -745,7 +745,7 @@ fn confirmation_requires_its_selected_action_to_be_visible() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(80, 5);
         shell.open_panel(Panel::SelectList {
-            title: "Approve?".into(),
+            surface: OrdinarySurfaceMetadata::new("Approve?"),
             items: vec!["Deny".into(), "Approve".into()],
             descriptions: vec![Some("writes src/lib.rs".into()); 2],
             selected,
@@ -782,7 +782,7 @@ fn confirmation_allows_a_visible_action_when_the_title_is_clipped() {
     shell.set_size(46, 8);
     let title = "Approve one exact workspace mutation with a deliberately long identity?";
     shell.open_panel(Panel::SelectList {
-        title: title.into(),
+        surface: OrdinarySurfaceMetadata::new(title),
         items: vec!["Deny".into(), "Approve".into()],
         descriptions: vec![None, None],
         selected: 1,
@@ -847,7 +847,7 @@ fn live_subagent_refresh_preserves_selection_by_stable_node_id() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Subagents".into(),
+        surface: OrdinarySurfaceMetadata::new("Subagents"),
         items: vec!["alpha".into(), "beta".into()],
         descriptions: vec![Some("running".into()), Some("done".into())],
         selected: 1,
@@ -877,7 +877,7 @@ fn select_list_filter_is_case_insensitive_and_matches_descriptions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: vec!["gpt-4o".into(), "claude-sonnet".into()],
         descriptions: vec![
             Some("openai · 128k context".into()),
@@ -972,7 +972,10 @@ fn select_list_filter_without_matches_keeps_panel_open_on_enter() {
         shell.panel_input(&panel_key(crossterm::event::KeyCode::Char(c)));
     }
     let rendered = render_shell(&shell.state.borrow(), 80).join("\n");
-    assert!(rendered.contains("No matches for"));
+    assert!(
+        rendered.contains("no matches") && rendered.contains("zzz"),
+        "{rendered}"
+    );
 
     // Enter is a no-op while nothing matches; Esc still cancels.
     assert!(
@@ -1108,7 +1111,7 @@ fn select_list_separates_model_metadata_and_drops_it_before_narrow_labels() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: vec![
             "GPT-5.6".into(),
             "Claude Opus 4.8".into(),
@@ -1178,7 +1181,7 @@ fn select_list_home_end_and_page_navigation_stay_bounded() {
         .map(|index| format!("Model {index:02}"))
         .collect::<Vec<_>>();
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         descriptions: vec![Some("provider · context".into()); items.len()],
         items,
         selected: 0,
@@ -1668,6 +1671,10 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         trust: crate::prompts::PromptTrust::UserInstalled,
         content_hash: "hash".into(),
     }]));
+    shell.set_skill_commands(Arc::from(vec![(
+        "workspace-review".into(),
+        "Review workspace changes".into(),
+    )]));
     shell.set_extension_commands(Arc::from(vec![
         ("checkpoint".into(), "Save checkpoint".into()),
         // A dynamic command cannot shadow a working built-in.
@@ -1682,19 +1689,37 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         .iter()
         .map(|template| template.name.as_str())
         .collect::<HashSet<_>>();
+    let skill_names = state
+        .skill_commands
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
     let extension_names = state
         .extension_commands
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<HashSet<_>>();
     for suggestion in suggestions.iter().filter(|suggestion| {
-        suggestion.description.starts_with("prompt ·")
-            || suggestion.description.starts_with("extension ·")
+        matches!(
+            suggestion.provenance,
+            super::input_overlays::SlashSuggestionProvenance::Prompt
+                | super::input_overlays::SlashSuggestionProvenance::Skill
+                | super::input_overlays::SlashSuggestionProvenance::Extension
+        )
     }) {
-        let registered = if suggestion.description.starts_with("prompt ·") {
-            prompt_names.contains(suggestion.name.as_str())
-        } else {
-            extension_names.contains(suggestion.name.as_str())
+        let registered = match suggestion.provenance {
+            super::input_overlays::SlashSuggestionProvenance::Prompt => {
+                prompt_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Skill => {
+                skill_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Extension => {
+                extension_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Builtin => {
+                unreachable!("only dynamic slash suggestions should reach this registration check")
+            }
         };
         assert!(registered, "unregistered suggestion: {suggestion:?}");
     }
@@ -1707,10 +1732,16 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         "dynamic command shadowed the built-in route"
     );
     assert!(suggestions.iter().any(|suggestion| {
-        suggestion.name == "local-review" && suggestion.description.starts_with("prompt ·")
+        suggestion.name == "local-review"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Prompt
     }));
     assert!(suggestions.iter().any(|suggestion| {
-        suggestion.name == "checkpoint" && suggestion.description.starts_with("extension ·")
+        suggestion.name == "workspace-review"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Skill
+    }));
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion.name == "checkpoint"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Extension
     }));
 }
 
@@ -4691,7 +4722,7 @@ fn new_session_shrink_reanchors_but_picker_growth_does_not() {
     assert!(fresh.stable_prefix + fresh.replacement.len() < 14);
 
     shell.open_panel(Panel::SelectList {
-        title: "Models".into(),
+        surface: OrdinarySurfaceMetadata::new("Models"),
         items: vec!["model-a".into(), "model-b".into()],
         descriptions: vec![None, None],
         selected: 0,
@@ -10500,7 +10531,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
-    assert_eq!(wide.len(), 7);
+    assert_eq!(wide.len(), 8);
     assert!(wide
         .first()
         .is_some_and(|line| line.chars().all(|ch| ch == '─')));
@@ -10512,7 +10543,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
-    assert_eq!(narrow.len(), 5);
+    assert_eq!(narrow.len(), 6);
     assert!(narrow
         .first()
         .is_some_and(|line| line.contains("Select model")));

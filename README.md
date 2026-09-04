@@ -1035,6 +1035,7 @@ third_party/              upstream license texts
 | [Product contract](docs/design/ygg-coding-agent.md) | Bootstrap, modes, configuration, resources, and UX. |
 | [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and the compiled default presentation. |
 | [Presentation contract](docs/design/ygg-presentation.md) | Stable Ygg structure, adaptive model atmosphere, and durable/live/diagnostic layers. |
+| [Command and picker surface contract](docs/design/ygg-command-picker-surfaces.md) | Shared transient discovery, selection, status, action, and terminal-capability vocabulary. |
 | [Benchmarking](docs/benchmarks/README.md) | Optional telemetry, systems measurements, failure taxonomy, and shootout methodology. |
 | [Beta protocol](docs/benchmarks/beta-protocol.md) | Opt-in first-ten-user daily-driver validation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |

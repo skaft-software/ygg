@@ -5,7 +5,10 @@
 The interactive frontend owns terminal setup/restoration and presentation only;
 `Agent` remains the sole model/tool runtime. The companion
 [presentation contract](ygg-presentation.md) defines the visual hierarchy,
-approval, and terminal-outcome semantics shared by these mechanics.
+approval, and terminal-outcome semantics shared by these mechanics. The
+[ordinary command and picker surface contract](ygg-command-picker-surfaces.md)
+defines the transient discovery, selection, status, and action vocabulary that
+uses that hierarchy without adding a second TUI.
 
 ## Terminal guarantees
 

@@ -7,7 +7,7 @@ use sexy_tui_rs::{visible_width, CURSOR_MARKER};
 
 use crate::presentation::compact_context_limit;
 use crate::tui::layout::PresentationLayout;
-use crate::tui::view::fit_line;
+use crate::tui::view::{fit_line, footer_width, FooterSegment};
 
 fn composer_cursor_marker(state: &super::view::ShellState) -> &'static str {
     if state.panel.is_some() {
@@ -308,52 +308,41 @@ enum FooterKind {
     Cost,
 }
 
-struct FooterSegment {
+/// The composer retains its domain role beside the shared, production footer
+/// segment primitive. Ordinary action footers and status chrome therefore use
+/// the same width and complete-segment vocabulary without coupling their data.
+struct StatusFooterSegment {
     kind: FooterKind,
-    variants: Vec<String>,
-    variant: usize,
-    visible: bool,
+    segment: FooterSegment,
 }
 
-impl FooterSegment {
+impl StatusFooterSegment {
     fn new(kind: FooterKind, variants: Vec<String>) -> Self {
         Self {
             kind,
-            variants,
-            variant: 0,
-            visible: true,
-        }
-    }
-
-    fn text(&self) -> &str {
-        &self.variants[self.variant.min(self.variants.len().saturating_sub(1))]
-    }
-
-    fn compact_once(&mut self) {
-        if self.variant + 1 < self.variants.len() {
-            self.variant += 1;
+            segment: FooterSegment::variants(variants),
         }
     }
 }
 
-fn footer_width(segments: &[FooterSegment], gap: usize) -> usize {
-    let visible = segments.iter().filter(|segment| segment.visible);
-    let count = visible.clone().count();
-    visible
-        .map(|segment| visible_width(segment.text()))
-        .sum::<usize>()
-        + count.saturating_sub(1) * gap
+fn status_footer_width(segments: &[StatusFooterSegment], gap: usize) -> usize {
+    let segments = segments
+        .iter()
+        .filter(|segment| segment.segment.is_visible())
+        .map(|segment| segment.segment.clone())
+        .collect::<Vec<_>>();
+    footer_width(&segments, gap)
 }
 
-fn hide_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
+fn hide_footer_kind(segments: &mut [StatusFooterSegment], kind: FooterKind) {
     if let Some(segment) = segments.iter_mut().find(|segment| segment.kind == kind) {
-        segment.visible = false;
+        segment.segment.hide();
     }
 }
 
-fn compact_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
+fn compact_footer_kind(segments: &mut [StatusFooterSegment], kind: FooterKind) {
     if let Some(segment) = segments.iter_mut().find(|segment| segment.kind == kind) {
-        segment.compact_once();
+        segment.segment.compact_once();
     }
 }
 
@@ -432,10 +421,15 @@ fn push_narrower_variant(variants: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn identity_variants(full_model: &str, model_names: &[String], thinking: &str) -> Vec<String> {
+fn identity_variants(
+    full_model: &str,
+    model_names: &[String],
+    thinking: &str,
+    separator: &str,
+) -> Vec<String> {
     let mut variants = Vec::new();
     if !thinking.is_empty() && !thinking.eq_ignore_ascii_case("off") {
-        push_narrower_variant(&mut variants, format!("{full_model} · {thinking}"));
+        push_narrower_variant(&mut variants, format!("{full_model}{separator}{thinking}"));
     }
     for model in model_names {
         push_narrower_variant(&mut variants, model.clone());
@@ -519,9 +513,14 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         &state.reasoning
     }
     .trim();
-    let mut segments = vec![FooterSegment::new(
+    let mut segments = vec![StatusFooterSegment::new(
         FooterKind::Identity,
-        identity_variants(&full_model, &model_names, effort),
+        identity_variants(
+            &full_model,
+            &model_names,
+            effort,
+            super::view::semantic_separator(&state.theme),
+        ),
     )];
 
     let base_context = if active {
@@ -544,7 +543,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         let marker = if estimated { "~" } else { "" };
         let percent = context_percent(used, limit);
         let limit_display = compact_context_limit(limit);
-        segments.push(FooterSegment::new(
+        segments.push(StatusFooterSegment::new(
             FooterKind::Context,
             vec![
                 format!("context {marker}{percent}%/{limit_display}"),
@@ -568,7 +567,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         }
     };
     if let Some(cost) = cost {
-        segments.push(FooterSegment::new(
+        segments.push(StatusFooterSegment::new(
             FooterKind::Cost,
             vec![format!("session {cost}")],
         ));
@@ -582,41 +581,41 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         hide_footer_kind(&mut segments, FooterKind::Cost);
     }
 
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         compact_footer_kind(&mut segments, FooterKind::Identity);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         compact_footer_kind(&mut segments, FooterKind::Context);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Cost);
     }
-    while footer_width(&segments, gap) > available {
-        let before = footer_width(&segments, gap);
+    while status_footer_width(&segments, gap) > available {
+        let before = status_footer_width(&segments, gap);
         compact_footer_kind(&mut segments, FooterKind::Identity);
-        if footer_width(&segments, gap) == before {
+        if status_footer_width(&segments, gap) == before {
             break;
         }
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Context);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Identity);
     }
 
     let context_is_urgent = displayed_context
         .is_some_and(|(used, limit)| limit > 0 && u128::from(used) * 100 >= u128::from(limit) * 90);
-    let style_segment = |segment: &FooterSegment| match segment.kind {
-        FooterKind::Identity => state.theme.fg("foreground", segment.text()),
-        FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.text()),
+    let style_segment = |segment: &StatusFooterSegment| match segment.kind {
+        FooterKind::Identity => state.theme.fg("foreground", segment.segment.text()),
+        FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.segment.text()),
         FooterKind::Cost
             if state
                 .session_cost_microdollars
                 .zip(state.max_session_cost_microdollars)
                 .is_some_and(|(cost, limit)| limit > 0 && cost >= limit.saturating_mul(9) / 10) =>
         {
-            state.theme.fg("error", segment.text())
+            state.theme.fg("error", segment.segment.text())
         }
         FooterKind::Cost
             if state
@@ -624,23 +623,23 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
                 .zip(state.max_session_cost_microdollars)
                 .is_some_and(|(cost, limit)| limit > 0 && cost >= limit / 2) =>
         {
-            state.theme.fg("warning", segment.text())
+            state.theme.fg("warning", segment.segment.text())
         }
-        _ => state.theme.fg("muted", segment.text()),
+        _ => state.theme.fg("muted", segment.segment.text()),
     };
 
     let identity = segments
         .iter()
-        .find(|segment| segment.visible && segment.kind == FooterKind::Identity);
+        .find(|segment| segment.segment.is_visible() && segment.kind == FooterKind::Identity);
     let metrics = segments
         .iter()
-        .filter(|segment| segment.visible && segment.kind != FooterKind::Identity)
+        .filter(|segment| segment.segment.is_visible() && segment.kind != FooterKind::Identity)
         .collect::<Vec<_>>();
     let identity_text = identity.map(style_segment).unwrap_or_default();
-    let identity_width = identity.map_or(0, |segment| visible_width(segment.text()));
+    let identity_width = identity.map_or(0, |segment| visible_width(segment.segment.text()));
     let metrics_width = metrics
         .iter()
-        .map(|segment| visible_width(segment.text()))
+        .map(|segment| visible_width(segment.segment.text()))
         .sum::<usize>()
         + metrics.len().saturating_sub(1) * gap;
     let metrics_text = metrics

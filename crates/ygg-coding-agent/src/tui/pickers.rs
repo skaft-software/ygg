@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -18,8 +18,8 @@ use crate::presentation::{
 };
 use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
 use crate::tui::view::{
-    ForkMessage, InteractiveShell, MessagePicker, Panel, PanelAction, PanelRequest, PanelResult,
-    PickerState,
+    ForkMessage, InteractiveShell, MessagePicker, OrdinarySurfaceLifecycle,
+    OrdinarySurfaceMetadata, Panel, PanelAction, PanelRequest, PanelResult, PickerState,
 };
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
@@ -263,7 +263,7 @@ where
 
     let initial_selected = initial_selected.min(items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
-        title: title.into(),
+        surface: OrdinarySurfaceMetadata::new(title),
         items,
         descriptions,
         selected: initial_selected,
@@ -370,7 +370,7 @@ where
     }
     let selected = initial_selected.min(initial.items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
-        title: initial.title,
+        surface: OrdinarySurfaceMetadata::new(initial.title),
         items: initial.items,
         descriptions: initial.descriptions,
         selected,
@@ -614,23 +614,41 @@ pub async fn session_picker(
             match request {
                 PanelRequest::LoadAll => {
                     let discovery_store = store.clone();
-                    let discovered = run_blocking_lifecycle(
+                    let discovered = match run_blocking_lifecycle(
                         shell,
                         input,
                         "discovering sessions in all workspaces…",
                         move || Ok(discovery_store.list_all()),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(discovered) => discovered,
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to load all workspaces: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
+                            );
+                            shell.render();
+                            return Err(error);
+                        }
+                    };
                     all_rows = Some(picker_rows(discovered.into_iter()));
                     shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
+                    shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                        "all workspaces loaded",
+                        Instant::now() + Duration::from_secs(2),
+                    ));
                     shell.render();
                 }
                 PanelRequest::TrashSession { path, .. } => {
                     let Some(id) = session_id_from_path(&path) else {
-                        shell.set_picker_message(
-                            "Failed to trash session: path has no valid id",
-                            std::time::Duration::from_secs(3),
-                        );
+                        shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::recoverable_error(
+                            "to trash session: path has no valid id",
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                        shell.render();
                         continue;
                     };
                     let target_store = store_for_session_path(store, &path);
@@ -654,24 +672,29 @@ pub async fn session_picker(
                             rows = next_rows;
                             all_rows = next_all;
                             shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
-                            shell.set_picker_message(
-                                "Session moved to trash",
-                                std::time::Duration::from_secs(2),
+                            shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                                "session moved to trash",
+                                Instant::now() + Duration::from_secs(2),
+                            ));
+                        }
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to trash session: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
                             );
                         }
-                        Err(error) => shell.set_picker_message(
-                            format!("Failed to trash session: {error}"),
-                            std::time::Duration::from_secs(3),
-                        ),
                     }
                     shell.render();
                 }
                 PanelRequest::RenameSession { path, name, .. } => {
                     let Some(id) = session_id_from_path(&path) else {
-                        shell.set_picker_message(
-                            "Failed to rename session: path has no valid id",
-                            std::time::Duration::from_secs(3),
-                        );
+                        shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::recoverable_error(
+                            "to rename session: path has no valid id",
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                        shell.render();
                         continue;
                     };
                     let target_store = store_for_session_path(store, &path);
@@ -688,15 +711,19 @@ pub async fn session_picker(
                             rows = next_rows;
                             all_rows = next_all;
                             shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
-                            shell.set_picker_message(
-                                "Session renamed",
-                                std::time::Duration::from_secs(2),
+                            shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                                "session renamed",
+                                Instant::now() + Duration::from_secs(2),
+                            ));
+                        }
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to rename session: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
                             );
                         }
-                        Err(error) => shell.set_picker_message(
-                            format!("Failed to rename session: {error}"),
-                            std::time::Duration::from_secs(3),
-                        ),
                     }
                     shell.render();
                 }

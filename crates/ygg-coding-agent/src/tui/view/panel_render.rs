@@ -6,9 +6,12 @@ use std::time::{Duration, Instant, SystemTime};
 use sexy_tui_rs::{visible_width, wrap_text_with_ansi, CURSOR_MARKER};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[cfg(test)]
+use super::OrdinarySurfaceMetadata;
 use super::{
-    fit_line, subdued_text, ForkMessage, MessagePicker, Panel, PanelAction, PickerScope,
-    PickerSort, PickerState, ShellState,
+    fit_line, fit_prioritized_footer, join_ordinary_metadata, render_ordinary_status, subdued_text,
+    FooterSegment, ForkMessage, MessagePicker, OrdinarySurfaceLifecycle, Panel, PanelAction,
+    PickerScope, PickerSort, PickerState, ShellState,
 };
 use crate::tui::fuzzy::{fuzzy_match, parse_search_query, SearchMode, TokenKind};
 use crate::tui::layout::{PickerLayout, PresentationLayout, MAX_APPROVAL_DETAIL_ROWS};
@@ -243,10 +246,11 @@ fn format_age(modified: SystemTime, now: SystemTime) -> String {
 }
 
 fn picker_header_title(picker: &PickerState) -> String {
-    match picker.scope {
-        PickerScope::Current => "Resume Session (Current Folder)".to_owned(),
-        PickerScope::All => "Resume Session (All)".to_owned(),
-    }
+    let scope = match picker.scope {
+        PickerScope::Current => "Current Folder",
+        PickerScope::All => "All",
+    };
+    format!("{} ({scope})", picker.surface.title)
 }
 
 fn picker_scope_text(theme: &YggTheme, picker: &PickerState) -> String {
@@ -281,9 +285,12 @@ fn picker_header_line(state: &ShellState, picker: &PickerState, width: u16) -> S
     let plan = PresentationLayout::new(&state.theme, width);
     let inset = usize::from(plan.inset);
     let width = usize::from(plan.content_width);
-    let left = state.theme.bold(&picker_header_title(picker));
+    let left = state.theme.bold(&panel_cell(
+        &picker_header_title(picker),
+        state.theme.unicode(),
+    ));
     let right = picker_scope_text(&state.theme, picker);
-    let right = sexy_tui_rs::truncate_to_width(&right, width, Some("…"));
+    let right = sexy_tui_rs::truncate_to_width(&right, width, Some(state.theme.glyph("ellipsis")));
     let gap = width
         .saturating_sub(visible_width(&left))
         .saturating_sub(visible_width(&right))
@@ -314,8 +321,8 @@ fn picker_filter_line(state: &ShellState, picker: &PickerState, width: u16) -> S
     );
     let available =
         usize::from(plan.inset + plan.content_width).saturating_sub(visible_width(&prefix));
-    let ellipsis = if state.theme.unicode() { "…" } else { "..." };
-    let value = panel_cell(value);
+    let ellipsis = state.theme.glyph("ellipsis");
+    let value = panel_cell(value, state.theme.unicode());
     if value.is_empty() {
         let placeholder = if label == "Rename" {
             "enter a session name"
@@ -342,43 +349,115 @@ fn picker_filter_line(state: &ShellState, picker: &PickerState, width: u16) -> S
     }
 }
 
+fn panel_action_hint(state: &ShellState, key: &str, verb: &str) -> String {
+    format!(
+        "{} {}",
+        state.theme.bold(&state.theme.fg("model_accent", key)),
+        state.theme.fg("muted", verb)
+    )
+}
+
+/// Render complete priority-ordered action hints through the one shared footer
+/// primitive. Scope-like context drops before the rightmost optional actions.
+fn panel_action_footer(
+    state: &ShellState,
+    width: u16,
+    prefix: &str,
+    scope: Option<&str>,
+    primary: (&str, &str),
+    optional: &[(&str, &str)],
+) -> String {
+    let mut segments = Vec::with_capacity(optional.len() + 2);
+    if let Some(scope) = scope.filter(|scope| !scope.is_empty()) {
+        segments.push(FooterSegment::optional(state.theme.fg("muted", scope), 0));
+    }
+    segments.push(FooterSegment::primary(panel_action_hint(
+        state, primary.0, primary.1,
+    )));
+    for (index, (key, verb)) in optional.iter().enumerate() {
+        // The visual right edge is the first optional action to disappear.
+        let drop_rank = u8::try_from(optional.len().saturating_sub(index)).unwrap_or(u8::MAX);
+        segments.push(FooterSegment::optional(
+            panel_action_hint(state, key, verb),
+            drop_rank,
+        ));
+    }
+    let separator = state
+        .theme
+        .fg("muted", super::semantic_separator(&state.theme));
+    fit_prioritized_footer(prefix, &separator, &mut segments, width)
+}
+
 fn picker_hints(state: &ShellState, picker: &PickerState, width: u16) -> (String, String) {
     let now = Instant::now();
+    let inset = " ".repeat(usize::from(
+        PresentationLayout::new(&state.theme, width).inset,
+    ));
     let first = if picker.confirming_delete {
-        state
-            .theme
-            .fg("error", "Delete session? Enter confirm · Esc cancel")
+        panel_action_footer(
+            state,
+            width,
+            &inset,
+            Some("Delete session?"),
+            ("enter", "confirm"),
+            &[("esc", "cancel")],
+        )
     } else if picker.rename.is_some() {
-        subdued_text(&state.theme, "Enter save · Esc cancel")
-    } else if let Some((message, _expires)) = picker
-        .message
-        .as_ref()
-        .filter(|(_, expires)| *expires > now)
-    {
-        let tone = if message.starts_with("Cannot") || message.starts_with("Failed") {
-            "error"
-        } else {
-            "accent"
-        };
-        state.theme.fg(tone, &panel_cell(message))
+        panel_action_footer(
+            state,
+            width,
+            &inset,
+            None,
+            ("enter", "save"),
+            &[("esc", "cancel")],
+        )
+    } else if matches!(
+        picker.surface.lifecycle,
+        OrdinarySurfaceLifecycle::Success(_)
+            | OrdinarySurfaceLifecycle::RecoverableError(_)
+            | OrdinarySurfaceLifecycle::Cancelled(_)
+    ) {
+        render_ordinary_status(&state.theme, &picker.surface.lifecycle, now).map_or_else(
+            || {
+                panel_action_footer(
+                    state,
+                    width,
+                    &inset,
+                    None,
+                    ("tab", "scope"),
+                    &[("re:<pattern>", "filter"), ("\"phrase\"", "exact")],
+                )
+            },
+            |status| fit_line(&format!("{inset}{status}"), width),
+        )
     } else {
-        "tab scope · re:<pattern> · \"phrase\" exact".to_owned()
+        panel_action_footer(
+            state,
+            width,
+            &inset,
+            None,
+            ("tab", "scope"),
+            &[("re:<pattern>", "filter"), ("\"phrase\"", "exact")],
+        )
     };
     let second = if picker.confirming_delete || picker.rename.is_some() {
         String::new()
     } else {
-        "^s sort · ^n named · del trash · ^p path on/off · ^r rename".to_owned()
-    };
-    let inset = " ".repeat(usize::from(
-        PresentationLayout::new(&state.theme, width).inset,
-    ));
-    (
-        fit_line(&format!("{inset}{first}"), width),
-        fit_line(
-            &format!("{inset}{}", subdued_text(&state.theme, &second)),
+        panel_action_footer(
+            state,
             width,
-        ),
-    )
+            &inset,
+            None,
+            ("^s", "sort"),
+            &[
+                ("^n", "named"),
+                ("del", "trash"),
+                ("^p", "path on/off"),
+                ("^r", "rename"),
+            ],
+        )
+    };
+    (first, second)
 }
 
 fn picker_workspace(meta: &crate::session_store::SessionMeta) -> String {
@@ -424,8 +503,12 @@ fn session_title(
         label.push(' ');
     }
     if is_unreadable_session(meta) {
-        label.push_str("(unreadable session · ");
-        label.push_str(&compact_session_id(&meta.id, state.theme.unicode()));
+        let compact_id = compact_session_id(&meta.id, state.theme.unicode());
+        label.push('(');
+        label.push_str(&join_ordinary_metadata(
+            &state.theme,
+            &["unreadable session", &compact_id],
+        ));
         label.push(')');
     } else {
         label.push_str(&meta.title);
@@ -436,10 +519,11 @@ fn session_title(
     if is_current {
         label.push_str(" (current)");
     }
-    panel_cell(&label)
+    panel_cell(&label, state.theme.unicode())
 }
 
 fn session_detail(
+    state: &ShellState,
     meta: &crate::session_store::SessionMeta,
     picker: &PickerState,
     now: SystemTime,
@@ -463,7 +547,12 @@ fn session_detail(
     if picker.show_path {
         details.push(shorten_home_path(&meta.path));
     }
-    details.join(" · ")
+    let sanitized = details
+        .iter()
+        .map(|detail| panel_cell(detail, state.theme.unicode()))
+        .collect::<Vec<_>>();
+    let parts = sanitized.iter().map(String::as_str).collect::<Vec<_>>();
+    join_ordinary_metadata(&state.theme, &parts)
 }
 
 fn session_rows_are_stacked(state: &ShellState, width: u16, body_rows: usize) -> bool {
@@ -482,16 +571,19 @@ fn render_picker_row(
     let is_current = picker.current_session_path.as_ref() == Some(&meta.path);
     let label = session_title(state, meta, is_current);
     let now = SystemTime::now();
-    let right = panel_cell(&session_detail(meta, picker, now));
+    let right = session_detail(state, meta, picker, now);
     let inset = " ".repeat(usize::from(
         PresentationLayout::new(&state.theme, width).inset,
     ));
     let cursor = if selected {
-        format!("{inset}{}", state.theme.fg("model_accent", "› "))
+        format!(
+            "{inset}{} ",
+            state.theme.fg("model_accent", state.theme.glyph("prompt"))
+        )
     } else {
         format!("{inset}  ")
     };
-    let ellipsis = if state.theme.unicode() { "…" } else { "..." };
+    let ellipsis = state.theme.glyph("ellipsis");
     let label = if confirming {
         state.theme.fg("error", &label)
     } else if is_current {
@@ -572,17 +664,24 @@ fn render_message_item(
     } else {
         message.text.replace(['\n', '\r'], " ")
     };
-    let display = panel_cell(&display);
+    let display = panel_cell(&display, state.theme.unicode());
     let prefix = tree_prefix(index, total, state.theme.unicode());
     let cursor = if selected {
-        state.theme.fg("model_accent", "› ")
+        format!(
+            "{} ",
+            state.theme.fg("model_accent", state.theme.glyph("prompt"))
+        )
     } else {
         "  ".to_owned()
     };
     let available = usize::from(width)
         .saturating_sub(visible_width(&cursor))
         .saturating_sub(visible_width(prefix));
-    let display = sexy_tui_rs::truncate_to_width(display.trim(), available.max(1), Some("…"));
+    let display = sexy_tui_rs::truncate_to_width(
+        display.trim(),
+        available.max(1),
+        Some(state.theme.glyph("ellipsis")),
+    );
     let display = if selected {
         state.theme.bold(&display)
     } else {
@@ -608,17 +707,17 @@ fn session_empty_message(picker: &PickerState) -> String {
     if picker.named_only {
         match picker.scope {
             PickerScope::Current => {
-                "No named sessions in current workspace. Press ^n to show all, or tab to view all."
+                "named sessions in the current workspace. Press ^n to show all, or tab to view all."
                     .to_owned()
             }
-            PickerScope::All => "No named sessions found. Press ^n to show all.".to_owned(),
+            PickerScope::All => "named sessions. Press ^n to show all.".to_owned(),
         }
     } else {
         match picker.scope {
             PickerScope::Current => {
-                "No sessions in current workspace. Press tab to view all.".to_owned()
+                "sessions in the current workspace. Press tab to view all.".to_owned()
             }
-            PickerScope::All => "No sessions found".to_owned(),
+            PickerScope::All => "sessions".to_owned(),
         }
     }
 }
@@ -631,7 +730,6 @@ fn render_session_picker(
     rule: &str,
 ) -> Vec<String> {
     let show_borders = state.theme.layout_for_width(width).show_panel_borders && max_rows >= 6;
-    let border_rows = usize::from(show_borders) * 2;
     let inset = " ".repeat(usize::from(
         PresentationLayout::new(&state.theme, width).inset,
     ));
@@ -643,33 +741,45 @@ fn render_session_picker(
     if max_rows >= 2 {
         lines.push(picker_filter_line(state, picker, width));
     }
-    if max_rows >= 3 {
+    // Keep one body row for the selected session or explicit lifecycle state.
+    // At short heights, footer hints yield before that semantic content.
+    let remaining_border_rows = usize::from(show_borders);
+    let reserve_body_row = usize::from(max_rows > lines.len() + remaining_border_rows);
+    let hint_rows = max_rows.saturating_sub(lines.len() + remaining_border_rows + reserve_body_row);
+    if hint_rows > 0 {
         let (first, second) = picker_hints(state, picker, width);
         lines.push(first);
-        if max_rows >= 4 {
+        if hint_rows > 1 {
             lines.push(second);
         }
     }
 
-    let body_rows = max_rows.saturating_sub(4 + border_rows);
+    let body_rows = max_rows.saturating_sub(lines.len() + remaining_border_rows);
     if body_rows > 0 {
         let ordering = session_picker_ordering(picker);
-        if picker.scope == PickerScope::All && picker.all_rows.is_none() {
-            lines.push(fit_line(
-                &format!(
-                    "{inset}{}",
-                    subdued_text(&state.theme, "Loading all workspaces…")
-                ),
-                width,
-            ));
+        if matches!(
+            &picker.surface.lifecycle,
+            OrdinarySurfaceLifecycle::Loading(_)
+        ) {
+            if let Some(status) =
+                render_ordinary_status(&state.theme, &picker.surface.lifecycle, Instant::now())
+            {
+                lines.push(fit_line(&format!("{inset}{status}"), width));
+            }
+        } else if matches!(
+            &picker.surface.lifecycle,
+            OrdinarySurfaceLifecycle::Empty(_)
+        ) {
+            if let Some(status) =
+                render_ordinary_status(&state.theme, &picker.surface.lifecycle, Instant::now())
+            {
+                lines.push(fit_line(&format!("{inset}{status}"), width));
+            }
         } else if ordering.is_empty() {
-            lines.push(fit_line(
-                &format!(
-                    "{inset}{}",
-                    subdued_text(&state.theme, &session_empty_message(picker))
-                ),
-                width,
-            ));
+            let lifecycle = OrdinarySurfaceLifecycle::empty(session_empty_message(picker));
+            if let Some(status) = render_ordinary_status(&state.theme, &lifecycle, Instant::now()) {
+                lines.push(fit_line(&format!("{inset}{status}"), width));
+            }
         } else {
             // Wide pickers use a title line plus a dim metadata line. This
             // keeps timestamps/counts from competing with a long prompt and
@@ -726,27 +836,60 @@ fn render_message_picker(
     if show_borders {
         lines.push(subdued_text(&state.theme, rule));
     }
-    lines.push(fit_line(&state.theme.bold("Fork from Message"), width));
     lines.push(fit_line(
-        &subdued_text(
-            &state.theme,
-            "Select a message to copy its path into a new session",
-        ),
+        &state
+            .theme
+            .bold(&panel_cell(&picker.surface.title, state.theme.unicode())),
         width,
     ));
-    if max_rows >= 3 {
+    if let Some(purpose) = picker.surface.purpose.as_deref() {
         lines.push(fit_line(
-            &subdued_text(&state.theme, "↑↓ select · enter fork · esc cancel"),
+            &subdued_text(&state.theme, &panel_cell(purpose, state.theme.unicode())),
             width,
         ));
     }
-    let body_rows = max_rows.saturating_sub(3 + border_rows);
+    if !matches!(
+        &picker.surface.lifecycle,
+        OrdinarySurfaceLifecycle::Ready | OrdinarySurfaceLifecycle::Empty(_)
+    ) {
+        if let Some(status) =
+            render_ordinary_status(&state.theme, &picker.surface.lifecycle, Instant::now())
+        {
+            lines.push(fit_line(&status, width));
+        }
+    }
+    // Keep one body row for the focused message or explicit empty state. At a
+    // constrained height the action footer yields rather than hiding status.
+    let can_show_footer = max_rows >= lines.len().saturating_add(2 + border_rows);
+    if can_show_footer {
+        let navigation = if state.theme.unicode() {
+            "↑↓"
+        } else {
+            "up/down"
+        };
+        lines.push(panel_action_footer(
+            state,
+            width,
+            "",
+            None,
+            (navigation, "select"),
+            &[("enter", "fork"), ("esc", "cancel")],
+        ));
+    }
+    let body_rows = max_rows.saturating_sub(lines.len() + border_rows);
     if body_rows > 0 {
         if picker.messages.is_empty() {
-            lines.push(fit_line(
-                &subdued_text(&state.theme, "  No user messages found"),
-                width,
-            ));
+            let lifecycle = if matches!(
+                &picker.surface.lifecycle,
+                OrdinarySurfaceLifecycle::Empty(_)
+            ) {
+                picker.surface.lifecycle.clone()
+            } else {
+                OrdinarySurfaceLifecycle::empty("user messages")
+            };
+            if let Some(status) = render_ordinary_status(&state.theme, &lifecycle, Instant::now()) {
+                lines.push(fit_line(&format!("  {status}"), width));
+            }
         } else {
             let total = picker.messages.len();
             let show_indicator = total.saturating_mul(3) > body_rows;
@@ -781,8 +924,10 @@ fn render_message_picker(
     lines
 }
 
-fn panel_cell(text: &str) -> String {
-    super::sanitize_for_terminal(text).replace('\n', " ")
+/// Project untrusted ordinary panel metadata before measuring or applying
+/// trusted theme ANSI. The terminal profile controls visible control notation.
+fn panel_cell(text: &str, unicode: bool) -> String {
+    super::sanitize_ordinary_surface_cell(text, unicode)
 }
 
 pub(super) fn document_content_width(theme: &YggTheme, width: u16) -> u16 {
@@ -842,18 +987,22 @@ fn confirmation_detail(descriptions: &[Option<String>]) -> Option<&str> {
         .filter(|detail| !detail.is_empty())
 }
 
-fn bounded_confirmation_detail(detail: &str) -> String {
+fn bounded_confirmation_detail(detail: &str, unicode: bool) -> String {
     const MAX_DETAIL_BYTES: usize = 4 * 1024;
-    let mut detail = panel_cell(detail);
+    let mut detail = panel_cell(detail, unicode);
     if detail.len() <= MAX_DETAIL_BYTES {
         return detail;
     }
-    let mut end = MAX_DETAIL_BYTES.saturating_sub('…'.len_utf8());
+    let mut end = MAX_DETAIL_BYTES.saturating_sub(if unicode { '…'.len_utf8() } else { 3 });
     while end > 0 && !detail.is_char_boundary(end) {
         end -= 1;
     }
     detail.truncate(end);
-    detail.push('…');
+    if unicode {
+        detail.push('…');
+    } else {
+        detail.push_str("...");
+    }
     detail
 }
 
@@ -907,7 +1056,7 @@ fn confirmation_detail_lines(
     let content_width = terminal_width
         .saturating_sub(visible_width(&plain_prefix) + inset)
         .max(1);
-    let detail = bounded_confirmation_detail(detail);
+    let detail = bounded_confirmation_detail(detail, state.theme.unicode());
     let mut wrapped = wrap_text_with_ansi(&detail, content_width);
     let rendered_rows = available_rows.min(MAX_APPROVAL_DETAIL_ROWS);
     let omitted = wrapped.len() > rendered_rows;
@@ -961,6 +1110,7 @@ fn panel_header(
         } else {
             title
         },
+        theme.unicode(),
     );
     let position = if show_position {
         if matches == 0 {
@@ -1017,12 +1167,12 @@ fn panel_filter_line(theme: &YggTheme, filter: &str, width: u16) -> String {
     };
     let available =
         usize::from(plan.inset + plan.content_width).saturating_sub(visible_width(&prefix));
-    let filter = panel_cell(filter);
+    let filter = panel_cell(filter, theme.unicode());
     if filter.is_empty() {
         let placeholder = sexy_tui_rs::truncate_to_width(
             "type to filter",
             available,
-            Some(if theme.unicode() { "…" } else { "..." }),
+            Some(theme.glyph("ellipsis")),
         );
         fit_line(
             &format!(
@@ -1032,7 +1182,7 @@ fn panel_filter_line(theme: &YggTheme, filter: &str, width: u16) -> String {
             terminal_width,
         )
     } else {
-        let ellipsis = if theme.unicode() { "…" } else { "..." };
+        let ellipsis = theme.glyph("ellipsis");
         let query = if visible_width(&filter) <= available {
             filter
         } else {
@@ -1138,9 +1288,9 @@ fn render_provider_heading(state: &ShellState, provider: &str, width: u16) -> St
         .saturating_sub(visible_width(&prefix))
         .saturating_sub(usize::from(plan.inset));
     let provider = sexy_tui_rs::truncate_to_width(
-        &panel_cell(provider),
+        &panel_cell(provider, state.theme.unicode()),
         available,
-        Some(if state.theme.unicode() { "…" } else { "..." }),
+        Some(state.theme.glyph("ellipsis")),
     );
     fit_line(&format!("{prefix}{}", state.theme.bold(&provider)), width)
 }
@@ -1177,7 +1327,7 @@ fn panel_label_width(
     let content_width = usize::from(PresentationLayout::new(&state.theme, width).content_width);
     let max_label = filtered
         .iter()
-        .map(|index| visible_width(&panel_cell(&items[*index])))
+        .map(|index| visible_width(&panel_cell(&items[*index], state.theme.unicode())))
         .max()
         .unwrap_or(0);
     let has_description = filtered.iter().any(|index| {
@@ -1208,7 +1358,7 @@ fn render_panel_item(
     stacked: bool,
     width: u16,
 ) -> PanelItemRender {
-    let item = panel_cell(item);
+    let item = panel_cell(item, state.theme.unicode());
     let marker = state.theme.glyph("prompt");
     let inset = " ".repeat(usize::from(
         PresentationLayout::new(&state.theme, width).inset,
@@ -1222,7 +1372,7 @@ fn render_panel_item(
         format!("{inset}  ")
     };
     let available = usize::from(width).saturating_sub(visible_width(&prefix));
-    let ellipsis = if state.theme.unicode() { "…" } else { "..." };
+    let ellipsis = state.theme.glyph("ellipsis");
 
     if stacked {
         let label = sexy_tui_rs::truncate_to_width(&item, available, Some(ellipsis));
@@ -1236,7 +1386,7 @@ fn render_panel_item(
         let detail_width = usize::from(width).saturating_sub(visible_width(&detail_prefix));
         if let Some(description) = description {
             let description = sexy_tui_rs::truncate_to_width(
-                &panel_cell(description),
+                &panel_cell(description, state.theme.unicode()),
                 detail_width,
                 Some(ellipsis),
             );
@@ -1275,7 +1425,7 @@ fn render_panel_item(
         let padding = label_width.saturating_sub(visible_width(&item));
         let description_width = available.saturating_sub(label_width + 2);
         let description = sexy_tui_rs::truncate_to_width(
-            &panel_cell(description),
+            &panel_cell(description, state.theme.unicode()),
             description_width,
             Some(ellipsis),
         );
@@ -1305,8 +1455,9 @@ pub(super) fn confirmation_enter_allowed(
     rendered: Option<&ConfirmationRenderMetadata>,
     item_index: usize,
     item_label: &str,
+    unicode: bool,
 ) -> bool {
-    let sanitized_label = panel_cell(item_label);
+    let sanitized_label = panel_cell(item_label, unicode);
     rendered.is_some_and(|rendered| {
         rendered.selected_action.as_ref().is_some_and(|action| {
             action.item_index == item_index
@@ -1340,6 +1491,7 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
     let max_panel = usize::from(state.size.1.max(5)).saturating_sub(4);
     match panel {
         Panel::SelectList {
+            surface,
             items,
             descriptions,
             filter,
@@ -1364,7 +1516,19 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             } else {
                 0
             };
-            let chrome_rows = if confirmation { 1 + detail_rows } else { 2 };
+            let metadata_rows = usize::from(surface.purpose.is_some())
+                + usize::from(
+                    !matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_))
+                        && render_ordinary_status(&state.theme, &surface.lifecycle, Instant::now())
+                            .is_some(),
+                );
+            // Ordinary selection surfaces reserve one semantic action footer;
+            // approval panels deliberately retain their separate contract.
+            let chrome_rows = if confirmation {
+                1 + detail_rows
+            } else {
+                3 + metadata_rows
+            };
             let available_rows = max_panel.saturating_sub(chrome_rows + border_rows);
             let row_height = usize::from(select_list_uses_stacked_rows(
                 state,
@@ -1395,7 +1559,20 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             let border_rows = usize::from(
                 state.theme.layout_for_width(width).show_panel_borders && max_panel >= 5,
             ) * 2;
-            (body + 3 + border_rows).min(max_panel)
+            let chrome_rows = 2
+                + usize::from(picker.surface.purpose.is_some())
+                + usize::from(
+                    !matches!(
+                        &picker.surface.lifecycle,
+                        OrdinarySurfaceLifecycle::Empty(_)
+                    ) && render_ordinary_status(
+                        &state.theme,
+                        &picker.surface.lifecycle,
+                        Instant::now(),
+                    )
+                    .is_some(),
+                );
+            (body + chrome_rows + border_rows).min(max_panel)
         }
         Panel::ReadOnlyDocument { text, styled, .. } => {
             let border_rows = usize::from(
@@ -1443,7 +1620,7 @@ fn render_panel_output_with_limit(
 
     match panel {
         Panel::SelectList {
-            title,
+            surface,
             items,
             descriptions,
             selected,
@@ -1454,7 +1631,7 @@ fn render_panel_output_with_limit(
             let filtered = filtered_indices_for_action(items, descriptions, action, filter);
             let header = panel_header(
                 &state.theme,
-                title,
+                &surface.title,
                 *selected,
                 filtered.len(),
                 !confirmation,
@@ -1487,12 +1664,33 @@ fn render_panel_output_with_limit(
                 && state.theme.layout_for_width(width).show_panel_borders
                 && max_rows >= 4;
             let mut lines = Vec::with_capacity(max_rows);
+            let content_inset = " ".repeat(usize::from(
+                PresentationLayout::new(&state.theme, width).inset,
+            ));
             if show_borders {
                 lines.push(dim(&rule));
             }
             lines.push(header);
             if let Some(filter_line) = filter_line {
                 lines.push(filter_line);
+            }
+            if !confirmation {
+                if let Some(purpose) = surface.purpose.as_deref() {
+                    lines.push(fit_line(
+                        &format!(
+                            "{content_inset}{}",
+                            dim(&panel_cell(purpose, state.theme.unicode()))
+                        ),
+                        width,
+                    ));
+                }
+                if !matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_)) {
+                    if let Some(status) =
+                        render_ordinary_status(&state.theme, &surface.lifecycle, Instant::now())
+                    {
+                        lines.push(fit_line(&format!("{content_inset}{status}"), width));
+                    }
+                }
             }
             if confirmation {
                 let action_rows = usize::from(!filtered.is_empty());
@@ -1504,16 +1702,29 @@ fn render_panel_output_with_limit(
                     available_detail_rows,
                 ));
             }
-            let max_body = max_rows.saturating_sub(lines.len() + usize::from(show_borders));
+            let show_footer = !confirmation
+                && max_rows >= lines.len().saturating_add(2 + usize::from(show_borders));
+            let max_body = max_rows
+                .saturating_sub(lines.len() + usize::from(show_borders) + usize::from(show_footer));
             if filtered.is_empty() && max_body > 0 {
-                let message = if filter.is_empty() {
-                    "  No matches".to_owned()
-                } else if state.theme.unicode() {
-                    format!("  No matches for “{}”", panel_cell(filter))
+                let lifecycle = if matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_))
+                {
+                    surface.lifecycle.clone()
                 } else {
-                    format!("  No matches for \"{}\"", panel_cell(filter))
+                    let detail = if filter.is_empty() {
+                        "items".to_owned()
+                    } else if state.theme.unicode() {
+                        format!("for “{}”", panel_cell(filter, state.theme.unicode()))
+                    } else {
+                        format!("for \"{}\"", panel_cell(filter, state.theme.unicode()))
+                    };
+                    OrdinarySurfaceLifecycle::empty(detail)
                 };
-                lines.push(fit_line(&dim(&message), width));
+                if let Some(status) =
+                    render_ordinary_status(&state.theme, &lifecycle, Instant::now())
+                {
+                    lines.push(fit_line(&format!("{content_inset}{status}"), width));
+                }
             } else if !filtered.is_empty() {
                 let stacked =
                     select_list_uses_stacked_rows(state, action, descriptions, width, max_body);
@@ -1566,6 +1777,21 @@ fn render_panel_output_with_limit(
                     lines.extend(item_render.lines);
                 }
             }
+            if show_footer {
+                let navigation = if state.theme.unicode() {
+                    "↑↓"
+                } else {
+                    "up/down"
+                };
+                lines.push(panel_action_footer(
+                    state,
+                    width,
+                    &content_inset,
+                    None,
+                    ("enter", "select"),
+                    &[(navigation, "navigate"), ("esc", "close")],
+                ));
+            }
             if show_borders {
                 lines.push(dim(&rule));
             }
@@ -1605,12 +1831,24 @@ fn render_panel_output_with_limit(
             } else {
                 format!("{}-{}/{}", start + 1, end, visual.len())
             };
-            let hint = if state.theme.unicode() {
-                format!("  {range} · ↑↓ scroll · esc/← back")
+            let navigation = if state.theme.unicode() {
+                "↑↓"
             } else {
-                format!("  {range} · up/down scroll · esc/left back")
+                "up/down"
             };
-            lines.push(fit_line(&dim(&hint), width));
+            let back = if state.theme.unicode() {
+                "esc/←"
+            } else {
+                "esc/left"
+            };
+            lines.push(panel_action_footer(
+                state,
+                width,
+                "  ",
+                Some(&range),
+                (navigation, "scroll"),
+                &[(back, "back")],
+            ));
             if show_borders {
                 lines.push(dim(&rule));
             }
@@ -1685,7 +1923,7 @@ mod grouped_model_tests {
         let mut shell = super::super::InteractiveShell::test_shell();
         shell.set_size(120, 24);
         shell.open_panel(Panel::SelectList {
-            title: "Select model".into(),
+            surface: OrdinarySurfaceMetadata::new("Select model"),
             items: vec!["Claude".into(), "GPT 4o".into(), "GPT 5".into()],
             descriptions: vec![
                 Some("in $3/M  out $15/M  200k ctx  vision".into()),

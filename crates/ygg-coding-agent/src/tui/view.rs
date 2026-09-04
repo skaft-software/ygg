@@ -47,6 +47,10 @@ use self::input_overlays::input_slash_suggestions;
 use self::input_overlays::render_slash_suggestions;
 #[cfg(test)]
 use self::native_scrollback::{render_shell, render_shell_at, render_shell_update};
+pub(crate) use self::ordinary_surface::{
+    fit_prioritized_footer, footer_width, join_ordinary_metadata, render_ordinary_status,
+    FooterSegment, OrdinarySurfaceLifecycle, OrdinarySurfaceMetadata,
+};
 use self::output_window::bounded_tail_rows;
 #[cfg(test)]
 pub(crate) use self::panel_render::panel_render_test_hook;
@@ -72,7 +76,9 @@ pub use self::terminal_text::bounded_live_append;
 use self::terminal_text::{
     normalize_carriage_return_progress, sanitize_extension_tool_render_segments,
 };
-pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
+pub(crate) use self::terminal_text::{
+    sanitize_for_terminal, sanitize_ordinary_surface_cell, sanitized_editor,
+};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
 use self::transcript_cache::TranscriptCache;
@@ -361,8 +367,9 @@ pub(crate) struct PickerState {
     pub(crate) confirming_delete: bool,
     /// The active rename buffer, when Ctrl+R has entered rename mode.
     pub(crate) rename: Option<String>,
-    /// `(message, expiration)` for transient picker status text.
-    pub(crate) message: Option<(String, Instant)>,
+    /// Typed ordinary title, purpose, and lifecycle state. Unlike the former
+    /// free-form message tuple, rendering cannot infer tone from its wording.
+    pub(crate) surface: OrdinarySurfaceMetadata,
     pub(crate) current_session_path: Option<PathBuf>,
 }
 
@@ -380,7 +387,7 @@ impl PickerState {
             scroll: 0,
             confirming_delete: false,
             rename: None,
-            message: None,
+            surface: OrdinarySurfaceMetadata::new("Resume Session"),
             current_session_path,
         }
     }
@@ -404,6 +411,7 @@ pub(crate) struct ForkMessage {
 /// State for the `/fork` message selector.
 #[derive(Clone, Debug)]
 pub(crate) struct MessagePicker {
+    pub(crate) surface: OrdinarySurfaceMetadata,
     pub(crate) messages: Vec<ForkMessage>,
     pub(crate) selected: usize,
 }
@@ -411,6 +419,10 @@ pub(crate) struct MessagePicker {
 impl MessagePicker {
     pub(crate) fn new(messages: Vec<ForkMessage>) -> Self {
         Self {
+            surface: OrdinarySurfaceMetadata::with_purpose(
+                "Fork from Message",
+                "Select a message to copy its path into a new session",
+            ),
             selected: messages.len().saturating_sub(1),
             messages,
         }
@@ -423,7 +435,7 @@ impl MessagePicker {
 pub(crate) enum Panel {
     /// Select-list panel (model picker, session picker, or thinking picker).
     SelectList {
-        title: String,
+        surface: OrdinarySurfaceMetadata,
         items: Vec<String>,
         descriptions: Vec<Option<String>>,
         selected: usize,
@@ -3735,13 +3747,16 @@ impl InteractiveShell {
             })
             .unwrap_or_else(|| old_selected.min(ordering.len().saturating_sub(1)));
         picker.scroll = 0;
+        if picker.surface.lifecycle.is_loading() {
+            picker.surface.lifecycle = OrdinarySurfaceLifecycle::Ready;
+        }
     }
 
-    /// Set transient text in the session-picker hint row.
-    pub(crate) fn set_picker_message(&mut self, message: impl Into<String>, ttl: Duration) {
+    /// Set an explicit semantic lifecycle status on the session picker.
+    pub(crate) fn set_picker_lifecycle(&mut self, lifecycle: OrdinarySurfaceLifecycle) {
         let mut state = self.state.borrow_mut();
         if let Some(Panel::SessionPicker { picker }) = state.panel.as_mut() {
-            picker.message = Some((message.into(), Instant::now() + ttl));
+            picker.surface.lifecycle = lifecycle;
         }
     }
 
@@ -3767,7 +3782,7 @@ impl InteractiveShell {
     ) {
         let mut state = self.state.borrow_mut();
         let Some(Panel::SelectList {
-            title: current_title,
+            surface: current_surface,
             items: current_items,
             descriptions: current_descriptions,
             selected,
@@ -3787,7 +3802,7 @@ impl InteractiveShell {
             .and_then(|index| current_ids.get(index))
             .cloned();
 
-        *current_title = title;
+        current_surface.title = title;
         *current_items = items;
         *current_descriptions = descriptions;
         *current_ids = node_ids;
@@ -3932,6 +3947,7 @@ impl InteractiveShell {
             }
             _ => 0,
         };
+        let unicode = state.theme.unicode();
         let panel = state.panel.as_mut()?;
         // Snapshot the action before we potentially mutate/drop the panel.
         let action = match panel {
@@ -3973,6 +3989,7 @@ impl InteractiveShell {
                                             confirmation_render.as_ref(),
                                             index,
                                             &items[index],
+                                            unicode,
                                         )
                                     {
                                         return None;
@@ -4081,6 +4098,10 @@ impl InteractiveShell {
                             match key.code {
                                 KeyCode::Esc if key.modifiers.is_empty() => {
                                     picker.rename = None;
+                                    picker.surface.lifecycle = OrdinarySurfaceLifecycle::cancelled(
+                                        "rename",
+                                        Instant::now() + Duration::from_secs(2),
+                                    );
                                 }
                                 KeyCode::Backspace if key.modifiers.is_empty() => {
                                     if let Some(rename) = picker.rename.as_mut() {
@@ -4146,6 +4167,10 @@ impl InteractiveShell {
                                 }
                                 KeyCode::Esc if key.modifiers.is_empty() => {
                                     picker.confirming_delete = false;
+                                    picker.surface.lifecycle = OrdinarySurfaceLifecycle::cancelled(
+                                        "delete",
+                                        Instant::now() + Duration::from_secs(2),
+                                    );
                                 }
                                 _ => {}
                             }
@@ -4158,6 +4183,8 @@ impl InteractiveShell {
                                 picker.selected = 0;
                                 picker.scroll = 0;
                                 if picker.scope == PickerScope::All && picker.all_rows.is_none() {
+                                    picker.surface.lifecycle =
+                                        OrdinarySurfaceLifecycle::loading("all workspaces");
                                     state.pending_panel_requests.push(PanelRequest::LoadAll);
                                 }
                             }
@@ -4190,11 +4217,11 @@ impl InteractiveShell {
                                     if let Some(meta) = picker.active_rows().get(index) {
                                         if picker.current_session_path.as_ref() == Some(&meta.path)
                                         {
-                                            picker.message = Some((
-                                                "Cannot delete the currently active session"
-                                                    .to_owned(),
-                                                Instant::now() + Duration::from_secs(3),
-                                            ));
+                                            picker.surface.lifecycle =
+                                                OrdinarySurfaceLifecycle::recoverable_error(
+                                                    "cannot delete the currently active session",
+                                                    Instant::now() + Duration::from_secs(3),
+                                                );
                                         } else {
                                             picker.confirming_delete = true;
                                         }
@@ -4748,6 +4775,7 @@ mod bash_render;
 mod editor_layout;
 mod input_overlays;
 mod native_scrollback;
+mod ordinary_surface;
 mod outcome_render;
 mod output_window;
 mod panel_render;
@@ -4769,5 +4797,7 @@ mod transcript_selection;
 mod viewport;
 mod welcome_card;
 
+#[cfg(test)]
+mod ordinary_surface_contract_tests;
 #[cfg(test)]
 mod tests;
