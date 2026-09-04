@@ -232,13 +232,18 @@ def host_presentation(snapshot: Mapping[str, Any]) -> dict[str, Any]:
                     "destructive": False,
                 }
             )
+        transport = (
+            server.get("transport")
+            if server.get("transport") in {"stdio", "streamable-http"}
+            else "stdio"
+        )
         nodes.append(
             {
                 "id": node_id,
                 "state": state_map.get(server.get("state"), "degraded"),
                 "label": _safe_label(server.get("label", server_id)),
                 "secondary": (
-                    f"stdio · catalog {_nonnegative_int(server.get('catalogRevision'))} · "
+                    f"{transport} · catalog {_nonnegative_int(server.get('catalogRevision'))} · "
                     f"{_nonnegative_int(server.get('toolCount'))} tools"
                 ),
                 "action_ids": action_ids,
@@ -303,9 +308,14 @@ def host_presentation(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     if servers and selected is not None:
         first = servers[0]
         restart = first.get("restart", {})
+        transport = (
+            first.get("transport")
+            if first.get("transport") in {"stdio", "streamable-http"}
+            else "stdio"
+        )
         body = (
             f"Lifecycle: {first.get('state', 'degraded')}\n"
-            "Transport: stdio\n"
+            f"Transport: {transport}\n"
             f"Catalog revision: {_nonnegative_int(first.get('catalogRevision'))}\n"
             f"Host catalog revision: {_nonnegative_int(first.get('hostCatalogRevision'))}\n"
             f"Published tools: {_nonnegative_int(first.get('toolCount'))}\n"
@@ -468,7 +478,11 @@ def _normalize_server(value: Mapping[str, Any]) -> dict[str, Any]:
         "id": _safe_identifier(value.get("id", "server")),
         "label": _safe_label(value.get("label", value.get("id", "server"))),
         "state": state,
-        "transport": "stdio",
+        "transport": (
+            value.get("transport")
+            if value.get("transport") in {"stdio", "streamable-http"}
+            else "stdio"
+        ),
         "connected": bool(value.get("connected", False)),
         "required": bool(value.get("required", False)),
         "scope": value.get("scope") if value.get("scope") in {"user", "project"} else "user",

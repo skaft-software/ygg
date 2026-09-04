@@ -27,7 +27,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["requires_ygg"], "=0.6.7")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-mcp")
         self.assertTrue(manifest["capabilities"]["process"])
-        self.assertFalse(manifest["capabilities"]["network"])
+        self.assertTrue(manifest["capabilities"]["network"])
         self.assertTrue(manifest["contributes"]["presentation"])
         self.assertEqual(manifest["contributes"]["commands"], ["mcp"])
 
@@ -41,6 +41,7 @@ class ReleaseSmokeTests(unittest.TestCase):
             "vendor/ygg_extension/extension.py",
             "vendor/ygg_extension/protocol.py",
             "ygg_mcp/runtime.py",
+            "ygg_mcp/streamable_http.py",
             "config.schema.json",
             "config.example.json",
             "fixtures/configs/real-local.json",

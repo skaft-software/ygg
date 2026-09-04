@@ -31,9 +31,69 @@ class ConfigTests(unittest.TestCase):
 
     def test_example_is_strict_and_disabled_until_user_edits_it(self):
         config = load_config(ROOT / "config.example.json")
-        self.assertEqual(len(config.servers), 1)
+        self.assertEqual(len(config.servers), 2)
         self.assertFalse(config.servers[0].enabled)
         self.assertEqual(config.servers[0].command, "/absolute/path/to/an-installed-mcp-server")
+        self.assertEqual(config.servers[1].transport, "streamable-http")
+        self.assertFalse(config.servers[1].enabled)
+
+    def test_streamable_http_configuration_is_explicit_and_rejects_unsafe_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            base = {
+                "version": 1,
+                "servers": {
+                    "remote": {
+                        "transport": "streamable-http",
+                        "label": "Reviewed remote",
+                        "url": "http://127.0.0.1:9876/mcp",
+                        "auth": {"type": "bearer", "credential": "reviewed_mcp"},
+                    }
+                },
+            }
+            self.write_json(path, base)
+            config = load_config(path)
+            remote = config.servers[0]
+            self.assertEqual(remote.transport, "streamable-http")
+            self.assertEqual(remote.url, "http://127.0.0.1:9876/mcp")
+            self.assertEqual(remote.auth.credential, "reviewed_mcp")
+            self.assertEqual(remote.command, "")
+            self.assertEqual(remote.args, ())
+            self.assertEqual(remote.environment, {})
+            self.assertNotIn("reviewed_mcp", repr(remote))
+
+            invalid_descriptors = [
+                {**base["servers"]["remote"], "command": "not-allowed"},
+                {**base["servers"]["remote"], "url": "http://localhost:9876/mcp"},
+                {**base["servers"]["remote"], "url": "https://user:pass@example.com/mcp"},
+                {**base["servers"]["remote"], "url": "https://example.com/mcp?token=no"},
+                {**base["servers"]["remote"], "url": "https://example.com/mcp#"},
+                {**base["servers"]["remote"], "url": "https://example.com/has space"},
+                {**base["servers"]["remote"], "headers": {"Authorization": "no"}},
+                {**base["servers"]["remote"], "auth": None},
+                {
+                    **base["servers"]["remote"],
+                    "auth": {"type": "bearer", "credential": "literal token"},
+                },
+            ]
+            for descriptor in invalid_descriptors:
+                self.write_json(path, {"version": 1, "servers": {"remote": descriptor}})
+                with self.assertRaises(ConfigError):
+                    load_config(path)
+
+            self.write_json(
+                path,
+                {
+                    "version": 1,
+                    "servers": {
+                        "wix": {
+                            "transport": "streamable-http",
+                            "url": "https://mcp.wix.com/mcp",
+                        }
+                    },
+                },
+            )
+            self.assertEqual(load_config(path).servers[0].url, "https://mcp.wix.com/mcp")
 
     def test_unknown_duplicate_and_oversized_configuration_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:

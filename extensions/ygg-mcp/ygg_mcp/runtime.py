@@ -126,7 +126,7 @@ def run(config_path: Optional[Path] = None) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ygg-mcp",
-        description="Ygg API 0.2 bridge for explicitly configured local stdio MCP servers",
+        description="Ygg API 0.2 bridge for explicitly configured stdio and Streamable HTTP MCP servers",
     )
     parser.add_argument(
         "--config",

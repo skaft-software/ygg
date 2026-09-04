@@ -38,17 +38,18 @@ from .protocol import (
     McpTimeout,
     McpTransportError,
 )
+from .streamable_http import CredentialProvider, McpStreamableHttpClient
 
 
 @dataclass
 class _ServerState:
     config: ServerConfig
     state: str
-    client: Optional[McpStdioClient] = None
+    client: Optional[Any] = None
     catalog_revision: int = 0
     host_catalog_revision: int = 0
     tools: dict[str, ToolBinding] = field(default_factory=dict)
-    catalog_client: Optional[McpStdioClient] = None
+    catalog_client: Optional[Any] = None
     restart_attempt: int = 0
     next_retry_at_ms: Optional[int] = None
     last_error: Optional[dict[str, Any]] = None
@@ -68,17 +69,8 @@ class BridgeManager:
         presentation: Optional[PresentationProducer] = None,
         scratch_directory: Optional[Path] = None,
         config_error: Optional[Mapping[str, Any]] = None,
-        client_factory: Optional[
-            Callable[
-                [
-                    ServerConfig,
-                    Limits,
-                    Callable[[McpStdioClient, McpError], None],
-                    Callable[[McpStdioClient], None],
-                ],
-                McpStdioClient,
-            ]
-        ] = None,
+        credential_provider: Optional[CredentialProvider] = None,
+        client_factory: Optional[Callable[..., Any]] = None,
         random_source: Optional[random.Random] = None,
     ) -> None:
         self.extension = extension
@@ -88,6 +80,7 @@ class BridgeManager:
             os.environ.get("YGG_EXTENSION_SCRATCH", ".ygg-mcp-scratch")
         )
         self.config_error = dict(config_error) if config_error is not None else None
+        self._credential_provider = credential_provider
         self._client_factory = client_factory or self._default_client_factory
         self._random = random_source or random.SystemRandom()
         self._servers: dict[str, _ServerState] = {
@@ -109,19 +102,29 @@ class BridgeManager:
             thread_name_prefix="ygg-mcp-manager",
         )
 
-    @staticmethod
     def _default_client_factory(
+        self,
         config: ServerConfig,
         limits: Limits,
-        on_failure: Callable[[McpStdioClient, McpError], None],
-        on_tools_changed: Callable[[McpStdioClient], None],
-    ) -> McpStdioClient:
-        return McpStdioClient(
-            config,
-            limits,
-            on_failure=on_failure,
-            on_tools_changed=on_tools_changed,
-        )
+        on_failure: Callable[[Any, McpError], None],
+        on_tools_changed: Callable[[Any], None],
+    ) -> Any:
+        if config.transport == "stdio":
+            return McpStdioClient(
+                config,
+                limits,
+                on_failure=on_failure,
+                on_tools_changed=on_tools_changed,
+            )
+        if config.transport == "streamable-http":
+            return McpStreamableHttpClient(
+                config,
+                limits,
+                credential_provider=self._credential_provider,
+                on_failure=on_failure,
+                on_tools_changed=on_tools_changed,
+            )
+        raise ValueError("unsupported MCP server transport")
 
     def start(self) -> None:
         """Start explicitly configured servers in bounded parallel workers."""
@@ -148,7 +151,7 @@ class BridgeManager:
                     state.timer.cancel()
                     state.timer = None
                 state.next_retry_at_ms = None
-        clients: list[McpStdioClient] = []
+        clients: list[Any] = []
         for state in states:
             with state.operation_lock:
                 with self._lock:
@@ -383,7 +386,7 @@ class BridgeManager:
             return True
 
     def _start_failed(
-        self, state: _ServerState, client: McpStdioClient, error: McpError
+        self, state: _ServerState, client: Any, error: McpError
     ) -> None:
         with self._lock:
             if state.client is not client:
@@ -394,7 +397,7 @@ class BridgeManager:
         self._schedule_after_failure(state, error)
 
     def _disconnect_after_failure(
-        self, state: _ServerState, client: McpStdioClient, error: McpError
+        self, state: _ServerState, client: Any, error: McpError
     ) -> None:
         with self._lock:
             if state.client is not client:
@@ -420,6 +423,12 @@ class BridgeManager:
                 self.config.limits.backoff_initial_ms * (2 ** (state.restart_attempt - 1)),
             )
             delay_ms = int(self._random.uniform(0, ceiling))
+            retry_after_ms = getattr(error, "retry_after_ms", None)
+            if isinstance(retry_after_ms, int) and not isinstance(retry_after_ms, bool):
+                delay_ms = max(
+                    delay_ms,
+                    min(self.config.limits.backoff_max_ms, retry_after_ms),
+                )
             delay_ms = max(1, delay_ms)
             state.state = "backoff"
             state.next_retry_at_ms = int(time.time() * 1000) + delay_ms
@@ -446,7 +455,7 @@ class BridgeManager:
             return
 
     def _on_client_failure(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         try:
             self._executor.submit(self._handle_client_failure, server_id, client, error)
@@ -454,13 +463,13 @@ class BridgeManager:
             return
 
     def _handle_client_failure(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         state = self._server(server_id)
         with state.operation_lock:
             self._disconnect_after_failure(state, client, error)
 
-    def _on_tools_changed(self, server_id: str, client: McpStdioClient) -> None:
+    def _on_tools_changed(self, server_id: str, client: Any) -> None:
         with self._lock:
             state = self._servers.get(server_id)
             if (
@@ -480,7 +489,7 @@ class BridgeManager:
     def _publish_catalog(
         self,
         state: _ServerState,
-        client: McpStdioClient,
+        client: Any,
         raw_tools: list[dict[str, Any]],
     ) -> None:
         next_revision = state.catalog_revision + 1
@@ -619,7 +628,7 @@ class BridgeManager:
             server.host_catalog_revision = self._host_catalog_revision
 
     def _handler(
-        self, binding: ToolBinding, client: McpStdioClient
+        self, binding: ToolBinding, client: Any
     ) -> Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]:
         def call(arguments: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
             return self._call_tool(binding, client, arguments, context)
@@ -629,7 +638,7 @@ class BridgeManager:
     def _call_tool(
         self,
         binding: ToolBinding,
-        client: McpStdioClient,
+        client: Any,
         arguments: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -789,7 +798,7 @@ class BridgeManager:
             return
 
     def _mark_call_degraded(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         state = self._server(server_id)
         with self._lock:
@@ -868,6 +877,7 @@ class BridgeManager:
             "connected": connected,
             "required": state.config.required,
             "scope": state.config.scope,
+            "transport": state.config.transport,
             "catalogRevision": state.catalog_revision,
             "hostCatalogRevision": state.host_catalog_revision,
             "restart": {

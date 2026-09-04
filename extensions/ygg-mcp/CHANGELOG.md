@@ -1,5 +1,14 @@
 # ygg-mcp changelog
 
+## Unreleased
+
+- Add an explicit, bounded Streamable HTTP transport with negotiated session
+  identity, JSON/SSE response framing, no-replay SSE resumption, cancellation,
+  status/content-type policy, and lifecycle reconnects.
+- Add strict remote configuration, exact-origin/TLS/redirect controls, and a
+  non-persistent bearer credential-adapter boundary; OAuth and static credential
+  configuration remain intentionally unsupported.
+
 ## 0.1.0 — Ygg 0.6.1
 
 - Add the first API `0.2` dynamic-catalog MCP bridge.
