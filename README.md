@@ -407,8 +407,9 @@ collaboration tool surface. Ygg still does not infer Ultra, collaboration, or
 Responses Lite from a model name or subscription plan; missing or unusable
 account-scoped metadata falls back conservatively. A successful live inventory
 is authoritative: if it omits Astra, Ygg does not inject a Codex Astra route.
-When it includes Astra alongside the direct OpenAI preset, the subscription
-route is selectable as `codex/gpt-6-astra`.
+When it includes Astra, the subscription route is always selectable as
+`codex/gpt-6-astra`, independently of whether a direct OpenAI preset is
+configured.
 
 GitHub Copilot is intentionally **not** a `ygg --login` or configuration preset.
 An embedding Rust application can own GitHub device login, OAuth storage,

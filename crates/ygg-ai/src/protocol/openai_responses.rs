@@ -875,7 +875,17 @@ pub(crate) fn build_request(
                 .then_some(model.spec.capabilities.parallel_tool_calls)
         },
         max_output_tokens,
-        temperature: req.temperature,
+        // Verified Astra routes reject sampling controls; all other Responses
+        // models remain unchanged. `top_p` and `logprobs` have no Responses
+        // DTO fields and remain absent.
+        temperature: if matches!(
+            model.spec.id.0.as_str(),
+            "gpt-6-astra" | "codex/gpt-6-astra"
+        ) {
+            None
+        } else {
+            req.temperature
+        },
         reasoning: reasoning_opt,
         text: text_opt,
         prompt_cache_key: prompt_cache_key(&req),
@@ -1774,6 +1784,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
         assert_eq!(body["model"], "o1-2024-12-17");
         assert_eq!(body["max_output_tokens"], 1000);
+        assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body.get("parallel_tool_calls").is_none());
@@ -1803,6 +1814,7 @@ mod tests {
             CompatibilityMode::Strict,
         );
 
+        req.temperature = Some(0.7);
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
         assert_eq!(body["model"], "gpt-6-astra");

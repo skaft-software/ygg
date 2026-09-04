@@ -789,7 +789,6 @@ fn model_id_implies_vision(id: &str) -> bool {
         || id.contains("gpt-5.4")
         || id.contains("gpt-5.5")
         || id.contains("gpt-5.6")
-        || id.contains("gpt-6")
         || (id.contains("deepseek") && id.contains("vision"))
         || id.contains("codex-mini")
         || id.contains("qwen3.5")
@@ -809,6 +808,7 @@ struct DiscoveredApiModel {
     context_window: Option<u64>,
     max_output_tokens: Option<u64>,
     tools: bool,
+    reasoning: bool,
     vision: bool,
     audio: bool,
 }
@@ -896,6 +896,44 @@ fn model_metadata_supports_tools(entry: &serde_json::Value) -> bool {
     model_metadata_tool_support(entry).unwrap_or(false)
 }
 
+/// Hosted inventories must explicitly advertise reasoning controls. This keeps
+/// unverified OpenAI-compatible model names from enabling unsupported requests.
+fn model_metadata_supports_reasoning(entry: &serde_json::Value) -> bool {
+    for metadata in [
+        Some(entry),
+        entry.get("top_provider"),
+        entry.get("provider"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for name in ["supports_reasoning", "reasoning", "reasoning_effort"] {
+            if let Some(supported) = metadata.get(name).and_then(metadata_capability_flag) {
+                return supported;
+            }
+        }
+        if let Some(capabilities) = metadata.get("capabilities") {
+            for name in ["reasoning", "reasoning_effort"] {
+                if let Some(supported) = capabilities.get(name).and_then(metadata_capability_flag) {
+                    return supported;
+                }
+            }
+        }
+        if let Some(parameters) = metadata
+            .get("supported_parameters")
+            .and_then(serde_json::Value::as_array)
+        {
+            return parameters.iter().any(|parameter| {
+                matches!(
+                    parameter.as_str(),
+                    Some("reasoning" | "reasoning_effort" | "reasoning.effort")
+                )
+            });
+        }
+    }
+    false
+}
+
 /// A custom endpoint is an explicit user-selected OpenAI-compatible runtime.
 /// Preserve Ygg's historical/local default when its sparse `/models` response
 /// says nothing about tools, while still honoring every explicit false.
@@ -975,6 +1013,7 @@ fn api_models_from_response(body: &serde_json::Value) -> anyhow::Result<Vec<Disc
                         .and_then(|provider| positive_u64(provider, &["max_completion_tokens"]))
                 }),
             tools: custom_model_metadata_supports_tools(entry),
+            reasoning: model_metadata_supports_reasoning(entry),
             vision,
             audio,
         });
@@ -1041,13 +1080,29 @@ fn has_model_id(catalog: &ModelCatalog, id: &str) -> bool {
     catalog.resolve(&ModelId(id.to_owned())).is_ok()
 }
 
-fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
+fn gpt_6_family_model(id: &str) -> bool {
+    id.rsplit('/')
+        .next()
+        .is_some_and(|id| id.to_ascii_lowercase().starts_with("gpt-6"))
+}
+
+/// Sparse public OpenAI inventory entries may use the documented GPT-6 family
+/// fallback. Other compatible providers must supply capability metadata.
+fn public_openai_gpt_6_model(declaration: &ProviderDeclaration, id: &str) -> bool {
+    declaration.id == "openai" && gpt_6_family_model(id)
+}
+
+fn discovered_model_supports_reasoning(
+    declaration: &ProviderDeclaration,
+    protocol: Protocol,
+    id: &str,
+) -> bool {
     let id = id.to_ascii_lowercase();
     let id = id.rsplit('/').next().unwrap_or(&id);
     match protocol {
         Protocol::OpenAiResponses => {
             id.starts_with("gpt-5")
-                || id.starts_with("gpt-6")
+                || public_openai_gpt_6_model(declaration, id)
                 || id.starts_with("codex-")
                 || id
                     .strip_prefix('o')
@@ -1117,22 +1172,25 @@ fn register_openai_compatible_models(
             continue;
         }
         let protocol = route.protocol;
-        let reasoning = discovered_model_supports_reasoning(protocol, api_name);
+        let reasoning =
+            model.reasoning || discovered_model_supports_reasoning(declaration, protocol, api_name);
         let context_window = model.context_window.unwrap_or(128_000);
         let max_output_tokens = model
             .max_output_tokens
             .unwrap_or(32_768)
             .min(context_window);
-        let mut input_modalities = if model.vision
-            || model_id_implies_vision(api_name)
-            || declaration
-                .discovery_capabilities
-                .gpt_vision_fallback(api_name)
-        {
-            ModalitySet::none().with(ygg_ai::Modality::Image)
-        } else {
-            ModalitySet::none()
-        };
+        // GPT-6 family fallbacks belong only to the verified public OpenAI
+        // declaration. Other providers must advertise image input directly.
+        let gpt_vision_fallback = declaration
+            .discovery_capabilities
+            .gpt_vision_fallback(api_name)
+            && (!gpt_6_family_model(api_name) || public_openai_gpt_6_model(declaration, api_name));
+        let mut input_modalities =
+            if model.vision || model_id_implies_vision(api_name) || gpt_vision_fallback {
+                ModalitySet::none().with(ygg_ai::Modality::Image)
+            } else {
+                ModalitySet::none()
+            };
         // Audio inventory metadata is only actionable on the Chat codec; the
         // Responses and Anthropic codecs intentionally have no audio mapping.
         if model.audio && protocol == Protocol::OpenAiChat {
@@ -1755,17 +1813,20 @@ fn register_azure_openai(
             output_modalities: ModalitySet::none(),
             tools: true,
             parallel_tool_calls: true,
-            reasoning: discovered_model_supports_reasoning(route.protocol, &deployment).then_some(
-                ReasoningCapability {
-                    control: ReasoningControl::Effort,
-                    exposes_text: true,
-                    preserves_state: true,
-                    effort_budgets: None,
-                    openai_chat_mode: OpenAiChatReasoningMode::Standard,
-                    min_effort: ygg_ai::ReasoningEffort::Minimal,
-                    max_effort: ygg_ai::ReasoningEffort::High,
-                },
-            ),
+            reasoning: discovered_model_supports_reasoning(
+                declaration,
+                route.protocol,
+                &deployment,
+            )
+            .then_some(ReasoningCapability {
+                control: ReasoningControl::Effort,
+                exposes_text: true,
+                preserves_state: true,
+                effort_budgets: None,
+                openai_chat_mode: OpenAiChatReasoningMode::Standard,
+                min_effort: ygg_ai::ReasoningEffort::Minimal,
+                max_effort: ygg_ai::ReasoningEffort::High,
+            }),
             responses_lite: false,
             agent_delegation: None,
             structured_output: true,
@@ -3343,6 +3404,13 @@ fn codex_models_from_response(
             positive_u64(entry, &["max_output_tokens", "max_completion_tokens"])
                 .unwrap_or(CODEX_MAX_OUTPUT_TOKENS)
                 .min(context_window);
+        let max_output_tokens = if id == "gpt-6-astra" {
+            // Astra's advertised input envelope never changes its 128K output
+            // contract, while lower live metadata remains authoritative.
+            max_output_tokens.min(CODEX_MAX_OUTPUT_TOKENS)
+        } else {
+            max_output_tokens
+        };
         let agent_delegation = entry
             .get("multi_agent_version")
             .and_then(serde_json::Value::as_str)
@@ -3478,7 +3546,7 @@ fn load_codex_model_cache(
     let Some(bytes) = store.load_fresh_model_cache(CODEX_MODEL_CACHE_REFRESH_INTERVAL)? else {
         return Ok(None);
     };
-    let cache: CodexModelCache =
+    let mut cache: CodexModelCache =
         serde_json::from_slice(&bytes).context("invalid Codex model cache")?;
     if cache.version != CODEX_MODEL_CACHE_VERSION
         || cache.account_id != claims.account_id
@@ -3486,6 +3554,13 @@ fn load_codex_model_cache(
         || cache.models.is_empty()
     {
         return Ok(None);
+    }
+    for model in &mut cache.models {
+        if model.id == "gpt-6-astra" {
+            // Current-schema caches can still contain a previously accepted
+            // over-cap Astra entry; normalize it to the fixed contract.
+            model.max_output_tokens = model.max_output_tokens.min(CODEX_MAX_OUTPUT_TOKENS);
+        }
     }
     let mut ids = std::collections::BTreeSet::new();
     for model in &cache.models {
@@ -3692,14 +3767,15 @@ fn register_openai_codex(
     })?;
 
     for model in models {
-        // Preserve familiar bare Codex ids when possible. If another API
-        // already owns one, namespace only the colliding entry instead of
-        // rejecting the account's entire live catalog.
-        let catalog_id = if catalog.resolve(&ModelId(model.id.clone())).is_ok() {
-            ModelId(format!("{}/{}", declaration.id, model.id))
-        } else {
-            ModelId(model.id.clone())
-        };
+        // Astra is always namespaced so an OAuth selection cannot be confused
+        // with the direct public OpenAI route when credentials change. Other
+        // Codex ids retain their historical collision-based compatibility.
+        let catalog_id =
+            if model.id == "gpt-6-astra" || catalog.resolve(&ModelId(model.id.clone())).is_ok() {
+                ModelId(format!("{}/{}", declaration.id, model.id))
+            } else {
+                ModelId(model.id.clone())
+            };
         let pricing = crate::providers::pricing_for(declaration, &model.id);
         let supports_image_input = codex_supports_image_input(&model.id);
         // The declaration keeps application session identity separate from the

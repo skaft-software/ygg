@@ -2,25 +2,44 @@ use super::*;
 
 #[test]
 fn discovered_reasoning_supports_chat_and_responses_models() {
+    let openai = &crate::providers::OPENAI;
     assert!(discovered_model_supports_reasoning(
+        openai,
         Protocol::OpenAiChat,
         "gemma-4-31b-it"
     ));
     assert!(discovered_model_supports_reasoning(
+        openai,
         Protocol::OpenAiResponses,
         "gpt-5.4"
     ));
     assert!(discovered_model_supports_reasoning(
+        openai,
         Protocol::OpenAiResponses,
         "openai/gpt-6-astra"
     ));
     assert!(!discovered_model_supports_reasoning(
+        openai,
         Protocol::OpenAiChat,
         "gemma-3-27b-it"
     ));
     assert!(!discovered_model_supports_reasoning(
+        openai,
         Protocol::AnthropicMessages,
         "claude-sonnet-4"
+    ));
+}
+
+#[test]
+fn gpt_6_capability_fallback_is_limited_to_public_openai() {
+    let openai = &crate::providers::OPENAI;
+    let opencode = &crate::providers::OPENCODE;
+    assert!(public_openai_gpt_6_model(openai, "gpt-6-astra"));
+    assert!(!public_openai_gpt_6_model(opencode, "gpt-6-astra"));
+    assert!(!discovered_model_supports_reasoning(
+        opencode,
+        Protocol::OpenAiResponses,
+        "gpt-6-astra"
     ));
 }
 
@@ -426,7 +445,7 @@ fn metadata_sparse_multimodal_model_ids_get_a_vision_fallback() {
     assert!(models[0].vision);
     assert!(model_id_implies_vision("gemini-2.5-pro"));
     assert!(model_id_implies_vision("anthropic/claude-sonnet-4-6"));
-    assert!(model_id_implies_vision("openai/gpt-6-astra"));
+    assert!(!model_id_implies_vision("openai/gpt-6-astra"));
     assert!(crate::providers::OPENAI
         .discovery_capabilities
         .gpt_vision_fallback("openai/gpt-6-astra"));
@@ -434,6 +453,27 @@ fn metadata_sparse_multimodal_model_ids_get_a_vision_fallback() {
     assert!(!model_id_implies_vision("deepseek-v4-flash"));
     assert!(model_id_implies_vision("Qwen/Qwen2.5-VL-7B"));
     assert!(!model_id_implies_vision("Qwen/Qwen3-Coder-30B"));
+}
+
+#[test]
+fn sparse_gpt_6_compatible_inventory_needs_explicit_capability_metadata() {
+    let response = serde_json::json!({
+        "data": [{"id": "gpt-6-astra"}]
+    });
+    let models = api_models_from_response(&response).unwrap();
+    assert!(!models[0].vision);
+    assert!(!models[0].reasoning);
+
+    let response = serde_json::json!({
+        "data": [{
+            "id": "gpt-6-astra",
+            "architecture": {"input_modalities": ["text", "image"]},
+            "supported_parameters": ["reasoning_effort"]
+        }]
+    });
+    let models = api_models_from_response(&response).unwrap();
+    assert!(models[0].vision);
+    assert!(models[0].reasoning);
 }
 
 #[test]
@@ -829,6 +869,36 @@ fn openrouter_discovery_requires_an_advertised_completion_ceiling() {
 }
 
 #[test]
+fn third_party_gpt_6_astra_discovery_remains_metadata_driven() {
+    let response = serde_json::json!({
+        "data": [{
+            "id": "openai/gpt-6-astra",
+            "context_length": 128_000,
+            "top_provider": {"max_completion_tokens": 32_000}
+        }]
+    });
+    let models = openrouter_models_from_response(&crate::providers::OPENROUTER, &response).unwrap();
+    assert_eq!(models.len(), 1);
+    assert!(!models[0]
+        .capabilities
+        .input_modalities
+        .contains(ygg_ai::Modality::Image));
+    assert!(models[0].capabilities.reasoning.is_none());
+
+    let mut advertised = response;
+    advertised["data"][0]["architecture"] =
+        serde_json::json!({"input_modalities": ["text", "image"]});
+    advertised["data"][0]["supported_parameters"] = serde_json::json!(["reasoning.effort"]);
+    let models =
+        openrouter_models_from_response(&crate::providers::OPENROUTER, &advertised).unwrap();
+    assert!(models[0]
+        .capabilities
+        .input_modalities
+        .contains(ygg_ai::Modality::Image));
+    assert!(models[0].capabilities.reasoning.is_some());
+}
+
+#[test]
 fn openrouter_anthropic_routes_enable_anthropic_cache_markers() {
     let response = serde_json::json!({
         "data": [{
@@ -963,6 +1033,24 @@ fn codex_models_require_a_usable_credential_and_include_astra_fallback() {
         "openai",
         "the direct OpenAI route must remain distinct from codex/gpt-6-astra"
     );
+}
+
+#[test]
+fn codex_astra_is_namespaced_without_a_direct_openai_model() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("codex.json");
+    write_codex_credential(&path, false, "plus");
+    let store = crate::auth::codex::CredentialStore::new(path);
+    // A default catalog models production after unavailable direct OpenAI
+    // presets were filtered out: only usable Codex OAuth remains.
+    let mut catalog = ModelCatalog::default();
+    register_openai_codex(&mut catalog, store, true).unwrap();
+
+    let astra = catalog
+        .resolve(&ModelId("codex/gpt-6-astra".into()))
+        .expect("namespaced Codex Astra");
+    assert_eq!(astra.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
+    assert!(catalog.resolve(&ModelId("gpt-6-astra".into())).is_err());
 }
 
 #[test]
@@ -1189,6 +1277,7 @@ fn codex_astra_live_object_metadata_requires_explicit_ultra_and_v2() {
             "visibility": "hide",
             "context_window": 1_050_000,
             "max_context_window": 872_000,
+            "max_output_tokens": 256_000,
             "default_reasoning_level": "low",
             "supported_reasoning_levels": [
                 {"effort": "low"},
@@ -1213,6 +1302,13 @@ fn codex_astra_live_object_metadata_requires_explicit_ultra_and_v2() {
     assert!(astra.responses_lite);
     assert_eq!(astra.agent_delegation, Some(ygg_ai::AgentDelegation::V2));
     assert!(codex_supports_image_input(&astra.id));
+
+    let mut lower_output_body = body.clone();
+    lower_output_body["models"][0]["max_output_tokens"] = serde_json::json!(64_000);
+    assert_eq!(
+        codex_models_from_response(&lower_output_body, None).unwrap()[0].max_output_tokens,
+        64_000
+    );
 
     let offline = conservative_offline_codex_models(models.clone());
     let offline_astra = &offline[0];
@@ -1387,6 +1483,48 @@ fn codex_model_cache_is_scoped_to_account_and_plan() {
     assert!(load_codex_model_cache(&store, &other_account)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn codex_astra_cache_caps_output_and_honors_lower_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = crate::auth::codex::CredentialStore::new(directory.path().join("codex.json"));
+    let plan = crate::auth::codex::ChatGptPlan::Plus;
+    let claims = crate::auth::codex::SubscriptionClaims {
+        account_id: "acct-a".into(),
+        plan: Some(plan),
+    };
+    let cache = |max_output_tokens| CodexModelCache {
+        version: CODEX_MODEL_CACHE_VERSION,
+        account_id: claims.account_id.clone(),
+        plan: codex_plan_cache_key(&claims).map(str::to_owned),
+        models: vec![DiscoveredCodexModel {
+            id: "gpt-6-astra".into(),
+            context_window: 272_000,
+            max_context_window: 872_000,
+            max_output_tokens,
+            min_effort: ygg_ai::ReasoningEffort::Low,
+            max_effort: ygg_ai::ReasoningEffort::Max,
+            responses_lite: false,
+            agent_delegation: None,
+        }],
+    };
+
+    store
+        .save_model_cache(&serde_json::to_vec(&cache(256_000)).unwrap())
+        .unwrap();
+    assert_eq!(
+        load_codex_model_cache(&store, &claims).unwrap().unwrap()[0].max_output_tokens,
+        CODEX_MAX_OUTPUT_TOKENS
+    );
+
+    store
+        .save_model_cache(&serde_json::to_vec(&cache(64_000)).unwrap())
+        .unwrap();
+    assert_eq!(
+        load_codex_model_cache(&store, &claims).unwrap().unwrap()[0].max_output_tokens,
+        64_000
+    );
 }
 
 #[test]

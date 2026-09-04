@@ -2533,6 +2533,27 @@ impl DelegationManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // Astra's host-side Ultra tier enables V2 collaboration, but the
+        // observed child-run wire contract is xhigh. Keep root and generic
+        // Ultra lowering unchanged by translating only this child boundary.
+        let child_reasoning = if self.template.model.spec.api_name == "gpt-6-astra"
+            && self.template.model.spec.capabilities.agent_delegation
+                == Some(ygg_ai::AgentDelegation::V2)
+            && self
+                .template
+                .model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.max_effort == ygg_ai::ReasoningEffort::Ultra)
+            && self.template.reasoning
+                == ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+        {
+            ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Xhigh)
+        } else {
+            self.template.reasoning.clone()
+        };
         let mut agent = Agent::new(AgentConfig {
             client: self.template.client.clone(),
             model: self.template.model.clone(),
@@ -2542,7 +2563,7 @@ impl DelegationManager {
             effect_broker: self.template.effect_broker.clone(),
             extensions,
             max_turns,
-            reasoning: self.template.reasoning.clone(),
+            reasoning: child_reasoning,
             reasoning_mode: self.template.reasoning_mode,
             cache_retention: self.template.cache_retention,
             session_id: None,
@@ -5125,6 +5146,8 @@ fn cleanup_failed_team_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn delegated_session_references_are_stable_path_free_and_strict() {
@@ -5272,6 +5295,67 @@ mod tests {
         let manager_mut = Arc::get_mut(&mut manager).expect("new manager is uniquely owned");
         manager_mut.template.extensions.load(&crate::CoreTools);
         manager
+    }
+
+    #[tokio::test]
+    async fn delegated_astra_ultra_v2_child_uses_xhigh_wire_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_bytes(
+                        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut manager = writable_manager(directory.path());
+        {
+            let manager_mut = Arc::get_mut(&mut manager).expect("new manager is uniquely owned");
+            let mut model = ygg_ai::ModelCatalog::builtin()
+                .unwrap()
+                .resolve(&ygg_ai::ModelId("gpt-6-astra".into()))
+                .unwrap();
+            let spec = Arc::make_mut(&mut model.spec);
+            spec.id = ygg_ai::ModelId("codex/gpt-6-astra".into());
+            spec.capabilities.agent_delegation = Some(ygg_ai::AgentDelegation::V2);
+            let reasoning = spec
+                .capabilities
+                .reasoning
+                .as_mut()
+                .expect("Astra reasoning capability");
+            reasoning.max_effort = ygg_ai::ReasoningEffort::Ultra;
+            let endpoint = Arc::make_mut(&mut model.endpoint);
+            endpoint.base_url = url::Url::parse(&format!("{}/", server.uri())).unwrap();
+            endpoint.auth = ygg_ai::Auth::None;
+            manager_mut
+                .template
+                .runtime
+                .get_mut()
+                .unwrap()
+                .max_output_tokens = model.spec.limits.max_output_tokens;
+            manager_mut.template.model = model;
+            manager_mut.template.reasoning =
+                ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra);
+        }
+
+        let (identity, _commands) = insert_test_record(&manager, DelegatedAgentStatus::Running);
+        let session = Session::create(directory.path().join("astra-child.jsonl")).unwrap();
+        let mut child = manager.build_child_agent(session, &identity, None).unwrap();
+        child
+            .complete("verify delegated wire effort")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[cfg(unix)]
