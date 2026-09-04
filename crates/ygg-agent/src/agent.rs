@@ -7133,6 +7133,7 @@ mod tests {
             id: ygg_ai::ToolCallId("call_malformed".into()),
             name: "bash".into(),
             arguments_json: format!(r#"{{"command":"{sensitive_argument}""#),
+            argument_error: None,
         };
         assert!(call.arguments_value().is_err());
 

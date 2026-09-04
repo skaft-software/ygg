@@ -5666,6 +5666,40 @@ async fn schema_rejected_bash_is_never_speculated_or_executed() {
         .expect("schema rejection is surfaced as a tool error");
     assert_eq!(error, SCHEMA_MISMATCH_ERROR);
     assert!(!error.contains("ls"));
+    let decision = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolPolicyDecision { id, decision, .. }
+                if id.0 == "schema_rejected_bash" =>
+            {
+                Some(decision)
+            }
+            _ => None,
+        })
+        .expect("schema rejection must be policy-visible");
+    assert_eq!(decision.effect, None);
+    assert!(!decision.allowed);
+    assert_eq!(decision.authorization, None);
+    assert_eq!(
+        decision.denial_code,
+        Some(ToolPolicyDenialCode::InvalidToolArguments)
+    );
+    assert!(!serde_json::to_string(decision)
+        .unwrap()
+        .contains(r#""command":"ls""#));
+    let started = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolStarted { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolStarted before schema rejection decision");
+    let decided = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolPolicyDecision for schema rejection");
+    let finished = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolFinished { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolFinished after schema rejection decision");
+    assert!(started < decided && decided < finished);
     assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
     assert_eq!(executions.load(Ordering::SeqCst), 0);
 
