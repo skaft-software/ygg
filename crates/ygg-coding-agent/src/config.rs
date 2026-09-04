@@ -477,6 +477,9 @@ pub struct Config {
     pub trusted_extensions: Vec<String>,
     /// One-shot extension names trusted only for this process invocation.
     pub invocation_trusted_extensions: Vec<String>,
+    /// One-shot process-owner gate for experimental remote Streamable HTTP MCP.
+    /// This is deliberately not loaded from configuration, environment, or sessions.
+    pub experimental_streamable_http_mcp: bool,
     /// One authoritative allowlist used for schema and implementation registration.
     pub tools: ToolPolicy,
     /// Optional machine-readable agent telemetry output. Disabled by default.

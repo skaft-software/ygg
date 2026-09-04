@@ -1352,6 +1352,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         extension_activation_overridden: true,
         trusted_extensions: request.trusted_extensions.clone(),
         invocation_trusted_extensions: Vec::new(),
+        experimental_streamable_http_mcp: false,
         tools,
         telemetry: None,
         context_files: request.context_files,
@@ -2135,6 +2136,10 @@ mod tests {
 
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
         assert!(!config.sandbox.allow_external_paths);
+        assert!(
+            !config.experimental_streamable_http_mcp,
+            "the host request/session boundary cannot enable experimental remote MCP"
+        );
         assert_eq!(
             config.sandbox.policy_provenance,
             ToolPolicyProvenance::all(PolicyValueSource::HostRequest)
@@ -2218,6 +2223,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("allow_file_mutations");
+        request["experimental_streamable_http_mcp"] = serde_json::json!(true);
+        let error = parse_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("experimental_streamable_http_mcp"));
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("experimental_streamable_http_mcp");
         request["history"] = serde_json::json!([{
             "role": "user",
             "text": "hello",

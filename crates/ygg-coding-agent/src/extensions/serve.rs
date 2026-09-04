@@ -11784,6 +11784,7 @@ mod tests {
             extension_activation_overridden: false,
             trusted_extensions: Vec::new(),
             invocation_trusted_extensions: Vec::new(),
+            experimental_streamable_http_mcp: false,
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: false,

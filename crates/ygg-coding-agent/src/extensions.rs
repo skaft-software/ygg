@@ -66,6 +66,9 @@ use crate::tui::view::{
 
 /// The first-party extension that owns every in-harness child-session surface.
 pub const SUBAGENTS_EXTENSION_NAME: &str = "ygg-subagents";
+/// The first-party MCP bridge whose remote transport is separately gated.
+pub const MCP_EXTENSION_NAME: &str = "ygg-mcp";
+const EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT: &str = "--experimental-streamable-http-mcp";
 const MAX_CONTEXT_CONTRIBUTION_BYTES: usize = 64 * 1024;
 /// Returns whether configuration is eligible to launch the trusted observer.
 ///
@@ -1225,6 +1228,32 @@ fn opaque_extension_resource_id(name: &str) -> String {
     format!("extension:{digest:x}")
 }
 
+/// Keep the experimental transport switch at the process-owner boundary.
+///
+/// Manifest and MCP configuration are both data loaded before the extension
+/// process starts. Strip any copy supplied through that data, then add the
+/// argument only when this Ygg process received its one-shot CLI opt-in.
+fn apply_experimental_streamable_http_mcp_gate(
+    descriptor: &mut DiscoveredExtension,
+    enabled: bool,
+) {
+    if descriptor.manifest.name != MCP_EXTENSION_NAME {
+        return;
+    }
+    descriptor
+        .manifest
+        .entrypoint
+        .args
+        .retain(|argument| argument != EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT);
+    if enabled {
+        descriptor
+            .manifest
+            .entrypoint
+            .args
+            .push(EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT.to_owned());
+    }
+}
+
 impl ExecutableExtensions {
     /// Discovers and starts extensions with a fresh ordinary-host runtime manager.
     ///
@@ -1321,7 +1350,13 @@ impl ExecutableExtensions {
             }
         }
 
-        let descriptors = by_name.into_values().collect::<Vec<_>>();
+        let mut descriptors = by_name.into_values().collect::<Vec<_>>();
+        for descriptor in &mut descriptors {
+            apply_experimental_streamable_http_mcp_gate(
+                descriptor,
+                config.experimental_streamable_http_mcp,
+            );
+        }
         for descriptor in &descriptors {
             if descriptor.activation.enabled
                 && descriptor.activation.trust == ExtensionTrust::Untrusted
@@ -4526,6 +4561,42 @@ shortcuts = [{ key = "ctrl+shift+p", name = "open_panel", description = "Open th
     }
 
     #[test]
+    fn streamable_http_mcp_gate_is_host_owned() {
+        let mut descriptor = DiscoveredExtension {
+            manifest: ExtensionManifest::parse(
+                r#"
+name = "ygg-mcp"
+version = "0.1.0"
+api_version = "0.2"
+
+[entrypoint]
+command = "fixture"
+args = ["--keep", "--experimental-streamable-http-mcp"]
+"#,
+            )
+            .unwrap(),
+            manifest_path: PathBuf::from("/tmp/ygg-mcp/extension.toml"),
+            source: ExtensionSource::Explicit,
+            activation: Default::default(),
+        };
+
+        apply_experimental_streamable_http_mcp_gate(&mut descriptor, false);
+        assert_eq!(
+            descriptor.manifest.entrypoint.args,
+            vec!["--keep".to_owned()]
+        );
+
+        apply_experimental_streamable_http_mcp_gate(&mut descriptor, true);
+        assert_eq!(
+            descriptor.manifest.entrypoint.args,
+            vec![
+                "--keep".to_owned(),
+                EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
     fn status_contributions_never_become_ambient_messages() {
         let (sender, receiver) = broadcast::channel(4);
         let mut extensions = ExecutableExtensions::default();
@@ -4740,6 +4811,7 @@ command = "does-not-exist"
             extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![name.to_owned()],
+            experimental_streamable_http_mcp: false,
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: false,

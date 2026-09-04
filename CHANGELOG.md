@@ -6,6 +6,10 @@ All notable changes to Ygg are documented here. This project follows Semantic Ve
 
 ### Fixed
 
+- Keep remote Streamable HTTP MCP unavailable by default: only the one-shot
+  process-owner CLI opt-in `--experimental-streamable-http-mcp` can pass the
+  gate to the first-party bridge. Project/global/session configuration,
+  environment, and manifests cannot activate it; stdio MCP is unaffected.
 - Fully neutralize Git clean/process filters from repository, worktree, and
   included configuration during Serve status refresh. Filter names that cannot
   be represented safely, including invalid UTF-8 and delimiter-bearing names,

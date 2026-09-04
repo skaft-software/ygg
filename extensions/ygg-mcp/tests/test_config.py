@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ygg_mcp.config import ConfigError, load_config
+from ygg_mcp.config import ConfigError, STREAMABLE_HTTP_GATE_ERROR, load_config
+from ygg_mcp.runtime import build_runtime
 
 from .helpers import ROOT
 
@@ -52,7 +53,16 @@ class ConfigTests(unittest.TestCase):
                 },
             }
             self.write_json(path, base)
-            config = load_config(path)
+            with self.assertRaisesRegex(ConfigError, "process owner"):
+                load_config(path)
+            self.write_json(
+                path,
+                {**base, "experimentalStreamableHttpMcp": True},
+            )
+            with self.assertRaises(ConfigError):
+                load_config(path)
+            self.write_json(path, base)
+            config = load_config(path, experimental_streamable_http_mcp=True)
             remote = config.servers[0]
             self.assertEqual(remote.transport, "streamable-http")
             self.assertEqual(remote.url, "http://127.0.0.1:9876/mcp")
@@ -79,7 +89,7 @@ class ConfigTests(unittest.TestCase):
             for descriptor in invalid_descriptors:
                 self.write_json(path, {"version": 1, "servers": {"remote": descriptor}})
                 with self.assertRaises(ConfigError):
-                    load_config(path)
+                    load_config(path, experimental_streamable_http_mcp=True)
 
             self.write_json(
                 path,
@@ -93,7 +103,37 @@ class ConfigTests(unittest.TestCase):
                     },
                 },
             )
-            self.assertEqual(load_config(path).servers[0].url, "https://mcp.wix.com/mcp")
+            self.assertEqual(
+                load_config(path, experimental_streamable_http_mcp=True).servers[0].url,
+                "https://mcp.wix.com/mcp",
+            )
+
+    def test_remote_gate_is_visible_to_the_product_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            self.write_json(
+                path,
+                {
+                    "version": 1,
+                    "servers": {
+                        "remote": {
+                            "transport": "streamable-http",
+                            "url": "https://mcp.example.invalid/mcp",
+                        }
+                    },
+                },
+            )
+            _, manager = build_runtime(config_path=path)
+        self.addCleanup(manager.shutdown)
+        self.assertEqual(manager.config.servers, ())
+        self.assertEqual(
+            manager.config_error,
+            {
+                "code": "experimental_streamable_http_mcp_required",
+                "summary": STREAMABLE_HTTP_GATE_ERROR,
+            },
+        )
+        self.assertIsNone(manager._executor)
 
     def test_unknown_duplicate_and_oversized_configuration_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -114,6 +154,47 @@ class ConfigTests(unittest.TestCase):
             oversized.chmod(0o600)
             with self.assertRaises(ConfigError):
                 load_config(oversized)
+
+    def test_trusted_project_remote_requires_the_process_owner_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            project = workspace / ".ygg" / "mcp.json"
+            project_bytes = self.write_json(
+                project,
+                {
+                    "version": 1,
+                    "servers": {
+                        "project-remote": {
+                            "transport": "streamable-http",
+                            "url": "https://mcp.example.invalid/mcp",
+                        }
+                    },
+                },
+            )
+            user = root / "user.json"
+            self.write_json(
+                user,
+                {
+                    "version": 1,
+                    "servers": {},
+                    "trustedProjects": [
+                        {
+                            "path": str(project),
+                            "sha256": hashlib.sha256(project_bytes).hexdigest(),
+                        }
+                    ],
+                },
+            )
+
+            with self.assertRaisesRegex(ConfigError, "process owner"):
+                load_config(user, workspace=workspace)
+            config = load_config(
+                user,
+                workspace=workspace,
+                experimental_streamable_http_mcp=True,
+            )
+            self.assertEqual(config.servers[0].id, "project-remote")
 
     def test_project_configuration_requires_workspace_containment_and_exact_digest(self):
         with tempfile.TemporaryDirectory() as directory:

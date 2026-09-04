@@ -225,8 +225,11 @@ ygg --enable-extension ygg-web-search --trust-extension ygg-web-search
 ```
 
 The small release catalog contains `ygg-browse`, `ygg-mcp`, `ygg-subagents`,
-and `ygg-web-search`. Use
-`ygg extension update <name>` or `ygg extension remove <name>` to manage one.
+and `ygg-web-search`. `ygg-mcp` retains normal local stdio support; its remote
+Streamable HTTP transport is blocked by default and requires the conspicuous
+one-shot process-owner flag `--experimental-streamable-http-mcp` (see its
+package README before using it). Use `ygg extension update <name>` or
+`ygg extension remove <name>` to manage one.
 Offline and third-party archives can be installed with
 `ygg extension install --path ./bundle.tar.gz`. Replace one atomically with
 `ygg extension update --path ./new-bundle.tar.gz`. Ygg runs no

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Gate Streamable HTTP MCP behind the conspicuous, one-shot
+  `ygg --experimental-streamable-http-mcp` process-owner flag. Configuration,
+  environment, project files, session/host requests, and manifest arguments
+  cannot enable it; denied activation fails before credentials, DNS, network, or
+  manager workers. Local stdio MCP is unchanged.
+- Document the nine unresolved Streamable HTTP defects and retain the transport
+  as blocked-by-default experimental code rather than presenting it as generally
+  safe.
+- Add deterministic configuration, runtime, and product-boundary coverage for
+  the gate.
 - Add an explicit, bounded Streamable HTTP transport with negotiated session
   identity, JSON/SSE response framing, no-replay SSE resumption, cancellation,
   status/content-type policy, and lifecycle reconnects.

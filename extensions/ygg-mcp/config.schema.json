@@ -88,7 +88,10 @@
       "additionalProperties": false,
       "required": ["transport", "url"],
       "properties": {
-        "transport": {"const": "streamable-http"},
+        "transport": {
+          "const": "streamable-http",
+          "description": "EXPERIMENTAL and blocked by default. Enabling this server also requires the Ygg process-owner --experimental-streamable-http-mcp CLI flag; no JSON, environment, project, or session field can substitute."
+        },
         "label": {"type": "string", "minLength": 1, "maxLength": 64},
         "url": {
           "type": "string",

@@ -10,10 +10,12 @@ Ygg <- API 0.2 JSON-RPC -> ygg-mcp <- MCP JSON-RPC stdio -> local servers
                                  \-> MCP Streamable HTTP -> explicit remote endpoint
 ```
 
-V1 supports local stdio servers plus explicit **Streamable HTTP** endpoints and
-their JSON tool catalogs. It does not support legacy MCP SSE endpoints, OAuth or
-browser authorization flows, resources, prompts, sampling, elicitation,
-automatic server installation, or ambient MCP discovery.
+V1 preserves local stdio servers. Streamable HTTP code exists only as a blocked-
+by-default **experimental** transport: it requires a conspicuous one-shot CLI
+opt-in from the Ygg process owner and is not suitable for production or sensitive
+credentials. It does not support legacy MCP SSE endpoints, OAuth or browser
+authorization flows, resources, prompts, sampling, elicitation, automatic server
+installation, or ambient MCP discovery.
 
 ## Security and authority
 
@@ -60,6 +62,33 @@ in the explicit stdio configuration. It does not inherit dotenv files or ambient
 provider/application tokens. Explicit `env` values are sensitive configuration:
 protect the file and never place secrets in labels or arguments.
 
+### Experimental Streamable HTTP gate
+
+Local stdio MCP remains available through normal reviewed configuration. Remote
+Streamable HTTP MCP is denied unless the **Ygg process owner** supplies this
+one-shot command-line switch for that process:
+
+```console
+ygg --experimental-streamable-http-mcp \
+    --enable-extension ygg-mcp --trust-extension ygg-mcp
+```
+
+This is intentionally not a configuration feature. `~/.ygg/mcp.json`,
+digest-pinned project MCP files, Ygg project/global configuration, environment
+variables, session/host requests, and extension-manifest arguments cannot grant
+it. The coding product strips a manifest-supplied copy and passes the switch to
+the bridge only after parsing the product CLI. A disabled remote template stays
+inert; enabling it without the switch fails during configuration loading, before
+credential lookup, DNS, network I/O, or MCP manager workers. Lifecycle actions
+also reject a disabled-gate remote before creating a worker.
+
+For direct development/configuration validation, the same owner switch is
+required on the bridge command:
+
+```console
+ygg-mcp --experimental-streamable-http-mcp --config ~/.ygg/mcp.json --check-config
+```
+
 A remote endpoint is a separate explicit network-trust decision. Streamable HTTP
 uses the exact configured URL, TLS certificate/hostname validation, no proxy or
 cookie discovery, and no redirects. HTTPS is required except for a numeric
@@ -77,6 +106,29 @@ it. The normal bundled runtime intentionally has no provider, so such a server
 parks with `authentication_unavailable`. OAuth discovery, browser redirects,
 token acquisition/refresh, persistent token stores, static config headers, and
 secret environment fallback are not implemented.
+
+### Known Streamable HTTP defects
+
+The gate is a containment measure, not a claim that remote transport is safe.
+Do **not** enable it for production, privileged networks, or sensitive
+credentials. The known unresolved defects are:
+
+1. HTTPS SSRF remains possible through DNS rebinding; connections are not pinned
+   to a reviewed address.
+2. Credential and session state can be shared across distinct resource owners.
+3. DNS workers can outlive cancellation and shutdown (they are not reliably
+   killable).
+4. Buffered SSE handling can confuse peer identity.
+5. Control-message fanout is unbounded.
+6. Aggregate budgets can reset across remote transport paths.
+7. Truncated framing can be accepted.
+8. An empty SSE event ID can produce an incorrect resume cursor.
+9. The startup deadline can be escaped.
+
+These defects are deliberately left visible rather than hidden behind a config
+knob. The only activation path is the process-owner opt-in above; remediation of
+the defects, not broader configuration, is required before this transport can be
+made generally available.
 
 ## Requirements and installation
 
@@ -119,6 +171,10 @@ $EDITOR ~/.ygg/mcp.json
 extensions/ygg-mcp/ygg-mcp --config ~/.ygg/mcp.json --check-config
 ```
 
+If the file enables a Streamable HTTP server, add
+`--experimental-streamable-http-mcp` to that validation command and to the Ygg
+process that will own the bridge. The JSON has no equivalent setting.
+
 `config.schema.json` is the normative JSON schema. The parser also rejects
 unknown/duplicate keys, non-UTF-8 or oversized files, symlink final files,
 linked `.ygg` roots or escaping trusted-project ancestors, files writable by
@@ -156,6 +212,10 @@ defines the server. A missing executable or invalid MCP handshake is a
 permanent failure parked until an explicit restart/config refresh.
 
 ### Streamable HTTP configuration
+
+This experimental configuration is inert without the process-owner
+`--experimental-streamable-http-mcp` flag. Adding the flag to JSON, a trusted
+project file, an environment variable, or a session does not work.
 
 A remote server must opt into `"transport": "streamable-http"` and name one
 absolute endpoint. It accepts `https`; `http` is accepted only for literal

@@ -718,6 +718,7 @@ class StreamableHttpTests(unittest.TestCase):
                 ),
                 scratch_directory=Path(directory),
                 credential_provider=provider,
+                experimental_streamable_http_mcp=True,
             )
             try:
                 manager.start()
@@ -756,6 +757,7 @@ class StreamableHttpTests(unittest.TestCase):
                     limits=limits(backoff_initial_ms=10, backoff_max_ms=20, shutdown_timeout_ms=250),
                 ),
                 scratch_directory=Path(directory),
+                experimental_streamable_http_mcp=True,
             )
             try:
                 manager.start()

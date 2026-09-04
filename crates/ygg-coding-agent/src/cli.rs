@@ -267,6 +267,10 @@ pub struct Cli {
         num_args = 1..
     )]
     pub trust_extensions: Vec<String>,
+    /// Process-owner opt-in for experimental remote Streamable HTTP MCP. This
+    /// one-shot gate is never read from configuration, environment, or sessions.
+    #[arg(long = "experimental-streamable-http-mcp")]
+    pub experimental_streamable_http_mcp: bool,
     /// Trust this workspace and load its project config, AGENTS.md, and skills.
     #[arg(long = "workspace-trusted", alias = "trust-workspace")]
     pub workspace_trusted: bool,
@@ -1588,6 +1592,7 @@ fn build_config_with_global_path(
         extension_activation_overridden,
         trusted_extensions,
         invocation_trusted_extensions,
+        experimental_streamable_http_mcp: cli.experimental_streamable_http_mcp,
         tools,
         telemetry: cli.telemetry.or(values.telemetry).map(|path| {
             if path.is_absolute() {
@@ -1650,6 +1655,7 @@ mod tests {
             extension_dirs: vec![],
             enable_extensions: vec![],
             trust_extensions: vec![],
+            experimental_streamable_http_mcp: false,
             workspace_trusted: false,
             safe_mode: false,
             effect_policy: None,
@@ -1843,6 +1849,48 @@ max_output_bytes = 4096
         cli.workspace = Some(directory.path().into());
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert!(config.sandbox.allow_remote_read);
+    }
+
+    #[test]
+    fn experimental_streamable_http_mcp_is_cli_only() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        assert!(
+            !config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .experimental_streamable_http_mcp
+        );
+
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "experimental_streamable_http_mcp = true\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "experimental_streamable_http_mcp = true\n",
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        assert!(
+            !build_config_with_global_path(cli, directory.path(), Some(&global))
+                .unwrap()
+                .experimental_streamable_http_mcp,
+            "global and trusted-project configuration cannot grant the experimental transport"
+        );
+
+        assert!(
+            Cli::try_parse_from(["ygg", "--experimental-streamable-http-m"]).is_err(),
+            "the process-owner gate must not accept an abbreviated spelling"
+        );
+        let mut cli = Cli::try_parse_from(["ygg", "--experimental-streamable-http-mcp"]).unwrap();
+        cli.workspace = Some(directory.path().into());
+        assert!(
+            config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .experimental_streamable_http_mcp
+        );
     }
 
     #[test]

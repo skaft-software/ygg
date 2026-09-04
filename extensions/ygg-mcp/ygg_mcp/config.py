@@ -30,6 +30,10 @@ _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CREDENTIAL_REFERENCE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
 _HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+STREAMABLE_HTTP_GATE_ERROR = (
+    "enabled Streamable HTTP MCP requires --experimental-streamable-http-mcp "
+    "from the process owner"
+)
 
 
 class ConfigError(ValueError):
@@ -151,13 +155,17 @@ def load_config(
     path: Optional[Union[os.PathLike[str], str]] = None,
     *,
     workspace: Optional[Union[os.PathLike[str], str]] = None,
+    experimental_streamable_http_mcp: bool = False,
 ) -> BridgeConfig:
     """Load one user file and its explicitly digest-pinned project files.
 
     A missing default user file is a valid empty configuration. An explicitly
     supplied missing file is an error. Project files are considered trusted
     only when the user file names an absolute path beneath the active
-    workspace's ``.ygg`` directory and pins its exact SHA-256 digest.
+    workspace's ``.ygg`` directory and pins its exact SHA-256 digest. Enabled
+    remote Streamable HTTP descriptors are accepted only when the trusted
+    extension process received the one-shot process-owner CLI opt-in; no
+    configuration, environment, or session field can supply that value.
     """
 
     explicit = path is not None
@@ -213,6 +221,14 @@ def load_config(
         seen_ids.update(server.id for server in project_servers)
         servers.extend(project_servers)
 
+    if (
+        any(
+            server.enabled and server.transport == "streamable-http"
+            for server in servers
+        )
+        and not experimental_streamable_http_mcp
+    ):
+        raise ConfigError(STREAMABLE_HTTP_GATE_ERROR)
     if len(servers) > limits.max_servers:
         raise ConfigError(f"configured servers exceed the {limits.max_servers}-server limit")
     if limits.max_result_bytes > limits.max_frame_bytes:
