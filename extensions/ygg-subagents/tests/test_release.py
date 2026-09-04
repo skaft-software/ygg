@@ -53,6 +53,7 @@ class ReleaseTests(unittest.TestCase):
             "ygg_subagents/orchestrator.py",
             "ygg_subagents/presentation.py",
             "vendor/ygg_extension/__init__.py",
+            "vendor/ygg_extension/api_v03.py",
             "vendor/ygg_extension/extension.py",
             "vendor/ygg_extension/protocol.py",
             "skills/ygg-subagents/SKILL.md",
@@ -65,12 +66,15 @@ class ReleaseTests(unittest.TestCase):
         )
         for relative in required:
             self.assertTrue((ROOT / relative).is_file(), relative)
-        for name in ("__init__.py", "extension.py", "protocol.py"):
-            source = REPOSITORY / "sdk" / "python" / "ygg_extension" / name
-            vendored = ROOT / "vendor" / "ygg_extension" / name
+        shared = REPOSITORY / "sdk" / "python" / "ygg_extension"
+        vendored = ROOT / "vendor" / "ygg_extension"
+        shared_files = {path.name for path in shared.glob("*.py")}
+        vendored_files = {path.name for path in vendored.glob("*.py")}
+        self.assertEqual(vendored_files, shared_files)
+        for name in sorted(shared_files):
             self.assertEqual(
-                hashlib.sha256(source.read_bytes()).hexdigest(),
-                hashlib.sha256(vendored.read_bytes()).hexdigest(),
+                hashlib.sha256((shared / name).read_bytes()).hexdigest(),
+                hashlib.sha256((vendored / name).read_bytes()).hexdigest(),
                 "vendored SDK drift: %s" % name,
             )
 

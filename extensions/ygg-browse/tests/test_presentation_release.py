@@ -241,7 +241,10 @@ class PackageTests(unittest.TestCase):
     def test_vendored_sdk_is_byte_synchronized_and_has_revision_guard(self) -> None:
         shared = REPOSITORY / "sdk" / "python" / "ygg_extension"
         vendor = PACKAGE / "vendor" / "ygg_extension"
-        for name in ("__init__.py", "extension.py", "protocol.py"):
+        shared_files = {path.name for path in shared.glob("*.py")}
+        vendor_files = {path.name for path in vendor.glob("*.py")}
+        self.assertEqual(vendor_files, shared_files)
+        for name in sorted(shared_files):
             self.assertEqual((vendor / name).read_bytes(), (shared / name).read_bytes(), name)
         self.assertIn(
             b"MAX_PRESENTATION_REVISION = (2**53) - 1",
