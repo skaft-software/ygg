@@ -944,6 +944,7 @@ fn manifest_for_plan(
         contributes: ManifestContributions {
             tools: Vec::new(),
             commands: vec![plan.name.clone()],
+            shortcuts: Vec::new(),
             hooks: vec![
                 ExtensionHook::AfterResponse,
                 ExtensionHook::BeforeToolCall,

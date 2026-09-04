@@ -151,6 +151,12 @@ const MAX_CHILD_REQUESTS: usize = 128;
 const MAX_CHILD_WORKERS: usize = 8;
 const MAX_DYNAMIC_EXTENSION_TOOLS: usize = 256;
 const MAX_EXTENSION_COMMANDS: usize = 256;
+/// Maximum static shortcut declarations accepted from one extension.
+pub const MAX_EXTENSION_SHORTCUTS: usize = 64;
+/// Maximum UTF-8 bytes in one terminal shortcut spelling.
+pub const MAX_EXTENSION_SHORTCUT_KEY_BYTES: usize = 128;
+/// Maximum UTF-8 bytes in one shortcut description.
+pub const MAX_EXTENSION_SHORTCUT_DESCRIPTION_BYTES: usize = 4 * 1024;
 const DYNAMIC_CATALOG_QUEUE_CAPACITY: usize = 32;
 const SUPERVISOR_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -1270,6 +1276,16 @@ impl ExtensionManifest {
                 "semantic presentation requires extension API 0.2".into(),
             ));
         }
+        if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.is_empty() {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "shortcuts require extension API 0.2".into(),
+            ));
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_3 && !self.contributes.shortcuts.is_empty() {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "shortcuts are not yet supported by extension API 0.3".into(),
+            ));
+        }
         if self.api_version == EXTENSION_API_VERSION_0_3
             && (!self.contributes.commands.is_empty()
                 || !self.contributes.hooks.is_empty()
@@ -1308,6 +1324,8 @@ impl ExtensionManifest {
         }
         validate_identifiers("tool", &self.contributes.tools, true)?;
         validate_identifiers("command", &self.contributes.commands, true)?;
+        validate_shortcut_definitions(&self.contributes.shortcuts)
+            .map_err(ExtensionRuntimeError::InvalidManifest)?;
         validate_identifiers("tool renderer", &self.contributes.tool_renderers, true)?;
         validate_identifiers("secret", &self.capabilities.secrets, true)?;
         validate_identifiers(
@@ -1396,6 +1414,9 @@ pub struct ManifestContributions {
     /// Slash-command names.
     #[serde(default)]
     pub commands: Vec<String>,
+    /// Global terminal shortcuts, bound only after host validation.
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutDefinition>,
     /// Agent lifecycle hooks.
     #[serde(default)]
     pub hooks: Vec<ExtensionHook>,
@@ -1906,6 +1927,18 @@ pub struct AgentSessionWaitRequest {
     pub timeout_ms: Option<u64>,
 }
 
+/// A global terminal shortcut declared in the manifest and echoed by initialize.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShortcutDefinition {
+    /// Portable terminal key spelling, for example `ctrl+shift+p`.
+    pub key: String,
+    /// Stable action identifier chosen by the extension.
+    pub name: String,
+    /// User-facing summary of the action.
+    pub description: String,
+}
+
 /// A slash-command definition supplied during initialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1926,6 +1959,8 @@ pub struct ExtensionContributions {
     pub tools: Vec<ToolDefinition>,
     /// Interactive commands and their help metadata.
     pub commands: Vec<CommandDefinition>,
+    /// Validated terminal shortcut metadata.
+    pub shortcuts: Vec<ShortcutDefinition>,
     /// Lifecycle hooks declared in the manifest.
     pub hooks: Vec<ExtensionHook>,
     /// Whether context requests are supported.
@@ -3389,6 +3424,8 @@ pub mod methods {
     pub const TOOL_CALL: &str = "tool/call";
     /// Host-to-extension slash-command invocation.
     pub const COMMAND_EXECUTE: &str = "command/execute";
+    /// Host-to-extension terminal shortcut invocation.
+    pub const SHORTCUT_EXECUTE: &str = "shortcut/execute";
     /// Host-to-extension lifecycle hook invocation.
     pub const HOOK_RUN: &str = "hook/run";
     /// Host request for prompt context.
@@ -3519,6 +3556,9 @@ pub struct InitializeResponse {
     /// manifests keep their existing exact declaration behavior.
     #[serde(default)]
     pub tool_renderers: Vec<String>,
+    /// Complete metadata for manifest-declared shortcuts.
+    #[serde(default)]
+    pub shortcuts: Vec<ShortcutDefinition>,
     /// Negotiated API `0.2` features and limits. API `0.1` must omit it.
     #[serde(default)]
     pub protocol: Option<ExtensionProtocolResponse>,
@@ -3546,6 +3586,15 @@ pub struct CommandRequest {
     pub name: String,
     /// Tokenized user arguments.
     pub arguments: Vec<String>,
+    /// Current execution metadata.
+    pub context: ExtensionExecutionContext,
+}
+
+/// Host-to-extension terminal shortcut call.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShortcutRequest {
+    /// Manifest-declared shortcut action name.
+    pub name: String,
     /// Current execution metadata.
     pub context: ExtensionExecutionContext,
 }
@@ -4272,6 +4321,85 @@ impl ExtensionProcess {
             ExtensionRuntimeError::Protocol(format!(
                 "invalid `{}` response from `{}`: {error}",
                 methods::COMMAND_EXECUTE,
+                self.inner.descriptor.manifest.name
+            ))
+        })
+    }
+
+    /// Invokes a manifest-declared terminal shortcut action.
+    pub async fn execute_shortcut(
+        &self,
+        name: impl Into<String>,
+        context: ExtensionExecutionContext,
+    ) -> Result<CommandOutput, ExtensionRuntimeError> {
+        self.execute_shortcut_inner(name.into(), context, None)
+            .await
+    }
+
+    /// Invokes a manifest-declared terminal shortcut action and reports the
+    /// exact generation-scoped operation identity once the request is admitted.
+    pub async fn execute_shortcut_controlled(
+        &self,
+        name: impl Into<String>,
+        context: ExtensionExecutionContext,
+        request_started: oneshot::Sender<ExtensionOperationToken>,
+    ) -> Result<CommandOutput, ExtensionRuntimeError> {
+        self.execute_shortcut_inner(name.into(), context, Some(request_started))
+            .await
+    }
+
+    async fn execute_shortcut_inner(
+        &self,
+        name: String,
+        mut context: ExtensionExecutionContext,
+        request_started: Option<oneshot::Sender<ExtensionOperationToken>>,
+    ) -> Result<CommandOutput, ExtensionRuntimeError> {
+        if !self
+            .inner
+            .contributions
+            .shortcuts
+            .iter()
+            .any(|shortcut| shortcut.name == name)
+        {
+            return Err(self.undeclared("shortcut", name));
+        }
+        let connection = read_std_lock(&self.inner.connection).clone();
+        connection.require_api_v03_host_method(methods::SHORTCUT_EXECUTE)?;
+        context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
+            session_id: owner.session_id,
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: connection.generation,
+        });
+        let resource_owner = context.resource_owner.clone();
+        let params = serde_json::to_value(ShortcutRequest { name, context })
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let result = match request_started {
+            Some(request_started) => {
+                connection
+                    .request_with_operation(
+                        methods::SHORTCUT_EXECUTE,
+                        params,
+                        self.inner.config.request_timeout,
+                        resource_owner,
+                        request_started,
+                    )
+                    .await?
+            }
+            None => {
+                connection
+                    .request_with_resource_owner(
+                        methods::SHORTCUT_EXECUTE,
+                        params,
+                        self.inner.config.request_timeout,
+                        resource_owner,
+                    )
+                    .await?
+            }
+        };
+        serde_json::from_value(result).map_err(|error| {
+            ExtensionRuntimeError::Protocol(format!(
+                "invalid `{}` response from `{}`: {error}",
+                methods::SHORTCUT_EXECUTE,
                 self.inner.descriptor.manifest.name
             ))
         })
@@ -7934,6 +8062,7 @@ fn negotiate_api_v03_contributions(
         || manifest.contributes.notifications
         || manifest.contributes.confirmations
         || manifest.contributes.presentation
+        || !manifest.contributes.shortcuts.is_empty()
     {
         return Err(ExtensionRuntimeError::Protocol(
             "API 0.3 received deferred manifest contributions after validation".into(),
@@ -8133,6 +8262,13 @@ fn negotiate_contributions_with_host_services(
     }
     validate_tool_definitions(&response.tools, &manifest.api_version)?;
 
+    if response.shortcuts != manifest.contributes.shortcuts {
+        return Err(ExtensionRuntimeError::Protocol(
+            "initialized shortcuts do not match manifest declarations".into(),
+        ));
+    }
+    validate_shortcut_definitions(&response.shortcuts).map_err(ExtensionRuntimeError::Protocol)?;
+
     let command_names = response
         .commands
         .iter()
@@ -8196,6 +8332,7 @@ fn negotiate_contributions_with_host_services(
         ExtensionContributions {
             tools: response.tools,
             commands: response.commands,
+            shortcuts: response.shortcuts,
             hooks: manifest.contributes.hooks.clone(),
             context: manifest.contributes.context,
             ui: manifest.contributes.ui.clone(),
@@ -8286,6 +8423,7 @@ fn contributions_compatible(
 ) -> bool {
     (dynamic_tools || established.tools == replacement.tools)
         && established.commands == replacement.commands
+        && established.shortcuts == replacement.shortcuts
         && established.hooks == replacement.hooks
         && established.context == replacement.context
         && established.ui == replacement.ui
@@ -11314,6 +11452,43 @@ fn extension_process_group_id(_child: &Child) -> u64 {
 #[cfg(not(unix))]
 fn kill_process_group(_process_group_id: u64) {}
 
+fn validate_shortcut_definitions(definitions: &[ShortcutDefinition]) -> Result<(), String> {
+    if definitions.len() > MAX_EXTENSION_SHORTCUTS {
+        return Err(format!(
+            "shortcut catalog contains {} entries; limit is {MAX_EXTENSION_SHORTCUTS}",
+            definitions.len()
+        ));
+    }
+    let mut names = BTreeSet::new();
+    let mut keys = BTreeSet::new();
+    for shortcut in definitions {
+        validate_identifier("shortcut", &shortcut.name, true).map_err(|error| error.to_string())?;
+        if shortcut.key.is_empty()
+            || shortcut.key.len() > MAX_EXTENSION_SHORTCUT_KEY_BYTES
+            || shortcut.key.trim() != shortcut.key
+            || shortcut.key.chars().any(char::is_control)
+        {
+            return Err(format!("invalid shortcut key `{}`", shortcut.key));
+        }
+        if shortcut.description.trim().is_empty()
+            || shortcut.description.len() > MAX_EXTENSION_SHORTCUT_DESCRIPTION_BYTES
+            || shortcut.description.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "shortcut `{}` has an invalid description",
+                shortcut.name
+            ));
+        }
+        if !names.insert(shortcut.name.as_str()) {
+            return Err(format!("duplicate shortcut definition `{}`", shortcut.name));
+        }
+        if !keys.insert(shortcut.key.to_ascii_lowercase()) {
+            return Err(format!("duplicate shortcut key `{}`", shortcut.key));
+        }
+    }
+    Ok(())
+}
+
 fn validate_identifiers(
     kind: &str,
     values: &[String],
@@ -12725,6 +12900,7 @@ confirmations = true
                 usage: None,
             }],
             tool_renderers: Vec::new(),
+            shortcuts: Vec::new(),
             protocol: None,
         };
         assert!(matches!(
@@ -12736,6 +12912,84 @@ confirmations = true
             ),
             Err(ExtensionRuntimeError::Protocol(message)) if message.contains("do not match")
         ));
+    }
+
+    #[test]
+    fn shortcut_contributions_must_match_initialize_and_respect_bounds() {
+        let manifest_source = r#"name = "shortcut-test"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "shortcut-test"
+[contributes]
+shortcuts = [{ key = "ctrl+shift+p", name = "open_panel", description = "Open the panel" }]
+"#;
+        let manifest = ExtensionManifest::parse(manifest_source).unwrap();
+        for (version, expected_error) in [
+            ("0.1", "shortcuts require extension API 0.2"),
+            ("0.3", "shortcuts are not yet supported"),
+        ] {
+            let unsupported = manifest_source.replace(
+                "api_version = \"0.2\"",
+                &format!("api_version = \"{version}\""),
+            );
+            assert!(matches!(
+                ExtensionManifest::parse(&unsupported),
+                Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains(expected_error)
+            ));
+        }
+        let response = |shortcuts: Vec<ShortcutDefinition>| InitializeResponse {
+            api_version: EXTENSION_API_VERSION_0_2.into(),
+            tools: Vec::new(),
+            commands: Vec::new(),
+            shortcuts,
+            protocol: Some(ExtensionProtocolResponse {
+                version: EXTENSION_API_VERSION_0_2.into(),
+                features: API_0_2_REQUIRED_FEATURES
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+                limits: ExtensionProtocolLimits {
+                    max_concurrent_requests: 1,
+                },
+                lifecycle_events: Vec::new(),
+            }),
+        };
+        let declared = manifest.contributes.shortcuts.clone();
+        let (contributions, _) = negotiate_contributions_with_host_services(
+            &manifest,
+            response(declared.clone()),
+            DEFAULT_PENDING_REQUESTS,
+            OfferedHostServices::default(),
+        )
+        .unwrap();
+        assert_eq!(contributions.shortcuts, declared);
+
+        let mismatch = vec![ShortcutDefinition {
+            key: "ctrl+shift+o".into(),
+            name: "open_panel".into(),
+            description: "Open the panel".into(),
+        }];
+        assert!(matches!(
+            negotiate_contributions_with_host_services(
+                &manifest,
+                response(mismatch),
+                DEFAULT_PENDING_REQUESTS,
+                OfferedHostServices::default(),
+            ),
+            Err(ExtensionRuntimeError::Protocol(message)) if message.contains("shortcuts do not match")
+        ));
+
+        let oversized = (0..=MAX_EXTENSION_SHORTCUTS)
+            .map(|index| ShortcutDefinition {
+                key: format!("ctrl+alt+{index}"),
+                name: format!("shortcut-{index}"),
+                description: "bounded shortcut".into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_shortcut_definitions(&oversized)
+            .unwrap_err()
+            .contains("limit is"));
     }
 
     #[cfg(unix)]
@@ -13254,6 +13508,7 @@ command = "runtime-command-validation"
             tools: Vec::new(),
             commands,
             tool_renderers: Vec::new(),
+            shortcuts: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -13314,6 +13569,7 @@ command = "agent-service"
             tools: Vec::new(),
             commands: Vec::new(),
             tool_renderers: Vec::new(),
+            shortcuts: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -13366,6 +13622,7 @@ command = "ygg-subagents"
             tools: Vec::new(),
             commands: Vec::new(),
             tool_renderers: Vec::new(),
+            shortcuts: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -13464,6 +13721,7 @@ secrets = ["browser.api_token"]
             tools: Vec::new(),
             commands: Vec::new(),
             tool_renderers: Vec::new(),
+            shortcuts: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -14661,6 +14919,99 @@ command = "runtime-commands.py"
             .await
             .unwrap();
         assert_eq!(output.text, "hello Ygg");
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn declared_shortcuts_execute_after_initialization() {
+        let temp = TempDir::new().unwrap();
+        let script_path = temp.path().join("shortcuts.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(90)
+    return json.loads(line)
+
+
+def send(value):
+    print(json.dumps(value, separators=(",", ":")), flush=True)
+
+
+initialize = receive()
+assert initialize["params"]["contributes"]["shortcuts"] == [{
+    "key": "ctrl+shift+p",
+    "name": "toggle-panel",
+    "description": "Toggle the extension panel",
+}], initialize
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "api_version": "0.2",
+        "tools": [],
+        "commands": [],
+        "shortcuts": [{
+            "key": "ctrl+shift+p",
+            "name": "toggle-panel",
+            "description": "Toggle the extension panel",
+        }],
+        "protocol": {
+            "version": "0.2",
+            "features": ["request_cancellation", "content_parts"],
+            "limits": {"max_concurrent_requests": 1},
+        },
+    },
+})
+
+shortcut = receive()
+assert shortcut["method"] == "shortcut/execute", shortcut
+assert shortcut["params"]["name"] == "toggle-panel", shortcut
+send({
+    "jsonrpc": "2.0",
+    "id": shortcut["id"],
+    "result": {
+        "text": "shortcut executed",
+        "notifications": [],
+        "context": [],
+    },
+})
+
+shutdown = receive()
+assert shutdown["method"] == "shutdown", shutdown
+send({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "shortcut-extension"
+version = "0.2.0"
+api_version = "0.2"
+[entrypoint]
+command = "shortcuts.py"
+[contributes]
+shortcuts = [{ key = "ctrl+shift+p", name = "toggle-panel", description = "Toggle the extension panel" }]
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+
+        let output = process
+            .execute_shortcut("toggle-panel", process.current_context())
+            .await
+            .unwrap();
+        assert_eq!(output.text, "shortcut executed");
         assert!(process.shutdown().await);
     }
 

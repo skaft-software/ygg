@@ -104,6 +104,130 @@ pub(crate) fn is_close_key(key: &KeyEvent) -> bool {
         && key.modifiers == KeyModifiers::CONTROL
 }
 
+/// A normalized, portable terminal binding used by extension manifests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionShortcutKey {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+/// Parse the restricted portable shortcut syntax accepted in extension manifests.
+/// Unmodified and shift-only keys are deliberately rejected so an extension can
+/// never consume ordinary editor input.
+pub(crate) fn parse_extension_shortcut(value: &str) -> Result<ExtensionShortcutKey, String> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key = None;
+    for part in value.split('+') {
+        let part = part.trim().to_ascii_lowercase();
+        if part.is_empty() {
+            return Err("shortcut contains an empty component".into());
+        }
+        let modifier = match part.as_str() {
+            "ctrl" | "control" => Some(KeyModifiers::CONTROL),
+            "alt" => Some(KeyModifiers::ALT),
+            "shift" => Some(KeyModifiers::SHIFT),
+            "super" | "cmd" | "command" => Some(KeyModifiers::SUPER),
+            _ => None,
+        };
+        if let Some(modifier) = modifier {
+            if modifiers.contains(modifier) {
+                return Err(format!("shortcut repeats modifier `{part}`"));
+            }
+            modifiers.insert(modifier);
+            continue;
+        }
+        if key.is_some() {
+            return Err("shortcut must have exactly one key".into());
+        }
+        key = Some(match part.as_str() {
+            "enter" | "return" => KeyCode::Enter,
+            "esc" | "escape" => KeyCode::Esc,
+            "tab" => KeyCode::Tab,
+            "backtab" => KeyCode::BackTab,
+            "backspace" => KeyCode::Backspace,
+            "delete" | "del" => KeyCode::Delete,
+            "insert" | "ins" => KeyCode::Insert,
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            "home" => KeyCode::Home,
+            "end" => KeyCode::End,
+            "pageup" | "page_up" => KeyCode::PageUp,
+            "pagedown" | "page_down" => KeyCode::PageDown,
+            name if name.strip_prefix('f').is_some_and(|number| {
+                number
+                    .parse::<u8>()
+                    .is_ok_and(|number| (1..=12).contains(&number))
+            }) =>
+            {
+                KeyCode::F(
+                    name.strip_prefix('f')
+                        .expect("validated function key prefix")
+                        .parse()
+                        .expect("validated function key"),
+                )
+            }
+            name if name.chars().count() == 1 => KeyCode::Char(
+                name.chars()
+                    .next()
+                    .expect("one-character shortcut key is present"),
+            ),
+            _ => return Err(format!("unsupported shortcut key `{part}`")),
+        });
+    }
+    let Some(code) = key else {
+        return Err("shortcut has no key".into());
+    };
+    if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
+        return Err("shortcut must include ctrl, alt, or super".into());
+    }
+    if matches!(code, KeyCode::Char(_))
+        && modifiers.contains(KeyModifiers::ALT)
+        && !modifiers.contains(KeyModifiers::SUPER)
+    {
+        return Err(
+            "shortcut character may be text produced by Option or AltGr; use ctrl or super instead"
+                .into(),
+        );
+    }
+    Ok(ExtensionShortcutKey { code, modifiers })
+}
+
+/// Convert a one-shot, non-text terminal event to a normalized extension shortcut key.
+pub(crate) fn extension_shortcut_key(event: &Event) -> Option<ExtensionShortcutKey> {
+    let Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind != KeyEventKind::Press || key_text(key).is_some() {
+        return None;
+    }
+    let code = match key.code {
+        KeyCode::Char(character) => KeyCode::Char(character.to_ascii_lowercase()),
+        code => code,
+    };
+    Some(ExtensionShortcutKey {
+        code,
+        modifiers: key.modifiers,
+    })
+}
+
+/// Bindings the host must retain for terminal safety and core interaction.
+pub(crate) fn is_reserved_extension_shortcut(key: &ExtensionShortcutKey) -> bool {
+    match (&key.code, key.modifiers) {
+        (KeyCode::Char('c' | 'd' | 'o' | 's'), KeyModifiers::CONTROL)
+        | (KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab, _) => true,
+        (KeyCode::Char('a' | 'c'), modifiers)
+            if modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+        {
+            true
+        }
+        (KeyCode::PageUp | KeyCode::PageDown, modifiers) if modifiers.is_empty() => true,
+        (KeyCode::End, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => true,
+        _ => false,
+    }
+}
+
 /// Translate one crossterm event according to the product keymap.
 #[cfg(test)]
 pub fn translate(event: Option<Event>, active: bool, editor_text: &str) -> InputAction {
@@ -391,6 +515,42 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn extension_shortcuts_normalize_events_and_preserve_host_bindings() {
+        let parsed = parse_extension_shortcut("ctrl+shift+p").unwrap();
+        assert_eq!(
+            extension_shortcut_key(&key(
+                KeyCode::Char('P'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            Some(parsed)
+        );
+        assert!(is_reserved_extension_shortcut(
+            &parse_extension_shortcut("ctrl+d").unwrap()
+        ));
+        assert!(is_reserved_extension_shortcut(
+            &parse_extension_shortcut("ctrl+shift+end").unwrap()
+        ));
+        assert_eq!(
+            extension_shortcut_key(&key(KeyCode::F(12), KeyModifiers::ALT)),
+            Some(parse_extension_shortcut("alt+f12").unwrap())
+        );
+        assert_eq!(
+            extension_shortcut_key(&key(KeyCode::Char('é'), KeyModifiers::ALT)),
+            None
+        );
+        assert_eq!(
+            extension_shortcut_key(&key(
+                KeyCode::Char('€'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )),
+            None
+        );
+        assert!(parse_extension_shortcut("shift+p").is_err());
+        assert!(parse_extension_shortcut("alt+p").is_err());
+        assert!(parse_extension_shortcut("ctrl+ctrl+p").is_err());
     }
 
     #[test]

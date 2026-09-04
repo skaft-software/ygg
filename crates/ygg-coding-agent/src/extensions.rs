@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
+use crossterm::event::Event;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -33,10 +34,10 @@ use ygg_agent::extension_process::{
     ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
     ExtensionRuntimeConfig, ExtensionSource, ExtensionTerminalInput, ExtensionTerminalResize,
     ExtensionTrust, ExtensionUiContribution, ExtensionUiSurface, ExtensionWidgetPlacement,
-    ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
-    EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_DELEGATION_TELEMETRY,
-    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES,
-    MAX_EXTENSION_UI_LINES,
+    ShortcutDefinition, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
+    EXTENSION_API_VERSION_0_1, EXTENSION_FEATURE_AGENT_SESSIONS,
+    EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES, MAX_EXTENSION_UI_LINES,
 };
 use ygg_agent::{
     Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
@@ -48,6 +49,10 @@ use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
 };
 use crate::session_store::SessionStore;
+use crate::tui::keymap::{
+    extension_shortcut_key, is_reserved_extension_shortcut, parse_extension_shortcut,
+    ExtensionShortcutKey,
+};
 use crate::tui::view::{
     InteractiveShell, ShellAutocompleteItem, ShellEditorSnapshot, ShellExtensionUi,
     ShellExtensionUiLine, ShellExtensionWorking,
@@ -91,6 +96,7 @@ const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const BACKGROUND_UPDATE_CAPACITY: usize = 64;
+const SHORTCUT_TASK_CONCURRENCY: usize = 8;
 const EVENT_DRAIN_BUDGET: usize = 64;
 const EVENT_DRAIN_PER_RECEIVER_BUDGET: usize = 8;
 const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
@@ -637,9 +643,226 @@ fn reduce_presentation_update(
     Ok(compact)
 }
 
+/// A host-validated terminal shortcut target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionShortcutInvocation {
+    pub(crate) extension: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredExtensionShortcut {
+    key: ExtensionShortcutKey,
+    invocation: ExtensionShortcutInvocation,
+}
+
+fn register_extension_shortcut(
+    registered: &mut Vec<RegisteredExtensionShortcut>,
+    diagnostics: &mut Vec<String>,
+    extension: &str,
+    shortcut: &ShortcutDefinition,
+) {
+    let key = match parse_extension_shortcut(&shortcut.key) {
+        Ok(key) => key,
+        Err(error) => {
+            diagnostics.push(format!(
+                "warning: extension {extension:?} shortcut {:?} was not registered: {error}",
+                shortcut.key
+            ));
+            return;
+        }
+    };
+    if is_reserved_extension_shortcut(&key) {
+        diagnostics.push(format!(
+            "warning: extension {extension:?} shortcut {:?} was not registered: binding is reserved by Ygg",
+            shortcut.key
+        ));
+        return;
+    }
+    if let Some(existing) = registered
+        .iter()
+        .find(|existing: &&RegisteredExtensionShortcut| existing.key == key)
+    {
+        diagnostics.push(format!(
+            "warning: extension {extension:?} shortcut {:?} conflicts with {}:{}; the first binding remains active",
+            shortcut.key, existing.invocation.extension, existing.invocation.name
+        ));
+        return;
+    }
+    registered.push(RegisteredExtensionShortcut {
+        key,
+        invocation: ExtensionShortcutInvocation {
+            extension: extension.to_owned(),
+            name: shortcut.name.clone(),
+            description: shortcut.description.clone(),
+        },
+    });
+}
+
+fn register_extension_shortcuts(
+    processes: &[ExtensionProcess],
+) -> (Vec<RegisteredExtensionShortcut>, Vec<String>) {
+    let mut registered = Vec::new();
+    let mut diagnostics = Vec::new();
+    for process in processes {
+        let extension = &process.descriptor().manifest.name;
+        for shortcut in &process.contributions().shortcuts {
+            register_extension_shortcut(&mut registered, &mut diagnostics, extension, shortcut);
+        }
+    }
+    (registered, diagnostics)
+}
+
+async fn execute_shortcut_headless(
+    process: ExtensionProcess,
+    name: String,
+    execution_context: ygg_agent::extension_process::ExtensionExecutionContext,
+) -> (String, Vec<ContextContribution>, Vec<String>) {
+    let extension = process.descriptor().manifest.name.clone();
+    let mut events = process.subscribe();
+    let (request_started, started) = tokio::sync::oneshot::channel();
+    let mut started = Box::pin(started);
+    let mut operation = None;
+    let mut execution = Box::pin(process.execute_shortcut_controlled(
+        name.clone(),
+        execution_context,
+        request_started,
+    ));
+    let mut events_open = true;
+    let mut confirmation_denied = false;
+    let mut confirmation_state_uncertain = false;
+    let output = loop {
+        tokio::select! {
+            result = &mut execution => break result,
+            started = &mut started, if operation.is_none() => match started {
+                Ok(started) => operation = Some(started),
+                Err(_) => break execution.await,
+            },
+            event = events.recv(), if events_open && operation.is_some() => match event {
+                Ok(ExtensionEvent::ConfirmationRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if parent_request_id.is_some_and(|parent| {
+                    operation.is_some_and(|operation| operation.owns(generation, parent))
+                }) => {
+                    // The persistent event drain may have denied this first;
+                    // either way, a background shortcut never owns an approval UI.
+                    confirmation_denied = true;
+                    if !process.confirmation_answered(&request_id, generation) {
+                        let _ = process.respond_to_confirmation(
+                            request_id,
+                            generation,
+                            ConfirmationResponse { confirmed: false },
+                        ).await;
+                    }
+                }
+                Ok(ExtensionEvent::InputRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if operation.is_some_and(|operation| operation.owns(generation, parent_request_id)) => {
+                    if !process.input_answered(&request_id, generation) {
+                        let _ = process.respond_to_input(
+                            request_id,
+                            generation,
+                            ExtensionInputResponse { value: None },
+                        ).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    confirmation_state_uncertain = true;
+                }
+                Err(broadcast::error::RecvError::Closed) => events_open = false,
+            },
+        }
+    };
+    if operation.is_none() {
+        if let Ok(started) = started.as_mut().get_mut().try_recv() {
+            operation = Some(started);
+        }
+    }
+    if let Some(operation) = operation {
+        loop {
+            match events.try_recv() {
+                Ok(ExtensionEvent::ConfirmationRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if parent_request_id
+                    .is_some_and(|parent| operation.owns(generation, parent)) =>
+                {
+                    // A response may already have been sent by the persistent
+                    // drain. It was necessarily a denial for this background
+                    // operation, so never admit its output or context.
+                    confirmation_denied = true;
+                    if !process.confirmation_answered(&request_id, generation) {
+                        let _ = process
+                            .respond_to_confirmation(
+                                request_id,
+                                generation,
+                                ConfirmationResponse { confirmed: false },
+                            )
+                            .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    confirmation_state_uncertain = true;
+                }
+            }
+        }
+    } else if output.is_ok() {
+        // A successful admitted request always reports its operation token. If
+        // it did not, do not accept output that cannot be scoped safely.
+        confirmation_state_uncertain = true;
+    }
+    match output {
+        Ok(_) if confirmation_denied => {
+            let message = format!(
+                "extension shortcut {extension:?}/{name:?} requires an interactive confirmation and was denied"
+            );
+            (extension, Vec::new(), vec![message])
+        }
+        Ok(_) if confirmation_state_uncertain => (
+            extension,
+            Vec::new(),
+            vec![format!(
+                "extension shortcut {name:?} output was discarded because its confirmation state could not be verified"
+            )],
+        ),
+        Ok(output) => {
+            let mut messages = Vec::new();
+            if !output.text.trim().is_empty() {
+                messages.push(output.text);
+            }
+            messages.extend(
+                output
+                    .notifications
+                    .iter()
+                    .map(|notification| format_notification(&name, notification)),
+            );
+            (extension, output.context, messages)
+        }
+        Err(error) => (
+            extension,
+            Vec::new(),
+            vec![format!("extension shortcut {name:?} failed: {error}")],
+        ),
+    }
+}
+
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
+    shortcuts: Vec<RegisteredExtensionShortcut>,
     summaries: Vec<ExtensionSummary>,
     diagnostics: BoundedDiagnostics,
     pending_context: PendingContext,
@@ -652,6 +875,7 @@ pub struct ExecutableExtensions {
     renderer_tasks: Vec<JoinHandle<()>>,
     autocomplete_tasks: Vec<JoinHandle<()>>,
     pending_editor_requests: VecDeque<PendingEditorRequest>,
+    shortcut_tasks: Vec<JoinHandle<()>>,
     event_drain_cursor: usize,
     confirmation_denials: VecDeque<PendingConfirmationDenial>,
     confirmation_tasks: Vec<JoinHandle<()>>,
@@ -890,6 +1114,7 @@ impl Default for ExecutableExtensions {
         Self {
             processes: Vec::new(),
             receivers: Vec::new(),
+            shortcuts: Vec::new(),
             summaries: Vec::new(),
             diagnostics: BoundedDiagnostics::default(),
             pending_context: PendingContext::default(),
@@ -902,6 +1127,7 @@ impl Default for ExecutableExtensions {
             renderer_tasks: Vec::new(),
             autocomplete_tasks: Vec::new(),
             pending_editor_requests: VecDeque::new(),
+            shortcut_tasks: Vec::new(),
             event_drain_cursor: 0,
             confirmation_denials: VecDeque::new(),
             confirmation_tasks: Vec::new(),
@@ -928,6 +1154,8 @@ pub struct ExtensionToolRenderUpdate {
 pub struct ExtensionBackgroundUpdates {
     pub rendered_tools: Vec<ExtensionToolRenderUpdate>,
     pub(crate) autocomplete: Vec<ExtensionAutocompleteUpdate>,
+    /// Completed shortcut output, ready for the interactive transcript.
+    pub shortcut_messages: Vec<String>,
 }
 
 enum ExtensionBackgroundUpdate {
@@ -938,6 +1166,11 @@ enum ExtensionBackgroundUpdate {
     Autocomplete {
         update: Option<ExtensionAutocompleteUpdate>,
         diagnostic: Option<String>,
+    },
+    Shortcut {
+        extension: String,
+        context: Vec<ContextContribution>,
+        messages: Vec<String>,
     },
 }
 
@@ -1133,6 +1366,9 @@ impl ExecutableExtensions {
             }
         }
 
+        let (shortcuts, shortcut_diagnostics) = register_extension_shortcuts(&processes);
+        diagnostics.extend(shortcut_diagnostics);
+
         let summaries = descriptors
             .into_iter()
             .map(|descriptor| {
@@ -1200,6 +1436,7 @@ impl ExecutableExtensions {
         let mut extensions = Self::default();
         extensions.processes = processes;
         extensions.receivers = receivers;
+        extensions.shortcuts = shortcuts;
         extensions.summaries = summaries;
         extensions.diagnostics.extend(diagnostics);
         extensions.session_id = host_state.session_id.clone();
@@ -1233,6 +1470,74 @@ impl ExecutableExtensions {
                 .negotiated_features()
                 .contains(EXTENSION_FEATURE_DYNAMIC_TOOLS)
         })
+    }
+
+    /// Resolve a host-validated extension shortcut from one terminal event.
+    fn shortcut_for_event(&self, event: &Event) -> Option<ExtensionShortcutInvocation> {
+        let key = extension_shortcut_key(event)?;
+        self.shortcuts
+            .iter()
+            .find(|shortcut| shortcut.key == key)
+            .map(|shortcut| shortcut.invocation.clone())
+    }
+
+    /// Schedule a shortcut without blocking terminal input. Child confirmation
+    /// and input requests are denied because a background invocation cannot
+    /// safely take ownership of the frontend confirmation surface.
+    pub(crate) fn dispatch_shortcut_for_event(
+        &mut self,
+        event: &Event,
+    ) -> Option<ExtensionShortcutInvocation> {
+        let invocation = self.shortcut_for_event(event)?;
+        let Some(process) = self
+            .processes
+            .iter()
+            .find(|process| {
+                process.descriptor().manifest.name == invocation.extension
+                    && process
+                        .contributions()
+                        .shortcuts
+                        .iter()
+                        .any(|shortcut| shortcut.name == invocation.name)
+            })
+            .cloned()
+        else {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} is no longer available",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        };
+        if Handle::try_current().is_err() {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} could not start outside the Ygg Tokio runtime",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        }
+        self.shortcut_tasks.retain(|task| !task.is_finished());
+        if self.shortcut_tasks.len() >= SHORTCUT_TASK_CONCURRENCY {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} was not started: {SHORTCUT_TASK_CONCURRENCY} invocations are already running",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        }
+        let sender = self.background_tx.clone();
+        let context = extension_execution_context(&process, self.resource_owner.as_deref());
+        let started = invocation.clone();
+        self.shortcut_tasks.push(tokio::spawn(async move {
+            let (extension, context, messages) =
+                execute_shortcut_headless(process, invocation.name, context).await;
+            let _ = sender
+                .send(ExtensionBackgroundUpdate::Shortcut {
+                    extension,
+                    context,
+                    messages,
+                })
+                .await;
+        }));
+        Some(started)
     }
 
     fn start_policy_supervisors(&mut self) {
@@ -2422,6 +2727,14 @@ impl ExecutableExtensions {
                     self.diagnostics.extend(diagnostic);
                     updates.autocomplete.extend(update);
                 }
+                ExtensionBackgroundUpdate::Shortcut {
+                    extension,
+                    context,
+                    messages,
+                } => {
+                    self.enqueue_contexts(&extension, context);
+                    updates.shortcut_messages.extend(messages);
+                }
             }
         }
         updates
@@ -2432,6 +2745,9 @@ impl ExecutableExtensions {
             task.abort();
         }
         for task in self.autocomplete_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.shortcut_tasks.drain(..) {
             task.abort();
         }
         for task in self.confirmation_tasks.drain(..) {
@@ -2518,6 +2834,9 @@ impl ExecutableExtensions {
             }
         }
         self.start_policy_supervisors();
+        let (shortcuts, diagnostics) = register_extension_shortcuts(&self.processes);
+        self.shortcuts = shortcuts;
+        messages.extend(diagnostics);
         messages.extend(self.drain_events());
         messages
     }
@@ -3575,6 +3894,141 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn shortcut(key: &str, name: &str) -> ShortcutDefinition {
+        ShortcutDefinition {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            description: format!("{name} action"),
+        }
+    }
+
+    #[test]
+    fn shortcut_registration_keeps_host_bindings_and_first_owner() {
+        let mut registered = Vec::new();
+        let mut diagnostics = Vec::new();
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-one",
+            &shortcut("ctrl+shift+p", "first"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-two",
+            &shortcut("control+shift+p", "second"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-three",
+            &shortcut("ctrl+d", "close"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-four",
+            &shortcut("shift+p", "editor"),
+        );
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].invocation.extension, "trusted-one");
+        assert_eq!(registered[0].invocation.name, "first");
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("conflicts")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("reserved")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("must include ctrl, alt, or super")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shortcut_dispatch_runs_registered_action_in_background() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("shortcut-fixture.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.2","tools":[],"commands":[],"shortcuts":[{"key":"ctrl+shift+p","name":"open_panel","description":"Open the panel"}],"protocol":{"version":"0.2","features":["request_cancellation","content_parts"],"limits":{"max_concurrent_requests":1}}}}'
+IFS= read -r shortcut
+case "$shortcut" in
+  *'"method":"shortcut/execute"'*'"name":"open_panel"'*) ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"text":"shortcut output","notifications":[],"context":[]}}'
+IFS= read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let manifest = ExtensionManifest::parse(
+            r#"name = "shortcut-fixture"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "shortcut-fixture.sh"
+[contributes]
+shortcuts = [{ key = "ctrl+shift+p", name = "open_panel", description = "Open the panel" }]
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process);
+        let (shortcuts, diagnostics) = register_extension_shortcuts(&extensions.processes);
+        assert!(diagnostics.is_empty());
+        extensions.shortcuts = shortcuts;
+
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('P'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let invocation = extensions
+            .dispatch_shortcut_for_event(&event)
+            .expect("registered shortcut is dispatched");
+        assert_eq!(invocation.extension, "shortcut-fixture");
+        assert_eq!(invocation.name, "open_panel");
+
+        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let updates = extensions.drain_background_updates();
+                if !updates.shortcut_messages.is_empty() {
+                    return updates.shortcut_messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shortcut result was not delivered");
+        assert_eq!(messages, vec!["shortcut output"]);
+        extensions.shutdown().await;
+    }
 
     #[test]
     fn first_party_status_marks_missing_delegation_telemetry_incompatible() {

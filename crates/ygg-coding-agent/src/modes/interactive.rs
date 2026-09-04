@@ -292,6 +292,14 @@ where
                         },
                     }
                 }
+                if let Some(shortcut) = executable_extensions.dispatch_shortcut_for_event(&event) {
+                    shell.notice(format!(
+                        "running extension shortcut {}: {}",
+                        shortcut.extension, shortcut.description
+                    ));
+                    shell.render();
+                    continue;
+                }
                 let pending = if shell.pending_is_empty() {
                     String::new()
                 } else {
@@ -1236,6 +1244,14 @@ where
                         },
                     }
                 }
+                if let Some(shortcut) = executable_extensions.dispatch_shortcut_for_event(&event) {
+                    shell.notice(format!(
+                        "running extension shortcut {}: {}",
+                        shortcut.extension, shortcut.description
+                    ));
+                    shell.render();
+                    continue;
+                }
                 let pending = if shell.pending_is_empty() {
                     String::new()
                 } else {
@@ -1693,6 +1709,10 @@ fn apply_extension_background(
         if shell.set_extension_autocomplete(&update.snapshot, update.prefix, update.items) {
             changed = true;
         }
+    }
+    for message in updates.shortcut_messages {
+        shell.notice(message);
+        changed = true;
     }
     for message in executable_extensions.drain_events_for_shell(shell) {
         shell.notice(message);
