@@ -44,7 +44,9 @@ use ygg_agent::extension_runtime::{
     ExtensionRuntimeManager, ExtensionSessionBinding,
 };
 use ygg_agent::{
-    Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
+    Agent, CancellationToken, ExtensionHost, ExtensionPolicyDecision,
+    ExtensionPresentationSnapshot, PostMutationContext, PostMutationKind, PostMutationRescan,
+    PostMutationState, Session, ToolProgress, ToolProgressSink,
 };
 use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
 
@@ -98,6 +100,11 @@ const PROMPT_RPC_DEADLINE: Duration = Duration::from_secs(5);
 const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
+/// Total per-extension deadline for the typed post-mutation hook. A timeout
+/// drops only that extension's rescan request after the host mutation settled.
+const POST_MUTATION_RPC_DEADLINE: Duration = Duration::from_millis(250);
+const MAX_SEEN_POST_MUTATION_IDS: usize = 256;
+const MAX_PENDING_POST_MUTATION_RESCANS: usize = 256;
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const BACKGROUND_UPDATE_CAPACITY: usize = 64;
 const SHORTCUT_TASK_CONCURRENCY: usize = 8;
@@ -341,6 +348,15 @@ pub trait ExtensionConfirmationHandler {
         Box::pin(std::future::pending())
     }
 
+    /// Receive one bounded, request-scoped extension command progress event.
+    ///
+    /// Implementations must treat this as transient presentation only; it is
+    /// never a command result or durable session content.
+    fn progress(&mut self, _extension: &str, _progress: &ToolProgress) {}
+
+    /// Clear transient command progress after its request settles.
+    fn finish_progress(&mut self, _extension: &str) {}
+
     fn confirm<'a>(
         &'a mut self,
         extension: &'a str,
@@ -369,6 +385,14 @@ where
 {
     fn wait_for_cancel<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
         self.inner.wait_for_cancel()
+    }
+
+    fn progress(&mut self, extension: &str, progress: &ToolProgress) {
+        self.inner.progress(extension, progress);
+    }
+
+    fn finish_progress(&mut self, extension: &str) {
+        self.inner.finish_progress(extension);
     }
 
     fn confirm<'a>(
@@ -895,6 +919,14 @@ pub struct ExecutableExtensions {
     session_started_at: Instant,
     session_lifecycle_started: bool,
     last_lifecycle_outcome: Option<ExtensionLifecycleOutcome>,
+    /// Stable host-created mutation identities already delivered to hooks.
+    /// Keeping this outside process generations prevents reload/restart paths
+    /// from redelivering the same completed mutation.
+    seen_post_mutation_ids: VecDeque<String>,
+    /// Bounded resolver work requested by admitted post-mutation hooks. The
+    /// product resource owner drains this queue and decides how to rescan; an
+    /// extension never receives authority to perform the host mutation.
+    pending_post_mutation_rescans: VecDeque<PostMutationRescan>,
     #[cfg(test)]
     lifecycle_delivery_test_control: Option<std::sync::Arc<LifecycleDeliveryTestControl>>,
 }
@@ -1149,6 +1181,8 @@ impl Default for ExecutableExtensions {
             session_started_at: Instant::now(),
             session_lifecycle_started: false,
             last_lifecycle_outcome: None,
+            seen_post_mutation_ids: VecDeque::new(),
+            pending_post_mutation_rescans: VecDeque::new(),
             #[cfg(test)]
             lifecycle_delivery_test_control: None,
         }
@@ -1182,6 +1216,13 @@ enum ExtensionBackgroundUpdate {
         context: Vec<ContextContribution>,
         messages: Vec<String>,
     },
+}
+
+fn opaque_extension_resource_id(name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    format!("extension:{digest:x}")
 }
 
 impl ExecutableExtensions {
@@ -2419,22 +2460,27 @@ impl ExecutableExtensions {
         let execution_context =
             extension_execution_context(&process, self.resource_owner.as_deref());
         let mut events = process.subscribe();
-        let output = {
+        let output: anyhow::Result<_> = async {
             let legacy_uncorrelated = process.api_version() == EXTENSION_API_VERSION_0_1;
             let (request_started, started) = tokio::sync::oneshot::channel();
             let mut started = Box::pin(started);
             let mut operation = None;
-            let mut execution = Box::pin(process.execute_command_controlled(
+            let cancellation_token = CancellationToken::default();
+            let (progress_sink, mut progress_rx) = ToolProgressSink::bounded_channel();
+            let mut execution = Box::pin(process.execute_command_controlled_with_progress(
                 name.to_owned(),
                 arguments,
                 execution_context,
+                cancellation_token.clone(),
+                progress_sink,
                 request_started,
             ));
             let mut events_open = true;
-            loop {
+            let result = loop {
                 // The cancellation future and confirmation UI borrow the same
                 // frontend. Keep the select in its own scope so cancellation
                 // is dropped before a confirmation prompt borrows it again.
+                let mut command_progress = None;
                 let event = {
                     let cancellation = confirmations.wait_for_cancel();
                     tokio::pin!(cancellation);
@@ -2447,15 +2493,24 @@ impl ExecutableExtensions {
                             }
                             Err(_) => break execution.await?,
                         },
+                        progress = progress_rx.recv() => {
+                            command_progress = progress;
+                            None
+                        },
                         event = events.recv(), if events_open && operation.is_some() => Some(event),
                         cancelled = &mut cancellation => {
                             cancelled.with_context(|| format!(
                                 "cancellation UI failed for extension {extension_name:?}"
                             ))?;
+                            cancellation_token.cancel();
                             anyhow::bail!("extension command {name:?} cancelled");
                         }
                     }
                 };
+                if let Some(progress) = command_progress {
+                    confirmations.progress(&extension_name, &progress);
+                    continue;
+                }
                 let Some(event) = event else {
                     continue;
                 };
@@ -2526,8 +2581,12 @@ impl ExecutableExtensions {
                     }
                     Err(broadcast::error::RecvError::Closed) => events_open = false,
                 }
-            }
-        };
+            };
+            Ok::<_, anyhow::Error>(result)
+        }
+        .await;
+        confirmations.finish_progress(&extension_name);
+        let output = output?;
         self.enqueue_contexts(&extension_name, output.context);
         let mut blocks = Vec::new();
         if !output.text.trim().is_empty() {
@@ -2591,10 +2650,14 @@ impl ExecutableExtensions {
                 let (request_started, started) = tokio::sync::oneshot::channel();
                 let mut started = Box::pin(started);
                 let mut operation = None;
-                let mut execution = Box::pin(process.execute_command_controlled(
+                let cancellation_token = CancellationToken::default();
+                let (progress_sink, _progress_rx) = ToolProgressSink::bounded_channel();
+                let mut execution = Box::pin(process.execute_command_controlled_with_progress(
                     name.to_owned(),
                     arguments,
                     execution_context,
+                    cancellation_token,
+                    progress_sink,
                     request_started,
                 ));
                 let mut events_open = true;
@@ -2871,6 +2934,138 @@ impl ExecutableExtensions {
         while self.background_rx.try_recv().is_ok() {}
     }
 
+    /// Delivers one completed, host-owned mutation to declared API `0.2`
+    /// post-mutation hooks and returns only subset-validated rescan requests.
+    ///
+    /// Call this only after durable commit or completed rollback. Duplicate
+    /// mutation identities are ignored across process reloads/restarts owned by
+    /// this `ExecutableExtensions` instance. The returned requests are queued
+    /// for the product resource resolver; hooks never get paths, contents, or
+    /// permission to perform the mutation themselves.
+    pub async fn notify_post_mutation(
+        &mut self,
+        mutation: PostMutationContext,
+    ) -> Vec<PostMutationRescan> {
+        if self
+            .seen_post_mutation_ids
+            .iter()
+            .any(|seen| seen == mutation.mutation_id())
+        {
+            return Vec::new();
+        }
+        while self.seen_post_mutation_ids.len() >= MAX_SEEN_POST_MUTATION_IDS {
+            self.seen_post_mutation_ids.pop_front();
+        }
+        self.seen_post_mutation_ids
+            .push_back(mutation.mutation_id().to_owned());
+
+        let resource_owner = self.resource_owner.clone();
+        let calls = self
+            .processes
+            .iter()
+            .filter(|process| {
+                process
+                    .contributions()
+                    .hooks
+                    .contains(&ExtensionHook::PostMutation)
+            })
+            .cloned()
+            .map(|process| {
+                let name = process.descriptor().manifest.name.clone();
+                let mutation = mutation.clone();
+                let resource_owner = resource_owner.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        POST_MUTATION_RPC_DEADLINE,
+                        process.post_mutation(&mutation, resource_owner.as_deref()),
+                    )
+                    .await;
+                    (name, result)
+                }
+            });
+        let results = futures_util::future::join_all(calls).await;
+        let mut accepted = Vec::new();
+        for (extension, result) in results {
+            let disposition = match result {
+                Ok(Ok(disposition)) => disposition,
+                Ok(Err(error)) => {
+                    self.diagnostics.push(format!(
+                        "warning: extension {extension:?} post_mutation hook failed: {error}"
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    self.diagnostics.push(format!(
+                        "warning: extension {extension:?} post_mutation hook exceeded {POST_MUTATION_RPC_DEADLINE:?}"
+                    ));
+                    continue;
+                }
+            };
+            let Some(resource_ids) = disposition.resource_ids() else {
+                continue;
+            };
+            if resource_ids.iter().any(|resource| {
+                mutation
+                    .affected_resources()
+                    .binary_search(resource)
+                    .is_err()
+            }) {
+                self.diagnostics.push(format!(
+                    "warning: extension {extension:?} requested a post_mutation rescan outside the affected resource set"
+                ));
+                continue;
+            }
+            let request = PostMutationRescan {
+                extension,
+                mutation_id: mutation.mutation_id().to_owned(),
+                generation: mutation.generation(),
+                resource_ids: resource_ids.to_vec(),
+            };
+            while self.pending_post_mutation_rescans.len() >= MAX_PENDING_POST_MUTATION_RESCANS {
+                self.pending_post_mutation_rescans.pop_front();
+            }
+            self.pending_post_mutation_rescans
+                .push_back(request.clone());
+            accepted.push(request);
+        }
+        accepted
+    }
+
+    /// Convenience bridge for a future committed Pi migration ingestion.
+    ///
+    /// The current `ygg migrate pi` scanner is explicitly dry-run and must not
+    /// invoke this method because it writes nothing. A real ingestion path must
+    /// pass the same stable ID on retry and call this only after commit or a
+    /// completed rollback.
+    pub async fn notify_migration_ingested(
+        &mut self,
+        mutation_id: impl Into<String>,
+        affected_resources: impl IntoIterator<Item = String>,
+        generation: u64,
+        state: PostMutationState,
+    ) -> Vec<PostMutationRescan> {
+        let Some(mutation) = PostMutationContext::new(
+            mutation_id,
+            PostMutationKind::MigrationIngestion,
+            affected_resources,
+            generation,
+            state,
+        ) else {
+            self.diagnostics
+                .push("warning: rejected invalid migration post_mutation notification");
+            return Vec::new();
+        };
+        self.notify_post_mutation(mutation).await
+    }
+
+    /// Drains host-validated rescan requests for the product resource owner.
+    ///
+    /// The queue contains no raw paths or contents and is bounded independently
+    /// of extension event/progress channels.
+    pub fn take_post_mutation_rescans(&mut self) -> Vec<PostMutationRescan> {
+        self.pending_post_mutation_rescans.drain(..).collect()
+    }
+
     async fn settle_session_lifecycle(&mut self) {
         if self.session_lifecycle_started {
             if let Some(session_id) = self.session_id.clone() {
@@ -2986,6 +3181,7 @@ impl ExecutableExtensions {
         // extension and completion timing cannot reorder user-visible lines.
         let results = futures_util::future::join_all(reloads).await;
         let mut messages = Vec::with_capacity(results.len());
+        let mut completed_mutations = Vec::new();
         for (name, result) in results {
             match result {
                 Ok(report) => {
@@ -2998,9 +3194,30 @@ impl ExecutableExtensions {
                             "forced"
                         }
                     ));
+                    let resource = opaque_extension_resource_id(&name);
+                    let mutation_id = format!("resource-reload:{resource}:{}", report.generation);
+                    if let Some(mutation) = PostMutationContext::new(
+                        mutation_id,
+                        PostMutationKind::Resource,
+                        vec![resource],
+                        report.generation,
+                        PostMutationState::Committed,
+                    ) {
+                        completed_mutations.push(mutation);
+                    }
                 }
                 Err(error) => messages.push(format!("unable to reload {name}: {error}")),
             }
+        }
+        for mutation in completed_mutations {
+            let rescans = self.notify_post_mutation(mutation).await;
+            messages.extend(rescans.into_iter().map(|request| {
+                format!(
+                    "extension {:?} requested bounded rescan of {} resource(s)",
+                    request.extension,
+                    request.resource_ids.len()
+                )
+            }));
         }
         self.start_policy_supervisors();
         let (shortcuts, diagnostics) = register_extension_shortcuts(&self.processes);

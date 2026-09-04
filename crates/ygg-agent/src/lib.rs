@@ -138,7 +138,14 @@ pub use events::{
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
     ToolPolicyDecision,
 };
-pub use extension::{EventObserver, Extension, ExtensionHost, ToolCallHook};
+pub use extension::{
+    AssistantPersistenceContext, EventObserver, Extension, ExtensionHost, PersistenceMetadataHook,
+    PersistenceMetadataProposal, PostMutationContext, PostMutationDisposition, PostMutationKind,
+    PostMutationRescan, PostMutationState, ProviderRetryAdvice, ProviderRetryContext,
+    ProviderRetryHook, ProviderRetryKind, ToolCallHook, MAX_POST_MUTATION_AFFECTED_RESOURCES,
+    MAX_POST_MUTATION_ID_BYTES, MAX_POST_MUTATION_RESOURCE_ID_BYTES,
+    MAX_PROVIDER_RETRY_ADDITIONAL_DELAY,
+};
 pub use extension_policy::{
     ExtensionActionIntent, ExtensionAdapterHints, ExtensionApprovalStore, ExtensionApprovalToken,
     ExtensionIntentPolicy, ExtensionPolicyDecision, ExtensionPolicyError, ExtensionPolicyFrontend,
@@ -168,21 +175,24 @@ pub use extension_process::{
     ExtensionHostState, ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
     ExtensionLifecycleOutcome, ExtensionManifest, ExtensionManifestInput,
     ExtensionNegotiatedProtocol, ExtensionNotification, ExtensionNotificationLevel,
-    ExtensionOperationToken, ExtensionPolicy, ExtensionPolicyEvaluationRequest,
-    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionProgressEncoding,
+    ExtensionOperationToken, ExtensionPersistenceMetadata, ExtensionPolicy,
+    ExtensionPolicyEvaluationRequest, ExtensionPolicyEvaluationResponse,
+    ExtensionPostMutationDisposition, ExtensionProcess, ExtensionProgressEncoding,
     ExtensionProgressEvent, ExtensionProgressStream, ExtensionProtocolLimits,
-    ExtensionProtocolRequest, ExtensionProtocolResponse, ExtensionReloadReport, ExtensionRequestId,
-    ExtensionResourceOwner, ExtensionRoot, ExtensionRuntimeConfig, ExtensionRuntimeError,
-    ExtensionSource, ExtensionStatusContribution, ExtensionTrust, ExtensionUiSurface,
-    RenderedToolCall, ToolCallOutput as ExtensionToolCallOutput, ToolCatalogUpdateResponse,
+    ExtensionProtocolRequest, ExtensionProtocolResponse, ExtensionProviderRetryAdvice,
+    ExtensionReloadReport, ExtensionRequestId, ExtensionResourceOwner, ExtensionRoot,
+    ExtensionRuntimeConfig, ExtensionRuntimeError, ExtensionSource, ExtensionStatusContribution,
+    ExtensionTrust, ExtensionUiSurface, RenderedToolCall,
+    ToolCallOutput as ExtensionToolCallOutput, ToolCatalogUpdateResponse,
     ToolDefinition as ExtensionToolDefinition, ToolRegistrationRequest, ToolRenderSegment,
     DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION, EXTENSION_API_VERSION_0_1,
     EXTENSION_API_VERSION_0_2, EXTENSION_API_VERSION_0_3, EXTENSION_FEATURE_AGENT_SESSIONS,
     EXTENSION_FEATURE_APPROVALS, EXTENSION_FEATURE_ARTIFACTS, EXTENSION_FEATURE_CONTENT_PARTS,
     EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_FEATURE_LIFECYCLE_EVENTS, EXTENSION_FEATURE_POLICY_INTENTS,
-    EXTENSION_FEATURE_REQUEST_CANCELLATION, EXTENSION_FEATURE_REQUEST_PROGRESS,
-    EXTENSION_FEATURE_RUNTIME_COMMANDS, EXTENSION_FEATURE_SECRETS, EXTENSION_MANIFEST_FILENAME,
+    EXTENSION_FEATURE_PROGRESS_DECORATION, EXTENSION_FEATURE_REQUEST_CANCELLATION,
+    EXTENSION_FEATURE_REQUEST_PROGRESS, EXTENSION_FEATURE_RUNTIME_COMMANDS,
+    EXTENSION_FEATURE_SECRETS, EXTENSION_MANIFEST_FILENAME,
     MAX_EXTENSION_CHILD_REQUEST_IDS_PER_GENERATION, MAX_EXTENSION_INPUT_PROMPT_BYTES,
     MAX_EXTENSION_INPUT_VALUE_BYTES, MAX_EXTENSION_RESULT_CONTENT_PARTS,
     MAX_EXTENSION_RESULT_MEDIA_BYTES,
@@ -206,8 +216,10 @@ pub use sandbox::{
     ShellSelection, ToolPolicyProvenance, DEFAULT_MAX_OUTPUT_BYTES,
 };
 pub use session::{
-    Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRecord,
-    SessionRunOutcome, SessionRunOutcomeStatus, UsageRecord, UsageRecordKind,
+    Checkpoint, Entry, EntryId, EntryMetadata, EntryValue, ExtensionEntryMetadata,
+    ExtensionMetadataProvenance, Session, SessionError, SessionRecord, SessionRunOutcome,
+    SessionRunOutcomeStatus, UsageRecord, UsageRecordKind, MAX_EXTENSION_ENTRY_METADATA_BYTES,
+    MAX_EXTENSION_ENTRY_METADATA_NAMESPACES, MAX_EXTENSION_ENTRY_METADATA_VALUE_BYTES,
 };
 pub use skills::{
     ContentHash, LoadedSkill, SkillActivationId, SkillDescriptor, SkillId, SkillLoadError,
@@ -218,7 +230,8 @@ pub use tool::{
     content_hash, CancellationToken, ErasedTool, ErasedToolAdapter, OutputStream, ReplaySafety,
     Tool, ToolConcurrency, ToolContext, ToolDefinition, ToolDescriptor, ToolError,
     ToolInputRequest, ToolInputResponse, ToolOutput, ToolOutputContentPart, ToolOutputDetails,
-    ToolOutputMediaKind, ToolOutputValidationError, ToolProgress, ToolProgressSink,
-    MAX_PROGRESS_CHUNK_BYTES, MAX_TOOL_METADATA_BYTES, MAX_TOOL_STRUCTURED_CONTENT_BYTES,
+    ToolOutputMediaKind, ToolOutputValidationError, ToolProgress, ToolProgressDecoration,
+    ToolProgressSink, MAX_PROGRESS_CHUNK_BYTES, MAX_TOOL_METADATA_BYTES,
+    MAX_TOOL_STRUCTURED_CONTENT_BYTES,
 };
 pub use tools::{BashTool, CoreTools, EditTool, ReadTool, SearchTool, WriteTool};

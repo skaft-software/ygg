@@ -18,7 +18,9 @@ use sexy_tui_rs::{
     parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, ImageAnchor,
     ImageCapabilities, ImagePlanner, ImageRegistry, ImageViewport, RichRenderer, TextEditor, TUI,
 };
-use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
+use ygg_agent::{
+    AgentEvent, EntryValue, OutputChannel, Session, ToolProgress, ToolProgressDecoration,
+};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
 
 use crate::config::Config;
@@ -231,6 +233,9 @@ struct ToolPanel {
     /// sanitized segments; roles are resolved against the current theme only
     /// while rendering. The durable provider-visible `output` stays intact.
     extension_render_segments: Vec<ygg_agent::extension_process::ToolRenderSegment>,
+    /// One bounded, replaceable live-progress annotation. This is cleared once
+    /// the immutable tool result arrives and never enters session persistence.
+    progress_decoration: Option<ToolProgressDecoration>,
     /// Presentation-only delegated-worker event. It deliberately uses the
     /// ordinary tool block lifecycle so its margin dot, scrollback stability,
     /// and disclosure behavior match real tool calls without pretending that
@@ -277,6 +282,7 @@ impl ToolPanel {
             duration: None,
             failure_reason,
             extension_render_segments: Vec::new(),
+            progress_decoration: None,
             subagent_activity: None,
             model_lab,
             cached_diff: RefCell::new(None),
@@ -2697,6 +2703,7 @@ impl InteractiveShell {
                     progress,
                     ToolProgress::Output { .. }
                         | ToolProgress::Status(_)
+                        | ToolProgress::Decoration(_)
                         | ToolProgress::Dropped { .. }
                 );
                 if let Some(panel) = state.tool_output_mut(id) {
@@ -2706,6 +2713,9 @@ impl InteractiveShell {
                         }
                         ToolProgress::Status(message) => {
                             bounded_live_append(&mut panel.output, &format!("{message}\n"));
+                        }
+                        ToolProgress::Decoration(decoration) => {
+                            panel.progress_decoration = Some(decoration.clone());
                         }
                         ToolProgress::Confirmation(request) => {
                             bounded_live_append(
@@ -2778,6 +2788,7 @@ impl InteractiveShell {
                     panel.is_error = tool_result_is_failure(&panel.name, result);
                     panel.failure_reason = tool_failure_reason(&panel.name, result);
                     panel.images = completed_images;
+                    panel.progress_decoration = None;
                     match result {
                         Ok(output) => {
                             panel.display.mark_media_read(output.media_kinds());

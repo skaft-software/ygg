@@ -27,7 +27,7 @@
 //! avoiding silent at-least-once mutations.
 
 use std::cell::{Ref, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, Write};
 use std::path::PathBuf;
@@ -144,6 +144,114 @@ pub struct UsageRecord {
     pub session_cost_picodollars_remainder: Option<u32>,
 }
 
+/// Maximum separately namespaced extension metadata values attached to one
+/// durable entry.
+pub const MAX_EXTENSION_ENTRY_METADATA_NAMESPACES: usize = 32;
+/// Maximum encoded JSON bytes retained for one extension metadata value.
+pub const MAX_EXTENSION_ENTRY_METADATA_VALUE_BYTES: usize = 16 * 1024;
+/// Maximum aggregate encoded JSON bytes retained for extension metadata on one
+/// durable entry.
+pub const MAX_EXTENSION_ENTRY_METADATA_BYTES: usize = 128 * 1024;
+const MAX_EXTENSION_ENTRY_METADATA_DEPTH: usize = 16;
+const MAX_EXTENSION_ENTRY_METADATA_NODES: usize = 256;
+const MAX_EXTENSION_ENTRY_METADATA_KEY_BYTES: usize = 256;
+
+/// Host-attested provenance for one extension-owned metadata value.
+///
+/// The extension never controls this envelope: the host attaches it while
+/// collecting a declared typed hook response before the entry is persisted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionMetadataProvenance {
+    /// Stable extension namespace selected during host registration.
+    pub extension: String,
+    /// Process generation that supplied the value, when the source is an
+    /// executable extension. Native extensions omit this fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_generation: Option<u64>,
+}
+
+/// One bounded extension-owned value retained beside a durable entry.
+///
+/// Values are never included in provider context. Frontends and exports must
+/// use [`EntryMetadata::public_extension_metadata`] rather than exposing this
+/// map directly, because private values are intentionally retained only for
+/// the owning extension's recovery/diagnostic boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionEntryMetadata {
+    /// Whether ordinary frontend/export projections may expose this value.
+    #[serde(default)]
+    pub public: bool,
+    /// Bounded inert JSON value owned by the extension namespace.
+    pub value: serde_json::Value,
+    /// Host-attested source identity.
+    pub provenance: ExtensionMetadataProvenance,
+}
+
+impl ExtensionEntryMetadata {
+    fn sanitized(self, namespace: &str) -> Option<Self> {
+        if !is_valid_extension_metadata_namespace(namespace)
+            || !is_valid_extension_metadata_namespace(&self.provenance.extension)
+            || self.provenance.extension != namespace
+        {
+            return None;
+        }
+        let mut nodes = 0usize;
+        if !valid_extension_metadata_value(&self.value, 0, &mut nodes) {
+            return None;
+        }
+        let encoded = serde_json::to_vec(&self.value).ok()?;
+        (encoded.len() <= MAX_EXTENSION_ENTRY_METADATA_VALUE_BYTES).then_some(self)
+    }
+}
+
+/// Returns whether `namespace` is a stable extension-owned metadata namespace.
+///
+/// Namespaces are lowercase ASCII segments separated by dots. This permits
+/// durable ownership checks without treating arbitrary user-facing text as a
+/// storage key.
+pub fn is_valid_extension_metadata_namespace(namespace: &str) -> bool {
+    !namespace.is_empty()
+        && namespace.len() <= 128
+        && namespace.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment.len() <= 64
+                && segment.bytes().enumerate().all(|(index, byte)| match byte {
+                    b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' => {
+                        index > 0 || byte.is_ascii_lowercase()
+                    }
+                    _ => false,
+                })
+        })
+}
+
+fn valid_extension_metadata_value(
+    value: &serde_json::Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> bool {
+    if depth > MAX_EXTENSION_ENTRY_METADATA_DEPTH || *nodes >= MAX_EXTENSION_ENTRY_METADATA_NODES {
+        return false;
+    }
+    *nodes = nodes.saturating_add(1);
+    match value {
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => true,
+        serde_json::Value::String(value) => {
+            value.len() <= MAX_EXTENSION_ENTRY_METADATA_VALUE_BYTES
+                && !value.chars().any(char::is_control)
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .all(|value| valid_extension_metadata_value(value, depth.saturating_add(1), nodes)),
+        serde_json::Value::Object(values) => values.iter().all(|(key, value)| {
+            key.len() <= MAX_EXTENSION_ENTRY_METADATA_KEY_BYTES
+                && !key.chars().any(char::is_control)
+                && valid_extension_metadata_value(value, depth.saturating_add(1), nodes)
+        }),
+    }
+}
+
 /// Stable presentation metadata attached to a durable session entry.
 ///
 /// Values are inert data, never terminal escape sequences. In addition to the
@@ -192,6 +300,13 @@ pub struct EntryMetadata {
     /// authoritative provider sidecar.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub local_synthetic_assistant: bool,
+    /// Extension-owned metadata keyed by a host-validated namespace.
+    ///
+    /// This is deliberately separate from host-owned presentation fields and
+    /// canonical message content. It is never reconstructed into provider
+    /// context.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extension_metadata: BTreeMap<String, ExtensionEntryMetadata>,
 }
 
 /// Durable terminal state for one frontend-owned agent run.
@@ -259,14 +374,48 @@ impl EntryMetadata {
         // The timing window is only meaningful beside a retained tool result.
         self.tool_started_unix_ms = None;
         self.tool_finished_unix_ms = None;
+        let mut encoded_metadata_bytes = 0usize;
+        let mut sanitized_extension_metadata = BTreeMap::new();
+        for (namespace, entry_metadata) in std::mem::take(&mut self.extension_metadata)
+            .into_iter()
+            .take(MAX_EXTENSION_ENTRY_METADATA_NAMESPACES)
+        {
+            let Some(entry_metadata) = entry_metadata.sanitized(&namespace) else {
+                continue;
+            };
+            let encoded = match serde_json::to_vec(&entry_metadata.value) {
+                Ok(encoded) => encoded,
+                Err(_) => continue,
+            };
+            let next = encoded_metadata_bytes.saturating_add(encoded.len());
+            if next > MAX_EXTENSION_ENTRY_METADATA_BYTES {
+                continue;
+            }
+            encoded_metadata_bytes = next;
+            sanitized_extension_metadata.insert(namespace, entry_metadata);
+        }
+        self.extension_metadata = sanitized_extension_metadata;
         (self.prompt_model.is_some()
             || self.prompt_model_source.is_some()
             || self.prompt_color.is_some()
             || self.display_text.is_some()
             || self.run_outcome.is_some()
             || self.tool_output.is_some()
-            || self.local_synthetic_assistant)
-            .then_some(self)
+            || self.local_synthetic_assistant
+            || !self.extension_metadata.is_empty())
+        .then_some(self)
+    }
+
+    /// Returns only extension metadata explicitly marked public by its owner.
+    ///
+    /// The returned map is a detached projection; private metadata remains
+    /// durable but is deliberately omitted.
+    pub fn public_extension_metadata(&self) -> BTreeMap<String, ExtensionEntryMetadata> {
+        self.extension_metadata
+            .iter()
+            .filter(|(_, value)| value.public)
+            .map(|(namespace, value)| (namespace.clone(), value.clone()))
+            .collect()
     }
 }
 
@@ -1963,6 +2112,49 @@ impl Session {
         stop_reason: StopReason,
         responses_output: Option<ygg_ai::ResponsesOutput>,
     ) -> Result<EntryId, SessionError> {
+        self.append_assistant_turn_with_metadata(
+            assistant,
+            endpoint,
+            model,
+            usage,
+            cost,
+            stop_reason,
+            responses_output,
+            None,
+        )
+    }
+
+    /// Appends a completed assistant turn with host-validated, extension-owned
+    /// metadata at the same durable boundary as the canonical message.
+    ///
+    /// This deliberately accepts only `extension_metadata`; host-owned prompt,
+    /// tool, and run presentation fields are cleared before persistence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_assistant_turn_with_metadata(
+        &mut self,
+        assistant: ygg_ai::AssistantMessage,
+        endpoint: EndpointId,
+        model: ModelId,
+        usage: Usage,
+        cost: Option<Cost>,
+        stop_reason: StopReason,
+        responses_output: Option<ygg_ai::ResponsesOutput>,
+        metadata: Option<EntryMetadata>,
+    ) -> Result<EntryId, SessionError> {
+        let metadata = metadata
+            .map(|mut metadata| {
+                metadata.prompt_model = None;
+                metadata.prompt_model_source = None;
+                metadata.prompt_color = None;
+                metadata.display_text = None;
+                metadata.run_outcome = None;
+                metadata.tool_output = None;
+                metadata.tool_started_unix_ms = None;
+                metadata.tool_finished_unix_ms = None;
+                metadata.local_synthetic_assistant = false;
+                metadata
+            })
+            .and_then(EntryMetadata::sanitized);
         let output_is_valid = responses_output.as_ref().is_none_or(|output| {
             !output.is_empty()
                 && assistant.protocol == ygg_ai::Protocol::OpenAiResponses
@@ -1989,7 +2181,7 @@ impl Session {
         let assistant_entry = Entry {
             id: assistant_id.clone(),
             parent,
-            metadata: None,
+            metadata,
             timestamp_unix_ms: Some(now_unix_millis()),
             value: EntryValue::Message(assistant_message.clone()),
         };
@@ -2807,6 +2999,7 @@ mod tests {
                     tool_started_unix_ms: None,
                     tool_finished_unix_ms: None,
                     local_synthetic_assistant: false,
+                    extension_metadata: Default::default(),
                 }),
             )
             .unwrap();
@@ -2823,6 +3016,7 @@ mod tests {
                     tool_started_unix_ms: None,
                     tool_finished_unix_ms: None,
                     local_synthetic_assistant: false,
+                    extension_metadata: Default::default(),
                 }),
             )
             .unwrap();
@@ -2841,6 +3035,7 @@ mod tests {
                 tool_started_unix_ms: None,
                 tool_finished_unix_ms: None,
                 local_synthetic_assistant: false,
+                extension_metadata: Default::default(),
             })
         );
         assert_eq!(session.entry(&invalid).unwrap().metadata, None);

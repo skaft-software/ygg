@@ -32,7 +32,10 @@ use crate::delegation::{
 use crate::effect::ToolEffect;
 use crate::events::AgentEvent;
 use crate::extension::{
-    DynamicToolRegistration, EventObserver, Extension, ExtensionHost, ToolCallHook,
+    AssistantPersistenceContext, DynamicToolRegistration, EventObserver, Extension, ExtensionHost,
+    PersistenceMetadataHook, PersistenceMetadataProposal, PostMutationContext,
+    PostMutationDisposition, ProviderRetryAdvice, ProviderRetryContext, ProviderRetryHook,
+    ToolCallHook,
 };
 use crate::extension_api_v03 as api_v03;
 use crate::extension_policy::{
@@ -42,7 +45,7 @@ use crate::extension_presentation::ExtensionPresentationSnapshot;
 use crate::extension_secret::{ExtensionSecretBroker, ExtensionSecretRequest};
 use crate::tool::{
     CancellationToken, OutputStream, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput,
-    ToolOutputContentPart, ToolProgressSink,
+    ToolOutputContentPart, ToolProgressDecoration, ToolProgressSink,
 };
 
 /// The newest executable-extension API implemented by this Ygg release.
@@ -63,6 +66,11 @@ pub const EXTENSION_FEATURE_REQUEST_CANCELLATION: &str = "request_cancellation";
 pub const EXTENSION_FEATURE_CONTENT_PARTS: &str = "content_parts";
 /// API `0.2` correlated progress feature.
 pub const EXTENSION_FEATURE_REQUEST_PROGRESS: &str = "request_progress";
+/// API `0.2` bounded replaceable tool-panel decoration feature.
+///
+/// This remains separate from ordinary status/output progress so API `0.1`
+/// and unnegotiated API `0.2` extensions keep their existing wire contract.
+pub const EXTENSION_FEATURE_PROGRESS_DECORATION: &str = "progress_decoration";
 /// API `0.2` host-ingested artifact feature.
 pub const EXTENSION_FEATURE_ARTIFACTS: &str = "artifacts";
 /// API `0.2` observational lifecycle feature.
@@ -110,6 +118,7 @@ const API_0_2_REQUIRED_FEATURES: &[&str] = &[
 ];
 const API_0_2_OPTIONAL_FEATURES: &[&str] = &[
     EXTENSION_FEATURE_REQUEST_PROGRESS,
+    EXTENSION_FEATURE_PROGRESS_DECORATION,
     EXTENSION_FEATURE_ARTIFACTS,
     EXTENSION_FEATURE_LIFECYCLE_EVENTS,
     EXTENSION_FEATURE_POLICY_INTENTS,
@@ -1371,7 +1380,7 @@ impl ExtensionManifest {
                 "semantic presentation requires extension API 0.2".into(),
             ));
         }
-        if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.is_empty() {
+if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.is_empty() {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "shortcuts require extension API 0.2".into(),
             ));
@@ -1379,6 +1388,21 @@ impl ExtensionManifest {
         if self.api_version == EXTENSION_API_VERSION_0_3 && !self.contributes.shortcuts.is_empty() {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "shortcuts are not yet supported by extension API 0.3".into(),
+            ));
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_1
+            && self.contributes.hooks.iter().any(|hook| {
+                matches!(
+                    hook,
+                    ExtensionHook::ProviderRetry
+                        | ExtensionHook::BeforePersistence
+                        | ExtensionHook::PostMutation
+                )
+            })
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "provider_retry, before_persistence, and post_mutation hooks require extension API 0.2"
+                    .into(),
             ));
         }
         if self.api_version == EXTENSION_API_VERSION_0_3
@@ -1547,6 +1571,15 @@ pub enum ExtensionHook {
     BeforeToolCall,
     /// Runs after a tool result is available.
     AfterToolCall,
+    /// Advises on a host-admitted provider retry without changing retry safety
+    /// or the host retry budget.
+    ProviderRetry,
+    /// Proposes one namespaced metadata value for a completed assistant turn
+    /// before its atomic durable persistence boundary.
+    BeforePersistence,
+    /// Observes a completed host resource mutation and may request a bounded
+    /// rescan of its declared affected resource identifiers.
+    PostMutation,
 }
 
 /// Semantic terminal surfaces an extension may populate.
@@ -2292,8 +2325,50 @@ pub enum ExtensionHookDisposition {
     },
 }
 
+/// Provider-retry advice accepted only from the typed `provider_retry` hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionProviderRetryAdvice {
+    /// Support the host-proposed retry without expanding its budget.
+    Retry,
+    /// Add bounded delay to the host-selected retry time. The host clamps this
+    /// value and never lets an extension shorten provider backoff.
+    Delay {
+        /// Requested additional delay in milliseconds.
+        additional_delay_ms: u64,
+    },
+    /// Decline the host-proposed retry.
+    Stop,
+}
+
+/// One process-owned metadata value proposed by `before_persistence`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionPersistenceMetadata {
+    /// Whether ordinary frontend/export projections may expose this value.
+    #[serde(default)]
+    pub public: bool,
+    /// Inert JSON owned by the manifest's extension namespace.
+    pub value: serde_json::Value,
+}
+
+/// Post-mutation disposition accepted only from a typed `post_mutation` hook.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ExtensionPostMutationDisposition {
+    /// The extension does not need a host resource rescan.
+    #[default]
+    NoRescan,
+    /// Request a bounded subset of the host-disclosed affected resources.
+    RequestRescan {
+        /// Opaque resource identities selected for rescan.
+        resource_ids: Vec<String>,
+    },
+}
+
 /// Typed hook response.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExtensionHookOutput {
     /// Whether the intercepted operation should proceed.
     #[serde(default)]
@@ -2304,6 +2379,16 @@ pub struct ExtensionHookOutput {
     /// User-visible notifications produced at this boundary.
     #[serde(default)]
     pub notifications: Vec<ExtensionNotification>,
+    /// Advice accepted only for a typed `provider_retry` hook response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry: Option<ExtensionProviderRetryAdvice>,
+    /// Metadata accepted only for a typed `before_persistence` hook response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence_metadata: Option<ExtensionPersistenceMetadata>,
+    /// Rescan disposition accepted only for a typed `post_mutation` hook
+    /// response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_mutation: Option<ExtensionPostMutationDisposition>,
 }
 
 /// A semantic status/header/footer contribution.
@@ -2914,6 +2999,15 @@ pub enum ExtensionProgressEvent {
         encoding: ExtensionProgressEncoding,
         /// UTF-8 text or base64 data.
         data: String,
+    },
+    /// Replace the one bounded decoration associated with the active tool or
+    /// command request. It is frontend-only and never enters session state.
+    Decoration {
+        /// Short current-state label.
+        label: String,
+        /// Optional one-line detail.
+        #[serde(default)]
+        detail: Option<String>,
     },
 }
 
@@ -4349,7 +4443,7 @@ impl ExtensionProcess {
         arguments: Vec<String>,
         context: ExtensionExecutionContext,
     ) -> Result<CommandOutput, ExtensionRuntimeError> {
-        self.execute_command_inner(name.into(), arguments, context, None)
+        self.execute_command_inner(name.into(), arguments, context, None, None, None)
             .await
     }
 
@@ -4362,16 +4456,53 @@ impl ExtensionProcess {
         context: ExtensionExecutionContext,
         request_started: oneshot::Sender<ExtensionOperationToken>,
     ) -> Result<CommandOutput, ExtensionRuntimeError> {
-        self.execute_command_inner(name.into(), arguments, context, Some(request_started))
-            .await
+        self.execute_command_inner(
+            name.into(),
+            arguments,
+            context,
+            Some(request_started),
+            None,
+            None,
+        )
+        .await
     }
 
+    /// Invokes a manifest-declared slash command through the bounded,
+    /// request-scoped progress channel used by model tools.
+    ///
+    /// The operation token, cancellation token, and progress sink all belong
+    /// to the same active request. Late progress is discarded when that
+    /// request settles or its generation is replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_command_controlled_with_progress(
+        &self,
+        name: impl Into<String>,
+        arguments: Vec<String>,
+        context: ExtensionExecutionContext,
+        cancellation: CancellationToken,
+        progress: ToolProgressSink,
+        request_started: oneshot::Sender<ExtensionOperationToken>,
+    ) -> Result<CommandOutput, ExtensionRuntimeError> {
+        self.execute_command_inner(
+            name.into(),
+            arguments,
+            context,
+            Some(request_started),
+            Some(cancellation),
+            Some(progress),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn execute_command_inner(
         &self,
         name: String,
         arguments: Vec<String>,
         context: ExtensionExecutionContext,
         request_started: Option<oneshot::Sender<ExtensionOperationToken>>,
+        cancellation: Option<CancellationToken>,
+        progress: Option<ToolProgressSink>,
     ) -> Result<CommandOutput, ExtensionRuntimeError> {
         if !self
             .inner
@@ -4397,8 +4528,21 @@ impl ExtensionProcess {
             context,
         })
         .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
-        let result = match request_started {
-            Some(request_started) => {
+        let result = match (request_started, cancellation, progress) {
+            (Some(request_started), Some(cancellation), Some(progress)) => {
+                connection
+                    .request_with_command_progress(
+                        methods::COMMAND_EXECUTE,
+                        params,
+                        self.inner.config.request_timeout,
+                        cancellation,
+                        progress,
+                        resource_owner,
+                        request_started,
+                    )
+                    .await?
+            }
+            (Some(request_started), _, _) => {
                 connection
                     .request_with_operation(
                         methods::COMMAND_EXECUTE,
@@ -4409,7 +4553,7 @@ impl ExtensionProcess {
                     )
                     .await?
             }
-            None => {
+            (None, _, _) => {
                 connection
                     .request_with_resource_owner(
                         methods::COMMAND_EXECUTE,
@@ -4538,6 +4682,70 @@ impl ExtensionProcess {
             resource_owner,
         )
         .await
+    }
+
+    /// Notifies this API `0.2` process after a completed host mutation.
+    ///
+    /// The caller owns mutation de-duplication and validates any selected
+    /// rescan resources against the context's affected-resource list. This
+    /// method never exposes paths, contents, credentials, or partial writes.
+    pub async fn post_mutation(
+        &self,
+        mutation: &PostMutationContext,
+        resource_owner: Option<&str>,
+    ) -> Result<PostMutationDisposition, ExtensionRuntimeError> {
+        if self.api_version() != EXTENSION_API_VERSION_0_2
+            || !self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::PostMutation)
+        {
+            return Ok(PostMutationDisposition::NoRescan);
+        }
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let generation = connection.generation;
+        let mut context = self.execution_context();
+        if let Some(resource_owner) = resource_owner {
+            context.resource_owner = Some(ExtensionResourceOwner {
+                session_id: resource_owner.to_owned(),
+                extension_instance_id: self.inner.instance_id.clone(),
+                process_generation: generation,
+            });
+        }
+        let payload = serde_json::json!({
+            "mutation_id": mutation.mutation_id(),
+            "kind": match mutation.kind() {
+                crate::extension::PostMutationKind::Configuration => "configuration",
+                crate::extension::PostMutationKind::Resource => "resource",
+                crate::extension::PostMutationKind::MigrationIngestion => "migration_ingestion",
+            },
+            "affected_resources": mutation.affected_resources(),
+            "generation": mutation.generation(),
+            "state": match mutation.state() {
+                crate::extension::PostMutationState::Committed => "committed",
+                crate::extension::PostMutationState::RolledBack => "rolled_back",
+            },
+        });
+        let output = self
+            .run_hook(ExtensionHook::PostMutation, payload, context)
+            .await?;
+        if read_std_lock(&self.inner.connection).generation != generation {
+            return Err(ExtensionRuntimeError::Protocol(
+                "discarded stale post_mutation response after process generation changed".into(),
+            ));
+        }
+        let disposition = match output.post_mutation.unwrap_or_default() {
+            ExtensionPostMutationDisposition::NoRescan => PostMutationDisposition::NoRescan,
+            ExtensionPostMutationDisposition::RequestRescan { resource_ids } => {
+                PostMutationDisposition::request_rescan(resource_ids).ok_or_else(|| {
+                    ExtensionRuntimeError::Protocol(
+                        "invalid bounded post_mutation rescan disposition".into(),
+                    )
+                })?
+            }
+        };
+        Ok(disposition)
     }
 
     /// Collects prompt context through the typed context contribution point.
@@ -5576,6 +5784,107 @@ impl ExtensionProcess {
     }
 }
 
+#[async_trait::async_trait]
+impl ProviderRetryHook for ExtensionProcess {
+    async fn provider_retry(&self, context: &ProviderRetryContext) -> ProviderRetryAdvice {
+        if self.api_version() != EXTENSION_API_VERSION_0_2
+            || !self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::ProviderRetry)
+        {
+            return ProviderRetryAdvice::NoOpinion;
+        }
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let generation = connection.generation;
+        let mut execution = self.execution_context();
+        execution.resource_owner = Some(ExtensionResourceOwner {
+            session_id: context.resource_owner.clone(),
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: generation,
+        });
+        let payload = serde_json::json!({
+            "run_id": context.run_id,
+            "attempt": context.attempt,
+            "max_attempts": context.max_attempts,
+            "host_delay_ms": context.host_delay.as_millis(),
+            "kind": match context.kind {
+                crate::extension::ProviderRetryKind::BeforeGeneration => "before_generation",
+                crate::extension::ProviderRetryKind::StreamStart => "stream_start",
+            },
+        });
+        let Ok(output) = self
+            .run_hook(ExtensionHook::ProviderRetry, payload, execution)
+            .await
+        else {
+            return ProviderRetryAdvice::NoOpinion;
+        };
+        if read_std_lock(&self.inner.connection).generation != generation {
+            return ProviderRetryAdvice::NoOpinion;
+        }
+        match output.provider_retry {
+            Some(ExtensionProviderRetryAdvice::Retry) => ProviderRetryAdvice::Retry,
+            Some(ExtensionProviderRetryAdvice::Delay {
+                additional_delay_ms,
+            }) => ProviderRetryAdvice::Delay {
+                additional: Duration::from_millis(additional_delay_ms),
+            },
+            Some(ExtensionProviderRetryAdvice::Stop) => ProviderRetryAdvice::Stop,
+            None => ProviderRetryAdvice::NoOpinion,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PersistenceMetadataHook for ExtensionProcess {
+    async fn before_assistant_persist(
+        &self,
+        context: &AssistantPersistenceContext,
+    ) -> Option<PersistenceMetadataProposal> {
+        if self.api_version() != EXTENSION_API_VERSION_0_2
+            || !self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::BeforePersistence)
+        {
+            return None;
+        }
+        let connection = read_std_lock(&self.inner.connection).clone();
+        let generation = connection.generation;
+        let mut execution = self.execution_context();
+        execution.resource_owner = Some(ExtensionResourceOwner {
+            session_id: context.resource_owner.clone(),
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: generation,
+        });
+        let payload = serde_json::json!({
+            "run_id": context.run_id,
+            "model": context.model,
+            "protocol": context.protocol,
+            "stop_reason": context.stop_reason,
+            "text_bytes": context.text_bytes,
+            "tool_call_count": context.tool_call_count,
+            "reasoning_part_count": context.reasoning_part_count,
+            "media_part_count": context.media_part_count,
+        });
+        let output = self
+            .run_hook(ExtensionHook::BeforePersistence, payload, execution)
+            .await
+            .ok()?;
+        if read_std_lock(&self.inner.connection).generation != generation {
+            return None;
+        }
+        let metadata = output.persistence_metadata?;
+        Some(PersistenceMetadataProposal::from_process(
+            metadata.public,
+            metadata.value,
+            generation,
+        ))
+    }
+}
+
 impl Extension for ExtensionProcess {
     fn register(&self, host: &mut ExtensionHost) {
         self.register_dynamic_tool_catalog(host);
@@ -5587,6 +5896,27 @@ impl Extension for ExtensionProcess {
             )
         }) {
             host.tool_call_hook(self.clone());
+        }
+        if self.api_version() == EXTENSION_API_VERSION_0_2
+            && self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::ProviderRetry)
+        {
+            host.provider_retry_hook(self.clone());
+        }
+        if self.api_version() == EXTENSION_API_VERSION_0_2
+            && self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::BeforePersistence)
+        {
+            host.persistence_metadata_hook(
+                self.inner.descriptor.manifest.name.clone(),
+                self.clone(),
+            );
         }
     }
 }
@@ -6515,7 +6845,11 @@ struct PendingRequest {
     terminal: Arc<AtomicU8>,
     frame_state: Arc<AtomicU8>,
     cancellation_sent: Arc<AtomicBool>,
+    /// Parent progress forwarded as ordinary status/output/decoration updates.
     progress: Option<ToolProgressSink>,
+    /// Parent progress allowed to own child confirmation/input replies. Model
+    /// tools use this; commands retain their existing confirmation receiver.
+    child_interaction_progress: Option<ToolProgressSink>,
     resource_owner: Option<ExtensionResourceOwner>,
     last_progress_sequence: Option<u64>,
 }
@@ -6924,8 +7258,10 @@ impl ProcessConnection {
         params: serde_json::Value,
         timeout: Duration,
     ) -> Result<serde_json::Value, ExtensionRuntimeError> {
-        self.request_inner(method, params, timeout, true, true, None, None, None, None)
-            .await
+        self.request_inner(
+            method, params, timeout, true, true, None, None, None, None, None,
+        )
+        .await
     }
 
     async fn request_with_resource_owner(
@@ -6941,6 +7277,7 @@ impl ProcessConnection {
             timeout,
             true,
             true,
+            None,
             None,
             None,
             resource_owner,
@@ -6963,6 +7300,7 @@ impl ProcessConnection {
             timeout,
             true,
             true,
+            None,
             None,
             None,
             resource_owner,
@@ -6989,7 +7327,36 @@ impl ProcessConnection {
             true,
             true,
             Some(cancellation),
+            Some(progress.clone()),
             Some(progress),
+            resource_owner,
+            Some(request_started),
+        )
+        .await
+    }
+
+    /// Runs a cancellable command with ordinary progress, while preserving the
+    /// command frontend as the owner of extension confirmation and input.
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_command_progress(
+        self: &Arc<Self>,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        cancellation: CancellationToken,
+        progress: ToolProgressSink,
+        resource_owner: Option<ExtensionResourceOwner>,
+        request_started: oneshot::Sender<ExtensionOperationToken>,
+    ) -> Result<serde_json::Value, ExtensionRuntimeError> {
+        self.request_inner(
+            method,
+            params,
+            timeout,
+            true,
+            true,
+            Some(cancellation),
+            Some(progress),
+            None,
             resource_owner,
             Some(request_started),
         )
@@ -7003,7 +7370,7 @@ impl ProcessConnection {
         timeout: Duration,
     ) -> Result<serde_json::Value, ExtensionRuntimeError> {
         self.request_inner(
-            method, params, timeout, false, false, None, None, None, None,
+            method, params, timeout, false, false, None, None, None, None, None,
         )
         .await
     }
@@ -7018,6 +7385,7 @@ impl ProcessConnection {
         use_request_slot: bool,
         cancellation: Option<CancellationToken>,
         progress: Option<ToolProgressSink>,
+        child_interaction_progress: Option<ToolProgressSink>,
         resource_owner: Option<ExtensionResourceOwner>,
         request_started: Option<oneshot::Sender<ExtensionOperationToken>>,
     ) -> Result<serde_json::Value, ExtensionRuntimeError> {
@@ -7076,6 +7444,7 @@ impl ProcessConnection {
                     frame_state: Arc::clone(&frame_state),
                     cancellation_sent,
                     progress,
+                    child_interaction_progress,
                     resource_owner,
                     last_progress_sequence: None,
                 },
@@ -11071,7 +11440,7 @@ fn register_child_request(
         );
         return Ok(None);
     };
-    let progress = parent_request.progress.clone();
+    let progress = parent_request.child_interaction_progress.clone();
     let resource_owner = parent_request.resource_owner.clone();
     let mut registered = insert_child_request(state, id, Some(parent), progress)?;
     registered.resource_owner = resource_owner;
@@ -11387,6 +11756,12 @@ fn dispatch_progress(
                 },
                 bytes,
             );
+        }
+        ExtensionProgressEvent::Decoration { label, detail } => {
+            require_feature(state, EXTENSION_FEATURE_PROGRESS_DECORATION)?;
+            let decoration = ToolProgressDecoration::new(label, detail)
+                .ok_or_else(|| "invalid bounded progress decoration".to_owned())?;
+            sink.send_one(crate::tool::ToolProgress::Decoration(decoration));
         }
     }
     Ok(())
@@ -11773,6 +12148,7 @@ confirmations = true
                 frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
                 cancellation_sent: Arc::new(AtomicBool::new(false)),
                 progress: None,
+                child_interaction_progress: None,
                 resource_owner,
                 last_progress_sequence: None,
             },
@@ -12510,6 +12886,7 @@ confirmations = true
                 frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
                 cancellation_sent: Arc::new(AtomicBool::new(false)),
                 progress: None,
+                child_interaction_progress: None,
                 resource_owner: None,
                 last_progress_sequence: None,
             },
@@ -12554,6 +12931,7 @@ confirmations = true
                 frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
                 cancellation_sent: Arc::new(AtomicBool::new(false)),
                 progress: None,
+                child_interaction_progress: None,
                 resource_owner: None,
                 last_progress_sequence: None,
             },
@@ -12631,6 +13009,7 @@ confirmations = true
                 frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
                 cancellation_sent: Arc::new(AtomicBool::new(false)),
                 progress: None,
+                child_interaction_progress: None,
                 resource_owner: None,
                 last_progress_sequence: None,
             },
@@ -12678,6 +13057,7 @@ confirmations = true
                 frame_state: Arc::new(AtomicU8::new(FRAME_WRITTEN)),
                 cancellation_sent: Arc::new(AtomicBool::new(false)),
                 progress: None,
+                child_interaction_progress: None,
                 resource_owner: None,
                 last_progress_sequence: None,
             },

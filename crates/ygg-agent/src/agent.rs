@@ -38,13 +38,17 @@ use crate::events::{
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
     ToolPolicyDecision,
 };
-use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
+use crate::extension::{
+    AssistantPersistenceContext, EventObserver, ExtensionHost, ProviderRetryAdvice,
+    ProviderRetryContext, ProviderRetryHook, ProviderRetryKind, RegisteredPersistenceMetadataHook,
+    ToolCallHook, MAX_PROVIDER_RETRY_ADDITIONAL_DELAY,
+};
 use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
-    DelegatedUsage, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
-    UsageRecordKind,
+    DelegatedUsage, EntryId, EntryMetadata, EntryValue, ExtensionEntryMetadata,
+    ExtensionMetadataProvenance, Session, SessionError, SessionRunOutcome, UsageRecordKind,
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
@@ -81,6 +85,10 @@ pub enum AgentError {
     /// Two tools were registered under the same name.
     #[error("duplicate tool name registered: {0}")]
     DuplicateTool(String),
+    /// An extension attempted to register an invalid or colliding durable
+    /// metadata namespace.
+    #[error("invalid extension metadata namespace: {0}")]
+    ExtensionMetadataNamespace(String),
     /// The configured collaboration runtime could not start an owning run.
     #[error("delegation error: {0}")]
     Delegation(String),
@@ -428,6 +436,7 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
         AgentError::IncompleteResponse { .. } => Some("response completion"),
         AgentError::Session(_)
         | AgentError::DuplicateTool(_)
+        | AgentError::ExtensionMetadataNamespace(_)
         | AgentError::Delegation(_)
         | AgentError::Workspace(_)
         | AgentError::TokenLimit { .. }
@@ -902,6 +911,13 @@ const TOOL_TRUNCATION_MARKER: &str = "\n[tool output truncated]\n";
 /// assistant message is persisted only after `Finished`, and tools are not
 /// executed until that point.
 const MAX_PROVIDER_RETRIES: usize = 3;
+/// Total time one retry decision may spend in extension advisory hooks.
+/// Hooks run only after the host has independently admitted the retry.
+const PROVIDER_RETRY_HOOK_BUDGET: Duration = Duration::from_millis(200);
+/// Total time a completed assistant turn may spend collecting extension-owned
+/// metadata before its atomic durable append. Timeout or cancellation drops
+/// only extension metadata, never the canonical assistant result.
+const PERSISTENCE_METADATA_HOOK_BUDGET: Duration = Duration::from_millis(200);
 /// Non-timeout network failures are usually short-lived connection loss. Five
 /// visible, cancellable replacement attempts give the connection time to
 /// recover without charging usage or consuming an autonomous model turn.
@@ -2376,6 +2392,143 @@ fn retry_after(error: &AiError, attempt: usize) -> Duration {
     // rand dependency. The provider's Retry-After always takes precedence.
     let base = 200u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(base + (attempt as u64 * 37) % 100)
+}
+
+struct ProviderRetryDecision {
+    proceed: bool,
+    additional_delay: Duration,
+}
+
+async fn provider_retry_decision(
+    hooks: &[Arc<dyn ProviderRetryHook>],
+    run_id: &str,
+    resource_owner: &str,
+    attempt: usize,
+    max_attempts: usize,
+    host_delay: Duration,
+    kind: ProviderRetryKind,
+    abort: &AbortFlag,
+) -> ProviderRetryDecision {
+    if abort.is_set() {
+        return ProviderRetryDecision {
+            proceed: false,
+            additional_delay: Duration::ZERO,
+        };
+    }
+    let deadline = tokio::time::Instant::now() + PROVIDER_RETRY_HOOK_BUDGET;
+    let context = ProviderRetryContext {
+        run_id: run_id.to_owned(),
+        resource_owner: resource_owner.to_owned(),
+        attempt,
+        max_attempts,
+        host_delay,
+        kind,
+    };
+    let mut additional_delay = Duration::ZERO;
+    for hook in hooks {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let advice = tokio::select! {
+            biased;
+            _ = abort.wait() => return ProviderRetryDecision {
+                proceed: false,
+                additional_delay: Duration::ZERO,
+            },
+            result = tokio::time::timeout(remaining, hook.provider_retry(&context)) => result.ok(),
+        };
+        match advice {
+            Some(ProviderRetryAdvice::Stop) => {
+                return ProviderRetryDecision {
+                    proceed: false,
+                    additional_delay: Duration::ZERO,
+                };
+            }
+            Some(ProviderRetryAdvice::Delay { additional }) => {
+                additional_delay = additional_delay
+                    .saturating_add(additional)
+                    .min(MAX_PROVIDER_RETRY_ADDITIONAL_DELAY);
+            }
+            Some(ProviderRetryAdvice::NoOpinion | ProviderRetryAdvice::Retry) | None => {}
+        }
+    }
+    ProviderRetryDecision {
+        proceed: !abort.is_set(),
+        additional_delay,
+    }
+}
+
+fn assistant_persistence_context(
+    run_id: &str,
+    resource_owner: &str,
+    assistant: &AssistantMessage,
+    stop_reason: StopReason,
+) -> AssistantPersistenceContext {
+    let mut text_bytes = 0usize;
+    let mut tool_call_count = 0usize;
+    let mut reasoning_part_count = 0usize;
+    let mut media_part_count = 0usize;
+    for part in &assistant.content {
+        match part {
+            AssistantPart::Text(text) => text_bytes = text_bytes.saturating_add(text.len()),
+            AssistantPart::ToolCall(_) => tool_call_count = tool_call_count.saturating_add(1),
+            AssistantPart::Reasoning(_) => {
+                reasoning_part_count = reasoning_part_count.saturating_add(1)
+            }
+            AssistantPart::Media(_) => media_part_count = media_part_count.saturating_add(1),
+        }
+    }
+    AssistantPersistenceContext {
+        run_id: run_id.to_owned(),
+        resource_owner: resource_owner.to_owned(),
+        model: assistant.model.clone(),
+        protocol: assistant.protocol,
+        stop_reason,
+        text_bytes,
+        tool_call_count,
+        reasoning_part_count,
+        media_part_count,
+    }
+}
+
+async fn collect_persistence_metadata(
+    hooks: &[RegisteredPersistenceMetadataHook],
+    context: &AssistantPersistenceContext,
+    abort: &AbortFlag,
+) -> Option<EntryMetadata> {
+    if hooks.is_empty() || abort.is_set() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + PERSISTENCE_METADATA_HOOK_BUDGET;
+    let mut metadata = EntryMetadata::default();
+    for registered in hooks {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() || abort.is_set() {
+            break;
+        }
+        let proposal = tokio::select! {
+            biased;
+            _ = abort.wait() => break,
+            result = tokio::time::timeout(remaining, registered.hook.before_assistant_persist(context)) => result.ok().flatten(),
+        };
+        let Some(proposal) = proposal else {
+            continue;
+        };
+        let process_generation = proposal.process_generation();
+        metadata.extension_metadata.insert(
+            registered.namespace.clone(),
+            ExtensionEntryMetadata {
+                public: proposal.public,
+                value: proposal.value,
+                provenance: ExtensionMetadataProvenance {
+                    extension: registered.namespace.clone(),
+                    process_generation,
+                },
+            },
+        );
+    }
+    (!metadata.extension_metadata.is_empty()).then_some(metadata)
 }
 
 fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
@@ -4178,6 +4331,9 @@ impl Agent {
         if let Some(duplicate) = config.extensions.duplicate_tools.first() {
             return Err(AgentError::DuplicateTool(duplicate.clone()));
         }
+        if let Some(namespace) = config.extensions.invalid_metadata_namespaces.first() {
+            return Err(AgentError::ExtensionMetadataNamespace(namespace.clone()));
+        }
         let workspace = config.sandbox.workspace.canonicalize().map_err(|e| {
             AgentError::Workspace(format!("{}: {e}", config.sandbox.workspace.display()))
         })?;
@@ -4517,6 +4673,7 @@ impl Agent {
             tool_started_unix_ms: None,
             tool_finished_unix_ms: None,
             local_synthetic_assistant: false,
+            extension_metadata: Default::default(),
         }
     }
 
@@ -5128,6 +5285,8 @@ impl Agent {
             resource_owner: self.resource_owner.clone(),
         };
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
+        let provider_retry_hooks = self.extensions.provider_retry_hooks.clone();
+        let persistence_metadata_hooks = self.extensions.persistence_metadata_hooks.clone();
         let max_turns = self.max_turns;
         let reasoning = self.reasoning.clone();
         let reasoning_mode = self.reasoning_mode;
@@ -5474,12 +5633,34 @@ impl Agent {
                                 && stream_retries < provider_retry_limit(&error)
                                 && retryable_before_generation(&error) =>
                         {
-                            let delay = retry_after(&error, stream_retries);
+                            let retry_limit = provider_retry_limit(&error);
+                            if abort.is_set() {
+                                break Ok(None);
+                            }
+                            let host_delay = retry_after(&error, stream_retries);
+                            let retry_decision = provider_retry_decision(
+                                &provider_retry_hooks,
+                                &effect_run_id,
+                                &resource_owner,
+                                stream_retries.saturating_add(1),
+                                retry_limit,
+                                host_delay,
+                                ProviderRetryKind::BeforeGeneration,
+                                &abort,
+                            )
+                            .await;
+                            if !retry_decision.proceed {
+                                if abort.is_set() {
+                                    break Ok(None);
+                                }
+                                break Err(error);
+                            }
+                            let delay = host_delay.saturating_add(retry_decision.additional_delay);
                             stream_retries += 1;
                             stream_context.provider_retry();
                             let ev = AgentEvent::ProviderRetry {
                                 attempt: stream_retries,
-                                max_attempts: provider_retry_limit(&error),
+                                max_attempts: retry_limit,
                                 delay,
                                 error: provider_retry_diagnostic(&model, &error),
                             };
@@ -5616,12 +5797,34 @@ impl Agent {
                             let error = AiError::StreamProtocol(
                                 ygg_ai::StreamProtocolError::MissingFinish,
                             );
-                            if provider_retries_enabled
+                            let retry_candidate = provider_retries_enabled
                                 && !attempt_saw_generation
                                 && stream_retries < MAX_PROVIDER_RETRIES
-                                && retryable_stream_start(&error)
-                            {
-                                let delay = retry_after(&error, stream_retries);
+                                && retryable_stream_start(&error);
+                            let host_delay = retry_after(&error, stream_retries);
+                            let retry_decision = if retry_candidate {
+                                provider_retry_decision(
+                                    &provider_retry_hooks,
+                                    &effect_run_id,
+                                    &resource_owner,
+                                    stream_retries.saturating_add(1),
+                                    MAX_PROVIDER_RETRIES,
+                                    host_delay,
+                                    ProviderRetryKind::StreamStart,
+                                    &abort,
+                                )
+                                .await
+                            } else {
+                                ProviderRetryDecision {
+                                    proceed: false,
+                                    additional_delay: Duration::ZERO,
+                                }
+                            };
+                            if abort.is_set() {
+                                break 'consume Err(FinishReason::Aborted);
+                            }
+                            if retry_decision.proceed {
+                                let delay = host_delay.saturating_add(retry_decision.additional_delay);
                                 stream_retries += 1;
                                 stream_context.provider_retry();
                                 let ev = AgentEvent::ProviderRetry {
@@ -5731,7 +5934,28 @@ impl Agent {
                                 && retryable_stream_start(&error)
                             {
                                 let retry_limit = provider_retry_limit(&error);
-                                let delay = retry_after(&error, stream_retries);
+                                if abort.is_set() {
+                                    break 'consume Err(FinishReason::Aborted);
+                                }
+                                let host_delay = retry_after(&error, stream_retries);
+                                let retry_decision = provider_retry_decision(
+                                    &provider_retry_hooks,
+                                    &effect_run_id,
+                                    &resource_owner,
+                                    stream_retries.saturating_add(1),
+                                    retry_limit,
+                                    host_delay,
+                                    ProviderRetryKind::StreamStart,
+                                    &abort,
+                                )
+                                .await;
+                                if !retry_decision.proceed {
+                                    if abort.is_set() {
+                                        break 'consume Err(FinishReason::Aborted);
+                                    }
+                                    break;
+                                }
+                                let delay = host_delay.saturating_add(retry_decision.additional_delay);
                                 stream_retries += 1;
                                 stream_context.provider_retry();
                                 let ev = AgentEvent::ProviderRetry {
@@ -5936,7 +6160,19 @@ impl Agent {
                     });
                 }
 
-                if let Err(error) = session.append_assistant_turn(
+                let persistence_context = assistant_persistence_context(
+                    &effect_run_id,
+                    &resource_owner,
+                    &assistant,
+                    stop_reason.clone(),
+                );
+                let persistence_metadata = collect_persistence_metadata(
+                    &persistence_metadata_hooks,
+                    &persistence_context,
+                    &abort,
+                )
+                .await;
+                if let Err(error) = session.append_assistant_turn_with_metadata(
                     assistant.clone(),
                     model.endpoint.id.clone(),
                     model.spec.id.clone(),
@@ -5944,6 +6180,7 @@ impl Agent {
                     response.cost,
                     stop_reason.clone(),
                     raw_responses_output,
+                    persistence_metadata,
                 ) {
                     break 'run FinishReason::Failed(error.into());
                 }

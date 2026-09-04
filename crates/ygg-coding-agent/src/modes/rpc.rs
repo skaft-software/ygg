@@ -1521,6 +1521,16 @@ impl EventTranslator {
                             }
                             accumulated.push_str(&status);
                         }
+                        ToolProgress::Decoration(decoration) => {
+                            if !accumulated.is_empty() {
+                                accumulated.push('\n');
+                            }
+                            accumulated.push_str(decoration.label());
+                            if let Some(detail) = decoration.detail() {
+                                accumulated.push_str(" · ");
+                                accumulated.push_str(detail);
+                            }
+                        }
                         ToolProgress::Dropped { bytes, events } => {
                             accumulated.push_str(&format!(
                                 "\n[dropped {bytes} bytes and {events} events]"

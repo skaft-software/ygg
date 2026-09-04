@@ -1987,6 +1987,11 @@ fn progress_payload(progress: ToolProgress) -> serde_json::Value {
             "type": "status",
             "message": clip_text(&message, 16 * 1024),
         }),
+        ToolProgress::Decoration(decoration) => serde_json::json!({
+            "type": "decoration",
+            "label": clip_text(decoration.label(), 256),
+            "detail": decoration.detail().map(|detail| clip_text(detail, 4 * 1024)),
+        }),
         ToolProgress::Confirmation(request) => {
             let payload = serde_json::json!({
                 "type": "confirmation_required",

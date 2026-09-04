@@ -17,7 +17,7 @@ use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::extension_process::MAX_EXTENSION_TERMINAL_INPUT_BYTES;
 use ygg_agent::{
     analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
-    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
+    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session, ToolProgress,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
@@ -102,6 +102,28 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                 }
             }
         })
+    }
+
+    fn progress(&mut self, extension: &str, progress: &ToolProgress) {
+        // Raw command output and status are intentionally not transcript
+        // content. The typed decoration is already bounded and terminal-safe,
+        // so it is the one semantic progress surface suitable for Pi's live
+        // status detail.
+        let ToolProgress::Decoration(decoration) = progress else {
+            return;
+        };
+        let detail = decoration
+            .detail()
+            .map(|detail| format!(" · {detail}"))
+            .unwrap_or_default();
+        self.shell
+            .set_status_detail(format!("{extension}: {}{detail}", decoration.label()));
+        self.shell.render();
+    }
+
+    fn finish_progress(&mut self, _extension: &str) {
+        self.shell.set_status_detail(String::new());
+        self.shell.render();
     }
 
     fn confirm<'a>(

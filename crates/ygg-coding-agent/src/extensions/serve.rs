@@ -9714,7 +9714,7 @@ async fn project_tool_progress(
                 .saturating_add(bytes.len() as u64);
             publish_tool_progress(&id.0, projection, events).await?;
         }
-        ToolProgress::Status(_) => {}
+        ToolProgress::Status(_) | ToolProgress::Decoration(_) => {}
         ToolProgress::Dropped { bytes, .. } => {
             let entry = projection.tool_progress.entry(id.0.clone()).or_default();
             entry.dropped_output_bytes = entry.dropped_output_bytes.saturating_add(bytes);

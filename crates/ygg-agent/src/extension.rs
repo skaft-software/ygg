@@ -12,7 +12,7 @@ use crate::events::AgentEvent;
 use crate::input::UserInput;
 use crate::tool::{Tool, ToolContext, ToolError};
 use tokio::sync::Notify;
-use ygg_ai::{Model, ToolDef};
+use ygg_ai::{Model, ModelId, Protocol, StopReason, ToolDef};
 
 type ToolPolicy = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
@@ -84,6 +84,326 @@ pub trait ToolCallHook: Send + Sync {
         is_error: bool,
         context: &ToolContext<'_>,
     );
+}
+
+/// Reason a host-controlled provider retry is being considered.
+///
+/// The host derives this classification from a redacted provider failure. It
+/// intentionally omits request content, endpoints, credentials, and arbitrary
+/// provider diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRetryKind {
+    /// Opening a replacement stream failed before any provider generation.
+    BeforeGeneration,
+    /// A stream ended before generating any provider content.
+    StreamStart,
+}
+
+/// Largest additional delay a provider-retry hook may add to one host retry.
+///
+/// Hooks can only add delay; they cannot shorten a provider `Retry-After` or
+/// the host's deterministic backoff.
+pub const MAX_PROVIDER_RETRY_ADDITIONAL_DELAY: Duration = Duration::from_secs(5);
+
+/// Read-only context for a typed provider-retry advisory hook.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRetryContext {
+    /// Host-created run identity.
+    pub run_id: String,
+    /// Host-derived resource owner for the session/run.
+    pub resource_owner: String,
+    /// One-based replacement-attempt number about to be made.
+    pub attempt: usize,
+    /// Authoritative maximum replacement attempts for this failure class.
+    pub max_attempts: usize,
+    /// Host-selected minimum delay, including any provider `Retry-After`.
+    pub host_delay: Duration,
+    /// Safe failure classification.
+    pub kind: ProviderRetryKind,
+}
+
+/// Non-authoritative advice returned by a provider-retry hook.
+///
+/// [`Retry`](Self::Retry) cannot create a retry when the host has exhausted a
+/// budget, decided the failure is unsafe to replay, or observed cancellation.
+/// [`Stop`](Self::Stop) can only decline the retry currently under
+/// consideration; it never changes terminal error classification.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProviderRetryAdvice {
+    /// Leave the host's retry decision unchanged.
+    #[default]
+    NoOpinion,
+    /// Record support for the host-proposed retry without expanding its budget.
+    Retry,
+    /// Add a bounded delay to the host-selected retry time. The host clamps the
+    /// value to [`MAX_PROVIDER_RETRY_ADDITIONAL_DELAY`]; hooks cannot shorten
+    /// a provider `Retry-After` or host backoff.
+    Delay {
+        /// Additional delay before the host opens the replacement stream.
+        additional: Duration,
+    },
+    /// Decline the host-proposed retry.
+    Stop,
+}
+
+/// Typed, bounded advisory hook invoked only after the host has independently
+/// established that a provider retry is safe and within its retry budget.
+#[async_trait::async_trait]
+pub trait ProviderRetryHook: Send + Sync {
+    /// Advises on the single retry under consideration.
+    async fn provider_retry(&self, context: &ProviderRetryContext) -> ProviderRetryAdvice;
+}
+
+/// Stable semantic summary of a completed assistant turn before it becomes a
+/// durable session entry.
+///
+/// This is deliberately not a mutable message or event. Extensions receive no
+/// message text, tool arguments, provider sidecar, or session internals here;
+/// they can return only their own bounded metadata value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssistantPersistenceContext {
+    /// Host-created run identity.
+    pub run_id: String,
+    /// Host-derived resource owner for the session/run.
+    pub resource_owner: String,
+    /// Canonical model that produced the completed turn.
+    pub model: ModelId,
+    /// Provider protocol used for the completed turn.
+    pub protocol: Protocol,
+    /// Semantic terminal reason supplied by the provider.
+    pub stop_reason: StopReason,
+    /// Number of text bytes in the completed assistant response.
+    pub text_bytes: usize,
+    /// Number of tool-call parts in the completed assistant response.
+    pub tool_call_count: usize,
+    /// Number of reasoning parts in the completed assistant response.
+    pub reasoning_part_count: usize,
+    /// Number of non-text media parts in the completed assistant response.
+    pub media_part_count: usize,
+}
+
+/// Extension-owned value proposed for one completed assistant entry.
+///
+/// The host validates shape and size at the session append boundary, adds the
+/// registered namespace/provenance, and ignores malformed or late output.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistenceMetadataProposal {
+    /// Whether regular frontend/export projections may expose this value.
+    pub public: bool,
+    /// Inert JSON owned by the registered extension namespace.
+    pub value: serde_json::Value,
+    process_generation: Option<u64>,
+}
+
+impl PersistenceMetadataProposal {
+    /// Creates one native extension-owned metadata proposal.
+    pub fn new(public: bool, value: serde_json::Value) -> Self {
+        Self {
+            public,
+            value,
+            process_generation: None,
+        }
+    }
+
+    pub(crate) fn from_process(public: bool, value: serde_json::Value, generation: u64) -> Self {
+        Self {
+            public,
+            value,
+            process_generation: Some(generation),
+        }
+    }
+
+    pub(crate) fn process_generation(&self) -> Option<u64> {
+        self.process_generation
+    }
+}
+
+/// Typed hook that can attach one namespaced metadata value to a completed
+/// assistant turn before its atomic persistence boundary.
+#[async_trait::async_trait]
+pub trait PersistenceMetadataHook: Send + Sync {
+    /// Returns a value for this turn, or `None` when the extension has no
+    /// durable annotation to attach.
+    async fn before_assistant_persist(
+        &self,
+        context: &AssistantPersistenceContext,
+    ) -> Option<PersistenceMetadataProposal>;
+}
+
+/// Maximum affected resource identities disclosed to a post-mutation hook.
+pub const MAX_POST_MUTATION_AFFECTED_RESOURCES: usize = 32;
+/// Maximum opaque mutation identifier bytes retained for de-duplication.
+pub const MAX_POST_MUTATION_ID_BYTES: usize = 128;
+/// Maximum opaque resource identity bytes in a post-mutation notification.
+pub const MAX_POST_MUTATION_RESOURCE_ID_BYTES: usize = 128;
+
+/// Host-owned category of a completed mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostMutationKind {
+    /// A host configuration value was durably changed or rolled back.
+    Configuration,
+    /// A host resource catalog changed after discovery/commit.
+    Resource,
+    /// A migration ingested a supported resource into host-owned storage.
+    MigrationIngestion,
+}
+
+/// Settled state supplied after a mutation's commit or rollback is complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostMutationState {
+    /// The mutation committed durably.
+    Committed,
+    /// The host completed its rollback and no partial mutation remains.
+    RolledBack,
+}
+
+/// Read-only, content-free notification of one completed host mutation.
+///
+/// Mutation and resource identities are opaque host identifiers, never file
+/// paths, raw contents, credentials, or a filesystem watch feed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostMutationContext {
+    mutation_id: String,
+    kind: PostMutationKind,
+    affected_resources: Vec<String>,
+    generation: u64,
+    state: PostMutationState,
+}
+
+impl PostMutationContext {
+    /// Creates a validated post-mutation notification.
+    ///
+    /// `mutation_id` must remain stable if delivery is retried. Returns `None`
+    /// when an identifier is not an opaque lower-ASCII host identity, the
+    /// generation is zero, or the bounded resource list is invalid.
+    pub fn new(
+        mutation_id: impl Into<String>,
+        kind: PostMutationKind,
+        affected_resources: impl IntoIterator<Item = String>,
+        generation: u64,
+        state: PostMutationState,
+    ) -> Option<Self> {
+        let mutation_id = mutation_id.into();
+        if generation == 0
+            || !valid_post_mutation_identity(&mutation_id, MAX_POST_MUTATION_ID_BYTES)
+        {
+            return None;
+        }
+        let mut affected_resources = affected_resources.into_iter().collect::<Vec<_>>();
+        if affected_resources.len() > MAX_POST_MUTATION_AFFECTED_RESOURCES
+            || affected_resources.iter().any(|resource| {
+                !valid_post_mutation_identity(resource, MAX_POST_MUTATION_RESOURCE_ID_BYTES)
+            })
+        {
+            return None;
+        }
+        affected_resources.sort();
+        affected_resources.dedup();
+        Some(Self {
+            mutation_id,
+            kind,
+            affected_resources,
+            generation,
+            state,
+        })
+    }
+
+    /// Stable host-created de-duplication identity.
+    pub fn mutation_id(&self) -> &str {
+        &self.mutation_id
+    }
+
+    /// Settled host mutation category.
+    pub fn kind(&self) -> PostMutationKind {
+        self.kind
+    }
+
+    /// Opaque affected host resource identities.
+    pub fn affected_resources(&self) -> &[String] {
+        &self.affected_resources
+    }
+
+    /// Host resource-generation fence associated with this mutation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether the host committed or fully rolled back the mutation.
+    pub fn state(&self) -> PostMutationState {
+        self.state
+    }
+}
+
+fn valid_post_mutation_identity(value: &str, maximum: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= maximum
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b':' | b'.' => {
+                index > 0 || byte.is_ascii_lowercase()
+            }
+            _ => false,
+        })
+}
+
+/// A bounded rescan request produced by a typed post-mutation hook.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PostMutationDisposition {
+    /// The extension does not need a host resource rescan.
+    #[default]
+    NoRescan,
+    /// Request rescanning only selected opaque identities from the mutation's
+    /// affected-resource list. The host validates subset and generation before
+    /// acting on this disposition.
+    RequestRescan {
+        /// Requested affected resource identities.
+        resource_ids: Vec<String>,
+    },
+}
+
+impl PostMutationDisposition {
+    /// Creates a shape-validated selected-resource rescan request.
+    pub fn request_rescan(resource_ids: impl IntoIterator<Item = String>) -> Option<Self> {
+        let mut resource_ids = resource_ids.into_iter().collect::<Vec<_>>();
+        if resource_ids.is_empty()
+            || resource_ids.len() > MAX_POST_MUTATION_AFFECTED_RESOURCES
+            || resource_ids.iter().any(|resource| {
+                !valid_post_mutation_identity(resource, MAX_POST_MUTATION_RESOURCE_ID_BYTES)
+            })
+        {
+            return None;
+        }
+        resource_ids.sort();
+        resource_ids.dedup();
+        Some(Self::RequestRescan { resource_ids })
+    }
+
+    /// Selected resource identities when a rescan was requested.
+    pub fn resource_ids(&self) -> Option<&[String]> {
+        match self {
+            Self::NoRescan => None,
+            Self::RequestRescan { resource_ids } => Some(resource_ids),
+        }
+    }
+}
+
+/// A host-validated, extension-attributed rescan request ready for the
+/// product's resource resolver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PostMutationRescan {
+    /// Registered extension namespace that requested the rescan.
+    pub extension: String,
+    /// Stable mutation identity that caused the request.
+    pub mutation_id: String,
+    /// Generation fence inherited from the settled host mutation.
+    pub generation: u64,
+    /// Selected opaque resource identities, already subset-validated by host.
+    pub resource_ids: Vec<String>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RegisteredPersistenceMetadataHook {
+    pub(crate) namespace: String,
+    pub(crate) hook: Arc<dyn PersistenceMetadataHook>,
 }
 
 #[derive(Default)]
@@ -373,7 +693,10 @@ pub struct ExtensionHost {
     pub(crate) tools: Vec<Arc<dyn Tool>>,
     pub(crate) observers: Vec<Arc<dyn EventObserver>>,
     pub(crate) tool_call_hooks: Vec<Arc<dyn ToolCallHook>>,
+    pub(crate) provider_retry_hooks: Vec<Arc<dyn ProviderRetryHook>>,
+    pub(crate) persistence_metadata_hooks: Vec<RegisteredPersistenceMetadataHook>,
     pub(crate) duplicate_tools: Vec<String>,
+    pub(crate) invalid_metadata_namespaces: Vec<String>,
     dynamic_tools: Arc<RwLock<DynamicToolRegistry>>,
 }
 
@@ -383,7 +706,10 @@ impl Default for ExtensionHost {
             tools: Vec::new(),
             observers: Vec::new(),
             tool_call_hooks: Vec::new(),
+            provider_retry_hooks: Vec::new(),
+            persistence_metadata_hooks: Vec::new(),
             duplicate_tools: Vec::new(),
+            invalid_metadata_namespaces: Vec::new(),
             dynamic_tools: Arc::new(RwLock::new(DynamicToolRegistry::default())),
         }
     }
@@ -488,6 +814,39 @@ impl ExtensionHost {
         self.tool_call_hooks.push(Arc::new(hook));
     }
 
+    /// Register a non-authoritative provider-retry advisory hook.
+    pub fn provider_retry_hook(&mut self, hook: impl ProviderRetryHook + 'static) {
+        self.provider_retry_hooks.push(Arc::new(hook));
+    }
+
+    /// Register a typed pre-persistence metadata hook under one extension-owned
+    /// namespace.
+    ///
+    /// The first valid registration for a namespace wins. Invalid or duplicate
+    /// namespaces make [`Agent::new`](crate::Agent::new) fail instead of
+    /// silently allowing one extension to overwrite another's durable data.
+    pub fn persistence_metadata_hook(
+        &mut self,
+        namespace: impl Into<String>,
+        hook: impl PersistenceMetadataHook + 'static,
+    ) {
+        let namespace = namespace.into();
+        if !crate::session::is_valid_extension_metadata_namespace(&namespace)
+            || self
+                .persistence_metadata_hooks
+                .iter()
+                .any(|registered| registered.namespace == namespace)
+        {
+            self.invalid_metadata_namespaces.push(namespace);
+            return;
+        }
+        self.persistence_metadata_hooks
+            .push(RegisteredPersistenceMetadataHook {
+                namespace,
+                hook: Arc::new(hook),
+            });
+    }
+
     /// Loads an extension by letting it register against this host.
     pub fn load(&mut self, extension: &dyn Extension) {
         extension.register(self);
@@ -551,6 +910,9 @@ impl ExtensionHost {
         let mut scoped = Self::new();
         scoped.observers = self.observers.clone();
         scoped.tool_call_hooks = self.tool_call_hooks.clone();
+        scoped.provider_retry_hooks = self.provider_retry_hooks.clone();
+        scoped.persistence_metadata_hooks = self.persistence_metadata_hooks.clone();
+        scoped.invalid_metadata_namespaces = self.invalid_metadata_namespaces.clone();
         let mut effective = Vec::new();
         for tool in available {
             let name = tool.definition().name;

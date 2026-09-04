@@ -950,6 +950,7 @@ mod tests {
                     tool_output: None,
                     tool_started_unix_ms: None,
                     tool_finished_unix_ms: None,
+                    extension_metadata: Default::default(),
                 }),
             )
             .unwrap();
@@ -973,6 +974,7 @@ mod tests {
                     tool_output: None,
                     tool_started_unix_ms: None,
                     tool_finished_unix_ms: None,
+                    extension_metadata: Default::default(),
                 }),
             )
             .unwrap();
