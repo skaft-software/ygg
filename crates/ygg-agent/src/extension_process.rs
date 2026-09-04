@@ -918,6 +918,9 @@ fn apple_process_snapshot(pid: i32) -> Option<ProcessSnapshot> {
         )
     };
     if read != size_i32 {
+        // Darwin can stop serving PROC_PIDTBSDINFO for an exited, unreaped
+        // process while `kill(pid, 0)` still succeeds. Treat the absent
+        // snapshot as no identity; falling back to `kill` would revive a zombie.
         return None;
     }
     // SAFETY: the exact-size success check above proves initialization.
@@ -18405,23 +18408,48 @@ sleep 30
             .spawn()
             .expect("spawn zombie fixture");
         let pid = i32::try_from(child.id()).expect("fixture pid");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let snapshot = loop {
-            if let Some(snapshot) = process_snapshot(pid).filter(|snapshot| snapshot.is_zombie) {
-                break Some(snapshot);
-            }
-            if Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let wait_id = libc::id_t::try_from(pid).expect("fixture wait id");
+        let mut exit = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: `exit` is writable siginfo storage and `pid` names our child.
+        // WNOWAIT observes its exit while preserving the state for `Child::wait`.
+        let wait_result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                wait_id,
+                exit.as_mut_ptr(),
+                libc::WEXITED | libc::WNOWAIT,
+            )
         };
-        child.wait().expect("reap zombie fixture");
+        let wait_error = (wait_result == -1).then(std::io::Error::last_os_error);
 
-        let snapshot = snapshot.expect("fixture process never reported as a zombie");
-        assert!(!snapshot.is_live());
-        assert_eq!(process_identity(pid), None);
+        // Capture liveness before reaping. Linux exposes a zombie snapshot;
+        // Darwin may instead stop serving PROC_PIDTBSDINFO for the zombie.
+        let snapshot = process_snapshot(pid);
+        let identity = process_identity(pid);
+        let is_live = process_is_live_for_test(pid);
+        let exit_status = child.wait().expect("reap zombie fixture");
+
+        assert_eq!(
+            wait_result, 0,
+            "waitid did not observe fixture exit: {wait_error:?}"
+        );
         assert!(
-            !process_is_live_for_test(pid),
+            exit_status.success(),
+            "zombie fixture failed: {exit_status}"
+        );
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(
+            snapshot.is_some_and(|snapshot| !snapshot.is_live()),
+            "an exited, unreaped process lacked a zombie snapshot: {snapshot:?}"
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(
+            snapshot.is_none_or(|snapshot| !snapshot.is_live()),
+            "an exited, unreaped process had a live snapshot: {snapshot:?}"
+        );
+        assert_eq!(identity, None);
+        assert!(
+            !is_live,
             "zombies must not keep lifecycle diagnostics alive"
         );
     }
