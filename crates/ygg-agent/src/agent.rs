@@ -6491,13 +6491,14 @@ impl Agent {
                                         }
                                     };
                                     for hook in &tool_call_hooks {
-                                        if let Err(_) = hook
+                                        if hook
                                             .before_tool_call(
                                                 &call.name,
                                                 &hook_arguments,
                                                 &tool_ctx,
                                             )
                                             .await
+                                            .is_err()
                                         {
                                             if tool_ctx.cancellation.is_cancelled() {
                                                 return Err(cancelled_tool_error());
