@@ -8,6 +8,7 @@
 
 pub mod capabilities;
 pub mod glyphs;
+pub mod images;
 pub mod rich_text;
 pub mod sanitize;
 mod scrollback;
@@ -20,10 +21,22 @@ pub mod utils;
 pub mod width;
 
 pub use capabilities::{
-    CapabilityOverrides, CapabilityProbe, ColorDepth, SupportLevel, TerminalCapabilities,
-    TerminalSize,
+    CapabilityOverrides, CapabilityProbe, CellPixelSize, ColorDepth, SupportLevel,
+    TerminalCapabilities, TerminalSize, MAX_CELL_PIXEL_DIMENSION,
 };
 pub use glyphs::GlyphSet;
+pub use images::{
+    cell_rows_for_pixels, parse_terminal_image_reply, ImageAction, ImageCapabilities,
+    ImageCapabilityOverrides, ImageCapabilityQuery, ImageDimensions, ImageError,
+    ImageFallbackReason, ImageFilename, ImageFormat, ImageId, ImageLayout, ImageLimits,
+    ImagePlanner, ImageProtocol, ImageProtocolEncoder, ImageRegistry, ImageRenderPlan,
+    ImageReservation, ImageTerminalCommand, ImageViewport, TerminalImage, TerminalImageReply,
+    HARD_MAX_CONTAINER_ITEMS, HARD_MAX_ENCODED_OUTPUT_BYTES, HARD_MAX_FILENAME_BYTES,
+    HARD_MAX_HEADER_BYTES, HARD_MAX_IMAGE_DIMENSION, HARD_MAX_IMAGE_PAYLOAD_BYTES,
+    HARD_MAX_IMAGE_PIXELS, HARD_MAX_LIVE_IMAGES, HARD_MAX_PROTOCOL_CHUNKS,
+    HARD_MAX_PROTOCOL_CHUNK_BYTES, HARD_MAX_QUERY_TIMEOUT, HARD_MAX_TERMINAL_REPLY_BYTES,
+    MAX_IMAGE_CELL_COLUMNS, MAX_RESERVED_IMAGE_ROWS,
+};
 pub use rich_text::diff::{DiffLine, DiffLineKind, DiffRenderOptions, UnifiedDiff};
 pub use rich_text::markdown::parse as parse_markdown;
 pub use rich_text::render::{

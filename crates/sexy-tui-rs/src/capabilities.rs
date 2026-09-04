@@ -6,6 +6,39 @@
 
 use std::io::IsTerminal;
 
+/// Maximum byte length accepted from one environment or explicit probe value.
+///
+/// Capability values are only hints. Ignoring an oversized or control-bearing
+/// value is safer than allocating and normalizing attacker-controlled text.
+const MAX_CAPABILITY_VALUE_BYTES: usize = 1_024;
+
+fn normalized_probe_value(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return String::new();
+    };
+    if value.is_empty()
+        || value.len() > MAX_CAPABILITY_VALUE_BYTES
+        || value.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return String::new();
+    }
+    value.to_ascii_lowercase()
+}
+
+fn bounded_environment_value(name: &str) -> Option<String> {
+    let value = std::env::var_os(name)?;
+    let encoded = value.as_os_str().as_encoded_bytes();
+    if encoded.is_empty() || encoded.len() > MAX_CAPABILITY_VALUE_BYTES {
+        return None;
+    }
+    let value = value.into_string().ok()?;
+    (!value.bytes().any(|byte| byte.is_ascii_control())).then_some(value)
+}
+
+fn valid_terminal_size(size: Option<TerminalSize>) -> Option<TerminalSize> {
+    size.filter(|size| size.columns > 0 && size.rows > 0)
+}
+
 /// Terminal colour precision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ColorDepth {
@@ -46,6 +79,49 @@ pub struct TerminalSize {
     pub rows: u16,
 }
 
+/// Upper bound accepted for a terminal cell-pixel measurement.
+///
+/// A cell size is terminal metadata rather than image content. Keeping it small
+/// prevents a hostile reply from turning a later image-layout multiplication
+/// into an unexpectedly large value.
+pub const MAX_CELL_PIXEL_DIMENSION: u16 = 16_384;
+
+/// Pixel dimensions of one terminal character cell.
+///
+/// Values can come from a bounded, caller-owned terminal reply parser. The
+/// constructor rejects zero and implausibly large measurements; callers cannot
+/// construct an invalid value through this public type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellPixelSize {
+    width: u16,
+    height: u16,
+}
+
+impl CellPixelSize {
+    /// Build a validated cell-pixel measurement.
+    pub const fn new(width: u16, height: u16) -> Option<Self> {
+        if width == 0
+            || height == 0
+            || width > MAX_CELL_PIXEL_DIMENSION
+            || height > MAX_CELL_PIXEL_DIMENSION
+        {
+            None
+        } else {
+            Some(Self { width, height })
+        }
+    }
+
+    /// Horizontal pixels in one terminal cell.
+    pub const fn width(self) -> u16 {
+        self.width
+    }
+
+    /// Vertical pixels in one terminal cell.
+    pub const fn height(self) -> u16 {
+        self.height
+    }
+}
+
 /// A central description shared by renderers, widgets, and terminal backends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalCapabilities {
@@ -73,6 +149,9 @@ pub struct TerminalCapabilities {
     pub animation: bool,
     /// Dimensions known at detection time, if any.
     pub dimensions: Option<TerminalSize>,
+    /// Pixel dimensions of one character cell when a caller has obtained a
+    /// validated terminal reply. Detection itself never sends a query.
+    pub cell_pixel_size: Option<CellPixelSize>,
     /// Plain/log mode: no cursor control, colour, hyperlinks, or animation.
     pub plain: bool,
 
@@ -110,6 +189,7 @@ impl TerminalCapabilities {
             bracketed_paste: false,
             animation: false,
             dimensions: None,
+            cell_pixel_size: None,
             plain: true,
             kitty_graphics: false,
             iterm2_images: false,
@@ -136,6 +216,7 @@ impl TerminalCapabilities {
             bracketed_paste: true,
             animation: true,
             dimensions: None,
+            cell_pixel_size: None,
             plain: false,
             kitty_graphics: false,
             iterm2_images: false,
@@ -154,29 +235,15 @@ impl TerminalCapabilities {
 
     /// Detect from an explicit probe. This is deterministic and testable.
     pub fn detect_from(probe: &CapabilityProbe, overrides: &CapabilityOverrides) -> Self {
-        let term = probe
-            .term
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let program = probe
-            .term_program
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let colorterm = probe
-            .colorterm
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let term = normalized_probe_value(probe.term.as_deref());
+        let program = normalized_probe_value(probe.term_program.as_deref());
+        let colorterm = normalized_probe_value(probe.colorterm.as_deref());
         let multiplexer = probe.tmux || term.starts_with("screen") || term.starts_with("tmux");
         let dumb = term == "dumb";
         let known_term = !term.is_empty() && !dumb;
         let interactive = probe.stdin_tty && probe.stdout_tty && known_term;
-        let utf8_locale = probe.locale.as_deref().is_some_and(|locale| {
-            let locale = locale.to_ascii_lowercase();
-            locale.contains("utf-8") || locale.contains("utf8")
-        });
+        let locale = normalized_probe_value(probe.locale.as_deref());
+        let utf8_locale = locale.contains("utf-8") || locale.contains("utf8");
         let rich = term.contains("ghostty")
             || term.contains("kitty")
             || term.contains("wezterm")
@@ -226,10 +293,11 @@ impl TerminalCapabilities {
             synchronized_output,
             bracketed_paste: interactive,
             animation: interactive,
-            dimensions: probe.dimensions,
+            dimensions: valid_terminal_size(probe.dimensions),
+            cell_pixel_size: probe.cell_pixel_size,
             plain: !interactive,
-            kitty_graphics: kitty_family && !probe.cmux,
-            iterm2_images: interactive && program == "iterm.app",
+            kitty_graphics: kitty_family && !multiplexer && !probe.cmux,
+            iterm2_images: interactive && !multiplexer && program == "iterm.app",
             kitty_keyboard: kitty_family,
             sync_output: synchronized_output,
             true_color: color_depth == ColorDepth::TrueColor,
@@ -254,11 +322,13 @@ impl TerminalCapabilities {
             self.synchronized_output = false;
             self.bracketed_paste = false;
             self.animation = false;
+            self.cell_pixel_size = None;
             self.kitty_graphics = false;
             self.iterm2_images = false;
             self.kitty_keyboard = false;
             self.nerd_font = false;
         }
+        self.dimensions = valid_terminal_size(self.dimensions);
         self.sync_output = self.synchronized_output;
         self.true_color = self.color_depth == ColorDepth::TrueColor;
     }
@@ -267,6 +337,15 @@ impl TerminalCapabilities {
     pub fn with_overrides(mut self, overrides: &CapabilityOverrides) -> Self {
         overrides.apply(&mut self);
         self.normalize();
+        self
+    }
+
+    /// Attach a caller-validated cell-pixel measurement without sending a
+    /// terminal query. Plain profiles deliberately discard the value.
+    pub fn with_cell_pixel_size(mut self, cell_pixel_size: CellPixelSize) -> Self {
+        if self.interactive && !self.plain {
+            self.cell_pixel_size = Some(cell_pixel_size);
+        }
         self
     }
 }
@@ -286,33 +365,28 @@ pub struct CapabilityProbe {
     pub wt_session: bool,
     pub cmux: bool,
     pub dimensions: Option<TerminalSize>,
+    /// A caller-supplied, already validated cell-pixel measurement. Process
+    /// detection deliberately leaves this unset because it never queries.
+    pub cell_pixel_size: Option<CellPixelSize>,
 }
 
 impl CapabilityProbe {
     /// Capture process state without writing terminal queries.
     pub fn from_process() -> Self {
-        let locale = std::env::var("LC_ALL")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .or_else(|| {
-                std::env::var("LC_CTYPE")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-            })
-            .or_else(|| std::env::var("LANG").ok().filter(|value| !value.is_empty()));
-        let dimensions = crossterm::terminal::size()
-            .ok()
-            .map(|(columns, rows)| TerminalSize { columns, rows });
+        let locale = bounded_environment_value("LC_ALL")
+            .or_else(|| bounded_environment_value("LC_CTYPE"))
+            .or_else(|| bounded_environment_value("LANG"));
+        let dimensions = valid_terminal_size(
+            crossterm::terminal::size()
+                .ok()
+                .map(|(columns, rows)| TerminalSize { columns, rows }),
+        );
         Self {
             stdin_tty: std::io::stdin().is_terminal(),
             stdout_tty: std::io::stdout().is_terminal(),
-            term: std::env::var("TERM").ok().filter(|value| !value.is_empty()),
-            term_program: std::env::var("TERM_PROGRAM")
-                .ok()
-                .filter(|value| !value.is_empty()),
-            colorterm: std::env::var("COLORTERM")
-                .ok()
-                .filter(|value| !value.is_empty()),
+            term: bounded_environment_value("TERM"),
+            term_program: bounded_environment_value("TERM_PROGRAM"),
+            colorterm: bounded_environment_value("COLORTERM"),
             locale,
             no_color: std::env::var_os("NO_COLOR").is_some(),
             tmux: std::env::var_os("TMUX").is_some(),
@@ -321,6 +395,7 @@ impl CapabilityProbe {
             wt_session: std::env::var_os("WT_SESSION").is_some(),
             cmux: std::env::var_os("CMUX_SOCKET_PATH").is_some(),
             dimensions,
+            cell_pixel_size: None,
         }
     }
 }
@@ -340,6 +415,8 @@ pub struct CapabilityOverrides {
     pub bracketed_paste: Option<bool>,
     pub animation: Option<bool>,
     pub dimensions: Option<TerminalSize>,
+    /// Explicit cell-pixel measurement obtained by caller-managed probing.
+    pub cell_pixel_size: Option<CellPixelSize>,
     pub plain: Option<bool>,
     pub kitty_graphics: Option<bool>,
     pub iterm2_images: Option<bool>,
@@ -369,6 +446,9 @@ impl CapabilityOverrides {
         assign!(animation);
         if let Some(value) = self.dimensions {
             capabilities.dimensions = Some(value);
+        }
+        if let Some(value) = self.cell_pixel_size {
+            capabilities.cell_pixel_size = Some(value);
         }
         assign!(plain);
         assign!(kitty_graphics);
@@ -436,12 +516,44 @@ mod tests {
             ColorDepth::None
         );
 
-        let mut tmux = probe("xterm-256color");
+        let mut tmux = probe("wezterm");
         tmux.term_program = Some("WezTerm".into());
         tmux.tmux = true;
         let caps = TerminalCapabilities::detect_from(&tmux, &Default::default());
         assert!(!caps.hyperlinks);
         assert!(!caps.synchronized_output);
+        assert!(!caps.kitty_graphics);
+
+        let mut iterm_tmux = probe("xterm-256color");
+        iterm_tmux.term_program = Some("iTerm.app".into());
+        iterm_tmux.tmux = true;
+        assert!(!TerminalCapabilities::detect_from(&iterm_tmux, &Default::default()).iterm2_images);
+    }
+
+    #[test]
+    fn bounded_probe_values_and_cell_pixels_are_normalized() {
+        let mut hostile = probe("xterm-256color");
+        hostile.term = Some("x".repeat(MAX_CAPABILITY_VALUE_BYTES + 1));
+        assert!(TerminalCapabilities::detect_from(&hostile, &Default::default()).plain);
+
+        let cell = CellPixelSize::new(8, 16).unwrap();
+        let mut measured = probe("xterm-256color");
+        measured.dimensions = Some(TerminalSize {
+            columns: 0,
+            rows: 24,
+        });
+        measured.cell_pixel_size = Some(cell);
+        let measured = TerminalCapabilities::detect_from(&measured, &Default::default());
+        assert_eq!(measured.dimensions, None);
+        assert_eq!(measured.cell_pixel_size, Some(cell));
+
+        let plain = measured.with_overrides(&CapabilityOverrides {
+            plain: Some(true),
+            ..CapabilityOverrides::default()
+        });
+        assert_eq!(plain.cell_pixel_size, None);
+        assert_eq!(CellPixelSize::new(0, 16), None);
+        assert_eq!(CellPixelSize::new(MAX_CELL_PIXEL_DIMENSION + 1, 16), None);
     }
 
     #[test]

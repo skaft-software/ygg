@@ -6,7 +6,9 @@ use std::process::Command;
 use std::rc::Rc;
 
 use sexy_tui_rs::{
-    ColorDepth, Component, Terminal, TerminalCapabilities, TerminalInput, CURSOR_MARKER, TUI,
+    CellPixelSize, ColorDepth, Component, ImageCapabilities, ImageId, ImageLimits, ImagePlanner,
+    ImageProtocol, ImageViewport, Terminal, TerminalCapabilities, TerminalImage, TerminalInput,
+    CURSOR_MARKER, TUI,
 };
 
 const PI_SYNC_BEGIN: &str = "\x1b[?2026h";
@@ -157,6 +159,56 @@ fn numbered(prefix: &str, count: usize) -> Vec<String> {
     (0..count)
         .map(|index| format!("{prefix} {index}"))
         .collect()
+}
+
+fn tall_png() -> TerminalImage {
+    // A valid, static 1x33 RGBA PNG generated from 33 filtered scanlines.
+    TerminalImage::from_bytes(vec![
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 33, 8,
+        6, 0, 0, 0, 24, 185, 193, 191, 0, 0, 0, 16, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192,
+        240, 159, 97, 144, 19, 0, 49, 155, 65, 191, 162, 42, 52, 239, 0, 0, 0, 0, 73, 69, 78, 68,
+        174, 66, 96, 130,
+    ])
+    .unwrap()
+}
+
+#[test]
+fn image_plans_keep_protocol_bytes_out_of_native_scrollback_frames() {
+    let image = tall_png();
+    let cell = CellPixelSize::new(8, 16).unwrap();
+    let viewport = ImageViewport::new(40, 10, Some(cell)).unwrap();
+    let kitty = ImagePlanner::new(
+        ImageCapabilities::forced(Some(ImageProtocol::Kitty), Some(cell)),
+        ImageLimits::default(),
+    )
+    .plan_place(ImageId::new(301).unwrap(), &image, viewport)
+    .unwrap();
+    let iterm = ImagePlanner::new(
+        ImageCapabilities::forced(Some(ImageProtocol::Iterm2), Some(cell)),
+        ImageLimits::default(),
+    )
+    .plan_place(ImageId::new(302).unwrap(), &image, viewport)
+    .unwrap();
+
+    assert_eq!(kitty.semantic_rows(), vec![String::new(); 3]);
+    assert_eq!(kitty.semantic_rows(), iterm.semantic_rows());
+    let mut harness = Harness::new(40, 10, kitty.semantic_rows());
+    harness.start();
+    let first_frame = harness.take_writes();
+    assert!(!first_frame.contains("\x1b_G"), "{first_frame:?}");
+    assert!(!first_frame.contains("\x1b]1337;"), "{first_frame:?}");
+
+    harness.resize(30, 10);
+    let resized_frame = harness.take_writes();
+    assert!(!resized_frame.contains("\x1b_G"), "{resized_frame:?}");
+    assert!(!resized_frame.contains("\x1b]1337;"), "{resized_frame:?}");
+
+    let mut kitty_wire = Vec::new();
+    kitty.write_protocol_to(&mut kitty_wire).unwrap();
+    assert!(kitty_wire.starts_with(b"\x1b_Ga=T,"));
+    let mut iterm_wire = Vec::new();
+    iterm.write_protocol_to(&mut iterm_wire).unwrap();
+    assert!(iterm_wire.starts_with(b"\x1b]1337;File="));
 }
 
 #[test]

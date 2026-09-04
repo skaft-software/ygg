@@ -16,7 +16,8 @@ updates stable, and degrades to deterministic escape-free text.
 - Unified diffs with visible `+`/`-` prefixes and optional line numbers.
 - One grapheme/display-cell width policy for CJK, combining marks, emoji, and tabs.
 - Conservative terminal capabilities, explicit overrides, Unicode/ASCII glyph sets,
-  color quantization, safe OSC 8 links, and complete plain mode.
+  color quantization, safe OSC 8 links, complete plain mode, and a bounded
+  out-of-band Kitty/iTerm2 image foundation.
 - Stable-ID `LiveRegion` updates with stale-generation rejection and chronological
   log events for noninteractive frontends.
 - Retained `Component`/`TUI` line-differential rendering and resize reflow.
@@ -189,6 +190,56 @@ let capabilities = TerminalCapabilities::detect().with_overrides(&CapabilityOver
 Unknown italics fall back to underline for semantic emphasis. Colors quantize to
 ANSI 16/256 or disappear while text and structural markers remain.
 
+## Terminal-image foundation
+
+The image API is intentionally out-of-band: image protocol bytes are never
+returned as component rows, copy text, or log text. Validate only caller-owned
+bytes with `TerminalImage`, derive a bounded `ImageRenderPlan`, render its
+`semantic_rows()` normally, and write its optional `ImageTerminalCommand`
+separately to the terminal output sink. Emit a real-image command while the
+cursor is at its first reserved row, before advancing the blank semantic
+reservation, but never concatenate it into a row string. That separation keeps
+selection, scrollback, diagnostics, and plain mode free of APC/OSC payloads.
+
+```rust,no_run
+use sexy_tui_rs::{
+    ImageCapabilities, ImageCapabilityOverrides, ImageId, ImageLimits, ImagePlanner,
+    ImageViewport, TerminalCapabilities,
+};
+
+# fn place(image: sexy_tui_rs::TerminalImage) -> Result<(), Box<dyn std::error::Error>> {
+let terminal = TerminalCapabilities::detect();
+let images = ImageCapabilities::detect(&terminal, &ImageCapabilityOverrides::default());
+let planner = ImagePlanner::new(images, ImageLimits::default());
+let viewport = ImageViewport::with_capabilities(80, 24, images)?;
+let plan = planner.plan_place(ImageId::new(1)?, &image, viewport)?;
+
+let semantic_rows = plan.semantic_rows(); // safe retained-frame/copy text
+let mut protocol = Vec::new();
+plan.write_protocol_to(&mut protocol)?; // write separately at the placement point
+# let _ = semantic_rows;
+# Ok(())
+# }
+```
+
+`TerminalImage` accepts bounded static PNG, JPEG, GIF, and WebP container
+headers without decoding or reading files, URLs, environment paths, or network
+data; animated PNG/GIF/WebP containers are rejected before terminal-side frame
+decoding. The direct protocol matrix is conservative: Kitty receives PNG only;
+iTerm2 receives PNG, JPEG, and GIF. Unsupported terminals, formats, and
+unaddressable operations receive deterministic ASCII fallback rows. `ImageRegistry`
+allocates nonzero IDs monotonically and never reuses deleted values; iTerm2 replacement
+and targeted deletion are deliberately unavailable instead of being guessed.
+
+`ImageLimits` has default and non-bypassable hard caps for source bytes,
+dimensions, pixels, metadata, base64 chunks, complete protocol output, replies,
+and query deadlines. `ImageRegistry` also caps concurrent live IDs. Capability
+detection is hint-only and sends no I/O.
+Callers that perform a single bounded query can use
+`ImageCapabilityQuery::parse_reply` to correlate only the expected reply type;
+forced protocol selection is for tests or caller-managed negotiation, never
+plain output.
+
 ## Themes
 
 Theme resolution has three layers:
@@ -257,9 +308,11 @@ algorithm at the pinned revision. It writes the complete first frame, tracks
 Pi's logical/hardware cursor and viewport state, updates the exact first-to-last
 changed range, lets pure CRLF appends enter native scrollback, and clears saved
 lines plus replays the complete frame on width/height changes or changes above
-the old viewport. Every interactive frame uses Pi's CSI 2026 delimiters. Kitty
-image row reservation, changed-range expansion, targeted deletion, and fallback
-replay follow the same control flow. `set_clear_on_shrink`,
+the old viewport. Every interactive frame uses Pi's CSI 2026 delimiters. The
+legacy embedded-Kitty compatibility path retains Pi's image row reservation,
+changed-range expansion, targeted deletion, and fallback replay behavior; new
+image callers should use the out-of-band `ImageRenderPlan` foundation above.
+`set_clear_on_shrink`,
 `set_show_hardware_cursor`, and `request_render_force` expose the corresponding
 Pi policies.
 
