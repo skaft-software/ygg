@@ -127,6 +127,16 @@ enum ChatContentPart {
     InputAudio {
         input_audio: ChatInputAudio,
     },
+    /// Mistral's replayable reasoning-content chunk.
+    Thinking {
+        thinking: Vec<ChatThinkingPart>,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ChatThinkingPart {
+    Text { text: String },
 }
 
 #[derive(Serialize)]
@@ -217,7 +227,7 @@ struct ChatResponseMessage {
     // `role` is always "assistant" here and is not needed after decode; the wire
     // field is ignored rather than stored.
     #[serde(default)]
-    content: Option<String>,
+    content: Option<ChatResponseContent>,
     #[serde(default)]
     reasoning_content: Option<String>,
     #[serde(default)]
@@ -226,6 +236,66 @@ struct ChatResponseMessage {
     tool_calls: Option<Vec<ChatResponseMessageToolCall>>,
     #[serde(default)]
     audio: Option<ChatAudioResponse>,
+}
+
+/// OpenAI-compatible endpoints normally return a string. Mistral's Chat
+/// Completions endpoint can instead return structured text and thinking chunks.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ChatResponseContent {
+    Text(String),
+    Parts(Vec<ChatResponseContentPart>),
+}
+
+#[derive(Deserialize)]
+struct ChatResponseContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    thinking: Vec<ChatThinkingResponsePart>,
+}
+
+#[derive(Deserialize)]
+struct ChatThinkingResponsePart {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+enum ChatContentFragment {
+    Text(String),
+    Reasoning(String),
+}
+
+fn content_fragments(content: &ChatResponseContent) -> Vec<ChatContentFragment> {
+    match content {
+        ChatResponseContent::Text(text) => vec![ChatContentFragment::Text(text.clone())],
+        ChatResponseContent::Parts(parts) => parts
+            .iter()
+            .flat_map(|part| match part.kind.as_str() {
+                "text" => part
+                    .text
+                    .as_ref()
+                    .map(|text| vec![ChatContentFragment::Text(text.clone())])
+                    .unwrap_or_default(),
+                "thinking" => part
+                    .thinking
+                    .iter()
+                    .filter(|thinking| thinking.kind.as_deref().unwrap_or("text") == "text")
+                    .filter_map(|thinking| {
+                        thinking
+                            .text
+                            .as_ref()
+                            .map(|text| ChatContentFragment::Reasoning(text.clone()))
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -299,7 +369,7 @@ struct ChatChunkChoice {
 #[derive(Deserialize)]
 struct ChatChunkDelta {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<ChatResponseContent>,
     #[serde(default)]
     reasoning_content: Option<String>,
     // OpenRouter and several OpenAI-compatible gateways normalize reasoning to
@@ -411,6 +481,21 @@ fn provider_reasoning_value(
     selected.filter(|value| !value.trim().eq_ignore_ascii_case("default"))
 }
 
+/// Mistral accepts tool-call IDs with exactly nine ASCII alphanumeric bytes.
+/// Keep a valid existing ID, otherwise derive a deterministic opaque ID without
+/// changing canonical IDs used by other endpoints.
+fn mistral_tool_call_id(id: &str) -> String {
+    let compact: String = id.chars().filter(char::is_ascii_alphanumeric).collect();
+    if compact.len() == 9 {
+        return compact;
+    }
+
+    let hash = id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    format!("{hash:016x}")[..9].to_owned()
+}
+
 /// Builds the OpenAI Chat Completions HTTP request parts.
 pub(crate) fn build_request(
     model: &crate::catalog::Model,
@@ -426,6 +511,8 @@ pub(crate) fn build_request(
         &model.spec.id,
         req.compatibility,
     )?;
+    let mistral_profile = model.endpoint.runtime.openai_chat_profile
+        == crate::types::OpenAiChatRuntimeProfile::Mistral;
 
     // 2. Map system prompt
     let reasoning_capability = model.spec.capabilities.reasoning.as_ref();
@@ -573,9 +660,11 @@ pub(crate) fn build_request(
                                 }
                             }
                             messages.push(ChatCompletionsMessage::Tool {
-                                tool_call_id: crate::protocol::normalize_tool_call_id(
-                                    &tr.tool_call_id.0,
-                                ),
+                                tool_call_id: if mistral_profile {
+                                    mistral_tool_call_id(&tr.tool_call_id.0)
+                                } else {
+                                    crate::protocol::normalize_tool_call_id(&tr.tool_call_id.0)
+                                },
                                 content: text_parts.join("\n"),
                             });
                         }
@@ -589,6 +678,7 @@ pub(crate) fn build_request(
             }
             Message::Assistant(ref assistant) => {
                 let mut text_parts = Vec::new();
+                let mut mistral_content_parts = Vec::new();
                 let mut reasoning_parts = Vec::new();
                 let mut tool_calls = Vec::new();
                 let mut audio_ref = None;
@@ -597,6 +687,23 @@ pub(crate) fn build_request(
                     match part {
                         AssistantPart::Text(ref text) => {
                             text_parts.push(text.clone());
+                            if mistral_profile {
+                                mistral_content_parts.push(ChatContentPart::Text {
+                                    text: text.clone(),
+                                    cache_control: None,
+                                });
+                            }
+                        }
+                        AssistantPart::Reasoning(reasoning)
+                            if mistral_profile
+                                && assistant.protocol == Protocol::OpenAiChat
+                                && assistant.model == model.spec.id =>
+                        {
+                            if let Some(text) = &reasoning.text {
+                                mistral_content_parts.push(ChatContentPart::Thinking {
+                                    thinking: vec![ChatThinkingPart::Text { text: text.clone() }],
+                                });
+                            }
                         }
                         // DeepSeek requires the previous turn's full
                         // `reasoning_content` when that turn called a tool.
@@ -626,7 +733,11 @@ pub(crate) fn build_request(
                         }
                         AssistantPart::ToolCall(ref tc) => {
                             tool_calls.push(ChatToolCall {
-                                id: crate::protocol::normalize_tool_call_id(&tc.id.0),
+                                id: if mistral_profile {
+                                    mistral_tool_call_id(&tc.id.0)
+                                } else {
+                                    crate::protocol::normalize_tool_call_id(&tc.id.0)
+                                },
                                 r#type: "function".to_string(),
                                 function: ChatFunctionCall {
                                     name: tc.name.clone(),
@@ -661,13 +772,16 @@ pub(crate) fn build_request(
                     }
                 }
 
-                let content_str = if text_parts.is_empty() {
+                let content_str = if mistral_profile {
+                    (!mistral_content_parts.is_empty())
+                        .then_some(ChatInstructionContent::Parts(mistral_content_parts))
+                } else if text_parts.is_empty() {
                     None
                 } else {
                     Some(ChatInstructionContent::Text(text_parts.join("\n")))
                 };
-                let reasoning_content =
-                    (!reasoning_parts.is_empty()).then(|| reasoning_parts.join("\n"));
+                let reasoning_content = (!mistral_profile && !reasoning_parts.is_empty())
+                    .then(|| reasoning_parts.join("\n"));
                 let tool_calls_opt = if tool_calls.is_empty() {
                     None
                 } else {
@@ -858,7 +972,7 @@ pub(crate) fn build_request(
         }
     }
 
-    let stream_options = if streaming {
+    let stream_options = if streaming && !mistral_profile {
         Some(ChatStreamOptions {
             include_usage: true,
         })
@@ -867,10 +981,10 @@ pub(crate) fn build_request(
     };
 
     // Model limits are local capacity metadata, not request defaults. Only
-    // forward a cap explicitly chosen by the caller. DeepSeek implements the
-    // compatible `max_tokens` field, while current OpenAI Chat uses
+    // forward a cap explicitly chosen by the caller. DeepSeek and Mistral use
+    // the compatible `max_tokens` field, while current OpenAI Chat uses
     // `max_completion_tokens`.
-    let (max_tokens, max_completion_tokens) = if deepseek_thinking {
+    let (max_tokens, max_completion_tokens) = if deepseek_thinking || mistral_profile {
         (req.max_output_tokens, None)
     } else {
         (None, req.max_output_tokens)
@@ -948,6 +1062,9 @@ pub(crate) fn build_request(
             }
             crate::types::SessionAffinityFormat::OpenRouter => {
                 headers.insert(http::HeaderName::from_static("x-session-id"), value);
+            }
+            crate::types::SessionAffinityFormat::Mistral => {
+                headers.insert(http::HeaderName::from_static("x-affinity"), value);
             }
             // Codex is a Responses route; accepting this value here keeps
             // configuration forward-compatible without emitting invalid Chat
@@ -1034,7 +1151,9 @@ fn add_cache_control_to_instruction(
                     *cache_control = Some(marker);
                     Some(())
                 }
-                ChatContentPart::ImageUrl { .. } | ChatContentPart::InputAudio { .. } => None,
+                ChatContentPart::ImageUrl { .. }
+                | ChatContentPart::InputAudio { .. }
+                | ChatContentPart::Thinking { .. } => None,
             })
         }
         ChatInstructionContent::Text(_) => None,
@@ -1091,38 +1210,53 @@ fn decode_response_inner(
         .is_some_and(|calls| !calls.is_empty());
     let mut recovered_content_tool = false;
     let mut recovered_locked_placeholder = false;
-    if let Some(ref text) = choice.message.content {
-        if !text.is_empty() {
-            if model.spec.capabilities.tools
-                && !has_native_tool_calls
-                && content_may_contain_tool_call(text)
-            {
-                let mut fallback =
-                    ResponseBuilder::new(model.spec.id.clone(), Protocol::OpenAiChat, None);
-                // The completed body is already fully available, so enabling
-                // ambiguous compatibility recovery cannot hide streamed JSON.
-                fallback.set_buffer_ambiguous_compatibility_content(true);
-                if let Some(tools) = tool_definitions {
-                    fallback.set_tool_definitions(tools)?;
-                }
-                let mut ignored_events = Vec::new();
-                consume_qwen_xml_content(&mut ignored_events, &mut fallback, text)?;
-                flush_qwen_xml_pending(&mut ignored_events, &mut fallback)?;
-                recovered_locked_placeholder = fallback.tool_output_locked_seen;
-                let fallback_response = fallback.finish()?;
-                recovered_content_tool = fallback_response
-                    .message
-                    .content
-                    .iter()
-                    .any(|part| matches!(part, AssistantPart::ToolCall(_)));
-                content.extend(fallback_response.message.content);
-            } else {
-                let sanitized = text.replace(TOOL_OUTPUT_LOCKED, "");
-                recovered_locked_placeholder = sanitized.len() != text.len();
-                if !sanitized.is_empty() {
-                    content.push(AssistantPart::Text(sanitized));
+    for fragment in choice
+        .message
+        .content
+        .as_ref()
+        .map(content_fragments)
+        .unwrap_or_default()
+    {
+        match fragment {
+            ChatContentFragment::Text(text) if !text.is_empty() => {
+                if model.spec.capabilities.tools
+                    && !has_native_tool_calls
+                    && content_may_contain_tool_call(&text)
+                {
+                    let mut fallback =
+                        ResponseBuilder::new(model.spec.id.clone(), Protocol::OpenAiChat, None);
+                    // The completed body is already fully available, so enabling
+                    // ambiguous compatibility recovery cannot hide streamed JSON.
+                    fallback.set_buffer_ambiguous_compatibility_content(true);
+                    if let Some(tools) = tool_definitions {
+                        fallback.set_tool_definitions(tools)?;
+                    }
+                    let mut ignored_events = Vec::new();
+                    consume_qwen_xml_content(&mut ignored_events, &mut fallback, &text)?;
+                    flush_qwen_xml_pending(&mut ignored_events, &mut fallback)?;
+                    recovered_locked_placeholder |= fallback.tool_output_locked_seen;
+                    let fallback_response = fallback.finish()?;
+                    recovered_content_tool |= fallback_response
+                        .message
+                        .content
+                        .iter()
+                        .any(|part| matches!(part, AssistantPart::ToolCall(_)));
+                    content.extend(fallback_response.message.content);
+                } else {
+                    let sanitized = text.replace(TOOL_OUTPUT_LOCKED, "");
+                    recovered_locked_placeholder |= sanitized.len() != text.len();
+                    if !sanitized.is_empty() {
+                        content.push(AssistantPart::Text(sanitized));
+                    }
                 }
             }
+            ChatContentFragment::Reasoning(text) if !text.is_empty() => {
+                content.push(AssistantPart::Reasoning(ReasoningPart {
+                    text: Some(text),
+                    state: None,
+                }));
+            }
+            ChatContentFragment::Text(_) | ChatContentFragment::Reasoning(_) => {}
         }
     }
 
@@ -1259,6 +1393,25 @@ fn decode_response_inner(
     })
 }
 
+fn emit_reasoning_delta(
+    events: &mut Vec<StreamEvent>,
+    builder: &mut ResponseBuilder,
+    reasoning: String,
+) -> Result<(), AiError> {
+    let idx = segment_index(builder, "reasoning");
+    if !builder.reasoning_text_buffers.contains_key(&idx) {
+        emit_event(events, builder, StreamEvent::ReasoningStart { index: idx })?;
+    }
+    emit_event(
+        events,
+        builder,
+        StreamEvent::ReasoningDelta {
+            index: idx,
+            delta: reasoning,
+        },
+    )
+}
+
 fn provider_error_from_stream_event(data: &str) -> Option<ProviderError> {
     let value: serde_json::Value = serde_json::from_str(data).ok()?;
     let error = value.get("error").and_then(|value| value.as_object())?;
@@ -1357,16 +1510,24 @@ pub(crate) fn decode_stream_event(
     }
 
     for choice in chunk.choices {
-        // Delta text content
-        if let Some(ref text) = choice.delta.content {
-            if !text.is_empty() {
-                if model.spec.capabilities.tools {
-                    // vLLM can return native XML/JSON tool syntax as ordinary
-                    // content. Defer recognized calls until turn completion so
-                    // a later structured `tool_calls` delta can supersede them.
-                    consume_qwen_xml_content(&mut events, builder, text)?;
-                } else {
-                    emit_text_without_locked_marker(&mut events, builder, text)?;
+        // Delta text and structured Mistral thinking content.
+        if let Some(ref wire_content) = choice.delta.content {
+            for fragment in content_fragments(wire_content) {
+                match fragment {
+                    ChatContentFragment::Text(text) if !text.is_empty() => {
+                        if model.spec.capabilities.tools {
+                            // vLLM can return native XML/JSON tool syntax as ordinary
+                            // content. Defer recognized calls until turn completion so
+                            // a later structured `tool_calls` delta can supersede them.
+                            consume_qwen_xml_content(&mut events, builder, &text)?;
+                        } else {
+                            emit_text_without_locked_marker(&mut events, builder, &text)?;
+                        }
+                    }
+                    ChatContentFragment::Reasoning(text) if !text.is_empty() => {
+                        emit_reasoning_delta(&mut events, builder, text)?;
+                    }
+                    ChatContentFragment::Text(_) | ChatContentFragment::Reasoning(_) => {}
                 }
             }
         }
@@ -1387,22 +1548,7 @@ pub(crate) fn decode_stream_event(
                     .filter(|text| !text.is_empty())
             });
         if let Some(reasoning) = reasoning_text {
-            let idx = segment_index(builder, "reasoning");
-            if !builder.reasoning_text_buffers.contains_key(&idx) {
-                emit_event(
-                    &mut events,
-                    builder,
-                    StreamEvent::ReasoningStart { index: idx },
-                )?;
-            }
-            emit_event(
-                &mut events,
-                builder,
-                StreamEvent::ReasoningDelta {
-                    index: idx,
-                    delta: reasoning.clone(),
-                },
-            )?;
+            emit_reasoning_delta(&mut events, builder, reasoning.clone())?;
         }
 
         // Delta tool calls
@@ -2995,6 +3141,81 @@ mod tests {
     }
 
     #[test]
+    fn mistral_profile_uses_its_bounded_request_contract() {
+        let mut model = make_test_model(false, false, false, true, false, false);
+        Arc::make_mut(&mut model.endpoint)
+            .runtime
+            .openai_chat_profile = crate::types::OpenAiChatRuntimeProfile::Mistral;
+        let cache = &mut Arc::make_mut(&mut model.spec).cache;
+        cache.send_session_affinity_headers = true;
+        cache.session_affinity_format = Some(crate::types::SessionAffinityFormat::Mistral);
+
+        let canonical_tool_id = "call_with_a_long_non_mistral_id";
+        let request = Request {
+            system: None,
+            messages: vec![
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantPart::Reasoning(ReasoningPart {
+                            text: Some("Inspect the repository first.".into()),
+                            state: None,
+                        }),
+                        AssistantPart::ToolCall(ToolCall {
+                            id: ToolCallId(canonical_tool_id.into()),
+                            name: "read".into(),
+                            arguments_json: r#"{"path":"README.md"}"#.into(),
+                        }),
+                    ],
+                    model: model.spec.id.clone(),
+                    protocol: Protocol::OpenAiChat,
+                }),
+                Message::User(UserMessage {
+                    content: vec![UserPart::ToolResult(crate::types::ToolResult {
+                        tool_call_id: ToolCallId(canonical_tool_id.into()),
+                        content: vec![ToolResultPart::Text("contents".into())],
+                        is_error: false,
+                        added_tool_names: None,
+                    })],
+                }),
+            ],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            max_output_tokens: Some(123),
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: crate::types::ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: crate::types::CacheRetention::Short,
+            session_id: Some("mistral-affinity".into()),
+        };
+
+        let parts = build_request(&model, &request).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
+        assert_eq!(body["max_tokens"], 123);
+        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("stream_options").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["thinking"][0]["text"],
+            "Inspect the repository first."
+        );
+        let normalized_id = body["messages"][0]["tool_calls"][0]["id"].as_str().unwrap();
+        assert_eq!(normalized_id, mistral_tool_call_id(canonical_tool_id));
+        assert_eq!(normalized_id.len(), 9);
+        assert!(normalized_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric()));
+        assert_eq!(body["messages"][1]["tool_call_id"], normalized_id);
+        assert_eq!(parts.headers["x-affinity"], "mistral-affinity");
+        assert!(parts.headers.get("session_id").is_none());
+        assert!(parts.headers.get("x-client-request-id").is_none());
+        assert!(parts.headers.get("x-session-affinity").is_none());
+    }
+
+    #[test]
     fn reasoning_only_local_turn_replays_as_assistant_content() {
         let model = make_test_model(false, false, false, false, false, false);
         let request = Request {
@@ -3671,6 +3892,30 @@ mod fixture_tests {
         assert_eq!(reasoning.text.as_deref(), Some("Let me think about it."));
         assert!(reasoning.state.is_none(), "Chat reasoning carries no state");
         assert_eq!(resp.usage.reasoning_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn mistral_structured_content_preserves_reasoning_order() {
+        let model = harness::model(Protocol::OpenAiChat, None);
+        let events = harness::drive(
+            &model,
+            decode_stream_event,
+            fx!("mistral_structured_content.sse"),
+            7,
+        )
+        .await
+        .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ReasoningStart { .. })));
+        assert_eq!(joined_text(&events), "The answer is 42.");
+        let response = harness::finished(&events);
+        assert!(matches!(
+            response.message.content.as_slice(),
+            [AssistantPart::Reasoning(reasoning), AssistantPart::Text(text)]
+                if reasoning.text.as_deref() == Some("Inspect first.")
+                    && text == "The answer is 42."
+        ));
     }
 
     #[tokio::test]

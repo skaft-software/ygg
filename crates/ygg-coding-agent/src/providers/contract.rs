@@ -8,8 +8,8 @@
 use std::fmt;
 
 use ygg_ai::{
-    EndpointTransport, ModelCatalog, Protocol, RequestBodyEncoding, RequestRuntime,
-    ResponsesRuntimeProfile,
+    ConfigError, EndpointTransport, ModelCatalog, OpenAiChatRuntimeProfile, Protocol,
+    RequestBodyEncoding, RequestRuntime, ResponsesRuntimeProfile,
 };
 
 /// Authentication setup advertised by a provider declaration.
@@ -110,6 +110,12 @@ pub enum StaticModelSet {
     MiniMax,
     /// OpenCode Zen's supported routes.
     OpenCode,
+    /// Mistral Chat Completions models.
+    Mistral,
+    /// Cloudflare Workers AI's OpenAI-compatible models.
+    CloudflareWorkersAi,
+    /// Cloudflare AI Gateway provider-routed models.
+    CloudflareAiGateway,
 }
 
 /// Whether a discovery cache is required before a provider can expose models or
@@ -141,6 +147,10 @@ pub enum CompatibilityProfile {
     Custom,
     /// Codex subscription cache affinity.
     Codex,
+    /// Mistral's `x-affinity` prompt-cache routing.
+    Mistral,
+    /// Cloudflare's OpenAI-compatible Workers and Gateway routes.
+    Cloudflare,
 }
 
 /// Pricing policy selected separately from provider availability.
@@ -168,6 +178,12 @@ pub enum PricingProfile {
     Custom,
     /// Codex accounting metadata; not an availability signal.
     Subscription,
+    /// Mistral's checked-in public rates.
+    Mistral,
+    /// Cloudflare Workers AI's checked-in public rates.
+    CloudflareWorkersAi,
+    /// Cloudflare AI Gateway's provider-routed rates.
+    CloudflareAiGateway,
 }
 
 /// Secret-free credential presentation selected by an endpoint route.
@@ -177,6 +193,9 @@ pub enum EndpointAuthPresentation {
     Bearer,
     /// Send the private environment credential in `x-api-key`.
     ApiKeyHeader,
+    /// Forward the private environment credential through Cloudflare AI
+    /// Gateway's `cf-aig-authorization: Bearer <token>` header.
+    CloudflareAiGateway,
     /// Bind a private dynamic resolver owned by the authentication lifecycle.
     Dynamic,
 }
@@ -186,6 +205,11 @@ pub enum EndpointAuthPresentation {
 pub struct ProviderRoute {
     /// Endpoint identity stored in the canonical model catalog.
     pub endpoint_id: &'static str,
+    /// Relative path appended to the declaration's resolved base URL.
+    ///
+    /// It is empty for ordinary endpoints and lets a gateway expose distinct
+    /// provider protocol routes without exposing resolved URLs publicly.
+    pub base_path: &'static str,
     /// Existing codec family selected by this route.
     pub protocol: Protocol,
     /// Secret-free presentation of the privately resolved credential.
@@ -246,6 +270,9 @@ pub struct ProviderDeclaration {
     pub name: &'static str,
     /// Versioned inference base URL.
     pub base_url: &'static str,
+    /// Environment identifiers substituted into `{IDENTIFIER}` URL path
+    /// placeholders at private catalog-registration time.
+    pub base_url_environment: &'static [&'static str],
     /// Setup and authentication lifecycle kind.
     pub authentication: ProviderAuthentication,
     /// Model inventory source.
@@ -338,23 +365,67 @@ impl ProviderDeclaration {
         }
     }
 
+    /// Resolve the private runtime base URL. Placeholder values are validated as
+    /// opaque URL-path identifiers and are never retained in public definitions
+    /// or error messages.
+    pub(crate) fn resolved_base_url(&self) -> Result<url::Url, ConfigError> {
+        self.resolve_base_url_with(ygg_ai::auth::read_bounded_env)
+    }
+
+    fn resolve_base_url_with(
+        &self,
+        mut read_environment: impl FnMut(&str) -> Result<Option<String>, ConfigError>,
+    ) -> Result<url::Url, ConfigError> {
+        let mut rendered = self.base_url.to_owned();
+        for variable in self.base_url_environment {
+            let value = read_environment(variable)
+                .map_err(|_| invalid_template_environment_error())?
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| ConfigError::MissingEnv((*variable).to_owned()))?;
+            if !valid_url_path_identifier(&value) {
+                return Err(invalid_template_environment_error());
+            }
+            let placeholder = format!("{{{variable}}}");
+            if !rendered.contains(&placeholder) {
+                return Err(ConfigError::InvalidBaseUrl(
+                    "provider base URL template is invalid".to_owned(),
+                ));
+            }
+            rendered = rendered.replace(&placeholder, &value);
+        }
+        if rendered.contains('{') || rendered.contains('}') {
+            return Err(ConfigError::InvalidBaseUrl(
+                "provider base URL template is invalid".to_owned(),
+            ));
+        }
+        let url = url::Url::parse(&rendered)
+            .map_err(|_| ConfigError::InvalidBaseUrl("provider base URL is invalid".to_owned()))?;
+        if valid_base_url(&url) {
+            Ok(url)
+        } else {
+            Err(ConfigError::InvalidBaseUrl(
+                "provider base URL is invalid".to_owned(),
+            ))
+        }
+    }
+
+    /// Resolve the private runtime URL for one declared provider route.
+    pub(crate) fn resolved_route_base_url(
+        &self,
+        route: &ProviderRoute,
+    ) -> Result<url::Url, ConfigError> {
+        self.resolved_base_url()?
+            .join(route.base_path)
+            .map_err(|_| ConfigError::InvalidBaseUrl("provider route URL is invalid".to_owned()))
+    }
+
     /// Validate a declaration before it is used to construct catalog entries.
     pub fn validate(&self) -> Result<(), ProviderDefinitionError> {
         validate_identifier(self.id, "provider")?;
         if !valid_provider_label(self.name) {
             return Err(ProviderDefinitionError::new("provider label is invalid"));
         }
-        let url = url::Url::parse(self.base_url)
-            .map_err(|_| ProviderDefinitionError::new("provider base URL is invalid"))?;
-        if !matches!(url.scheme(), "http" | "https")
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !url.path().ends_with('/')
-        {
-            return Err(ProviderDefinitionError::new("provider base URL is invalid"));
-        }
+        validate_base_url_template(self.base_url, self.base_url_environment)?;
         match self.authentication {
             ProviderAuthentication::Environment { variables } => {
                 if variables.is_empty() || variables.iter().any(|value| !valid_env_name(value)) {
@@ -375,6 +446,18 @@ impl ProviderDeclaration {
         }
         for (index, route) in self.routes.iter().enumerate() {
             validate_identifier(route.endpoint_id, "endpoint")?;
+            if !valid_route_base_path(route.base_path) {
+                return Err(ProviderDefinitionError::new(
+                    "provider route base path is invalid",
+                ));
+            }
+            if route.runtime.openai_chat_profile != OpenAiChatRuntimeProfile::Default
+                && route.protocol != Protocol::OpenAiChat
+            {
+                return Err(ProviderDefinitionError::new(
+                    "provider OpenAI Chat runtime profile requires a Chat route",
+                ));
+            }
             if route.runtime.responses_profile != ResponsesRuntimeProfile::Default
                 && route.protocol != Protocol::OpenAiResponses
             {
@@ -393,7 +476,9 @@ impl ProviderDeclaration {
                 (self.authentication, route.auth_presentation),
                 (
                     ProviderAuthentication::Environment { .. },
-                    EndpointAuthPresentation::Bearer | EndpointAuthPresentation::ApiKeyHeader
+                    EndpointAuthPresentation::Bearer
+                        | EndpointAuthPresentation::ApiKeyHeader
+                        | EndpointAuthPresentation::CloudflareAiGateway
                 ) | (
                     ProviderAuthentication::Subscription { .. },
                     EndpointAuthPresentation::Dynamic
@@ -406,7 +491,8 @@ impl ProviderDeclaration {
             }
             for previous in &self.routes[..index] {
                 if previous.endpoint_id == route.endpoint_id
-                    && (previous.auth_presentation != route.auth_presentation
+                    && (previous.base_path != route.base_path
+                        || previous.auth_presentation != route.auth_presentation
                         || previous.transport != route.transport
                         || previous.runtime != route.runtime)
                 {
@@ -825,6 +911,73 @@ fn valid_env_name(value: &str) -> bool {
             .all(|value| value.is_ascii_alphanumeric() || value == b'_')
 }
 
+fn valid_base_url(url: &url::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().ends_with('/')
+}
+
+fn validate_base_url_template(
+    base_url: &str,
+    environment: &[&str],
+) -> Result<(), ProviderDefinitionError> {
+    let mut rendered = base_url.to_owned();
+    let mut seen = std::collections::HashSet::new();
+    for variable in environment {
+        let placeholder = format!("{{{variable}}}");
+        if !valid_env_name(variable)
+            || !seen.insert(*variable)
+            || rendered.matches(&placeholder).count() != 1
+        {
+            return Err(ProviderDefinitionError::new(
+                "provider base URL template is invalid",
+            ));
+        }
+        rendered = rendered.replace(&placeholder, "placeholder");
+    }
+    if rendered.contains('{') || rendered.contains('}') {
+        return Err(ProviderDefinitionError::new(
+            "provider base URL template is invalid",
+        ));
+    }
+    let url = url::Url::parse(&rendered)
+        .map_err(|_| ProviderDefinitionError::new("provider base URL is invalid"))?;
+    if valid_base_url(&url) {
+        Ok(())
+    } else {
+        Err(ProviderDefinitionError::new("provider base URL is invalid"))
+    }
+}
+
+fn valid_url_path_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn invalid_template_environment_error() -> ConfigError {
+    ConfigError::InvalidBaseUrl("provider base URL environment value is invalid".to_owned())
+}
+
+fn valid_route_base_path(path: &str) -> bool {
+    path.is_empty()
+        || (path.ends_with('/')
+            && !path.starts_with('/')
+            && path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .all(|segment| {
+                    segment.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                }))
+}
+
 /// Check that a declaration header is a bounded public request header rather
 /// than an authentication or credential carrier.
 pub(crate) fn valid_public_header(name: &str, value: &str) -> bool {
@@ -978,15 +1131,52 @@ mod tests {
     }
 
     #[test]
+    fn cloudflare_base_url_templates_validate_values_without_exposing_them() {
+        let account_id = "account_123";
+        let workers_url = CLOUDFLARE_WORKERS_AI
+            .resolve_base_url_with(|variable| {
+                assert_eq!(variable, "CLOUDFLARE_ACCOUNT_ID");
+                Ok(Some(account_id.to_owned()))
+            })
+            .unwrap();
+        assert_eq!(
+            workers_url.as_str(),
+            "https://api.cloudflare.com/client/v4/accounts/account_123/ai/v1/"
+        );
+
+        let gateway_url = CLOUDFLARE_AI_GATEWAY
+            .resolve_base_url_with(|variable| match variable {
+                "CLOUDFLARE_ACCOUNT_ID" => Ok(Some(account_id.to_owned())),
+                "CLOUDFLARE_GATEWAY_ID" => Ok(Some("gateway-456".to_owned())),
+                _ => unreachable!("unexpected template variable"),
+            })
+            .unwrap();
+        assert_eq!(
+            gateway_url.as_str(),
+            "https://gateway.ai.cloudflare.com/v1/account_123/gateway-456/"
+        );
+        assert!(!format!("{:?}", CLOUDFLARE_AI_GATEWAY.definition()).contains(account_id));
+
+        let unsafe_value = "account/identifier-must-not-appear";
+        let error = CLOUDFLARE_WORKERS_AI
+            .resolve_base_url_with(|_| Ok(Some(unsafe_value.to_owned())))
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::InvalidBaseUrl(_)));
+        assert!(!error.to_string().contains(unsafe_value));
+    }
+
+    #[test]
     fn generated_declaration_validation_rejects_invalid_runtime_and_secret_headers() {
         const INVALID_RUNTIME_ROUTES: &[ProviderRoute] = &[ProviderRoute {
             endpoint_id: "invalid-runtime",
+            base_path: "",
             protocol: Protocol::OpenAiChat,
             auth_presentation: EndpointAuthPresentation::Bearer,
             transport: EndpointTransport::Http,
             runtime: RequestRuntime {
                 body_encoding: RequestBodyEncoding::Identity,
                 responses_profile: ResponsesRuntimeProfile::Codex,
+                openai_chat_profile: OpenAiChatRuntimeProfile::Default,
                 lifecycle_feedback: false,
             },
         }];

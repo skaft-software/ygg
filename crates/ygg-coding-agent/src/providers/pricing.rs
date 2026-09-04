@@ -130,6 +130,47 @@ fn anthropic_pricing(model_id: &str) -> Option<Pricing> {
     Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
 }
 
+fn mistral_pricing(model_id: &str) -> Option<Pricing> {
+    let rates = match model_id {
+        "codestral-latest" => (300_000, 900_000, 0, 0),
+        "devstral-latest" => (400_000, 2_000_000, 0, 0),
+        "magistral-medium-latest" => (2_000_000, 5_000_000, 0, 0),
+        "mistral-large-latest" => (500_000, 1_500_000, 0, 0),
+        "mistral-small-latest" => (150_000, 600_000, 0, 0),
+        "pixtral-large-latest" => (2_000_000, 6_000_000, 0, 0),
+        _ => return None,
+    };
+    Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
+}
+
+fn cloudflare_workers_ai_pricing(model_id: &str) -> Option<Pricing> {
+    let rates = match model_id {
+        "@cf/meta/llama-4-scout-17b-16e-instruct" => (270_000, 850_000, 0, 0),
+        "@cf/mistralai/mistral-small-3.1-24b-instruct" => (351_000, 555_000, 0, 0),
+        "@cf/moonshotai/kimi-k2.7-code" => (950_000, 4_000_000, 190_000, 0),
+        "@cf/openai/gpt-oss-120b" => (350_000, 750_000, 0, 0),
+        "@cf/zai-org/glm-5.2" => (1_400_000, 4_400_000, 260_000, 0),
+        _ => return None,
+    };
+    Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
+}
+
+fn cloudflare_ai_gateway_pricing(model_id: &str) -> Option<Pricing> {
+    let rates = match model_id {
+        "claude-haiku-4-5" => (1_000_000, 5_000_000, 100_000, 1_250_000),
+        "claude-sonnet-4-5" => (3_000_000, 15_000_000, 300_000, 3_750_000),
+        "claude-opus-4-5" => (5_000_000, 25_000_000, 500_000, 6_250_000),
+        "gpt-4o" => (2_500_000, 10_000_000, 1_250_000, 0),
+        "gpt-4o-mini" => (150_000, 600_000, 80_000, 0),
+        "gpt-5.4" => (2_500_000, 15_000_000, 250_000, 0),
+        "o3" => (2_000_000, 8_000_000, 500_000, 0),
+        "o4-mini" => (1_100_000, 4_400_000, 280_000, 0),
+        "workers-ai/@cf/moonshotai/kimi-k2.6" => (950_000, 4_000_000, 160_000, 0),
+        _ => return None,
+    };
+    Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
+}
+
 /// Return Ygg-owned pricing overrides for provider/model routes whose live
 /// inventory APIs do not publish rates. Special cases such as long-context
 /// tiers remain here; the declaration-aware [`pricing_for`] wrapper falls back to the
@@ -177,6 +218,9 @@ fn legacy_model_pricing(profile: PricingProfile, model_id: &str) -> Option<Prici
                 _ => return None,
             }
         }
+        PricingProfile::Mistral => return mistral_pricing(model_id),
+        PricingProfile::CloudflareWorkersAi => return cloudflare_workers_ai_pricing(model_id),
+        PricingProfile::CloudflareAiGateway => return cloudflare_ai_gateway_pricing(model_id),
         PricingProfile::Subscription => return subscription_pricing(model_id),
         _ => return None,
     };

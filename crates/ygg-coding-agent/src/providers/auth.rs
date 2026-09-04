@@ -82,6 +82,10 @@ pub(crate) fn environment_auth(
             http::HeaderName::from_static("x-api-key"),
             credential.variable(),
         )),
+        EndpointAuthPresentation::CloudflareAiGateway => Ok(Auth::header_bearer_env(
+            http::HeaderName::from_static("cf-aig-authorization"),
+            credential.variable(),
+        )),
         EndpointAuthPresentation::Dynamic => {
             anyhow::bail!("environment provider declaration has an invalid credential presentation")
         }
@@ -106,6 +110,10 @@ pub(crate) fn environment_discovery_headers(
             http::HeaderName::from_static("x-api-key"),
             credential.value().to_owned(),
         ),
+        EndpointAuthPresentation::CloudflareAiGateway => (
+            http::HeaderName::from_static("cf-aig-authorization"),
+            format!("Bearer {}", credential.value()),
+        ),
         EndpointAuthPresentation::Dynamic => {
             anyhow::bail!("environment provider declaration has an invalid credential presentation")
         }
@@ -127,7 +135,7 @@ pub(crate) fn missing_environment_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::contract::{ANTHROPIC, OPENAI};
+    use crate::providers::contract::{ANTHROPIC, CLOUDFLARE_AI_GATEWAY, OPENAI};
 
     #[test]
     fn diagnostics_never_format_a_resolved_value() {
@@ -149,6 +157,12 @@ mod tests {
         };
         let auth = environment_auth(&ANTHROPIC.routes[0], &credential).unwrap();
         assert!(matches!(auth, Auth::HeaderEnv { .. }));
+        let gateway = environment_auth(&CLOUDFLARE_AI_GATEWAY.routes[0], &credential).unwrap();
+        assert!(matches!(
+            gateway,
+            Auth::HeaderBearerEnv { ref name, .. }
+                if name == &http::HeaderName::from_static("cf-aig-authorization")
+        ));
     }
 
     #[test]
@@ -162,5 +176,11 @@ mod tests {
 
         let api_key = environment_discovery_headers(&ANTHROPIC.routes[0], &credential).unwrap();
         assert!(api_key[http::HeaderName::from_static("x-api-key")].is_sensitive());
+
+        let gateway =
+            environment_discovery_headers(&CLOUDFLARE_AI_GATEWAY.routes[0], &credential).unwrap();
+        let gateway_header = &gateway[http::HeaderName::from_static("cf-aig-authorization")];
+        assert_eq!(gateway_header.to_str().unwrap(), "Bearer not-formatted");
+        assert!(gateway_header.is_sensitive());
     }
 }

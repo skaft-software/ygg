@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "providers": [
     {
       "const_name": "OPENAI",
@@ -711,6 +711,164 @@
       ],
       "compatibility": "codex",
       "pricing": "subscription",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "MISTRAL",
+      "id": "mistral",
+      "name": "Mistral",
+      "base_url": "https://api.mistral.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MISTRAL_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "mistral",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "mistral",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default",
+          "openai_chat_profile": "mistral"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "mistral",
+      "pricing": "mistral",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "CLOUDFLARE_WORKERS_AI",
+      "id": "cloudflare-workers-ai",
+      "name": "Cloudflare Workers AI",
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/",
+      "base_url_environment": [
+        "CLOUDFLARE_ACCOUNT_ID"
+      ],
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "CLOUDFLARE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "cloudflare_workers_ai",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "cloudflare-workers-ai",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "cloudflare",
+      "pricing": "cloudflare_workers_ai",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "CLOUDFLARE_AI_GATEWAY",
+      "id": "cloudflare-ai-gateway",
+      "name": "Cloudflare AI Gateway",
+      "base_url": "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/",
+      "base_url_environment": [
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_GATEWAY_ID"
+      ],
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "CLOUDFLARE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "cloudflare_ai_gateway",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "cloudflare-ai-gateway-compat",
+          "base_path": "compat/",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "cloudflare-ai-gateway-openai",
+          "base_path": "openai/",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "cloudflare-ai-gateway-anthropic",
+          "base_path": "anthropic/",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "select_prefix",
+          "prefix": "claude-",
+          "route": 2
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "workers-ai/",
+          "route": 0
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "gpt-",
+          "route": 1
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "o",
+          "route": 1
+        },
+        {
+          "kind": "default",
+          "route": 1
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "cloudflare",
+      "pricing": "cloudflare_ai_gateway",
       "discovery_capabilities": "default"
     }
   ]

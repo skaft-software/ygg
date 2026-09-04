@@ -62,7 +62,12 @@ pub(crate) fn cache_compatibility(
             cache.send_session_affinity_headers = true;
             cache.session_affinity_format = Some(SessionAffinityFormat::Codex);
         }
+        CompatibilityProfile::Mistral => {
+            cache.send_session_affinity_headers = true;
+            cache.session_affinity_format = Some(SessionAffinityFormat::Mistral);
+        }
         CompatibilityProfile::Default
+        | CompatibilityProfile::Cloudflare
         | CompatibilityProfile::Fireworks
         | CompatibilityProfile::OpenCode
         | CompatibilityProfile::Custom => {}
@@ -84,7 +89,7 @@ pub(crate) fn cache_compatibility(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::contract::{FIREWORKS, OPENAI, OPENCODE, OPENROUTER};
+    use crate::providers::contract::{FIREWORKS, MISTRAL, OPENAI, OPENCODE, OPENROUTER};
 
     #[test]
     fn generated_profiles_preserve_known_route_behavior() {
@@ -111,6 +116,16 @@ mod tests {
             Protocol::AnthropicMessages,
         );
         assert!(!fireworks.supports_cache_control_on_tools);
+
+        let mistral = cache_compatibility(
+            MISTRAL.compatibility,
+            "mistral-small-latest",
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(
+            mistral.session_affinity_format,
+            Some(SessionAffinityFormat::Mistral)
+        );
 
         let opencode =
             cache_compatibility(OPENCODE.compatibility, "gpt-5.4", Protocol::OpenAiResponses);

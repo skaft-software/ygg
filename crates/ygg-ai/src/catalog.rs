@@ -66,6 +66,13 @@ pub enum AuthConfig {
         /// Env var name.
         var: String,
     },
+    /// Bearer token forwarded in a custom header referenced by an environment variable.
+    HeaderBearerEnv {
+        /// Header name.
+        name: String,
+        /// Env var name.
+        var: String,
+    },
     /// Dynamic token resolver bound at load-time.
     Dynamic {
         /// Registry identifier for the resolver.
@@ -388,6 +395,11 @@ fn resolve_auth(
             let header_name = http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| ConfigError::InvalidHeader(e.to_string()))?;
             Ok(crate::auth::Auth::header_env(header_name, var))
+        }
+        AuthConfig::HeaderBearerEnv { name, var } => {
+            let header_name = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| ConfigError::InvalidHeader(e.to_string()))?;
+            Ok(crate::auth::Auth::header_bearer_env(header_name, var))
         }
         AuthConfig::Dynamic { resolver_id } => {
             let resolver = resolvers

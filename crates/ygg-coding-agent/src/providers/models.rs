@@ -620,6 +620,223 @@ pub const OPENCODE_MODELS: &[StaticModelPreset] = &[
     ),
 ];
 
+/// Checked-in Mistral Chat Completions models. These retain the Mistral
+/// transport profile while using the canonical OpenAI Chat model contract.
+pub const MISTRAL_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "codestral-latest",
+        "Codestral",
+        Protocol::OpenAiChat,
+        256_000,
+        4_096,
+        false,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "devstral-latest",
+        "Devstral 2",
+        Protocol::OpenAiChat,
+        262_144,
+        262_144,
+        false,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "magistral-medium-latest",
+        "Magistral Medium",
+        Protocol::OpenAiChat,
+        128_000,
+        16_384,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mistral-large-latest",
+        "Mistral Large",
+        Protocol::OpenAiChat,
+        262_144,
+        262_144,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mistral-small-latest",
+        "Mistral Small",
+        Protocol::OpenAiChat,
+        256_000,
+        256_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "pixtral-large-latest",
+        "Pixtral Large",
+        Protocol::OpenAiChat,
+        128_000,
+        128_000,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+];
+
+/// A conservative Workers AI inventory for its documented OpenAI-compatible
+/// endpoint. Cloudflare can add models independently; these are the checked-in
+/// models with complete capability and pricing metadata.
+pub const CLOUDFLARE_WORKERS_AI_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "Llama 4 Scout 17B 16E Instruct",
+        Protocol::OpenAiChat,
+        131_000,
+        16_384,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "@cf/mistralai/mistral-small-3.1-24b-instruct",
+        "Mistral Small 3.1 24B Instruct",
+        Protocol::OpenAiChat,
+        128_000,
+        128_000,
+        false,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "@cf/moonshotai/kimi-k2.7-code",
+        "Kimi K2.7 Code",
+        Protocol::OpenAiChat,
+        262_144,
+        262_144,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "@cf/openai/gpt-oss-120b",
+        "GPT OSS 120B",
+        Protocol::OpenAiChat,
+        128_000,
+        16_384,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "@cf/zai-org/glm-5.2",
+        "GLM-5.2",
+        Protocol::OpenAiChat,
+        262_144,
+        262_144,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+/// Common Cloudflare AI Gateway passthrough models. Gateway route selection is
+/// declaration-owned: Claude uses Anthropic Messages, OpenAI reasoning models
+/// use Responses, and Workers AI models use the compatibility route.
+pub const CLOUDFLARE_AI_GATEWAY_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "claude-haiku-4-5",
+        "Claude Haiku 4.5",
+        Protocol::AnthropicMessages,
+        200_000,
+        64_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "claude-sonnet-4-5",
+        "Claude Sonnet 4.5",
+        Protocol::AnthropicMessages,
+        200_000,
+        64_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "claude-opus-4-5",
+        "Claude Opus 4.5",
+        Protocol::AnthropicMessages,
+        200_000,
+        64_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gpt-4o",
+        "GPT-4o",
+        Protocol::OpenAiResponses,
+        128_000,
+        16_384,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gpt-4o-mini",
+        "GPT-4o mini",
+        Protocol::OpenAiResponses,
+        128_000,
+        16_384,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gpt-5.4",
+        "GPT-5.4",
+        Protocol::OpenAiResponses,
+        1_050_000,
+        128_000,
+        true,
+        true,
+        ReasoningEffort::Xhigh,
+    ),
+    StaticModelPreset::new(
+        "o3",
+        "o3",
+        Protocol::OpenAiResponses,
+        200_000,
+        100_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "o4-mini",
+        "o4-mini",
+        Protocol::OpenAiResponses,
+        200_000,
+        100_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+        "Workers AI Kimi K2.6",
+        Protocol::OpenAiChat,
+        256_000,
+        256_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
 /// Return static models for a declaration-selected set without branching on a
 /// provider identifier.
 pub(crate) fn static_models(set: StaticModelSet) -> &'static [StaticModelPreset] {
@@ -627,5 +844,8 @@ pub(crate) fn static_models(set: StaticModelSet) -> &'static [StaticModelPreset]
         StaticModelSet::None => &[],
         StaticModelSet::MiniMax => MINIMAX_MODELS,
         StaticModelSet::OpenCode => OPENCODE_MODELS,
+        StaticModelSet::Mistral => MISTRAL_MODELS,
+        StaticModelSet::CloudflareWorkersAi => CLOUDFLARE_WORKERS_AI_MODELS,
+        StaticModelSet::CloudflareAiGateway => CLOUDFLARE_AI_GATEWAY_MODELS,
     }
 }

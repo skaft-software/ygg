@@ -410,6 +410,9 @@ pub(crate) fn responses_affinity_headers(
         Some(crate::types::SessionAffinityFormat::OpenRouter) => {
             headers.insert(http::HeaderName::from_static("x-session-id"), value);
         }
+        // Mistral is a Chat route; accept the configuration here without
+        // applying a Chat-only header to a Responses request.
+        Some(crate::types::SessionAffinityFormat::Mistral) => {}
         Some(crate::types::SessionAffinityFormat::Codex) => {
             headers.insert(http::HeaderName::from_static("session-id"), value.clone());
             headers.insert(http::HeaderName::from_static("x-client-request-id"), value);

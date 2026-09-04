@@ -297,6 +297,33 @@ export OPENROUTER_API_KEY='...'
 ygg --model openrouter/anthropic/claude-sonnet-4.6
 ```
 
+Mistral's built-in Chat Completions preset uses its native request and reasoning
+content conventions while retaining Ygg's normal model selection:
+
+```sh
+export MISTRAL_API_KEY='...'
+ygg --model mistral/mistral-small-latest
+```
+
+Cloudflare Workers AI requires an account identifier as well as an API key:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID='...'
+export CLOUDFLARE_API_KEY='...'
+ygg --model cloudflare-workers-ai/@cf/openai/gpt-oss-120b
+```
+
+Cloudflare AI Gateway routes the built-in Claude, OpenAI, and Workers AI models
+through the gateway's documented provider paths. Set its non-secret gateway
+identifier too:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID='...'
+export CLOUDFLARE_GATEWAY_ID='...'
+export CLOUDFLARE_API_KEY='...'
+ygg --model cloudflare-ai-gateway/claude-sonnet-4-5
+```
+
 ChatGPT subscription users can use the hosted device flow instead of manually managing an API key:
 
 ```sh
@@ -572,7 +599,7 @@ For untrusted repositories, use a container, VM, or restricted account; see
 | OpenAI Chat Completions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Anthropic Messages | ✓ | ✓ | ✓ | ✓ | ✓ |
 
-Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, and OpenCode Zen. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
+Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, OpenCode Zen, Mistral, Cloudflare Workers AI, and Cloudflare AI Gateway. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
 
 Capability handling is model-specific. ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
 

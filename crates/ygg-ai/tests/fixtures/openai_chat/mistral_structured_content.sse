@@ -1,0 +1,9 @@
+: cite: Mistral Chat Completions structured content (`thinking` and `text` chunks)
+: cite: docs/design/ygg-ai.md §12.1/§14 (ordered text/reasoning stream events)
+data: {"id":"mistral-structured","choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":"Inspect first."}]},{"type":"text","text":"The answer is 42."}]}}]}
+
+data: {"id":"mistral-structured","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"mistral-structured","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":7,"total_tokens":19}}
+
+data: [DONE]

@@ -28,8 +28,12 @@ pub(crate) fn register_environment_endpoints(
     credential: &EnvironmentCredential,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    let base_url = url::Url::parse(declaration.base_url)?;
-    register_environment_endpoints_at_base_url(catalog, declaration, credential, &base_url, timeout)
+    for route in declaration.routes {
+        let auth = environment_auth(route, credential)?;
+        let route_base_url = declaration.resolved_route_base_url(route)?;
+        register_endpoint(catalog, declaration, route, auth, route_base_url, timeout)?;
+    }
+    Ok(())
 }
 
 /// Register every unique route endpoint at a validated configuration override.
@@ -46,7 +50,8 @@ pub(crate) fn register_environment_endpoints_at_base_url(
 ) -> anyhow::Result<()> {
     for route in declaration.routes {
         let auth = environment_auth(route, credential)?;
-        register_endpoint(catalog, declaration, route, auth, base_url, timeout)?;
+        let route_base_url = base_url.join(route.base_path)?;
+        register_endpoint(catalog, declaration, route, auth, route_base_url, timeout)?;
     }
     Ok(())
 }
@@ -57,7 +62,7 @@ fn register_endpoint(
     declaration: &ProviderDeclaration,
     route: &ProviderRoute,
     auth: Auth,
-    base_url: &url::Url,
+    route_base_url: url::Url,
     timeout: Duration,
 ) -> anyhow::Result<()> {
     let endpoint_id = EndpointId(route.endpoint_id.into());
@@ -66,7 +71,7 @@ fn register_endpoint(
     }
     catalog.register_endpoint(Endpoint {
         id: endpoint_id,
-        base_url: base_url.clone(),
+        base_url: route_base_url,
         auth,
         default_headers: public_headers(declaration.extra_headers)?,
         transport: route.transport,
@@ -223,7 +228,9 @@ pub(crate) fn declared_endpoint_ids(declaration: &ProviderDeclaration) -> HashSe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::contract::{MINIMAX, OPENCODE};
+    use crate::providers::contract::{
+        CLOUDFLARE_AI_GATEWAY, CLOUDFLARE_WORKERS_AI, MINIMAX, MISTRAL, OPENCODE,
+    };
 
     #[test]
     fn static_models_use_only_generated_route_endpoints() {
@@ -278,6 +285,87 @@ mod tests {
             .capabilities
             .input_modalities
             .contains(ygg_ai::Modality::Image));
+    }
+
+    #[test]
+    fn alternate_provider_routes_keep_private_url_and_auth_details_in_catalog() {
+        let credential = EnvironmentCredential::for_test("CLOUDFLARE_API_KEY", "test-value");
+        let gateway_base =
+            url::Url::parse("https://gateway.example.test/v1/account/gateway/").unwrap();
+        let mut gateway = ModelCatalog::default();
+        register_environment_endpoints_at_base_url(
+            &mut gateway,
+            &CLOUDFLARE_AI_GATEWAY,
+            &credential,
+            &gateway_base,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        register_static_models(&mut gateway, &CLOUDFLARE_AI_GATEWAY).unwrap();
+
+        let claude = gateway
+            .resolve(&ModelId("cloudflare-ai-gateway/claude-sonnet-4-5".into()))
+            .unwrap();
+        assert_eq!(claude.spec.protocol, Protocol::AnthropicMessages);
+        assert_eq!(
+            claude.endpoint.base_url.as_str(),
+            "https://gateway.example.test/v1/account/gateway/anthropic/"
+        );
+        assert!(matches!(
+            claude.endpoint.auth,
+            Auth::HeaderBearerEnv { ref name, .. }
+                if name == &http::HeaderName::from_static("cf-aig-authorization")
+        ));
+
+        let openai = gateway
+            .resolve(&ModelId("cloudflare-ai-gateway/gpt-5.4".into()))
+            .unwrap();
+        assert_eq!(openai.spec.protocol, Protocol::OpenAiResponses);
+        assert_eq!(
+            openai.endpoint.base_url.as_str(),
+            "https://gateway.example.test/v1/account/gateway/openai/"
+        );
+        let workers = gateway
+            .resolve(&ModelId(
+                "cloudflare-ai-gateway/workers-ai/@cf/moonshotai/kimi-k2.6".into(),
+            ))
+            .unwrap();
+        assert_eq!(workers.spec.protocol, Protocol::OpenAiChat);
+        assert_eq!(
+            workers.endpoint.base_url.as_str(),
+            "https://gateway.example.test/v1/account/gateway/compat/"
+        );
+
+        let mut mistral = ModelCatalog::default();
+        register_environment_endpoints(&mut mistral, &MISTRAL, &credential, Duration::from_secs(1))
+            .unwrap();
+        register_static_models(&mut mistral, &MISTRAL).unwrap();
+        let mistral_model = mistral
+            .resolve(&ModelId("mistral/mistral-small-latest".into()))
+            .unwrap();
+        assert_eq!(
+            mistral_model.endpoint.runtime.openai_chat_profile,
+            ygg_ai::OpenAiChatRuntimeProfile::Mistral
+        );
+
+        let workers_base =
+            url::Url::parse("https://workers.example.test/client/v4/accounts/account/ai/v1/")
+                .unwrap();
+        let mut workers_catalog = ModelCatalog::default();
+        register_environment_endpoints_at_base_url(
+            &mut workers_catalog,
+            &CLOUDFLARE_WORKERS_AI,
+            &credential,
+            &workers_base,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        register_static_models(&mut workers_catalog, &CLOUDFLARE_WORKERS_AI).unwrap();
+        assert!(workers_catalog
+            .resolve(&ModelId(
+                "cloudflare-workers-ai/@cf/openai/gpt-oss-120b".into(),
+            ))
+            .is_ok());
     }
 
     #[test]

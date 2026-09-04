@@ -135,6 +135,8 @@ struct ProviderSpec {
     id: String,
     name: String,
     base_url: String,
+    #[serde(default)]
+    base_url_environment: Vec<String>,
     authentication: AuthenticationSpec,
     model_discovery: DiscoverySpec,
     discovery_capabilities: String,
@@ -172,11 +174,19 @@ struct FilterSpec {
 #[serde(deny_unknown_fields)]
 struct RouteSpec {
     endpoint_id: String,
+    #[serde(default)]
+    base_path: String,
     protocol: String,
     transport: String,
     body_encoding: String,
     responses_profile: String,
+    #[serde(default = "default_openai_chat_profile")]
+    openai_chat_profile: String,
     auth_presentation: String,
+}
+
+fn default_openai_chat_profile() -> String {
+    "default".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +229,53 @@ fn valid_environment_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn valid_base_url(url: &url::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().ends_with('/')
+}
+
+fn valid_base_url_template(base_url: &str, environment: &[String]) -> bool {
+    let mut rendered = base_url.to_owned();
+    let mut seen = HashSet::new();
+    for variable in environment {
+        let placeholder = format!("{{{variable}}}");
+        if !valid_environment_name(variable)
+            || !seen.insert(variable)
+            || rendered.matches(&placeholder).count() != 1
+        {
+            return false;
+        }
+        rendered = rendered.replace(&placeholder, "placeholder");
+    }
+    if rendered.contains('{') || rendered.contains('}') {
+        return false;
+    }
+    url::Url::parse(&rendered).is_ok_and(|url| valid_base_url(&url))
+}
+
+fn valid_route_base_path(path: &str) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+    if !path.ends_with('/') || path.starts_with('/') {
+        return false;
+    }
+    let segments = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    !segments.is_empty()
+        && segments.iter().all(|segment| {
+            segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
 }
 
 fn credential_like_header(name: &str) -> bool {
@@ -300,10 +357,19 @@ fn responses_profile_expression(value: &str) -> Option<&'static str> {
     }
 }
 
+fn openai_chat_profile_expression(value: &str) -> Option<&'static str> {
+    match value {
+        "default" => Some("OpenAiChatRuntimeProfile::Default"),
+        "mistral" => Some("OpenAiChatRuntimeProfile::Mistral"),
+        _ => None,
+    }
+}
+
 fn auth_presentation_expression(value: &str) -> Option<&'static str> {
     match value {
         "bearer" => Some("EndpointAuthPresentation::Bearer"),
         "api_key_header" => Some("EndpointAuthPresentation::ApiKeyHeader"),
+        "cloudflare_ai_gateway" => Some("EndpointAuthPresentation::CloudflareAiGateway"),
         "dynamic" => Some("EndpointAuthPresentation::Dynamic"),
         _ => None,
     }
@@ -323,6 +389,9 @@ fn static_models_expression(value: &str) -> Option<&'static str> {
         "none" => Some("StaticModelSet::None"),
         "minimax" => Some("StaticModelSet::MiniMax"),
         "opencode" => Some("StaticModelSet::OpenCode"),
+        "mistral" => Some("StaticModelSet::Mistral"),
+        "cloudflare_workers_ai" => Some("StaticModelSet::CloudflareWorkersAi"),
+        "cloudflare_ai_gateway" => Some("StaticModelSet::CloudflareAiGateway"),
         _ => None,
     }
 }
@@ -345,6 +414,8 @@ fn compatibility_expression(value: &str) -> Option<&'static str> {
         "opencode" => Some("CompatibilityProfile::OpenCode"),
         "custom" => Some("CompatibilityProfile::Custom"),
         "codex" => Some("CompatibilityProfile::Codex"),
+        "mistral" => Some("CompatibilityProfile::Mistral"),
+        "cloudflare" => Some("CompatibilityProfile::Cloudflare"),
         _ => None,
     }
 }
@@ -360,6 +431,9 @@ fn pricing_expression(value: &str) -> Option<&'static str> {
         "openrouter" => Some("PricingProfile::OpenRouter"),
         "custom" => Some("PricingProfile::Custom"),
         "subscription" => Some("PricingProfile::Subscription"),
+        "mistral" => Some("PricingProfile::Mistral"),
+        "cloudflare_workers_ai" => Some("PricingProfile::CloudflareWorkersAi"),
+        "cloudflare_ai_gateway" => Some("PricingProfile::CloudflareAiGateway"),
         _ => None,
     }
 }
@@ -599,15 +673,7 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
             "provider declaration has an invalid label",
         ));
     }
-    let base_url = url::Url::parse(&spec.base_url)
-        .map_err(|_| provider_manifest_error("provider declaration has an invalid base URL"))?;
-    if !matches!(base_url.scheme(), "http" | "https")
-        || !base_url.username().is_empty()
-        || base_url.password().is_some()
-        || base_url.query().is_some()
-        || base_url.fragment().is_some()
-        || !base_url.path().ends_with('/')
-    {
+    if !valid_base_url_template(&spec.base_url, &spec.base_url_environment) {
         return Err(provider_manifest_error(
             "provider declaration has an invalid base URL",
         ));
@@ -635,10 +701,12 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
     }
     for route in &spec.routes {
         if !valid_provider_identifier(&route.endpoint_id)
+            || !valid_route_base_path(&route.base_path)
             || protocol_expression(&route.protocol).is_none()
             || transport_expression(&route.transport).is_none()
             || body_encoding_expression(&route.body_encoding).is_none()
             || responses_profile_expression(&route.responses_profile).is_none()
+            || openai_chat_profile_expression(&route.openai_chat_profile).is_none()
             || auth_presentation_expression(&route.auth_presentation).is_none()
         {
             return Err(provider_manifest_error(
@@ -648,6 +716,11 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
         if route.responses_profile != "default" && route.protocol != "openai_responses" {
             return Err(provider_manifest_error(
                 "provider Responses runtime profile requires a Responses route",
+            ));
+        }
+        if route.openai_chat_profile != "default" && route.protocol != "openai_chat" {
+            return Err(provider_manifest_error(
+                "provider OpenAI Chat runtime profile requires a Chat route",
             ));
         }
         if route.transport == "websocket_preferred" && route.protocol != "openai_responses" {
@@ -661,7 +734,7 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
             (&spec.authentication, route.auth_presentation.as_str()),
             (
                 AuthenticationSpec::Environment { .. },
-                "bearer" | "api_key_header"
+                "bearer" | "api_key_header" | "cloudflare_ai_gateway"
             ) | (AuthenticationSpec::Subscription { .. }, "dynamic")
         );
         if !valid_presentation {
@@ -673,10 +746,12 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
     for (index, route) in spec.routes.iter().enumerate() {
         for previous in &spec.routes[..index] {
             if previous.endpoint_id == route.endpoint_id
-                && (previous.auth_presentation != route.auth_presentation
+                && (previous.base_path != route.base_path
+                    || previous.auth_presentation != route.auth_presentation
                     || previous.transport != route.transport
                     || previous.body_encoding != route.body_encoding
-                    || previous.responses_profile != route.responses_profile)
+                    || previous.responses_profile != route.responses_profile
+                    || previous.openai_chat_profile != route.openai_chat_profile)
             {
                 return Err(provider_manifest_error(
                     "provider endpoint routes disagree on runtime configuration",
@@ -755,7 +830,7 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
     let source = fs::read_to_string(&manifest_path)?;
     let manifest: ProviderManifest = serde_json::from_str(&source)
         .map_err(|_| provider_manifest_error("provider declaration manifest is invalid JSON"))?;
-    if manifest.schema_version != 1 || manifest.providers.is_empty() {
+    if manifest.schema_version != 2 || manifest.providers.is_empty() {
         return Err(provider_manifest_error(
             "provider declaration manifest has an unsupported schema version",
         ));
@@ -798,6 +873,17 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
             .expect("writing to String cannot fail");
         writeln!(generated, "    base_url: {},", quote(&provider.base_url))
             .expect("writing to String cannot fail");
+        let base_url_environment = provider
+            .base_url_environment
+            .iter()
+            .map(|value| quote(value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            generated,
+            "    base_url_environment: &[{base_url_environment}],"
+        )
+        .expect("writing to String cannot fail");
         writeln!(
             generated,
             "    authentication: {},",
@@ -833,8 +919,9 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
         for route in &provider.routes {
             writeln!(
                 generated,
-                "        ProviderRoute {{ endpoint_id: {}, protocol: {}, auth_presentation: {}, transport: {}, runtime: RequestRuntime {{ body_encoding: {}, responses_profile: {}, lifecycle_feedback: false }} }},",
+                "        ProviderRoute {{ endpoint_id: {}, base_path: {}, protocol: {}, auth_presentation: {}, transport: {}, runtime: RequestRuntime {{ body_encoding: {}, responses_profile: {}, openai_chat_profile: {}, lifecycle_feedback: false }} }},",
                 quote(&route.endpoint_id),
+                quote(&route.base_path),
                 protocol_expression(&route.protocol).expect("validated protocol"),
                 auth_presentation_expression(&route.auth_presentation)
                     .expect("validated auth presentation"),
@@ -842,6 +929,8 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
                 body_encoding_expression(&route.body_encoding).expect("validated body encoding"),
                 responses_profile_expression(&route.responses_profile)
                     .expect("validated responses profile"),
+                openai_chat_profile_expression(&route.openai_chat_profile)
+                    .expect("validated OpenAI Chat profile"),
             )
             .expect("writing to String cannot fail");
         }

@@ -111,6 +111,17 @@ pub enum Auth {
         /// Name of the environment variable containing the value.
         var: String,
     },
+    /// Bearer token loaded from the environment in a custom header.
+    ///
+    /// This is used by proxy APIs such as Cloudflare AI Gateway that forward
+    /// the downstream provider token outside the ordinary `Authorization`
+    /// header.
+    HeaderBearerEnv {
+        /// Name of the custom header.
+        name: http::HeaderName,
+        /// Name of the environment variable containing the token.
+        var: String,
+    },
     /// Dynamic token resolver (e.g. OAuth flow, auto-refreshing keys).
     Dynamic(std::sync::Arc<dyn CredentialResolver>),
 }
@@ -128,6 +139,11 @@ impl std::fmt::Debug for Auth {
             Auth::BearerEnv { var } => f.debug_struct("BearerEnv").field("var", var).finish(),
             Auth::HeaderEnv { name, var } => f
                 .debug_struct("HeaderEnv")
+                .field("name", name)
+                .field("var", var)
+                .finish(),
+            Auth::HeaderBearerEnv { name, var } => f
+                .debug_struct("HeaderBearerEnv")
                 .field("name", name)
                 .field("var", var)
                 .finish(),
@@ -168,6 +184,14 @@ impl Auth {
         }
     }
 
+    /// Returns Auth::HeaderBearerEnv.
+    pub fn header_bearer_env(name: http::HeaderName, var: impl Into<String>) -> Self {
+        Self::HeaderBearerEnv {
+            name,
+            var: var.into(),
+        }
+    }
+
     /// Returns Auth::Dynamic.
     pub fn dynamic(r: std::sync::Arc<dyn CredentialResolver>) -> Self {
         Self::Dynamic(r)
@@ -181,7 +205,9 @@ impl Auth {
     /// and dynamic credentials are usable by construction.
     pub fn is_configured(&self) -> bool {
         match self {
-            Self::BearerEnv { var } | Self::HeaderEnv { var, .. } => Secret::from_env(var)
+            Self::BearerEnv { var }
+            | Self::HeaderEnv { var, .. }
+            | Self::HeaderBearerEnv { var, .. } => Secret::from_env(var)
                 .map(|secret| !secret.expose().trim().is_empty())
                 .unwrap_or(false),
             Self::None | Self::Bearer(_) | Self::Header { .. } | Self::Dynamic(_) => true,
@@ -367,6 +393,15 @@ where
             val.set_sensitive(true);
             headers.insert(name.clone(), val);
         }
+        Auth::HeaderBearerEnv { name, var } => {
+            let secret = resolve_env_secret_with(var, read_env)?;
+            redactor.insert(secret.clone());
+            let bearer_str = format!("Bearer {}", secret.expose());
+            let mut val = http::HeaderValue::from_str(&bearer_str)
+                .map_err(|_| AuthError::InvalidHeaderValue)?;
+            val.set_sensitive(true);
+            headers.insert(name.clone(), val);
+        }
         Auth::Dynamic(resolver) => {
             let cred = resolver.resolve().await?;
             redactor.insert(cred.value.clone());
@@ -404,7 +439,9 @@ pub(crate) fn auth_header_name(auth: &Auth) -> Option<http::HeaderName> {
     match auth {
         Auth::None => None,
         Auth::Bearer(_) | Auth::BearerEnv { .. } => Some(http::header::AUTHORIZATION),
-        Auth::Header { name, .. } | Auth::HeaderEnv { name, .. } => Some(name.clone()),
+        Auth::Header { name, .. }
+        | Auth::HeaderEnv { name, .. }
+        | Auth::HeaderBearerEnv { name, .. } => Some(name.clone()),
         Auth::Dynamic(_) => None,
     }
 }
@@ -541,12 +578,40 @@ mod tests {
         );
         assert!(header.headers.get("x-api-key").unwrap().is_sensitive());
 
+        let gateway = resolve_headers_with_env(
+            &Auth::header_bearer_env(
+                http::HeaderName::from_static("cf-aig-authorization"),
+                "GATEWAY_KEY",
+            ),
+            &read_at_limit,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            gateway
+                .headers
+                .get("cf-aig-authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            format!("Bearer {at_limit}")
+        );
+        assert!(gateway
+            .headers
+            .get("cf-aig-authorization")
+            .unwrap()
+            .is_sensitive());
+
         let read_over_limit = |var: &str| -> Result<Option<String>, ConfigError> {
             bounded_env_value(var, Ok("x".repeat(MAX_ENV_VALUE_BYTES + 1)))
         };
         for auth in [
             Auth::bearer_env("BEARER_KEY"),
             Auth::header_env(http::HeaderName::from_static("x-api-key"), "HEADER_KEY"),
+            Auth::header_bearer_env(
+                http::HeaderName::from_static("cf-aig-authorization"),
+                "GATEWAY_KEY",
+            ),
         ] {
             let error = resolve_headers_with_env(&auth, &read_over_limit)
                 .await
@@ -555,7 +620,7 @@ mod tests {
             assert!(matches!(
                 error,
                 AuthError::EnvironmentValueTooLarge { var, max_bytes }
-                    if (var == "BEARER_KEY" || var == "HEADER_KEY")
+                    if (var == "BEARER_KEY" || var == "HEADER_KEY" || var == "GATEWAY_KEY")
                         && max_bytes == MAX_ENV_VALUE_BYTES
             ));
         }

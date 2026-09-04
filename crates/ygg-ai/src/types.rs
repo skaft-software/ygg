@@ -95,6 +95,8 @@ pub enum SessionAffinityFormat {
     OpenRouter,
     /// Codex's `session-id` and `x-client-request-id` headers.
     Codex,
+    /// Mistral's `x-affinity` header.
+    Mistral,
 }
 
 /// Supported wire protocols.
@@ -135,6 +137,9 @@ pub struct RequestRuntime {
     /// Responses-family behavior selected by the endpoint declaration.
     #[serde(default)]
     pub responses_profile: ResponsesRuntimeProfile,
+    /// Chat-Completions-family behavior selected by the endpoint declaration.
+    #[serde(default)]
+    pub openai_chat_profile: OpenAiChatRuntimeProfile,
     /// Opt into Ygg's OpenAI-compatible cold-start lifecycle extension.
     ///
     /// When enabled on a streaming OpenAI Chat HTTP/SSE request, Ygg advertises
@@ -143,6 +148,21 @@ pub struct RequestRuntime {
     /// this keep the ordinary OpenAI-compatible request and response behavior.
     #[serde(default)]
     pub lifecycle_feedback: bool,
+}
+
+/// Endpoint behavior for an existing OpenAI Chat Completions codec.
+///
+/// This is endpoint data rather than a provider identity. Mistral's chat
+/// endpoint retains the OpenAI Chat transport and stream envelope while using
+/// a few documented request and content conventions of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiChatRuntimeProfile {
+    /// Public OpenAI Chat Completions behavior.
+    #[default]
+    Default,
+    /// Mistral Chat Completions compatibility behavior.
+    Mistral,
 }
 
 /// Endpoint behavior for an existing OpenAI Responses codec.
