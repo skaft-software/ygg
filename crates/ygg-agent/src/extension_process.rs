@@ -90,6 +90,19 @@ pub const DELEGATION_TELEMETRY_SCHEMA: &str = "ygg.delegation.telemetry.v1";
 pub const EXTENSION_FEATURE_APPROVALS: &str = "approvals";
 /// API `0.2` owner-scoped host secret lookup service.
 pub const EXTENSION_FEATURE_SECRETS: &str = "secrets";
+/// API `0.2` bounded semantic UI contribution transport.
+///
+/// This grants no terminal ownership: extensions can publish only validated
+/// snapshots which the frontend projects through its own theme and layout.
+pub const EXTENSION_FEATURE_SEMANTIC_UI: &str = "semantic_ui";
+/// API `0.2` host-owned editor snapshot and mutation handoff.
+pub const EXTENSION_FEATURE_EDITOR_HANDOFF: &str = "editor_handoff";
+/// API `0.2` observer-only normalized terminal-input and resize events.
+pub const EXTENSION_FEATURE_TERMINAL_INPUT: &str = "terminal_input";
+/// API `0.2` bounded host-mediated autocomplete queries.
+pub const EXTENSION_FEATURE_AUTOCOMPLETE: &str = "autocomplete";
+/// API `0.2` initialization-time semantic tool-renderer discovery.
+pub const EXTENSION_FEATURE_DYNAMIC_TOOL_RENDERERS: &str = "dynamic_tool_renderers";
 
 const API_0_2_REQUIRED_FEATURES: &[&str] = &[
     EXTENSION_FEATURE_REQUEST_CANCELLATION,
@@ -102,6 +115,11 @@ const API_0_2_OPTIONAL_FEATURES: &[&str] = &[
     EXTENSION_FEATURE_POLICY_INTENTS,
     EXTENSION_FEATURE_DYNAMIC_TOOLS,
     EXTENSION_FEATURE_RUNTIME_COMMANDS,
+    EXTENSION_FEATURE_SEMANTIC_UI,
+    EXTENSION_FEATURE_EDITOR_HANDOFF,
+    EXTENSION_FEATURE_TERMINAL_INPUT,
+    EXTENSION_FEATURE_AUTOCOMPLETE,
+    EXTENSION_FEATURE_DYNAMIC_TOOL_RENDERERS,
 ];
 
 const MAX_EXTENSION_AGENT_WAIT_MS: u64 = 60_000;
@@ -163,6 +181,24 @@ const MAX_PRESENTATION_UPDATES_PER_SECOND: usize = 32;
 // older event has necessarily fallen outside the broadcast channel's window.
 const ANSWERED_CONFIRMATION_CAPACITY: usize = EXTENSION_EVENT_CAPACITY;
 const MAX_CONFIRMATION_REQUEST_ID_BYTES: usize = 256;
+/// Maximum bytes in one semantic UI key.
+pub const MAX_EXTENSION_UI_KEY_BYTES: usize = 128;
+/// Maximum bytes in one semantic UI text field or widget line.
+pub const MAX_EXTENSION_UI_TEXT_BYTES: usize = 8 * 1024;
+/// Maximum widget lines in one semantic UI snapshot.
+pub const MAX_EXTENSION_UI_LINES: usize = 32;
+/// Maximum custom working-indicator frames in one snapshot.
+pub const MAX_EXTENSION_UI_INDICATOR_FRAMES: usize = 16;
+/// Maximum persistent keyed status or widget entries from one extension generation.
+pub const MAX_EXTENSION_UI_ENTRIES: usize = 64;
+/// Maximum editor text bytes admitted through the host-owned handoff.
+pub const MAX_EXTENSION_EDITOR_TEXT_BYTES: usize = 256 * 1024;
+/// Maximum autocomplete items from one extension query.
+pub const MAX_EXTENSION_AUTOCOMPLETE_ITEMS: usize = 32;
+/// Maximum bytes in one autocomplete item field.
+pub const MAX_EXTENSION_AUTOCOMPLETE_TEXT_BYTES: usize = 1024;
+/// Maximum bytes in one normalized observer input payload.
+pub const MAX_EXTENSION_TERMINAL_INPUT_BYTES: usize = 256;
 
 static HOST_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static HOST_SHUTDOWN_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
@@ -2156,6 +2192,381 @@ pub struct ExtensionStatusContribution {
     pub priority: i32,
 }
 
+/// Placement for a bounded semantic widget relative to the host-owned editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionWidgetPlacement {
+    /// Reserve rows above the host-owned composer.
+    #[default]
+    AboveEditor,
+    /// Reserve rows below the host-owned composer.
+    BelowEditor,
+}
+
+/// One extension-owned semantic UI snapshot.
+///
+/// These values are deliberately data-only. They cannot contain escape
+/// sequences, terminal handles, callbacks, or arbitrary component factories.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionUiContribution {
+    /// A keyed compact status item. `text: null` clears the key.
+    Status {
+        /// Stable key scoped to the extension instance and generation.
+        key: String,
+        /// Plain text, or `null` to remove this status item.
+        #[serde(default)]
+        text: Option<String>,
+        /// Finite host-resolved semantic role.
+        #[serde(default)]
+        style_role: Option<String>,
+        /// Higher values are retained first when vertical space is constrained.
+        #[serde(default)]
+        priority: i32,
+    },
+    /// A keyed plain-text widget. `lines: null` clears the key.
+    Widget {
+        /// Stable key scoped to the extension instance and generation.
+        key: String,
+        /// Complete plain-text lines, or `null` to remove the widget.
+        #[serde(default)]
+        lines: Option<Vec<String>>,
+        /// Host-owned placement around the composer.
+        #[serde(default)]
+        placement: ExtensionWidgetPlacement,
+        /// Finite host-resolved semantic role for every line.
+        #[serde(default)]
+        style_role: Option<String>,
+        /// Higher values are retained first when vertical space is constrained.
+        #[serde(default)]
+        priority: i32,
+    },
+    /// Bounded metadata for the host-owned working indicator.
+    Working {
+        /// Optional plain status text. `null` restores the host default.
+        #[serde(default)]
+        message: Option<String>,
+        /// Optional visibility override. The host still controls run ownership.
+        #[serde(default)]
+        visible: Option<bool>,
+        /// Optional finite indicator frame list. Empty means hidden.
+        #[serde(default)]
+        frames: Option<Vec<String>>,
+        /// Optional bounded animation interval in milliseconds.
+        #[serde(default)]
+        interval_ms: Option<u64>,
+    },
+    /// Bounded label for a host-owned collapsed-thinking affordance.
+    HiddenThinking {
+        /// Plain replacement label, or `null` to restore the host default.
+        #[serde(default)]
+        label: Option<String>,
+    },
+}
+
+impl ExtensionUiContribution {
+    fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::Status {
+                key,
+                text,
+                style_role,
+                ..
+            } => {
+                validate_extension_ui_key(key)?;
+                if let Some(text) = text {
+                    validate_extension_ui_text("status text", text, false)?;
+                }
+                validate_extension_style_role(style_role.as_deref())
+            }
+            Self::Widget {
+                key,
+                lines,
+                style_role,
+                ..
+            } => {
+                validate_extension_ui_key(key)?;
+                if let Some(lines) = lines {
+                    if lines.len() > MAX_EXTENSION_UI_LINES {
+                        return Err(format!(
+                            "widget has {} lines; limit is {MAX_EXTENSION_UI_LINES}",
+                            lines.len()
+                        ));
+                    }
+                    for line in lines {
+                        validate_extension_ui_text("widget line", line, false)?;
+                    }
+                }
+                validate_extension_style_role(style_role.as_deref())
+            }
+            Self::Working {
+                message,
+                frames,
+                interval_ms,
+                ..
+            } => {
+                if let Some(message) = message {
+                    validate_extension_ui_text("working message", message, false)?;
+                }
+                if let Some(frames) = frames {
+                    if frames.len() > MAX_EXTENSION_UI_INDICATOR_FRAMES {
+                        return Err(format!(
+                            "working indicator has {} frames; limit is {MAX_EXTENSION_UI_INDICATOR_FRAMES}",
+                            frames.len()
+                        ));
+                    }
+                    for frame in frames {
+                        validate_extension_ui_text("working indicator frame", frame, false)?;
+                    }
+                }
+                if interval_ms.is_some_and(|interval| !(16..=10_000).contains(&interval)) {
+                    return Err("working indicator interval must be 16..=10000ms".into());
+                }
+                Ok(())
+            }
+            Self::HiddenThinking { label } => {
+                if let Some(label) = label {
+                    validate_extension_ui_text("hidden thinking label", label, false)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// A host-owned editor operation requested by an extension.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExtensionEditorRequest {
+    /// Return the latest host editor snapshot.
+    Get,
+    /// Replace the host editor text and discard its pending attachments.
+    Set {
+        /// Complete replacement text.
+        text: String,
+    },
+    /// Insert text through the host's ordinary paste policy.
+    Paste {
+        /// Text to paste at the host editor cursor.
+        text: String,
+    },
+    /// Ask the host to return focus to its normal editor at a safe boundary.
+    Focus,
+}
+
+impl ExtensionEditorRequest {
+    fn validate(&self) -> Result<(), String> {
+        let text = match self {
+            Self::Set { text } | Self::Paste { text } => Some(text),
+            Self::Get | Self::Focus => None,
+        };
+        if let Some(text) = text {
+            validate_extension_editor_text(text)?;
+        }
+        Ok(())
+    }
+}
+
+/// Snapshot returned after one host-owned editor operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionEditorResponse {
+    /// Current plain editor text after the operation.
+    pub text: String,
+    /// Host-monotonic editor revision.
+    pub revision: u64,
+    /// Whether the normal host editor is the active input surface.
+    pub focused: bool,
+}
+
+/// One observer-only normalized terminal input event.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionTerminalInput {
+    /// Normalized key/text payload. This cannot consume or transform input.
+    pub data: String,
+}
+
+/// A host terminal resize observation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionTerminalResize {
+    /// Current terminal columns.
+    pub columns: u16,
+    /// Current terminal rows.
+    pub rows: u16,
+}
+
+/// Registration marker for one extension-side autocomplete chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionAutocompleteRegistration {
+    /// Extension-local registration revision. It is informational only.
+    pub revision: u64,
+}
+
+/// A host-to-extension autocomplete query over one editor snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionAutocompleteRequest {
+    /// Complete bounded editor text snapshot.
+    pub text: String,
+    /// UTF-8 byte offset at a host-validated character boundary.
+    pub cursor: usize,
+    /// Host-monotonic editor revision used to reject stale replies.
+    pub revision: u64,
+}
+
+impl ExtensionAutocompleteRequest {
+    fn validate(&self) -> Result<(), String> {
+        validate_extension_editor_text(&self.text)?;
+        if self.cursor > self.text.len() || !self.text.is_char_boundary(self.cursor) {
+            return Err("autocomplete cursor is outside a UTF-8 character boundary".into());
+        }
+        Ok(())
+    }
+}
+
+/// One bounded semantic autocomplete choice.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionAutocompleteItem {
+    /// Text inserted by the host when the choice is accepted.
+    pub value: String,
+    /// Plain primary label.
+    pub label: String,
+    /// Optional plain secondary label.
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl ExtensionAutocompleteItem {
+    fn validate(&self) -> Result<(), String> {
+        validate_extension_autocomplete_text("autocomplete value", &self.value)?;
+        validate_extension_autocomplete_text("autocomplete label", &self.label)?;
+        if let Some(description) = &self.description {
+            validate_extension_autocomplete_text("autocomplete description", description)?;
+        }
+        Ok(())
+    }
+}
+
+/// Extension result for one host-mediated autocomplete query.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionAutocompleteResponse {
+    /// Exact plain suffix before the cursor that the host may replace.
+    pub prefix: String,
+    /// Ordered bounded candidate list.
+    #[serde(default)]
+    pub items: Vec<ExtensionAutocompleteItem>,
+}
+
+impl ExtensionAutocompleteResponse {
+    fn validate(&self) -> Result<(), String> {
+        validate_extension_autocomplete_text("autocomplete prefix", &self.prefix)?;
+        if self.items.len() > MAX_EXTENSION_AUTOCOMPLETE_ITEMS {
+            return Err(format!(
+                "autocomplete response has {} items; limit is {MAX_EXTENSION_AUTOCOMPLETE_ITEMS}",
+                self.items.len()
+            ));
+        }
+        self.items
+            .iter()
+            .try_for_each(ExtensionAutocompleteItem::validate)
+    }
+}
+
+fn validate_extension_ui_key(key: &str) -> Result<(), String> {
+    if key.is_empty() || key.len() > MAX_EXTENSION_UI_KEY_BYTES {
+        return Err(format!(
+            "UI key must contain 1..={MAX_EXTENSION_UI_KEY_BYTES} UTF-8 bytes"
+        ));
+    }
+    if !key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("UI key must use ASCII letters, digits, '.', '_', or '-'".into());
+    }
+    Ok(())
+}
+
+fn validate_extension_ui_text(kind: &str, text: &str, allow_newlines: bool) -> Result<(), String> {
+    if text.len() > MAX_EXTENSION_UI_TEXT_BYTES {
+        return Err(format!(
+            "{kind} exceeded {MAX_EXTENSION_UI_TEXT_BYTES} UTF-8 bytes"
+        ));
+    }
+    if text.chars().any(|character| {
+        character == '\u{1b}'
+            || (character.is_control()
+                && character != '\t'
+                && (!allow_newlines || character != '\n'))
+    }) {
+        return Err(format!("{kind} contains a terminal control character"));
+    }
+    Ok(())
+}
+
+fn validate_extension_style_role(role: Option<&str>) -> Result<(), String> {
+    let Some(role) = role else {
+        return Ok(());
+    };
+    const ALLOWED: &[&str] = &[
+        "extension.pi.status",
+        "extension.pi.muted",
+        "extension.pi.accent",
+        "extension.pi.warning",
+        "extension.pi.error",
+    ];
+    if ALLOWED.contains(&role) {
+        Ok(())
+    } else {
+        Err("UI style_role is not one of the finite host semantic roles".into())
+    }
+}
+
+fn validate_extension_renderer_role(role: Option<&str>) -> Result<(), String> {
+    let Some(role) = role else {
+        return Ok(());
+    };
+    if role.is_empty()
+        || role.len() > MAX_EXTENSION_UI_KEY_BYTES
+        || role.chars().any(|character| character.is_control())
+    {
+        return Err("tool renderer style_role is not bounded plain text".into());
+    }
+    Ok(())
+}
+
+fn validate_extension_editor_text(text: &str) -> Result<(), String> {
+    if text.len() > MAX_EXTENSION_EDITOR_TEXT_BYTES {
+        return Err(format!(
+            "editor text exceeded {MAX_EXTENSION_EDITOR_TEXT_BYTES} UTF-8 bytes"
+        ));
+    }
+    if text.chars().any(|character| {
+        character == '\u{1b}'
+            || (character.is_control() && !matches!(character, '\n' | '\t' | '\r'))
+    }) {
+        return Err("editor text contains a terminal control character".into());
+    }
+    Ok(())
+}
+
+fn validate_extension_autocomplete_text(kind: &str, text: &str) -> Result<(), String> {
+    if text.len() > MAX_EXTENSION_AUTOCOMPLETE_TEXT_BYTES {
+        return Err(format!(
+            "{kind} exceeded {MAX_EXTENSION_AUTOCOMPLETE_TEXT_BYTES} UTF-8 bytes"
+        ));
+    }
+    if text.chars().any(|character| character.is_control()) {
+        return Err(format!("{kind} contains a terminal control character"));
+    }
+    Ok(())
+}
+
 /// Notification severity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2251,6 +2662,22 @@ pub struct RenderedToolCall {
     /// Ordered semantic segments. Newlines remain explicit in segment text.
     #[serde(default)]
     pub segments: Vec<ToolRenderSegment>,
+}
+
+impl RenderedToolCall {
+    fn validate(&self) -> Result<(), String> {
+        if self.segments.len() > MAX_EXTENSION_UI_LINES.saturating_mul(4) {
+            return Err(format!(
+                "tool renderer returned {} segments; limit is {}",
+                self.segments.len(),
+                MAX_EXTENSION_UI_LINES.saturating_mul(4)
+            ));
+        }
+        self.segments.iter().try_for_each(|segment| {
+            validate_extension_ui_text("tool renderer segment", &segment.text, true)?;
+            validate_extension_renderer_role(segment.style_role.as_deref())
+        })
+    }
 }
 
 /// JSON-RPC identifier used by a process-originated request.
@@ -2698,6 +3125,31 @@ pub enum ExtensionEvent {
         /// Status/header/footer content.
         contribution: ExtensionStatusContribution,
     },
+    /// Bounded semantic UI state from an extension generation.
+    UiContributed {
+        /// Process generation that owns the snapshot.
+        generation: u64,
+        /// Complete keyed or global semantic contribution.
+        contribution: ExtensionUiContribution,
+    },
+    /// A host-owned editor operation awaiting a frontend projection.
+    EditorRequested {
+        /// Process-originated JSON-RPC ID.
+        request_id: ExtensionRequestId,
+        /// Process generation that owns the request.
+        generation: u64,
+        /// Bounded editor operation.
+        request: ExtensionEditorRequest,
+    },
+    /// An extension registered one bounded autocomplete chain.
+    AutocompleteRegistered {
+        /// Process-originated JSON-RPC ID.
+        request_id: ExtensionRequestId,
+        /// Process generation that owns the registration.
+        generation: u64,
+        /// Informational extension-local registration revision.
+        registration: ExtensionAutocompleteRegistration,
+    },
     /// Frontend-neutral semantic state for activity and detail inspectors.
     PresentationUpdated {
         /// Process generation that owns the complete snapshot.
@@ -2959,6 +3411,20 @@ pub mod methods {
     pub const CONTEXT_CONTRIBUTION: &str = "context/contribution";
     /// Extension-to-host unsolicited semantic UI contribution.
     pub const STATUS_CONTRIBUTION: &str = "status/contribution";
+    /// Extension-to-host bounded semantic UI snapshot.
+    pub const UI_CONTRIBUTION: &str = "ui/contribution";
+    /// Extension-to-host host-owned editor request.
+    pub const UI_EDITOR: &str = "ui/editor";
+    /// Host-to-extension editor snapshot notification.
+    pub const UI_EDITOR_STATE: &str = "ui/editor-state";
+    /// Host-to-extension observer-only normalized terminal input.
+    pub const UI_TERMINAL_INPUT: &str = "ui/terminal-input";
+    /// Host-to-extension observer-only terminal resize.
+    pub const UI_RESIZE: &str = "ui/resize";
+    /// Extension-to-host autocomplete registration request.
+    pub const AUTOCOMPLETE_REGISTER: &str = "ui/autocomplete/register";
+    /// Host-to-extension bounded autocomplete query.
+    pub const AUTOCOMPLETE_COMPLETE: &str = "ui/autocomplete/complete";
     /// Extension-to-host complete frontend-neutral presentation snapshot.
     pub const PRESENTATION_UPDATE: &str = "presentation/update";
     /// Extension-to-host structured policy intent.
@@ -3047,6 +3513,12 @@ pub struct InitializeResponse {
     /// Complete metadata for manifest-declared commands.
     #[serde(default)]
     pub commands: Vec<CommandDefinition>,
+    /// Tool names for which this generation provides bounded semantic renderers.
+    ///
+    /// Runtime discovery requires the `dynamic_tool_renderers` feature; static
+    /// manifests keep their existing exact declaration behavior.
+    #[serde(default)]
+    pub tool_renderers: Vec<String>,
     /// Negotiated API `0.2` features and limits. API `0.1` must omit it.
     #[serde(default)]
     pub protocol: Option<ExtensionProtocolResponse>,
@@ -3914,7 +4386,153 @@ impl ExtensionProcess {
                     process_generation: connection.generation,
                 });
         let resource_owner = request.context.resource_owner.clone();
-        self.request_typed_on_connection(connection, methods::TOOL_RENDER, &request, resource_owner)
+        let rendered: RenderedToolCall = self
+            .request_typed_on_connection(connection, methods::TOOL_RENDER, &request, resource_owner)
+            .await?;
+        rendered
+            .validate()
+            .map_err(ExtensionRuntimeError::Protocol)?;
+        Ok(rendered)
+    }
+
+    /// Queries one registered host-mediated autocomplete chain without granting
+    /// it terminal or editor ownership.
+    pub async fn request_autocomplete(
+        &self,
+        request: ExtensionAutocompleteRequest,
+    ) -> Result<ExtensionAutocompleteResponse, ExtensionRuntimeError> {
+        request
+            .validate()
+            .map_err(ExtensionRuntimeError::Protocol)?;
+        let connection = read_std_lock(&self.inner.connection).clone();
+        if !read_std_lock(&connection.protocol).supports(EXTENSION_FEATURE_AUTOCOMPLETE) {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension did not negotiate autocomplete".into(),
+            ));
+        }
+        let response: ExtensionAutocompleteResponse = self
+            .request_typed_on_connection(connection, methods::AUTOCOMPLETE_COMPLETE, &request, None)
+            .await?;
+        response
+            .validate()
+            .map_err(ExtensionRuntimeError::Protocol)?;
+        Ok(response)
+    }
+
+    /// Delivers a host-owned editor snapshot to an extension. The request is a
+    /// no-op when the extension did not negotiate editor handoff.
+    pub fn notify_editor_state(
+        &self,
+        response: ExtensionEditorResponse,
+    ) -> Result<(), ExtensionRuntimeError> {
+        validate_extension_editor_text(&response.text).map_err(ExtensionRuntimeError::Protocol)?;
+        self.queue_ui_notification(
+            EXTENSION_FEATURE_EDITOR_HANDOFF,
+            methods::UI_EDITOR_STATE,
+            &response,
+        )
+    }
+
+    /// Delivers one observer-only normalized terminal input event. Extensions
+    /// cannot consume, replace, or delay normal host input handling.
+    pub fn notify_terminal_input(
+        &self,
+        input: ExtensionTerminalInput,
+    ) -> Result<(), ExtensionRuntimeError> {
+        if input.data.len() > MAX_EXTENSION_TERMINAL_INPUT_BYTES
+            || input.data.chars().any(|character| character == '\u{1b}')
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "normalized terminal input exceeded its bounded plain-text contract".into(),
+            ));
+        }
+        self.queue_ui_notification(
+            EXTENSION_FEATURE_TERMINAL_INPUT,
+            methods::UI_TERMINAL_INPUT,
+            &input,
+        )
+    }
+
+    /// Delivers one observer-only terminal resize event.
+    pub fn notify_terminal_resize(
+        &self,
+        resize: ExtensionTerminalResize,
+    ) -> Result<(), ExtensionRuntimeError> {
+        self.queue_ui_notification(
+            EXTENSION_FEATURE_TERMINAL_INPUT,
+            methods::UI_RESIZE,
+            &resize,
+        )
+    }
+
+    fn queue_ui_notification<T: Serialize>(
+        &self,
+        feature: &str,
+        method: &str,
+        params: &T,
+    ) -> Result<(), ExtensionRuntimeError> {
+        let connection = read_std_lock(&self.inner.connection).clone();
+        if !read_std_lock(&connection.protocol).supports(feature) {
+            return Ok(());
+        }
+        connection.require_api_v03_host_method(method)?;
+        let params = serde_json::to_value(params)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        if connection.queue_notification(method, params) {
+            Ok(())
+        } else {
+            Err(ExtensionRuntimeError::Closed(format!(
+                "unable to queue `{method}` notification"
+            )))
+        }
+    }
+
+    /// Answers a process-originated editor request only when its generation is
+    /// still current. This is the editor lease's stale-owner fence.
+    pub async fn respond_to_editor(
+        &self,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        response: ExtensionEditorResponse,
+    ) -> Result<(), ExtensionRuntimeError> {
+        validate_extension_editor_text(&response.text).map_err(ExtensionRuntimeError::Protocol)?;
+        let connection = read_std_lock(&self.inner.connection).clone();
+        if generation != connection.generation {
+            return Err(ExtensionRuntimeError::Closed(format!(
+                "editor request belongs to stale generation {generation}; current generation is {}",
+                connection.generation
+            )));
+        }
+        if !read_std_lock(&connection.protocol).supports(EXTENSION_FEATURE_EDITOR_HANDOFF) {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension did not negotiate editor_handoff".into(),
+            ));
+        }
+        connection.send_child_response(request_id, &response).await
+    }
+
+    /// Acknowledges an autocomplete registration only when the original
+    /// generation is still current.
+    pub async fn respond_to_autocomplete_registration(
+        &self,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        accepted: bool,
+    ) -> Result<(), ExtensionRuntimeError> {
+        let connection = read_std_lock(&self.inner.connection).clone();
+        if generation != connection.generation {
+            return Err(ExtensionRuntimeError::Closed(format!(
+                "autocomplete registration belongs to stale generation {generation}; current generation is {}",
+                connection.generation
+            )));
+        }
+        if !read_std_lock(&connection.protocol).supports(EXTENSION_FEATURE_AUTOCOMPLETE) {
+            return Err(ExtensionRuntimeError::Protocol(
+                "extension did not negotiate autocomplete".into(),
+            ));
+        }
+        connection
+            .send_child_response(request_id, &serde_json::json!({"accepted": accepted}))
             .await
     }
 
@@ -5468,6 +6086,9 @@ impl Tool for ProcessTool {
                         ctx.progress.status(contribution.text);
                     }
                     Ok(ExtensionEvent::PresentationUpdated { .. }) => {}
+                    Ok(ExtensionEvent::UiContributed { .. }) => {}
+                    Ok(ExtensionEvent::EditorRequested { .. }) => {}
+                    Ok(ExtensionEvent::AutocompleteRegistered { .. }) => {}
                     Ok(ExtensionEvent::ContextContributed { .. }) => {}
                     Ok(ExtensionEvent::PolicyEvaluationRequested {
                         ..
@@ -7543,6 +8164,34 @@ fn negotiate_contributions_with_host_services(
         }
     }
 
+    let tool_renderers = if protocol.supports(EXTENSION_FEATURE_DYNAMIC_TOOL_RENDERERS) {
+        if response.tool_renderers.len() > MAX_DYNAMIC_EXTENSION_TOOLS {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "tool renderer catalog contains {} entries; limit is {MAX_DYNAMIC_EXTENSION_TOOLS}",
+                response.tool_renderers.len()
+            )));
+        }
+        let mut unique_renderers = BTreeSet::new();
+        for renderer in &response.tool_renderers {
+            if !unique_renderers.insert(renderer.as_str()) {
+                return Err(ExtensionRuntimeError::Protocol(format!(
+                    "tool renderer catalog contains duplicate `{renderer}`"
+                )));
+            }
+            validate_identifier("tool renderer", renderer, true)?;
+        }
+        response.tool_renderers
+    } else {
+        if !response.tool_renderers.is_empty()
+            && response.tool_renderers != manifest.contributes.tool_renderers
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "runtime tool renderers require dynamic_tool_renderers negotiation".into(),
+            ));
+        }
+        manifest.contributes.tool_renderers.clone()
+    };
+
     Ok((
         ExtensionContributions {
             tools: response.tools,
@@ -7550,7 +8199,7 @@ fn negotiate_contributions_with_host_services(
             hooks: manifest.contributes.hooks.clone(),
             context: manifest.contributes.context,
             ui: manifest.contributes.ui.clone(),
-            tool_renderers: manifest.contributes.tool_renderers.clone(),
+            tool_renderers,
             notifications: manifest.contributes.notifications,
             confirmations: manifest.contributes.confirmations,
             presentation: manifest.contributes.presentation,
@@ -9305,6 +9954,81 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 let _ = state
                     .events
                     .send(ExtensionEvent::StatusContributed { contribution });
+            }
+            methods::UI_CONTRIBUTION => {
+                require_feature(state, EXTENSION_FEATURE_SEMANTIC_UI)?;
+                let contribution: ExtensionUiContribution = serde_json::from_value(params)
+                    .map_err(|error| format!("invalid semantic UI contribution: {error}"))?;
+                contribution
+                    .validate()
+                    .map_err(|error| format!("invalid semantic UI contribution: {error}"))?;
+                let _ = state.events.send(ExtensionEvent::UiContributed {
+                    generation: state.generation,
+                    contribution,
+                });
+            }
+            methods::UI_EDITOR => {
+                require_feature(state, EXTENSION_FEATURE_EDITOR_HANDOFF)?;
+                let id = parse_child_request_id(object, methods::UI_EDITOR)?;
+                let request: ExtensionEditorRequest = serde_json::from_value(params)
+                    .map_err(|error| format!("invalid editor request: {error}"))?;
+                request
+                    .validate()
+                    .map_err(|error| format!("invalid editor request: {error}"))?;
+                let _registered = insert_child_request(state, id.clone(), None, None)?;
+                if state
+                    .events
+                    .send(ExtensionEvent::EditorRequested {
+                        request_id: id.clone(),
+                        generation: state.generation,
+                        request,
+                    })
+                    .is_err()
+                {
+                    try_queue_child_response(
+                        &state.child_requests,
+                        &id,
+                        &state.writer,
+                        state.max_message_bytes(),
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {
+                                "code": -32000,
+                                "message": "no active host-owned editor frontend",
+                            },
+                        }),
+                    )?;
+                }
+            }
+            methods::AUTOCOMPLETE_REGISTER => {
+                require_feature(state, EXTENSION_FEATURE_AUTOCOMPLETE)?;
+                let id = parse_child_request_id(object, methods::AUTOCOMPLETE_REGISTER)?;
+                let registration: ExtensionAutocompleteRegistration =
+                    serde_json::from_value(params)
+                        .map_err(|error| format!("invalid autocomplete registration: {error}"))?;
+                let _registered = insert_child_request(state, id.clone(), None, None)?;
+                if state
+                    .events
+                    .send(ExtensionEvent::AutocompleteRegistered {
+                        request_id: id.clone(),
+                        generation: state.generation,
+                        registration,
+                    })
+                    .is_err()
+                {
+                    try_queue_child_response(
+                        &state.child_requests,
+                        &id,
+                        &state.writer,
+                        state.max_message_bytes(),
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {"accepted": false},
+                        }),
+                    )?;
+                }
             }
             methods::PRESENTATION_UPDATE => {
                 require_declared(state.declared.presentation, "semantic presentation")?;
@@ -12000,6 +12724,7 @@ confirmations = true
                 description: "Checkpoint".into(),
                 usage: None,
             }],
+            tool_renderers: Vec::new(),
             protocol: None,
         };
         assert!(matches!(
@@ -12528,6 +13253,7 @@ command = "runtime-command-validation"
             api_version: EXTENSION_API_VERSION_0_2.into(),
             tools: Vec::new(),
             commands,
+            tool_renderers: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -12587,6 +13313,7 @@ command = "agent-service"
             api_version: EXTENSION_API_VERSION_0_2.into(),
             tools: Vec::new(),
             commands: Vec::new(),
+            tool_renderers: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -12638,6 +13365,7 @@ command = "ygg-subagents"
             api_version: EXTENSION_API_VERSION_0_2.into(),
             tools: Vec::new(),
             commands: Vec::new(),
+            tool_renderers: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -12735,6 +13463,7 @@ secrets = ["browser.api_token"]
             api_version: EXTENSION_API_VERSION_0_2.into(),
             tools: Vec::new(),
             commands: Vec::new(),
+            tool_renderers: Vec::new(),
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),
                 features: API_0_2_REQUIRED_FEATURES
@@ -14128,6 +14857,79 @@ command = "dynamic.py"
         .expect("live tool did not unregister");
         assert!(process.tool_definitions().is_empty());
         assert!(process.shutdown().await);
+    }
+
+    #[test]
+    fn semantic_ui_transport_rejects_terminal_controls_and_oversized_widgets() {
+        assert!(ExtensionUiContribution::Status {
+            key: "pi.status".into(),
+            text: Some("ready".into()),
+            style_role: Some("extension.pi.status".into()),
+            priority: 0,
+        }
+        .validate()
+        .is_ok());
+        assert!(ExtensionUiContribution::Status {
+            key: "pi.status".into(),
+            text: Some("\u{1b}[31munsafe".into()),
+            style_role: Some("extension.pi.status".into()),
+            priority: 0,
+        }
+        .validate()
+        .is_err());
+        assert!(ExtensionUiContribution::Widget {
+            key: "pi.widget".into(),
+            lines: Some(vec!["row".into(); MAX_EXTENSION_UI_LINES + 1]),
+            placement: ExtensionWidgetPlacement::AboveEditor,
+            style_role: None,
+            priority: 0,
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn autocomplete_transport_requires_a_character_boundary_and_plain_choices() {
+        assert!(ExtensionAutocompleteRequest {
+            text: "é".into(),
+            cursor: 1,
+            revision: 1,
+        }
+        .validate()
+        .is_err());
+        assert!(ExtensionAutocompleteResponse {
+            prefix: "@".into(),
+            items: vec![ExtensionAutocompleteItem {
+                value: "file".into(),
+                label: "file".into(),
+                description: Some("\u{1b}[31munsafe".into()),
+            }],
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn rendered_tool_transport_is_bounded_and_plain_text() {
+        assert!(RenderedToolCall {
+            segments: vec![ToolRenderSegment {
+                text: "\u{1b}[31munsafe".into(),
+                style_role: None,
+            }],
+        }
+        .validate()
+        .is_err());
+        assert!(RenderedToolCall {
+            segments: vec![
+                ToolRenderSegment {
+                    text: "row".into(),
+                    style_role: None,
+                };
+                MAX_EXTENSION_UI_LINES.saturating_mul(4) + 1
+            ],
+        }
+        .validate()
+        .is_err());
     }
 
     fn write_manifest(directory: &Path, name: &str, description: &str) {

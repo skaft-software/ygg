@@ -378,11 +378,71 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
     lines
 }
 
+fn render_extension_autocomplete(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    if max_rows < 2 || !super::normal_editor_focused(state) {
+        return Vec::new();
+    }
+    let Some(overlay) = state.extension_autocomplete.as_ref() else {
+        return Vec::new();
+    };
+    if overlay.items.is_empty()
+        || overlay.revision != state.editor.revision()
+        || overlay.text != state.editor.text()
+        || overlay.cursor != state.editor.cursor()
+    {
+        return Vec::new();
+    }
+    let item_rows = max_rows.saturating_sub(1).min(5);
+    let marker = state.theme.glyph("prompt");
+    let marker_width = visible_width(marker).max(1);
+    let available = usize::from(width).saturating_sub(marker_width + 5).max(1);
+    let mut lines = Vec::with_capacity(item_rows.saturating_add(1));
+    for (index, item) in overlay.items.iter().take(item_rows).enumerate() {
+        let prefix = if index == 0 {
+            marker.to_owned()
+        } else {
+            " ".repeat(marker_width)
+        };
+        let label = super::sanitize_for_terminal(&item.label);
+        let label = truncate_to_width(&label, available, None);
+        let choice = format!("{prefix} {label}");
+        let choice = if index == 0 {
+            state.theme.bold(&state.theme.fg("model_accent", &choice))
+        } else {
+            state.theme.fg("foreground", &choice)
+        };
+        let description = item
+            .description
+            .as_deref()
+            .map(super::sanitize_for_terminal)
+            .filter(|description| !description.is_empty())
+            .map(|description| truncate_to_width(&description, available / 2, None));
+        let line = description.map_or(choice.clone(), |description| {
+            format!("{choice}  {}", state.theme.fg("muted", &description))
+        });
+        lines.push(fit_line(&format!("  {line}"), width));
+    }
+    let separator = suggestion_separator(state);
+    lines.push(fit_line(
+        &format!(
+            "  {}{separator}{}",
+            state.theme.fg("muted", "extension suggestions"),
+            suggestion_key_hint(state, "tab", "accept")
+        ),
+        width,
+    ));
+    lines
+}
+
 pub(super) fn render_input_suggestions(
     state: &ShellState,
     width: u16,
     max_rows: usize,
 ) -> Vec<String> {
+    let extension = render_extension_autocomplete(state, width, max_rows);
+    if !extension.is_empty() {
+        return extension;
+    }
     let slash = render_slash_suggestions(state, width, max_rows);
     if slash.is_empty() {
         render_path_suggestions(state, width, max_rows)

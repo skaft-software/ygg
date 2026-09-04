@@ -26,14 +26,17 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
-    DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
+    DiscoveredExtension, ExtensionAutocompleteRequest, ExtensionEditorRequest,
+    ExtensionEditorResponse, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
     ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
     ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
     ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
-    ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest,
-    ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
+    ExtensionRuntimeConfig, ExtensionSource, ExtensionTerminalInput, ExtensionTerminalResize,
+    ExtensionTrust, ExtensionUiContribution, ExtensionUiSurface, ExtensionWidgetPlacement,
+    ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
     EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_DELEGATION_TELEMETRY,
-    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME,
+    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES,
+    MAX_EXTENSION_UI_LINES,
 };
 use ygg_agent::{
     Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
@@ -45,6 +48,10 @@ use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
 };
 use crate::session_store::SessionStore;
+use crate::tui::view::{
+    InteractiveShell, ShellAutocompleteItem, ShellEditorSnapshot, ShellExtensionUi,
+    ShellExtensionUiLine, ShellExtensionWorking,
+};
 
 /// The first-party extension that owns every in-harness child-session surface.
 pub const SUBAGENTS_EXTENSION_NAME: &str = "ygg-subagents";
@@ -90,6 +97,15 @@ const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
 const INPUT_CANCELLATION_QUEUE_CAPACITY: usize = 64;
 const INPUT_CANCELLATION_CONCURRENCY: usize = 8;
+const EXTENSION_UI_EDITOR_RESPONSE_DEADLINE: Duration = Duration::from_millis(500);
+const EXTENSION_AUTOCOMPLETE_DEADLINE: Duration = Duration::from_millis(500);
+const MAX_EXTENSION_AUTOCOMPLETE_TASKS: usize = 1;
+const MAX_PROJECTED_EXTENSION_UI_LINES: usize = if MAX_EXTENSION_UI_ENTRIES > MAX_EXTENSION_UI_LINES
+{
+    MAX_EXTENSION_UI_ENTRIES
+} else {
+    MAX_EXTENSION_UI_LINES
+};
 const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: safe mode denies extension process startup; rerun without --safe-mode only inside OS-level isolation";
 static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -628,9 +644,14 @@ pub struct ExecutableExtensions {
     diagnostics: BoundedDiagnostics,
     pending_context: PendingContext,
     presentations: BTreeMap<String, ExtensionPresentationView>,
+    semantic_ui: BTreeMap<String, SemanticUiView>,
+    autocomplete_registrations: BTreeMap<String, RegisteredAutocomplete>,
+    last_editor_state: Option<EditorStateDelivery>,
     background_tx: mpsc::Sender<ExtensionBackgroundUpdate>,
     background_rx: mpsc::Receiver<ExtensionBackgroundUpdate>,
     renderer_tasks: Vec<JoinHandle<()>>,
+    autocomplete_tasks: Vec<JoinHandle<()>>,
+    pending_editor_requests: VecDeque<PendingEditorRequest>,
     event_drain_cursor: usize,
     confirmation_denials: VecDeque<PendingConfirmationDenial>,
     confirmation_tasks: Vec<JoinHandle<()>>,
@@ -812,6 +833,57 @@ struct PendingInputCancellation {
     generation: u64,
 }
 
+struct PendingEditorRequest {
+    process: ExtensionProcess,
+    request_id: ExtensionRequestId,
+    generation: u64,
+    request: ExtensionEditorRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditorStateDelivery {
+    state: ExtensionEditorResponse,
+    generations: BTreeMap<String, (u64, String)>,
+}
+
+#[derive(Clone)]
+struct SemanticUiStatus {
+    text: String,
+    style_role: Option<String>,
+    priority: i32,
+}
+
+#[derive(Clone)]
+struct SemanticUiWidget {
+    lines: Vec<String>,
+    placement: ExtensionWidgetPlacement,
+    style_role: Option<String>,
+    priority: i32,
+}
+
+#[derive(Default)]
+struct SemanticUiView {
+    extension_instance_id: String,
+    generation: u64,
+    statuses: BTreeMap<String, SemanticUiStatus>,
+    widgets: BTreeMap<String, SemanticUiWidget>,
+    working: Option<ShellExtensionWorking>,
+    hidden_thinking_label: Option<String>,
+}
+
+#[derive(Clone)]
+struct RegisteredAutocomplete {
+    process: ExtensionProcess,
+    generation: u64,
+    extension_instance_id: String,
+}
+
+pub(crate) struct ExtensionAutocompleteUpdate {
+    pub(crate) snapshot: ShellEditorSnapshot,
+    pub(crate) prefix: String,
+    pub(crate) items: Vec<ShellAutocompleteItem>,
+}
+
 impl Default for ExecutableExtensions {
     fn default() -> Self {
         let (background_tx, background_rx) = mpsc::channel(BACKGROUND_UPDATE_CAPACITY);
@@ -822,9 +894,14 @@ impl Default for ExecutableExtensions {
             diagnostics: BoundedDiagnostics::default(),
             pending_context: PendingContext::default(),
             presentations: BTreeMap::new(),
+            semantic_ui: BTreeMap::new(),
+            autocomplete_registrations: BTreeMap::new(),
+            last_editor_state: None,
             background_tx,
             background_rx,
             renderer_tasks: Vec::new(),
+            autocomplete_tasks: Vec::new(),
+            pending_editor_requests: VecDeque::new(),
             event_drain_cursor: 0,
             confirmation_denials: VecDeque::new(),
             confirmation_tasks: Vec::new(),
@@ -850,11 +927,16 @@ pub struct ExtensionToolRenderUpdate {
 #[derive(Default)]
 pub struct ExtensionBackgroundUpdates {
     pub rendered_tools: Vec<ExtensionToolRenderUpdate>,
+    pub(crate) autocomplete: Vec<ExtensionAutocompleteUpdate>,
 }
 
 enum ExtensionBackgroundUpdate {
     Renderer {
         update: Option<ExtensionToolRenderUpdate>,
+        diagnostic: Option<String>,
+    },
+    Autocomplete {
+        update: Option<ExtensionAutocompleteUpdate>,
         diagnostic: Option<String>,
     },
 }
@@ -2255,7 +2337,79 @@ impl ExecutableExtensions {
         true
     }
 
-    /// Drain completed renderer work without waiting, retaining completion order.
+    /// Start one host-mediated autocomplete request for the active editor
+    /// snapshot. A late result is fenced by the shell revision before display.
+    pub fn request_editor_autocomplete(&mut self, snapshot: ShellEditorSnapshot) -> bool {
+        self.prune_semantic_ui();
+        self.autocomplete_tasks.retain(|task| !task.is_finished());
+        if self.autocomplete_tasks.len() >= MAX_EXTENSION_AUTOCOMPLETE_TASKS {
+            return true;
+        }
+        let Some(registration) = self.autocomplete_registrations.values().next().cloned() else {
+            return false;
+        };
+        let process = registration.process;
+        if !process.is_running()
+            || process.health_snapshot().generation != registration.generation
+            || process.extension_instance_id() != registration.extension_instance_id
+        {
+            return false;
+        }
+        let request = ExtensionAutocompleteRequest {
+            text: snapshot.text.clone(),
+            cursor: snapshot.cursor,
+            revision: snapshot.revision,
+        };
+        let sender = self.background_tx.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {}: autocomplete requires the Tokio runtime",
+                process.descriptor().manifest.name
+            ));
+            return false;
+        };
+        self.autocomplete_tasks.push(handle.spawn(async move {
+            let (update, diagnostic) = match tokio::time::timeout(
+                EXTENSION_AUTOCOMPLETE_DEADLINE,
+                process.request_autocomplete(request),
+            )
+            .await
+            {
+                Err(_) => (
+                    None,
+                    Some(format!(
+                        "warning: extension autocomplete exceeded {EXTENSION_AUTOCOMPLETE_DEADLINE:?}"
+                    )),
+                ),
+                Ok(Err(error)) => (
+                    None,
+                    Some(format!("warning: extension autocomplete failed: {error}")),
+                ),
+                Ok(Ok(response)) => (
+                    Some(ExtensionAutocompleteUpdate {
+                        snapshot,
+                        prefix: response.prefix,
+                        items: response
+                            .items
+                            .into_iter()
+                            .map(|item| ShellAutocompleteItem {
+                                value: item.value,
+                                label: item.label,
+                                description: item.description,
+                            })
+                            .collect(),
+                    }),
+                    None,
+                ),
+            };
+            let _ = sender
+                .send(ExtensionBackgroundUpdate::Autocomplete { update, diagnostic })
+                .await;
+        }));
+        true
+    }
+
+    /// Drain completed renderer and autocomplete work without waiting.
     pub fn drain_background_updates(&mut self) -> ExtensionBackgroundUpdates {
         let mut updates = ExtensionBackgroundUpdates::default();
         while let Ok(update) = self.background_rx.try_recv() {
@@ -2264,6 +2418,10 @@ impl ExecutableExtensions {
                     self.diagnostics.extend(diagnostic);
                     updates.rendered_tools.extend(update);
                 }
+                ExtensionBackgroundUpdate::Autocomplete { update, diagnostic } => {
+                    self.diagnostics.extend(diagnostic);
+                    updates.autocomplete.extend(update);
+                }
             }
         }
         updates
@@ -2271,6 +2429,9 @@ impl ExecutableExtensions {
 
     fn cancel_background_work(&mut self) {
         for task in self.renderer_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.autocomplete_tasks.drain(..) {
             task.abort();
         }
         for task in self.confirmation_tasks.drain(..) {
@@ -2435,10 +2596,352 @@ impl ExecutableExtensions {
         self.schedule_input_cancellations();
     }
 
+    fn apply_semantic_ui_contribution(
+        &mut self,
+        extension: String,
+        process: &ExtensionProcess,
+        generation: u64,
+        contribution: ExtensionUiContribution,
+    ) -> Result<(), String> {
+        let health = process.health_snapshot();
+        if !process.is_running() || health.generation != generation {
+            return Err(format!(
+                "discarded semantic UI contribution from stale generation {generation}"
+            ));
+        }
+        let instance_id = process.extension_instance_id().to_owned();
+        let view = self.semantic_ui.entry(extension).or_default();
+        if view.generation != generation || view.extension_instance_id != instance_id {
+            *view = SemanticUiView {
+                extension_instance_id: instance_id,
+                generation,
+                ..SemanticUiView::default()
+            };
+        }
+        match contribution {
+            ExtensionUiContribution::Status {
+                key,
+                text,
+                style_role,
+                priority,
+            } => {
+                if let Some(text) = text {
+                    if !view.statuses.contains_key(&key)
+                        && view.statuses.len().saturating_add(view.widgets.len())
+                            >= MAX_EXTENSION_UI_ENTRIES
+                    {
+                        return Err(format!(
+                            "semantic UI entry limit {MAX_EXTENSION_UI_ENTRIES} reached"
+                        ));
+                    }
+                    view.statuses.insert(
+                        key,
+                        SemanticUiStatus {
+                            text,
+                            style_role,
+                            priority,
+                        },
+                    );
+                } else {
+                    view.statuses.remove(&key);
+                }
+            }
+            ExtensionUiContribution::Widget {
+                key,
+                lines,
+                placement,
+                style_role,
+                priority,
+            } => {
+                if let Some(lines) = lines {
+                    if !view.widgets.contains_key(&key)
+                        && view.statuses.len().saturating_add(view.widgets.len())
+                            >= MAX_EXTENSION_UI_ENTRIES
+                    {
+                        return Err(format!(
+                            "semantic UI entry limit {MAX_EXTENSION_UI_ENTRIES} reached"
+                        ));
+                    }
+                    view.widgets.insert(
+                        key,
+                        SemanticUiWidget {
+                            lines,
+                            placement,
+                            style_role,
+                            priority,
+                        },
+                    );
+                } else {
+                    view.widgets.remove(&key);
+                }
+            }
+            ExtensionUiContribution::Working {
+                message,
+                visible,
+                frames,
+                interval_ms,
+            } => {
+                view.working = Some(ShellExtensionWorking {
+                    message,
+                    visible,
+                    frames,
+                    interval_ms,
+                });
+            }
+            ExtensionUiContribution::HiddenThinking { label } => {
+                view.hidden_thinking_label = label;
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_semantic_ui(&mut self) {
+        self.semantic_ui.retain(|extension, view| {
+            self.processes.iter().any(|process| {
+                process.descriptor().manifest.name == *extension
+                    && process.is_running()
+                    && process.extension_instance_id() == view.extension_instance_id
+                    && process.health_snapshot().generation == view.generation
+            })
+        });
+        self.autocomplete_registrations
+            .retain(|extension, registration| {
+                self.processes.iter().any(|process| {
+                    process.descriptor().manifest.name == *extension
+                        && process.is_running()
+                        && process.extension_instance_id() == registration.extension_instance_id
+                        && process.health_snapshot().generation == registration.generation
+                })
+            });
+    }
+
+    fn semantic_ui_projection(&mut self) -> ShellExtensionUi {
+        self.prune_semantic_ui();
+        let mut statuses = Vec::new();
+        let mut above_editor = Vec::new();
+        let mut below_editor = Vec::new();
+        let mut working = None;
+        let mut hidden_thinking_label = None;
+        for view in self.semantic_ui.values() {
+            for status in view.statuses.values() {
+                statuses.push(ShellExtensionUiLine {
+                    text: status.text.clone(),
+                    style_role: status.style_role.clone(),
+                    priority: status.priority,
+                });
+            }
+            for widget in view.widgets.values() {
+                let target = match widget.placement {
+                    ExtensionWidgetPlacement::AboveEditor => &mut above_editor,
+                    ExtensionWidgetPlacement::BelowEditor => &mut below_editor,
+                };
+                target.extend(
+                    widget
+                        .lines
+                        .iter()
+                        .cloned()
+                        .map(|text| ShellExtensionUiLine {
+                            text,
+                            style_role: widget.style_role.clone(),
+                            priority: widget.priority,
+                        }),
+                );
+            }
+            if working.is_none() {
+                working = view.working.clone();
+            }
+            if hidden_thinking_label.is_none() {
+                hidden_thinking_label = view.hidden_thinking_label.clone();
+            }
+        }
+        let sort = |left: &ShellExtensionUiLine, right: &ShellExtensionUiLine| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.text.cmp(&right.text))
+        };
+        statuses.sort_by(sort);
+        above_editor.sort_by(sort);
+        below_editor.sort_by(sort);
+        statuses.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        above_editor.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        below_editor.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        ShellExtensionUi {
+            statuses,
+            above_editor,
+            below_editor,
+            working,
+            hidden_thinking_label,
+        }
+    }
+
+    /// Project validated semantic extension UI into the host-owned interactive
+    /// shell. Any stale process generation is discarded before rendering.
+    pub fn sync_semantic_ui(&mut self, shell: &mut InteractiveShell) -> bool {
+        shell.set_extension_ui(self.semantic_ui_projection())
+    }
+
+    /// Notify negotiated editor-handoff extensions whenever the host-owned
+    /// editor snapshot changes. The cursor deliberately remains host-local;
+    /// autocomplete receives it only in its explicit request payload.
+    pub fn sync_editor_state(&mut self, snapshot: ShellEditorSnapshot) {
+        let state = ExtensionEditorResponse {
+            text: snapshot.text,
+            revision: snapshot.revision,
+            focused: snapshot.focused,
+        };
+        let generations = self
+            .processes
+            .iter()
+            .filter(|process| process.is_running())
+            .map(|process| {
+                (
+                    process.descriptor().manifest.name.clone(),
+                    (
+                        process.health_snapshot().generation,
+                        process.extension_instance_id().to_owned(),
+                    ),
+                )
+            })
+            .collect();
+        let delivery = EditorStateDelivery { state, generations };
+        if self.last_editor_state.as_ref() == Some(&delivery) {
+            return;
+        }
+        self.last_editor_state = Some(delivery.clone());
+        for process in &self.processes {
+            if let Err(error) = process.notify_editor_state(delivery.state.clone()) {
+                self.diagnostics.push(format!(
+                    "warning: {}: editor state notification failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    /// Broadcast one already-normalized input observation without granting any
+    /// extension an input-consumption path.
+    pub fn observe_terminal_input(&mut self, data: String) {
+        for process in &self.processes {
+            if let Err(error) =
+                process.notify_terminal_input(ExtensionTerminalInput { data: data.clone() })
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: terminal input observation failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    /// Broadcast one host-observed resize without letting extensions own layout.
+    pub fn observe_terminal_resize(&mut self, columns: u16, rows: u16) {
+        for process in &self.processes {
+            if let Err(error) =
+                process.notify_terminal_resize(ExtensionTerminalResize { columns, rows })
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: terminal resize observation failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    fn queue_editor_response(
+        &mut self,
+        process: ExtensionProcess,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        response: ExtensionEditorResponse,
+    ) {
+        let name = process.descriptor().manifest.name.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {name}: host-owned editor response requires the Tokio runtime"
+            ));
+            return;
+        };
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(
+                EXTENSION_UI_EDITOR_RESPONSE_DEADLINE,
+                process.respond_to_editor(request_id, generation, response),
+            )
+            .await;
+        });
+    }
+
+    fn queue_autocomplete_registration_response(
+        &mut self,
+        process: ExtensionProcess,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        accepted: bool,
+    ) {
+        let name = process.descriptor().manifest.name.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {name}: autocomplete registration response requires the Tokio runtime"
+            ));
+            return;
+        };
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(
+                EXTENSION_UI_EDITOR_RESPONSE_DEADLINE,
+                process.respond_to_autocomplete_registration(request_id, generation, accepted),
+            )
+            .await;
+        });
+    }
+
+    fn drain_editor_requests_into_shell(&mut self, shell: &mut InteractiveShell) {
+        while let Some(pending) = self.pending_editor_requests.pop_front() {
+            if !pending.process.is_running()
+                || pending.process.health_snapshot().generation != pending.generation
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: discarded host-owned editor request from stale generation {}",
+                    pending.process.descriptor().manifest.name,
+                    pending.generation
+                ));
+                continue;
+            }
+            let snapshot = match pending.request {
+                ExtensionEditorRequest::Get => shell.extension_editor_snapshot(),
+                ExtensionEditorRequest::Set { text } => shell.extension_set_editor(text),
+                ExtensionEditorRequest::Paste { text } => shell.extension_paste_editor(text),
+                ExtensionEditorRequest::Focus => shell.extension_focus_editor(),
+            };
+            self.queue_editor_response(
+                pending.process,
+                pending.request_id,
+                pending.generation,
+                ExtensionEditorResponse {
+                    text: snapshot.text,
+                    revision: snapshot.revision,
+                    focused: snapshot.focused,
+                },
+            );
+        }
+    }
+
+    /// Drain extension events while an interactive shell owns the editor. This
+    /// is deliberately separate from the generic event drain so headless hosts
+    /// never accidentally grant an editor lease.
+    pub fn drain_events_for_shell(&mut self, shell: &mut InteractiveShell) -> Vec<String> {
+        let messages = self.drain_events_inner(true);
+        self.drain_editor_requests_into_shell(shell);
+        messages
+    }
+
     /// Drain a fixed amount of extension work without letting a continuously
     /// ready process monopolize the input/render task. The start receiver
     /// rotates between calls and each receiver has a smaller per-call quota.
     pub fn drain_events(&mut self) -> Vec<String> {
+        self.drain_events_inner(false)
+    }
+
+    fn drain_events_inner(&mut self, interactive: bool) -> Vec<String> {
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         let receiver_count = self.receivers.len();
@@ -2477,6 +2980,98 @@ impl ExecutableExtensions {
                         // Header/status/footer contributions remain available as
                         // protocol data, but the coding TUI never turns them
                         // into ambient transcript or composer chrome.
+                    }
+                    Ok(ExtensionEvent::UiContributed {
+                        generation,
+                        contribution,
+                    }) => {
+                        let Some(process) = process.as_ref() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: semantic UI source process is unavailable"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        if let Err(error) = self.apply_semantic_ui_contribution(
+                            name.clone(),
+                            process,
+                            generation,
+                            contribution,
+                        ) {
+                            self.diagnostics.push(format!("warning: {name}: {error}"));
+                        }
+                    }
+                    Ok(ExtensionEvent::EditorRequested {
+                        request_id,
+                        generation,
+                        request,
+                    }) => {
+                        let Some(process) = process.clone() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: host-owned editor request has no process"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        if interactive && self.pending_editor_requests.len() < EVENT_DRAIN_BUDGET {
+                            self.pending_editor_requests
+                                .push_back(PendingEditorRequest {
+                                    process,
+                                    request_id,
+                                    generation,
+                                    request,
+                                });
+                        } else {
+                            self.queue_editor_response(
+                                process,
+                                request_id,
+                                generation,
+                                ExtensionEditorResponse {
+                                    text: String::new(),
+                                    revision: 0,
+                                    focused: false,
+                                },
+                            );
+                            if interactive {
+                                self.diagnostics.push(format!(
+                                    "warning: {name}: host-owned editor request queue is full"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(ExtensionEvent::AutocompleteRegistered {
+                        request_id,
+                        generation,
+                        registration: _,
+                    }) => {
+                        let Some(process) = process.clone() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: autocomplete registration has no process"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        let accepted = interactive
+                            && process.is_running()
+                            && process.health_snapshot().generation == generation;
+                        if accepted {
+                            self.autocomplete_registrations.insert(
+                                name.clone(),
+                                RegisteredAutocomplete {
+                                    extension_instance_id: process
+                                        .extension_instance_id()
+                                        .to_owned(),
+                                    process: process.clone(),
+                                    generation,
+                                },
+                            );
+                        }
+                        self.queue_autocomplete_registration_response(
+                            process, request_id, generation, accepted,
+                        );
                     }
                     Ok(ExtensionEvent::PresentationUpdated {
                         generation,
@@ -2609,6 +3204,7 @@ impl ExecutableExtensions {
                         && process.health_snapshot().generation == view.generation
                 })
         });
+        self.prune_semantic_ui();
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         messages

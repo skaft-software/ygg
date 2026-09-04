@@ -14,6 +14,7 @@ use tokio::time::{Instant, Interval, MissedTickBehavior};
 use ygg_agent::extension_process::ExtensionInputRequest;
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
+use ygg_agent::extension_process::MAX_EXTENSION_TERMINAL_INPUT_BYTES;
 use ygg_agent::{
     analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
     GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
@@ -239,6 +240,7 @@ where
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(Idle::Quit),
                 };
+                observe_extension_terminal_event(executable_extensions, &event);
                 if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
                     shell.request_close();
                     return Ok(Idle::Quit);
@@ -310,8 +312,14 @@ where
                         shell.render();
                     }
                     InputAction::CompletePath => {
-                        shell.complete_path();
-                        shell.render();
+                        if shell.accept_extension_autocomplete() {
+                            shell.render();
+                        } else if !executable_extensions
+                            .request_editor_autocomplete(shell.extension_editor_snapshot())
+                        {
+                            shell.complete_path();
+                            shell.render();
+                        }
                     }
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);
@@ -657,6 +665,45 @@ fn is_ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && key.code == KeyCode::Char('c')
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Forward only normalized, bounded observations. Extensions never receive the
+/// terminal event itself and cannot influence the host keymap or resize path.
+fn observe_extension_terminal_event(
+    executable_extensions: &mut crate::extensions::ExecutableExtensions,
+    event: &Event,
+) {
+    match event {
+        Event::Resize(columns, rows) => {
+            executable_extensions.observe_terminal_resize(*columns, *rows);
+        }
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            // Debug formatting escapes control characters in `KeyCode::Char`,
+            // so this never turns a terminal escape sequence into extension data.
+            executable_extensions
+                .observe_terminal_input(format!("key:{:?}:{:?}", key.modifiers, key.code));
+        }
+        Event::Paste(text) => {
+            let mut normalized = String::from("paste:");
+            for character in text.chars() {
+                let encoded = match character {
+                    '\n' => "\\n".to_owned(),
+                    '\r' => "\\r".to_owned(),
+                    '\t' => "\\t".to_owned(),
+                    character if character.is_control() => "�".to_owned(),
+                    character => character.to_string(),
+                };
+                if normalized.len().saturating_add(encoded.len())
+                    > MAX_EXTENSION_TERMINAL_INPUT_BYTES
+                {
+                    break;
+                }
+                normalized.push_str(&encoded);
+            }
+            executable_extensions.observe_terminal_input(normalized);
+        }
+        _ => {}
+    }
 }
 
 /// Keep raw-terminal input, resize handling, rendering, and termination
@@ -1128,6 +1175,7 @@ where
                         continue;
                     }
                 };
+                observe_extension_terminal_event(executable_extensions, &event);
                 if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
                     request_active_close(
                         control,
@@ -1204,8 +1252,14 @@ where
                         shell.render();
                     }
                     InputAction::CompletePath => {
-                        shell.complete_path();
-                        shell.render();
+                        if shell.accept_extension_autocomplete() {
+                            shell.render();
+                        } else if !executable_extensions
+                            .request_editor_autocomplete(shell.extension_editor_snapshot())
+                        {
+                            shell.complete_path();
+                            shell.render();
+                        }
                     }
                     InputAction::Abort => {
                         control.abort();
@@ -1617,9 +1671,12 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
         &app.reasoning,
         &app.sessions,
     );
-    for message in app.executable_extensions.drain_events() {
+    for message in app.executable_extensions.drain_events_for_shell(shell) {
         shell.notice(message);
     }
+    let _ = app.executable_extensions.sync_semantic_ui(shell);
+    app.executable_extensions
+        .sync_editor_state(shell.extension_editor_snapshot());
 }
 
 fn apply_extension_background(
@@ -1632,10 +1689,19 @@ fn apply_extension_background(
         shell.apply_extension_tool_renderer(&update.id, &update.segments);
         changed = true;
     }
-    for message in executable_extensions.drain_events() {
+    for update in updates.autocomplete {
+        if shell.set_extension_autocomplete(&update.snapshot, update.prefix, update.items) {
+            changed = true;
+        }
+    }
+    for message in executable_extensions.drain_events_for_shell(shell) {
         shell.notice(message);
         changed = true;
     }
+    if executable_extensions.sync_semantic_ui(shell) {
+        changed = true;
+    }
+    executable_extensions.sync_editor_state(shell.extension_editor_snapshot());
     // Extension contributions can arrive (or change) after the initial
     // handshake; keep the composer's slash-command list in step so commands
     // like /subagents are enterable as soon as their owning process is ready.

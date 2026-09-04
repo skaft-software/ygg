@@ -725,6 +725,54 @@ struct ViewportAnchor {
     semantic: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShellExtensionUi {
+    pub statuses: Vec<ShellExtensionUiLine>,
+    pub above_editor: Vec<ShellExtensionUiLine>,
+    pub below_editor: Vec<ShellExtensionUiLine>,
+    pub working: Option<ShellExtensionWorking>,
+    pub hidden_thinking_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellExtensionUiLine {
+    pub text: String,
+    pub style_role: Option<String>,
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellExtensionWorking {
+    pub message: Option<String>,
+    pub visible: Option<bool>,
+    pub frames: Option<Vec<String>>,
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellEditorSnapshot {
+    pub text: String,
+    pub cursor: usize,
+    pub revision: u64,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellAutocompleteItem {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellAutocompleteOverlay {
+    text: String,
+    cursor: usize,
+    revision: u64,
+    prefix: String,
+    items: Vec<ShellAutocompleteItem>,
+}
+
 #[derive(Default)]
 pub(crate) struct ShellState {
     /// Active interactive panel, if any.
@@ -837,6 +885,11 @@ pub(crate) struct ShellState {
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
+    /// Current host-projected extension UI. It contains only semantic text and
+    /// finite roles; rendering remains owned by the shell theme and layout.
+    extension_ui: ShellExtensionUi,
+    /// One bounded extension autocomplete result awaiting explicit host accept.
+    extension_autocomplete: Option<ShellAutocompleteOverlay>,
     status_detail: String,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
@@ -975,6 +1028,14 @@ fn status_rainbow_strength_at(reasoning: Option<&str>, elapsed: Option<Duration>
 fn is_provider_lifecycle_status(heading: &str) -> bool {
     let base = heading.split_once(" · ").map_or(heading, |(base, _)| base);
     base.starts_with("Loading ") || base.ends_with(" queued") || base.ends_with(" ready")
+}
+
+fn invalidate_extension_autocomplete(state: &mut ShellState) {
+    state.extension_autocomplete = None;
+}
+
+fn normal_editor_focused(state: &ShellState) -> bool {
+    state.panel.is_none() && state.overlay.is_none() && state.tool_input_prompt.is_none()
 }
 
 impl ShellState {
@@ -2957,6 +3018,7 @@ impl InteractiveShell {
         } else {
             format!("{restored}\n\n{current}")
         });
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn apply_edit(&mut self, action: EditAction) {
@@ -3046,6 +3108,7 @@ impl InteractiveShell {
                 state.file_index = Some(composer::workspace_files(&root, 10_000));
             }
         }
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Complete a unique slash-command prefix at the end of the prompt.
@@ -3063,6 +3126,7 @@ impl InteractiveShell {
             );
             state.editor.set_text(completed);
             state.slash_popup_dismissed = true;
+            invalidate_extension_autocomplete(&mut state);
         }
     }
 
@@ -3112,6 +3176,7 @@ impl InteractiveShell {
                     if command.accepts_argument { " " } else { "" }
                 ));
                 state.slash_popup_dismissed = true;
+                invalidate_extension_autocomplete(&mut state);
                 return;
             }
             SlashMenuAction::Close => {
@@ -3324,6 +3389,7 @@ impl InteractiveShell {
             let end = state.editor.text().len();
             let _ = state.editor.replace_range(token_start..end, &replacement);
             state.editor.move_to_end();
+            invalidate_extension_autocomplete(&mut state);
             return;
         }
 
@@ -3339,6 +3405,7 @@ impl InteractiveShell {
         let end = state.editor.text().len();
         let _ = state.editor.replace_range(token_start..end, &replacement);
         state.editor.move_to_end();
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn set_identity(&mut self, provider: &str, model: &str, reasoning: &str) {
@@ -3485,6 +3552,133 @@ impl InteractiveShell {
         state.update_image_rendering(enabled, capabilities);
     }
 
+    /// Replace the complete host-projected semantic extension UI. The caller
+    /// owns stale-generation filtering; this shell only retains data and keeps
+    /// all terminal rendering/theme decisions host-side.
+    pub fn set_extension_ui(&mut self, ui: ShellExtensionUi) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.extension_ui == ui {
+            return false;
+        }
+        state.extension_ui = ui;
+        true
+    }
+
+    /// Snapshot the normal host editor for a bounded extension handoff.
+    pub fn extension_editor_snapshot(&self) -> ShellEditorSnapshot {
+        let state = self.state.borrow();
+        ShellEditorSnapshot {
+            text: state.editor.text().to_owned(),
+            cursor: state.editor.cursor(),
+            revision: state.editor.revision(),
+            focused: normal_editor_focused(&state),
+        }
+    }
+
+    /// Replace editor text only while the ordinary host editor owns input.
+    /// Attachments are deliberately cleared because extension text cannot refer
+    /// to opaque attachment ledger entries.
+    pub fn extension_set_editor(&mut self, text: String) -> ShellEditorSnapshot {
+        let mut state = self.state.borrow_mut();
+        if normal_editor_focused(&state) {
+            state.editor.set_text(text);
+            state.ledger.clear();
+            state.slash_selection = 0;
+            state.slash_scroll = 0;
+            state.slash_popup_dismissed = false;
+            invalidate_extension_autocomplete(&mut state);
+        }
+        ShellEditorSnapshot {
+            text: state.editor.text().to_owned(),
+            cursor: state.editor.cursor(),
+            revision: state.editor.revision(),
+            focused: normal_editor_focused(&state),
+        }
+    }
+
+    /// Paste through the same host policy used for terminal bracketed paste.
+    pub fn extension_paste_editor(&mut self, text: String) -> ShellEditorSnapshot {
+        if self.extension_editor_snapshot().focused {
+            self.apply_edit(EditAction::Paste(text));
+        }
+        self.extension_editor_snapshot()
+    }
+
+    /// Focus requests are advisory: exclusive host panels and tool-input
+    /// pickers remain owners until they finish, so an extension cannot steal
+    /// terminal input or bypass the keymap.
+    pub fn extension_focus_editor(&self) -> ShellEditorSnapshot {
+        self.extension_editor_snapshot()
+    }
+
+    /// Install a bounded autocomplete response only if the exact host snapshot
+    /// that originated it is still current. This is the frontend half of the
+    /// revision fence and rejects late/reordered extension replies.
+    pub fn set_extension_autocomplete(
+        &mut self,
+        snapshot: &ShellEditorSnapshot,
+        prefix: String,
+        items: Vec<ShellAutocompleteItem>,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let current = {
+            let editor = &state.editor;
+            normal_editor_focused(&state)
+                && editor.revision() == snapshot.revision
+                && editor.text() == snapshot.text.as_str()
+                && editor.cursor() == snapshot.cursor
+                && snapshot.cursor >= prefix.len()
+                && editor.text()[..snapshot.cursor].ends_with(&prefix)
+        };
+        if !current || items.is_empty() {
+            return false;
+        }
+        state.extension_autocomplete = Some(ShellAutocompleteOverlay {
+            text: snapshot.text.clone(),
+            cursor: snapshot.cursor,
+            revision: snapshot.revision,
+            prefix,
+            items,
+        });
+        true
+    }
+
+    /// Accept the first extension autocomplete choice through a normal host
+    /// editor mutation. Selection/navigation remains host-owned for now.
+    pub fn accept_extension_autocomplete(&mut self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(overlay) = state.extension_autocomplete.clone() else {
+            return false;
+        };
+        let current = {
+            let editor = &state.editor;
+            normal_editor_focused(&state)
+                && editor.revision() == overlay.revision
+                && editor.text() == overlay.text.as_str()
+                && editor.cursor() == overlay.cursor
+                && overlay.cursor >= overlay.prefix.len()
+                && editor.text()[..overlay.cursor].ends_with(&overlay.prefix)
+        };
+        if !current {
+            state.extension_autocomplete = None;
+            return false;
+        }
+        let Some(item) = overlay.items.first() else {
+            state.extension_autocomplete = None;
+            return false;
+        };
+        let start = overlay.cursor - overlay.prefix.len();
+        if !state
+            .editor
+            .replace_range(start..overlay.cursor, &item.value)
+        {
+            state.extension_autocomplete = None;
+            return false;
+        }
+        invalidate_extension_autocomplete(&mut state);
+        true
+    }
+
     pub fn pending_is_empty(&self) -> bool {
         self.state.borrow().editor.is_empty()
     }
@@ -3513,6 +3707,7 @@ impl InteractiveShell {
     pub fn drain_composed(&mut self) -> ComposedInput {
         let mut state = self.state.borrow_mut();
         let mut text = state.editor.take_text();
+        invalidate_extension_autocomplete(&mut state);
 
         // Drag/drop is not consistently delivered as a bracketed-paste event.
         // When it arrives as ordinary keys, promote every existing media path
@@ -3572,6 +3767,7 @@ impl InteractiveShell {
         let mut state = self.state.borrow_mut();
         state.editor.set_text(composed.display_text);
         state.ledger.restore(composed.attachments);
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Discard the current draft and every attachment it owns.
@@ -3582,6 +3778,7 @@ impl InteractiveShell {
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn drain_editor(&mut self) -> String {
@@ -3589,7 +3786,9 @@ impl InteractiveShell {
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
-        state.editor.take_text()
+        let text = state.editor.take_text();
+        invalidate_extension_autocomplete(&mut state);
+        text
     }
 
     fn materialize_deferred_history(&mut self) -> Result<bool> {
@@ -4208,6 +4407,7 @@ impl InteractiveShell {
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Replace a live subagent list without losing its filter or stable-node
@@ -5243,3 +5443,50 @@ mod welcome_card;
 mod ordinary_surface_contract_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod extension_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn extension_autocomplete_is_revision_fenced_before_acceptance() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Char('@'));
+        let snapshot = shell.extension_editor_snapshot();
+        assert!(shell.set_extension_autocomplete(
+            &snapshot,
+            "@".into(),
+            vec![ShellAutocompleteItem {
+                value: "file".into(),
+                label: "file".into(),
+                description: None,
+            }],
+        ));
+
+        shell.apply_edit(EditAction::Char('x'));
+        assert!(!shell.accept_extension_autocomplete());
+        assert_eq!(shell.pending(), "@x");
+
+        let current = shell.extension_editor_snapshot();
+        assert!(!shell.set_extension_autocomplete(
+            &snapshot,
+            "@".into(),
+            vec![ShellAutocompleteItem {
+                value: "stale".into(),
+                label: "stale".into(),
+                description: None,
+            }],
+        ));
+        assert!(shell.set_extension_autocomplete(
+            &current,
+            "@x".into(),
+            vec![ShellAutocompleteItem {
+                value: "file".into(),
+                label: "file".into(),
+                description: None,
+            }],
+        ));
+        assert!(shell.accept_extension_autocomplete());
+        assert_eq!(shell.pending(), "file");
+    }
+}
