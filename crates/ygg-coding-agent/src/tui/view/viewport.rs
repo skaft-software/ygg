@@ -9,8 +9,11 @@ use super::transcript_selection::{
     selection_position_for_visual_cell, visual_line_for_transcript_position, TranscriptPosition,
 };
 use super::{
-    fit_line, semantic_separator, ShellOverlay, ShellState, TranscriptBlock, ViewportAnchor,
+    fit_line, render_ordinary_status, sanitize_ordinary_surface_cell, semantic_separator,
+    subdued_text, OrdinarySurfaceLifecycle, ReportBody, ReportOverlay, ShellOverlay, ShellState,
+    TranscriptBlock, ViewportAnchor,
 };
+use crate::tui::layout::PresentationLayout;
 
 pub(super) fn transcript_lines(state: &ShellState, width: u16) -> Ref<'_, Vec<String>> {
     state.rendered_transcript(width)
@@ -77,13 +80,192 @@ pub(super) fn wrap_overlay_text(text: &str, width: usize) -> Vec<String> {
     wrapped
 }
 
-pub(super) fn overlay_lines(state: &ShellState, width: u16) -> Vec<String> {
+fn report_body_lines(report: &ReportOverlay, state: &ShellState, width: u16) -> Vec<String> {
+    let plan = PresentationLayout::new(&state.theme, width);
+    match &report.body {
+        ReportBody::Text { text, styled } => {
+            super::panel_render::document_visual_lines_styled(text, &state.theme, width, *styled)
+        }
+        ReportBody::Context(context) => {
+            let inset = " ".repeat(usize::from(plan.inset));
+            context
+                .render_body(&state.theme, plan.content_width)
+                .into_iter()
+                .map(|line| fit_line(&format!("{inset}{line}"), width))
+                .collect()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReportGeometry {
+    purpose: bool,
+    status: bool,
+    footer: bool,
+    body_rows: usize,
+}
+
+fn report_geometry(
+    report: &ReportOverlay,
+    status_visible: bool,
+    max_rows: usize,
+) -> ReportGeometry {
+    if max_rows == 0 {
+        return ReportGeometry {
+            purpose: false,
+            status: false,
+            footer: false,
+            body_rows: 0,
+        };
+    }
+
+    // Title and one semantic body row win at emergency heights. Purpose,
+    // lifecycle, and actions yield in that order rather than creating a blank
+    // report frame with no inspectable data.
+    let purpose = report.surface.purpose.is_some() && max_rows >= 3;
+    let status = status_visible && max_rows >= 3 + usize::from(purpose);
+    let chrome = 1 + usize::from(purpose) + usize::from(status);
+    let footer = max_rows >= chrome.saturating_add(2);
+    ReportGeometry {
+        purpose,
+        status,
+        footer,
+        body_rows: max_rows
+            .saturating_sub(chrome + usize::from(footer))
+            .max(usize::from(max_rows > chrome)),
+    }
+}
+
+fn report_range(start: usize, end: usize, total: usize) -> String {
+    if total == 0 {
+        "0/0".to_owned()
+    } else if start.saturating_add(1) == end {
+        format!("{end}/{total}")
+    } else {
+        format!("{}-{end}/{total}", start + 1)
+    }
+}
+
+fn report_header(state: &ShellState, report: &ReportOverlay, width: u16) -> String {
+    let plan = PresentationLayout::new(&state.theme, width);
+    let inset = " ".repeat(usize::from(plan.inset));
+    let title = sanitize_ordinary_surface_cell(&report.surface.title, state.theme.unicode());
+    let title = sexy_tui_rs::truncate_to_width(
+        &title,
+        usize::from(plan.content_width).max(1),
+        Some(state.theme.glyph("ellipsis")),
+    );
+    fit_line(&format!("{inset}{}", state.theme.bold(&title)), width)
+}
+
+fn report_status(report: &ReportOverlay, state: &ShellState) -> Option<String> {
+    render_ordinary_status(&state.theme, &report.surface.lifecycle, Instant::now())
+}
+
+fn render_report_overlay(
+    report: &ReportOverlay,
+    state: &ShellState,
+    width: u16,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
+
+    let body = report_body_lines(report, state, width);
+    let status = report_status(report, state);
+    let geometry = report_geometry(report, status.is_some(), max_rows);
+    let maximum = body.len().saturating_sub(geometry.body_rows);
+    let start = report.scroll_from_top.min(maximum);
+    let end = start.saturating_add(geometry.body_rows).min(body.len());
+    let range = report_range(start, end, body.len());
+    let plan = PresentationLayout::new(&state.theme, width);
+    let inset = " ".repeat(usize::from(plan.inset));
+    let mut lines = Vec::with_capacity(max_rows);
+    lines.push(report_header(state, report, width));
+    if geometry.purpose {
+        if let Some(purpose) = report.surface.purpose.as_deref() {
+            lines.push(fit_line(
+                &format!(
+                    "{inset}{}",
+                    subdued_text(
+                        &state.theme,
+                        &sanitize_ordinary_surface_cell(purpose, state.theme.unicode()),
+                    )
+                ),
+                width,
+            ));
+        }
+    }
+    if geometry.status {
+        if let Some(status) = status {
+            lines.push(fit_line(&format!("{inset}{status}"), width));
+        }
+    }
+    if geometry.body_rows > 0 {
+        if body.is_empty() && matches!(report.surface.lifecycle, OrdinarySurfaceLifecycle::Ready) {
+            let empty = OrdinarySurfaceLifecycle::empty("report data");
+            if let Some(status) = render_ordinary_status(&state.theme, &empty, Instant::now()) {
+                lines.push(fit_line(&format!("{inset}{status}"), width));
+            }
+        } else {
+            lines.extend(body[start..end].iter().map(|line| fit_line(line, width)));
+        }
+    }
+    if geometry.footer {
+        let navigation = if state.theme.unicode() {
+            "↑↓"
+        } else {
+            "up/down"
+        };
+        let page = if state.theme.unicode() {
+            "pg↑↓"
+        } else {
+            "pgup/dn"
+        };
+        let close = if state.theme.unicode() {
+            "esc/←"
+        } else {
+            "esc/left"
+        };
+        lines.push(super::panel_render::panel_action_footer(
+            state,
+            width,
+            &inset,
+            Some(&range),
+            (navigation, "scroll"),
+            &[(page, "page"), (close, "close")],
+        ));
+    }
+    lines.truncate(max_rows);
+    lines
+}
+
+/// Return report navigation limits for the current terminal frame. The shell
+/// uses this before mutating overlay state so repeated navigation remains
+/// bounded by actual wrapped report rows, not a stale source-line count.
+pub(super) fn report_scroll_metrics_for_state(state: &ShellState) -> Option<(usize, usize)> {
+    let ShellOverlay::Report(report) = state.overlay.as_ref()? else {
+        return None;
+    };
+    let width = state.size.0;
+    let chrome = shell_chrome(state, width, Instant::now());
+    let body = report_body_lines(report, state, width);
+    let status = report_status(report, state);
+    let geometry = report_geometry(report, status.is_some(), chrome.transcript_rows);
+    Some((
+        body.len().saturating_sub(geometry.body_rows),
+        geometry.body_rows.max(1),
+    ))
+}
+
+pub(super) fn overlay_lines(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
     let Some(overlay) = &state.overlay else {
         return Vec::new();
     };
     match overlay {
         ShellOverlay::Text(text) => wrap_overlay_text(text, usize::from(width).max(1)),
-        ShellOverlay::Context(report) => report.render(&state.theme, width),
+        ShellOverlay::Report(report) => render_report_overlay(report, state, width, max_rows),
     }
 }
 
@@ -268,7 +450,7 @@ pub(super) fn render_shell_viewport_at(
 ) -> Vec<String> {
     let chrome = shell_chrome(state, width, now);
     let mut lines = if state.overlay.is_some() {
-        let mut overlay = overlay_lines(state, width);
+        let mut overlay = overlay_lines(state, width, chrome.transcript_rows);
         overlay.truncate(chrome.transcript_rows);
         overlay
     } else {

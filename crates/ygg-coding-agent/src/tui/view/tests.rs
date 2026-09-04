@@ -602,7 +602,8 @@ fn session_picker_render_shows_scope_markers_and_fork_metadata() {
     assert!(rendered.contains("^s sort"));
     assert_eq!(raw.join("\n").matches(CURSOR_MARKER).count(), 1);
     assert!(plain[1].starts_with("Resume Session"), "{plain:?}");
-    assert!(plain[2].starts_with("Filter"), "{plain:?}");
+    assert!(plain[2].starts_with("Select a saved session"), "{plain:?}");
+    assert!(plain[3].starts_with("Filter"), "{plain:?}");
     let selected = plain
         .iter()
         .find(|line| line.contains("Forked (fork)"))
@@ -4224,7 +4225,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
             visible
                 .lines()
                 .next()
-                .is_some_and(|line| line.contains("Context Usage")),
+                .is_some_and(|line| line.contains("Context")),
             "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
         );
         assert!(visible.contains("Estimated usage by category"), "{visible}");
@@ -4256,7 +4257,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert!(
-            !physical.contains("Context Usage"),
+            !physical.contains("Estimated usage by category"),
             "overlay entered history:\n{physical}"
         );
         for index in 0..40 {

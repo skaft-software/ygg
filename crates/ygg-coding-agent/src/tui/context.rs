@@ -158,9 +158,21 @@ impl ContextReport {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn render(&self, theme: &YggTheme, width: u16) -> Vec<String> {
         let width = width.max(1);
         let mut lines = vec![fit_line(&theme.bold("Context Usage"), width)];
+        lines.extend(self.render_body(theme, width));
+        lines
+    }
+
+    /// Render the semantic context content without a title. Ordinary report
+    /// chrome owns the title when `/context` appears alongside the other
+    /// transient reports, while the legacy/full report renderer above keeps its
+    /// standalone heading for callers that need it.
+    pub(crate) fn render_body(&self, theme: &YggTheme, width: u16) -> Vec<String> {
+        let width = width.max(1);
+        let mut lines = Vec::new();
         let (columns, _) = grid_dimensions(self.context_window);
         let spaced_grid = usize::from(width) >= columns.saturating_mul(2);
         let grid_width = if spaced_grid {

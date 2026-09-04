@@ -359,7 +359,7 @@ fn panel_action_hint(state: &ShellState, key: &str, verb: &str) -> String {
 
 /// Render complete priority-ordered action hints through the one shared footer
 /// primitive. Scope-like context drops before the rightmost optional actions.
-fn panel_action_footer(
+pub(super) fn panel_action_footer(
     state: &ShellState,
     width: u16,
     prefix: &str,
@@ -738,6 +738,17 @@ fn render_session_picker(
         lines.push(subdued_text(&state.theme, rule));
     }
     lines.push(picker_header_line(state, picker, width));
+    if max_rows >= 4 {
+        if let Some(purpose) = picker.surface.purpose.as_deref() {
+            lines.push(fit_line(
+                &format!(
+                    "{inset}{}",
+                    subdued_text(&state.theme, &panel_cell(purpose, state.theme.unicode()))
+                ),
+                width,
+            ));
+        }
+    }
     if max_rows >= 2 {
         lines.push(picker_filter_line(state, picker, width));
     }
@@ -1504,10 +1515,12 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             // count in their heading.
             let filtered = filtered_indices_for_action(items, descriptions, action, filter);
             let body = filtered.len().max(1);
+            let show_purpose = !confirmation && surface.purpose.is_some() && max_panel >= 4;
+            let border_min_rows = if show_purpose { 6 } else { 5 };
             let border_rows = usize::from(
                 !confirmation
                     && state.theme.layout_for_width(width).show_panel_borders
-                    && max_panel >= 4,
+                    && max_panel >= border_min_rows,
             ) * 2;
             let detail_rows = if confirmation {
                 let available_detail_rows =
@@ -1516,7 +1529,7 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             } else {
                 0
             };
-            let metadata_rows = usize::from(surface.purpose.is_some())
+            let metadata_rows = usize::from(show_purpose)
                 + usize::from(
                     !matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_))
                         && render_ordinary_status(&state.theme, &surface.lifecycle, Instant::now())
@@ -1549,10 +1562,11 @@ fn panel_rows(state: &ShellState, width: u16) -> usize {
             let border_rows = usize::from(
                 state.theme.layout_for_width(width).show_panel_borders && max_panel >= 6,
             ) * 2;
-            let available_rows = max_panel.saturating_sub(4 + border_rows);
+            let chrome_rows = 4 + usize::from(picker.surface.purpose.is_some());
+            let available_rows = max_panel.saturating_sub(chrome_rows + border_rows);
             let row_height =
                 usize::from(session_rows_are_stacked(state, width, available_rows)) + 1;
-            (body * row_height + 4 + border_rows).min(max_panel)
+            (body * row_height + chrome_rows + border_rows).min(max_panel)
         }
         Panel::MessagePicker { picker } => {
             let body = picker.messages.len().saturating_mul(3).max(1);
@@ -1660,9 +1674,14 @@ fn render_panel_output_with_limit(
             // Approval detail is shared evidence rendered once above the
             // actions. At constrained heights, always reserve a row for the
             // selected action so Enter can never confirm invisible UI.
+            // Preserve a selected body row before optional explanatory chrome.
+            // At three rows the title, filter, and focusable item are the
+            // minimum usable picker; purpose yields until a fourth row exists.
+            let show_purpose = !confirmation && surface.purpose.is_some() && max_rows >= 4;
+            let border_min_rows = if show_purpose { 6 } else { 5 };
             let show_borders = !confirmation
                 && state.theme.layout_for_width(width).show_panel_borders
-                && max_rows >= 4;
+                && max_rows >= border_min_rows;
             let mut lines = Vec::with_capacity(max_rows);
             let content_inset = " ".repeat(usize::from(
                 PresentationLayout::new(&state.theme, width).inset,
@@ -1674,7 +1693,7 @@ fn render_panel_output_with_limit(
             if let Some(filter_line) = filter_line {
                 lines.push(filter_line);
             }
-            if !confirmation {
+            if show_purpose {
                 if let Some(purpose) = surface.purpose.as_deref() {
                     lines.push(fit_line(
                         &format!(
@@ -1684,12 +1703,12 @@ fn render_panel_output_with_limit(
                         width,
                     ));
                 }
-                if !matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_)) {
-                    if let Some(status) =
-                        render_ordinary_status(&state.theme, &surface.lifecycle, Instant::now())
-                    {
-                        lines.push(fit_line(&format!("{content_inset}{status}"), width));
-                    }
+            }
+            if !confirmation && !matches!(&surface.lifecycle, OrdinarySurfaceLifecycle::Empty(_)) {
+                if let Some(status) =
+                    render_ordinary_status(&state.theme, &surface.lifecycle, Instant::now())
+                {
+                    lines.push(fit_line(&format!("{content_inset}{status}"), width));
                 }
             }
             if confirmation {

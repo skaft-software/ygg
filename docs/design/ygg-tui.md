@@ -7,8 +7,8 @@ The interactive frontend owns terminal setup/restoration and presentation only;
 [presentation contract](ygg-presentation.md) defines the visual hierarchy,
 approval, and terminal-outcome semantics shared by these mechanics. The
 [ordinary command and picker surface contract](ygg-command-picker-surfaces.md)
-defines the transient discovery, selection, status, and action vocabulary that
-uses that hierarchy without adding a second TUI.
+defines the transient discovery, selection, read-only report, status, and action
+vocabulary that uses that hierarchy without adding a second TUI.
 
 ## Terminal guarantees
 
@@ -106,6 +106,11 @@ the active match and hint keys use the active model's adaptive accent, matching
 picker focus and the composer without treating the focused item as provider
 provenance.
 Executable-extension status/header/footer contributions never occupy that row.
+Read-only `/help`, `/status`, `/context`, `/cost`, and `/cache` reports use the
+same title/purpose/status/footer vocabulary as ordinary pickers. They occupy a
+temporary viewport surface rather than transcript history, start at their first
+semantic body row, and support Up/Down, PageUp/PageDown, Home, and End scrolling;
+Escape or Left returns to the composer.
 Generic presentation snapshots do not create persistent chrome. The first-party
 `ygg-subagents` observation surface is the bounded exception: while an owning
 run has workers, the host renders its complete owner-fenced `subagent` roster in

@@ -246,7 +246,7 @@ where
 async fn pick_list<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
-    title: &str,
+    surface: OrdinarySurfaceMetadata,
     items: Vec<String>,
     descriptions: Vec<Option<String>>,
     initial_selected: usize,
@@ -263,7 +263,7 @@ where
 
     let initial_selected = initial_selected.min(items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
-        surface: OrdinarySurfaceMetadata::new(title),
+        surface,
         items,
         descriptions,
         selected: initial_selected,
@@ -320,7 +320,7 @@ where
 pub async fn extension_picker<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
-    title: &str,
+    surface: OrdinarySurfaceMetadata,
     items: Vec<String>,
     descriptions: Vec<Option<String>>,
     initial_selected: usize,
@@ -332,7 +332,7 @@ where
     pick_list(
         shell,
         input,
-        title,
+        surface,
         items,
         descriptions,
         initial_selected,
@@ -917,7 +917,10 @@ pub async fn thinking_picker(
     let Some(index) = pick_list(
         shell,
         input,
-        "Select thinking level",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select thinking level",
+            "Choose the reasoning effort for subsequent prompts",
+        ),
         items,
         vec![None; levels.len()],
         0,
@@ -1005,7 +1008,7 @@ where
     let selected = pick_list(
         shell,
         input,
-        &title,
+        OrdinarySurfaceMetadata::new(title),
         items,
         descriptions,
         0,
@@ -1201,7 +1204,10 @@ pub async fn optional_model_picker(
     let Some(index) = pick_list(
         shell,
         input,
-        "Select model",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select model",
+            "Choose the model used for subsequent prompts",
+        ),
         presentation.labels,
         presentation.descriptions,
         0,
@@ -1290,7 +1296,7 @@ mod tests {
         let selected = pick_list(
             &mut shell,
             &mut input,
-            "Choose",
+            OrdinarySurfaceMetadata::new("Choose"),
             vec!["one".into()],
             vec![None],
             0,

@@ -293,8 +293,30 @@ struct QueuedSteering {
 
 #[derive(Clone, Debug)]
 enum ShellOverlay {
+    /// Legacy one-shot text overlay retained for transient compatibility paths
+    /// that do not yet own an ordinary report record.
     Text(String),
+    /// A scrollable, semantic report using the same title/purpose/status/action
+    /// contract as ordinary pickers without becoming a persistent dashboard.
+    Report(ReportOverlay),
+}
+
+/// Body data for an ordinary report. Text is sanitized at the producer boundary;
+/// only explicit, internally styled content may retain trusted theme ANSI.
+#[derive(Clone, Debug)]
+enum ReportBody {
+    Text { text: String, styled: bool },
     Context(crate::tui::context::ContextReport),
+}
+
+/// Mutable presentation state for a report over the transcript viewport.
+/// `scroll_from_top` starts at the report heading so help and accounting reports
+/// retain their task context before a reader chooses to inspect later rows.
+#[derive(Clone, Debug)]
+struct ReportOverlay {
+    surface: OrdinarySurfaceMetadata,
+    body: ReportBody,
+    scroll_from_top: usize,
 }
 
 /// Scope used by the session picker.
@@ -389,7 +411,10 @@ impl PickerState {
             scroll: 0,
             confirming_delete: false,
             rename: None,
-            surface: OrdinarySurfaceMetadata::new("Resume Session"),
+            surface: OrdinarySurfaceMetadata::with_purpose(
+                "Resume Session",
+                "Select a saved session to continue",
+            ),
             current_session_path,
         }
     }
@@ -516,6 +541,17 @@ pub(crate) enum PanelResult {
     Select(String),
     /// User cancelled (Esc).
     Cancel,
+}
+
+/// Result of dispatching a key to a transient report overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayInputResult {
+    /// The legacy overlay owner retains its historical any-key dismissal path.
+    Legacy,
+    /// The report remains open after consuming navigation.
+    Consumed,
+    /// The report acknowledged dismissal and has closed itself.
+    Closed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -3603,6 +3639,45 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Text(sanitize_for_terminal(&text)));
     }
 
+    fn show_report(&mut self, surface: OrdinarySurfaceMetadata, body: ReportBody) {
+        self.state.borrow_mut().overlay = Some(ShellOverlay::Report(ReportOverlay {
+            surface,
+            body,
+            scroll_from_top: 0,
+        }));
+    }
+
+    /// Show a terminal-safe read-only report using ordinary title, purpose,
+    /// status, and footer chrome. Report text remains outside transcript copy.
+    pub fn show_report_text(
+        &mut self,
+        title: impl Into<String>,
+        purpose: impl Into<String>,
+        text: String,
+    ) {
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(title, purpose),
+            ReportBody::Text {
+                text: sanitize_for_terminal(&text),
+                styled: false,
+            },
+        );
+    }
+
+    /// Styled report text must already have been terminal-sanitized at its
+    /// producing boundary. Only Ygg-owned theme SGR is retained while wrapping.
+    pub fn show_styled_report_text(
+        &mut self,
+        title: impl Into<String>,
+        purpose: impl Into<String>,
+        text: String,
+    ) {
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(title, purpose),
+            ReportBody::Text { text, styled: true },
+        );
+    }
+
     /// Extension slash-command output, framed with heading chrome. The body
     /// is sanitized; only trusted theme styling added here survives.
     pub fn show_extension_output(&mut self, command: &str, text: String) {
@@ -3615,7 +3690,13 @@ impl InteractiveShell {
     }
 
     pub fn show_context_report(&mut self, report: crate::tui::context::ContextReport) {
-        self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(
+                "Context",
+                "Review the estimated request context before the next turn",
+            ),
+            ReportBody::Context(report),
+        );
     }
 
     /// Toggle the one global transcript disclosure mode (ctrl+o).
@@ -3646,9 +3727,16 @@ impl InteractiveShell {
     }
 
     pub fn show_status_text_with_telemetry(&mut self, text: String) {
-        let mut state = self.state.borrow_mut();
-        let text = format!("{text}\n\n{}", status_telemetry(&state, Instant::now()));
-        state.overlay = Some(ShellOverlay::Text(styled_status_text(&state.theme, &text)));
+        let (theme, text) = {
+            let state = self.state.borrow();
+            let text = format!("{text}\n\n{}", status_telemetry(&state, Instant::now()));
+            (state.theme.clone(), text)
+        };
+        self.show_styled_report_text(
+            "Status",
+            "Review active model, session, and safety diagnostics",
+            styled_status_text(&theme, &text),
+        );
     }
 
     pub fn close_overlay(&mut self) {
@@ -3657,6 +3745,67 @@ impl InteractiveShell {
 
     pub fn has_overlay(&self) -> bool {
         self.state.borrow().overlay.is_some()
+    }
+
+    /// Let a shared report retain navigation while preserving the legacy
+    /// one-shot overlay dismissal semantics for every other transient overlay.
+    pub(crate) fn overlay_input(&mut self, event: &crossterm::event::Event) -> OverlayInputResult {
+        let mut state = self.state.borrow_mut();
+        if !matches!(state.overlay.as_ref(), Some(ShellOverlay::Report(_))) {
+            return OverlayInputResult::Legacy;
+        }
+        let (maximum, page_rows) =
+            self::viewport::report_scroll_metrics_for_state(&state).unwrap_or((0, 1));
+        let mut close = false;
+        if let crossterm::event::Event::Key(key) = event {
+            if crate::tui::keymap::accepts_key_event(key) {
+                let Some(ShellOverlay::Report(report)) = state.overlay.as_mut() else {
+                    return OverlayInputResult::Legacy;
+                };
+                report.scroll_from_top = report.scroll_from_top.min(maximum);
+                match key.code {
+                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Left
+                        if key.modifiers.is_empty() =>
+                    {
+                        close = true;
+                    }
+                    crossterm::event::KeyCode::Up if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report.scroll_from_top.saturating_sub(1);
+                    }
+                    crossterm::event::KeyCode::Down if key.modifiers.is_empty() => {
+                        report.scroll_from_top =
+                            report.scroll_from_top.saturating_add(1).min(maximum);
+                    }
+                    crossterm::event::KeyCode::PageUp if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report.scroll_from_top.saturating_sub(page_rows);
+                    }
+                    crossterm::event::KeyCode::PageDown if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report
+                            .scroll_from_top
+                            .saturating_add(page_rows)
+                            .min(maximum);
+                    }
+                    crossterm::event::KeyCode::Home if key.modifiers.is_empty() => {
+                        report.scroll_from_top = 0;
+                    }
+                    crossterm::event::KeyCode::End if key.modifiers.is_empty() => {
+                        report.scroll_from_top = maximum;
+                    }
+                    _ => close = true,
+                }
+            }
+        } else {
+            // Legacy overlays dismiss on arbitrary input. A report retains
+            // that familiar escape hatch for non-navigation events without
+            // letting text leak into the composer behind it.
+            close = true;
+        }
+        if close {
+            state.overlay = None;
+            OverlayInputResult::Closed
+        } else {
+            OverlayInputResult::Consumed
+        }
     }
 
     /// Requests a coordinated interactive close at the next owning boundary.

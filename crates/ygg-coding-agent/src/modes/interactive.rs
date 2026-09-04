@@ -48,7 +48,7 @@ use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
     background_from_terminal_rgb, load_theme, load_theme_for_background, TerminalBackground,
 };
-use crate::tui::view::InteractiveShell;
+use crate::tui::view::{InteractiveShell, OrdinarySurfaceMetadata, OverlayInputResult};
 
 /// Ordered controls sent to the frozen Agent during an active run.
 #[derive(Debug)]
@@ -265,12 +265,23 @@ where
                             shell.render();
                             continue;
                         }
-                        _ => {
-                            shell.close_overlay();
-                            shell.clear_error();
-                            shell.render();
-                            continue;
-                        }
+                        _ => match shell.overlay_input(&event) {
+                            OverlayInputResult::Consumed => {
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Closed => {
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Legacy => {
+                                shell.close_overlay();
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                        },
                     }
                 }
                 let pending = if shell.pending_is_empty() {
@@ -454,12 +465,18 @@ fn apply_goal_command(
     use ygg_agent::GoalAction as DurableGoalAction;
 
     match command {
-        commands::GoalCommand::Help => shell.show_overlay_text(
+        commands::GoalCommand::Help => shell.show_report_text(
+            "Goal help",
+            "Browse commands for the current session goal",
             "Goal commands\n\n/goal <objective>\n/goal status\n/goal pause\n/goal resume\n/goal clear"
                 .to_owned(),
         ),
         commands::GoalCommand::Status => match goal_status_text(app) {
-            Ok(status) => shell.show_overlay_text(status),
+            Ok(status) => shell.show_report_text(
+                "Goal status",
+                "Review the current session goal",
+                status,
+            ),
             Err(error) => shell.error(format!("unable to read goal: {error}")),
         },
         commands::GoalCommand::Set(objective) => match app
@@ -1145,12 +1162,23 @@ where
                             shell.render();
                             continue;
                         }
-                        _ => {
-                            shell.close_overlay();
-                            shell.clear_error();
-                            shell.render();
-                            continue;
-                        }
+                        _ => match shell.overlay_input(&event) {
+                            OverlayInputResult::Consumed => {
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Closed => {
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Legacy => {
+                                shell.close_overlay();
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                        },
                     }
                 }
                 let pending = if shell.pending_is_empty() {
@@ -1965,7 +1993,10 @@ async fn web_search_management_menu(
     let Some(index) = extension_picker(
         shell,
         input,
-        "Web search provider · Enter selects · Esc returns",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select web search provider",
+            "Choose a provider for web search or disable the extension",
+        ),
         items,
         descriptions,
         0,
@@ -2039,7 +2070,10 @@ async fn extension_management_menu(
         let Some(index) = extension_picker(
             shell,
             input,
-            "Extensions · Enter manages/toggles · Esc closes",
+            OrdinarySurfaceMetadata::with_purpose(
+                "Manage extensions",
+                "Select a bundle to inspect or manage its activation",
+            ),
             items,
             descriptions,
             selected,
@@ -3259,7 +3293,11 @@ async fn run_idle_command(
 ) -> anyhow::Result<IdleCommandOutcome> {
     match command {
         Command::Help(topic) => {
-            shell.show_overlay_text(commands::help_text(&app.config.workspace, topic.as_deref()));
+            shell.show_report_text(
+                "Help",
+                "Browse commands and keyboard shortcuts",
+                commands::help_text(&app.config.workspace, topic.as_deref()),
+            );
         }
         Command::Status => {
             shell.show_status_text_with_telemetry(commands::status_text(&app, None));
@@ -3267,10 +3305,16 @@ async fn run_idle_command(
         Command::Context => {
             shell.show_context_report(crate::tui::context::ContextReport::capture(&app, &[]));
         }
-        Command::Cost => {
-            shell.show_overlay_text(commands::cost_text(app.agent.session(), &app.model))
-        }
-        Command::Cache => shell.show_overlay_text(commands::cache_text(app.agent.session())),
+        Command::Cost => shell.show_report_text(
+            "Cost",
+            "Review session token usage and estimated cost",
+            commands::cost_text(app.agent.session(), &app.model),
+        ),
+        Command::Cache => shell.show_report_text(
+            "Cache",
+            "Review session cache accounting",
+            commands::cache_text(app.agent.session()),
+        ),
         Command::Update => {
             match await_lifecycle(shell, input, "checking for updates…", async {
                 crate::update::check().await
@@ -4068,11 +4112,17 @@ async fn run_interactive_without_model(
             Idle::Command(raw) => match commands::parse(&raw) {
                 Command::Quit => return Ok(resume_command),
                 Command::Help(topic) => {
-                    shell.show_overlay_text(commands::help_text(&workspace, topic.as_deref()));
+                    shell.show_report_text(
+                        "Help",
+                        "Browse commands and keyboard shortcuts",
+                        commands::help_text(&workspace, topic.as_deref()),
+                    );
                     shell.render();
                 }
                 Command::Status => {
-                    shell.show_overlay_text(
+                    shell.show_report_text(
+                        "Status",
+                        "Review the read-only session configuration",
                         "No model is configured. The session can be read, but prompts are disabled."
                             .to_owned(),
                     );

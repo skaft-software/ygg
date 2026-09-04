@@ -106,6 +106,8 @@ struct RenderedFixture {
     picker: Vec<String>,
     commands_raw: Vec<String>,
     commands: Vec<String>,
+    report_raw: Vec<String>,
+    report: Vec<String>,
 }
 
 fn shell_for(fixture: ContractFixture) -> InteractiveShell {
@@ -122,9 +124,25 @@ fn plain_rows(lines: &[String]) -> Vec<String> {
         .collect()
 }
 
+const REPORT_BODY: &str = "Overview\nCommands are available from the composer.\nUse a topic to narrow the list.\nKeyboard shortcuts remain visible.\nReports preserve semantic content.\nNo dashboard is created.\nScroll to inspect later rows.";
+
+fn rendered_report(shell: &InteractiveShell, width: u16, max_rows: usize) -> Vec<String> {
+    super::viewport::overlay_lines(&shell.state.borrow(), width, max_rows)
+}
+
+fn rendered_live_report(shell: &InteractiveShell) -> Vec<String> {
+    let state = shell.state.borrow();
+    let width = state.size.0;
+    let max_rows = super::shell_chrome::shell_chrome(&state, width, Instant::now()).transcript_rows;
+    super::viewport::overlay_lines(&state, width, max_rows)
+}
+
 fn open_contract_picker(shell: &mut InteractiveShell) {
     shell.open_panel(Panel::SelectList {
-        surface: OrdinarySurfaceMetadata::new("Select model"),
+        surface: OrdinarySurfaceMetadata::with_purpose(
+            "Select model",
+            "Choose the model used for subsequent prompts",
+        ),
         items: vec!["Atlas".into(), "Borealis".into()],
         descriptions: vec![
             Some("128K context; vision".into()),
@@ -147,12 +165,20 @@ fn render_fixture(fixture: ContractFixture) -> RenderedFixture {
         let state = shell.state.borrow();
         super::input_overlays::render_slash_suggestions(&state, fixture.width, 4)
     };
+    shell.show_report_text(
+        "Help",
+        "Browse commands and keyboard shortcuts",
+        REPORT_BODY.to_owned(),
+    );
+    let report_raw = rendered_report(&shell, fixture.width, usize::from(fixture.height));
 
     RenderedFixture {
         picker: plain_rows(&picker_raw),
         commands: plain_rows(&commands_raw),
+        report: plain_rows(&report_raw),
         picker_raw,
         commands_raw,
+        report_raw,
     }
 }
 
@@ -204,6 +230,31 @@ fn render_hostile_suggestions(shell: &InteractiveShell, width: u16) -> Vec<Strin
 }
 
 #[test]
+fn ordinary_picker_yields_purpose_before_its_focused_row() {
+    let mut shell = shell_for(REGULAR);
+    open_contract_picker(&mut shell);
+
+    let compact = plain_rows(&super::panel_render::render_panel_with_limit(
+        &shell.state.borrow(),
+        REGULAR.width,
+        3,
+    ))
+    .join("\n");
+    assert!(compact.contains("Select model"));
+    assert!(compact.contains("Borealis"));
+    assert!(!compact.contains("Choose the model"));
+
+    let ordinary = plain_rows(&super::panel_render::render_panel_with_limit(
+        &shell.state.borrow(),
+        REGULAR.width,
+        4,
+    ))
+    .join("\n");
+    assert!(ordinary.contains("Choose the model"));
+    assert!(ordinary.contains("Borealis"));
+}
+
+#[test]
 fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
     for fixture in [
         NARROW,
@@ -218,20 +269,27 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
         let rendered = render_fixture(fixture);
         let picker = rendered.picker.join("\n");
         let commands = rendered.commands.join("\n");
+        let report = rendered.report.join("\n");
 
         assert!(
             rendered
                 .picker
                 .iter()
                 .chain(&rendered.commands)
+                .chain(&rendered.report)
                 .all(|line| visible_width(line) <= usize::from(fixture.width)),
-            "{} overflowed {} columns:\npicker={picker:?}\ncommands={commands:?}",
+            "{} overflowed {} columns:\npicker={picker:?}\ncommands={commands:?}\nreport={report:?}",
             fixture.name,
             fixture.width,
         );
         assert!(
             picker.contains("Select model"),
             "{} lost title: {picker}",
+            fixture.name
+        );
+        assert!(
+            picker.contains("Choose the model"),
+            "{} lost model picker purpose: {picker}",
             fixture.name
         );
         assert!(
@@ -247,6 +305,14 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
         assert!(
             commands.contains("navigate") && commands.contains("select"),
             "{} lost primary action-footer grammar: {commands}",
+            fixture.name
+        );
+        assert!(
+            report.contains("Help")
+                && report.contains("Browse commands and keyboard shortcuts")
+                && report.contains("Overview")
+                && report.contains("scroll"),
+            "{} lost shared report title, purpose, body, or action: {report}",
             fixture.name
         );
         let expected_footer = match (fixture.width, fixture.unicode) {
@@ -295,13 +361,15 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
                     .picker_raw
                     .iter()
                     .chain(&rendered.commands_raw)
+                    .chain(&rendered.report_raw)
                     // The renderer's cursor marker is a control sentinel,
                     // not colour/style output; remove it before testing the
                     // no-colour presentation projection.
                     .all(|line| !line.replace(CURSOR_MARKER, "").contains('\x1b')),
-                "no-color fixture emitted ANSI styling: picker={:?}, commands={:?}",
+                "no-color fixture emitted ANSI styling: picker={:?}, commands={:?}, report={:?}",
                 rendered.picker_raw,
-                rendered.commands_raw
+                rendered.commands_raw,
+                rendered.report_raw
             );
         }
     }
@@ -309,6 +377,7 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
     let ascii = render_fixture(ASCII);
     let ascii_picker = ascii.picker.join("\n");
     let ascii_commands = ascii.commands.join("\n");
+    let ascii_report = ascii.report.join("\n");
     assert!(
         ascii_picker.contains("> Borealis"),
         "ASCII focus marker: {ascii_picker}"
@@ -318,10 +387,19 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
         "ASCII action footer: {ascii_commands}"
     );
     assert!(
+        ascii_report.contains("up/down scroll")
+            && ascii_report.contains("pgup/dn page")
+            && ascii_report.contains("esc/left close"),
+        "ASCII report action footer: {ascii_report}"
+    );
+    assert!(
         !ascii_picker.contains('›')
             && !ascii_commands.contains('↑')
             && !ascii_commands.contains('↓')
-            && !ascii_commands.contains('↵'),
+            && !ascii_commands.contains('↵')
+            && !ascii_report.contains('↑')
+            && !ascii_report.contains('↓')
+            && !ascii_report.contains('←'),
         "ASCII fixture leaked Unicode interaction glyphs"
     );
 
@@ -334,6 +412,177 @@ fn ordinary_surface_contract_fixture_matrix_preserves_grid_and_capabilities() {
     assert_eq!(
         ordinary.commands, reduced.commands,
         "motion changed command discovery geometry"
+    );
+    assert_eq!(
+        ordinary.report, reduced.report,
+        "motion changed report geometry"
+    );
+}
+
+#[test]
+fn ordinary_surface_contract_migrates_resume_extensions_and_inline_completion() {
+    let mut resume = shell_for(REGULAR);
+    resume.open_panel(Panel::SessionPicker {
+        picker: PickerState::new(Vec::new(), None),
+    });
+    let resume_text = rendered_panel(&resume, REGULAR.width);
+    assert!(
+        resume_text.contains("Resume Session")
+            && resume_text.contains("Select a saved session to continue"),
+        "resume picker lost shared title/purpose chrome: {resume_text}"
+    );
+
+    let mut extensions = shell_for(REGULAR);
+    extensions.open_panel(Panel::SelectList {
+        surface: OrdinarySurfaceMetadata::with_purpose(
+            "Manage extensions",
+            "Select a bundle to inspect or manage its activation",
+        ),
+        items: vec!["ygg-web-search".into()],
+        descriptions: vec![Some("installed 1.0 · enabled".into())],
+        selected: 0,
+        filter: String::new(),
+        action: PanelAction::SelectExtension(vec!["ygg-web-search".into()]),
+    });
+    let extension_text = rendered_panel(&extensions, REGULAR.width);
+    assert!(
+        extension_text.contains("Manage extensions")
+            && extension_text.contains("Select a bundle to inspect or manage its activation")
+            && extension_text.contains("ygg-web-search")
+            && extension_text.contains("enter select"),
+        "extension picker lost shared title/purpose/action chrome: {extension_text}"
+    );
+
+    let mut completion = shell_for(REGULAR);
+    set_editor(&mut completion, "/m");
+    let completion_rows = plain_rows(&super::input_overlays::render_slash_suggestions(
+        &completion.state.borrow(),
+        REGULAR.width,
+        4,
+    ));
+    let completion_text = completion_rows.join("\n");
+    assert!(
+        completion_text.contains("/model")
+            && completion_text.contains("commands")
+            && completion_text.contains("navigate")
+            && completion_text.contains("select"),
+        "composer-owned completion lost its shared action vocabulary: {completion_text}"
+    );
+}
+
+#[test]
+fn ordinary_report_contract_keeps_navigation_and_lifecycle_semantic() {
+    let mut shell = shell_for(REGULAR);
+    let body = (0..30)
+        .map(|index| format!("report row {index:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    shell.show_report_text(
+        "Cost",
+        "Review session token usage and estimated cost",
+        body,
+    );
+
+    let initial = plain_rows(&rendered_live_report(&shell)).join("\n");
+    assert!(
+        initial.contains("Cost")
+            && initial.contains("Review session token usage")
+            && initial.contains("report row 00")
+            && !initial.contains("report row 29"),
+        "report did not start at its task context: {initial}"
+    );
+    assert_eq!(
+        shell.overlay_input(&Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        ))),
+        OverlayInputResult::Consumed
+    );
+    let paged = plain_rows(&rendered_live_report(&shell)).join("\n");
+    assert!(
+        !paged.contains("report row 00") && shell.has_overlay(),
+        "page navigation leaked through or did not move: {paged}"
+    );
+    assert_eq!(
+        shell.overlay_input(&Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))),
+        OverlayInputResult::Consumed
+    );
+    let tail = plain_rows(&rendered_live_report(&shell)).join("\n");
+    assert!(
+        tail.contains("report row 29"),
+        "end did not reach the final report row: {tail}"
+    );
+    assert_eq!(
+        shell.overlay_input(&Event::Key(KeyEvent::new(
+            KeyCode::Home,
+            KeyModifiers::NONE
+        ))),
+        OverlayInputResult::Consumed
+    );
+    assert!(
+        plain_rows(&rendered_live_report(&shell))
+            .join("\n")
+            .contains("report row 00"),
+        "home did not return to the report heading"
+    );
+    assert_eq!(
+        shell.overlay_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))),
+        OverlayInputResult::Closed
+    );
+    assert!(!shell.has_overlay(), "escape did not close the report");
+
+    shell.show_status_text_with_telemetry("model status summary".into());
+    assert!(matches!(
+        shell.state.borrow().overlay.as_ref(),
+        Some(ShellOverlay::Report(_))
+    ));
+    let status = plain_rows(&rendered_report(&shell, REGULAR.width, 8)).join("\n");
+    assert!(
+        status.contains("Status") && status.contains("model status summary"),
+        "status did not use shared report chrome: {status}"
+    );
+    shell.close_overlay();
+
+    shell.show_overlay_text("legacy one-shot overlay".into());
+    assert_eq!(
+        shell.overlay_input(&Event::Key(KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE
+        ))),
+        OverlayInputResult::Legacy,
+        "report navigation must not change legacy overlay ownership"
+    );
+    assert!(
+        shell.has_overlay(),
+        "legacy overlay was unexpectedly closed"
+    );
+    shell.close_overlay();
+
+    let mut lifecycle =
+        OrdinarySurfaceMetadata::with_purpose("Cache", "Review session cache accounting");
+    lifecycle.lifecycle = OrdinarySurfaceLifecycle::loading("collecting cache entries");
+    shell.show_report(
+        lifecycle,
+        ReportBody::Text {
+            text: "cache rows are still arriving".into(),
+            styled: false,
+        },
+    );
+    let lifecycle = plain_rows(&rendered_report(&shell, NO_COLOR.width, 8)).join("\n");
+    assert!(
+        lifecycle.contains("Cache")
+            && lifecycle.contains("Review session cache accounting")
+            && lifecycle.to_ascii_lowercase().contains("loading")
+            && lifecycle.contains("collecting cache entries"),
+        "report lifecycle status lost its typed semantics: {lifecycle}"
+    );
+
+    let constrained = plain_rows(&rendered_report(&shell, NO_COLOR.width, 2)).join("\n");
+    assert!(
+        constrained.contains("Cache")
+            && constrained.contains("cache rows are still arriving")
+            && !constrained.to_ascii_lowercase().contains("loading"),
+        "a two-row report must keep a body row before optional lifecycle chrome: {constrained}"
     );
 }
 

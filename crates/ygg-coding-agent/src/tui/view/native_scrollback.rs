@@ -44,7 +44,7 @@ fn render_native_overlay_suffix(
     requested_stable_prefix: usize,
 ) -> (usize, Vec<String>, usize, usize) {
     let overlay_prefix_len = native_overlay_prefix_len(transcript.len(), &chrome);
-    let mut overlay = overlay_lines(state, width);
+    let mut overlay = overlay_lines(state, width, chrome.transcript_rows);
     append_viewport_chrome(&mut overlay, chrome);
 
     let transcript_prefix_len = overlay_prefix_len.min(transcript.len());

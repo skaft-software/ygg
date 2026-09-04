@@ -8,19 +8,24 @@ TUI vocabulary. It applies over the shared grid in
 [`ygg-tui.md`](ygg-tui.md); it does not introduce a second renderer, theme, or
 modal system.
 
-An **ordinary surface** is a short-lived command suggestion list, picker, or
-its adjacent status. It helps a user find, inspect, and choose an already
-available command or item. It is not a persistent dashboard, provider-branded
-view, diagnostic console, or authority boundary.
+An **ordinary surface** is a short-lived command suggestion list, picker,
+read-only report, or its adjacent status. It helps a user find, inspect, and
+choose an already available command or item, or review bounded session facts.
+It is not a persistent dashboard, provider-branded view, diagnostic console,
+or authority boundary.
 
 ## Scope and ownership
 
 - Inline slash and path discovery remain part of the composer. The composer
   supplies their title and purpose, so an inline list need not repeat a panel
-  heading.
-- A picker supplies a title and, where needed, one concise purpose line. Its
-  driver remains responsible for fetching, mutation, cancellation, and
-  confirmation.
+  heading; it still uses the shared focus, count, terminal-safety, and action
+  footer vocabulary.
+- Model, resume-session, and extension pickers supply a task title and one
+  concise purpose line. Their drivers remain responsible for fetching,
+  mutation, cancellation, and confirmation.
+- A read-only report owns the same title, purpose, lifecycle, and action
+  record, but its body is semantic display data rather than selectable rows.
+  It cannot create a dashboard, alter the transcript, or grant a capability.
 - The existing `PanelAction`, picker driver, and keymap remain authoritative.
   Presentation neither makes an item selectable nor grants a capability.
 - Approval panels remain enforcement surfaces. They retain the separate
@@ -28,6 +33,19 @@ view, diagnostic console, or authority boundary.
   ordinary contract must not weaken them.
 - Existing surfaces migrate only when their owner needs this vocabulary. This
   contract is deliberately not a mandate to rewrite every panel in one change.
+
+### Read-only reports
+
+`/help`, `/status`, `/context`, `/cost`, and `/cache` use an ordinary report.
+Their body starts at the first semantic row so the task title and accounting or
+help context remain visible. Wrapped rows reflow through `PresentationLayout`
+on resize; reports keep only their semantic body and never enter transcript
+copy or native scrollback.
+
+Up/Down, PageUp/PageDown, Home, and End scroll a report without dismissing it.
+Escape and Left close it. Its footer describes only those handled actions and
+shows the visible body-row range when geometry permits. Other legacy text
+overlays retain their one-shot dismissal owner until separately migrated.
 
 ## Surface record and hierarchy
 
@@ -40,10 +58,10 @@ constrained geometry must retain an actionable row.
 | --- | --- |
 | Title | A short imperative or noun phrase identifying the task, never a provider slogan. |
 | Purpose | One subdued sentence explaining the result of a selection or the current operation. |
-| Content | Selectable rows and non-selectable headings in a deterministic order. A heading is metadata, never a keyboard stop. |
+| Content | Selectable rows and non-selectable headings in a deterministic order, or a terminal-safe read-only report body. A heading is metadata, never a keyboard stop. |
 | Status | An explicit textual lifecycle state, optionally with one bounded useful detail. |
 | Search | A visible filter/query only when typing changes the candidate set. Approval choices never get one. |
-| Count | The filtered selection position and total, or an explicit empty state. It describes candidates, not invisible headings. |
+| Count | The filtered selection position and total, an explicit empty state, or the visible report-row range. It describes semantic content, not invisible headings. |
 | Focus | One visual focus marker on the keyboard-active row or control. It follows the active shell accent, not a candidate's provider. |
 | Selection | The semantic item identity/index returned to the driver. Filtering, resize, and live replacement preserve or revalidate it by the surface's existing rules. |
 | Metadata | Subdued, terminal-safe facts that help compare rows. It moves below the primary label at regular widths and may share a row only when width permits. |
@@ -116,17 +134,18 @@ content.
   returns the original semantic index or stable ID already owned by the driver.
 - Count uses candidate rows only. Provider/group headings and status rows never
   become selectable or inflate the count.
-- Focus follows keyboard ownership. Up/Down, PageUp/PageDown, Home/End, Enter,
-  Escape, Left, and Ctrl+D retain the behavior assigned by the current picker
-  or document driver; a footer may describe those keys but cannot redefine
-  them.
+- Focus follows keyboard ownership. Pickers and document drivers retain their
+  assigned Up/Down, PageUp/PageDown, Home/End, Enter, Escape, Left, and Ctrl+D
+  behavior. Reports consume Up/Down, PageUp/PageDown, Home, and End for body
+  navigation, and Escape or Left closes them; a footer may describe those keys
+  but cannot redefine them.
 - A live list preserves focus by its stable identity where one exists and
   revalidates that identity immediately before a privileged follow-up.
-- All label, purpose, metadata, status-detail, and query strings originating
-  outside trusted presentation code are terminal-sanitized. Inline command
-  labels, hints, and descriptions become one terminal-safe display cell before
-  width measurement or trusted-theme styling; selection and completion retain
-  their raw command identity.
+- All label, purpose, metadata, status-detail, query, and unstyled report-body
+  strings originating outside trusted presentation code are terminal-sanitized.
+  Inline command labels, hints, and descriptions become one terminal-safe
+  display cell before width measurement or trusted-theme styling; selection and
+  completion retain their raw command identity.
 
 The common action-footer grammar is:
 
@@ -159,10 +178,10 @@ The information architecture is invariant across terminal profiles:
 
 The focused Rust fixture matrix lives in
 `crates/ygg-coding-agent/src/tui/view/ordinary_surface_contract_tests.rs`. It
-uses fixed labels, metadata, filter state, selection, and command query; it
-asserts semantic rows and width bounds rather than terminal-byte sequences.
-That leaves PTY/frame-byte regression coverage to its own future issue while
-making those tests able to reuse the same stable surface facts.
+uses fixed labels, metadata, filter state, selection, command query, and report
+body; it asserts semantic rows and width bounds rather than terminal-byte
+sequences. That leaves PTY/frame-byte regression coverage to its own future
+issue while making those tests able to reuse the same stable surface facts.
 
 | Fixture | Size | Capability profile | Required observations |
 | --- | --- | --- | --- |
@@ -175,9 +194,11 @@ making those tests able to reuse the same stable surface facts.
 | `no-color-80x24` | `80×24` | Unicode, no colour | No ANSI styling; explicit words retain status and action meaning. |
 | `reduced-motion-80x24` | `80×24` | Unicode, truecolor, animation disabled | Static projection matches the ordinary semantic frame. |
 
-The fixtures also exercise loading, success, empty, recoverable-failure, and
-cancellation semantics; title/purpose hierarchy; hostile prompt, skill, and
-extension command metadata in rich and no-colour projections; and the
-intentional blank metadata rhythm. They do not decide stale-startup-row
-replacement, terminal replay, cursor byte streams, or PTY behavior. Those are
-separate concerns owned by the renderer and its dedicated regressions.
+The fixtures also exercise report title/purpose/body/action hierarchy,
+first-row default, navigation, typed lifecycle status, and legacy-overlay
+ownership; loading, success, empty, recoverable-failure, and cancellation
+semantics; hostile prompt, skill, and extension command metadata in rich and
+no-colour projections; and the intentional blank metadata rhythm. They do not
+decide stale-startup-row replacement, terminal replay, cursor byte streams, or
+PTY behavior. Those are separate concerns owned by the renderer and its
+dedicated regressions.
