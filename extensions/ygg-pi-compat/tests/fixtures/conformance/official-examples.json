@@ -1,0 +1,1014 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "fixtures": [
+    {
+      "id": "example-load:auto-commit-on-exit-ts",
+      "kind": "real_package_load",
+      "upstream": "auto-commit-on-exit.ts",
+      "entrypoint": "examples/extensions/auto-commit-on-exit.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:auto-commit-on-exit-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "auto-commit-on-exit.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:bash-spawn-hook-ts",
+      "kind": "real_package_load",
+      "upstream": "bash-spawn-hook.ts",
+      "entrypoint": "examples/extensions/bash-spawn-hook.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:bash-spawn-hook-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "bash-spawn-hook.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:bookmark-ts",
+      "kind": "real_package_load",
+      "upstream": "bookmark.ts",
+      "entrypoint": "examples/extensions/bookmark.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:bookmark-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "bookmark.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:border-status-editor-ts",
+      "kind": "real_package_load",
+      "upstream": "border-status-editor.ts",
+      "entrypoint": "examples/extensions/border-status-editor.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:border-status-editor-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "border-status-editor.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:built-in-tool-renderer-ts",
+      "kind": "real_package_load",
+      "upstream": "built-in-tool-renderer.ts",
+      "entrypoint": "examples/extensions/built-in-tool-renderer.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:built-in-tool-renderer-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "built-in-tool-renderer.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:claude-rules-ts",
+      "kind": "real_package_load",
+      "upstream": "claude-rules.ts",
+      "entrypoint": "examples/extensions/claude-rules.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:claude-rules-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "claude-rules.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:commands-ts",
+      "kind": "real_package_load",
+      "upstream": "commands.ts",
+      "entrypoint": "examples/extensions/commands.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:commands-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "commands.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:confirm-destructive-ts",
+      "kind": "real_package_load",
+      "upstream": "confirm-destructive.ts",
+      "entrypoint": "examples/extensions/confirm-destructive.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:confirm-destructive-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "confirm-destructive.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:custom-compaction-ts",
+      "kind": "real_package_load",
+      "upstream": "custom-compaction.ts",
+      "entrypoint": "examples/extensions/custom-compaction.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:custom-compaction-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "custom-compaction.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:custom-footer-ts",
+      "kind": "real_package_load",
+      "upstream": "custom-footer.ts",
+      "entrypoint": "examples/extensions/custom-footer.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:custom-footer-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "custom-footer.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:custom-header-ts",
+      "kind": "real_package_load",
+      "upstream": "custom-header.ts",
+      "entrypoint": "examples/extensions/custom-header.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:custom-header-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "custom-header.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:custom-provider-anthropic",
+      "kind": "real_package_load",
+      "upstream": "custom-provider-anthropic",
+      "entrypoint": "examples/extensions/custom-provider-anthropic/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:custom-provider-anthropic",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "custom-provider-anthropic",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:custom-provider-gitlab-duo",
+      "kind": "real_package_load",
+      "upstream": "custom-provider-gitlab-duo",
+      "entrypoint": "examples/extensions/custom-provider-gitlab-duo/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:custom-provider-gitlab-duo",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "custom-provider-gitlab-duo",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:dirty-repo-guard-ts",
+      "kind": "real_package_load",
+      "upstream": "dirty-repo-guard.ts",
+      "entrypoint": "examples/extensions/dirty-repo-guard.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:dirty-repo-guard-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "dirty-repo-guard.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:doom-overlay",
+      "kind": "real_package_load",
+      "upstream": "doom-overlay",
+      "entrypoint": "examples/extensions/doom-overlay/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:doom-overlay",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "doom-overlay",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:dynamic-resources",
+      "kind": "real_package_load",
+      "upstream": "dynamic-resources",
+      "entrypoint": "examples/extensions/dynamic-resources/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:dynamic-resources",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "dynamic-resources",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:dynamic-tools-ts",
+      "kind": "real_package_load",
+      "upstream": "dynamic-tools.ts",
+      "entrypoint": "examples/extensions/dynamic-tools.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:dynamic-tools-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "dynamic-tools.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:entry-renderer-ts",
+      "kind": "real_package_load",
+      "upstream": "entry-renderer.ts",
+      "entrypoint": "examples/extensions/entry-renderer.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:entry-renderer-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "entry-renderer.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:event-bus-ts",
+      "kind": "real_package_load",
+      "upstream": "event-bus.ts",
+      "entrypoint": "examples/extensions/event-bus.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:event-bus-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "event-bus.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:file-trigger-ts",
+      "kind": "real_package_load",
+      "upstream": "file-trigger.ts",
+      "entrypoint": "examples/extensions/file-trigger.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:file-trigger-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "file-trigger.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:git-checkpoint-ts",
+      "kind": "real_package_load",
+      "upstream": "git-checkpoint.ts",
+      "entrypoint": "examples/extensions/git-checkpoint.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:git-checkpoint-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "git-checkpoint.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:git-merge-and-resolve-ts",
+      "kind": "real_package_load",
+      "upstream": "git-merge-and-resolve.ts",
+      "entrypoint": "examples/extensions/git-merge-and-resolve.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:git-merge-and-resolve-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "git-merge-and-resolve.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:github-issue-autocomplete-ts",
+      "kind": "real_package_load",
+      "upstream": "github-issue-autocomplete.ts",
+      "entrypoint": "examples/extensions/github-issue-autocomplete.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:github-issue-autocomplete-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "github-issue-autocomplete.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:gondolin",
+      "kind": "real_package_load",
+      "upstream": "gondolin",
+      "entrypoint": "examples/extensions/gondolin/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:gondolin",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "gondolin",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:handoff-ts",
+      "kind": "real_package_load",
+      "upstream": "handoff.ts",
+      "entrypoint": "examples/extensions/handoff.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:handoff-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "handoff.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:hello-ts",
+      "kind": "real_package_load",
+      "upstream": "hello.ts",
+      "entrypoint": "examples/extensions/hello.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:hello-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "hello.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:hidden-thinking-label-ts",
+      "kind": "real_package_load",
+      "upstream": "hidden-thinking-label.ts",
+      "entrypoint": "examples/extensions/hidden-thinking-label.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:hidden-thinking-label-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "hidden-thinking-label.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:inline-bash-ts",
+      "kind": "real_package_load",
+      "upstream": "inline-bash.ts",
+      "entrypoint": "examples/extensions/inline-bash.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:inline-bash-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "inline-bash.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:input-transform-streaming-ts",
+      "kind": "real_package_load",
+      "upstream": "input-transform-streaming.ts",
+      "entrypoint": "examples/extensions/input-transform-streaming.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:input-transform-streaming-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "input-transform-streaming.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:input-transform-ts",
+      "kind": "real_package_load",
+      "upstream": "input-transform.ts",
+      "entrypoint": "examples/extensions/input-transform.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:input-transform-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "input-transform.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:interactive-shell-ts",
+      "kind": "real_package_load",
+      "upstream": "interactive-shell.ts",
+      "entrypoint": "examples/extensions/interactive-shell.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:interactive-shell-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "interactive-shell.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:kimi-deferred-tools-ts",
+      "kind": "real_package_load",
+      "upstream": "kimi-deferred-tools.ts",
+      "entrypoint": "examples/extensions/kimi-deferred-tools.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:kimi-deferred-tools-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "kimi-deferred-tools.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:mac-system-theme-ts",
+      "kind": "real_package_load",
+      "upstream": "mac-system-theme.ts",
+      "entrypoint": "examples/extensions/mac-system-theme.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:mac-system-theme-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "mac-system-theme.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:message-renderer-ts",
+      "kind": "real_package_load",
+      "upstream": "message-renderer.ts",
+      "entrypoint": "examples/extensions/message-renderer.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:message-renderer-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "message-renderer.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:minimal-mode-ts",
+      "kind": "real_package_load",
+      "upstream": "minimal-mode.ts",
+      "entrypoint": "examples/extensions/minimal-mode.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:minimal-mode-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "minimal-mode.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:modal-editor-ts",
+      "kind": "real_package_load",
+      "upstream": "modal-editor.ts",
+      "entrypoint": "examples/extensions/modal-editor.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:modal-editor-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "modal-editor.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:model-status-ts",
+      "kind": "real_package_load",
+      "upstream": "model-status.ts",
+      "entrypoint": "examples/extensions/model-status.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:model-status-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "model-status.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:notify-ts",
+      "kind": "real_package_load",
+      "upstream": "notify.ts",
+      "entrypoint": "examples/extensions/notify.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:notify-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "notify.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:overlay-qa-tests-ts",
+      "kind": "real_package_load",
+      "upstream": "overlay-qa-tests.ts",
+      "entrypoint": "examples/extensions/overlay-qa-tests.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:overlay-qa-tests-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "overlay-qa-tests.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:overlay-test-ts",
+      "kind": "real_package_load",
+      "upstream": "overlay-test.ts",
+      "entrypoint": "examples/extensions/overlay-test.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:overlay-test-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "overlay-test.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:permission-gate-ts",
+      "kind": "real_package_load",
+      "upstream": "permission-gate.ts",
+      "entrypoint": "examples/extensions/permission-gate.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:permission-gate-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "permission-gate.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:pirate-ts",
+      "kind": "real_package_load",
+      "upstream": "pirate.ts",
+      "entrypoint": "examples/extensions/pirate.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:pirate-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "pirate.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:plan-mode",
+      "kind": "real_package_load",
+      "upstream": "plan-mode",
+      "entrypoint": "examples/extensions/plan-mode/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-load:preset-ts",
+      "kind": "real_package_load",
+      "upstream": "preset.ts",
+      "entrypoint": "examples/extensions/preset.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:preset-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "preset.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:project-trust-ts",
+      "kind": "real_package_load",
+      "upstream": "project-trust.ts",
+      "entrypoint": "examples/extensions/project-trust.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:project-trust-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "project-trust.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:prompt-customizer-ts",
+      "kind": "real_package_load",
+      "upstream": "prompt-customizer.ts",
+      "entrypoint": "examples/extensions/prompt-customizer.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:prompt-customizer-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "prompt-customizer.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:protected-paths-ts",
+      "kind": "real_package_load",
+      "upstream": "protected-paths.ts",
+      "entrypoint": "examples/extensions/protected-paths.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:protected-paths-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "protected-paths.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:provider-payload-ts",
+      "kind": "real_package_load",
+      "upstream": "provider-payload.ts",
+      "entrypoint": "examples/extensions/provider-payload.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:provider-payload-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "provider-payload.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:qna-ts",
+      "kind": "real_package_load",
+      "upstream": "qna.ts",
+      "entrypoint": "examples/extensions/qna.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:qna-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "qna.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:question-ts",
+      "kind": "real_package_load",
+      "upstream": "question.ts",
+      "entrypoint": "examples/extensions/question.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:question-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "question.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:questionnaire-ts",
+      "kind": "real_package_load",
+      "upstream": "questionnaire.ts",
+      "entrypoint": "examples/extensions/questionnaire.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:questionnaire-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "questionnaire.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:rainbow-editor-ts",
+      "kind": "real_package_load",
+      "upstream": "rainbow-editor.ts",
+      "entrypoint": "examples/extensions/rainbow-editor.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:rainbow-editor-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "rainbow-editor.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:reload-runtime-ts",
+      "kind": "real_package_load",
+      "upstream": "reload-runtime.ts",
+      "entrypoint": "examples/extensions/reload-runtime.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:reload-runtime-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "reload-runtime.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:rpc-demo-ts",
+      "kind": "real_package_load",
+      "upstream": "rpc-demo.ts",
+      "entrypoint": "examples/extensions/rpc-demo.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:rpc-demo-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "rpc-demo.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:sandbox",
+      "kind": "real_package_load",
+      "upstream": "sandbox",
+      "entrypoint": "examples/extensions/sandbox/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:sandbox",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "sandbox",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:send-user-message-ts",
+      "kind": "real_package_load",
+      "upstream": "send-user-message.ts",
+      "entrypoint": "examples/extensions/send-user-message.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:send-user-message-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "send-user-message.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:session-name-ts",
+      "kind": "real_package_load",
+      "upstream": "session-name.ts",
+      "entrypoint": "examples/extensions/session-name.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:session-name-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "session-name.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:shutdown-command-ts",
+      "kind": "real_package_load",
+      "upstream": "shutdown-command.ts",
+      "entrypoint": "examples/extensions/shutdown-command.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:shutdown-command-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "shutdown-command.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:snake-ts",
+      "kind": "real_package_load",
+      "upstream": "snake.ts",
+      "entrypoint": "examples/extensions/snake.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:snake-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "snake.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:space-invaders-ts",
+      "kind": "real_package_load",
+      "upstream": "space-invaders.ts",
+      "entrypoint": "examples/extensions/space-invaders.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:space-invaders-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "space-invaders.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:ssh-ts",
+      "kind": "real_package_load",
+      "upstream": "ssh.ts",
+      "entrypoint": "examples/extensions/ssh.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:ssh-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "ssh.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:status-line-ts",
+      "kind": "real_package_load",
+      "upstream": "status-line.ts",
+      "entrypoint": "examples/extensions/status-line.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:status-line-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "status-line.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:structured-output-ts",
+      "kind": "real_package_load",
+      "upstream": "structured-output.ts",
+      "entrypoint": "examples/extensions/structured-output.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:structured-output-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "structured-output.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:subagent",
+      "kind": "real_package_load",
+      "upstream": "subagent",
+      "entrypoint": "examples/extensions/subagent/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:subagent",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "subagent",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:summarize-ts",
+      "kind": "real_package_load",
+      "upstream": "summarize.ts",
+      "entrypoint": "examples/extensions/summarize.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:summarize-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "summarize.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:system-prompt-header-ts",
+      "kind": "real_package_load",
+      "upstream": "system-prompt-header.ts",
+      "entrypoint": "examples/extensions/system-prompt-header.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:system-prompt-header-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "system-prompt-header.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:tic-tac-toe-ts",
+      "kind": "real_package_load",
+      "upstream": "tic-tac-toe.ts",
+      "entrypoint": "examples/extensions/tic-tac-toe.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:tic-tac-toe-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "tic-tac-toe.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:timed-confirm-ts",
+      "kind": "real_package_load",
+      "upstream": "timed-confirm.ts",
+      "entrypoint": "examples/extensions/timed-confirm.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:timed-confirm-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "timed-confirm.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:titlebar-spinner-ts",
+      "kind": "real_package_load",
+      "upstream": "titlebar-spinner.ts",
+      "entrypoint": "examples/extensions/titlebar-spinner.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:titlebar-spinner-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "titlebar-spinner.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:todo-ts",
+      "kind": "real_package_load",
+      "upstream": "todo.ts",
+      "entrypoint": "examples/extensions/todo.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:todo-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "todo.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:tool-override-ts",
+      "kind": "real_package_load",
+      "upstream": "tool-override.ts",
+      "entrypoint": "examples/extensions/tool-override.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:tool-override-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "tool-override.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:tools-ts",
+      "kind": "real_package_load",
+      "upstream": "tools.ts",
+      "entrypoint": "examples/extensions/tools.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:tools-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "tools.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:trigger-compact-ts",
+      "kind": "real_package_load",
+      "upstream": "trigger-compact.ts",
+      "entrypoint": "examples/extensions/trigger-compact.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:trigger-compact-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "trigger-compact.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:truncated-tool-ts",
+      "kind": "real_package_load",
+      "upstream": "truncated-tool.ts",
+      "entrypoint": "examples/extensions/truncated-tool.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:truncated-tool-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "truncated-tool.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:widget-placement-ts",
+      "kind": "real_package_load",
+      "upstream": "widget-placement.ts",
+      "entrypoint": "examples/extensions/widget-placement.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:widget-placement-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "widget-placement.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:with-deps",
+      "kind": "real_package_load",
+      "upstream": "with-deps",
+      "entrypoint": "examples/extensions/with-deps/index.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:with-deps",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "with-deps",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:working-indicator-ts",
+      "kind": "real_package_load",
+      "upstream": "working-indicator.ts",
+      "entrypoint": "examples/extensions/working-indicator.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:working-indicator-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "working-indicator.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    },
+    {
+      "id": "example-load:working-message-test-ts",
+      "kind": "real_package_load",
+      "upstream": "working-message-test.ts",
+      "entrypoint": "examples/extensions/working-message-test.ts",
+      "assertion": "The pinned, integrity-verified source initializes through Pi public loader without source rewriting."
+    },
+    {
+      "id": "example-registration:working-message-test-ts",
+      "kind": "registration_or_explicit_diagnostic",
+      "upstream": "working-message-test.ts",
+      "assertion": "The conformance runner records a registered supported surface or explicit startup diagnostic; it never counts a silent call as compatible."
+    }
+  ]
+}

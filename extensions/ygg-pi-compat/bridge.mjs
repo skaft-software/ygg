@@ -76,6 +76,26 @@ const LIFECYCLE_EVENTS = [
   "tool/started",
   "tool/settled",
 ];
+const BRIDGED_PI_EVENTS = new Set([
+  "session_start",
+  "session_shutdown",
+  "context",
+  "before_agent_start",
+  "agent_start",
+  "agent_end",
+  "agent_settled",
+  "turn_start",
+  "turn_end",
+  "tool_execution_start",
+  "tool_execution_update",
+  "tool_execution_end",
+  "tool_call",
+  "tool_result",
+]);
+
+function bridgedPiEvent(event) {
+  return typeof event === "string" && BRIDGED_PI_EVENTS.has(event);
+}
 
 const args = parseArgs(process.argv.slice(2));
 const protocolWrite = process.stdout.write.bind(process.stdout);
@@ -1182,15 +1202,16 @@ async function collectBeforePromptContext(prompt) {
     );
     if (contribution) context.push(contribution);
   }
-  if (result?.messages) {
-    for (const message of result.messages) {
-      const contribution = contextContribution(
-        "pi-before-agent-start",
-        messageContent(message),
-        "prompt_suffix",
-      );
-      if (contribution) context.push(contribution);
-    }
+  const messages = [];
+  if (result?.message) messages.push(result.message);
+  if (Array.isArray(result?.messages)) messages.push(...result.messages);
+  for (const message of messages) {
+    const contribution = contextContribution(
+      "pi-before-agent-start",
+      messageContent(message),
+      "prompt_suffix",
+    );
+    if (contribution) context.push(contribution);
   }
   return context;
 }
@@ -1290,9 +1311,15 @@ async function loadBridge(params) {
   bridge.unsupported = [];
   for (const [index, extension] of loaded.extensions.entries()) {
     const label = sourceLabel(index);
-    if (extension.shortcuts.size) bridge.unsupported.push(`${label}: shortcuts`);
-    if (extension.flags.size) bridge.unsupported.push(`${label}: flags`);
-    if (extension.messageRenderers.size) bridge.unsupported.push(`${label}: message renderers`);
+    const registeredEvents = extension.handlers ?? extension.eventHandlers;
+    if (registeredEvents instanceof Map) {
+      for (const event of registeredEvents.keys()) {
+        if (!bridgedPiEvent(event)) bridge.unsupported.push(`${label}: event ${event}`);
+      }
+    }
+    if (extension.shortcuts?.size) bridge.unsupported.push(`${label}: shortcuts`);
+    if (extension.flags?.size) bridge.unsupported.push(`${label}: flags`);
+    if (extension.messageRenderers?.size) bridge.unsupported.push(`${label}: message renderers`);
     if (extension.entryRenderers?.size) bridge.unsupported.push(`${label}: entry renderers`);
     if (extension.markdownTransformer) bridge.unsupported.push(`${label}: markdown transformer`);
   }
@@ -1373,6 +1400,10 @@ function dequeueByName(map, name) {
 
 async function callPiTool(message) {
   const name = message.params?.name;
+  // A host may dispatch the first call for a newly published dynamic tool as
+  // soon as it answers tools/register. Wait for that publication chain before
+  // checking the catalog revision so the valid call cannot race its own reply.
+  await bridge.toolRefreshChain;
   const revision = message.params?.catalog_revision ?? bridge.catalogRevision;
   const tools = bridge.toolSnapshots.get(revision);
   if (!tools) throw new Error(`unknown or retired Pi tool catalog revision ${revision}`);

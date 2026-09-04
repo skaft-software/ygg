@@ -1,0 +1,2736 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "release_status": "dogfood_conformance",
+  "claim": "The bridge has executable safe-divergence coverage. It does not claim byte-for-byte Pi TUI or provider parity.",
+  "package_verification": {
+    "profile_integrity": "profiles/0.84.4.integrity.json",
+    "coding_agent_tarball_integrity": "sha512-jmOlrqUmvhh/siNWFRXjYLJzhKFIHNsAQaysRwzQPQFnPAaV/vhqHsLH/MBsIISA1Rjj7WTUFR3nJrpXoLx39w==",
+    "tui_tarball_integrity": "sha512-nPUnwDkLtupPXnZQYrCwPFcuTydCDqTY6ZbFqhsL4S4kVq0AT418kPa/6uXwtaCD+MjBNBltb7ScTYX65yeE1w==",
+    "full_gate_requires": [
+      "coding_agent_tarball",
+      "tui_tarball",
+      "exact_package_manifest",
+      "exact_example_inventory"
+    ]
+  },
+  "safe_divergence_decisions": [
+    {
+      "id": "pi-0.84.4-dogfood-explicit-safe-divergence",
+      "scope": "Current dogfood branch only; every divergence must be user-visible or return a compatibility error.",
+      "release_approval_required": true
+    }
+  ],
+  "public_surfaces": [
+    {
+      "id": "events:project_trust",
+      "area": "events",
+      "surface": "project_trust",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:project_trust",
+      "behavior": "Event registration is diagnosed explicitly because project_trust is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because project_trust is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:resources_discover",
+      "area": "events",
+      "surface": "resources_discover",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:resources_discover",
+      "behavior": "Event registration is diagnosed explicitly because resources_discover is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because resources_discover is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_start",
+      "area": "events",
+      "surface": "session_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_start",
+      "behavior": "Emitted from session/started with a host-derived reason.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted from session/started with a host-derived reason."
+      }
+    },
+    {
+      "id": "events:session_info_changed",
+      "area": "events",
+      "surface": "session_info_changed",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_info_changed",
+      "behavior": "Event registration is diagnosed explicitly because session_info_changed is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_info_changed is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_before_switch",
+      "area": "events",
+      "surface": "session_before_switch",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_before_switch",
+      "behavior": "Event registration is diagnosed explicitly because session_before_switch is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_before_switch is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_before_fork",
+      "area": "events",
+      "surface": "session_before_fork",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_before_fork",
+      "behavior": "Event registration is diagnosed explicitly because session_before_fork is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_before_fork is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_before_compact",
+      "area": "events",
+      "surface": "session_before_compact",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_before_compact",
+      "behavior": "Event registration is diagnosed explicitly because session_before_compact is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_before_compact is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_compact",
+      "area": "events",
+      "surface": "session_compact",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_compact",
+      "behavior": "Event registration is diagnosed explicitly because session_compact is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_compact is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_compact_failed",
+      "area": "events",
+      "surface": "session_compact_failed",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_compact_failed",
+      "behavior": "Event registration is diagnosed explicitly because session_compact_failed is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_compact_failed is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_shutdown",
+      "area": "events",
+      "surface": "session_shutdown",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_shutdown",
+      "behavior": "Emitted once from settlement or shutdown with a synthetic reason.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted once from settlement or shutdown with a synthetic reason."
+      }
+    },
+    {
+      "id": "events:session_before_tree",
+      "area": "events",
+      "surface": "session_before_tree",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_before_tree",
+      "behavior": "Event registration is diagnosed explicitly because session_before_tree is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_before_tree is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:session_tree",
+      "area": "events",
+      "surface": "session_tree",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:session_tree",
+      "behavior": "Event registration is diagnosed explicitly because session_tree is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because session_tree is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:context",
+      "area": "events",
+      "surface": "context",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:context",
+      "behavior": "Bounded additions become Ygg context; canonical history replacement remains host-owned.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Bounded additions become Ygg context; canonical history replacement remains host-owned."
+      }
+    },
+    {
+      "id": "events:before_provider_request",
+      "area": "events",
+      "surface": "before_provider_request",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:before_provider_request",
+      "behavior": "Event registration is diagnosed explicitly because before_provider_request is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because before_provider_request is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:before_provider_headers",
+      "area": "events",
+      "surface": "before_provider_headers",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:before_provider_headers",
+      "behavior": "Event registration is diagnosed explicitly because before_provider_headers is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because before_provider_headers is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:after_provider_response",
+      "area": "events",
+      "surface": "after_provider_response",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:after_provider_response",
+      "behavior": "Event registration is diagnosed explicitly because after_provider_response is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because after_provider_response is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:before_agent_start",
+      "area": "events",
+      "surface": "before_agent_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:before_agent_start",
+      "behavior": "Bounded system/message additions become host context suffixes.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Bounded system/message additions become host context suffixes."
+      }
+    },
+    {
+      "id": "events:agent_start",
+      "area": "events",
+      "surface": "agent_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:agent_start",
+      "behavior": "Emitted from turn/started with the bridge lifecycle payload.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted from turn/started with the bridge lifecycle payload."
+      }
+    },
+    {
+      "id": "events:agent_end",
+      "area": "events",
+      "surface": "agent_end",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:agent_end",
+      "behavior": "Emitted after response settlement with reduced messages.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted after response settlement with reduced messages."
+      }
+    },
+    {
+      "id": "events:agent_settled",
+      "area": "events",
+      "surface": "agent_settled",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:agent_settled",
+      "behavior": "Emitted after the synthetic agent_end event.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted after the synthetic agent_end event."
+      }
+    },
+    {
+      "id": "events:ui_prompt_start",
+      "area": "events",
+      "surface": "ui_prompt_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:ui_prompt_start",
+      "behavior": "Event registration is diagnosed explicitly because ui_prompt_start is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because ui_prompt_start is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:ui_prompt_end",
+      "area": "events",
+      "surface": "ui_prompt_end",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:ui_prompt_end",
+      "behavior": "Event registration is diagnosed explicitly because ui_prompt_end is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because ui_prompt_end is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:turn_start",
+      "area": "events",
+      "surface": "turn_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:turn_start",
+      "behavior": "Emitted with a synthetic turn index and timestamp.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted with a synthetic turn index and timestamp."
+      }
+    },
+    {
+      "id": "events:turn_end",
+      "area": "events",
+      "surface": "turn_end",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:turn_end",
+      "behavior": "Emitted with reduced tool-result and message history.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted with reduced tool-result and message history."
+      }
+    },
+    {
+      "id": "events:message_start",
+      "area": "events",
+      "surface": "message_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:message_start",
+      "behavior": "Event registration is diagnosed explicitly because message_start is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because message_start is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:message_update",
+      "area": "events",
+      "surface": "message_update",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:message_update",
+      "behavior": "Event registration is diagnosed explicitly because message_update is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because message_update is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:message_end",
+      "area": "events",
+      "surface": "message_end",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:message_end",
+      "behavior": "Event registration is diagnosed explicitly because message_end is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because message_end is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:tool_execution_start",
+      "area": "events",
+      "surface": "tool_execution_start",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:tool_execution_start",
+      "behavior": "Emitted from host tool/started lifecycle.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted from host tool/started lifecycle."
+      }
+    },
+    {
+      "id": "events:tool_execution_update",
+      "area": "events",
+      "surface": "tool_execution_update",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:tool_execution_update",
+      "behavior": "Pi partial results route through bounded Ygg progress.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi partial results route through bounded Ygg progress."
+      }
+    },
+    {
+      "id": "events:tool_execution_end",
+      "area": "events",
+      "surface": "tool_execution_end",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:tool_execution_end",
+      "behavior": "Emitted from host tool/settled lifecycle with reduced result details.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Emitted from host tool/settled lifecycle with reduced result details."
+      }
+    },
+    {
+      "id": "events:model_select",
+      "area": "events",
+      "surface": "model_select",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:model_select",
+      "behavior": "Event registration is diagnosed explicitly because model_select is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because model_select is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:thinking_level_select",
+      "area": "events",
+      "surface": "thinking_level_select",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:thinking_level_select",
+      "behavior": "Event registration is diagnosed explicitly because thinking_level_select is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because thinking_level_select is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:user_bash",
+      "area": "events",
+      "surface": "user_bash",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:user_bash",
+      "behavior": "Event registration is diagnosed explicitly because user_bash is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because user_bash is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:input",
+      "area": "events",
+      "surface": "input",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:input",
+      "behavior": "Event registration is diagnosed explicitly because input is not emitted by the bounded bridge.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event registration is diagnosed explicitly because input is not emitted by the bounded bridge."
+      }
+    },
+    {
+      "id": "events:tool_call",
+      "area": "events",
+      "surface": "tool_call",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:tool_call",
+      "behavior": "Blocks and Pi-tool argument preparation are preserved; unrepresentable mutation fails.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Blocks and Pi-tool argument preparation are preserved; unrepresentable mutation fails."
+      }
+    },
+    {
+      "id": "events:tool_result",
+      "area": "events",
+      "surface": "tool_result",
+      "status": "safe_divergence",
+      "behavioral_fixture": "events:tool_result",
+      "behavior": "Pi-tool content/details/error/usage transforms are preserved; native mutation fails.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi-tool content/details/error/usage transforms are preserved; native mutation fails."
+      }
+    },
+    {
+      "id": "extension_api:on",
+      "area": "extension_api",
+      "surface": "on",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:on",
+      "behavior": "Supported events are registered; unavailable events emit a startup diagnostic.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Supported events are registered; unavailable events emit a startup diagnostic."
+      }
+    },
+    {
+      "id": "extension_api:registerTool",
+      "area": "extension_api",
+      "surface": "registerTool",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerTool",
+      "behavior": "Initial tool registration and execution use the public Pi runner.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Initial tool registration and execution use the public Pi runner."
+      }
+    },
+    {
+      "id": "extension_api:registerCommand",
+      "area": "extension_api",
+      "surface": "registerCommand",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerCommand",
+      "behavior": "Initial commands become native Ygg commands when runtime_commands is negotiated.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Initial commands become native Ygg commands when runtime_commands is negotiated."
+      }
+    },
+    {
+      "id": "extension_api:registerShortcut",
+      "area": "extension_api",
+      "surface": "registerShortcut",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerShortcut",
+      "behavior": "Shortcut registration is diagnosed at startup; host key dispatch remains deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Shortcut registration is diagnosed at startup; host key dispatch remains deferred."
+      }
+    },
+    {
+      "id": "extension_api:registerFlag",
+      "area": "extension_api",
+      "surface": "registerFlag",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerFlag",
+      "behavior": "Pi defaults remain local; host flag projection is deferred and registration is diagnosed at startup.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi defaults remain local; host flag projection is deferred and registration is diagnosed at startup."
+      }
+    },
+    {
+      "id": "extension_api:getFlag",
+      "area": "extension_api",
+      "surface": "getFlag",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getFlag",
+      "behavior": "Returns Pi runtime/default values; host invocation flags are not projected.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Returns Pi runtime/default values; host invocation flags are not projected."
+      }
+    },
+    {
+      "id": "extension_api:registerMessageRenderer",
+      "area": "extension_api",
+      "surface": "registerMessageRenderer",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerMessageRenderer",
+      "behavior": "Remote component rendering is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote component rendering is rejected explicitly."
+      }
+    },
+    {
+      "id": "extension_api:registerMarkdownTransformer",
+      "area": "extension_api",
+      "surface": "registerMarkdownTransformer",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerMarkdownTransformer",
+      "behavior": "Transcript mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Transcript mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "extension_api:registerEntryRenderer",
+      "area": "extension_api",
+      "surface": "registerEntryRenderer",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerEntryRenderer",
+      "behavior": "Remote component rendering is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote component rendering is rejected explicitly."
+      }
+    },
+    {
+      "id": "extension_api:sendMessage",
+      "area": "extension_api",
+      "surface": "sendMessage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:sendMessage",
+      "behavior": "Root-session delivery is rejected explicitly; host message projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Root-session delivery is rejected explicitly; host message projection is deferred."
+      }
+    },
+    {
+      "id": "extension_api:sendUserMessage",
+      "area": "extension_api",
+      "surface": "sendUserMessage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:sendUserMessage",
+      "behavior": "Root-session delivery is rejected explicitly; host message projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Root-session delivery is rejected explicitly; host message projection is deferred."
+      }
+    },
+    {
+      "id": "extension_api:appendEntry",
+      "area": "extension_api",
+      "surface": "appendEntry",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:appendEntry",
+      "behavior": "Durable custom entries are rejected explicitly; session-state projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Durable custom entries are rejected explicitly; session-state projection is deferred."
+      }
+    },
+    {
+      "id": "extension_api:setSessionName",
+      "area": "extension_api",
+      "surface": "setSessionName",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:setSessionName",
+      "behavior": "Session-name mutation is rejected explicitly; session-state projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Session-name mutation is rejected explicitly; session-state projection is deferred."
+      }
+    },
+    {
+      "id": "extension_api:getSessionName",
+      "area": "extension_api",
+      "surface": "getSessionName",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getSessionName",
+      "behavior": "Returns the latest host session-name snapshot.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Returns the latest host session-name snapshot."
+      }
+    },
+    {
+      "id": "extension_api:setLabel",
+      "area": "extension_api",
+      "surface": "setLabel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:setLabel",
+      "behavior": "Entry-label mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Entry-label mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "extension_api:exec",
+      "area": "extension_api",
+      "surface": "exec",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:exec",
+      "behavior": "Runs only inside the explicitly trusted Pi extension process, never through Ygg bash.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Runs only inside the explicitly trusted Pi extension process, never through Ygg bash."
+      }
+    },
+    {
+      "id": "extension_api:getActiveTools",
+      "area": "extension_api",
+      "surface": "getActiveTools",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getActiveTools",
+      "behavior": "Reports bridge-local Pi tools rather than the full Ygg policy.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Reports bridge-local Pi tools rather than the full Ygg policy."
+      }
+    },
+    {
+      "id": "extension_api:getAllTools",
+      "area": "extension_api",
+      "surface": "getAllTools",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getAllTools",
+      "behavior": "Reports bridge-local Pi tool information.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Reports bridge-local Pi tool information."
+      }
+    },
+    {
+      "id": "extension_api:setActiveTools",
+      "area": "extension_api",
+      "surface": "setActiveTools",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:setActiveTools",
+      "behavior": "Active-tool policy mutation is rejected explicitly; host policy projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Active-tool policy mutation is rejected explicitly; host policy projection is deferred."
+      }
+    },
+    {
+      "id": "extension_api:getCommands",
+      "area": "extension_api",
+      "surface": "getCommands",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getCommands",
+      "behavior": "Reports commands registered by the Pi runner.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Reports commands registered by the Pi runner."
+      }
+    },
+    {
+      "id": "extension_api:setModel",
+      "area": "extension_api",
+      "surface": "setModel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:setModel",
+      "behavior": "Model mutation remains host-owned and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Model mutation remains host-owned and errors explicitly."
+      }
+    },
+    {
+      "id": "extension_api:getThinkingLevel",
+      "area": "extension_api",
+      "surface": "getThinkingLevel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:getThinkingLevel",
+      "behavior": "Derives a read-only level from the host reasoning snapshot.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Derives a read-only level from the host reasoning snapshot."
+      }
+    },
+    {
+      "id": "extension_api:setThinkingLevel",
+      "area": "extension_api",
+      "surface": "setThinkingLevel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:setThinkingLevel",
+      "behavior": "Reasoning mutation remains host-owned and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Reasoning mutation remains host-owned and errors explicitly."
+      }
+    },
+    {
+      "id": "extension_api:registerProvider",
+      "area": "extension_api",
+      "surface": "registerProvider",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:registerProvider",
+      "behavior": "Provider and OAuth registration are rejected; no credential or network proxy is implicit.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Provider and OAuth registration are rejected; no credential or network proxy is implicit."
+      }
+    },
+    {
+      "id": "extension_api:unregisterProvider",
+      "area": "extension_api",
+      "surface": "unregisterProvider",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:unregisterProvider",
+      "behavior": "Provider mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Provider mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "extension_api:events.emit",
+      "area": "extension_api",
+      "surface": "events.emit",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:events.emit",
+      "behavior": "Event bus is shared only by sources in the same bridge process.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event bus is shared only by sources in the same bridge process."
+      }
+    },
+    {
+      "id": "extension_api:events.on",
+      "area": "extension_api",
+      "surface": "events.on",
+      "status": "safe_divergence",
+      "behavioral_fixture": "extension_api:events.on",
+      "behavior": "Event bus is shared only by sources in the same bridge process.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Event bus is shared only by sources in the same bridge process."
+      }
+    },
+    {
+      "id": "ui_context:select",
+      "area": "ui_context",
+      "surface": "select",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:select",
+      "behavior": "Uses bounded text input rather than a Pi selector component.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Uses bounded text input rather than a Pi selector component."
+      }
+    },
+    {
+      "id": "ui_context:confirm",
+      "area": "ui_context",
+      "surface": "confirm",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:confirm",
+      "behavior": "Uses Ygg confirmation requests.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Uses Ygg confirmation requests."
+      }
+    },
+    {
+      "id": "ui_context:input",
+      "area": "ui_context",
+      "surface": "input",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:input",
+      "behavior": "Uses Ygg bounded single-line input requests.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Uses Ygg bounded single-line input requests."
+      }
+    },
+    {
+      "id": "ui_context:notify",
+      "area": "ui_context",
+      "surface": "notify",
+      "status": "passing",
+      "behavioral_fixture": "ui_context:notify",
+      "behavior": "Emits a declared Ygg notification without writing protocol stdout."
+    },
+    {
+      "id": "ui_context:onTerminalInput",
+      "area": "ui_context",
+      "surface": "onTerminalInput",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:onTerminalInput",
+      "behavior": "Raw terminal ownership stays in Ygg and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Raw terminal ownership stays in Ygg and errors explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setStatus",
+      "area": "ui_context",
+      "surface": "setStatus",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setStatus",
+      "behavior": "Publishes one semantic Ygg status contribution.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Publishes one semantic Ygg status contribution."
+      }
+    },
+    {
+      "id": "ui_context:setWorkingMessage",
+      "area": "ui_context",
+      "surface": "setWorkingMessage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setWorkingMessage",
+      "behavior": "Working-label ownership stays in Ygg and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Working-label ownership stays in Ygg and errors explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setWorkingVisible",
+      "area": "ui_context",
+      "surface": "setWorkingVisible",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setWorkingVisible",
+      "behavior": "Working-loader visibility stays in Ygg and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Working-loader visibility stays in Ygg and errors explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setWorkingIndicator",
+      "area": "ui_context",
+      "surface": "setWorkingIndicator",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setWorkingIndicator",
+      "behavior": "Custom loading frames are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Custom loading frames are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setHiddenThinkingLabel",
+      "area": "ui_context",
+      "surface": "setHiddenThinkingLabel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setHiddenThinkingLabel",
+      "behavior": "Hidden-thinking label mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Hidden-thinking label mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setWidget",
+      "area": "ui_context",
+      "surface": "setWidget",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setWidget",
+      "behavior": "Widget transport is rejected explicitly; plain-text host projection is deferred.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Widget transport is rejected explicitly; plain-text host projection is deferred."
+      }
+    },
+    {
+      "id": "ui_context:setFooter",
+      "area": "ui_context",
+      "surface": "setFooter",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setFooter",
+      "behavior": "Remote footer components are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote footer components are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setHeader",
+      "area": "ui_context",
+      "surface": "setHeader",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setHeader",
+      "behavior": "Remote header components are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote header components are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setTitle",
+      "area": "ui_context",
+      "surface": "setTitle",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setTitle",
+      "behavior": "Terminal title ownership stays in Ygg and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Terminal title ownership stays in Ygg and errors explicitly."
+      }
+    },
+    {
+      "id": "ui_context:custom",
+      "area": "ui_context",
+      "surface": "custom",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:custom",
+      "behavior": "Focused remote components are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Focused remote components are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:pasteToEditor",
+      "area": "ui_context",
+      "surface": "pasteToEditor",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:pasteToEditor",
+      "behavior": "Composer mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Composer mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setEditorText",
+      "area": "ui_context",
+      "surface": "setEditorText",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setEditorText",
+      "behavior": "Composer mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Composer mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:getEditorText",
+      "area": "ui_context",
+      "surface": "getEditorText",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:getEditorText",
+      "behavior": "Composer state is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Composer state is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:editor",
+      "area": "ui_context",
+      "surface": "editor",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:editor",
+      "behavior": "Editor dialog transport is rejected explicitly; the host-owned editor handoff is not a Pi bridge surface.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Editor dialog transport is rejected explicitly; the host-owned editor handoff is not a Pi bridge surface."
+      }
+    },
+    {
+      "id": "ui_context:addAutocompleteProvider",
+      "area": "ui_context",
+      "surface": "addAutocompleteProvider",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:addAutocompleteProvider",
+      "behavior": "Autocomplete mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Autocomplete mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setEditorComponent",
+      "area": "ui_context",
+      "surface": "setEditorComponent",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setEditorComponent",
+      "behavior": "Remote editor components are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote editor components are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:getEditorComponent",
+      "area": "ui_context",
+      "surface": "getEditorComponent",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:getEditorComponent",
+      "behavior": "Remote editor components are rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Remote editor components are rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:theme",
+      "area": "ui_context",
+      "surface": "theme",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:theme",
+      "behavior": "Text/style helpers preserve text while stripping Pi styling.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Text/style helpers preserve text while stripping Pi styling."
+      }
+    },
+    {
+      "id": "ui_context:getAllThemes",
+      "area": "ui_context",
+      "surface": "getAllThemes",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:getAllThemes",
+      "behavior": "Pi theme inventory is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi theme inventory is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:getTheme",
+      "area": "ui_context",
+      "surface": "getTheme",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:getTheme",
+      "behavior": "Pi theme lookup is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi theme lookup is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setTheme",
+      "area": "ui_context",
+      "surface": "setTheme",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setTheme",
+      "behavior": "Pi theme mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Pi theme mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:getToolsExpanded",
+      "area": "ui_context",
+      "surface": "getToolsExpanded",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:getToolsExpanded",
+      "behavior": "Transcript disclosure state is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Transcript disclosure state is rejected explicitly."
+      }
+    },
+    {
+      "id": "ui_context:setToolsExpanded",
+      "area": "ui_context",
+      "surface": "setToolsExpanded",
+      "status": "safe_divergence",
+      "behavioral_fixture": "ui_context:setToolsExpanded",
+      "behavior": "Transcript disclosure mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Transcript disclosure mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:ui",
+      "area": "context",
+      "surface": "ui",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:ui",
+      "behavior": "Provides the bounded bridge UI context.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Provides the bounded bridge UI context."
+      }
+    },
+    {
+      "id": "context:mode",
+      "area": "context",
+      "surface": "mode",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:mode",
+      "behavior": "Always Pi RPC mode rather than an interactive Pi TUI.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Always Pi RPC mode rather than an interactive Pi TUI."
+      }
+    },
+    {
+      "id": "context:hasUI",
+      "area": "context",
+      "surface": "hasUI",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:hasUI",
+      "behavior": "True only for bridged dialogs, not arbitrary Pi components.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "True only for bridged dialogs, not arbitrary Pi components."
+      }
+    },
+    {
+      "id": "context:cwd",
+      "area": "context",
+      "surface": "cwd",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:cwd",
+      "behavior": "Uses the canonical Ygg workspace.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Uses the canonical Ygg workspace."
+      }
+    },
+    {
+      "id": "context:sessionManager",
+      "area": "context",
+      "surface": "sessionManager",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:sessionManager",
+      "behavior": "Session snapshots and mutation are host-owned and rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Session snapshots and mutation are host-owned and rejected explicitly."
+      }
+    },
+    {
+      "id": "context:modelRegistry",
+      "area": "context",
+      "surface": "modelRegistry",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:modelRegistry",
+      "behavior": "Credential/model registry access is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Credential/model registry access is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:model",
+      "area": "context",
+      "surface": "model",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:model",
+      "behavior": "A Pi Model object is not reconstructed from a Ygg model id.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "A Pi Model object is not reconstructed from a Ygg model id."
+      }
+    },
+    {
+      "id": "context:scopedModels",
+      "area": "context",
+      "surface": "scopedModels",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:scopedModels",
+      "behavior": "Returns an empty read-only snapshot.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Returns an empty read-only snapshot."
+      }
+    },
+    {
+      "id": "context:thinkingLevel",
+      "area": "context",
+      "surface": "thinkingLevel",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:thinkingLevel",
+      "behavior": "Derives from the host reasoning snapshot.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Derives from the host reasoning snapshot."
+      }
+    },
+    {
+      "id": "context:isIdle",
+      "area": "context",
+      "surface": "isIdle",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:isIdle",
+      "behavior": "Tracks the bridged turn lifecycle only.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Tracks the bridged turn lifecycle only."
+      }
+    },
+    {
+      "id": "context:isProjectTrusted",
+      "area": "context",
+      "surface": "isProjectTrusted",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:isProjectTrusted",
+      "behavior": "Conservatively returns false because Ygg trust is not projected.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Conservatively returns false because Ygg trust is not projected."
+      }
+    },
+    {
+      "id": "context:signal",
+      "area": "context",
+      "surface": "signal",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:signal",
+      "behavior": "Binds to the active Ygg request cancellation signal.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Binds to the active Ygg request cancellation signal."
+      }
+    },
+    {
+      "id": "context:abort",
+      "area": "context",
+      "surface": "abort",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:abort",
+      "behavior": "Cancels the active bridged request.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Cancels the active bridged request."
+      }
+    },
+    {
+      "id": "context:hasPendingMessages",
+      "area": "context",
+      "surface": "hasPendingMessages",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:hasPendingMessages",
+      "behavior": "Queue inspection is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Queue inspection is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:shutdown",
+      "area": "context",
+      "surface": "shutdown",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:shutdown",
+      "behavior": "Extension code cannot terminate the host and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Extension code cannot terminate the host and errors explicitly."
+      }
+    },
+    {
+      "id": "context:getContextUsage",
+      "area": "context",
+      "surface": "getContextUsage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:getContextUsage",
+      "behavior": "Returns unknown without a bounded host usage snapshot.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Returns unknown without a bounded host usage snapshot."
+      }
+    },
+    {
+      "id": "context:compact",
+      "area": "context",
+      "surface": "compact",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:compact",
+      "behavior": "Compaction is host-owned and errors explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Compaction is host-owned and errors explicitly."
+      }
+    },
+    {
+      "id": "context:getSystemPrompt",
+      "area": "context",
+      "surface": "getSystemPrompt",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:getSystemPrompt",
+      "behavior": "Exact effective prompt disclosure is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Exact effective prompt disclosure is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:getSystemPromptOptions",
+      "area": "context",
+      "surface": "getSystemPromptOptions",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:getSystemPromptOptions",
+      "behavior": "Returns only canonical cwd.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Returns only canonical cwd."
+      }
+    },
+    {
+      "id": "context:waitForIdle",
+      "area": "context",
+      "surface": "waitForIdle",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:waitForIdle",
+      "behavior": "Command dispatch is treated as idle and returns immediately.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Command dispatch is treated as idle and returns immediately."
+      }
+    },
+    {
+      "id": "context:newSession",
+      "area": "context",
+      "surface": "newSession",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:newSession",
+      "behavior": "Session replacement is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Session replacement is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:fork",
+      "area": "context",
+      "surface": "fork",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:fork",
+      "behavior": "Session replacement is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Session replacement is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:navigateTree",
+      "area": "context",
+      "surface": "navigateTree",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:navigateTree",
+      "behavior": "Tree mutation is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Tree mutation is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:switchSession",
+      "area": "context",
+      "surface": "switchSession",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:switchSession",
+      "behavior": "Session replacement is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Session replacement is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:reload",
+      "area": "context",
+      "surface": "reload",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:reload",
+      "behavior": "Runtime reload is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Runtime reload is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:replacement.sendMessage",
+      "area": "context",
+      "surface": "replacement.sendMessage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:replacement.sendMessage",
+      "behavior": "Replacement-session messaging is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Replacement-session messaging is rejected explicitly."
+      }
+    },
+    {
+      "id": "context:replacement.sendUserMessage",
+      "area": "context",
+      "surface": "replacement.sendUserMessage",
+      "status": "safe_divergence",
+      "behavioral_fixture": "context:replacement.sendUserMessage",
+      "behavior": "Replacement-session messaging is rejected explicitly.",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Replacement-session messaging is rejected explicitly."
+      }
+    }
+  ],
+  "official_examples": [
+    {
+      "id": "example:auto-commit-on-exit-ts",
+      "upstream": "auto-commit-on-exit.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/auto-commit-on-exit.ts",
+      "load_fixture": "example-load:auto-commit-on-exit-ts",
+      "behavioral_fixture": "example-registration:auto-commit-on-exit-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:bash-spawn-hook-ts",
+      "upstream": "bash-spawn-hook.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/bash-spawn-hook.ts",
+      "load_fixture": "example-load:bash-spawn-hook-ts",
+      "behavioral_fixture": "example-registration:bash-spawn-hook-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:bookmark-ts",
+      "upstream": "bookmark.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/bookmark.ts",
+      "load_fixture": "example-load:bookmark-ts",
+      "behavioral_fixture": "example-registration:bookmark-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:border-status-editor-ts",
+      "upstream": "border-status-editor.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/border-status-editor.ts",
+      "load_fixture": "example-load:border-status-editor-ts",
+      "behavioral_fixture": "example-registration:border-status-editor-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:built-in-tool-renderer-ts",
+      "upstream": "built-in-tool-renderer.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/built-in-tool-renderer.ts",
+      "load_fixture": "example-load:built-in-tool-renderer-ts",
+      "behavioral_fixture": "example-registration:built-in-tool-renderer-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:claude-rules-ts",
+      "upstream": "claude-rules.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/claude-rules.ts",
+      "load_fixture": "example-load:claude-rules-ts",
+      "behavioral_fixture": "example-registration:claude-rules-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:commands-ts",
+      "upstream": "commands.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/commands.ts",
+      "load_fixture": "example-load:commands-ts",
+      "behavioral_fixture": "example-registration:commands-ts",
+      "exercised_surfaces": [
+        "extension_api.registerCommand"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:confirm-destructive-ts",
+      "upstream": "confirm-destructive.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/confirm-destructive.ts",
+      "load_fixture": "example-load:confirm-destructive-ts",
+      "behavioral_fixture": "example-registration:confirm-destructive-ts",
+      "exercised_surfaces": [
+        "ui_context.confirm"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:custom-compaction-ts",
+      "upstream": "custom-compaction.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/custom-compaction.ts",
+      "load_fixture": "example-load:custom-compaction-ts",
+      "behavioral_fixture": "example-registration:custom-compaction-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:custom-footer-ts",
+      "upstream": "custom-footer.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/custom-footer.ts",
+      "load_fixture": "example-load:custom-footer-ts",
+      "behavioral_fixture": "example-registration:custom-footer-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:custom-header-ts",
+      "upstream": "custom-header.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/custom-header.ts",
+      "load_fixture": "example-load:custom-header-ts",
+      "behavioral_fixture": "example-registration:custom-header-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:custom-provider-anthropic",
+      "upstream": "custom-provider-anthropic",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/custom-provider-anthropic/index.ts",
+      "load_fixture": "example-load:custom-provider-anthropic",
+      "behavioral_fixture": "example-registration:custom-provider-anthropic",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:custom-provider-gitlab-duo",
+      "upstream": "custom-provider-gitlab-duo",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/custom-provider-gitlab-duo/index.ts",
+      "load_fixture": "example-load:custom-provider-gitlab-duo",
+      "behavioral_fixture": "example-registration:custom-provider-gitlab-duo",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:dirty-repo-guard-ts",
+      "upstream": "dirty-repo-guard.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/dirty-repo-guard.ts",
+      "load_fixture": "example-load:dirty-repo-guard-ts",
+      "behavioral_fixture": "example-registration:dirty-repo-guard-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:doom-overlay",
+      "upstream": "doom-overlay",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/doom-overlay/index.ts",
+      "load_fixture": "example-load:doom-overlay",
+      "behavioral_fixture": "example-registration:doom-overlay",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:dynamic-resources",
+      "upstream": "dynamic-resources",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/dynamic-resources/index.ts",
+      "load_fixture": "example-load:dynamic-resources",
+      "behavioral_fixture": "example-registration:dynamic-resources",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:dynamic-tools-ts",
+      "upstream": "dynamic-tools.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/dynamic-tools.ts",
+      "load_fixture": "example-load:dynamic-tools-ts",
+      "behavioral_fixture": "example-registration:dynamic-tools-ts",
+      "exercised_surfaces": [
+        "extension_api.registerTool"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:entry-renderer-ts",
+      "upstream": "entry-renderer.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/entry-renderer.ts",
+      "load_fixture": "example-load:entry-renderer-ts",
+      "behavioral_fixture": "example-registration:entry-renderer-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:event-bus-ts",
+      "upstream": "event-bus.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/event-bus.ts",
+      "load_fixture": "example-load:event-bus-ts",
+      "behavioral_fixture": "example-registration:event-bus-ts",
+      "exercised_surfaces": [
+        "extension_api.events.emit",
+        "extension_api.events.on"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:file-trigger-ts",
+      "upstream": "file-trigger.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/file-trigger.ts",
+      "load_fixture": "example-load:file-trigger-ts",
+      "behavioral_fixture": "example-registration:file-trigger-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:git-checkpoint-ts",
+      "upstream": "git-checkpoint.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/git-checkpoint.ts",
+      "load_fixture": "example-load:git-checkpoint-ts",
+      "behavioral_fixture": "example-registration:git-checkpoint-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:git-merge-and-resolve-ts",
+      "upstream": "git-merge-and-resolve.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/git-merge-and-resolve.ts",
+      "load_fixture": "example-load:git-merge-and-resolve-ts",
+      "behavioral_fixture": "example-registration:git-merge-and-resolve-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:github-issue-autocomplete-ts",
+      "upstream": "github-issue-autocomplete.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/github-issue-autocomplete.ts",
+      "load_fixture": "example-load:github-issue-autocomplete-ts",
+      "behavioral_fixture": "example-registration:github-issue-autocomplete-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:gondolin",
+      "upstream": "gondolin",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/gondolin/index.ts",
+      "load_fixture": "example-load:gondolin",
+      "behavioral_fixture": "example-registration:gondolin",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:handoff-ts",
+      "upstream": "handoff.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/handoff.ts",
+      "load_fixture": "example-load:handoff-ts",
+      "behavioral_fixture": "example-registration:handoff-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:hello-ts",
+      "upstream": "hello.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/hello.ts",
+      "load_fixture": "example-load:hello-ts",
+      "behavioral_fixture": "example-registration:hello-ts",
+      "exercised_surfaces": [
+        "extension_api.registerTool"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:hidden-thinking-label-ts",
+      "upstream": "hidden-thinking-label.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/hidden-thinking-label.ts",
+      "load_fixture": "example-load:hidden-thinking-label-ts",
+      "behavioral_fixture": "example-registration:hidden-thinking-label-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:inline-bash-ts",
+      "upstream": "inline-bash.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/inline-bash.ts",
+      "load_fixture": "example-load:inline-bash-ts",
+      "behavioral_fixture": "example-registration:inline-bash-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:input-transform-streaming-ts",
+      "upstream": "input-transform-streaming.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/input-transform-streaming.ts",
+      "load_fixture": "example-load:input-transform-streaming-ts",
+      "behavioral_fixture": "example-registration:input-transform-streaming-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:input-transform-ts",
+      "upstream": "input-transform.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/input-transform.ts",
+      "load_fixture": "example-load:input-transform-ts",
+      "behavioral_fixture": "example-registration:input-transform-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:interactive-shell-ts",
+      "upstream": "interactive-shell.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/interactive-shell.ts",
+      "load_fixture": "example-load:interactive-shell-ts",
+      "behavioral_fixture": "example-registration:interactive-shell-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:kimi-deferred-tools-ts",
+      "upstream": "kimi-deferred-tools.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/kimi-deferred-tools.ts",
+      "load_fixture": "example-load:kimi-deferred-tools-ts",
+      "behavioral_fixture": "example-registration:kimi-deferred-tools-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:mac-system-theme-ts",
+      "upstream": "mac-system-theme.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/mac-system-theme.ts",
+      "load_fixture": "example-load:mac-system-theme-ts",
+      "behavioral_fixture": "example-registration:mac-system-theme-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:message-renderer-ts",
+      "upstream": "message-renderer.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/message-renderer.ts",
+      "load_fixture": "example-load:message-renderer-ts",
+      "behavioral_fixture": "example-registration:message-renderer-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:minimal-mode-ts",
+      "upstream": "minimal-mode.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/minimal-mode.ts",
+      "load_fixture": "example-load:minimal-mode-ts",
+      "behavioral_fixture": "example-registration:minimal-mode-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:modal-editor-ts",
+      "upstream": "modal-editor.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/modal-editor.ts",
+      "load_fixture": "example-load:modal-editor-ts",
+      "behavioral_fixture": "example-registration:modal-editor-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:model-status-ts",
+      "upstream": "model-status.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/model-status.ts",
+      "load_fixture": "example-load:model-status-ts",
+      "behavioral_fixture": "example-registration:model-status-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:notify-ts",
+      "upstream": "notify.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/notify.ts",
+      "load_fixture": "example-load:notify-ts",
+      "behavioral_fixture": "example-registration:notify-ts",
+      "exercised_surfaces": [
+        "ui_context.notify"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:overlay-qa-tests-ts",
+      "upstream": "overlay-qa-tests.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/overlay-qa-tests.ts",
+      "load_fixture": "example-load:overlay-qa-tests-ts",
+      "behavioral_fixture": "example-registration:overlay-qa-tests-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:overlay-test-ts",
+      "upstream": "overlay-test.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/overlay-test.ts",
+      "load_fixture": "example-load:overlay-test-ts",
+      "behavioral_fixture": "example-registration:overlay-test-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:permission-gate-ts",
+      "upstream": "permission-gate.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/permission-gate.ts",
+      "load_fixture": "example-load:permission-gate-ts",
+      "behavioral_fixture": "example-registration:permission-gate-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:pirate-ts",
+      "upstream": "pirate.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/pirate.ts",
+      "load_fixture": "example-load:pirate-ts",
+      "behavioral_fixture": "example-registration:pirate-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:plan-mode",
+      "upstream": "plan-mode",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/plan-mode/index.ts",
+      "load_fixture": "example-load:plan-mode",
+      "behavioral_fixture": "plan-mode:full-journey",
+      "exercised_surfaces": [
+        "extension_api.registerCommand",
+        "extension_api.registerShortcut",
+        "extension_api.registerFlag",
+        "extension_api.setActiveTools",
+        "extension_api.appendEntry",
+        "extension_api.sendMessage",
+        "extension_api.sendUserMessage",
+        "events.tool_call",
+        "events.context",
+        "events.before_agent_start",
+        "events.turn_end",
+        "events.agent_end",
+        "events.session_start",
+        "ui_context.select",
+        "ui_context.editor",
+        "ui_context.setStatus",
+        "ui_context.setWidget"
+      ],
+      "assertion": "Runs unchanged through toggle, policy, interception, persistence/resume, dialogs, widgets, messaging, commands, flags, and shortcut seam journeys."
+    },
+    {
+      "id": "example:preset-ts",
+      "upstream": "preset.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/preset.ts",
+      "load_fixture": "example-load:preset-ts",
+      "behavioral_fixture": "example-registration:preset-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:project-trust-ts",
+      "upstream": "project-trust.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/project-trust.ts",
+      "load_fixture": "example-load:project-trust-ts",
+      "behavioral_fixture": "example-registration:project-trust-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:prompt-customizer-ts",
+      "upstream": "prompt-customizer.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/prompt-customizer.ts",
+      "load_fixture": "example-load:prompt-customizer-ts",
+      "behavioral_fixture": "example-registration:prompt-customizer-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:protected-paths-ts",
+      "upstream": "protected-paths.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/protected-paths.ts",
+      "load_fixture": "example-load:protected-paths-ts",
+      "behavioral_fixture": "example-registration:protected-paths-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:provider-payload-ts",
+      "upstream": "provider-payload.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/provider-payload.ts",
+      "load_fixture": "example-load:provider-payload-ts",
+      "behavioral_fixture": "example-registration:provider-payload-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:qna-ts",
+      "upstream": "qna.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/qna.ts",
+      "load_fixture": "example-load:qna-ts",
+      "behavioral_fixture": "example-registration:qna-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:question-ts",
+      "upstream": "question.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/question.ts",
+      "load_fixture": "example-load:question-ts",
+      "behavioral_fixture": "example-registration:question-ts",
+      "exercised_surfaces": [
+        "ui_context.select"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:questionnaire-ts",
+      "upstream": "questionnaire.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/questionnaire.ts",
+      "load_fixture": "example-load:questionnaire-ts",
+      "behavioral_fixture": "example-registration:questionnaire-ts",
+      "exercised_surfaces": [
+        "ui_context.select"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:rainbow-editor-ts",
+      "upstream": "rainbow-editor.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/rainbow-editor.ts",
+      "load_fixture": "example-load:rainbow-editor-ts",
+      "behavioral_fixture": "example-registration:rainbow-editor-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:reload-runtime-ts",
+      "upstream": "reload-runtime.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/reload-runtime.ts",
+      "load_fixture": "example-load:reload-runtime-ts",
+      "behavioral_fixture": "example-registration:reload-runtime-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:rpc-demo-ts",
+      "upstream": "rpc-demo.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/rpc-demo.ts",
+      "load_fixture": "example-load:rpc-demo-ts",
+      "behavioral_fixture": "example-registration:rpc-demo-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:sandbox",
+      "upstream": "sandbox",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/sandbox/index.ts",
+      "load_fixture": "example-load:sandbox",
+      "behavioral_fixture": "example-registration:sandbox",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:send-user-message-ts",
+      "upstream": "send-user-message.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/send-user-message.ts",
+      "load_fixture": "example-load:send-user-message-ts",
+      "behavioral_fixture": "example-registration:send-user-message-ts",
+      "exercised_surfaces": [
+        "extension_api.sendUserMessage"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:session-name-ts",
+      "upstream": "session-name.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/session-name.ts",
+      "load_fixture": "example-load:session-name-ts",
+      "behavioral_fixture": "example-registration:session-name-ts",
+      "exercised_surfaces": [
+        "extension_api.getSessionName",
+        "extension_api.setSessionName"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:shutdown-command-ts",
+      "upstream": "shutdown-command.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/shutdown-command.ts",
+      "load_fixture": "example-load:shutdown-command-ts",
+      "behavioral_fixture": "example-registration:shutdown-command-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:snake-ts",
+      "upstream": "snake.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/snake.ts",
+      "load_fixture": "example-load:snake-ts",
+      "behavioral_fixture": "example-registration:snake-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:space-invaders-ts",
+      "upstream": "space-invaders.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/space-invaders.ts",
+      "load_fixture": "example-load:space-invaders-ts",
+      "behavioral_fixture": "example-registration:space-invaders-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:ssh-ts",
+      "upstream": "ssh.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/ssh.ts",
+      "load_fixture": "example-load:ssh-ts",
+      "behavioral_fixture": "example-registration:ssh-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:status-line-ts",
+      "upstream": "status-line.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/status-line.ts",
+      "load_fixture": "example-load:status-line-ts",
+      "behavioral_fixture": "example-registration:status-line-ts",
+      "exercised_surfaces": [
+        "ui_context.setStatus"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:structured-output-ts",
+      "upstream": "structured-output.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/structured-output.ts",
+      "load_fixture": "example-load:structured-output-ts",
+      "behavioral_fixture": "example-registration:structured-output-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:subagent",
+      "upstream": "subagent",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/subagent/index.ts",
+      "load_fixture": "example-load:subagent",
+      "behavioral_fixture": "example-registration:subagent",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:summarize-ts",
+      "upstream": "summarize.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/summarize.ts",
+      "load_fixture": "example-load:summarize-ts",
+      "behavioral_fixture": "example-registration:summarize-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:system-prompt-header-ts",
+      "upstream": "system-prompt-header.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/system-prompt-header.ts",
+      "load_fixture": "example-load:system-prompt-header-ts",
+      "behavioral_fixture": "example-registration:system-prompt-header-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:tic-tac-toe-ts",
+      "upstream": "tic-tac-toe.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/tic-tac-toe.ts",
+      "load_fixture": "example-load:tic-tac-toe-ts",
+      "behavioral_fixture": "example-registration:tic-tac-toe-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:timed-confirm-ts",
+      "upstream": "timed-confirm.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/timed-confirm.ts",
+      "load_fixture": "example-load:timed-confirm-ts",
+      "behavioral_fixture": "example-registration:timed-confirm-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:titlebar-spinner-ts",
+      "upstream": "titlebar-spinner.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/titlebar-spinner.ts",
+      "load_fixture": "example-load:titlebar-spinner-ts",
+      "behavioral_fixture": "example-registration:titlebar-spinner-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:todo-ts",
+      "upstream": "todo.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/todo.ts",
+      "load_fixture": "example-load:todo-ts",
+      "behavioral_fixture": "example-registration:todo-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:tool-override-ts",
+      "upstream": "tool-override.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/tool-override.ts",
+      "load_fixture": "example-load:tool-override-ts",
+      "behavioral_fixture": "example-registration:tool-override-ts",
+      "exercised_surfaces": [
+        "events.tool_call",
+        "events.tool_result"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:tools-ts",
+      "upstream": "tools.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/tools.ts",
+      "load_fixture": "example-load:tools-ts",
+      "behavioral_fixture": "example-registration:tools-ts",
+      "exercised_surfaces": [
+        "extension_api.registerTool"
+      ],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:trigger-compact-ts",
+      "upstream": "trigger-compact.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/trigger-compact.ts",
+      "load_fixture": "example-load:trigger-compact-ts",
+      "behavioral_fixture": "example-registration:trigger-compact-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:truncated-tool-ts",
+      "upstream": "truncated-tool.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/truncated-tool.ts",
+      "load_fixture": "example-load:truncated-tool-ts",
+      "behavioral_fixture": "example-registration:truncated-tool-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:widget-placement-ts",
+      "upstream": "widget-placement.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/widget-placement.ts",
+      "load_fixture": "example-load:widget-placement-ts",
+      "behavioral_fixture": "example-registration:widget-placement-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:with-deps",
+      "upstream": "with-deps",
+      "kind": "directory",
+      "entrypoint": "examples/extensions/with-deps/index.ts",
+      "load_fixture": "example-load:with-deps",
+      "behavioral_fixture": "example-registration:with-deps",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:working-indicator-ts",
+      "upstream": "working-indicator.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/working-indicator.ts",
+      "load_fixture": "example-load:working-indicator-ts",
+      "behavioral_fixture": "example-registration:working-indicator-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    },
+    {
+      "id": "example:working-message-test-ts",
+      "upstream": "working-message-test.ts",
+      "kind": "file",
+      "entrypoint": "examples/extensions/working-message-test.ts",
+      "load_fixture": "example-load:working-message-test-ts",
+      "behavioral_fixture": "example-registration:working-message-test-ts",
+      "exercised_surfaces": [],
+      "assertion": "Runs unchanged through the public Pi loader and validates the declared bridge registration/diagnostic path."
+    }
+  ],
+  "tui_audit": [
+    {
+      "id": "tui:test-autocomplete-test-ts",
+      "upstream": "test/autocomplete.test.ts",
+      "area": "autocomplete",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-autocomplete-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-bug-regression-isimageline-startswith-bug-test-ts",
+      "upstream": "test/bug-regression-isimageline-startswith-bug.test.ts",
+      "area": "terminal-image",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-bug-regression-isimageline-startswith-bug-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-editor-history-keybindings-test-ts",
+      "upstream": "test/editor-history-keybindings.test.ts",
+      "area": "editor",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-editor-history-keybindings-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-editor-test-ts",
+      "upstream": "test/editor.test.ts",
+      "area": "editor",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-editor-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-fuzzy-test-ts",
+      "upstream": "test/fuzzy.test.ts",
+      "area": "autocomplete",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-fuzzy-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-input-test-ts",
+      "upstream": "test/input.test.ts",
+      "area": "input",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-input-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-keybindings-test-ts",
+      "upstream": "test/keybindings.test.ts",
+      "area": "keybindings",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-keybindings-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-keys-test-ts",
+      "upstream": "test/keys.test.ts",
+      "area": "keys",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-keys-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-latex-test-ts",
+      "upstream": "test/latex.test.ts",
+      "area": "markdown",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-latex-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-layout-test-ts",
+      "upstream": "test/layout.test.ts",
+      "area": "layout",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-layout-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-markdown-test-ts",
+      "upstream": "test/markdown.test.ts",
+      "area": "markdown",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-markdown-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-native-module-path-test-ts",
+      "upstream": "test/native-module-path.test.ts",
+      "area": "native-module",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-native-module-path-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-overlay-non-capturing-test-ts",
+      "upstream": "test/overlay-non-capturing.test.ts",
+      "area": "overlay",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-overlay-non-capturing-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-overlay-options-test-ts",
+      "upstream": "test/overlay-options.test.ts",
+      "area": "overlay",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-overlay-options-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-overlay-short-content-test-ts",
+      "upstream": "test/overlay-short-content.test.ts",
+      "area": "overlay",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-overlay-short-content-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-regression-overlay-cjk-boundary-test-ts",
+      "upstream": "test/regression-overlay-cjk-boundary.test.ts",
+      "area": "overlay",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-regression-overlay-cjk-boundary-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-regression-regional-indicator-width-test-ts",
+      "upstream": "test/regression-regional-indicator-width.test.ts",
+      "area": "width",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-regression-regional-indicator-width-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-select-list-test-ts",
+      "upstream": "test/select-list.test.ts",
+      "area": "widgets",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-select-list-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-settings-list-test-ts",
+      "upstream": "test/settings-list.test.ts",
+      "area": "widgets",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-settings-list-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-stdin-buffer-test-ts",
+      "upstream": "test/stdin-buffer.test.ts",
+      "area": "stdin-buffer",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-stdin-buffer-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-tab-width-test-ts",
+      "upstream": "test/tab-width.test.ts",
+      "area": "width",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tab-width-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-terminal-colors-test-ts",
+      "upstream": "test/terminal-colors.test.ts",
+      "area": "terminal",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-terminal-colors-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-terminal-image-test-ts",
+      "upstream": "test/terminal-image.test.ts",
+      "area": "terminal-image",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-terminal-image-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-terminal-test-ts",
+      "upstream": "test/terminal.test.ts",
+      "area": "terminal",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-terminal-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-truncate-to-width-test-ts",
+      "upstream": "test/truncate-to-width.test.ts",
+      "area": "width",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-truncate-to-width-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-truncated-text-test-ts",
+      "upstream": "test/truncated-text.test.ts",
+      "area": "widgets",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-truncated-text-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-tui-alt-screen-test-ts",
+      "upstream": "test/tui-alt-screen.test.ts",
+      "area": "tui",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tui-alt-screen-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-tui-cell-size-input-test-ts",
+      "upstream": "test/tui-cell-size-input.test.ts",
+      "area": "tui",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tui-cell-size-input-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-tui-overlay-style-leak-test-ts",
+      "upstream": "test/tui-overlay-style-leak.test.ts",
+      "area": "overlay",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tui-overlay-style-leak-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-tui-render-test-ts",
+      "upstream": "test/tui-render.test.ts",
+      "area": "tui",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tui-render-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ]
+    },
+    {
+      "id": "tui:test-tui-shrink-test-ts",
+      "upstream": "test/tui-shrink.test.ts",
+      "area": "tui",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-tui-shrink-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ]
+    },
+    {
+      "id": "tui:test-word-navigation-test-ts",
+      "upstream": "test/word-navigation.test.ts",
+      "area": "editor",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-word-navigation-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    },
+    {
+      "id": "tui:test-wrap-ansi-test-ts",
+      "upstream": "test/wrap-ansi.test.ts",
+      "area": "width",
+      "status": "safe_divergence",
+      "behavioral_fixture": "tui:test-wrap-ansi-test-ts",
+      "safe_divergence": {
+        "decision": "pi-0.84.4-dogfood-explicit-safe-divergence",
+        "reason": "Ygg keeps a semantic TUI boundary; arbitrary Pi component/input ownership is not treated as equivalent."
+      },
+      "rust_equivalents": []
+    }
+  ],
+  "gates": [
+    {
+      "id": "package-profile",
+      "fixture": "profile-integrity",
+      "status": "covered"
+    },
+    {
+      "id": "all-official-examples",
+      "fixture": "official-example-inventory",
+      "status": "covered"
+    },
+    {
+      "id": "plan-mode",
+      "fixture": "plan-mode:full-journey",
+      "status": "covered"
+    },
+    {
+      "id": "cancellation",
+      "fixture": "bridge-cancellation",
+      "status": "covered"
+    },
+    {
+      "id": "bounds",
+      "fixture": "bridge-bounds",
+      "status": "covered"
+    },
+    {
+      "id": "restart",
+      "fixture": "host-supervisor-restart",
+      "status": "covered"
+    },
+    {
+      "id": "trust",
+      "fixture": "host-extension-trust",
+      "status": "covered"
+    },
+    {
+      "id": "source-change",
+      "fixture": "bridge-source-fingerprint",
+      "status": "covered"
+    },
+    {
+      "id": "sanitized-environment",
+      "fixture": "host-sanitized-environment",
+      "status": "covered"
+    },
+    {
+      "id": "provider-oauth",
+      "fixture": "extension_api:registerProvider",
+      "status": "covered"
+    },
+    {
+      "id": "tui-33-row-audit",
+      "fixture": "tui-audit",
+      "status": "covered"
+    },
+    {
+      "id": "api-0.1-0.2-regression",
+      "fixture": "legacy-api-regression",
+      "status": "covered"
+    },
+    {
+      "id": "generated-sdk-schema",
+      "fixture": "generated-api-0.3",
+      "status": "covered"
+    }
+  ]
+}

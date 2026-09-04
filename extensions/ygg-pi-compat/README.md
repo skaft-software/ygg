@@ -12,8 +12,10 @@ The current profile targets exactly
 validates both before importing extension code; it does not silently follow a
 newer Pi runtime found on `PATH`. Exact source revision, npm integrity values,
 public surface names, and the 78-example corpus live in the machine-readable
-[`profiles/0.84.4.json`](profiles/0.84.4.json); the human status ledger and
-completion gates live in [COMPATIBILITY.md](COMPATIBILITY.md).
+[`profiles/0.84.4.json`](profiles/0.84.4.json). The canonical per-surface,
+example, and TUI evidence is in
+[`profiles/0.84.4.ledger.json`](profiles/0.84.4.ledger.json);
+[COMPATIBILITY.md](COMPATIBILITY.md) is its human view.
 
 Use `ygg pi plan`, `ygg pi preflight --plan FILE`, then `ygg pi publish --plan
 FILE` to create an aggregate link; `ygg pi install` is the equivalent local
@@ -60,9 +62,11 @@ names. Unknown APIs fail closed instead of being labeled bridge-compatible.
 ## Tests
 
 ```sh
-python3 -m unittest discover -s extensions/ygg-pi-compat/tests \
-  -p 'test_bridge_protocol.py'
+# Hermetic bridge, public-surface, and ledger fixtures.
+python3 -m unittest discover -s extensions/ygg-pi-compat/tests -p 'test_*.py'
+python3 extensions/ygg-pi-compat/conformance.py --check --json
 
+# Developer diagnosis only; this does not verify npm tarball integrity.
 YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
   python3 -m unittest discover -s extensions/ygg-pi-compat/tests \
   -p 'test_bridge_protocol.py'
@@ -70,12 +74,25 @@ YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
 YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
   cargo test -p ygg-coding-agent \
   pi::tests::generated_link_runs_the_pinned_real_pi_hello_example_when_selected --lib
+
+# Full unchanged-source loader gate: local artifacts only, no download,
+# fresh HOME/allowlisted environment, and Linux unshare --net required.
+python3 extensions/ygg-pi-compat/conformance.py --full --network-isolated \
+  --coding-agent-tarball /local/pi-coding-agent-0.84.4.tgz \
+  --tui-tarball /local/pi-tui-0.84.4.tgz \
+  --pi-package /local/unpacked/pi-coding-agent \
+  --source-root /local/pi-source-at-b79e4cc
 ```
 
-The real-Pi suite covers the official hello example and an unchanged
-`plan-mode` load plus `/todos` smoke. It does not claim plan-mode behavioral
-parity: flags, shortcuts, active-tool overlays, widgets, and durable custom
-entries remain release blockers.
+The full gate validates the pinned npm SRI values and matches the selected
+coding-agent and Node-resolved Pi TUI package roots against their tarballs before
+it loads all 78 unchanged sources through Pi's public loader. It reports failure
+rather than treating a fake fixture, a package directory alone, or a smoke test
+as real-runtime proof. The real-Pi suite covers the official hello example and
+an unchanged `plan-mode` load plus `/todos` smoke. It does not claim plan-mode
+behavioral parity: flags, shortcuts, active-tool overlays, session entries,
+root messages, editor/widget transport, and durable custom entries remain
+explicitly rejected release blockers.
 
 The bridge uses the selected Pi package's own loader and does not install npm
 dependencies. `ygg pi plan --pi-package DIR` validates and records an exact

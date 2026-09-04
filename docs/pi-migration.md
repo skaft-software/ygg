@@ -149,6 +149,15 @@ been upgraded to API `0.3`.
 
 The exhaustive per-event/API/UI ledger and completion gates are maintained in
 [`extensions/ygg-pi-compat/COMPATIBILITY.md`](../extensions/ygg-pi-compat/COMPATIBILITY.md).
+Its canonical machine-readable form is
+[`0.84.4.ledger.json`](../extensions/ygg-pi-compat/profiles/0.84.4.ledger.json).
+`python3 extensions/ygg-pi-compat/conformance.py --check --json` validates its
+118 public surfaces, 78 official examples, 33 TUI audit rows, six plan-mode
+journeys, fixture links, and profile digest without claiming that a real Pi
+package was run. The separate full gate accepts only local integrity-verified
+tarballs, a clean pinned Pi checkout, a fresh allowlisted environment, and Linux
+network isolation.
+
 It supports Pi tools, transformed result details/error/usage, live tool catalogs,
 notifications, confirmations, text input, basic lifecycle/context events, and
 local Pi event-bus behavior. On a Ygg host negotiating `runtime_commands`, Pi's

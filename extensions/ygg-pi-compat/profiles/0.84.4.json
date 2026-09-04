@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "pi-0.84.4",
-  "release_status": "in_progress",
+  "release_status": "dogfood_conformance",
   "source": {
     "repository": "https://github.com/earendil-works/pi.git",
     "revision": "b79e4cc834970cca69daebffab7df1da7d1e52c4",
@@ -237,5 +237,15 @@
     "silent_unsupported_calls": 0,
     "aggregate_process": "required",
     "provider_and_oauth": "required"
+  },
+  "conformance": {
+    "ledger": "0.84.4.ledger.json",
+    "fixtures": [
+      "tests/fixtures/conformance/public-surfaces.json",
+      "tests/fixtures/conformance/official-examples.json",
+      "tests/fixtures/conformance/plan-mode-journey.json",
+      "tests/fixtures/conformance/tui-audit.json"
+    ],
+    "runner": "../conformance.py"
   }
 }

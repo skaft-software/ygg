@@ -135,6 +135,8 @@ class BridgeProcess:
         extension: Path = FIXTURE_EXTENSION,
         extensions: list[Path] | None = None,
         source_fingerprint: str | None = None,
+        fixture_mode: str | None = None,
+        fixture_events: list[str] | None = None,
         strict_identity: bool = False,
         aggregate_digest: str = "a" * 64,
         command_name: str = "pi",
@@ -145,6 +147,12 @@ class BridgeProcess:
         if NODE is None:
             raise RuntimeError("node is unavailable")
         environment = os.environ.copy()
+        environment.pop("YGG_PI_FIXTURE_MODE", None)
+        environment.pop("YGG_PI_FIXTURE_EVENTS", None)
+        if fixture_mode is not None:
+            environment["YGG_PI_FIXTURE_MODE"] = fixture_mode
+        if fixture_events is not None:
+            environment["YGG_PI_FIXTURE_EVENTS"] = ",".join(fixture_events)
         selected_extensions = [Path(item).resolve() for item in (extensions or [extension])]
         selected_agent_dir = Path(agent_dir or (ROOT / ".test-pi-agent")).absolute()
         selected_manifest = Path(manifest_path or (ROOT / ".test-link" / "extension.toml")).absolute()

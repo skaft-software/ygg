@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "algorithm": "sha256",
+  "encoding": "raw_utf8_bytes",
+  "digest": "978235260573350cac3944361ad61d9a546954fc502406f0584d8cb6e8c5a1bd"
+}
