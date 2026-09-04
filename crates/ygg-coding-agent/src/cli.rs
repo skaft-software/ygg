@@ -2202,6 +2202,20 @@ mod tests {
         build_config_with_global_path(cli, directory, Some(&directory.join("missing-global.toml")))
     }
 
+    #[test]
+    fn gpt_6_astra_uses_the_generic_cli_model_path() {
+        let directory = cwd();
+        let cli = Cli::try_parse_from(["ygg", "--model", "gpt-6-astra", "--offline"]).unwrap();
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.model, Some(ygg_ai::ModelId("gpt-6-astra".into())));
+        assert!(config.model_explicit);
+
+        let catalog = ygg_ai::ModelCatalog::builtin().unwrap();
+        let model = catalog.resolve(config.model.as_ref().unwrap()).unwrap();
+        assert_eq!(model.spec.api_name, "gpt-6-astra");
+        assert_eq!(model.endpoint.id.0, "openai");
+    }
+
     fn extension_flag(
         name: &str,
         kind: ExtensionFlagType,

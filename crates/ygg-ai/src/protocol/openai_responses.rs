@@ -1793,6 +1793,32 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_astra_preserves_default_reasoning_and_emits_top_wire_efforts() {
+        let model = crate::catalog::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-6-astra".to_owned()))
+            .unwrap();
+        let mut req = user_req(
+            vec![UserPart::Text("Hello".to_owned())],
+            CompatibilityMode::Strict,
+        );
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert!(body.get("reasoning").is_none());
+
+        for (effort, expected) in [
+            (crate::types::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::types::ReasoningEffort::Max, "max"),
+        ] {
+            req.reasoning = ReasoningConfig::Effort(effort);
+            let body: serde_json::Value =
+                serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+            assert_eq!(body["reasoning"]["effort"], expected);
+        }
+    }
+
+    #[test]
     fn responses_lite_uses_header_and_input_items_for_tools_and_instructions() {
         let mut model = make_test_model(true);
         let mut spec = (*model.spec).clone();

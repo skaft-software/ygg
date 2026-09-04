@@ -522,6 +522,58 @@ mod tests {
     }
 
     #[test]
+    fn builtin_gpt_6_astra_matches_the_public_openai_contract() {
+        let catalog = ModelCatalog::builtin().unwrap();
+        let model = catalog.resolve(&ModelId("gpt-6-astra".to_owned())).unwrap();
+        assert_eq!(model.spec.api_name, "gpt-6-astra");
+        assert_eq!(model.spec.display_name.as_deref(), Some("GPT-6 Astra"));
+        assert_eq!(model.spec.endpoint.0, "openai");
+        assert_eq!(model.spec.protocol, crate::types::Protocol::OpenAiResponses);
+        assert_eq!(model.spec.limits.context_window, 1_050_000);
+        assert_eq!(model.spec.limits.max_output_tokens, 128_000);
+
+        let capabilities = &model.spec.capabilities;
+        assert!(capabilities
+            .input_modalities
+            .contains(crate::types::Modality::Image));
+        assert!(!capabilities
+            .input_modalities
+            .contains(crate::types::Modality::Audio));
+        assert_eq!(
+            capabilities.output_modalities,
+            crate::types::ModalitySet::none()
+        );
+        assert!(capabilities.tools);
+        assert!(capabilities.parallel_tool_calls);
+        assert!(capabilities.structured_output);
+        assert!(!capabilities.responses_lite);
+        assert_eq!(capabilities.agent_delegation, None);
+        let reasoning = capabilities.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.control, ReasoningControl::Effort);
+        assert_eq!(reasoning.min_effort, crate::types::ReasoningEffort::Low);
+        assert_eq!(reasoning.max_effort, crate::types::ReasoningEffort::Max);
+
+        let pricing = model.spec.pricing.as_ref().unwrap();
+        assert_eq!(pricing.input, crate::pricing::TokenRate(10_000_000));
+        assert_eq!(pricing.cache_read, crate::pricing::TokenRate(1_000_000));
+        assert_eq!(
+            pricing.cache_write_5m,
+            crate::pricing::TokenRate(12_500_000)
+        );
+        assert_eq!(pricing.output, crate::pricing::TokenRate(50_000_000));
+        assert_eq!(pricing.tiers.len(), 1);
+        let tier = &pricing.tiers[0];
+        assert_eq!(tier.min_input_tokens, 272_001);
+        assert_eq!(tier.input, Some(crate::pricing::TokenRate(20_000_000)));
+        assert_eq!(tier.cache_read, Some(crate::pricing::TokenRate(2_000_000)));
+        assert_eq!(
+            tier.cache_write_5m,
+            Some(crate::pricing::TokenRate(25_000_000))
+        );
+        assert_eq!(tier.output, Some(crate::pricing::TokenRate(75_000_000)));
+    }
+
+    #[test]
     fn endpoint_labels_are_presentation_only_and_follow_endpoint_identity() {
         let mut catalog = ModelCatalog::default();
         let endpoint_id = EndpointId("custom-apple-fm".into());
@@ -609,6 +661,7 @@ mod tests {
         for id in [
             "gpt-4o-mini",
             "gpt-5.4-mini-responses",
+            "gpt-6-astra",
             "claude-sonnet-4-5",
             "claude-fable-5",
             "claude-opus-4-8",

@@ -42,6 +42,7 @@ pub const ENDPOINT_ID: &str = "openai-codex";
 /// reached. The authenticated `/models` response is authoritative at runtime,
 /// so account-specific and newly released models are not gated on this list.
 pub const MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",

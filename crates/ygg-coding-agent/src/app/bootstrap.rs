@@ -789,6 +789,7 @@ fn model_id_implies_vision(id: &str) -> bool {
         || id.contains("gpt-5.4")
         || id.contains("gpt-5.5")
         || id.contains("gpt-5.6")
+        || id.contains("gpt-6")
         || (id.contains("deepseek") && id.contains("vision"))
         || id.contains("codex-mini")
         || id.contains("qwen3.5")
@@ -1042,9 +1043,11 @@ fn has_model_id(catalog: &ModelCatalog, id: &str) -> bool {
 
 fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
     let id = id.to_ascii_lowercase();
+    let id = id.rsplit('/').next().unwrap_or(&id);
     match protocol {
         Protocol::OpenAiResponses => {
             id.starts_with("gpt-5")
+                || id.starts_with("gpt-6")
                 || id.starts_with("codex-")
                 || id
                     .strip_prefix('o')
@@ -3157,18 +3160,19 @@ fn extract_ctx_from_model_entry(entry: &serde_json::Value) -> u64 {
 // then applies the bounded working-window policy below.
 const CODEX_LEGACY_CONTEXT_WINDOW: u64 = 272_000;
 const CODEX_5_6_CONTEXT_WINDOW: u64 = 372_000;
+const CODEX_ASTRA_MAX_CONTEXT_WINDOW: u64 = 872_000;
 const CODEX_PRO_CONTEXT_WINDOW: u64 = 1_000_000;
 const CODEX_CONTEXT_WINDOW_CAP: u64 = 272_000;
 const CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
 /// Codex retains the provider-advertised maximum as discovery metadata, while
 /// Ygg deliberately budgets requests against Pi's 272K working window. Smaller
 /// advertised windows remain authoritative.
-const CODEX_MODEL_CACHE_VERSION: u8 = 3;
+const CODEX_MODEL_CACHE_VERSION: u8 = 4;
 const CODEX_MODEL_CACHE_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 // This is the Codex `/models` schema compatibility version Ygg implements,
-// not Ygg's package version. Sending `0.1.0` causes the backend to filter out
-// models that require a contemporary Codex client.
-const CODEX_MODELS_CLIENT_VERSION: &str = "0.147.0";
+// not Ygg's package version. Sending an older version causes the backend to
+// filter out models that require a contemporary Codex client.
+const CODEX_MODELS_CLIENT_VERSION: &str = "0.153.2";
 
 pub(crate) fn effective_compaction_threshold_fraction(config: &Config, model: &Model) -> f64 {
     let Some(max_active_tokens) = config
@@ -3246,8 +3250,12 @@ fn reasoning_effort(value: &str) -> Option<ygg_ai::ReasoningEffort> {
 fn codex_reasoning_range(
     entry: &serde_json::Value,
     model_id: &str,
-) -> (ygg_ai::ReasoningEffort, ygg_ai::ReasoningEffort) {
-    let fallback = (ygg_ai::ReasoningEffort::Minimal, codex_max_effort(model_id));
+) -> (ygg_ai::ReasoningEffort, ygg_ai::ReasoningEffort, bool) {
+    let fallback = (
+        codex_min_effort(model_id),
+        codex_max_effort(model_id),
+        false,
+    );
     let Some(levels) = entry
         .get("supported_reasoning_levels")
         .or_else(|| entry.get("supported_reasoning_efforts"))
@@ -3283,6 +3291,7 @@ fn codex_reasoning_range(
             .copied()
             .max()
             .expect("non-empty validated reasoning levels"),
+        true,
     )
 }
 
@@ -3319,13 +3328,20 @@ fn codex_models_from_response(
             &["context_window", "context_length", "max_context_tokens"],
         );
         let advertised_max = positive_u64(entry, &["max_context_window"]);
-        let (default_context_window, max_context_window) =
+        let (mut default_context_window, mut max_context_window) =
             match (advertised_context, advertised_max) {
                 (Some(context), Some(maximum)) => (context.min(maximum), maximum),
                 (Some(context), None) => (context, context),
                 (None, Some(maximum)) => (maximum, maximum),
                 (None, None) => fallback,
             };
+        if id == "gpt-6-astra" {
+            // Keep Astra's larger advertised input envelope distinct from the
+            // conservative Codex working budget, and never overstate the
+            // provider's 872K input allowance when only a total window appears.
+            max_context_window = max_context_window.min(CODEX_ASTRA_MAX_CONTEXT_WINDOW);
+            default_context_window = default_context_window.min(max_context_window);
+        }
         let context_window =
             codex_context_window_for_plan(default_context_window, max_context_window, plan);
         let max_output_tokens =
@@ -3337,8 +3353,16 @@ fn codex_models_from_response(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|version| version.eq_ignore_ascii_case("v2"))
             .then_some(AgentDelegation::V2);
-        let (mut min_effort, mut max_effort) = codex_reasoning_range(entry, id);
-        if agent_delegation != Some(AgentDelegation::V2) {
+        let (mut min_effort, mut max_effort, has_live_reasoning_range) =
+            codex_reasoning_range(entry, id);
+        if agent_delegation == Some(AgentDelegation::V2)
+            && has_live_reasoning_range
+            && max_effort == ygg_ai::ReasoningEffort::Max
+        {
+            // Ultra is the host-side V2 delegation tier over maximum model
+            // reasoning; it is never an offline or standalone wire claim.
+            max_effort = ygg_ai::ReasoningEffort::Ultra;
+        } else if agent_delegation != Some(AgentDelegation::V2) {
             max_effort = max_effort.min(ygg_ai::ReasoningEffort::Max);
             min_effort = min_effort.min(max_effort);
         }
@@ -3366,7 +3390,9 @@ fn codex_models_from_response(
 }
 
 fn codex_model_context_limits(model_id: &str) -> (u64, u64) {
-    if model_id == "gpt-5.4" || model_id == "codex-auto-review" {
+    if model_id == "gpt-6-astra" {
+        (CODEX_LEGACY_CONTEXT_WINDOW, CODEX_ASTRA_MAX_CONTEXT_WINDOW)
+    } else if model_id == "gpt-5.4" || model_id == "codex-auto-review" {
         (CODEX_LEGACY_CONTEXT_WINDOW, CODEX_PRO_CONTEXT_WINDOW)
     } else if model_id.starts_with("gpt-5.6-") {
         (CODEX_5_6_CONTEXT_WINDOW, CODEX_5_6_CONTEXT_WINDOW)
@@ -3406,10 +3432,18 @@ fn codex_model_limits(
     )
 }
 
+fn codex_min_effort(model_id: &str) -> ygg_ai::ReasoningEffort {
+    if model_id == "gpt-6-astra" {
+        ygg_ai::ReasoningEffort::Low
+    } else {
+        ygg_ai::ReasoningEffort::Minimal
+    }
+}
+
 // New Codex families accept the top `max` effort tier. Live discovery narrows
 // this range when the backend publishes explicit supported reasoning levels.
 fn codex_max_effort(model_id: &str) -> ygg_ai::ReasoningEffort {
-    if model_id.starts_with("gpt-5.6-") {
+    if model_id == "gpt-6-astra" || model_id.starts_with("gpt-5.6-") {
         ygg_ai::ReasoningEffort::Max
     } else {
         ygg_ai::ReasoningEffort::High
@@ -3422,6 +3456,7 @@ fn codex_max_effort(model_id: &str) -> ygg_ai::ReasoningEffort {
 /// OAuth model to text-only.
 fn codex_supports_image_input(model_id: &str) -> bool {
     model_id == "codex-mini-latest"
+        || model_id == "gpt-6-astra"
         || model_id.starts_with("gpt-5.4")
         || model_id.starts_with("gpt-5.5")
         || model_id.starts_with("gpt-5.6")
@@ -3506,7 +3541,7 @@ fn fallback_codex_models(
                 context_window: limits.context_window,
                 max_context_window,
                 max_output_tokens: limits.max_output_tokens,
-                min_effort: ygg_ai::ReasoningEffort::Minimal,
+                min_effort: codex_min_effort(model_id),
                 max_effort: codex_max_effort(model_id),
                 responses_lite: false,
                 agent_delegation: None,

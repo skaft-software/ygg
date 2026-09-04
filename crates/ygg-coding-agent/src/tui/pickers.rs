@@ -1580,6 +1580,20 @@ mod tests {
         assert!(descriptions
             .iter()
             .any(|description| description.contains("vision")));
+
+        let astra_index = presentation
+            .ids
+            .iter()
+            .position(|id| id.0 == "gpt-6-astra")
+            .expect("built-in Astra should use the generic model picker path");
+        assert_eq!(presentation.providers[astra_index], "OpenAI");
+        assert_eq!(presentation.labels[astra_index], "GPT-6 Astra");
+        let astra_description = descriptions[astra_index];
+        assert!(astra_description.contains("$10/M"));
+        assert!(astra_description.contains("$50/M"));
+        assert!(astra_description.contains("1.1M ctx"));
+        assert!(astra_description.contains("vision"));
+
         assert!(descriptions.iter().all(|description| {
             !description.contains("tools")
                 && !description.contains("reasoning")

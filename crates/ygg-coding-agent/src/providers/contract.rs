@@ -113,10 +113,12 @@ pub enum DiscoveryCapabilityProfile {
 impl DiscoveryCapabilityProfile {
     /// Whether a sparse API model should receive the GPT image fallback.
     pub(crate) fn gpt_vision_fallback(self, model_id: &str) -> bool {
+        let model_id = model_id.rsplit('/').next().unwrap_or(model_id);
         matches!(self, Self::GptVisionFallback)
             && (model_id.starts_with("gpt-4o")
                 || model_id.starts_with("gpt-4.1")
-                || model_id.starts_with("gpt-5"))
+                || model_id.starts_with("gpt-5")
+                || model_id.starts_with("gpt-6"))
     }
 
     /// Whether sparse models are assumed to accept image input.

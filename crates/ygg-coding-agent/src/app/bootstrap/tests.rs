@@ -10,6 +10,10 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
         Protocol::OpenAiResponses,
         "gpt-5.4"
     ));
+    assert!(discovered_model_supports_reasoning(
+        Protocol::OpenAiResponses,
+        "openai/gpt-6-astra"
+    ));
     assert!(!discovered_model_supports_reasoning(
         Protocol::OpenAiChat,
         "gemma-3-27b-it"
@@ -422,6 +426,10 @@ fn metadata_sparse_multimodal_model_ids_get_a_vision_fallback() {
     assert!(models[0].vision);
     assert!(model_id_implies_vision("gemini-2.5-pro"));
     assert!(model_id_implies_vision("anthropic/claude-sonnet-4-6"));
+    assert!(model_id_implies_vision("openai/gpt-6-astra"));
+    assert!(crate::providers::OPENAI
+        .discovery_capabilities
+        .gpt_vision_fallback("openai/gpt-6-astra"));
     assert!(model_id_implies_vision("deepseek-v4-flash-vision-exp"));
     assert!(!model_id_implies_vision("deepseek-v4-flash"));
     assert!(model_id_implies_vision("Qwen/Qwen2.5-VL-7B"));
@@ -865,7 +873,7 @@ fn write_codex_credential(path: &std::path::Path, localhost: bool, plan: &str) {
 }
 
 #[test]
-fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
+fn codex_models_require_a_usable_credential_and_include_astra_fallback() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("codex.json");
     let store = crate::auth::codex::CredentialStore::new(&path);
@@ -884,12 +892,41 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
     let mut catalog = base_model_catalog(true).unwrap();
     register_openai_codex(&mut catalog, store, false).unwrap();
     for model_id in crate::auth::codex::MODELS {
-        let model = catalog.resolve(&ModelId((*model_id).into())).unwrap();
+        let catalog_id = if *model_id == "gpt-6-astra" {
+            "codex/gpt-6-astra"
+        } else {
+            model_id
+        };
+        let model = catalog.resolve(&ModelId(catalog_id.into())).unwrap();
         assert_eq!(model.endpoint.id.0, crate::auth::codex::ENDPOINT_ID);
         assert_eq!(model.spec.protocol, Protocol::OpenAiResponses);
         assert_eq!(model.spec.limits.context_window, 272_000);
         assert_eq!(model.spec.limits.max_output_tokens, 128_000);
         assert!(model.spec.pricing.is_some());
+        if *model_id == "gpt-6-astra" {
+            assert!(model
+                .spec
+                .capabilities
+                .input_modalities
+                .contains(ygg_ai::Modality::Image));
+            let reasoning = model.spec.capabilities.reasoning.as_ref().unwrap();
+            assert_eq!(reasoning.min_effort, ygg_ai::ReasoningEffort::Low);
+            assert_eq!(reasoning.max_effort, ygg_ai::ReasoningEffort::Max);
+            assert!(!model.spec.capabilities.responses_lite);
+            assert_eq!(model.spec.capabilities.agent_delegation, None);
+            let pricing = model.spec.pricing.as_ref().unwrap();
+            assert_eq!(pricing.input, ygg_ai::TokenRate(10_000_000));
+            assert_eq!(pricing.cache_read, ygg_ai::TokenRate(1_000_000));
+            assert_eq!(pricing.cache_write_5m, ygg_ai::TokenRate(12_500_000));
+            assert_eq!(pricing.output, ygg_ai::TokenRate(50_000_000));
+            assert_eq!(pricing.tiers.len(), 1);
+            let tier = &pricing.tiers[0];
+            assert_eq!(tier.min_input_tokens, 272_001);
+            assert_eq!(tier.input, Some(ygg_ai::TokenRate(20_000_000)));
+            assert_eq!(tier.cache_read, Some(ygg_ai::TokenRate(2_000_000)));
+            assert_eq!(tier.cache_write_5m, Some(ygg_ai::TokenRate(25_000_000)));
+            assert_eq!(tier.output, Some(ygg_ai::TokenRate(75_000_000)));
+        }
         assert!(!model.spec.cache.supports_long_retention);
         assert!(!model.spec.cache.send_session_id_header);
         assert_eq!(
@@ -916,6 +953,33 @@ fn codex_models_require_a_usable_credential_and_include_luna_fallback() {
     // live account discovery can add or remove models independently of it.
     assert!(catalog.resolve(&ModelId("gpt-5.5-pro".into())).is_err());
     assert!(catalog.resolve(&ModelId("gpt-5.6-luna".into())).is_ok());
+    assert_eq!(
+        catalog
+            .resolve(&ModelId("gpt-6-astra".into()))
+            .unwrap()
+            .endpoint
+            .id
+            .0,
+        "openai",
+        "the direct OpenAI route must remain distinct from codex/gpt-6-astra"
+    );
+}
+
+#[test]
+fn codex_astra_fallback_is_conservative_and_retains_advertised_max() {
+    let pro = crate::auth::codex::ChatGptPlan::Pro;
+    let models = fallback_codex_models(Some(&pro));
+    let astra = models
+        .iter()
+        .find(|model| model.id == "gpt-6-astra")
+        .unwrap();
+    assert_eq!(astra.context_window, 272_000);
+    assert_eq!(astra.max_context_window, 872_000);
+    assert_eq!(astra.max_output_tokens, 128_000);
+    assert_eq!(astra.min_effort, ygg_ai::ReasoningEffort::Low);
+    assert_eq!(astra.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert!(!astra.responses_lite);
+    assert_eq!(astra.agent_delegation, None);
 }
 
 #[test]
@@ -1040,7 +1104,8 @@ fn codex_fallback_never_infers_ultra_or_delegation_from_oauth_plan() {
 }
 
 #[test]
-fn codex_spark_is_registered_as_image_capable() {
+fn codex_spark_and_astra_are_registered_as_image_capable() {
+    assert!(codex_supports_image_input("gpt-6-astra"));
     assert!(codex_supports_image_input("gpt-5.3-codex-spark"));
     assert!(codex_supports_image_input("gpt-5.3-codex"));
     assert!(codex_supports_image_input("gpt-5.4-mini"));
@@ -1057,7 +1122,9 @@ fn codex_spark_is_registered_as_image_capable() {
 }
 
 #[test]
-fn codex_catalog_query_uses_the_implemented_schema_version() {
+fn codex_catalog_query_uses_astra_compatible_client_and_cache_versions() {
+    assert_eq!(CODEX_MODELS_CLIENT_VERSION, "0.153.2");
+    assert_eq!(CODEX_MODEL_CACHE_VERSION, 4);
     let url = codex_models_url().unwrap();
     assert_eq!(url.path(), "/backend-api/codex/models");
     assert_eq!(
@@ -1110,6 +1177,71 @@ fn codex_discovery_accepts_account_catalog_and_caps_live_context() {
             .context_window,
         CODEX_LEGACY_CONTEXT_WINDOW
     );
+}
+
+#[test]
+fn codex_astra_live_object_metadata_enables_only_v2_host_ultra() {
+    let mut body = serde_json::json!({
+        "models": [{
+            "slug": "gpt-6-astra",
+            "minimal_client_version": "0.153.0",
+            "supported_in_api": true,
+            "visibility": "hide",
+            "context_window": 1_050_000,
+            "max_context_window": 872_000,
+            "default_reasoning_level": "low",
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "medium"},
+                {"effort": "high"},
+                {"effort": "xhigh"},
+                {"effort": "max"}
+            ],
+            "use_responses_lite": true,
+            "multi_agent_version": "v2"
+        }]
+    });
+    let models = codex_models_from_response(&body, None).unwrap();
+    let astra = &models[0];
+    assert_eq!(astra.id, "gpt-6-astra");
+    assert_eq!(astra.context_window, 272_000);
+    assert_eq!(astra.max_context_window, 872_000);
+    assert_eq!(astra.max_output_tokens, 128_000);
+    assert_eq!(astra.min_effort, ygg_ai::ReasoningEffort::Low);
+    assert_eq!(astra.max_effort, ygg_ai::ReasoningEffort::Ultra);
+    assert!(astra.responses_lite);
+    assert_eq!(astra.agent_delegation, Some(ygg_ai::AgentDelegation::V2));
+    assert!(codex_supports_image_input(&astra.id));
+
+    let offline = conservative_offline_codex_models(models.clone());
+    let offline_astra = &offline[0];
+    assert_eq!(offline_astra.context_window, 272_000);
+    assert_eq!(offline_astra.max_context_window, 872_000);
+    assert_eq!(offline_astra.min_effort, ygg_ai::ReasoningEffort::Low);
+    assert_eq!(offline_astra.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert!(!offline_astra.responses_lite);
+    assert_eq!(offline_astra.agent_delegation, None);
+
+    body["models"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("multi_agent_version");
+    let without_v2 = codex_models_from_response(&body, None).unwrap();
+    let astra = &without_v2[0];
+    assert_eq!(astra.min_effort, ygg_ai::ReasoningEffort::Low);
+    assert_eq!(astra.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert!(astra.responses_lite);
+    assert_eq!(astra.agent_delegation, None);
+}
+
+#[test]
+fn codex_live_inventory_does_not_inject_unadvertised_astra() {
+    let models = codex_models_from_response(
+        &serde_json::json!({"models": [{"slug": "gpt-5.6-sol"}]}),
+        None,
+    )
+    .unwrap();
+    assert!(models.iter().all(|model| model.id != "gpt-6-astra"));
 }
 
 #[test]
@@ -1312,7 +1444,9 @@ fn codex_model_cache_fails_closed_when_stale_future_dated_or_incomplete() {
     let valid_value: serde_json::Value = serde_json::from_slice(&valid).unwrap();
 
     let mut prior_schema = valid_value.clone();
-    prior_schema["version"] = serde_json::json!(CODEX_MODEL_CACHE_VERSION - 1);
+    // Schema 3 predates the Astra-compatible client version and must not hide
+    // newly eligible models for the cache refresh interval.
+    prior_schema["version"] = serde_json::json!(3);
     let prior_schema_store =
         crate::auth::codex::CredentialStore::new(directory.path().join("prior-schema.json"));
     prior_schema_store

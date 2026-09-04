@@ -295,6 +295,11 @@ export OPENAI_API_KEY='...'
 ygg --model gpt-5.4
 ```
 
+The direct OpenAI catalog also includes `gpt-6-astra` on Responses with
+text/image input, a 1.05M-token context window, 128K output, and `low` through
+`max` reasoning effort. Inputs above 272K use its long-context price tier.
+Select it through the same generic path: `ygg --model gpt-6-astra`.
+
 ```sh
 export OPENROUTER_API_KEY='...'
 ygg --model openrouter/anthropic/claude-sonnet-4.6
@@ -380,10 +385,11 @@ ygg --login codex
 ygg --model gpt-5.6
 ```
 
-When that account's live Codex catalog advertises both the `ultra` effort and
-V2 collaboration for the selected model, Ultra is available only while the
-trusted, enabled `ygg-subagents` extension is live. Install and activate that
-extension first so every child session has an observable `/subagents` surface:
+When that account's live Codex catalog advertises a complete top-end reasoning
+range and V2 collaboration for the selected model, Ygg exposes the host-side
+`ultra` tier only while the trusted, enabled `ygg-subagents` extension is live.
+Install and activate that extension first so every child session has an
+observable `/subagents` surface:
 
 ```sh
 ygg extension install ygg-subagents
@@ -399,7 +405,10 @@ The extension owns the model-facing `subagent_*` tools and the host's bounded
 child-session service; the coding product does not expose a parallel native
 collaboration tool surface. Ygg still does not infer Ultra, collaboration, or
 Responses Lite from a model name or subscription plan; missing or unusable
-account-scoped metadata falls back conservatively.
+account-scoped metadata falls back conservatively. A successful live inventory
+is authoritative: if it omits Astra, Ygg does not inject a Codex Astra route.
+When it includes Astra alongside the direct OpenAI preset, the subscription
+route is selectable as `codex/gpt-6-astra`.
 
 GitHub Copilot is intentionally **not** a `ygg --login` or configuration preset.
 An embedding Rust application can own GitHub device login, OAuth storage,
