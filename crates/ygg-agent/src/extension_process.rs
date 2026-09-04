@@ -11796,7 +11796,7 @@ async fn queue_api_v03_child_response(
                 }
                 // Writer admission is the sole terminal outcome boundary.
                 claim.mark_admitted();
-                let completed = tokio::select! {
+                tokio::select! {
                     biased;
                     _ = host_shutdown_requested() => {
                         return Err("host is shutting down".into());
@@ -11808,7 +11808,6 @@ async fn queue_api_v03_child_response(
                             .map_err(|error| pending_error(error).to_string())?;
                     }
                 };
-                let _ = completed;
                 return Ok(ChildResponseAdmission::Queued);
             }
             Err(CHILD_RESPONDING) => {
@@ -14764,7 +14763,7 @@ confirmations = true
                 .expect("response frame deadline")
                 .expect("response frame");
             let response = serde_json::from_slice::<serde_json::Value>(
-                frame.line.strip_suffix(&[b'\n']).unwrap(),
+                frame.line.strip_suffix(b"\n").unwrap(),
             )
             .unwrap();
             assert_eq!(response["result"]["session_id"], result_session_id);
