@@ -957,11 +957,12 @@ fn manifest_for_plan(
             notifications: true,
             confirmations: true,
             presentation: false,
+            providers: false,
         },
         // An aggregate is one exact ordered bridge invocation. Its generated
         // arguments carry every locked source fingerprint, so the runtime
         // catalog's complete manifest digest cannot pool a subset/reordering.
-        runtime: if sources.len() > 1 {
+        runtime: if plan.sources.len() > 1 {
             ExtensionRuntimeSettings {
                 lifecycle: ExtensionLifecycleProfile::PiAggregate,
                 sharing: ExtensionRuntimeSharing::Workspace,
@@ -2655,6 +2656,13 @@ mod tests {
             &record.link_identity,
         )
         .unwrap();
+        assert_eq!(
+            manifest.runtime,
+            ExtensionRuntimeSettings {
+                lifecycle: ExtensionLifecycleProfile::PiAggregate,
+                sharing: ExtensionRuntimeSharing::Workspace,
+            }
+        );
         let ordered = manifest
             .entrypoint
             .args

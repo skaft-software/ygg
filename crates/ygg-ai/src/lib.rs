@@ -69,7 +69,8 @@ pub use responses::{
     ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
 pub use stream::{
-    CanonicalStreamAssembler, ProviderLifecycle, ProviderLifecycleState, ResponseStream, StreamEvent,
+    CanonicalStreamAssembler, ProviderLifecycle, ProviderLifecycleState, ResponseStream,
+    StreamEvent,
 };
 pub use transform::transform_messages;
 pub use types::{

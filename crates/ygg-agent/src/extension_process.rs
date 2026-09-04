@@ -5877,24 +5877,22 @@ impl ExtensionProcess {
         let session_hook_end_reason = if previous_crashed { "crash" } else { "reload" };
         let settled_session_hook_bindings =
             self.take_session_hook_bindings_for_generation(previous.generation);
-        let session_hook_ends =
-            futures_util::future::join_all(settled_session_hook_bindings.iter().map(|binding| {
-                let endpoint = if previous_crashed {
-                    &replacement_endpoint
-                } else {
-                    &binding.endpoint
-                };
-                self.dispatch_session_hook_end(
-                    binding,
-                    endpoint,
-                    ExtensionLifecycleOutcome::Interrupted,
-                    session_hook_end_reason,
-                )
-            }))
+        if !previous_crashed {
+            let session_hook_ends = futures_util::future::join_all(
+                settled_session_hook_bindings.iter().map(|binding| {
+                    self.dispatch_session_hook_end(
+                        binding,
+                        &binding.endpoint,
+                        ExtensionLifecycleOutcome::Interrupted,
+                        session_hook_end_reason,
+                    )
+                }),
+            )
             .await;
-        for result in session_hook_ends {
-            if let Err(error) = result {
-                self.emit_session_hook_failure("session_end", &error);
+            for result in session_hook_ends {
+                if let Err(error) = result {
+                    self.emit_session_hook_failure("session_end", &error);
+                }
             }
         }
 
@@ -6065,6 +6063,28 @@ impl ExtensionProcess {
                         "replacement tool catalog could not be published after cutover: {message}"
                     ),
                 });
+            }
+        }
+        // A replacement's reader remains paused until cutover. Crash recovery
+        // finalizers must therefore wait until the replacement is authoritative
+        // before awaiting its response; otherwise the bounded finalizer times
+        // out against its own paused reader.
+        if previous_crashed {
+            let session_hook_ends = futures_util::future::join_all(
+                settled_session_hook_bindings.iter().map(|binding| {
+                    self.dispatch_session_hook_end(
+                        binding,
+                        &replacement_endpoint,
+                        ExtensionLifecycleOutcome::Interrupted,
+                        session_hook_end_reason,
+                    )
+                }),
+            )
+            .await;
+            for result in session_hook_ends {
+                if let Err(error) = result {
+                    self.emit_session_hook_failure("session_end", &error);
+                }
             }
         }
         let replacement_session_hook_bindings = self.install_replacement_session_hook_bindings(
@@ -7853,6 +7873,7 @@ impl ProcessConnection {
             false,
             None,
             None,
+            None,
             Some(resource_owner),
             None,
         )
@@ -8688,6 +8709,7 @@ fn decode_provider_stream_event(
             let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
             Ok(DecodedProviderStreamEvent::Emit(StreamEvent::ToolCallEnd {
                 index: payload.index,
+                argument_error: None,
             }))
         }
         "usage" => {

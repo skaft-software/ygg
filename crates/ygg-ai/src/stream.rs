@@ -900,10 +900,12 @@ impl CanonicalStreamAssembler {
             StreamEvent::ReasoningEnd { index } => {
                 self.end_part(*index, CanonicalPartKind::Reasoning)?
             }
-            StreamEvent::ToolCallEnd { index } => {
+            StreamEvent::ToolCallEnd { index, .. } => {
                 self.end_part(*index, CanonicalPartKind::ToolCall)?
             }
-            StreamEvent::MediaCompleted { .. } | StreamEvent::Usage(_) => {}
+            StreamEvent::MediaCompleted { .. }
+            | StreamEvent::ProviderLifecycle(_)
+            | StreamEvent::Usage(_) => {}
         }
         self.builder.on_event(&event)
     }
@@ -1514,6 +1516,12 @@ mod tests {
                 response_id: Some("response-1".to_owned()),
             })
             .expect("started");
+        assembler
+            .push(StreamEvent::ProviderLifecycle(ProviderLifecycle {
+                state: ProviderLifecycleState::Loading,
+                detail: Some("warming".to_owned()),
+            }))
+            .expect("lifecycle feedback");
         assembler
             .push(StreamEvent::TextStart { index: 0 })
             .expect("text start");
