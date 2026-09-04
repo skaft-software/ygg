@@ -2,7 +2,9 @@
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::error::Error as _;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -12,11 +14,12 @@ use crate::error::{
     AiError, DecodeError, HttpError, ProviderError, StreamProgress, StreamProtocolError,
     TransportError, TransportPhase,
 };
+use crate::host_transport::{HostStreamModel, HostStreamTransport};
 use crate::responses_ws::{ResponsesWsLiveness, ResponsesWsPool};
 use crate::stream::{
     ProviderLifecycle, ProviderLifecycleState, ResponseBuilder, ResponseStream, StreamEvent,
 };
-use crate::types::{Protocol, Request, Response, ToolDef};
+use crate::types::{EndpointId, Protocol, Request, Response, ToolDef};
 use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
@@ -1391,6 +1394,7 @@ fn responses_websocket_stream(
 pub struct AiClient {
     http: reqwest::Client,
     responses_ws: ResponsesWsPool,
+    host_stream_transports: Arc<StdMutex<HashMap<EndpointId, Arc<dyn HostStreamTransport>>>>,
     stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
@@ -1426,6 +1430,7 @@ impl AiClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             responses_ws: ResponsesWsPool::default(),
+            host_stream_transports: Arc::new(StdMutex::new(HashMap::new())),
             stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
@@ -1437,10 +1442,36 @@ impl AiClient {
         Self {
             http,
             responses_ws: ResponsesWsPool::default(),
+            host_stream_transports: Arc::new(StdMutex::new(HashMap::new())),
             stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
         }
+    }
+
+    /// Registers a host-owned stream transport for one catalog endpoint.
+    ///
+    /// The registration is shared by clones of this client. The transport sees
+    /// only canonical request data and [`crate::HostStreamModel`]; resolved
+    /// credentials, endpoint URLs, and headers are deliberately not exposed.
+    /// Replacing a transport is an explicit host authority action.
+    pub fn register_host_stream_transport(
+        &self,
+        endpoint: EndpointId,
+        transport: Arc<dyn HostStreamTransport>,
+    ) {
+        self.host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(endpoint, transport);
+    }
+
+    /// Removes a host-owned stream transport for one endpoint.
+    pub fn remove_host_stream_transport(&self, endpoint: &EndpointId) {
+        self.host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(endpoint);
     }
 
     /// Sets the maximum quiet interval and absolute lifetime of response bodies,
@@ -1572,6 +1603,38 @@ impl AiClient {
         crate::catalog::validate_model_spec(&model.spec)?;
         if model.spec.endpoint != model.endpoint.id {
             return Err(crate::ConfigError::UnknownEndpoint(model.spec.endpoint.clone()).into());
+        }
+
+        let host_transport = self
+            .host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&model.endpoint.id)
+            .cloned();
+        if let Some(transport) = host_transport {
+            // Keep host-mediated transports on the canonical side of the same
+            // replay-history and capability boundary as HTTP codecs. Unlike a
+            // protocol codec they cannot safely perform lossy wire-specific
+            // degradation, so validate strictly rather than exposing an
+            // unsupported canonical feature to an extension transport.
+            let mut request = req;
+            request.messages =
+                crate::transform::transform_request_messages_owned(request.messages, model);
+            let request =
+                crate::validate::normalize_request_reasoning(&request, &model.spec.capabilities)
+                    .into_owned();
+            let diagnostics = crate::validate::validate_request(
+                &request,
+                &model.spec.capabilities,
+                &model.spec.limits,
+                model.spec.protocol,
+                &model.spec.id,
+                crate::CompatibilityMode::Strict,
+            )?;
+            let stream = transport
+                .stream(HostStreamModel::from(model), request, diagnostics)
+                .await?;
+            return Ok(crate::stream::guard(stream));
         }
 
         // Derive target-compatible replay history without mutating the caller's

@@ -36,6 +36,7 @@ pub mod auth;
 pub mod catalog;
 pub mod client;
 pub mod error;
+pub mod host_transport;
 mod json_repair;
 pub mod model_metadata;
 pub mod pricing;
@@ -60,13 +61,16 @@ pub use error::{
     ProviderError, StreamProgress, StreamProtocolError, TransportError, TransportPhase,
     UnsupportedError, ValidationError,
 };
+pub use host_transport::{HostStreamModel, HostStreamTransport};
 pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};
 pub use responses::{
     ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
     ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
-pub use stream::{ProviderLifecycle, ProviderLifecycleState, ResponseStream, StreamEvent};
+pub use stream::{
+    CanonicalStreamAssembler, ProviderLifecycle, ProviderLifecycleState, ResponseStream, StreamEvent,
+};
 pub use transform::transform_messages;
 pub use types::{
     AgentDelegation, AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,

@@ -141,6 +141,54 @@
       "value": 4096,
       "description": "Maximum UTF-8 bytes in one migration diagnostic reason.",
       "negotiated": false
+    },
+    {
+      "name": "max_providers",
+      "value": 32,
+      "description": "Maximum live extension-provider declarations across one host registry.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_models",
+      "value": 256,
+      "description": "Maximum live extension-provider model declarations across one host registry.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_id_bytes",
+      "value": 64,
+      "description": "Maximum UTF-8 bytes in an extension provider or model identifier.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_label_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in an extension provider or model display label.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_auth_scopes",
+      "value": 32,
+      "description": "Maximum OAuth or credential scopes in one host-policy request.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_auth_lease_bytes",
+      "value": 256,
+      "description": "Maximum UTF-8 bytes in an opaque host-issued authorization lease.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_stream_event_bytes",
+      "value": 65536,
+      "description": "Maximum canonical bytes in one provider stream event payload.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_stream_events",
+      "value": 100000,
+      "description": "Maximum events accepted for one extension-provider stream.",
+      "negotiated": false
     }
   ],
   "capabilities": [
@@ -171,6 +219,24 @@
     {
       "name": "migration.adapter.v1",
       "description": "Bounded read-only setup detection and import conversion for host-owned migration ingestion.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_auth",
+      "description": "Explicit host-policy OAuth and credential authorization requests with opaque leases only.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_catalog",
+      "description": "Lifecycle-owned registration of secret-free extension provider and model catalogs.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_stream",
+      "description": "Bounded host-mediated inference stream proxying for registered extension models.",
       "host_offer": "optional",
       "status": "foundation"
     },
@@ -251,6 +317,94 @@
       "status": "foundation",
       "params": "MigrationImportParams",
       "result": "MigrationImportResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/auth/request",
+      "direction": "extension_to_host",
+      "capability": "provider_auth",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderAuthorizationRequest",
+      "result": "ProviderAuthorizationResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/auth/revoke",
+      "direction": "extension_to_host",
+      "capability": "provider_auth",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderAuthorizationRequest",
+      "result": "ProviderAuthorizationResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/cancel",
+      "direction": "host_to_extension",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamCancelParams",
+      "result": null,
+      "terminal": "stream_event",
+      "notification": true
+    },
+    {
+      "name": "provider/event",
+      "direction": "extension_to_host",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamEvent",
+      "result": null,
+      "terminal": "stream_event",
+      "notification": true
+    },
+    {
+      "name": "provider/stream",
+      "direction": "host_to_extension",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamRequest",
+      "result": "ProviderStreamAccepted",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/register",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderRegisterParams",
+      "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/unregister",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderUnregisterParams",
+      "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/update",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderUpdateParams",
+      "result": "ProviderCatalogResult",
       "terminal": "result_or_error",
       "notification": false
     },
@@ -1167,6 +1321,422 @@
           "nullable": false
         }
       ]
+    },
+    {
+      "name": "ProviderAuthRequirement",
+      "description": "Secret-free authentication class requested by an extension provider. Credential values and authorization URLs are never protocol fields.",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "none",
+            "oauth",
+            "host_credential"
+          ]
+        },
+        {
+          "name": "subject",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "scopes",
+          "type": "string[]",
+          "presence": "optional",
+          "nullable": false,
+          "max_items": "max_provider_auth_scopes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderDefinition",
+      "description": "One secret-free provider declaration owned by the current extension process generation.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "label",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_label_bytes"
+        },
+        {
+          "name": "auth",
+          "type": "ProviderAuthRequirement",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderModelCapabilities",
+      "description": "Capability subset advertised for a provider-owned model. Media and endpoint configuration remain host policy.",
+      "fields": [
+        {
+          "name": "tools",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "parallel_tool_calls",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "structured_output",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reasoning",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderModelDefinition",
+      "description": "A model in a provider-owned catalog. It contains no endpoint, header, credential, or URL material.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "api_name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "protocol",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages"
+          ]
+        },
+        {
+          "name": "context_window",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "max_output_tokens",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "capabilities",
+          "type": "ProviderModelCapabilities",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "display_name",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_label_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderRegisterParams",
+      "description": "Atomic initial registration of one provider and its complete current model set.",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "ProviderDefinition",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "models",
+          "type": "ProviderModelDefinition[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderUpdateParams",
+      "description": "Atomic replacement of one owned provider and its complete current model set.",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "ProviderDefinition",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "models",
+          "type": "ProviderModelDefinition[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderUnregisterParams",
+      "description": "Removal of a provider owned by the current extension process generation.",
+      "fields": [
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderCatalogResult",
+      "description": "Acknowledgement of an atomic provider catalog mutation. IDs are inspectable only; no secret data is retained.",
+      "fields": [
+        {
+          "name": "revision",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "provider_ids",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_providers"
+        },
+        {
+          "name": "model_ids",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamRequest",
+      "description": "Host-to-extension inference request using canonical request JSON and an optional opaque host authorization lease.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "model_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "request",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "authorization_lease",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_auth_lease_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamAccepted",
+      "description": "Explicit acceptance fact for a provider stream. Acceptance ambiguity never authorizes an automatic replay.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "accepted",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamEvent",
+      "description": "One ordered, bounded canonical provider stream event. Payload shape is selected by kind and decoded by the host.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "sequence",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "started",
+            "text_start",
+            "text_delta",
+            "text_end",
+            "reasoning_start",
+            "reasoning_delta",
+            "reasoning_end",
+            "tool_call_start",
+            "tool_call_args_delta",
+            "tool_call_end",
+            "usage",
+            "finished",
+            "error",
+            "heartbeat"
+          ]
+        },
+        {
+          "name": "payload",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamCancelParams",
+      "description": "Best-effort cancellation notification for an accepted provider stream.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderAuthorizationRequest",
+      "description": "Explicit extension request for host-policy authorization. It never carries credential values, URLs, or callback endpoints.",
+      "fields": [
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "action",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "authorize",
+            "refresh",
+            "revoke"
+          ]
+        },
+        {
+          "name": "interactive",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "scopes",
+          "type": "string[]",
+          "presence": "optional",
+          "nullable": false,
+          "max_items": "max_provider_auth_scopes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderAuthorizationResult",
+      "description": "Host-policy authorization state and an optional opaque, non-secret request-scoped lease.",
+      "fields": [
+        {
+          "name": "status",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "ready",
+            "pending",
+            "denied",
+            "unavailable",
+            "revoked"
+          ]
+        },
+        {
+          "name": "lease",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_auth_lease_bytes"
+        }
+      ]
     }
   ],
   "fixtures": [
@@ -1204,7 +1774,10 @@
             "tool_call"
           ],
           "optional_capabilities": [
-            "migration.adapter.v1"
+            "migration.adapter.v1",
+            "provider_auth",
+            "provider_catalog",
+            "provider_stream"
           ],
           "required_methods": [
             "$/cancelRequest",
@@ -1214,7 +1787,15 @@
           ],
           "optional_methods": [
             "migration/detect",
-            "migration/import"
+            "migration/import",
+            "provider/auth/request",
+            "provider/auth/revoke",
+            "provider/cancel",
+            "provider/event",
+            "provider/stream",
+            "providers/register",
+            "providers/unregister",
+            "providers/update"
           ],
           "limits": {
             "max_frame_bytes": 1048576,
@@ -1476,6 +2057,93 @@
           }
         ]
       }
+    },
+    {
+      "name": "provider-register-params",
+      "value": {
+        "provider": {
+          "auth": {
+            "kind": "none"
+          },
+          "id": "fixture-provider",
+          "label": "Fixture provider"
+        },
+        "models": [
+          {
+            "api_name": "fixture-model",
+            "capabilities": {
+              "parallel_tool_calls": false,
+              "reasoning": false,
+              "structured_output": true,
+              "tools": true
+            },
+            "context_window": 32768,
+            "id": "fixture-model",
+            "max_output_tokens": 4096,
+            "protocol": "openai_chat"
+          }
+        ]
+      }
+    },
+    {
+      "name": "provider-catalog-result",
+      "value": {
+        "revision": 1,
+        "provider_ids": [
+          "fixture-provider"
+        ],
+        "model_ids": [
+          "fixture-provider/fixture-model"
+        ]
+      }
+    },
+    {
+      "name": "provider-stream-params",
+      "value": {
+        "stream_id": "stream-1",
+        "provider_id": "fixture-provider",
+        "model_id": "fixture-model",
+        "request": {
+          "messages": [],
+          "tools": []
+        }
+      }
+    },
+    {
+      "name": "provider-stream-accepted",
+      "value": {
+        "stream_id": "stream-1",
+        "accepted": true
+      }
+    },
+    {
+      "name": "provider-stream-event",
+      "value": {
+        "stream_id": "stream-1",
+        "sequence": 0,
+        "kind": "started",
+        "payload": {
+          "response_id": "fixture-response"
+        }
+      }
+    },
+    {
+      "name": "provider-authorization-request",
+      "value": {
+        "provider_id": "fixture-provider",
+        "action": "authorize",
+        "interactive": true,
+        "scopes": [
+          "inference"
+        ]
+      }
+    },
+    {
+      "name": "provider-authorization-result",
+      "value": {
+        "status": "ready",
+        "lease": "opaque-lease"
+      }
     }
   ],
   "canonical_profile": {
@@ -1620,6 +2288,13 @@
     {
       "name": "lone-low-surrogate-key",
       "raw": "{\"\\udc00\":1}"
+    },
+    {
+      "name": "provider-auth-credential-field",
+      "value": {
+        "kind": "host_credential",
+        "credential": "not-allowed"
+      }
     }
   ]
 }

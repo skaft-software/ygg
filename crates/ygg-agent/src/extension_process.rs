@@ -23,7 +23,11 @@ use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Notify, Semaphore};
-use ygg_ai::{Media, ToolDef};
+use ygg_ai::{
+    AiError, CanonicalStreamAssembler, Diagnostic, HostStreamModel, HostStreamTransport, Media,
+    Protocol, ProviderError, ResponseStream, StopReason, StreamEvent, ToolCallId, ToolDef,
+    TransportError, TransportPhase, Usage,
+};
 
 use crate::artifact::{ArtifactId, ArtifactPublication, ArtifactSource, ArtifactStore};
 use crate::delegation::{
@@ -42,6 +46,9 @@ use crate::extension_policy::{
     ExtensionActionIntent, ExtensionApprovalStore, ExtensionApprovalToken, ExtensionPolicyDecision,
 };
 use crate::extension_presentation::ExtensionPresentationSnapshot;
+use crate::extension_provider::{
+    ExtensionProviderOwner, ExtensionProviderRegistry, ExtensionProviderRegistryError,
+};
 use crate::extension_secret::{ExtensionSecretBroker, ExtensionSecretRequest};
 use crate::tool::{
     CancellationToken, OutputStream, ReplaySafety, Tool, ToolContext, ToolError, ToolOutput,
@@ -155,6 +162,9 @@ const DEFAULT_PENDING_REQUESTS: usize = 64;
 const DEFAULT_WRITER_QUEUE: usize = 128;
 const DEFAULT_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
+const DEFAULT_PROVIDER_STREAM_BUFFER: usize = 32;
+const DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PROVIDER_STREAM_DEADLINE: Duration = Duration::from_secs(5 * 60);
 const MAX_TOMBSTONES: usize = 512;
 const MAX_CHILD_REQUESTS: usize = 128;
 const MAX_CHILD_WORKERS: usize = 8;
@@ -1405,6 +1415,11 @@ if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.
                     .into(),
             ));
         }
+        if self.api_version != EXTENSION_API_VERSION_0_3 && self.contributes.providers {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "provider catalogs require extension API 0.3".into(),
+            ));
+        }
         if self.api_version == EXTENSION_API_VERSION_0_3
             && (!self.contributes.commands.is_empty()
                 || !self.contributes.hooks.is_empty()
@@ -1557,6 +1572,10 @@ pub struct ManifestContributions {
     /// Whether API `0.2` semantic presentation snapshots may arrive.
     #[serde(default, skip_serializing_if = "is_false")]
     pub presentation: bool,
+    /// Whether this API `0.3` extension may register a lifecycle-owned,
+    /// secret-free provider/model catalog.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub providers: bool,
 }
 
 /// Supported extension lifecycle hooks.
@@ -2103,6 +2122,8 @@ pub struct ExtensionContributions {
     pub confirmations: bool,
     /// Whether semantic presentation snapshots may arrive from the process.
     pub presentation: bool,
+    /// Whether the current API 0.3 contract permits provider catalog mutation.
+    pub providers: bool,
 }
 
 /// Session and model facts exposed to an extension through typed requests.
@@ -3426,6 +3447,16 @@ pub struct ExtensionRuntimeConfig {
     /// only when this is configured and the manifest declares secret names.
     /// The broker must not strongly retain this extension process.
     pub secret_broker: Option<Arc<dyn ExtensionSecretBroker>>,
+    /// Shared lifecycle registry for API 0.3 extension provider catalogs.
+    /// When absent, provider capabilities may not be negotiated or published.
+    pub provider_registry: Option<Arc<ExtensionProviderRegistry>>,
+    /// Bounded number of provider events held for one caller before the host
+    /// cancels the stream rather than buffering unbounded output.
+    pub provider_stream_buffer: usize,
+    /// Maximum quiet interval between accepted provider stream events.
+    pub provider_stream_idle_timeout: Duration,
+    /// Absolute maximum duration of an accepted provider stream.
+    pub provider_stream_deadline: Duration,
     /// Maximum duration of one request.
     pub request_timeout: Duration,
     /// Per-stage shutdown timeout, applied once to the shutdown request/ack and
@@ -3457,6 +3488,16 @@ impl std::fmt::Debug for ExtensionRuntimeConfig {
             .field("agent_sessions", &self.agent_sessions)
             .field("approvals", &self.approvals)
             .field("secret_broker_configured", &self.secret_broker.is_some())
+            .field(
+                "provider_registry_configured",
+                &self.provider_registry.is_some(),
+            )
+            .field("provider_stream_buffer", &self.provider_stream_buffer)
+            .field(
+                "provider_stream_idle_timeout",
+                &self.provider_stream_idle_timeout,
+            )
+            .field("provider_stream_deadline", &self.provider_stream_deadline)
             .field("request_timeout", &self.request_timeout)
             .field("shutdown_timeout", &self.shutdown_timeout)
             .field("max_message_bytes", &self.max_message_bytes)
@@ -3478,6 +3519,10 @@ impl ExtensionRuntimeConfig {
             agent_sessions: false,
             approvals: false,
             secret_broker: None,
+            provider_registry: None,
+            provider_stream_buffer: DEFAULT_PROVIDER_STREAM_BUFFER,
+            provider_stream_idle_timeout: DEFAULT_PROVIDER_STREAM_IDLE_TIMEOUT,
+            provider_stream_deadline: DEFAULT_PROVIDER_STREAM_DEADLINE,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             shutdown_timeout: DEFAULT_SHUTDOWN_TIMEOUT,
             max_message_bytes: DEFAULT_EXTENSION_MESSAGE_BYTES,
@@ -3671,6 +3716,22 @@ pub mod methods {
     pub const TOOLS_REGISTER: &str = "tools/register";
     /// Extension-to-host live tool removal request.
     pub const TOOLS_UNREGISTER: &str = "tools/unregister";
+    /// Extension-to-host atomic provider catalog registration.
+    pub const PROVIDERS_REGISTER: &str = "providers/register";
+    /// Extension-to-host atomic provider catalog replacement.
+    pub const PROVIDERS_UPDATE: &str = "providers/update";
+    /// Extension-to-host provider catalog removal.
+    pub const PROVIDERS_UNREGISTER: &str = "providers/unregister";
+    /// Host-to-extension provider inference stream request.
+    pub const PROVIDER_STREAM: &str = "provider/stream";
+    /// Extension-to-host ordered provider stream event notification.
+    pub const PROVIDER_EVENT: &str = "provider/event";
+    /// Host-to-extension best-effort provider stream cancellation.
+    pub const PROVIDER_CANCEL: &str = "provider/cancel";
+    /// Extension-to-host explicit host-policy authorization request.
+    pub const PROVIDER_AUTH_REQUEST: &str = "provider/auth/request";
+    /// Extension-to-host explicit authorization revocation request.
+    pub const PROVIDER_AUTH_REVOKE: &str = "provider/auth/revoke";
     /// Extension request to create one host-owned child model session.
     pub const AGENT_SPAWN: &str = "agent/spawn";
     /// Extension request to send steering input to an owned child session.
@@ -4098,11 +4159,14 @@ impl ExtensionProcess {
         if config.max_message_bytes == 0
             || config.max_pending_requests == 0
             || config.writer_queue_capacity == 0
+            || config.provider_stream_buffer == 0
             || config.cancellation_grace.is_zero()
             || config.tombstone_ttl.is_zero()
+            || config.provider_stream_idle_timeout.is_zero()
+            || config.provider_stream_deadline.is_zero()
         {
             return Err(ExtensionRuntimeError::Protocol(
-                "message, request, writer, cancellation, and tombstone limits must be greater than zero"
+                "message, request, writer, provider stream, cancellation, and tombstone limits must be greater than zero"
                     .into(),
             ));
         }
@@ -4148,6 +4212,7 @@ impl ExtensionProcess {
             catalog_updates.clone(),
             Arc::clone(&delegation_service),
             Arc::clone(&approval_store),
+            false,
         )
         .await?;
         let process = Self {
@@ -4292,6 +4357,22 @@ impl ExtensionProcess {
         !read_std_lock(&self.inner.connection)
             .closed
             .load(Ordering::Acquire)
+    }
+
+    /// Builds a host-owned transport for one registered extension provider
+    /// model. The product chooses where to install this transport in its
+    /// canonical model catalog; the extension never receives endpoint URLs,
+    /// headers, or credentials through this handle.
+    pub fn provider_stream_transport(
+        &self,
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> Arc<dyn HostStreamTransport> {
+        Arc::new(ExtensionProviderStreamTransport {
+            process: Arc::downgrade(&self.inner),
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+        })
     }
 
     /// Builds the current ambient execution context for command, hook,
@@ -5433,6 +5514,7 @@ impl ExtensionProcess {
             self.inner.catalog_updates.clone(),
             Arc::clone(&self.inner.delegation_service),
             Arc::clone(&self.inner.approval_store),
+            true,
         )
         .await?;
         tokio::spawn(forward_candidate_events(
@@ -5653,6 +5735,7 @@ impl ExtensionProcess {
             }
 
             *active = Arc::clone(&replacement);
+            replacement.activate_post_initialize();
             self.inner.generation.store(generation, Ordering::Release);
             self.inner.generation_changed.notify_waiters();
             let catalog_publication = replacement_reservation
@@ -6783,6 +6866,14 @@ impl ProtocolFrameLimit {
     }
 }
 
+struct ProviderStreamIngress {
+    sender: mpsc::Sender<api_v03::ProviderStreamEvent>,
+    next_sequence: usize,
+    terminal: bool,
+}
+
+type ProviderStreams = Arc<StdMutex<HashMap<String, ProviderStreamIngress>>>;
+
 struct ProcessConnection {
     writer: mpsc::Sender<WriterFrame>,
     child: Arc<Mutex<Child>>,
@@ -6802,6 +6893,8 @@ struct ProcessConnection {
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
     api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
+    initialization_complete: Arc<AtomicBool>,
+    initialization_changed: Arc<Notify>,
     catalog_guard: StdRwLock<()>,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_revision: AtomicU64,
@@ -6812,6 +6905,14 @@ struct ProcessConnection {
     artifact_leases: AtomicU64,
     artifact_leases_changed: Notify,
     artifacts_settled: AtomicBool,
+    provider_registry: Option<Arc<ExtensionProviderRegistry>>,
+    provider_owner: ExtensionProviderOwner,
+    provider_streams: ProviderStreams,
+    next_provider_stream_id: AtomicU64,
+    provider_stream_buffer: usize,
+    provider_stream_idle_timeout: Duration,
+    provider_stream_deadline: Duration,
+    provider_owner_removed: AtomicBool,
     process_group: ProcessGroupGuard,
 }
 
@@ -7252,6 +7353,49 @@ impl ProcessConnection {
             let _ = self.artifact_store.settle_generation(self.generation);
         }
     }
+
+    fn remove_provider_owner(&self) {
+        if !self.provider_owner_removed.swap(true, Ordering::AcqRel) {
+            if let Some(registry) = &self.provider_registry {
+                registry.remove_owner(&self.provider_owner);
+            }
+        }
+    }
+
+    fn activate_post_initialize(&self) {
+        self.initialization_complete.store(true, Ordering::Release);
+        self.initialization_changed.notify_waiters();
+    }
+
+    fn cancel_provider_stream(&self, stream_id: &str, reason: &str) {
+        let removed = lock_std_mutex(&self.provider_streams).remove(stream_id);
+        if removed.is_some()
+            && !self.closed.load(Ordering::Acquire)
+            && self
+                .require_api_v03_host_method(methods::PROVIDER_CANCEL)
+                .is_ok()
+        {
+            let _ = self.queue_notification(
+                methods::PROVIDER_CANCEL,
+                serde_json::json!({"stream_id": stream_id, "reason": reason}),
+            );
+        }
+    }
+
+    fn cancel_all_provider_streams(&self, reason: &str) {
+        let ids = lock_std_mutex(&self.provider_streams)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for stream_id in ids {
+            self.cancel_provider_stream(&stream_id, reason);
+        }
+    }
+
+    fn settle_provider_stream(&self, stream_id: &str) {
+        lock_std_mutex(&self.provider_streams).remove(stream_id);
+    }
+
     async fn request(
         self: &Arc<Self>,
         method: &str,
@@ -7884,6 +8028,8 @@ impl ProcessConnection {
     async fn shutdown(self: &Arc<Self>) -> bool {
         self.begin_drain();
         self.cancel_all_pending("shutdown");
+        self.cancel_all_provider_streams("shutdown");
+        self.remove_provider_owner();
         let quiescent = tokio::time::timeout(self.shutdown_timeout, async {
             loop {
                 let changed = self.artifact_leases_changed.notified();
@@ -7957,6 +8103,8 @@ impl ProcessConnection {
 
     async fn terminate(&self) {
         self.draining.store(true, Ordering::Release);
+        self.cancel_all_provider_streams("terminated");
+        self.remove_provider_owner();
         self.kill_process_group();
         let mut child = self.child.lock().await;
         let _ = child.kill().await;
@@ -7980,8 +8128,489 @@ impl ProcessConnection {
 
 impl Drop for ProcessConnection {
     fn drop(&mut self) {
+        self.remove_provider_owner();
+        lock_std_mutex(&self.provider_streams).clear();
         self.process_group.terminate_now();
         self.settle_artifacts();
+    }
+}
+
+/// Host-facing adapter for one extension-owned provider/model route.
+///
+/// It resolves the active process generation for every request so a stale
+/// catalog route cannot continue to call a replaced process.
+struct ExtensionProviderStreamTransport {
+    process: Weak<ExtensionProcessInner>,
+    provider_id: String,
+    model_id: String,
+}
+
+struct ProviderStreamCancellation {
+    connection: Weak<ProcessConnection>,
+    stream_id: String,
+    armed: bool,
+}
+
+impl ProviderStreamCancellation {
+    fn new(connection: &Arc<ProcessConnection>, stream_id: String) -> Self {
+        Self {
+            connection: Arc::downgrade(connection),
+            stream_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProviderStreamCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(connection) = self.connection.upgrade() {
+                connection.cancel_provider_stream(&self.stream_id, "caller dropped stream");
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderStartedPayload {
+    #[serde(default)]
+    response_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderIndexPayload {
+    index: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderDeltaPayload {
+    index: usize,
+    delta: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderToolCallStartPayload {
+    index: usize,
+    id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderUsagePayload {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_read_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
+    #[serde(default)]
+    cache_write_1h_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    reasoning_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
+impl From<ProviderUsagePayload> for Usage {
+    fn from(value: ProviderUsagePayload) -> Self {
+        Self {
+            input_tokens: value.input_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            cache_write_tokens: value.cache_write_tokens,
+            cache_write_1h_tokens: value.cache_write_1h_tokens,
+            output_tokens: value.output_tokens,
+            reasoning_tokens: value.reasoning_tokens,
+            total_tokens: value.total_tokens,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderFinishedPayload {
+    stop_reason: StopReason,
+}
+
+enum DecodedProviderStreamEvent {
+    Emit(StreamEvent),
+    Finish(StopReason),
+    Heartbeat,
+    Error,
+}
+
+enum ProviderStreamWait {
+    Event(Option<api_v03::ProviderStreamEvent>),
+    Idle,
+    Deadline,
+}
+
+fn invalid_provider_stream_event() -> AiError {
+    AiError::StreamProtocol(ygg_ai::StreamProtocolError::UnexpectedEvent(
+        "invalid extension provider stream event".to_owned(),
+    ))
+}
+
+fn decode_provider_stream_payload<T: DeserializeOwned>(
+    payload: serde_json::Value,
+) -> Result<T, AiError> {
+    serde_json::from_value(payload).map_err(|_| invalid_provider_stream_event())
+}
+
+fn decode_provider_stream_event(
+    event: api_v03::ProviderStreamEvent,
+) -> Result<DecodedProviderStreamEvent, AiError> {
+    let payload = event.payload;
+    match event.kind.as_str() {
+        "started" => {
+            let payload: ProviderStartedPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::Started {
+                response_id: payload.response_id,
+            }))
+        }
+        "text_start" => {
+            let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextStart {
+                index: payload.index,
+            }))
+        }
+        "text_delta" => {
+            let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextDelta {
+                index: payload.index,
+                delta: payload.delta,
+            }))
+        }
+        "text_end" => {
+            let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::TextEnd {
+                index: payload.index,
+            }))
+        }
+        "reasoning_start" => {
+            let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(
+                StreamEvent::ReasoningStart {
+                    index: payload.index,
+                },
+            ))
+        }
+        "reasoning_delta" => {
+            let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(
+                StreamEvent::ReasoningDelta {
+                    index: payload.index,
+                    delta: payload.delta,
+                },
+            ))
+        }
+        "reasoning_end" => {
+            let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(
+                StreamEvent::ReasoningEnd {
+                    index: payload.index,
+                },
+            ))
+        }
+        "tool_call_start" => {
+            let payload: ProviderToolCallStartPayload = decode_provider_stream_payload(payload)?;
+            if payload.id.is_empty() || payload.name.is_empty() {
+                return Err(invalid_provider_stream_event());
+            }
+            Ok(DecodedProviderStreamEvent::Emit(
+                StreamEvent::ToolCallStart {
+                    index: payload.index,
+                    id: ToolCallId(payload.id),
+                    name: payload.name,
+                },
+            ))
+        }
+        "tool_call_args_delta" => {
+            let payload: ProviderDeltaPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(
+                StreamEvent::ToolCallArgsDelta {
+                    index: payload.index,
+                    delta: payload.delta,
+                },
+            ))
+        }
+        "tool_call_end" => {
+            let payload: ProviderIndexPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::ToolCallEnd {
+                index: payload.index,
+            }))
+        }
+        "usage" => {
+            let payload: ProviderUsagePayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Emit(StreamEvent::Usage(
+                payload.into(),
+            )))
+        }
+        "finished" => {
+            let payload: ProviderFinishedPayload = decode_provider_stream_payload(payload)?;
+            Ok(DecodedProviderStreamEvent::Finish(payload.stop_reason))
+        }
+        "heartbeat" => Ok(DecodedProviderStreamEvent::Heartbeat),
+        "error" => Ok(DecodedProviderStreamEvent::Error),
+        _ => Err(invalid_provider_stream_event()),
+    }
+}
+
+fn provider_transport_error(
+    phase: TransportPhase,
+    timeout: bool,
+    message: &'static str,
+) -> AiError {
+    AiError::Transport(TransportError {
+        phase,
+        timeout,
+        message: message.to_owned(),
+    })
+}
+
+fn provider_unavailable_error() -> AiError {
+    AiError::Provider(ProviderError {
+        code: None,
+        kind: Some("extension_provider".to_owned()),
+        message: "extension provider is unavailable".to_owned(),
+        request_id: None,
+    })
+}
+
+fn provider_protocol_name(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::OpenAiChat => "openai_chat",
+        Protocol::OpenAiResponses => "openai_responses",
+        Protocol::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+fn extension_provider_response_stream(
+    connection: Arc<ProcessConnection>,
+    stream_id: String,
+    mut receiver: mpsc::Receiver<api_v03::ProviderStreamEvent>,
+    model: HostStreamModel,
+    request: ygg_ai::Request,
+    diagnostics: Vec<Diagnostic>,
+) -> ResponseStream {
+    Box::pin(async_stream::try_stream! {
+        let mut cancellation = ProviderStreamCancellation::new(&connection, stream_id.clone());
+        let mut assembler = CanonicalStreamAssembler::new(
+            model.id,
+            model.protocol,
+            model.pricing,
+            &request.tools,
+        )?;
+        assembler.add_host_diagnostics(diagnostics);
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at + connection.provider_stream_deadline;
+        let mut last_event_at = started_at;
+
+        loop {
+            let idle_deadline = last_event_at + connection.provider_stream_idle_timeout;
+            let waiting = tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => ProviderStreamWait::Deadline,
+                _ = tokio::time::sleep_until(idle_deadline) => ProviderStreamWait::Idle,
+                event = receiver.recv() => ProviderStreamWait::Event(event),
+            };
+            let event = match waiting {
+                ProviderStreamWait::Deadline => Err(provider_transport_error(
+                    TransportPhase::Body,
+                    true,
+                    "extension provider stream deadline exceeded",
+                ))?,
+                ProviderStreamWait::Idle => Err(provider_transport_error(
+                    TransportPhase::Body,
+                    true,
+                    "extension provider stream idle timeout exceeded",
+                ))?,
+                ProviderStreamWait::Event(Some(event)) => event,
+                ProviderStreamWait::Event(None) => {
+                    Err(AiError::StreamProtocol(ygg_ai::StreamProtocolError::MissingFinish))?
+                }
+            };
+            last_event_at = tokio::time::Instant::now();
+            assembler.observe_transport_event()?;
+            match decode_provider_stream_event(event)? {
+                DecodedProviderStreamEvent::Emit(event) => {
+                    assembler.push(event.clone())?;
+                    yield event;
+                }
+                DecodedProviderStreamEvent::Finish(stop_reason) => {
+                    let response = assembler.finish(stop_reason)?;
+                    connection.settle_provider_stream(&stream_id);
+                    cancellation.disarm();
+                    yield StreamEvent::Finished(response);
+                    return;
+                }
+                DecodedProviderStreamEvent::Heartbeat => {}
+                DecodedProviderStreamEvent::Error => {
+                    Err(AiError::Provider(ProviderError {
+                        code: None,
+                        kind: Some("extension_provider".to_owned()),
+                        message: "extension provider reported an error".to_owned(),
+                        request_id: None,
+                    }))?
+                }
+            }
+        }
+    })
+}
+
+#[async_trait::async_trait]
+impl HostStreamTransport for ExtensionProviderStreamTransport {
+    async fn stream(
+        &self,
+        model: HostStreamModel,
+        request: ygg_ai::Request,
+        diagnostics: Vec<Diagnostic>,
+    ) -> Result<ResponseStream, AiError> {
+        let process = self
+            .process
+            .upgrade()
+            .ok_or_else(provider_unavailable_error)?;
+        let connection = read_std_lock(&process.connection).clone();
+        if !connection_is_usable(&connection)
+            || connection
+                .require_api_v03_host_method(methods::PROVIDER_STREAM)
+                .is_err()
+        {
+            return Err(provider_unavailable_error());
+        }
+        let Some(registry) = connection.provider_registry.clone() else {
+            return Err(provider_unavailable_error());
+        };
+        let Some(route) = registry.resolve(&self.provider_id, &self.model_id) else {
+            return Err(provider_unavailable_error());
+        };
+        if route.owner != connection.provider_owner
+            || route.model.protocol != provider_protocol_name(model.protocol)
+        {
+            return Err(provider_unavailable_error());
+        }
+
+        let stream_sequence = connection
+            .next_provider_stream_id
+            .fetch_add(1, Ordering::AcqRel);
+        if stream_sequence == u64::MAX {
+            return Err(provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider stream identifier space is exhausted",
+            ));
+        }
+        let stream_id = format!("provider-{}-{stream_sequence}", connection.generation);
+        let request_value = serde_json::to_value(&request).map_err(|_| {
+            provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider request could not be serialized",
+            )
+        })?;
+        if api_v03::canonical_json(&request_value).is_err() {
+            return Err(provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider request is not canonical API 0.3 JSON",
+            ));
+        }
+        let params = api_v03::ProviderStreamRequest {
+            stream_id: stream_id.clone(),
+            provider_id: self.provider_id.clone(),
+            model_id: self.model_id.clone(),
+            request: request_value,
+            authorization_lease: None,
+        };
+        let params = serde_json::to_value(params).map_err(|_| {
+            provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider request could not be encoded",
+            )
+        })?;
+        if api_v03::parse_provider_stream_request(params.clone()).is_err() {
+            return Err(provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider request was rejected by the API contract",
+            ));
+        }
+        let (sender, receiver) = mpsc::channel(connection.provider_stream_buffer);
+        {
+            let mut streams = lock_std_mutex(&connection.provider_streams);
+            if streams.contains_key(&stream_id) {
+                return Err(provider_transport_error(
+                    TransportPhase::ResponseHeaders,
+                    false,
+                    "extension provider stream identifier collision",
+                ));
+            }
+            streams.insert(
+                stream_id.clone(),
+                ProviderStreamIngress {
+                    sender,
+                    next_sequence: 0,
+                    terminal: false,
+                },
+            );
+        }
+
+        let accepted = match connection
+            .request(
+                methods::PROVIDER_STREAM,
+                params,
+                connection.provider_stream_idle_timeout,
+            )
+            .await
+        {
+            Ok(value) => api_v03::parse_provider_stream_accepted(value).map_err(|_| {
+                connection.cancel_provider_stream(&stream_id, "invalid stream acceptance");
+                provider_transport_error(
+                    TransportPhase::ResponseHeaders,
+                    false,
+                    "extension provider returned an invalid stream acceptance",
+                )
+            })?,
+            Err(_) => {
+                connection.cancel_provider_stream(&stream_id, "stream request failed");
+                return Err(provider_transport_error(
+                    TransportPhase::ResponseHeaders,
+                    false,
+                    "extension provider stream request failed",
+                ));
+            }
+        };
+        if accepted.stream_id != stream_id {
+            connection.cancel_provider_stream(&stream_id, "stream identifier mismatch");
+            return Err(provider_transport_error(
+                TransportPhase::ResponseHeaders,
+                false,
+                "extension provider returned a mismatched stream acceptance",
+            ));
+        }
+        if !accepted.accepted {
+            connection.settle_provider_stream(&stream_id);
+            return Err(provider_unavailable_error());
+        }
+
+        Ok(extension_provider_response_stream(
+            connection,
+            stream_id,
+            receiver,
+            model,
+            request,
+            diagnostics,
+        ))
     }
 }
 
@@ -8017,6 +8646,7 @@ async fn spawn_connection(
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
     approval_store: Arc<ExtensionApprovalStore>,
+    defer_post_initialize: bool,
 ) -> Result<(Arc<ProcessConnection>, ExtensionContributions), ExtensionRuntimeError> {
     let extension_dir =
         descriptor
@@ -8163,6 +8793,11 @@ async fn spawn_connection(
     }));
     let initialization_complete = Arc::new(AtomicBool::new(false));
     let initialization_changed = Arc::new(Notify::new());
+    let provider_owner = ExtensionProviderOwner {
+        extension_instance_id: instance_id.to_owned(),
+        generation,
+    };
+    let provider_streams = Arc::new(StdMutex::new(HashMap::new()));
     let (writer, writer_frames) = mpsc::channel(config.writer_queue_capacity);
     tokio::spawn(run_protocol_writer(
         stdin,
@@ -8202,6 +8837,9 @@ async fn spawn_connection(
         Arc::clone(&tombstones),
         Arc::clone(&protocol),
         Arc::clone(&api_v03_contract),
+        config.provider_registry.clone(),
+        provider_owner.clone(),
+        Arc::clone(&provider_streams),
         Arc::clone(&tool_catalog),
         catalog_updates,
         delegation_service,
@@ -8254,6 +8892,8 @@ async fn spawn_connection(
         tombstones,
         protocol,
         api_v03_contract,
+        initialization_complete: Arc::clone(&initialization_complete),
+        initialization_changed: Arc::clone(&initialization_changed),
         catalog_guard: StdRwLock::new(()),
         tool_catalog,
         catalog_revision: AtomicU64::new(0),
@@ -8264,6 +8904,14 @@ async fn spawn_connection(
         artifact_leases: AtomicU64::new(0),
         artifact_leases_changed: Notify::new(),
         artifacts_settled: AtomicBool::new(false),
+        provider_registry: config.provider_registry.clone(),
+        provider_owner,
+        provider_streams,
+        next_provider_stream_id: AtomicU64::new(1),
+        provider_stream_buffer: config.provider_stream_buffer,
+        provider_stream_idle_timeout: config.provider_stream_idle_timeout,
+        provider_stream_deadline: config.provider_stream_deadline,
+        provider_owner_removed: AtomicBool::new(false),
         process_group,
     });
     artifact_guard.disarm();
@@ -8360,9 +9008,13 @@ async fn spawn_connection(
                     "invalid API 0.3 initialize response: {error}"
                 ))
             })?;
-            negotiate_api_v03_contributions(&descriptor.manifest, offer, response).map(
-                |(contributions, protocol, contract)| (contributions, protocol, Some(contract)),
+            negotiate_api_v03_contributions(
+                &descriptor.manifest,
+                offer,
+                response,
+                config.provider_registry.is_some(),
             )
+            .map(|(contributions, protocol, contract)| (contributions, protocol, Some(contract)))
         } else {
             let response: InitializeResponse =
                 serde_json::from_value(response).map_err(|error| {
@@ -8398,8 +9050,9 @@ async fn spawn_connection(
     *write_std_lock(&connection.protocol) = protocol;
     *write_std_lock(&connection.api_v03_contract) = api_v03_contract;
     *write_std_lock(&connection.tool_catalog) = contributions.tools.clone();
-    initialization_complete.store(true, Ordering::Release);
-    initialization_changed.notify_waiters();
+    if !defer_post_initialize {
+        connection.activate_post_initialize();
+    }
     update_health(&connection.health, ExtensionHealthState::Ready, None);
     Ok((connection, contributions))
 }
@@ -8522,6 +9175,7 @@ fn negotiate_api_v03_contributions(
     manifest: &ExtensionManifest,
     offer: &api_v03::ContractOffer,
     response: api_v03::InitializeResponse,
+    provider_registry_available: bool,
 ) -> Result<
     (
         ExtensionContributions,
@@ -8538,6 +9192,64 @@ fn negotiate_api_v03_contributions(
     }
     api_v03::validate_initialize_response(&response).map_err(api_v03_protocol_error)?;
     let contract = api_v03::negotiate(offer, &response.contract).map_err(api_v03_protocol_error)?;
+    let provider_capabilities = ["provider_catalog", "provider_stream", "provider_auth"];
+    let provider_methods = [
+        methods::PROVIDERS_REGISTER,
+        methods::PROVIDERS_UPDATE,
+        methods::PROVIDERS_UNREGISTER,
+        methods::PROVIDER_STREAM,
+        methods::PROVIDER_EVENT,
+        methods::PROVIDER_CANCEL,
+        methods::PROVIDER_AUTH_REQUEST,
+        methods::PROVIDER_AUTH_REVOKE,
+    ];
+    let selects_provider = contract
+        .capabilities
+        .iter()
+        .any(|capability| provider_capabilities.contains(&capability.as_str()))
+        || contract
+            .methods
+            .iter()
+            .any(|method| provider_methods.contains(&method.as_str()));
+    if selects_provider && !manifest.contributes.providers {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 provider methods require contributes.providers = true".into(),
+        ));
+    }
+    if selects_provider && !provider_registry_available {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 provider methods are unavailable because no host provider registry is configured"
+                .into(),
+        ));
+    }
+    let selects_provider_stream = contract.methods.contains(methods::PROVIDER_STREAM)
+        || contract.methods.contains(methods::PROVIDER_EVENT)
+        || contract.methods.contains(methods::PROVIDER_CANCEL);
+    if selects_provider_stream && !contract.capabilities.contains("provider_catalog") {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 provider streaming requires the provider_catalog capability".into(),
+        ));
+    }
+    if selects_provider_stream
+        && ![
+            methods::PROVIDER_STREAM,
+            methods::PROVIDER_EVENT,
+            methods::PROVIDER_CANCEL,
+        ]
+        .iter()
+        .all(|method| contract.methods.contains(*method))
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 provider streaming requires stream, event, and cancellation methods".into(),
+        ));
+    }
+    if contract.methods.contains(methods::PROVIDER_AUTH_REQUEST)
+        && !contract.capabilities.contains("provider_catalog")
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 provider authorization requires the provider_catalog capability".into(),
+        ));
+    }
     if !manifest.contributes.commands.is_empty()
         || !manifest.contributes.hooks.is_empty()
         || !manifest.contributes.ui.is_empty()
@@ -8579,6 +9291,8 @@ fn negotiate_api_v03_contributions(
     Ok((
         ExtensionContributions {
             tools,
+            providers: manifest.contributes.providers
+                && contract.capabilities.contains("provider_catalog"),
             ..ExtensionContributions::default()
         },
         protocol,
@@ -8824,6 +9538,7 @@ fn negotiate_contributions_with_host_services(
             notifications: manifest.contributes.notifications,
             confirmations: manifest.contributes.confirmations,
             presentation: manifest.contributes.presentation,
+            providers: false,
         },
         protocol,
     ))
@@ -9732,6 +10447,9 @@ struct ProtocolReadState {
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
     api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
+    provider_registry: Option<Arc<ExtensionProviderRegistry>>,
+    provider_owner: ExtensionProviderOwner,
+    provider_streams: ProviderStreams,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
@@ -10106,6 +10824,9 @@ async fn read_protocol_stdout<R>(
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
     api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
+    provider_registry: Option<Arc<ExtensionProviderRegistry>>,
+    provider_owner: ExtensionProviderOwner,
+    provider_streams: ProviderStreams,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
@@ -10143,6 +10864,9 @@ async fn read_protocol_stdout<R>(
         tombstones,
         protocol,
         api_v03_contract,
+        provider_registry,
+        provider_owner,
+        provider_streams,
         tool_catalog,
         catalog_updates,
         delegation_service,
@@ -10214,6 +10938,10 @@ async fn read_protocol_stdout<R>(
     };
 
     state.closed.store(true, Ordering::Release);
+    if let Some(registry) = &state.provider_registry {
+        registry.remove_owner(&state.provider_owner);
+    }
+    lock_std_mutex(&state.provider_streams).clear();
     let message = match result {
         Ok(()) => "extension stdout closed".to_owned(),
         Err(message) => {
@@ -10704,6 +11432,80 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 let request_id: ExtensionRequestId = serde_json::from_value(id)
                     .map_err(|error| format!("invalid cancel request id: {error}"))?;
                 settle_child_request(&state.child_requests, &request_id);
+            }
+            methods::PROVIDERS_REGISTER => {
+                require_declared(state.declared.providers, "provider catalogs")?;
+                let id = parse_child_request_id(object, methods::PROVIDERS_REGISTER)?;
+                insert_child_request(state, id.clone(), None, None)?;
+                let result = api_v03::parse_provider_register_params(params)
+                    .map_err(|_| ProviderHostResponseError::Invalid)
+                    .and_then(|request| {
+                        provider_registry_for_request(state)?
+                            .register(state.provider_owner.clone(), request)
+                            .map_err(provider_registry_response_error)
+                    })
+                    .and_then(provider_catalog_response_value);
+                queue_provider_host_response(state, &id, result)?;
+            }
+            methods::PROVIDERS_UPDATE => {
+                require_declared(state.declared.providers, "provider catalogs")?;
+                let id = parse_child_request_id(object, methods::PROVIDERS_UPDATE)?;
+                insert_child_request(state, id.clone(), None, None)?;
+                let result = api_v03::parse_provider_update_params(params)
+                    .map_err(|_| ProviderHostResponseError::Invalid)
+                    .and_then(|request| {
+                        provider_registry_for_request(state)?
+                            .update(state.provider_owner.clone(), request)
+                            .map_err(provider_registry_response_error)
+                    })
+                    .and_then(provider_catalog_response_value);
+                queue_provider_host_response(state, &id, result)?;
+            }
+            methods::PROVIDERS_UNREGISTER => {
+                require_declared(state.declared.providers, "provider catalogs")?;
+                let id = parse_child_request_id(object, methods::PROVIDERS_UNREGISTER)?;
+                insert_child_request(state, id.clone(), None, None)?;
+                let result = api_v03::parse_provider_unregister_params(params)
+                    .map_err(|_| ProviderHostResponseError::Invalid)
+                    .and_then(|request| {
+                        provider_registry_for_request(state)?
+                            .unregister(&state.provider_owner, &request.provider_id)
+                            .map_err(provider_registry_response_error)
+                    })
+                    .and_then(provider_catalog_response_value);
+                queue_provider_host_response(state, &id, result)?;
+            }
+            methods::PROVIDER_AUTH_REQUEST | methods::PROVIDER_AUTH_REVOKE => {
+                require_declared(state.declared.providers, "provider authorization")?;
+                let id = parse_child_request_id(object, method)?;
+                insert_child_request(state, id.clone(), None, None)?;
+                let expected_action = if method == methods::PROVIDER_AUTH_REVOKE {
+                    "revoke"
+                } else {
+                    "authorize"
+                };
+                let result = api_v03::parse_provider_authorization_request(params)
+                    .map_err(|_| ProviderHostResponseError::Invalid)
+                    .and_then(|request| {
+                        if (method == methods::PROVIDER_AUTH_REVOKE
+                            && request.action != expected_action)
+                            || (method == methods::PROVIDER_AUTH_REQUEST
+                                && !matches!(request.action.as_str(), "authorize" | "refresh"))
+                        {
+                            return Err(ProviderHostResponseError::Invalid);
+                        }
+                        provider_registry_for_request(state)?
+                            .request_authorization(&state.provider_owner, request)
+                            .map_err(provider_registry_response_error)
+                    })
+                    .and_then(provider_authorization_response_value);
+                queue_provider_host_response(state, &id, result)?;
+            }
+            methods::PROVIDER_EVENT => {
+                require_declared(state.declared.providers, "provider streams")?;
+                let event = api_v03::parse_provider_stream_event(params)
+                    .map_err(|_| "invalid API 0.3 provider stream event".to_owned())?;
+                dispatch_provider_stream_event(state, event)?;
             }
             methods::POLICY_EVALUATE => {
                 require_feature(state, EXTENSION_FEATURE_POLICY_INTENTS)?;
@@ -11344,6 +12146,171 @@ fn require_feature(state: &ProtocolReadState, feature: &str) -> Result<(), Strin
     } else {
         Err(format!("extension did not negotiate `{feature}`"))
     }
+}
+
+#[derive(Clone, Copy)]
+enum ProviderHostResponseError {
+    Invalid,
+    ResourceExhausted,
+    Unavailable,
+}
+
+fn provider_registry_for_request(
+    state: &ProtocolReadState,
+) -> Result<Arc<ExtensionProviderRegistry>, ProviderHostResponseError> {
+    state
+        .provider_registry
+        .clone()
+        .ok_or(ProviderHostResponseError::Unavailable)
+}
+
+fn provider_registry_response_error(
+    error: ExtensionProviderRegistryError,
+) -> ProviderHostResponseError {
+    match error {
+        ExtensionProviderRegistryError::ResourceExhausted(_) => {
+            ProviderHostResponseError::ResourceExhausted
+        }
+        ExtensionProviderRegistryError::Invalid(_)
+        | ExtensionProviderRegistryError::StaleOwner
+        | ExtensionProviderRegistryError::ProviderConflict => ProviderHostResponseError::Invalid,
+    }
+}
+
+fn provider_catalog_response_value(
+    result: api_v03::ProviderCatalogResult,
+) -> Result<serde_json::Value, ProviderHostResponseError> {
+    let value = serde_json::to_value(result).map_err(|_| ProviderHostResponseError::Unavailable)?;
+    api_v03::parse_provider_catalog_result(value.clone())
+        .map_err(|_| ProviderHostResponseError::Unavailable)?;
+    Ok(value)
+}
+
+fn provider_authorization_response_value(
+    result: api_v03::ProviderAuthorizationResult,
+) -> Result<serde_json::Value, ProviderHostResponseError> {
+    let value = serde_json::to_value(result).map_err(|_| ProviderHostResponseError::Unavailable)?;
+    api_v03::parse_provider_authorization_result(value.clone())
+        .map_err(|_| ProviderHostResponseError::Unavailable)?;
+    Ok(value)
+}
+
+fn queue_provider_host_response(
+    state: &ProtocolReadState,
+    id: &ExtensionRequestId,
+    result: Result<serde_json::Value, ProviderHostResponseError>,
+) -> Result<(), String> {
+    let response = match result {
+        Ok(result) => serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }),
+        Err(error) => {
+            let name = match error {
+                ProviderHostResponseError::Invalid => "invalid_params",
+                ProviderHostResponseError::ResourceExhausted => "resource_exhausted",
+                ProviderHostResponseError::Unavailable => "capability_mismatch",
+            };
+            let error = api_v03::error_object(name, None)
+                .map_err(|error| format!("invalid API 0.3 provider error response: {error}"))?;
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": error,
+            })
+        }
+    };
+    let queued = queue_writer_value(&state.writer, &state.frame_limit, response);
+    settle_child_request(&state.child_requests, id);
+    queued
+}
+
+fn provider_stream_is_terminal(kind: &str) -> bool {
+    matches!(kind, "finished" | "error")
+}
+
+fn queue_provider_stream_cancel_from_reader(
+    state: &ProtocolReadState,
+    stream_id: String,
+    reason: &'static str,
+) -> Result<(), String> {
+    let params = api_v03::ProviderStreamCancelParams {
+        stream_id,
+        reason: Some(reason.to_owned()),
+    };
+    let params = serde_json::to_value(params)
+        .map_err(|error| format!("cannot encode provider stream cancellation: {error}"))?;
+    api_v03::parse_provider_stream_cancel_params(params.clone())
+        .map_err(|error| format!("invalid provider stream cancellation: {error}"))?;
+    queue_writer_value(
+        &state.writer,
+        &state.frame_limit,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": methods::PROVIDER_CANCEL,
+            "params": params,
+        }),
+    )
+}
+
+fn dispatch_provider_stream_event(
+    state: &ProtocolReadState,
+    event: api_v03::ProviderStreamEvent,
+) -> Result<(), String> {
+    let payload = api_v03::canonical_json(&event.payload)
+        .map_err(|error| format!("invalid provider stream payload: {error}"))?;
+    if payload.len() > api_v03::MAX_PROVIDER_STREAM_EVENT_BYTES {
+        return Err(format!(
+            "provider stream payload exceeded {} bytes",
+            api_v03::MAX_PROVIDER_STREAM_EVENT_BYTES
+        ));
+    }
+    let stream_id = event.stream_id.clone();
+    let terminal = provider_stream_is_terminal(&event.kind);
+    let mut cancel = false;
+    {
+        let mut streams = lock_std_mutex(&state.provider_streams);
+        let ingress = streams
+            .get_mut(&stream_id)
+            .ok_or_else(|| "provider stream event references an unknown stream".to_owned())?;
+        if ingress.terminal {
+            return Err("provider stream event arrived after a terminal event".into());
+        }
+        if event.sequence != ingress.next_sequence {
+            return Err("provider stream event sequence is not contiguous".into());
+        }
+        if ingress.next_sequence >= api_v03::MAX_PROVIDER_STREAM_EVENTS {
+            return Err("provider stream event limit exceeded".into());
+        }
+        match ingress.sender.try_send(event) {
+            Ok(()) => {
+                ingress.next_sequence = ingress
+                    .next_sequence
+                    .checked_add(1)
+                    .ok_or_else(|| "provider stream event sequence overflowed".to_owned())?;
+                ingress.terminal = terminal;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                cancel = true;
+            }
+        }
+        if terminal || cancel {
+            streams.remove(&stream_id);
+        }
+    }
+    if cancel {
+        let _ = state.events.send(ExtensionEvent::Diagnostic {
+            message: "extension provider stream exceeded host backpressure capacity".into(),
+        });
+        queue_provider_stream_cancel_from_reader(
+            state,
+            stream_id,
+            "host provider stream backpressure",
+        )?;
+    }
+    Ok(())
 }
 
 fn queue_catalog_update(
@@ -12107,6 +13074,12 @@ confirmations = true
                     DEFAULT_PENDING_REQUESTS,
                 ))),
                 api_v03_contract: Arc::new(StdRwLock::new(None)),
+                provider_registry: None,
+                provider_owner: ExtensionProviderOwner {
+                    extension_instance_id: "instance-test".into(),
+                    generation: 1,
+                },
+                provider_streams: Arc::new(StdMutex::new(HashMap::new())),
                 tool_catalog: Arc::new(StdRwLock::new(Vec::new())),
                 catalog_updates,
                 delegation_service: Arc::new(StdRwLock::new(None)),

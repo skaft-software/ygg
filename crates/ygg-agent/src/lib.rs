@@ -80,6 +80,7 @@ pub mod extension_api_v03;
 pub mod extension_policy;
 pub mod extension_presentation;
 pub mod extension_process;
+pub mod extension_provider;
 pub mod extension_runtime;
 pub mod extension_secret;
 pub mod goal_driver;
@@ -196,6 +197,11 @@ pub use extension_process::{
     MAX_EXTENSION_CHILD_REQUEST_IDS_PER_GENERATION, MAX_EXTENSION_INPUT_PROMPT_BYTES,
     MAX_EXTENSION_INPUT_VALUE_BYTES, MAX_EXTENSION_RESULT_CONTENT_PARTS,
     MAX_EXTENSION_RESULT_MEDIA_BYTES,
+};
+pub use extension_provider::{
+    ExtensionProviderAuthorizationPolicy, ExtensionProviderAuthorizationStatus,
+    ExtensionProviderCatalogEntry, ExtensionProviderOwner, ExtensionProviderRegistry,
+    ExtensionProviderRegistryError, ExtensionProviderRoute,
 };
 pub use extension_secret::{
     ExtensionSecretBroker, ExtensionSecretError, ExtensionSecretRequest, ExtensionSecretValue,
