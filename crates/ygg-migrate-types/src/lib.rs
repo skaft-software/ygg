@@ -1748,7 +1748,7 @@ struct PortableIntegerVisitor {
     field: &'static str,
 }
 
-impl<'de> Visitor<'de> for PortableIntegerVisitor {
+impl Visitor<'_> for PortableIntegerVisitor {
     type Value = u64;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
