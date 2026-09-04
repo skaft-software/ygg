@@ -21,6 +21,7 @@ mod output;
 mod pi;
 mod presentation;
 mod prompts;
+mod provider_setup;
 mod providers;
 /// Credential-free provider definition and canonical catalog contribution API.
 pub mod provider {
@@ -117,6 +118,9 @@ async fn run() -> anyhow::Result<()> {
     }
     if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
+    }
+    if let Some(cli::TopLevelCommand::Setup { options }) = top_level_command.clone() {
+        return provider_setup::run_cli(&options, &config);
     }
     extension_package::migrate_v0_6_2_packages().await;
     #[cfg(feature = "serve")]

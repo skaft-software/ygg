@@ -15,6 +15,7 @@ pub use store::{
     default_path, CredentialStore, CustomAuthConfig, CustomCredential, CustomModel, CustomPricing,
     CustomProvider, CustomRegistry,
 };
+pub(crate) use store::{RegistryCommitError, RegistrySnapshot};
 
 /// Endpoint id used by the original single custom endpoint.
 pub const ENDPOINT_ID: &str = "custom-openai";

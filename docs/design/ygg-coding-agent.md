@@ -64,6 +64,31 @@ under the same byte/record bounds, cache failures fall back to JSONL, and
 normally dropped `App` instances refresh their already-replayed active session
 without reopening it. The catalog is never a prerequisite for resume.
 
+## Provider setup and readiness
+
+The custom credential registry and the canonical `ModelCatalog` are the sole
+provider state. `ProviderSetupService` captures a registry snapshot, validates
+one explicitly selected OpenAI-compatible endpoint, optionally performs one
+bounded `/models` probe, presents a secret-free receipt, and persists through a
+private compare-and-swap only after final confirmation. It then rebuilds the
+same canonical catalog and verifies the selected `ModelId`; it never constructs
+a partial `Agent`, scans localhost, follows discovery redirects, writes setup
+telemetry, or creates a parallel catalog/store.
+
+Interactive startup opens the ordinary guided setup surfaces only when bootstrap
+has no runnable model inventory and there is no explicit `--model`; cancellation
+continues in existing read-only model-less mode. A successful setup installs the
+rebuilt catalog and selected default in memory, while keeping resumed-session
+model provenance eligible to win under normal startup precedence. Print and RPC
+never open a picker: unresolved and unavailable models return a deterministic
+secret-safe diagnostic that names `ygg setup --yes` and available model IDs.
+
+The non-interactive `ygg setup` adapter shares the transaction. It requires an
+explicit `--endpoint` or explicit `--preset lm-studio`, reviews by default, and
+uses `--yes` to commit. `--offline --manual-model` is the no-probe recovery
+path. Cancellation, review-only operation, offline discovery rejection, and a
+stale registry snapshot do not write the registry.
+
 ## System prompt
 
 The stable, model-agnostic base contract gives both local and cloud models an

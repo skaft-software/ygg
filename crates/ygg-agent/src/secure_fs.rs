@@ -376,6 +376,38 @@ pub fn write_private_atomic(path: &Path, data: &[u8], limit: usize) -> Result<()
     imp::PreparedMutation::prepare_private(path, limit)?.commit_private(data, &|| false)
 }
 
+/// Atomically publish owner-only bytes only if the target still matches an
+/// earlier caller snapshot.
+///
+/// This is the private counterpart to [`write_atomic_if_unchanged`]. Both the
+/// snapshot and final replacement are descriptor-bound, while the target and
+/// every parent retain the owner-only checks used by [`write_private_atomic`].
+/// A concurrent replacement is reported as [`SecureFileError::Changed`] rather
+/// than being overwritten.
+pub fn write_private_atomic_if_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+    data: &[u8],
+    limit: usize,
+) -> Result<(), SecureFileError> {
+    validate_absolute_file_path(path)?;
+    if data.len() > limit {
+        return Err(SecureFileError::TooLarge {
+            actual: data.len() as u64,
+            limit,
+        });
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?;
+    imp::create_private_directory_all(parent)?;
+    let prepared = imp::PreparedMutation::prepare_private(path, limit)?;
+    if prepared.original() != expected {
+        return Err(SecureFileError::Changed);
+    }
+    prepared.commit_private(data, &|| false)
+}
+
 /// Atomically publish regular-file bytes only if the target still matches an
 /// earlier caller snapshot. The descriptor-bound mutation revalidates both
 /// bytes and file identity, uses no-replace creation for a missing target, and
@@ -3543,6 +3575,28 @@ mod tests {
             Err(SecureFileError::Changed)
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "newer version");
+    }
+
+    #[test]
+    fn private_conditional_atomic_write_rejects_a_stale_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("private/target.json");
+        write_private_atomic(&path, b"newer version", 1024).unwrap();
+
+        assert!(matches!(
+            write_private_atomic_if_unchanged(
+                &path,
+                Some(b"older version"),
+                b"stale replacement",
+                1024,
+            ),
+            Err(SecureFileError::Changed)
+        ));
+        assert_eq!(
+            read_private_file_bounded(&path, 1024).unwrap(),
+            b"newer version"
+        );
     }
 
     #[test]

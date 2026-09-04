@@ -11,6 +11,7 @@ use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+use ygg_agent::extension_process::ExtensionInputRequest;
 #[cfg(unix)]
 use ygg_agent::extension_process::ProcessGroupGuard;
 use ygg_agent::{
@@ -35,14 +36,19 @@ use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::{HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
+use crate::provider_setup::{
+    CompletedSetup, ProviderSetupError, ProviderSetupService, ProviderSetupState,
+    SetupAuthentication, SetupAuthority, SetupDraft,
+};
 use crate::resources::{compose_instructions, expand_skill_command};
 use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
-    message_picker, optional_model_picker, read_only_document, read_only_document_live_styled,
-    session_picker, subagent_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
+    message_picker, optional_model_picker, provider_setup_picker, read_only_document,
+    read_only_document_live_styled, session_picker, subagent_picker, thinking_picker,
+    tool_input_picker, SubagentPickerSnapshot,
 };
 use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
@@ -4218,8 +4224,452 @@ fn schedule_responses_prewarm(app: &App) {
     });
 }
 
+#[derive(Clone, Copy)]
+enum GuidedSetupPreset {
+    LmStudio,
+    OpenAiCompatible,
+}
+
+async fn guided_setup_input(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    prompt: &str,
+    secret: bool,
+) -> anyhow::Result<Option<String>> {
+    // This is the existing bounded temporary-input surface. Secret values are
+    // never copied into the ordinary composer or rendered frame.
+    extension_input_picker(
+        shell,
+        input,
+        &ExtensionInputRequest {
+            parent_request_id: 0,
+            prompt: prompt.to_owned(),
+            secret,
+        },
+    )
+    .await
+}
+
+fn valid_guided_manual_model(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+/// First-run interactive onboarding for an explicitly selected compatible
+/// endpoint. Every path before `commit_and_rebuild` is in-memory only.
+async fn guided_provider_setup(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    config: &crate::config::Config,
+) -> anyhow::Result<Option<CompletedSetup>> {
+    let mut replace_existing = false;
+    'setup: loop {
+        let Some(preset) = provider_setup_picker(
+            shell,
+            input,
+            "Set up a provider",
+            vec![
+                "LM Studio".to_owned(),
+                "OpenAI-compatible endpoint".to_owned(),
+                "Continue without a provider".to_owned(),
+            ],
+            vec![
+                Some("Use an explicitly selected local OpenAI-compatible endpoint".to_owned()),
+                Some("Use one endpoint you enter; Ygg will not scan for services".to_owned()),
+                Some("Open the session read-only; no provider data is written".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let preset = match preset {
+            0 => GuidedSetupPreset::LmStudio,
+            1 => GuidedSetupPreset::OpenAiCompatible,
+            _ => return Ok(None),
+        };
+
+        let endpoint = match preset {
+            GuidedSetupPreset::LmStudio => {
+                let Some(choice) = provider_setup_picker(
+                    shell,
+                    input,
+                    "LM Studio endpoint",
+                    vec![
+                        "Use http://localhost:1234/v1/".to_owned(),
+                        "Enter a different endpoint".to_owned(),
+                        "Back".to_owned(),
+                    ],
+                    vec![
+                        Some("The default LM Studio OpenAI-compatible server".to_owned()),
+                        Some("Only the endpoint you enter will be contacted".to_owned()),
+                        Some("Return to provider selection without writing state".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                else {
+                    continue 'setup;
+                };
+                match choice {
+                    0 => "http://localhost:1234/v1/".to_owned(),
+                    1 => {
+                        let Some(endpoint) =
+                            guided_setup_input(shell, input, "Endpoint URL:", false).await?
+                        else {
+                            continue 'setup;
+                        };
+                        endpoint
+                    }
+                    _ => continue 'setup,
+                }
+            }
+            GuidedSetupPreset::OpenAiCompatible => {
+                let Some(endpoint) =
+                    guided_setup_input(shell, input, "Endpoint URL:", false).await?
+                else {
+                    continue 'setup;
+                };
+                endpoint
+            }
+        };
+
+        let Some(authentication_choice) = provider_setup_picker(
+            shell,
+            input,
+            "Credential source",
+            vec![
+                "No authentication".to_owned(),
+                "Enter an API key".to_owned(),
+                "Read an API key from an environment variable".to_owned(),
+                "Back".to_owned(),
+            ],
+            vec![
+                Some("Do not send or store a credential".to_owned()),
+                Some("The key is hidden and stored only after final confirmation".to_owned()),
+                Some("The environment value is read only at runtime and is not stored".to_owned()),
+                Some("Return to provider selection without writing state".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        else {
+            continue 'setup;
+        };
+        let authentication = match authentication_choice {
+            0 => SetupAuthentication::no_authentication(),
+            1 => {
+                let Some(value) = guided_setup_input(shell, input, "API key:", true).await? else {
+                    continue 'setup;
+                };
+                SetupAuthentication::api_key(value)
+            }
+            2 => {
+                let Some(variable) =
+                    guided_setup_input(shell, input, "Environment variable name:", false).await?
+                else {
+                    continue 'setup;
+                };
+                SetupAuthentication::environment(variable)
+            }
+            _ => continue 'setup,
+        };
+
+        let is_default_lm_studio = matches!(preset, GuidedSetupPreset::LmStudio)
+            && endpoint == "http://localhost:1234/v1/"
+            && matches!(&authentication, SetupAuthentication::None);
+        let draft = if is_default_lm_studio {
+            SetupDraft::lm_studio().replace_existing(replace_existing)
+        } else {
+            let (provider_id, label) = match preset {
+                GuidedSetupPreset::LmStudio => ("local", "LM Studio"),
+                GuidedSetupPreset::OpenAiCompatible => ("custom", "OpenAI-compatible endpoint"),
+            };
+            SetupDraft::new(provider_id, label, endpoint, authentication)
+                .replace_existing(replace_existing)
+        };
+        let service = ProviderSetupService::new(
+            crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path()),
+            config.offline,
+        );
+        let transaction = match service.begin(draft) {
+            Ok(transaction) => transaction,
+            Err(error)
+                if matches!(
+                    &error,
+                    ProviderSetupError::State(ProviderSetupState::ProviderAlreadyConfigured)
+                ) =>
+            {
+                shell.error(error.to_string());
+                shell.render();
+                match provider_setup_picker(
+                    shell,
+                    input,
+                    "Provider already configured",
+                    vec![
+                        "Replace the existing provider after review".to_owned(),
+                        "Edit setup values".to_owned(),
+                        "Cancel setup".to_owned(),
+                    ],
+                    vec![
+                        Some(
+                            "The existing provider is changed only after final confirmation"
+                                .to_owned(),
+                        ),
+                        Some("Return to endpoint and credential selection".to_owned()),
+                        Some("No provider state is written".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                {
+                    Some(0) => {
+                        replace_existing = true;
+                        continue 'setup;
+                    }
+                    Some(1) => {
+                        replace_existing = false;
+                        continue 'setup;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Err(error) => {
+                shell.error(error.to_string());
+                shell.render();
+                match provider_setup_picker(
+                    shell,
+                    input,
+                    "Provider setup needs attention",
+                    vec!["Edit setup values".to_owned(), "Cancel setup".to_owned()],
+                    vec![
+                        Some("Correct the endpoint or credential source and try again".to_owned()),
+                        Some("No provider state is written".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                {
+                    Some(0) => continue 'setup,
+                    _ => return Ok(None),
+                }
+            }
+        };
+
+        let mut transaction = transaction;
+        let mut discover = if config.offline {
+            false
+        } else {
+            let Some(choice) =
+                provider_setup_picker(
+                    shell,
+                    input,
+                    "Model inventory",
+                    vec![
+                        "Discover models from this endpoint".to_owned(),
+                        "Enter a model ID manually".to_owned(),
+                        "Back".to_owned(),
+                    ],
+                    vec![
+                    Some("Send one bounded request only to this selected endpoint's /models path"
+                        .to_owned()),
+                    Some("Do not contact the endpoint; useful for offline or unsupported discovery"
+                        .to_owned()),
+                    Some("Return to provider selection without writing state".to_owned()),
+                ],
+                    0,
+                )
+                .await?
+            else {
+                let _ = transaction.cancel();
+                continue 'setup;
+            };
+            match choice {
+                0 => true,
+                1 => false,
+                _ => {
+                    let _ = transaction.cancel();
+                    continue 'setup;
+                }
+            }
+        };
+
+        let prepared = 'prepare: loop {
+            if !discover {
+                let Some(model) = guided_setup_input(shell, input, "Model ID:", false).await?
+                else {
+                    let _ = transaction.cancel();
+                    continue 'setup;
+                };
+                if !valid_guided_manual_model(&model) {
+                    shell.error("provider setup configuration is invalid".to_owned());
+                    shell.render();
+                    continue 'prepare;
+                }
+                break 'prepare service.prepare_manual(transaction, &model)?;
+            }
+
+            let discovery_service = service.clone();
+            let (returned_transaction, discovery) =
+                run_blocking_lifecycle(shell, input, "discovering models…", move || {
+                    let mut transaction = transaction;
+                    let result = discovery_service.discover(&mut transaction);
+                    Ok((transaction, result))
+                })
+                .await?;
+            transaction = returned_transaction;
+            match discovery {
+                Ok(models) => {
+                    let items = models
+                        .iter()
+                        .map(|model| model.display_name.clone())
+                        .collect::<Vec<_>>();
+                    let descriptions = models
+                        .iter()
+                        .map(|model| Some(model.api_name.clone()))
+                        .collect::<Vec<_>>();
+                    let Some(selected) = provider_setup_picker(
+                        shell,
+                        input,
+                        "Select a discovered model",
+                        items,
+                        descriptions,
+                        0,
+                    )
+                    .await?
+                    else {
+                        let _ = transaction.cancel();
+                        continue 'setup;
+                    };
+                    break 'prepare service
+                        .prepare_discovered(transaction, &models[selected].api_name)?;
+                }
+                Err(error) => {
+                    let diagnostic = error
+                        .state()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| error.to_string());
+                    shell.error(diagnostic.clone());
+                    shell.render();
+                    match provider_setup_picker(
+                        shell,
+                        input,
+                        "Model discovery needs attention",
+                        vec![
+                            "Retry this endpoint".to_owned(),
+                            "Enter a model ID manually".to_owned(),
+                            "Edit endpoint or credentials".to_owned(),
+                            "Cancel setup".to_owned(),
+                        ],
+                        vec![
+                            Some(diagnostic),
+                            Some("Continue without any additional endpoint request".to_owned()),
+                            Some("Return to provider selection without writing state".to_owned()),
+                            Some("No provider state is written".to_owned()),
+                        ],
+                        0,
+                    )
+                    .await?
+                    {
+                        Some(0) => {
+                            discover = true;
+                            continue 'prepare;
+                        }
+                        Some(1) => {
+                            discover = false;
+                            continue 'prepare;
+                        }
+                        Some(2) => {
+                            let _ = transaction.cancel();
+                            continue 'setup;
+                        }
+                        _ => {
+                            let _ = transaction.cancel();
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        };
+
+        let receipt = prepared
+            .receipt()
+            .render(Some(&SetupAuthority::from_config(config)));
+        match provider_setup_picker(
+            shell,
+            input,
+            "Review provider setup",
+            vec![
+                "Confirm and save".to_owned(),
+                "Edit setup values".to_owned(),
+                "Cancel setup".to_owned(),
+            ],
+            vec![
+                Some(receipt),
+                Some("Discard this review and return to provider selection".to_owned()),
+                Some("Discard this review; no provider state is written".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        {
+            Some(0) => {
+                let commit_service = service.clone();
+                match run_blocking_lifecycle(shell, input, "saving provider setup…", move || {
+                    commit_service
+                        .commit_and_rebuild(prepared)
+                        .map_err(Into::into)
+                })
+                .await
+                {
+                    Ok(completed) => {
+                        if let Err(error) = crate::cli::persist_model(&completed.model.0) {
+                            shell.error(format!(
+                                "provider saved, but the selected model preference could not be saved: {error}"
+                            ));
+                            shell.render();
+                        }
+                        return Ok(Some(completed));
+                    }
+                    Err(error) => {
+                        shell.error(format!("provider setup could not be finalized: {error}"));
+                        shell.render();
+                        match provider_setup_picker(
+                            shell,
+                            input,
+                            "Provider setup needs attention",
+                            vec!["Start over".to_owned(), "Cancel setup".to_owned()],
+                            vec![
+                                Some(
+                                    "Reload current provider state and review it again".to_owned(),
+                                ),
+                                Some("Return without making another change".to_owned()),
+                            ],
+                            0,
+                        )
+                        .await?
+                        {
+                            Some(0) => continue 'setup,
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+            }
+            Some(1) => {
+                let _ = prepared.cancel();
+                continue 'setup;
+            }
+            _ => {
+                let _ = prepared.cancel();
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
-pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
+pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
     let theme = load_theme(&boot.config);
     let size = Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
@@ -4228,6 +4678,22 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     shell.set_runtime_config(boot.config.clone());
     apply_detected_terminal_background(&mut shell, &boot.config);
     let mut input = EventStream::new();
+    // Offer setup only when bootstrap has no runnable provider inventory. An
+    // explicit --model remains authoritative, and resumed provenance is still
+    // resolved after this optional first-run transaction.
+    if !boot.config.model_explicit && boot.catalog.models().next().is_none() {
+        let config = boot.config.clone();
+        if let Some(completed) = guided_provider_setup(&mut shell, &mut input, &config).await? {
+            boot.catalog = completed.catalog;
+            boot.config.model = Some(completed.model.clone());
+            // Keep this as a persisted default rather than an invocation
+            // override, so an existing session's provenance remains eligible.
+            boot.config.model_explicit = false;
+            shell.set_runtime_config(boot.config.clone());
+            shell.notice(format!("provider setup saved · {}", completed.model.0));
+            shell.render();
+        }
+    }
     // The shell owns a dedicated renderer thread, but sexy-tui still renders
     // synchronously when that thread receives a request. This clock only
     // coalesces high-rate wheel input on the input loop.

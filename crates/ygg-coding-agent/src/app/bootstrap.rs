@@ -3372,7 +3372,10 @@ fn register_openai_codex(
     Ok(())
 }
 
-fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
+fn base_model_catalog_with_custom_store(
+    offline: bool,
+    explicit_custom_store: Option<&crate::auth::custom::CredentialStore>,
+) -> anyhow::Result<ModelCatalog> {
     let mut catalog = ModelCatalog::builtin()?;
     // The embedded catalog describes supported integrations, not enabled
     // accounts. Do not offer a cloud model until its endpoint can resolve a
@@ -3403,8 +3406,24 @@ fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
     }
 
     // Explicit custom models remain usable offline; only auto-discovery is skipped.
-    // Tests never inspect ambient HOME credentials.
-    if !cfg!(test) {
+    // Normal tests never inspect ambient HOME credentials, while provider setup
+    // passes its explicit existing store so it can rebuild the same catalog
+    // immediately without introducing a second registry or catalog type.
+    if let Some(store) = explicit_custom_store {
+        if let Err(error) =
+            register_custom_openai_endpoints_from_store(&mut catalog, store, offline)
+        {
+            crate::output::stderr!("warning: custom provider registry unavailable: {error}");
+        }
+        if !cfg!(test) {
+            if let Err(error) =
+                register_default_apple_foundation_models(&mut catalog, store, offline)
+            {
+                crate::output::stderr!("warning: Apple Foundation Models unavailable: {error}");
+            }
+            catalog.retain_configured_models();
+        }
+    } else if !cfg!(test) {
         let store = crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path());
         if let Err(error) =
             register_custom_openai_endpoints_from_store(&mut catalog, &store, offline)
@@ -3423,6 +3442,10 @@ fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
     Ok(catalog)
 }
 
+fn base_model_catalog(offline: bool) -> anyhow::Result<ModelCatalog> {
+    base_model_catalog_with_custom_store(offline, None)
+}
+
 /// Build the runtime model catalog, exposing ChatGPT subscription models only
 /// when Ygg owns a usable OAuth credential.
 pub fn model_catalog() -> anyhow::Result<ModelCatalog> {
@@ -3431,6 +3454,23 @@ pub fn model_catalog() -> anyhow::Result<ModelCatalog> {
 
 pub fn model_catalog_with_offline(offline: bool) -> anyhow::Result<ModelCatalog> {
     let mut catalog = base_model_catalog(offline)?;
+    register_codex_catalog(&mut catalog, offline);
+    Ok(catalog)
+}
+
+/// Rebuild the canonical catalog against one explicit existing custom store.
+/// Provider setup uses this after its final atomic write so a selected model is
+/// immediately available without restarting or constructing a partial Agent.
+pub(crate) fn model_catalog_with_setup_store(
+    custom_store: &crate::auth::custom::CredentialStore,
+    offline: bool,
+) -> anyhow::Result<ModelCatalog> {
+    let mut catalog = base_model_catalog_with_custom_store(offline, Some(custom_store))?;
+    register_codex_catalog(&mut catalog, offline);
+    Ok(catalog)
+}
+
+fn register_codex_catalog(catalog: &mut ModelCatalog, offline: bool) {
     // Unit tests use explicit temporary credential stores and must never inspect
     // the developer's ambient HOME. Runtime offline mode still registers a
     // locally authenticated Codex endpoint, but never discovers or refreshes
@@ -3438,11 +3478,10 @@ pub fn model_catalog_with_offline(offline: bool) -> anyhow::Result<ModelCatalog>
     if !cfg!(test) {
         let store = crate::auth::codex::CredentialStore::new(crate::auth::codex::default_path());
         // Non-fatal: a stale or malformed OAuth file must never block Ygg startup.
-        if let Err(error) = register_openai_codex(&mut catalog, store, offline) {
+        if let Err(error) = register_openai_codex(catalog, store, offline) {
             crate::output::stderr!("warning: OpenAI Codex models unavailable: {error}");
         }
     }
-    Ok(catalog)
 }
 
 /// Build the catalog without subscription models, used to make `/logout`
@@ -3837,11 +3876,38 @@ pub fn resolve_launch_print(boot: &Bootstrap, stamp: &str) -> anyhow::Result<Lau
             .map(|model| model.id.0.clone())
             .collect::<Vec<_>>();
         models.sort();
+        let diagnosis = match crate::provider_setup::ProviderSetupService::<
+            crate::provider_setup::HttpSetupProbe,
+        >::readiness(&boot.catalog, None)
+        {
+            crate::provider_setup::ProviderSetupState::NoProvider => {
+                "no provider is configured; run `ygg setup --yes` for an explicitly selected OpenAI-compatible endpoint".to_owned()
+            }
+            crate::provider_setup::ProviderSetupState::Ready => {
+                "no model configured; run `ygg setup --yes` for an explicitly selected OpenAI-compatible endpoint".to_owned()
+            }
+            state => state.to_string(),
+        };
         anyhow::anyhow!(
-            "no model configured: pass --model <id>, resume a session with model provenance, or set model in .ygg/config.toml (available: {})",
+            "{diagnosis}, pass --model <id>, resume a session with model provenance, or set model in .ygg/config.toml (available: {})",
             models.join(", ")
         )
     })?;
+    if boot.catalog.resolve(&model).is_err() {
+        let mut available = boot
+            .catalog
+            .models()
+            .map(|model| model.id.0.clone())
+            .collect::<Vec<_>>();
+        available.sort();
+        let diagnosis = crate::provider_setup::ProviderSetupService::<
+            crate::provider_setup::HttpSetupProbe,
+        >::readiness(&boot.catalog, Some(&model));
+        anyhow::bail!(
+            "{diagnosis}; run `ygg setup --yes` or choose an available model (available: {})",
+            available.join(", ")
+        );
+    }
 
     Ok(LaunchSelection {
         model,

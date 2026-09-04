@@ -3,7 +3,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use ygg_agent::{EffectPolicy, PolicyValueSource, ToolPolicyProvenance};
 use ygg_ai::ModelId;
@@ -17,6 +17,67 @@ use crate::extension_package::ExtensionCommand;
 use crate::migrate::MigrationCommand;
 use crate::pi::PiCommand;
 use crate::session_commands::SessionCommand;
+
+/// Deterministic, non-interactive setup input for one OpenAI-compatible endpoint.
+#[derive(Clone, Debug, Args)]
+pub struct SetupCommand {
+    /// Setup profile. Select `lm-studio` to use its documented URL; an explicit
+    /// --endpoint otherwise implies `openai-compatible`.
+    #[arg(long, value_enum)]
+    pub preset: Option<SetupPreset>,
+    /// Explicit OpenAI-compatible versioned base URL. This is the only endpoint
+    /// setup probes; no local or network scanning is performed.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+    /// Stable custom-registry provider ID (letters, digits, '-' and '_').
+    #[arg(long, value_name = "ID")]
+    pub provider: Option<String>,
+    /// Human-facing provider label.
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
+    /// Select this ID from the discovered model inventory. Without it, setup
+    /// uses the lexicographically first discovered model deterministically.
+    #[arg(long, value_name = "ID", conflicts_with = "manual_model")]
+    pub model: Option<String>,
+    /// Store exactly this explicit model inventory without probing. Required for
+    /// a new setup in offline mode.
+    #[arg(long, value_name = "ID", conflicts_with = "model")]
+    pub manual_model: Option<String>,
+    /// Read a bearer credential from this environment variable at runtime. The
+    /// variable value is never written to the custom provider registry.
+    #[arg(long, value_name = "VAR", conflicts_with = "no_auth")]
+    pub api_key_env: Option<String>,
+    /// Explicitly use no authentication (the default for local profiles).
+    #[arg(long, conflicts_with = "api_key_env")]
+    pub no_auth: bool,
+    /// Permit replacing an already configured provider with the same ID. A
+    /// concurrent registry change still fails rather than being overwritten.
+    #[arg(long)]
+    pub replace: bool,
+    /// Persist the reviewed setup and save its selected model preference.
+    #[arg(long, conflicts_with = "cancel")]
+    pub yes: bool,
+    /// Stop after the deterministic review receipt without writing anything.
+    #[arg(long, conflicts_with = "yes")]
+    pub cancel: bool,
+    /// Disable discovery network traffic for this setup only. Pair it with
+    /// --manual-model to provide an explicit offline inventory.
+    #[arg(long)]
+    pub offline: bool,
+}
+
+/// Supported setup profiles. Native Ollama transport is deliberately not
+/// advertised here; this flow uses only explicitly selected OpenAI-compatible
+/// `/v1` endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SetupPreset {
+    /// LM Studio's documented keyless OpenAI-compatible endpoint.
+    #[value(name = "lm-studio")]
+    LmStudio,
+    /// A user-supplied OpenAI-compatible endpoint.
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
+}
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum TopLevelCommand {
@@ -48,6 +109,12 @@ pub enum TopLevelCommand {
     },
     /// Check local prerequisites, configured providers, and model visibility.
     Doctor,
+    /// Configure one explicitly selected OpenAI-compatible provider without
+    /// prompting. Review only by default; pass --yes to persist.
+    Setup {
+        #[command(flatten)]
+        options: SetupCommand,
+    },
     /// Launch the loopback-only Ygg Serve application.
     ///
     /// Default builds dispatch to the installed extension runtime; builds with
@@ -2719,6 +2786,50 @@ max_output_bytes = 4096
         assert!(cli.message.is_none());
         assert!(matches!(cli.command, Some(TopLevelCommand::Doctor)));
         assert!(cli.offline);
+    }
+
+    #[test]
+    fn setup_command_parses_explicit_non_interactive_inputs() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "setup",
+            "--endpoint",
+            "https://models.example.test/v1/",
+            "--api-key-env",
+            "EXAMPLE_API_KEY",
+            "--manual-model",
+            "example-model",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Setup { options })
+                if options.preset.is_none()
+                    && options.endpoint.as_deref() == Some("https://models.example.test/v1/")
+                    && options.api_key_env.as_deref() == Some("EXAMPLE_API_KEY")
+                    && options.manual_model.as_deref() == Some("example-model")
+                    && options.yes
+        ));
+
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "setup",
+            "--preset",
+            "lm-studio",
+            "--offline",
+            "--manual-model",
+            "local-model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Setup { options })
+                if options.preset == Some(SetupPreset::LmStudio)
+                    && options.offline
+                    && options.manual_model.as_deref() == Some("local-model")
+        ));
     }
 
     #[test]

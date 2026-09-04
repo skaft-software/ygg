@@ -509,6 +509,10 @@ pub(crate) enum PanelAction {
     SelectExtension(Vec<String>),
     /// Select one subagent presentation node.
     SelectSubagent(Vec<String>),
+    /// Select one step in guided provider onboarding. Kept distinct from
+    /// extension selection so ordinary-surface consumers retain the workflow
+    /// purpose rather than inferring it from labels.
+    ProviderSetup(Vec<String>),
     /// Drive the enhanced session browser without copying its row data.
     SessionPicker,
     /// Drive the user-message fork browser without copying its row data.

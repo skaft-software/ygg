@@ -341,6 +341,33 @@ where
     .await
 }
 
+/// Select a single step in the guided provider-setup flow. This uses the
+/// ordinary select-list surface and retains cancellation as a non-mutating
+/// outcome for the caller.
+pub async fn provider_setup_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
+    title: &str,
+    items: Vec<String>,
+    descriptions: Vec<Option<String>>,
+    initial_selected: usize,
+) -> anyhow::Result<Option<usize>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let action_items = items.clone();
+    pick_list(
+        shell,
+        input,
+        title,
+        items,
+        descriptions,
+        initial_selected,
+        PanelAction::ProviderSetup(action_items),
+    )
+    .await
+}
+
 /// Complete live subagent list replacement supplied by the owning product loop.
 pub struct SubagentPickerSnapshot {
     pub title: String,

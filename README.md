@@ -326,6 +326,38 @@ Responses Lite from a model name or subscription plan; missing or unusable
 account-scoped metadata falls back conservatively.
 ### Use custom OpenAI-compatible providers
 
+For a first local model, launch interactive `ygg` with no configured model and
+choose **LM Studio** or **OpenAI-compatible endpoint** in the guided setup flow.
+The flow asks for one endpoint, an optional credential source, a discovered or
+manual model ID, and a final review before it writes anything. It never scans
+localhost or a network for servers.
+
+For scripts, `ygg setup` is the same transactional operation without prompts.
+It prints a secret-free review receipt by default; add `--yes` only after
+reviewing it. Select LM Studio explicitly before using its documented default
+endpoint, or supply an endpoint yourself:
+
+```sh
+# One explicitly selected LM Studio endpoint; review only.
+ygg setup --preset lm-studio --manual-model local-model
+
+# Commit a discovered model inventory after confirmation.
+ygg setup --endpoint https://models.example.test/v1/ \
+  --api-key-env EXAMPLE_API_KEY --yes
+
+# Offline/manual recovery makes no discovery request.
+ygg setup --endpoint http://127.0.0.1:8000/v1/ \
+  --offline --manual-model Qwen3-Coder --yes
+```
+
+`--cancel`, review-only setup, offline failure, and a concurrent registry change
+leave the registry unchanged. Setup sends a bounded `GET /models` only to the
+endpoint selected in that invocation, follows no redirects, writes no setup
+telemetry, and never includes API-key or secret-header values in a receipt,
+diagnostic, session, or cache. Print and RPC modes never open the guided flow;
+when no model can be resolved they report the deterministic `ygg setup --yes`
+recovery command instead.
+
 Configure all custom endpoints together in `~/.ygg/credentials/custom.json`:
 
 ```json
@@ -817,6 +849,7 @@ warning. New configuration should use `reasoning` alone.
 | Area | Options |
 | --- | --- |
 | Provider auth | `--login`, `--logout`, `--headless` |
+| Provider setup | `setup --preset lm-studio --manual-model ID [--yes]`, `setup --endpoint URL [--api-key-env VAR] [--model ID\|--manual-model ID] [--offline] [--yes]` |
 | Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
 | Session | `--continue`, `--resume`, `--fork`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
