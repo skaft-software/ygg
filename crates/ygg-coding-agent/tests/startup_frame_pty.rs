@@ -249,7 +249,7 @@ impl PtyYgg {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                if libc::ioctl(tty_fd, libc::TIOCSCTTY, 0) == -1 {
+                if libc::ioctl(tty_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -317,9 +317,12 @@ impl PtyYgg {
             thread::sleep(Duration::from_millis(5));
         };
         self.pty.drain_for(DRAIN_TIME);
+        // A controlling-terminal session exit revokes the parent-held slave on
+        // macOS (tcgetattr returns ENOTTY), while the PTY master continues to
+        // expose the same terminal mode state on both macOS and Linux.
         let restored = terminal_modes_equal(
             &self.pty.original_termios,
-            &terminal_attributes(self.pty.slave.as_raw_fd()),
+            &terminal_attributes(self.pty.master.as_raw_fd()),
         );
         ShutdownCapture {
             output: std::mem::take(&mut self.pty.output),
