@@ -367,7 +367,7 @@ fn model_resolution_has_cli_project_global_precedence() {
 }
 
 #[test]
-fn opencode_discovery_infers_supported_protocols_and_skips_gemini() {
+fn opencode_discovery_infers_supported_protocols_and_routes_gemini() {
     let preset = &crate::providers::OPENCODE;
     let binding = |model_id| {
         discovered_preset_binding(preset, model_id).map(|route| (route.endpoint_id, route.protocol))
@@ -388,7 +388,10 @@ fn opencode_discovery_infers_supported_protocols_and_skips_gemini() {
         binding("qwen3.7-instruct"),
         Some(("opencode", Protocol::OpenAiChat))
     );
-    assert_eq!(binding("gemini-future"), None);
+    assert_eq!(
+        binding("gemini-future"),
+        Some(("opencode-google", Protocol::GoogleGenerativeAi))
+    );
     assert_eq!(
         binding("kimi-future"),
         Some(("opencode", Protocol::OpenAiChat))
