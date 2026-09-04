@@ -3,7 +3,7 @@
 
 use std::time::Instant;
 
-use sexy_tui_rs::{visible_width, CURSOR_MARKER};
+use sexy_tui_rs::{visible_width, TextEditor, CURSOR_MARKER};
 
 use crate::presentation::compact_context_limit;
 use crate::tui::layout::PresentationLayout;
@@ -14,6 +14,17 @@ fn composer_cursor_marker(state: &super::view::ShellState) -> &'static str {
         ""
     } else {
         CURSOR_MARKER
+    }
+}
+
+/// Render-safe composer text plus the corresponding cursor offset. The editor
+/// owns source text and grapheme-safe cursor state; sanitization is only a
+/// terminal-boundary projection.
+fn composer_editor_display(state: &super::view::ShellState) -> (String, usize) {
+    if let Some(prompt) = &state.tool_input_prompt {
+        (prompt.clone(), prompt.len())
+    } else {
+        super::view::sanitized_editor(state.editor.text(), state.editor.cursor())
     }
 }
 
@@ -172,11 +183,7 @@ fn render_composer_box(
         }
     };
 
-    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
-        (prompt.clone(), prompt.len())
-    } else {
-        super::view::sanitized_editor(&state.editor, state.editor_cursor)
-    };
+    let (editor, editor_cursor) = composer_editor_display(state);
 
     if editor.is_empty() {
         for index in 0..content_rows {
@@ -187,20 +194,21 @@ fn render_composer_box(
             }
         }
     } else {
-        let editor_layout = state.cached_editor_layout(
-            (inner_width.saturating_sub(2) as u16).max(1),
-            Some(&editor),
-            Some(editor_cursor),
+        let projection = TextEditor::render_projection_for(
+            &editor,
+            editor_cursor,
+            inner_width.saturating_sub(2).max(1),
+            cursor_marker,
         );
-        let total_lines = editor_layout.lines.len();
+        let total_lines = projection.lines().len();
         let overflow = total_lines.saturating_sub(content_rows);
         let visible_rows = if overflow > 0 {
             (content_rows.saturating_sub(1)).max(1).min(total_lines)
         } else {
             content_rows.max(1).min(total_lines)
         };
-        let mut start = editor_layout
-            .cursor_row
+        let mut start = projection
+            .cursor_row()
             .saturating_add(1)
             .saturating_sub(visible_rows);
         let end = (start + visible_rows).min(total_lines);
@@ -221,23 +229,15 @@ fn render_composer_box(
         }
 
         for index in start..end {
-            let visual_line = &editor_layout.lines[index];
-            let content = if index == editor_layout.cursor_row {
-                let cursor = editor_cursor.clamp(visual_line.start, visual_line.visible_end);
-                format!(
-                    "{}{cursor_marker}{}",
-                    &editor[visual_line.start..cursor],
-                    &editor[cursor..visual_line.visible_end]
-                )
-            } else {
-                editor[visual_line.start..visual_line.visible_end].to_owned()
-            };
             let prefix = if index == 0 {
                 format!("{marker} ")
             } else {
                 "  ".to_owned()
             };
-            rendered.push(render_row(&format!("{prefix}{content}")));
+            rendered.push(render_row(&format!(
+                "{prefix}{}",
+                projection.lines()[index]
+            )));
         }
 
         if hidden_below > 0 {
@@ -278,21 +278,20 @@ fn render_plain_content(state: &super::view::ShellState, width: u16) -> Vec<Stri
             .model_fg(state.model_lab, state.theme.glyph("prompt")),
     );
     let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
-        (prompt.clone(), prompt.len())
-    } else {
-        super::view::sanitized_editor(&state.editor, state.editor_cursor)
-    };
+    let (editor, editor_cursor) = composer_editor_display(state);
     if editor.is_empty() {
-        return vec![format!("{marker} {cursor_marker}")];
+        return vec![fit_line(&format!("{cursor_marker}{marker}"), width)];
     }
-    let cursor = editor_cursor.min(editor.len());
-    let line = format!(
-        "{marker} {}{cursor_marker}{}",
-        &editor[..cursor],
-        &editor[cursor..]
+    let projection = TextEditor::render_projection_for(
+        &editor,
+        editor_cursor,
+        visible_width(&editor).saturating_add(1).max(1),
+        cursor_marker,
     );
-    vec![fit_line(&line, width)]
+    vec![fit_line(
+        &format!("{marker} {}", projection.lines().join("\n")),
+        width,
+    )]
 }
 
 // ---------------------------------------------------------------------------
@@ -699,28 +698,16 @@ pub fn render_composer_surface(
 ) -> Vec<String> {
     let w = usize::from(width);
     if w < 3 {
-        let cursor_marker = composer_cursor_marker(state);
-        let marker = state.theme.bold(
-            &state
-                .theme
-                .model_fg(state.model_lab, state.theme.glyph("prompt")),
-        );
-        let prompt = if state.editor.is_empty() {
-            fit_line(&format!("{cursor_marker}{marker}"), width)
-        } else {
-            let (editor, _) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
-            fit_line(&format!("{cursor_marker}{marker} {editor}"), width)
-        };
-        let mut lines = vec![prompt];
+        let mut lines = render_plain_content(state, width);
         append_status_footer(&mut lines, state, width, now);
         return lines;
     }
 
     let presentation = PresentationLayout::new(&state.theme, width);
-    // Use wrapped (visual) line count so a single long line that wraps
-    // across several rows is counted properly when deciding how tall the
-    // composer box should be.
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
+    // Use wrapped (visual) line count so a single long line that wraps across
+    // several rows is counted properly when deciding how tall the composer box
+    // should be.
+    let (editor, editor_cursor) = composer_editor_display(state);
     let editor_width = if w < 12 {
         presentation.content_width.saturating_sub(2).max(1)
     } else {
@@ -731,9 +718,8 @@ pub fn render_composer_surface(
     let visual_lines = if editor.is_empty() {
         1
     } else {
-        state
-            .cached_editor_layout(editor_width.max(2), Some(&editor), Some(editor_cursor))
-            .lines
+        TextEditor::layout_for(&editor, editor_cursor, usize::from(editor_width))
+            .lines()
             .len()
             .max(1)
     };
@@ -773,7 +759,7 @@ fn render_compact(
         .theme
         .bold(&state.theme.model_fg(state.model_lab, marker));
     let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
+    let (editor, editor_cursor) = composer_editor_display(state);
 
     if editor.is_empty() {
         lines.push(fit_line(
@@ -785,35 +771,28 @@ fn render_compact(
     }
 
     let inner_w = usize::from(plan.content_width.saturating_sub(2).max(1));
-    let layout = state.cached_editor_layout(inner_w as u16, Some(&editor), Some(editor_cursor));
-    let visible_rows = content_rows.max(1).min(layout.lines.len());
-    let mut start = layout
-        .cursor_row
+    let projection =
+        TextEditor::render_projection_for(&editor, editor_cursor, inner_w, cursor_marker);
+    let visible_rows = content_rows.max(1).min(projection.lines().len());
+    let mut start = projection
+        .cursor_row()
         .saturating_add(1)
         .saturating_sub(visible_rows);
-    let end = (start + visible_rows).min(layout.lines.len());
+    let end = (start + visible_rows).min(projection.lines().len());
     if end.saturating_sub(start) < visible_rows {
         start = end.saturating_sub(visible_rows);
     }
 
     for index in start..end {
-        let vis_line = &layout.lines[index];
-        let content = if index == layout.cursor_row {
-            let cursor = editor_cursor.clamp(vis_line.start, vis_line.visible_end);
-            format!(
-                "{}{cursor_marker}{}",
-                &editor[vis_line.start..cursor],
-                &editor[cursor..vis_line.visible_end]
-            )
-        } else {
-            editor[vis_line.start..vis_line.visible_end].to_owned()
-        };
         let prefix = if index == 0 {
             format!("{padding}{marker_s} ")
         } else {
             format!("{padding}  ")
         };
-        lines.push(fit_line(&format!("{prefix}{content}"), width));
+        lines.push(fit_line(
+            &format!("{prefix}{}", projection.lines()[index]),
+            width,
+        ));
     }
     append_status_footer(&mut lines, state, width, now);
     lines

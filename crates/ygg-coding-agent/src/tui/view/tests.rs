@@ -2237,14 +2237,14 @@ fn vertical_editor_navigation_snaps_to_document_boundaries_in_one_step() {
         shell.apply_edit(EditAction::Char(character));
     }
 
-    shell.state.borrow_mut().editor_cursor = 3;
+    shell.state.borrow_mut().editor.set_cursor(3);
     shell.apply_edit(EditAction::Up);
-    assert_eq!(shell.state.borrow().editor_cursor, 0);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
 
-    let editor_len = shell.state.borrow().editor.len();
-    shell.state.borrow_mut().editor_cursor = editor_len - 2;
+    let editor_len = shell.state.borrow().editor.text().len();
+    shell.state.borrow_mut().editor.set_cursor(editor_len - 2);
     shell.apply_edit(EditAction::Down);
-    assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    assert_eq!(shell.state.borrow().editor.cursor(), editor_len);
 }
 
 #[test]
@@ -2255,23 +2255,24 @@ fn vertical_editor_navigation_snaps_at_soft_wrapped_boundaries() {
         shell.apply_edit(EditAction::Char(character));
     }
 
-    shell.state.borrow_mut().editor_cursor = 3;
+    shell.state.borrow_mut().editor.set_cursor(3);
     shell.apply_edit(EditAction::Up);
-    assert_eq!(shell.state.borrow().editor_cursor, 0);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
 
-    let editor_len = shell.state.borrow().editor.len();
-    shell.state.borrow_mut().editor_cursor = editor_len - 2;
+    let editor_len = shell.state.borrow().editor.text().len();
+    shell.state.borrow_mut().editor.set_cursor(editor_len - 2);
     let (editor, cursor) = {
         let state = shell.state.borrow();
-        (state.editor.clone(), state.editor_cursor)
+        (state.editor.text().to_owned(), state.editor.cursor())
     };
     assert_eq!(
-        editor_layout(&editor, cursor, 8).cursor_row,
+        sexy_tui_rs::TextEditor::layout_for(&editor, cursor, composer_editor_wrap_width(8))
+            .cursor_row(),
         2,
         "fixture cursor must begin on the bottom soft-wrapped row"
     );
     shell.apply_edit(EditAction::Down);
-    assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    assert_eq!(shell.state.borrow().editor.cursor(), editor_len);
 }
 
 #[test]
@@ -2281,7 +2282,7 @@ fn clear_editor_discards_attachments_and_resets_composer_navigation() {
     assert!(!shell.state.borrow().ledger.is_empty());
     {
         let mut state = shell.state.borrow_mut();
-        state.editor_cursor = 3;
+        state.editor.set_cursor(3);
         state.slash_selection = 4;
         state.slash_scroll = 2;
         state.slash_popup_dismissed = true;
@@ -2292,7 +2293,7 @@ fn clear_editor_discards_attachments_and_resets_composer_navigation() {
     {
         let state = shell.state.borrow();
         assert!(state.editor.is_empty());
-        assert_eq!(state.editor_cursor, 0);
+        assert_eq!(state.editor.cursor(), 0);
         assert!(state.ledger.is_empty());
         assert_eq!(state.slash_selection, 0);
         assert_eq!(state.slash_scroll, 0);
@@ -2318,10 +2319,55 @@ fn bracketed_paste_preserves_multiline_editor_text_without_submitting() {
     shell.apply_edit(EditAction::Char('a'));
     shell.apply_edit(EditAction::Paste("b\r\nc\rd".into()));
     assert_eq!(shell.pending(), "ab\nc\nd");
-    assert_eq!(shell.state.borrow().editor_cursor, "ab\nc\nd".len());
+    assert_eq!(shell.state.borrow().editor.cursor(), "ab\nc\nd".len());
     let rendered = render_shell(&shell.state.borrow(), 120);
     assert!(rendered.iter().any(|line| line.contains("ab")));
     assert!(rendered.iter().any(|line| line.contains("c")));
+}
+
+#[test]
+fn composer_delegates_grapheme_edits_and_repaints_only_the_native_frame_suffix() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(24, 12);
+    shell.notice("committed transcript row");
+
+    let now = Instant::now();
+    let mut frame = ShellFrameState::default();
+    let _initial = render_shell_update(&shell.state.borrow(), 24, now, &mut frame);
+    let committed = frame.transcript_len;
+
+    shell.apply_edit(EditAction::Paste("e\u{301}👩‍💻界".into()));
+    shell.apply_edit(EditAction::Left);
+    shell.apply_edit(EditAction::Backspace);
+    assert_eq!(shell.pending(), "e\u{301}界");
+    shell.apply_edit(EditAction::Delete);
+    assert_eq!(shell.pending(), "e\u{301}");
+    assert!(shell.state.borrow().editor.cursor_is_valid());
+
+    let update = render_shell_update(&shell.state.borrow(), 24, now, &mut frame);
+    assert_eq!(update.stable_prefix, committed);
+    assert!(!update.rebuild_scrollback);
+    assert!(
+        !update
+            .replacement
+            .iter()
+            .any(|line| line.contains("committed transcript row")),
+        "draft edits must not replay committed native history"
+    );
+    assert_eq!(
+        update
+            .replacement
+            .iter()
+            .map(|line| line.matches(CURSOR_MARKER).count())
+            .sum::<usize>(),
+        1,
+        "the reusable editor projection must emit one cursor marker"
+    );
+    assert!(update
+        .replacement
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .any(|line| line.contains("e\u{301}")));
 }
 
 #[test]
@@ -2508,7 +2554,7 @@ fn prompt_bar_cursor_tracks_insertions_and_cursor_motion() {
     shell.apply_edit(EditAction::Left);
     shell.apply_edit(EditAction::Left);
     shell.apply_edit(EditAction::Char('X'));
-    assert_eq!(shell.state.borrow().editor, "abcdXef");
+    assert_eq!(shell.state.borrow().editor.text(), "abcdXef");
 
     let rendered = render_shell(&shell.state.borrow(), 120);
     let line = rendered
@@ -5330,7 +5376,7 @@ fn transcript_events_prompt_and_composer_share_one_grid() {
     let working_row = rendered_row(&working, "Working");
     let tool_row = rendered_row(&tool, "Bash");
     let shell = InteractiveShell::test_shell();
-    shell.state.borrow_mut().editor = "draft".into();
+    shell.state.borrow_mut().editor.set_text("draft");
     let composer_row = plain_composer_surface(&shell, 80, Instant::now())
         .into_iter()
         .find(|line| line.contains("draft"))
@@ -7523,7 +7569,7 @@ fn reasoning_to_working_to_tool_reuses_the_cached_tail_in_long_sessions() {
         let state = shell.state.borrow();
         let rendered = state.rendered_transcript(80);
         let cache = state.transcript_cache.borrow();
-        assert_eq!(state.editor, "x");
+        assert_eq!(state.editor.text(), "x");
         assert_eq!(cache.generation, generation + 1);
         assert_eq!(cache.last_update_start, working_start);
         assert_eq!(&rendered[..working_start], history_lines.as_slice());
@@ -7584,7 +7630,7 @@ fn unrendered_working_handoff_preserves_the_long_session_cache() {
         let state = shell.state.borrow();
         let rendered = state.rendered_transcript(80);
         let cache = state.transcript_cache.borrow();
-        assert_eq!(state.editor, "x");
+        assert_eq!(state.editor.text(), "x");
         assert_eq!(cache.generation, generation + 1);
         assert_eq!(cache.last_update_start, reasoning_start);
         assert_eq!(&rendered[..reasoning_start], history_lines.as_slice());
@@ -9880,7 +9926,7 @@ fn slash_popup_keeps_selection_visible_across_paging_filtering_and_resize() {
     shell.slash_menu(SlashMenuAction::Last);
     shell.apply_edit(EditAction::Char('m'));
     let state = shell.state.borrow();
-    assert_eq!(state.editor, "/m");
+    assert_eq!(state.editor.text(), "/m");
     assert_eq!(state.slash_selection, 0);
     assert_eq!(state.slash_scroll, 0);
     drop(state);
@@ -10603,7 +10649,7 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
         },
         None,
     )));
-    state.editor = "draft a local patch".into();
+    state.editor.set_text("draft a local patch");
 }
 
 fn ansi_background_is_open_at_end(line: &str) -> bool {

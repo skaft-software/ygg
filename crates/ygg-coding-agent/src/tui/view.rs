@@ -15,7 +15,8 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer,
+    TextEditor, TUI,
 };
 use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
@@ -39,9 +40,6 @@ use crate::tui::theme::{ModelLab, ThemeDensity, YggTheme};
 #[cfg(test)]
 use self::assistant_block::reasoning_heading_from_block;
 use self::assistant_block::AssistantBlock;
-use self::editor_layout::{
-    editor_column, editor_layout, editor_offset_at_column, normalize_paste, EditorLayoutCache,
-};
 use self::input_overlays::input_slash_suggestions;
 #[cfg(test)]
 use self::input_overlays::render_slash_suggestions;
@@ -115,6 +113,13 @@ fn is_subagent_tool(name: &str) -> bool {
 
 /// Maximum physical rows retained in a collapsed command-output tail.
 const COMPACT_EXEC_OUTPUT_ROWS: usize = 5;
+
+/// Convert application-owned composer geometry into usable text cells. The
+/// prompt marker, its gap, and the hardware-cursor reservation stay shell
+/// policy; `TextEditor` receives only this final text width.
+pub(super) fn composer_editor_wrap_width(width: u16) -> usize {
+    usize::from(width).saturating_sub(3).max(1)
+}
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -679,7 +684,8 @@ pub(crate) struct ShellState {
     /// Persistent rich renderers: their syntax caches survive token updates.
     rich_renderer: RefCell<Option<RichRenderer>>,
     reasoning_renderer: RefCell<Option<RichRenderer>>,
-    pub(crate) editor: String,
+    /// Reusable text model for the normal composer draft and cursor.
+    pub(crate) editor: TextEditor,
     /// Ephemeral tool-owned prompt rendered in place of the editor. Secret
     /// keystrokes never enter `editor` or any transcript/session structure.
     pub(crate) tool_input_prompt: Option<String>,
@@ -702,8 +708,6 @@ pub(crate) struct ShellState {
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
-    /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
-    pub(crate) editor_cursor: usize,
     status_detail: String,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
@@ -819,9 +823,6 @@ pub(crate) struct ShellState {
     /// Start of the animated invocation header. It remains mutable until the
     /// first real conversation block so model changes can recolor it in place.
     startup_card_started_at: Option<Instant>,
-    /// Cached editor layout so input and transcript updates do not repeatedly
-    /// re-wrap an unchanged prompt.
-    cached_layout: RefCell<Option<EditorLayoutCache>>,
 }
 
 const STATUS_RAINBOW_DURATION: Duration = Duration::from_secs(2);
@@ -2561,15 +2562,14 @@ impl InteractiveShell {
         }
         state.ledger.restore(attachments);
         let restored = displays.join("\n\n");
-        let current = std::mem::take(&mut state.editor);
-        state.editor = if current.trim().is_empty() {
+        let current = state.editor.take_text();
+        state.editor.set_text(if current.trim().is_empty() {
             restored
         } else if restored.is_empty() {
             current
         } else {
             format!("{restored}\n\n{current}")
-        };
-        state.editor_cursor = state.editor.len();
+        });
     }
 
     pub fn apply_edit(&mut self, action: EditAction) {
@@ -2582,128 +2582,40 @@ impl InteractiveShell {
                 | EditAction::Newline
         );
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = state.editor_cursor.min(state.editor.len());
+        let wrap_width = composer_editor_wrap_width(state.size.0);
         match action {
-            EditAction::Char(character) => {
-                let cursor = state.editor_cursor;
-                state.editor.insert(cursor, character);
-                state.editor_cursor = cursor + character.len_utf8();
-            }
             EditAction::Paste(text) => {
-                let pasted = normalize_paste(&text);
-                match composer::classify_paste(&pasted) {
-                    composer::PasteKind::Verbatim => {
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &pasted);
-                        state.editor_cursor = cursor + pasted.len();
-                    }
-                    composer::PasteKind::LargeText => {
-                        let chip = state.ledger.attach_pasted_text(pasted);
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &chip);
-                        state.editor_cursor = cursor + chip.len();
-                    }
+                // Attachment policy remains shell-owned, but the reusable
+                // editor is the sole authority for normalized text insertion
+                // and cursor movement.
+                let pasted = TextEditor::normalize_paste(&text);
+                let inserted = match composer::classify_paste(&pasted) {
+                    composer::PasteKind::Verbatim | composer::PasteKind::NonMediaFile(_) => pasted,
+                    composer::PasteKind::LargeText => state.ledger.attach_pasted_text(pasted),
                     composer::PasteKind::MediaFile(path) => {
                         let modalities = state.input_modalities;
                         match state.ledger.attach_media(&path, modalities) {
-                            Ok(chip) => {
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &chip);
-                                state.editor_cursor = cursor + chip.len();
-                            }
+                            Ok(chip) => chip,
                             Err(error) => {
                                 state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &pasted);
-                                state.editor_cursor = cursor + pasted.len();
+                                pasted
                             }
                         }
                     }
                     composer::PasteKind::DocumentFile(path) => {
                         match state.ledger.attach_file_reference(&path) {
-                            Ok(chip) => {
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &chip);
-                                state.editor_cursor = cursor + chip.len();
-                            }
+                            Ok(chip) => chip,
                             Err(error) => {
                                 state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &pasted);
-                                state.editor_cursor = cursor + pasted.len();
+                                pasted
                             }
                         }
                     }
-                    composer::PasteKind::NonMediaFile(_) => {
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &pasted);
-                        state.editor_cursor = cursor + pasted.len();
-                    }
-                }
-            }
-            EditAction::Backspace => {
-                if state.editor_cursor > 0 {
-                    let previous = state.editor[..state.editor_cursor]
-                        .char_indices()
-                        .last()
-                        .map_or(0, |(offset, _)| offset);
-                    let cursor = state.editor_cursor;
-                    state.editor.replace_range(previous..cursor, "");
-                    state.editor_cursor = previous;
-                }
-            }
-            EditAction::Delete => {
-                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
-                    let end = state.editor_cursor + character.len_utf8();
-                    let cursor = state.editor_cursor;
-                    state.editor.replace_range(cursor..end, "");
-                }
-            }
-            EditAction::Newline => {
-                let cursor = state.editor_cursor;
-                state.editor.insert(cursor, '\n');
-                state.editor_cursor = cursor + 1;
-            }
-            EditAction::Left => {
-                if state.editor_cursor > 0 {
-                    state.editor_cursor = state.editor[..state.editor_cursor]
-                        .char_indices()
-                        .last()
-                        .map_or(0, |(offset, _)| offset);
-                }
-            }
-            EditAction::Right => {
-                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
-                    state.editor_cursor += character.len_utf8();
-                }
-            }
-            EditAction::Up | EditAction::Down => {
-                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
-                let last_row = layout.lines.len().saturating_sub(1);
-                if matches!(action, EditAction::Up) && layout.cursor_row == 0 {
-                    state.editor_cursor = 0;
-                } else if matches!(action, EditAction::Down) && layout.cursor_row == last_row {
-                    state.editor_cursor = state.editor.len();
-                } else {
-                    let current = &layout.lines[layout.cursor_row];
-                    let target_row = if matches!(action, EditAction::Up) {
-                        layout.cursor_row - 1
-                    } else {
-                        layout.cursor_row + 1
-                    };
-                    let column = editor_column(&state.editor, current, state.editor_cursor);
-                    state.editor_cursor =
-                        editor_offset_at_column(&state.editor, &layout.lines[target_row], column);
-                }
-            }
-            EditAction::Home | EditAction::End => {
-                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
-                let line = &layout.lines[layout.cursor_row];
-                state.editor_cursor = if matches!(action, EditAction::Home) {
-                    line.start
-                } else {
-                    line.visible_end
                 };
+                state.editor.apply(EditAction::Paste(inserted), wrap_width);
+            }
+            action => {
+                state.editor.apply(action, wrap_width);
             }
         }
 
@@ -2712,8 +2624,8 @@ impl InteractiveShell {
             state.slash_scroll = 0;
             state.slash_popup_dismissed = false;
         }
-        if state.editor_cursor == state.editor.len()
-            && composer::active_mention(&state.editor)
+        if state.editor.cursor() == state.editor.text().len()
+            && composer::active_mention(state.editor.text())
                 .is_some_and(|query| !composer::is_path_query(query))
             && state.file_index.is_none()
         {
@@ -2726,7 +2638,7 @@ impl InteractiveShell {
     /// Complete a unique slash-command prefix at the end of the prompt.
     pub fn complete_slash_command(&mut self) {
         let mut state = self.state.borrow_mut();
-        if state.editor_cursor != state.editor.len() {
+        if state.editor.cursor() != state.editor.text().len() {
             return;
         }
         let suggestions = input_slash_suggestions(&state);
@@ -2736,8 +2648,7 @@ impl InteractiveShell {
                 suggestion.name,
                 if suggestion.accepts_argument { " " } else { "" }
             );
-            state.editor = completed;
-            state.editor_cursor = state.editor.len();
+            state.editor.set_text(completed);
             state.slash_popup_dismissed = true;
         }
     }
@@ -2782,12 +2693,11 @@ impl InteractiveShell {
             }
             SlashMenuAction::Select => {
                 let command = &suggestions[state.slash_selection];
-                state.editor = format!(
+                state.editor.set_text(format!(
                     "/{}{}",
                     command.name,
                     if command.accepts_argument { " " } else { "" }
-                );
-                state.editor_cursor = state.editor.len();
+                ));
                 state.slash_popup_dismissed = true;
                 return;
             }
@@ -2939,18 +2849,20 @@ impl InteractiveShell {
         false
     }
 
-    /// behavior; literal paths are inserted as text. Directory completions omit
+    /// Complete one trailing mention or literal path at the end of the draft.
+    /// Media and PDF completions remain composer policy and become attachment
+    /// chips; literal paths are inserted as text. Directory completions omit
     /// the trailing space so another Tab can descend into them.
     pub fn complete_path(&mut self) {
         let mut state = self.state.borrow_mut();
-        if state.editor_cursor != state.editor.len() {
+        if state.editor.cursor() != state.editor.text().len() {
             return;
         }
         let Some(root) = state.workspace.clone() else {
             return;
         };
 
-        if let Some(query) = composer::active_mention(&state.editor).map(str::to_owned) {
+        if let Some(query) = composer::active_mention(state.editor.text()).map(str::to_owned) {
             let suggestion = if composer::is_path_query(&query) {
                 composer::path_matches(&root, &query, 1).into_iter().next()
             } else {
@@ -2973,54 +2885,47 @@ impl InteractiveShell {
             let Some(suggestion) = suggestion else {
                 return;
             };
-            let token_start = state.editor.len() - (query.len() + 1);
-
-            if suggestion.is_dir {
-                state
-                    .editor
-                    .replace_range(token_start.., &format!("@{}", suggestion.completion));
+            let token_start = state.editor.text().len() - (query.len() + 1);
+            let replacement = if suggestion.is_dir {
+                format!("@{}", suggestion.completion)
             } else if composer::media_kind_for_path(&suggestion.path).is_some() {
                 let modalities = state.input_modalities;
                 match state.ledger.attach_media(&suggestion.path, modalities) {
-                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Ok(chip) => chip,
                     Err(error) => {
                         state.push_block(TranscriptBlock::Notice(error.to_string()));
-                        state
-                            .editor
-                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                        format!("@{} ", suggestion.completion)
                     }
                 }
             } else if composer::file_kind_for_path(&suggestion.path).is_some() {
                 match state.ledger.attach_file_reference(&suggestion.path) {
-                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Ok(chip) => chip,
                     Err(error) => {
                         state.push_block(TranscriptBlock::Notice(error.to_string()));
-                        state
-                            .editor
-                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                        format!("@{} ", suggestion.completion)
                     }
                 }
             } else {
-                state
-                    .editor
-                    .replace_range(token_start.., &format!("@{} ", suggestion.completion));
-            }
-            state.editor_cursor = state.editor.len();
+                format!("@{} ", suggestion.completion)
+            };
+            let end = state.editor.text().len();
+            let _ = state.editor.replace_range(token_start..end, &replacement);
+            state.editor.move_to_end();
             return;
         }
 
-        let Some(query) = composer::active_path(&state.editor).map(str::to_owned) else {
+        let Some(query) = composer::active_path(state.editor.text()).map(str::to_owned) else {
             return;
         };
         let Some(suggestion) = composer::path_matches(&root, &query, 1).into_iter().next() else {
             return;
         };
-        let token_start = state.editor.len() - query.len();
+        let token_start = state.editor.text().len() - query.len();
         let suffix = if suggestion.is_dir { "" } else { " " };
-        state
-            .editor
-            .replace_range(token_start.., &format!("{}{suffix}", suggestion.completion));
-        state.editor_cursor = state.editor.len();
+        let replacement = format!("{}{suffix}", suggestion.completion);
+        let end = state.editor.text().len();
+        let _ = state.editor.replace_range(token_start..end, &replacement);
+        state.editor.move_to_end();
     }
 
     pub fn set_identity(&mut self, provider: &str, model: &str, reasoning: &str) {
@@ -3160,7 +3065,7 @@ impl InteractiveShell {
     }
 
     pub fn pending(&self) -> String {
-        self.state.borrow().editor.clone()
+        self.state.borrow().editor.text().to_owned()
     }
 
     pub fn set_tool_input_prompt(&mut self, prompt: Option<String>) {
@@ -3180,8 +3085,7 @@ impl InteractiveShell {
     /// Drain the editor and resolve chips into ordered parts.
     pub fn drain_composed(&mut self) -> ComposedInput {
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = 0;
-        let mut text = std::mem::take(&mut state.editor);
+        let mut text = state.editor.take_text();
 
         // Drag/drop is not consistently delivered as a bracketed-paste event.
         // When it arrives as ordinary keys, promote every existing media path
@@ -3239,8 +3143,7 @@ impl InteractiveShell {
     /// must be observationally equivalent to a validation error.
     pub fn restore_composed(&mut self, composed: ComposedInput) {
         let mut state = self.state.borrow_mut();
-        state.editor = composed.display_text;
-        state.editor_cursor = state.editor.len();
+        state.editor.set_text(composed.display_text);
         state.ledger.restore(composed.attachments);
     }
 
@@ -3248,7 +3151,6 @@ impl InteractiveShell {
     pub fn clear_editor(&mut self) {
         let mut state = self.state.borrow_mut();
         state.editor.clear();
-        state.editor_cursor = 0;
         state.ledger.clear();
         state.slash_selection = 0;
         state.slash_scroll = 0;
@@ -3257,11 +3159,10 @@ impl InteractiveShell {
 
     pub fn drain_editor(&mut self) -> String {
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = 0;
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
-        std::mem::take(&mut state.editor)
+        state.editor.take_text()
     }
 
     fn materialize_deferred_history(&mut self) -> Result<bool> {
@@ -3763,12 +3664,10 @@ impl InteractiveShell {
     /// Put a selected user message back into the ordinary composer.
     pub(crate) fn prefill_editor(&mut self, text: String) {
         let mut state = self.state.borrow_mut();
-        state.editor = text;
-        state.editor_cursor = state.editor.len();
+        state.editor.set_text(text);
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
-        *state.cached_layout.get_mut() = None;
     }
 
     /// Replace a live subagent list without losing its filter or stable-node
@@ -4772,7 +4671,6 @@ impl sexy_tui_rs::Terminal for TestTerminal {
 
 mod assistant_block;
 mod bash_render;
-mod editor_layout;
 mod input_overlays;
 mod native_scrollback;
 mod ordinary_surface;

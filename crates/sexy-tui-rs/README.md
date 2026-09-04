@@ -15,6 +15,8 @@ updates stable, and degrades to deterministic escape-free text.
 - Optional `syntect` highlighting mapped to semantic theme roles.
 - Unified diffs with visible `+`/`-` prefixes and optional line numbers.
 - One grapheme/display-cell width policy for CJK, combining marks, emoji, and tabs.
+- Pure `TextEditor` buffer/cursor/layout model with grapheme-safe edits, visual-row motion,
+  and cursor-marker projections; applications retain key, theme, and submission policy.
 - Conservative terminal capabilities, explicit overrides, Unicode/ASCII glyph sets,
   color quantization, safe OSC 8 links, complete plain mode, and a bounded
   out-of-band Kitty/iTerm2 image foundation.
@@ -286,6 +288,38 @@ Code backgrounds are absent unless a theme explicitly supplies one.
 See [`docs/rich-rendering.md`](docs/rich-rendering.md) for architecture and
 [`docs/ygg-integration.md`](docs/ygg-integration.md) for migration boundaries.
 
+## Text editing model
+
+`TextEditor` is a reusable multiline text model, not a terminal-event parser or
+styled widget. It owns editable UTF-8 text, a cursor that is always an extended
+grapheme boundary, visual wrapping in terminal cells, and optional cursor-marker
+projection. The embedding application supplies its usable text width after
+reserving prompt, border, and padding columns.
+
+```rust
+use sexy_tui_rs::{TextEditAction, TextEditor};
+
+let mut editor = TextEditor::with_text("alpha beta");
+editor.apply(TextEditAction::Home, 6);
+assert_eq!(editor.cursor(), "alpha ".len()); // second visual row
+
+let projection = editor.render_projection(6, "<cursor>");
+assert_eq!(projection.lines(), ["alpha", "<cursor>beta"]);
+```
+
+`Char`, `Paste`, deletion, Left/Right, Up/Down, Home, and End are semantic
+`TextEditAction`s. Paste normalizes CRLF and bare CR to LF; ordinary text set by
+`set_text` stays authoritative. Up/Down preserve the selected display-cell
+column across short rows and reflow. `TextEditorLayout` exposes grapheme-safe
+source ranges for renderers, while `TextEditorProjection` inserts a non-empty
+marker exactly once on the cursor row.
+
+The model deliberately does **not** sanitize text, parse terminal input, draw
+chrome, attach files, choose focus, or submit a draft. Sanitize only at the
+application's render boundary. When that boundary renders a transformed safe
+copy rather than the source buffer, use `TextEditor::layout_for` and
+`TextEditor::render_projection_for` with the matching transformed cursor offset.
+
 ## Components and TUI
 
 The retained API remains available:
@@ -299,9 +333,9 @@ pub trait Component {
 ```
 
 Rich components include `RichText`, `Markdown`, and
-`StreamingMarkdownWidget`. `Input` and `Editor` move/delete whole grapheme
-clusters and emit Pi's trusted cursor marker, which `TUI` maps to the IME
-hardware-cursor position.
+`StreamingMarkdownWidget`. Compose `TextEditor`'s plain projected rows into an
+application-owned component when a retained frame needs editable text; the TUI
+maps its trusted cursor marker to the IME hardware-cursor position.
 
 Interactive rendering defaults to a direct Rust port of Pi's retained-frame
 algorithm at the pinned revision. It writes the complete first frame, tracks

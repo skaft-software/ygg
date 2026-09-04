@@ -15,6 +15,7 @@ mod scrollback;
 pub mod style;
 pub mod terminal;
 pub mod terminal_colors;
+pub mod text_editor;
 pub mod theme;
 pub mod tui;
 pub mod utils;
@@ -63,6 +64,9 @@ pub use terminal::{
 pub use terminal_colors::{
     is_osc11_background_color_response, parse_osc11_background_color,
     parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme,
+};
+pub use text_editor::{
+    TextEditAction, TextEditor, TextEditorLayout, TextEditorProjection, TextEditorVisualLine,
 };
 pub use theme::capability::CapabilityTier;
 pub use theme::Theme;

@@ -5,6 +5,10 @@ use crossterm::event::{
 };
 use sexy_tui_rs::key_text;
 
+/// Semantic editor mutations shared with the reusable text model. The shell
+/// continues to own terminal-event translation and key policy.
+pub use sexy_tui_rs::TextEditAction as EditAction;
+
 /// Actions produced by the pure terminal-event translator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -60,24 +64,6 @@ pub enum PointerGesture {
     Begin { row: u16, col: u16, extend: bool },
     Extend { row: u16, col: u16 },
     End { row: u16, col: u16 },
-}
-
-/// Editor mutations understood by the shell.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EditAction {
-    Char(char),
-    /// A bracketed-paste payload. It is inserted verbatim by the editor rather
-    /// than being interpreted as key presses or command submission.
-    Paste(String),
-    Backspace,
-    Delete,
-    Newline,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
 }
 
 fn is_command_submission(key: &KeyEvent) -> bool {

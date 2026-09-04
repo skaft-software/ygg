@@ -43,13 +43,13 @@ pub(super) struct InputSlashSuggestion {
 }
 
 pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSuggestion> {
-    let Some(query) = state.editor.strip_prefix('/') else {
+    let Some(query) = state.editor.text().strip_prefix('/') else {
         return Vec::new();
     };
     if query.contains(char::is_whitespace) || query.contains('\n') {
         return Vec::new();
     }
-    let mut suggestions = commands::slash_suggestions(&state.editor)
+    let mut suggestions = commands::slash_suggestions(state.editor.text())
         .into_iter()
         .map(|command| InputSlashSuggestion {
             name: command.name.to_owned(),
@@ -297,12 +297,32 @@ pub(super) fn render_slash_suggestions(
 }
 
 fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
-    if max_rows < 2 || state.editor_cursor != state.editor.len() {
+    if max_rows < 2 || state.editor.cursor() != state.editor.text().len() {
         return Vec::new();
     }
 
-    let (heading_label, matches) = if let Some(query) = composer::active_mention(&state.editor) {
-        if composer::is_path_query(query) {
+    let (heading_label, matches) =
+        if let Some(query) = composer::active_mention(state.editor.text()) {
+            if composer::is_path_query(query) {
+                let Some(root) = &state.workspace else {
+                    return Vec::new();
+                };
+                let matches = composer::path_matches(root, query, 5)
+                    .into_iter()
+                    .map(|suggestion| suggestion.completion)
+                    .collect();
+                ("paths", matches)
+            } else {
+                let Some(files) = state.file_index.as_ref() else {
+                    return Vec::new();
+                };
+                let matches = composer::mention_matches(files, query, 5)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                ("project files", matches)
+            }
+        } else if let Some(query) = composer::active_path(state.editor.text()) {
             let Some(root) = &state.workspace else {
                 return Vec::new();
             };
@@ -312,27 +332,8 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
                 .collect();
             ("paths", matches)
         } else {
-            let Some(files) = state.file_index.as_ref() else {
-                return Vec::new();
-            };
-            let matches = composer::mention_matches(files, query, 5)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-            ("project files", matches)
-        }
-    } else if let Some(query) = composer::active_path(&state.editor) {
-        let Some(root) = &state.workspace else {
             return Vec::new();
         };
-        let matches = composer::path_matches(root, query, 5)
-            .into_iter()
-            .map(|suggestion| suggestion.completion)
-            .collect();
-        ("paths", matches)
-    } else {
-        return Vec::new();
-    };
     let matches: Vec<String> = matches;
     if matches.is_empty() {
         return Vec::new();
