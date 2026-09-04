@@ -39,6 +39,20 @@ tokio-tungstenite = "0.29"
 [lints.rust]
 missing_docs = "warn"
 
+[profile.ci-test]
+# This independent Cargo workspace uses the same bounded CI artifact policy as
+# the root workspace.
+inherits = "test"
+debug = "limited"
+incremental = false
+
+[profile.profiling]
+# Preserve release-like optimization while keeping full profiler symbols.
+inherits = "release"
+debug = "full"
+lto = "off"
+strip = "none"
+
 # Keep the audited lopdf 0.42.0 parser compatible with the Rust 1.86 MSRV;
 # see the vendored patch's source note for the one syntax-only change.
 [patch.crates-io]

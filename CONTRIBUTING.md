@@ -110,8 +110,8 @@ affected crate. Before requesting review, run the full release gate:
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
-cargo test --workspace --doc --locked
+cargo test --workspace --all-targets --all-features --profile ci-test --locked
+cargo test --workspace --doc --profile ci-test --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
 cargo audit --file extensions/ygg-serve/Cargo.lock
@@ -120,6 +120,11 @@ cargo deny --manifest-path extensions/ygg-serve/Cargo.toml check
 (cd apps/web && npm ci && npm audit --audit-level=high)
 git diff --check
 ```
+
+CI uses the additive `ci-test` profile for Rust tests; ordinary `cargo test`
+continues to use Cargo's default test profile. See
+[docs/build-profiles.md](docs/build-profiles.md) for the CI and profiling
+commands.
 
 Terminal changes should include a renderer, VT100, or PTY regression when the
 behavior depends on cells, cursor movement, scrollback, styles, or shutdown.

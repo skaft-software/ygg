@@ -984,8 +984,8 @@ Normal builds are deterministic and use checked-in model metadata.
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
-cargo test --workspace --doc --locked
+cargo test --workspace --all-targets --all-features --profile ci-test --locked
+cargo test --workspace --doc --profile ci-test --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
 cargo deny check
@@ -996,6 +996,10 @@ Build the release binary:
 ```sh
 cargo build --release --locked -p ygg-coding-agent --bin ygg
 ```
+
+CI uses the additive `ci-test` profile above; ordinary `cargo test` remains
+unchanged. Use the release-like, symbol-retaining `profiling` profile as
+[documented in docs/build-profiles.md](docs/build-profiles.md).
 
 The declared MSRV is Rust 1.86. Command execution is Unix-only. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution scope, review expectations, and the release checklist.
 
@@ -1037,6 +1041,7 @@ third_party/              upstream license texts
 | [Presentation contract](docs/design/ygg-presentation.md) | Stable Ygg structure, adaptive model atmosphere, and durable/live/diagnostic layers. |
 | [Command and picker surface contract](docs/design/ygg-command-picker-surfaces.md) | Shared transient discovery, selection, status, action, and terminal-capability vocabulary. |
 | [Benchmarking](docs/benchmarks/README.md) | Optional telemetry, systems measurements, failure taxonomy, and shootout methodology. |
+| [Build profiles](docs/build-profiles.md) | CI test artifacts, profiler-friendly release-like builds, and comparison commands. |
 | [Beta protocol](docs/benchmarks/beta-protocol.md) | Opt-in first-ten-user daily-driver validation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |
 
