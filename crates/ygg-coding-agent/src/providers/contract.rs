@@ -116,10 +116,20 @@ impl DiscoveryCapabilityProfile {
 pub enum StaticModelSet {
     /// No static models are supplied.
     None,
+    /// Kimi Coding's supported Anthropic-compatible routes.
+    KimiCoding,
     /// MiniMax's supported Anthropic-compatible routes.
     MiniMax,
+    /// MiniMax China's supported Anthropic-compatible routes.
+    MiniMaxChina,
     /// OpenCode Zen's supported routes.
     OpenCode,
+    /// OpenCode Zen Go's compatible OpenAI Chat routes.
+    OpenCodeGo,
+    /// Vercel AI Gateway's Anthropic-compatible starter routes.
+    VercelAiGateway,
+    /// Xiaomi regional token-plan Anthropic-compatible routes.
+    XiaomiTokenPlan,
     /// Mistral Chat Completions models.
     Mistral,
     /// Cloudflare Workers AI's OpenAI-compatible models.
@@ -1131,7 +1141,544 @@ include!(concat!(env!("OUT_DIR"), "/provider_declarations.rs"));
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde::Deserialize;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use ygg_ai::{
+        AiClient, Auth, CacheRetention, Capabilities, CompatibilityMode, Message, ModalitySet,
+        Model, ModelCatalog, ModelId, ModelLimits, OutputFormat, OutputModalities, ReasoningConfig,
+        ReasoningMode, Request, ToolChoice, UserMessage, UserPart,
+    };
+
     use super::*;
+    use crate::providers::auth::EnvironmentCredential;
+    use crate::providers::catalog::{
+        register_discovered_model, register_environment_endpoints_at_base_url,
+        register_static_models,
+    };
+
+    const PINNED_PI_PROVIDER_IDS: &[&str] = &[
+        "amazon-bedrock",
+        "anthropic",
+        "ant-ling",
+        "azure-openai-responses",
+        "cerebras",
+        "cloudflare-ai-gateway",
+        "cloudflare-workers-ai",
+        "deepseek",
+        "fireworks",
+        "github-copilot",
+        "google",
+        "google-vertex",
+        "groq",
+        "huggingface",
+        "kimi-coding",
+        "minimax",
+        "minimax-cn",
+        "mistral",
+        "moonshotai",
+        "moonshotai-cn",
+        "openai",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
+        "openrouter",
+        "vercel-ai-gateway",
+        "xai",
+        "xiaomi",
+        "xiaomi-token-plan-ams",
+        "xiaomi-token-plan-cn",
+        "xiaomi-token-plan-sgp",
+        "zai",
+    ];
+
+    #[derive(Debug, Deserialize)]
+    struct PiProviderInventory {
+        schema_version: u8,
+        pi_package: String,
+        expected_provider_ids: Vec<String>,
+        providers: Vec<PiProviderFixture>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PiProviderFixture {
+        id: String,
+        decision: PiProviderDecision,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum PiProviderDecision {
+        Declared {
+            fixture_id: String,
+            provider_id: String,
+            fixture: PiRouteFixture,
+        },
+        DeclaredSubset {
+            fixture_id: String,
+            provider_id: String,
+            fixture: PiRouteFixture,
+            excluded_surfaces: Vec<String>,
+            missing_primitive: String,
+            release_blocker: String,
+        },
+        Unsupported {
+            fixture_id: String,
+            missing_primitive: String,
+            release_blocker: String,
+        },
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct PiRouteFixture {
+        registration: String,
+        model_id: String,
+        protocol: String,
+        endpoint_id: String,
+        auth_presentation: String,
+        base_url: String,
+        environment_variable: String,
+    }
+
+    fn fixture_protocol(value: &str) -> Protocol {
+        match value {
+            "anthropic_messages" => Protocol::AnthropicMessages,
+            "openai_chat" => Protocol::OpenAiChat,
+            "openai_responses" => Protocol::OpenAiResponses,
+            other => panic!("unknown fixture protocol: {other}"),
+        }
+    }
+
+    fn fixture_auth_presentation(value: &str) -> EndpointAuthPresentation {
+        match value {
+            "api_key_header" => EndpointAuthPresentation::ApiKeyHeader,
+            "bearer" => EndpointAuthPresentation::Bearer,
+            "dynamic" => EndpointAuthPresentation::Dynamic,
+            other => panic!("unknown fixture auth presentation: {other}"),
+        }
+    }
+
+    fn fixture_capabilities() -> Capabilities {
+        Capabilities {
+            input_modalities: ModalitySet::none(),
+            output_modalities: ModalitySet::none(),
+            tools: true,
+            parallel_tool_calls: true,
+            reasoning: None,
+            responses_lite: false,
+            agent_delegation: None,
+            structured_output: false,
+            deferred_tool_loading: false,
+        }
+    }
+
+    fn fixture_request() -> Request {
+        Request {
+            system: None,
+            messages: vec![Message::User(UserMessage {
+                content: vec![UserPart::Text("fixture request".to_owned())],
+            })],
+            tools: vec![],
+            tool_choice: ToolChoice::Auto,
+            // Subset routes intentionally exercise the portable request shape;
+            // their legacy max-token profiles are recorded as exclusions.
+            max_output_tokens: None,
+            temperature: None,
+            stop: vec![],
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
+            responses: None,
+            output_format: OutputFormat::Text,
+            output_modalities: OutputModalities::Text,
+            compatibility: CompatibilityMode::Strict,
+            cache_retention: CacheRetention::None,
+            session_id: None,
+        }
+    }
+
+    fn fixture_stream_response(protocol: &str) -> (&'static str, &'static str) {
+        const ANTHROPIC: &str = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"fixture-anthropic\",\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"fixture\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        const OPENAI_CHAT: &str = concat!(
+            "data: {\"id\":\"fixture-openai-chat\",\"choices\":[{\"delta\":{\"content\":\"fixture\"}}]}\n\n",
+            "data: {\"id\":\"fixture-openai-chat\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        const OPENAI_RESPONSES: &str = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"fixture-openai-responses\"}}\n\n",
+            "data: {\"type\":\"response.content_part.added\",\"output_index\":0,\"content_index\":0,\"part\":{\"type\":\"output_text\"}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"fixture\"}\n\n",
+            "data: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture-openai-responses\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n",
+        );
+
+        match protocol {
+            "anthropic_messages" => (ANTHROPIC, "fixture-anthropic"),
+            "openai_chat" => (OPENAI_CHAT, "fixture-openai-chat"),
+            "openai_responses" => (OPENAI_RESPONSES, "fixture-openai-responses"),
+            other => panic!("unknown fixture protocol: {other}"),
+        }
+    }
+
+    fn fixture_request_path(fixture: &PiRouteFixture) -> String {
+        let base_url = url::Url::parse(&fixture.base_url)
+            .unwrap_or_else(|error| panic!("invalid fixture URL: {error}"));
+        let prefix = base_url.path().trim_end_matches('/');
+        let suffix = match fixture.protocol.as_str() {
+            "anthropic_messages" => "messages",
+            "openai_chat" => "chat/completions",
+            "openai_responses" => "responses",
+            other => panic!("unknown fixture protocol: {other}"),
+        };
+        format!("{prefix}/{suffix}")
+    }
+
+    fn fixture_base_at_server(server: &MockServer, fixture: &PiRouteFixture) -> url::Url {
+        let fixture_url = url::Url::parse(&fixture.base_url)
+            .unwrap_or_else(|error| panic!("invalid fixture URL: {error}"));
+        let mut output = url::Url::parse(&server.uri()).expect("wiremock URL");
+        output.set_path(fixture_url.path());
+        output
+    }
+
+    fn fixture_auth(value: &str) -> Auth {
+        match value {
+            "api_key_header" => {
+                Auth::header(http::HeaderName::from_static("x-api-key"), "fixture-secret")
+            }
+            "bearer" => Auth::bearer("fixture-secret"),
+            other => panic!("request fixture does not support auth presentation: {other}"),
+        }
+    }
+
+    fn register_fixture_model(
+        declaration: &ProviderDeclaration,
+        fixture_id: &str,
+        fixture: &PiRouteFixture,
+        base_url: &url::Url,
+    ) -> Model {
+        let credential = EnvironmentCredential::for_test("TEST_PROVIDER_KEY", "fixture-value");
+        let mut catalog = ModelCatalog::default();
+        register_environment_endpoints_at_base_url(
+            &mut catalog,
+            declaration,
+            &credential,
+            base_url,
+            Duration::from_secs(1),
+        )
+        .unwrap_or_else(|error| panic!("{fixture_id}: endpoint registration failed: {error}"));
+
+        match fixture.registration.as_str() {
+            "static" => register_static_models(&mut catalog, declaration).unwrap_or_else(|error| {
+                panic!("{fixture_id}: static model registration failed: {error}")
+            }),
+            "discovered" => register_discovered_model(
+                &mut catalog,
+                declaration,
+                &fixture.model_id,
+                None,
+                fixture_capabilities(),
+                ModelLimits {
+                    context_window: 1_024,
+                    max_output_tokens: 256,
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("{fixture_id}: discovery registration failed: {error}")),
+            other => panic!("{fixture_id}: unknown fixture registration {other}"),
+        }
+
+        let catalog_id = format!("{}/{}", declaration.id, fixture.model_id);
+        catalog
+            .resolve(&ModelId(catalog_id))
+            .unwrap_or_else(|_| panic!("{fixture_id}: model was not registered"))
+            .clone()
+    }
+
+    fn declaration_for_fixture(provider_id: &str) -> &'static ProviderDeclaration {
+        ALL_PROVIDER_DECLARATIONS
+            .iter()
+            .find(|declaration| declaration.id == provider_id)
+            .unwrap_or_else(|| panic!("missing declaration for fixture provider {provider_id}"))
+    }
+
+    fn assert_declared_fixture(
+        pi_provider_id: &str,
+        fixture_id: &str,
+        provider_id: &str,
+        fixture: &PiRouteFixture,
+    ) {
+        let declaration = declaration_for_fixture(provider_id);
+        assert_eq!(
+            declaration.base_url, fixture.base_url,
+            "{fixture_id}: {pi_provider_id} base URL drifted"
+        );
+        let route = declaration
+            .route_for_model(&fixture.model_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{fixture_id}: {pi_provider_id} has no route for {}",
+                    fixture.model_id
+                )
+            });
+        assert_eq!(
+            route.protocol,
+            fixture_protocol(&fixture.protocol),
+            "{fixture_id}: {pi_provider_id} protocol drifted"
+        );
+        assert_eq!(
+            route.endpoint_id, fixture.endpoint_id,
+            "{fixture_id}: {pi_provider_id} endpoint drifted"
+        );
+        assert_eq!(
+            route.auth_presentation,
+            fixture_auth_presentation(&fixture.auth_presentation),
+            "{fixture_id}: {pi_provider_id} auth presentation drifted"
+        );
+
+        match (
+            declaration.authentication,
+            fixture.auth_presentation.as_str(),
+        ) {
+            (ProviderAuthentication::Environment { variables }, "bearer" | "api_key_header") => {
+                assert!(
+                    variables
+                        .iter()
+                        .any(|variable| *variable == fixture.environment_variable),
+                    "{fixture_id}: {pi_provider_id} environment variable drifted"
+                );
+            }
+            (ProviderAuthentication::Subscription { .. }, "dynamic") => {
+                assert!(
+                    fixture.environment_variable.is_empty(),
+                    "{fixture_id}: subscription fixtures must not name an environment credential"
+                );
+            }
+            _ => panic!("{fixture_id}: authentication kind and presentation disagree"),
+        }
+
+        if fixture.registration == "subscription" {
+            assert!(matches!(
+                declaration.authentication,
+                ProviderAuthentication::Subscription { .. }
+            ));
+            return;
+        }
+
+        let base_url = url::Url::parse(&fixture.base_url)
+            .unwrap_or_else(|error| panic!("{fixture_id}: invalid fixture URL: {error}"));
+        let resolved = register_fixture_model(declaration, fixture_id, fixture, &base_url);
+        assert_eq!(resolved.spec.protocol, route.protocol);
+        assert_eq!(resolved.endpoint.id.0, route.endpoint_id);
+        assert_eq!(resolved.endpoint.base_url.as_str(), fixture.base_url);
+    }
+
+    #[test]
+    fn pinned_pi_provider_inventory_has_tested_decisions() {
+        let inventory: PiProviderInventory =
+            serde_json::from_str(include_str!("../../fixtures/providers/pi-0.84.4.json"))
+                .expect("valid Pi provider compatibility fixture");
+        assert_eq!(inventory.schema_version, 1);
+        assert_eq!(
+            inventory.pi_package,
+            "@earendil-works/pi-coding-agent@0.84.4"
+        );
+        assert_eq!(
+            inventory.expected_provider_ids,
+            PINNED_PI_PROVIDER_IDS
+                .iter()
+                .map(|provider_id| (*provider_id).to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(inventory.providers.len(), PINNED_PI_PROVIDER_IDS.len());
+        assert_eq!(
+            inventory
+                .providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            PINNED_PI_PROVIDER_IDS
+        );
+
+        let mut fixture_ids = HashSet::new();
+        let mut declared_provider_ids = HashSet::new();
+        for provider in &inventory.providers {
+            match &provider.decision {
+                PiProviderDecision::Declared {
+                    fixture_id,
+                    provider_id,
+                    fixture,
+                } => {
+                    assert!(
+                        fixture_ids.insert(fixture_id),
+                        "duplicate fixture id: {fixture_id}"
+                    );
+                    assert!(
+                        declared_provider_ids.insert(provider_id),
+                        "duplicate declaration fixture: {provider_id}"
+                    );
+                    assert_declared_fixture(&provider.id, fixture_id, provider_id, fixture);
+                }
+                PiProviderDecision::DeclaredSubset {
+                    fixture_id,
+                    provider_id,
+                    fixture,
+                    excluded_surfaces,
+                    missing_primitive,
+                    release_blocker,
+                } => {
+                    assert!(
+                        fixture_ids.insert(fixture_id),
+                        "duplicate fixture id: {fixture_id}"
+                    );
+                    assert!(
+                        declared_provider_ids.insert(provider_id),
+                        "duplicate declaration fixture: {provider_id}"
+                    );
+                    assert!(
+                        !excluded_surfaces.is_empty() && !missing_primitive.is_empty(),
+                        "{fixture_id}: a subset decision requires an explicit missing primitive"
+                    );
+                    assert!(
+                        !release_blocker.is_empty(),
+                        "{fixture_id}: a subset decision requires a release blocker"
+                    );
+                    assert_declared_fixture(&provider.id, fixture_id, provider_id, fixture);
+                }
+                PiProviderDecision::Unsupported {
+                    fixture_id,
+                    missing_primitive,
+                    release_blocker,
+                } => {
+                    assert!(
+                        fixture_ids.insert(fixture_id),
+                        "duplicate fixture id: {fixture_id}"
+                    );
+                    assert!(
+                        !missing_primitive.is_empty() && !release_blocker.is_empty(),
+                        "{fixture_id}: unsupported providers require a primitive and release blocker"
+                    );
+                    assert!(
+                        ALL_PROVIDER_DECLARATIONS
+                            .iter()
+                            .all(|declaration| declaration.id != provider.id),
+                        "{fixture_id}: unsupported Pi provider {} acquired a declaration; update its decision",
+                        provider.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_pi_provider_fixtures_send_declared_routes_without_network_access() {
+        let inventory: PiProviderInventory =
+            serde_json::from_str(include_str!("../../fixtures/providers/pi-0.84.4.json"))
+                .expect("valid Pi provider compatibility fixture");
+        let server = MockServer::start().await;
+        let client = AiClient::new();
+        let mut expected_requests = Vec::new();
+        for provider in &inventory.providers {
+            let (fixture_id, provider_id, fixture) = match &provider.decision {
+                PiProviderDecision::Declared {
+                    fixture_id,
+                    provider_id,
+                    fixture,
+                }
+                | PiProviderDecision::DeclaredSubset {
+                    fixture_id,
+                    provider_id,
+                    fixture,
+                    ..
+                } if fixture.registration != "subscription" => (fixture_id, provider_id, fixture),
+                PiProviderDecision::Declared { .. }
+                | PiProviderDecision::DeclaredSubset { .. }
+                | PiProviderDecision::Unsupported { .. } => continue,
+            };
+            let declaration = declaration_for_fixture(provider_id);
+            let base_url = fixture_base_at_server(&server, fixture);
+            let request_path = fixture_request_path(fixture);
+            let (response_body, response_id) = fixture_stream_response(&fixture.protocol);
+            Mock::given(method("POST"))
+                .and(path(request_path.clone()))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(response_body),
+                )
+                .mount(&server)
+                .await;
+
+            let mut model = register_fixture_model(declaration, fixture_id, fixture, &base_url);
+            Arc::make_mut(&mut model.endpoint).auth = fixture_auth(&fixture.auth_presentation);
+            let (header, value) = match fixture.auth_presentation.as_str() {
+                "api_key_header" => ("x-api-key", "fixture-secret"),
+                "bearer" => ("authorization", "Bearer fixture-secret"),
+                other => panic!("{fixture_id}: unsupported request auth presentation {other}"),
+            };
+            let response = client
+                .complete(&model, fixture_request())
+                .await
+                .unwrap_or_else(|error| panic!("{fixture_id}: request fixture failed: {error}"));
+            assert_eq!(
+                response.response_id.as_deref(),
+                Some(response_id),
+                "{fixture_id}: stream response decoding drifted"
+            );
+            expected_requests.push((
+                fixture_id.clone(),
+                request_path,
+                header,
+                value,
+                fixture.model_id.clone(),
+            ));
+        }
+
+        let received = server
+            .received_requests()
+            .await
+            .expect("wiremock received requests");
+        assert_eq!(received.len(), expected_requests.len());
+        for (request, (fixture_id, path, header, value, model_id)) in
+            received.iter().zip(expected_requests)
+        {
+            assert_eq!(
+                request.url.path(),
+                path,
+                "{fixture_id}: request route drifted"
+            );
+            assert_eq!(
+                request
+                    .headers
+                    .get(header)
+                    .and_then(|value| value.to_str().ok()),
+                Some(value),
+                "{fixture_id}: request authentication presentation drifted"
+            );
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("fixture request JSON");
+            assert_eq!(
+                body["model"].as_str(),
+                Some(model_id.as_str()),
+                "{fixture_id}: request model drifted"
+            );
+            assert_eq!(
+                body["stream"].as_bool(),
+                Some(true),
+                "{fixture_id}: request must use streaming transport"
+            );
+        }
+    }
 
     #[test]
     fn generated_declarations_are_valid_and_route_only_by_data() {

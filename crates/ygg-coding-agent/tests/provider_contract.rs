@@ -7,7 +7,7 @@ use ygg_sdk::provider::{
 #[test]
 fn generated_builtin_definitions_are_credential_free() {
     let definitions = builtin_provider_definitions();
-    assert_eq!(definitions.len(), 16);
+    assert_eq!(definitions.len(), 24);
 
     let rendered = format!("{definitions:?}");
     assert!(!rendered.contains("https://"));

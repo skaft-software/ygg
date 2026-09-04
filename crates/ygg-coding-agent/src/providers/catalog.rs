@@ -250,7 +250,7 @@ fn static_model_capabilities(model: &StaticModelPreset) -> Capabilities {
             preserves_state: model.protocol != Protocol::OpenAiChat,
             effort_budgets: None,
             openai_chat_mode: model.openai_chat_reasoning_profile.openai_chat_mode(),
-            min_effort: ygg_ai::ReasoningEffort::Minimal,
+            min_effort: model.min_reasoning_effort,
             max_effort: model.max_reasoning_effort,
         }),
         responses_lite: false,
@@ -282,7 +282,7 @@ pub(crate) fn declared_endpoint_ids(declaration: &ProviderDeclaration) -> HashSe
 mod tests {
     use super::*;
     use crate::providers::contract::{
-        CLOUDFLARE_AI_GATEWAY, CLOUDFLARE_WORKERS_AI, MINIMAX, MISTRAL, OPENCODE,
+        CLOUDFLARE_AI_GATEWAY, CLOUDFLARE_WORKERS_AI, MINIMAX, MISTRAL, OPENCODE, OPENCODE_GO,
     };
 
     #[test]
@@ -338,6 +338,31 @@ mod tests {
             .capabilities
             .input_modalities
             .contains(ygg_ai::Modality::Image));
+
+        let mut opencode_go = ModelCatalog::default();
+        register_environment_endpoints(
+            &mut opencode_go,
+            &OPENCODE_GO,
+            &credential,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        register_static_models(&mut opencode_go, &OPENCODE_GO).unwrap();
+        let deepseek_go = opencode_go
+            .resolve(&ModelId("opencode-go/deepseek-v4-pro".into()))
+            .expect("OpenCode Go DeepSeek model");
+        let reasoning = deepseek_go
+            .spec
+            .capabilities
+            .reasoning
+            .as_ref()
+            .expect("OpenCode Go DeepSeek reasoning capability");
+        assert_eq!(reasoning.min_effort, ygg_ai::ReasoningEffort::High);
+        assert_eq!(reasoning.max_effort, ygg_ai::ReasoningEffort::High);
+        assert_eq!(
+            reasoning.openai_chat_mode,
+            ygg_ai::OpenAiChatReasoningMode::DeepSeekThinking
+        );
     }
 
     #[test]

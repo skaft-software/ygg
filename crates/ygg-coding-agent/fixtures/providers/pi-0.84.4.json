@@ -1,0 +1,593 @@
+{
+  "schema_version": 1,
+  "pi_package": "@earendil-works/pi-coding-agent@0.84.4",
+  "inventory_basis": "The target package is pinned above. The exact 0.84.4 npm artifact was unavailable in this offline workspace, so the 31 observed IDs are carried from local @mariozechner/pi-ai@0.73.1 and ant-ling is included from Issue #252 scope. This ledger is an integration assumption, not evidence that 0.73.1 equals the target package.",
+  "expected_provider_ids": [
+    "amazon-bedrock",
+    "anthropic",
+    "ant-ling",
+    "azure-openai-responses",
+    "cerebras",
+    "cloudflare-ai-gateway",
+    "cloudflare-workers-ai",
+    "deepseek",
+    "fireworks",
+    "github-copilot",
+    "google",
+    "google-vertex",
+    "groq",
+    "huggingface",
+    "kimi-coding",
+    "minimax",
+    "minimax-cn",
+    "mistral",
+    "moonshotai",
+    "moonshotai-cn",
+    "openai",
+    "openai-codex",
+    "opencode",
+    "opencode-go",
+    "openrouter",
+    "vercel-ai-gateway",
+    "xai",
+    "xiaomi",
+    "xiaomi-token-plan-ams",
+    "xiaomi-token-plan-cn",
+    "xiaomi-token-plan-sgp",
+    "zai"
+  ],
+  "providers": [
+    {
+      "id": "amazon-bedrock",
+      "label": "Amazon Bedrock",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "amazon-bedrock-unsupported-decision",
+        "missing_primitive": "Bedrock Converse/ConverseStream codec plus AWS SigV4 credential-chain resolution",
+        "release_blocker": "#246"
+      }
+    },
+    {
+      "id": "anthropic",
+      "label": "Anthropic",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "anthropic-declaration-route",
+        "provider_id": "anthropic",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "claude-fixture",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "anthropic",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://api.anthropic.com/v1/",
+          "environment_variable": "ANTHROPIC_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "ant-ling",
+      "label": "ANT Ling",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "ant-ling-unsupported-decision",
+        "missing_primitive": "ANT Ling request/stream schema and credential presentation",
+        "release_blocker": "#252"
+      }
+    },
+    {
+      "id": "azure-openai-responses",
+      "label": "Azure OpenAI Responses",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "azure-openai-responses-unsupported-decision",
+        "missing_primitive": "Azure resource/deployment/API-version route construction and Azure API-key presentation",
+        "release_blocker": "#247"
+      }
+    },
+    {
+      "id": "cerebras",
+      "label": "Cerebras",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "cerebras-declaration-route",
+        "provider_id": "cerebras",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "llama-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "cerebras",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.cerebras.ai/v1/",
+          "environment_variable": "CEREBRAS_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "cloudflare-ai-gateway",
+      "label": "Cloudflare AI Gateway",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "cloudflare-ai-gateway-unsupported-decision",
+        "missing_primitive": "Account/gateway URL construction and gateway-specific auth/header policy",
+        "release_blocker": "#251"
+      }
+    },
+    {
+      "id": "cloudflare-workers-ai",
+      "label": "Cloudflare Workers AI",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "cloudflare-workers-ai-unsupported-decision",
+        "missing_primitive": "Account-scoped Workers AI route construction and response normalization",
+        "release_blocker": "#250"
+      }
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "deepseek-declaration-route",
+        "provider_id": "deepseek",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "deepseek-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "deepseek",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.deepseek.com/v1/",
+          "environment_variable": "DEEPSEEK_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "fireworks",
+      "label": "Fireworks AI",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "fireworks-declaration-route",
+        "provider_id": "fireworks",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "kimi-fixture",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "fireworks",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.fireworks.ai/inference/v1/",
+          "environment_variable": "FIREWORKS_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "github-copilot",
+      "label": "GitHub Copilot",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "github-copilot-unsupported-decision",
+        "missing_primitive": "Copilot OAuth token refresh and dynamic request-header lifecycle",
+        "release_blocker": "#249"
+      }
+    },
+    {
+      "id": "google",
+      "label": "Google Generative AI",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "google-unsupported-decision",
+        "missing_primitive": "Google Generative AI request/stream codec and Gemini discovery",
+        "release_blocker": "#244"
+      }
+    },
+    {
+      "id": "google-vertex",
+      "label": "Google Vertex AI",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "google-vertex-unsupported-decision",
+        "missing_primitive": "Vertex inference codec plus Application Default Credentials and project/location resolution",
+        "release_blocker": "#248"
+      }
+    },
+    {
+      "id": "groq",
+      "label": "Groq",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "groq-declaration-route",
+        "provider_id": "groq",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "llama-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "groq",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.groq.com/openai/v1/",
+          "environment_variable": "GROQ_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "huggingface",
+      "label": "Hugging Face",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "huggingface-declaration-route",
+        "provider_id": "huggingface",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "model-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "huggingface",
+          "auth_presentation": "bearer",
+          "base_url": "https://router.huggingface.co/v1/",
+          "environment_variable": "HF_TOKEN"
+        }
+      }
+    },
+    {
+      "id": "kimi-coding",
+      "label": "Kimi Coding",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "kimi-coding-declaration-route",
+        "provider_id": "kimi-coding",
+        "fixture": {
+          "registration": "static",
+          "model_id": "kimi-for-coding",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "kimi-coding",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://api.kimi.com/coding/v1/",
+          "environment_variable": "KIMI_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "minimax",
+      "label": "MiniMax",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "minimax-declaration-route",
+        "provider_id": "minimax",
+        "fixture": {
+          "registration": "static",
+          "model_id": "MiniMax-M2.7",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "minimax",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://api.minimax.io/anthropic/v1/",
+          "environment_variable": "MINIMAX_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "minimax-cn",
+      "label": "MiniMax China",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "minimax-cn-declaration-route",
+        "provider_id": "minimax-cn",
+        "fixture": {
+          "registration": "static",
+          "model_id": "MiniMax-M2.7",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "minimax-cn",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://api.minimaxi.com/anthropic/v1/",
+          "environment_variable": "MINIMAX_CN_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "mistral",
+      "label": "Mistral",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "mistral-unsupported-decision",
+        "missing_primitive": "Mistral Conversations request/stream codec",
+        "release_blocker": "#245"
+      }
+    },
+    {
+      "id": "moonshotai",
+      "label": "Moonshot AI",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared_subset",
+        "fixture_id": "moonshotai-declaration-route",
+        "provider_id": "moonshotai",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "kimi-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "moonshotai",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.moonshot.ai/v1/",
+          "environment_variable": "MOONSHOT_API_KEY"
+        },
+        "missing_primitive": "Declarative OpenAI Chat legacy max_tokens/non-developer request profile",
+        "release_blocker": "#252",
+        "note": "The existing generic declaration remains available for its ordinary route; unsupported Pi-specific request options are not claimed.",
+        "excluded_surfaces": [
+          "Pi routes requiring legacy max_tokens or a non-developer system role"
+        ]
+      }
+    },
+    {
+      "id": "moonshotai-cn",
+      "label": "Moonshot AI China",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared_subset",
+        "fixture_id": "moonshotai-cn-declaration-route",
+        "provider_id": "moonshotai-cn",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "kimi-k2.5",
+          "protocol": "openai_chat",
+          "endpoint_id": "moonshotai-cn",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.moonshot.cn/v1/",
+          "environment_variable": "MOONSHOT_API_KEY"
+        },
+        "missing_primitive": "Declarative OpenAI Chat legacy max_tokens/non-developer request profile",
+        "release_blocker": "#252",
+        "excluded_surfaces": [
+          "Pi routes requiring legacy max_tokens or a non-developer system role"
+        ]
+      }
+    },
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "openai-declaration-route",
+        "provider_id": "openai",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "gpt-fixture",
+          "protocol": "openai_responses",
+          "endpoint_id": "openai",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.openai.com/v1/",
+          "environment_variable": "OPENAI_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "openai-codex",
+      "label": "OpenAI Codex",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "openai-codex-declaration-route",
+        "provider_id": "codex",
+        "fixture": {
+          "registration": "subscription",
+          "model_id": "gpt-fixture",
+          "protocol": "openai_responses",
+          "endpoint_id": "openai-codex",
+          "auth_presentation": "dynamic",
+          "base_url": "https://chatgpt.com/backend-api/codex/",
+          "environment_variable": ""
+        },
+        "note": "Pi's openai-codex id maps to Ygg's codex declaration."
+      }
+    },
+    {
+      "id": "opencode",
+      "label": "OpenCode Zen",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "opencode-declaration-route",
+        "provider_id": "opencode",
+        "fixture": {
+          "registration": "static",
+          "model_id": "deepseek-v4-pro",
+          "protocol": "openai_chat",
+          "endpoint_id": "opencode",
+          "auth_presentation": "bearer",
+          "base_url": "https://opencode.ai/zen/v1/",
+          "environment_variable": "OPENCODE_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "opencode-go",
+      "label": "OpenCode Zen Go",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared_subset",
+        "fixture_id": "opencode-go-declaration-route",
+        "provider_id": "opencode-go",
+        "fixture": {
+          "registration": "static",
+          "model_id": "deepseek-v4-pro",
+          "protocol": "openai_chat",
+          "endpoint_id": "opencode-go",
+          "auth_presentation": "bearer",
+          "base_url": "https://opencode.ai/zen/go/v1/",
+          "environment_variable": "OPENCODE_API_KEY"
+        },
+        "missing_primitive": "Provider-specific OpenAI Chat reasoning-effort map plus Qwen thinking-format request/replay encoding",
+        "release_blocker": "#252",
+        "excluded_surfaces": [
+          "deepseek-v4-{flash,pro} xhigh-to-max effort mapping",
+          "qwen3.5-plus and qwen3.6-plus thinking-format request/replay encoding"
+        ]
+      }
+    },
+    {
+      "id": "openrouter",
+      "label": "OpenRouter",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "openrouter-declaration-route",
+        "provider_id": "openrouter",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "provider/model-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "openrouter",
+          "auth_presentation": "bearer",
+          "base_url": "https://openrouter.ai/api/v1/",
+          "environment_variable": "OPENROUTER_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "vercel-ai-gateway",
+      "label": "Vercel AI Gateway",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared_subset",
+        "fixture_id": "vercel-ai-gateway-declaration-route",
+        "provider_id": "vercel-ai-gateway",
+        "fixture": {
+          "registration": "static",
+          "model_id": "anthropic/claude-sonnet-4.6",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "vercel-ai-gateway",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://ai-gateway.vercel.sh/v1/",
+          "environment_variable": "AI_GATEWAY_API_KEY"
+        },
+        "excluded_surfaces": [
+          "Pi Vercel AI Gateway catalog entries other than anthropic/claude-sonnet-4.6 and openai/gpt-5.4"
+        ],
+        "missing_primitive": "Pinned Vercel catalog snapshot ingestion with per-model compatibility profiles",
+        "release_blocker": "#252",
+        "note": "A static starter catalog avoids claiming a live gateway inventory; both declared entries use the Pi Anthropic Messages route."
+      }
+    },
+    {
+      "id": "xai",
+      "label": "xAI",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "xai-declaration-route",
+        "provider_id": "xai",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "grok-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "xai",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.x.ai/v1/",
+          "environment_variable": "XAI_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "xiaomi",
+      "label": "Xiaomi",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "xiaomi-declaration-route",
+        "provider_id": "xiaomi",
+        "fixture": {
+          "registration": "discovered",
+          "model_id": "mimo-fixture",
+          "protocol": "openai_chat",
+          "endpoint_id": "xiaomi",
+          "auth_presentation": "bearer",
+          "base_url": "https://api.xiaomimimo.com/v1/",
+          "environment_variable": "XIAOMI_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "xiaomi-token-plan-ams",
+      "label": "Xiaomi Token Plan (AMS)",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "xiaomi-token-plan-ams-declaration-route",
+        "provider_id": "xiaomi-token-plan-ams",
+        "fixture": {
+          "registration": "static",
+          "model_id": "mimo-v2.5",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "xiaomi-token-plan-ams",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://token-plan-ams.xiaomimimo.com/anthropic/v1/",
+          "environment_variable": "XIAOMI_TOKEN_PLAN_AMS_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "xiaomi-token-plan-cn",
+      "label": "Xiaomi Token Plan (CN)",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "xiaomi-token-plan-cn-declaration-route",
+        "provider_id": "xiaomi-token-plan-cn",
+        "fixture": {
+          "registration": "static",
+          "model_id": "mimo-v2.5",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "xiaomi-token-plan-cn",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic/v1/",
+          "environment_variable": "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "xiaomi-token-plan-sgp",
+      "label": "Xiaomi Token Plan (SGP)",
+      "evidence": "Reference evidence: local @mariozechner/pi-ai@0.73.1 generated inventory; the exact @earendil-works/pi-coding-agent@0.84.4 package was unavailable locally.",
+      "decision": {
+        "kind": "declared",
+        "fixture_id": "xiaomi-token-plan-sgp-declaration-route",
+        "provider_id": "xiaomi-token-plan-sgp",
+        "fixture": {
+          "registration": "static",
+          "model_id": "mimo-v2.5",
+          "protocol": "anthropic_messages",
+          "endpoint_id": "xiaomi-token-plan-sgp",
+          "auth_presentation": "api_key_header",
+          "base_url": "https://token-plan-sgp.xiaomimimo.com/anthropic/v1/",
+          "environment_variable": "XIAOMI_TOKEN_PLAN_SGP_API_KEY"
+        }
+      }
+    },
+    {
+      "id": "zai",
+      "label": "Z.ai",
+      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "decision": {
+        "kind": "unsupported",
+        "fixture_id": "zai-unsupported-decision",
+        "missing_primitive": "ZAI thinking-format encoding and fragmented ZAI tool-stream decoder",
+        "release_blocker": "#252"
+      }
+    }
+  ]
+}

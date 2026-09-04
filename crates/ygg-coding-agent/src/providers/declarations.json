@@ -1030,6 +1030,310 @@
       "compatibility": "openai",
       "pricing": "reference",
       "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "KIMI_CODING",
+      "id": "kimi-coding",
+      "name": "Kimi Coding",
+      "base_url": "https://api.kimi.com/coding/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "KIMI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "kimi_coding",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "kimi-coding",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [
+        [
+          "User-Agent",
+          "KimiCLI/1.5"
+        ]
+      ],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "MINIMAX_CN",
+      "id": "minimax-cn",
+      "name": "MiniMax China",
+      "base_url": "https://api.minimaxi.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MINIMAX_CN_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "minimax_cn",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "minimax-cn",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "minimax",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "MOONSHOTAI_CN",
+      "id": "moonshotai-cn",
+      "name": "Moonshot AI China",
+      "base_url": "https://api.moonshot.cn/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MOONSHOT_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "moonshotai-cn",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "OPENCODE_GO",
+      "id": "opencode-go",
+      "name": "OpenCode Zen Go",
+      "base_url": "https://opencode.ai/zen/go/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "OPENCODE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "opencode_go",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "opencode-go",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "opencode",
+      "pricing": "opencode",
+      "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "VERCEL_AI_GATEWAY",
+      "id": "vercel-ai-gateway",
+      "name": "Vercel AI Gateway",
+      "base_url": "https://ai-gateway.vercel.sh/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "AI_GATEWAY_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "vercel_ai_gateway",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "vercel-ai-gateway",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_AMS",
+      "id": "xiaomi-token-plan-ams",
+      "name": "Xiaomi Token Plan (AMS)",
+      "base_url": "https://token-plan-ams.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_AMS_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-ams",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_CN",
+      "id": "xiaomi-token-plan-cn",
+      "name": "Xiaomi Token Plan (CN)",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-cn",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_SGP",
+      "id": "xiaomi-token-plan-sgp",
+      "name": "Xiaomi Token Plan (SGP)",
+      "base_url": "https://token-plan-sgp.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_SGP_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-sgp",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
     }
   ]
 }

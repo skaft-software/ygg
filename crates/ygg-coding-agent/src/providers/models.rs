@@ -33,6 +33,8 @@ pub struct StaticModelPreset {
     pub max_output_tokens: u64,
     pub vision: bool,
     pub reasoning: bool,
+    /// Lowest portable reasoning effort that the provider accepts.
+    pub min_reasoning_effort: ReasoningEffort,
     pub max_reasoning_effort: ReasoningEffort,
     /// Request encoding used for this static model's OpenAI Chat reasoning.
     pub openai_chat_reasoning_profile: StaticOpenAiChatReasoningProfile,
@@ -58,9 +60,15 @@ impl StaticModelPreset {
             max_output_tokens,
             vision,
             reasoning,
+            min_reasoning_effort: ReasoningEffort::Minimal,
             max_reasoning_effort,
             openai_chat_reasoning_profile: StaticOpenAiChatReasoningProfile::Standard,
         }
+    }
+
+    const fn with_min_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.min_reasoning_effort = effort;
+        self
     }
 
     const fn with_deepseek_thinking(mut self) -> Self {
@@ -97,6 +105,248 @@ pub const MINIMAX_MODELS: &[StaticModelPreset] = &[
         1_000_000,
         128_000,
         true,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+/// Kimi Coding routes carried by the Pi compatibility inventory.
+pub const KIMI_CODING_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "kimi-for-coding",
+        "Kimi For Coding",
+        Protocol::AnthropicMessages,
+        262_144,
+        32_768,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "kimi-k2-thinking",
+        "Kimi K2 Thinking",
+        Protocol::AnthropicMessages,
+        262_144,
+        32_768,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+/// MiniMax China's published Anthropic-compatible routes.
+pub const MINIMAX_CHINA_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "MiniMax-M2.7",
+        "MiniMax-M2.7",
+        Protocol::AnthropicMessages,
+        204_800,
+        131_072,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "MiniMax-M2.7-highspeed",
+        "MiniMax-M2.7 Highspeed",
+        Protocol::AnthropicMessages,
+        204_800,
+        131_072,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+/// Vercel AI Gateway starter routes which Pi exposes through Anthropic Messages.
+///
+/// The gateway's broader catalog is intentionally not inferred from a live
+/// inventory: these stable entries make the declared provider useful while the
+/// pinned catalog remains a checked-in compatibility decision.
+pub const VERCEL_AI_GATEWAY_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "anthropic/claude-sonnet-4.6",
+        "Claude Sonnet 4.6",
+        Protocol::AnthropicMessages,
+        1_000_000,
+        128_000,
+        true,
+        true,
+        ReasoningEffort::Max,
+    ),
+    StaticModelPreset::new(
+        "openai/gpt-5.4",
+        "GPT 5.4",
+        Protocol::AnthropicMessages,
+        1_050_000,
+        128_000,
+        true,
+        true,
+        ReasoningEffort::Xhigh,
+    ),
+];
+
+/// OpenCode Zen Go models that use the existing standard or DeepSeek Chat
+/// compatibility profiles. DeepSeek's Pi map only accepts `high`, so its
+/// presets clamp the portable effort range accordingly. Qwen-thinking routes
+/// deliberately stay absent until their distinct thinking format has a codec
+/// primitive.
+pub const OPENCODE_GO_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "deepseek-v4-flash",
+        "DeepSeek V4 Flash",
+        Protocol::OpenAiChat,
+        1_000_000,
+        384_000,
+        false,
+        true,
+        ReasoningEffort::High,
+    )
+    .with_min_reasoning_effort(ReasoningEffort::High)
+    .with_deepseek_thinking(),
+    StaticModelPreset::new(
+        "deepseek-v4-pro",
+        "DeepSeek V4 Pro",
+        Protocol::OpenAiChat,
+        1_000_000,
+        384_000,
+        false,
+        true,
+        ReasoningEffort::High,
+    )
+    .with_min_reasoning_effort(ReasoningEffort::High)
+    .with_deepseek_thinking(),
+    StaticModelPreset::new(
+        "glm-5",
+        "GLM-5",
+        Protocol::OpenAiChat,
+        202_752,
+        32_768,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "glm-5.1",
+        "GLM-5.1",
+        Protocol::OpenAiChat,
+        202_752,
+        32_768,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "kimi-k2.5",
+        "Kimi K2.5",
+        Protocol::OpenAiChat,
+        262_144,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "kimi-k2.6",
+        "Kimi K2.6",
+        Protocol::OpenAiChat,
+        262_144,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2.5",
+        "MiMo V2.5",
+        Protocol::OpenAiChat,
+        1_000_000,
+        128_000,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2.5-pro",
+        "MiMo V2.5 Pro",
+        Protocol::OpenAiChat,
+        1_048_576,
+        128_000,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "minimax-m2.5",
+        "MiniMax M2.5",
+        Protocol::OpenAiChat,
+        204_800,
+        65_536,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "minimax-m2.7",
+        "MiniMax M2.7",
+        Protocol::OpenAiChat,
+        204_800,
+        131_072,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+/// Xiaomi's regional token-plan routes share this static Anthropic catalog.
+pub const XIAOMI_TOKEN_PLAN_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "mimo-v2-flash",
+        "MiMo V2 Flash",
+        Protocol::AnthropicMessages,
+        262_144,
+        65_536,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2-omni",
+        "MiMo V2 Omni",
+        Protocol::AnthropicMessages,
+        262_144,
+        131_072,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2-pro",
+        "MiMo V2 Pro",
+        Protocol::AnthropicMessages,
+        1_048_576,
+        131_072,
+        false,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2.5",
+        "MiMo V2.5",
+        Protocol::AnthropicMessages,
+        1_048_576,
+        131_072,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "mimo-v2.5-pro",
+        "MiMo V2.5 Pro",
+        Protocol::AnthropicMessages,
+        1_048_576,
+        131_072,
+        false,
         true,
         ReasoningEffort::High,
     ),
@@ -1019,8 +1269,13 @@ pub const CLOUDFLARE_AI_GATEWAY_MODELS: &[StaticModelPreset] = &[
 pub(crate) fn static_models(set: StaticModelSet) -> &'static [StaticModelPreset] {
     match set {
         StaticModelSet::None => &[],
+        StaticModelSet::KimiCoding => KIMI_CODING_MODELS,
         StaticModelSet::MiniMax => MINIMAX_MODELS,
+        StaticModelSet::MiniMaxChina => MINIMAX_CHINA_MODELS,
         StaticModelSet::OpenCode => OPENCODE_MODELS,
+        StaticModelSet::OpenCodeGo => OPENCODE_GO_MODELS,
+        StaticModelSet::VercelAiGateway => VERCEL_AI_GATEWAY_MODELS,
+        StaticModelSet::XiaomiTokenPlan => XIAOMI_TOKEN_PLAN_MODELS,
         StaticModelSet::Bedrock => BEDROCK_MODELS,
         StaticModelSet::Mistral => MISTRAL_MODELS,
         StaticModelSet::CloudflareWorkersAi => CLOUDFLARE_WORKERS_AI_MODELS,

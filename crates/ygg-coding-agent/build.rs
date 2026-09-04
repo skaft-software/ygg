@@ -430,12 +430,17 @@ fn static_models_expression(value: &str) -> Option<&'static str> {
     match value {
         "none" => Some("StaticModelSet::None"),
         "minimax" => Some("StaticModelSet::MiniMax"),
+        "minimax_cn" => Some("StaticModelSet::MiniMaxChina"),
+        "kimi_coding" => Some("StaticModelSet::KimiCoding"),
         "opencode" => Some("StaticModelSet::OpenCode"),
         "mistral" => Some("StaticModelSet::Mistral"),
         "cloudflare_workers_ai" => Some("StaticModelSet::CloudflareWorkersAi"),
         "cloudflare_ai_gateway" => Some("StaticModelSet::CloudflareAiGateway"),
         "bedrock" => Some("StaticModelSet::Bedrock"),
         "google" => Some("StaticModelSet::Google"),
+        "opencode_go" => Some("StaticModelSet::OpenCodeGo"),
+        "vercel_ai_gateway" => Some("StaticModelSet::VercelAiGateway"),
+        "xiaomi_token_plan" => Some("StaticModelSet::XiaomiTokenPlan"),
         _ => None,
     }
 }
