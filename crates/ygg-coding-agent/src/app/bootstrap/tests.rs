@@ -1180,7 +1180,7 @@ fn codex_discovery_accepts_account_catalog_and_caps_live_context() {
 }
 
 #[test]
-fn codex_astra_live_object_metadata_enables_only_v2_host_ultra() {
+fn codex_astra_live_object_metadata_requires_explicit_ultra_and_v2() {
     let mut body = serde_json::json!({
         "models": [{
             "slug": "gpt-6-astra",
@@ -1195,7 +1195,8 @@ fn codex_astra_live_object_metadata_enables_only_v2_host_ultra() {
                 {"effort": "medium"},
                 {"effort": "high"},
                 {"effort": "xhigh"},
-                {"effort": "max"}
+                {"effort": "max"},
+                {"effort": "ultra"}
             ],
             "use_responses_lite": true,
             "multi_agent_version": "v2"
@@ -1221,6 +1222,19 @@ fn codex_astra_live_object_metadata_enables_only_v2_host_ultra() {
     assert_eq!(offline_astra.max_effort, ygg_ai::ReasoningEffort::Max);
     assert!(!offline_astra.responses_lite);
     assert_eq!(offline_astra.agent_delegation, None);
+
+    let mut max_only_body = body.clone();
+    let removed = max_only_body["models"][0]["supported_reasoning_levels"]
+        .as_array_mut()
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(removed["effort"], "ultra");
+    let max_only = codex_models_from_response(&max_only_body, None).unwrap();
+    let astra = &max_only[0];
+    assert_eq!(astra.min_effort, ygg_ai::ReasoningEffort::Low);
+    assert_eq!(astra.max_effort, ygg_ai::ReasoningEffort::Max);
+    assert_eq!(astra.agent_delegation, Some(ygg_ai::AgentDelegation::V2));
 
     body["models"][0]
         .as_object_mut()

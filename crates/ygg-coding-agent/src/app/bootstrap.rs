@@ -3250,12 +3250,8 @@ fn reasoning_effort(value: &str) -> Option<ygg_ai::ReasoningEffort> {
 fn codex_reasoning_range(
     entry: &serde_json::Value,
     model_id: &str,
-) -> (ygg_ai::ReasoningEffort, ygg_ai::ReasoningEffort, bool) {
-    let fallback = (
-        codex_min_effort(model_id),
-        codex_max_effort(model_id),
-        false,
-    );
+) -> (ygg_ai::ReasoningEffort, ygg_ai::ReasoningEffort) {
+    let fallback = (codex_min_effort(model_id), codex_max_effort(model_id));
     let Some(levels) = entry
         .get("supported_reasoning_levels")
         .or_else(|| entry.get("supported_reasoning_efforts"))
@@ -3291,7 +3287,6 @@ fn codex_reasoning_range(
             .copied()
             .max()
             .expect("non-empty validated reasoning levels"),
-        true,
     )
 }
 
@@ -3353,16 +3348,10 @@ fn codex_models_from_response(
             .and_then(serde_json::Value::as_str)
             .is_some_and(|version| version.eq_ignore_ascii_case("v2"))
             .then_some(AgentDelegation::V2);
-        let (mut min_effort, mut max_effort, has_live_reasoning_range) =
-            codex_reasoning_range(entry, id);
-        if agent_delegation == Some(AgentDelegation::V2)
-            && has_live_reasoning_range
-            && max_effort == ygg_ai::ReasoningEffort::Max
-        {
-            // Ultra is the host-side V2 delegation tier over maximum model
-            // reasoning; it is never an offline or standalone wire claim.
-            max_effort = ygg_ai::ReasoningEffort::Ultra;
-        } else if agent_delegation != Some(AgentDelegation::V2) {
+        let (mut min_effort, mut max_effort) = codex_reasoning_range(entry, id);
+        if agent_delegation != Some(AgentDelegation::V2) {
+            // Ultra is valid only when the live inventory explicitly advertises
+            // it alongside V2 delegation. Never promote an advertised `max`.
             max_effort = max_effort.min(ygg_ai::ReasoningEffort::Max);
             min_effort = min_effort.min(max_effort);
         }

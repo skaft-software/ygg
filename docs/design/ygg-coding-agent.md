@@ -353,13 +353,14 @@ strip Ultra, Responses Lite, and delegation. Ygg never infers those dynamic
 capabilities from model names or OAuth plans. Astra additionally retains its
 872K advertised input maximum while ordinary request budgeting stays at 272K.
 
-Ultra is selectable only when a complete live-derived reasoning range reaches
-the model's `max` tier (or explicitly advertises `ultra`), V2 delegation is
-present, and the linked `ygg-agent` host reports an executable V2 runtime. This
-avoids advertising “maximum reasoning with automatic task delegation” when only
-the model-side label is present. The legacy persisted
-`ReasoningMode::Pro` value remains readable for durable sessions, but no picker
-or new configuration writes it and no codec serializes `reasoning.mode`.
+Ultra is selectable only when a complete live-derived reasoning range
+explicitly includes `ultra`, V2 delegation is present, and the linked
+`ygg-agent` host reports an executable V2 runtime. An advertised `max` level is
+never promoted to Ultra. This avoids advertising “maximum reasoning with
+automatic task delegation” when only the model-side maximum is present. The
+legacy persisted `ReasoningMode::Pro` value remains readable for durable
+sessions, but no picker or new configuration writes it and no codec serializes
+`reasoning.mode`.
 Eligible legacy selections migrate at startup to Ultra; ineligible ones retain
 their effort with Pro cleared and a warning. At every idle rebuild boundary, an
 explicit effort selection likewise supersedes and clears any restored legacy

@@ -1805,9 +1805,18 @@ mod tests {
 
         let body: serde_json::Value =
             serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["model"], "gpt-6-astra");
         assert!(body.get("reasoning").is_none());
+        for unsupported in ["temperature", "top_p", "logprobs"] {
+            assert!(
+                body.get(unsupported).is_none(),
+                "Astra request unexpectedly included {unsupported}"
+            );
+        }
 
         for (effort, expected) in [
+            (crate::types::ReasoningEffort::Minimal, "low"),
+            (crate::types::ReasoningEffort::Low, "low"),
             (crate::types::ReasoningEffort::Xhigh, "xhigh"),
             (crate::types::ReasoningEffort::Max, "max"),
         ] {

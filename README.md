@@ -385,11 +385,11 @@ ygg --login codex
 ygg --model gpt-5.6
 ```
 
-When that account's live Codex catalog advertises a complete top-end reasoning
-range and V2 collaboration for the selected model, Ygg exposes the host-side
-`ultra` tier only while the trusted, enabled `ygg-subagents` extension is live.
-Install and activate that extension first so every child session has an
-observable `/subagents` surface:
+When that account's live Codex catalog explicitly advertises the `ultra`
+reasoning level and V2 collaboration for the selected model, Ygg exposes the
+host-side `ultra` tier only while the trusted, enabled `ygg-subagents` extension
+is live. Install and activate that extension first so every child session has
+an observable `/subagents` surface:
 
 ```sh
 ygg extension install ygg-subagents
