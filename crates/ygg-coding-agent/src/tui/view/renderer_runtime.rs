@@ -146,6 +146,7 @@ pub(super) fn render_loop(
     size: TerminalSize,
     rx: Receiver<RenderCommand>,
     application_viewport: bool,
+    clear_on_start: bool,
 ) {
     let mut tui = TUI::new(Box::new(terminal));
     // Ygg's composer uses the terminal cursor itself; unlike Pi's editor, it
@@ -156,12 +157,12 @@ pub(super) fn render_loop(
         state.clone(),
         application_viewport,
     )));
-    // A new renderer may follow bootstrap diagnostics just as a resumed
-    // renderer follows ordinary terminal output. In either case it has no
-    // copy of Pi's physical cursor or viewport state, so force one
-    // authoritative clear-and-replay instead of treating those rows as a
-    // fresh append or a retained Ygg frame.
-    tui.request_render_force(true);
+    if clear_on_start {
+        // A resumed renderer has no copy of Pi's physical cursor/viewport
+        // state. Force one authoritative clear-and-replay instead of treating
+        // the retained transcript as a fresh append and duplicating it.
+        tui.request_render_force(true);
+    }
     tui.start();
 
     let mut last_render: Option<Instant> = None;

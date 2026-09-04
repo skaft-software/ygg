@@ -98,13 +98,8 @@ frame; enabling the compatibility extension reintroduces the semantic-commit
 ledger and changes resize/offscreen-mutation semantics. Ygg's composer emits a
 cursor marker but does not paint Pi's fake inverted cursor cell, so the product
 must call `TUI::set_show_hardware_cursor(true)` on every renderer construction
-and resume. It must also call `TUI::request_render_force(true)` before
-`TUI::start()`: Pi's unforced first paint assumes a renderer-owned physical
-frame, while Ygg can have bootstrap diagnostics on the primary screen. The
-forced entry clears the screen and saved lines before replaying the complete
-Ygg frame, so diagnostics cannot become retained rows. Incremental Markdown
-and transcript caches remain useful for constructing that frame, but they are
-not a replacement terminal algorithm.
+and resume. Incremental Markdown and transcript caches remain useful for
+constructing that frame, but they are not a replacement terminal algorithm.
 
 ## Transcript mapping
 

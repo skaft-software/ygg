@@ -134,11 +134,6 @@ impl Harness {
         self.writes.borrow_mut().clear();
     }
 
-    /// Simulate setup output written before Ygg takes ownership of the TTY.
-    fn seed_pre_tui_rows(&self, data: &str) {
-        self.parser.borrow_mut().process(data.as_bytes());
-    }
-
     fn take_writes(&self) -> String {
         std::mem::take(&mut *self.writes.borrow_mut())
     }
@@ -589,69 +584,6 @@ fn pi_cursor_marker_positions_ime_after_the_synchronized_frame() {
     let end = output.find(PI_SYNC_END).unwrap();
     let cursor = output.find("\x1b[3G").unwrap();
     assert!(end < cursor, "{output:?}");
-}
-
-#[test]
-fn pi_forced_start_replaces_pre_tui_rows_across_redraw_resize_and_reentry() {
-    let mut harness = Harness::new(
-        20,
-        5,
-        vec!["Frame 0".into(), "Frame 1".into(), "Frame 2".into()],
-    );
-    harness.seed_pre_tui_rows("pre-TUI startup log A\r\npre-TUI startup log B\r\n");
-    harness.tui.request_render_force(true);
-    harness.start();
-
-    let initial = harness.take_writes();
-    assert!(initial.contains(PI_CLEAR_AND_REPLAY), "{initial:?}");
-    assert_eq!(&harness.viewport()[..3], ["Frame 0", "Frame 1", "Frame 2"]);
-    assert!(
-        !harness
-            .viewport()
-            .iter()
-            .any(|row| row.contains("pre-TUI startup log")),
-        "startup rows survived first frame: {:?}",
-        harness.viewport()
-    );
-
-    harness.lines.borrow_mut()[1] = "Frame redraw".into();
-    harness.render();
-    let redraw = harness.take_writes();
-    assert!(!redraw.contains(PI_CLEAR_AND_REPLAY), "{redraw:?}");
-    assert_eq!(
-        &harness.viewport()[..3],
-        ["Frame 0", "Frame redraw", "Frame 2"]
-    );
-
-    harness.resize(24, 4);
-    let resized = harness.take_writes();
-    assert!(resized.contains(PI_CLEAR_AND_REPLAY), "{resized:?}");
-    assert_eq!(
-        &harness.viewport()[..3],
-        ["Frame 0", "Frame redraw", "Frame 2"]
-    );
-
-    // Model a suspend/resume boundary: ordinary terminal output may have
-    // replaced the physical grid while the renderer was stopped.
-    harness.tui.stop();
-    harness.clear_writes();
-    harness.seed_pre_tui_rows("post-suspend log\r\n");
-    harness.tui.request_render_force(true);
-    harness.start();
-    let reentry = harness.take_writes();
-    assert!(reentry.contains(PI_CLEAR_AND_REPLAY), "{reentry:?}");
-    assert_eq!(
-        &harness.viewport()[..3],
-        ["Frame 0", "Frame redraw", "Frame 2"]
-    );
-    assert!(
-        !harness
-            .viewport()
-            .iter()
-            .any(|row| row.contains("post-suspend log")),
-        "post-suspend rows survived reentry: {:?}",
-        harness.viewport()
-    );
 }
 
 #[test]

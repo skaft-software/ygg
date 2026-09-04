@@ -1895,6 +1895,7 @@ impl InteractiveShell {
                     render_size,
                     render_rx,
                     capture_mouse,
+                    false,
                 )
             })?;
 
@@ -1977,6 +1978,7 @@ impl InteractiveShell {
                     render_size,
                     render_rx,
                     application_viewport,
+                    true,
                 )
             })?;
         self.render_tx = Some(render_tx);
