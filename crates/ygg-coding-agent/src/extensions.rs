@@ -1759,6 +1759,7 @@ impl ExecutableExtensions {
     ///
     /// Bootstrap and rebuild pass the same value through this seam so API 0.3
     /// declarations keep their process-owner fences while the App is replaced.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn discover_and_start_with_provider_runtime(
         config: &Config,
         session: &Session,
