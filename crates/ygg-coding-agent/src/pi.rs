@@ -297,7 +297,7 @@ struct LegacyPiLinkRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedPiLinkRecord {
     Legacy(LegacyPiLinkRecord),
-    V2(PiLinkRecord),
+    V2(Box<PiLinkRecord>),
 }
 
 impl ParsedPiLinkRecord {
@@ -333,7 +333,7 @@ impl ParsedPiLinkRecord {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParsedPiInstallation {
     Link(ParsedPiLinkRecord),
-    Lock(PiLockRecord),
+    Lock(Box<PiLockRecord>),
 }
 
 impl ParsedPiInstallation {
@@ -801,7 +801,7 @@ fn load_installation(package: &Path) -> Option<ParsedPiInstallation> {
         ygg_agent::secure_fs::read_regular_file_bounded(&lock_path, MAX_PI_LOCK_BYTES)
     {
         if let Ok(record) = parse_lock_record(&bytes) {
-            return Some(ParsedPiInstallation::Lock(record));
+            return Some(ParsedPiInstallation::Lock(Box::new(record)));
         }
     }
     let record_path = package.join(LINK_RECORD);
@@ -1234,7 +1234,9 @@ fn parse_link_record(bytes: &[u8]) -> anyhow::Result<ParsedPiLinkRecord> {
     let schema: LinkRecordSchema = serde_json::from_slice(bytes)?;
     match schema.schema_version {
         1 => Ok(ParsedPiLinkRecord::Legacy(serde_json::from_slice(bytes)?)),
-        2 | LINK_SCHEMA_VERSION => Ok(ParsedPiLinkRecord::V2(serde_json::from_slice(bytes)?)),
+        2 | LINK_SCHEMA_VERSION => Ok(ParsedPiLinkRecord::V2(Box::new(serde_json::from_slice(
+            bytes,
+        )?))),
         version => anyhow::bail!("unsupported Pi link record schema {version}"),
     }
 }
@@ -2437,9 +2439,9 @@ mod tests {
         let source = canonical(&source);
         let before = fingerprint_source(&source).unwrap();
         let plan = test_plan(&temp, std::slice::from_ref(&source), "pi-example");
-        let record = ParsedPiLinkRecord::V2(
+        let record = ParsedPiLinkRecord::V2(Box::new(
             link_record_from_plan(&plan, test_trust(&temp, "pi-example")).unwrap(),
-        );
+        ));
         fs::write(&source, b"after").unwrap();
         let after = fingerprint_source(&source).unwrap();
         assert_ne!(before.digest, after.digest);
@@ -2547,7 +2549,7 @@ mod tests {
         ));
         assert!(valid_sha256(&record.link_identity));
         assert_eq!(
-            link_status(&ParsedPiLinkRecord::V2(record.clone())),
+            link_status(&ParsedPiLinkRecord::V2(Box::new(record.clone()))),
             "metadata-current (explicit enable/trust required; trust decision not asserted)"
         );
 
@@ -2801,7 +2803,8 @@ mod tests {
             b"export const changed = true;\n",
         )
         .unwrap();
-        assert!(link_status(&ParsedPiLinkRecord::V2(record)).contains("pinned Pi runtime changed"));
+        assert!(link_status(&ParsedPiLinkRecord::V2(Box::new(record)))
+            .contains("pinned Pi runtime changed"));
     }
 
     #[cfg(unix)]

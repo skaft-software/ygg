@@ -2745,9 +2745,8 @@ impl InteractiveShell {
                 duration,
             } => {
                 let index = state.tool_panels.get(id).copied();
-                let completed_images = index
-                    .is_some()
-                    .then(|| match result {
+                let completed_images = if index.is_some() {
+                    match result {
                         Ok(output) => project_tool_images(
                             output.content_parts().iter().filter_map(|part| match part {
                                 ygg_agent::ToolOutputContentPart::Media(media) => Some(media),
@@ -2756,8 +2755,10 @@ impl InteractiveShell {
                             &mut state.tool_image_budget,
                         ),
                         Err(_) => Vec::new(),
-                    })
-                    .unwrap_or_default();
+                    }
+                } else {
+                    Vec::new()
+                };
                 let completed_images = state.register_tool_images(completed_images);
                 let estimated_result_tokens = match result {
                     Ok(output) => output.media().iter().fold(

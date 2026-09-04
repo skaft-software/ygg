@@ -1310,45 +1310,47 @@ fn build_config_with_global_path(
         policy_environment.offline.is_some(),
         values.offline.is_some(),
     );
-    let mut sandbox = SandboxPolicy::default();
-    sandbox.policy_provenance = ToolPolicyProvenance {
-        effect_policy: effect_policy_source,
-        workspace_confinement: policy_value_source(
-            policy_environment.allow_external_paths.is_some(),
-            values.allow_external_paths.is_some(),
-        ),
-        allow_edit: policy_value_source(
-            policy_environment.allow_edit.is_some(),
-            values.allow_edit.is_some(),
-        ),
-        allow_write: policy_value_source(
-            policy_environment.allow_write.is_some(),
-            values.allow_write.is_some(),
-        ),
-        allow_process: policy_value_source(
-            policy_environment.allow_process.is_some(),
-            values.allow_process.is_some(),
-        ),
-        allow_shell: policy_value_source(
-            policy_environment.allow_shell.is_some(),
-            values.allow_shell.is_some(),
-        ),
-        shell_path: policy_value_source(
-            policy_environment.shell_path.is_some(),
-            values.shell_path.is_some(),
-        ),
-        bash_timeout: policy_value_source(
-            policy_environment.bash_timeout_secs.is_some(),
-            values.bash_timeout_secs.is_some(),
-        ),
-        max_output_bytes: policy_value_source(
-            policy_environment.max_output_bytes.is_some(),
-            values.max_output_bytes.is_some(),
-        ),
-        allow_remote_read: policy_value_source(
-            policy_environment.allow_remote_read.is_some(),
-            values.allow_remote_read.is_some(),
-        ),
+    let mut sandbox = SandboxPolicy {
+        policy_provenance: ToolPolicyProvenance {
+            effect_policy: effect_policy_source,
+            workspace_confinement: policy_value_source(
+                policy_environment.allow_external_paths.is_some(),
+                values.allow_external_paths.is_some(),
+            ),
+            allow_edit: policy_value_source(
+                policy_environment.allow_edit.is_some(),
+                values.allow_edit.is_some(),
+            ),
+            allow_write: policy_value_source(
+                policy_environment.allow_write.is_some(),
+                values.allow_write.is_some(),
+            ),
+            allow_process: policy_value_source(
+                policy_environment.allow_process.is_some(),
+                values.allow_process.is_some(),
+            ),
+            allow_shell: policy_value_source(
+                policy_environment.allow_shell.is_some(),
+                values.allow_shell.is_some(),
+            ),
+            shell_path: policy_value_source(
+                policy_environment.shell_path.is_some(),
+                values.shell_path.is_some(),
+            ),
+            bash_timeout: policy_value_source(
+                policy_environment.bash_timeout_secs.is_some(),
+                values.bash_timeout_secs.is_some(),
+            ),
+            max_output_bytes: policy_value_source(
+                policy_environment.max_output_bytes.is_some(),
+                values.max_output_bytes.is_some(),
+            ),
+            allow_remote_read: policy_value_source(
+                policy_environment.allow_remote_read.is_some(),
+                values.allow_remote_read.is_some(),
+            ),
+        },
+        ..SandboxPolicy::default()
     };
     if let Some(value) = values.allow_external_paths {
         sandbox.allow_external_paths = value;
@@ -1778,7 +1780,7 @@ max_output_bytes = 4096
             policy.workspace_confinement.source,
             PolicyValueSource::Config
         );
-        assert_eq!(policy.workspace_confinement.value, true);
+        assert!(policy.workspace_confinement.value);
         assert_eq!(policy.effect_policy.value, EffectPolicy::Controlled);
         assert_eq!(policy.effect_policy.source, PolicyValueSource::Config);
         assert!(!policy.allow_edit.value);
@@ -1786,9 +1788,9 @@ max_output_bytes = 4096
         assert!(!policy.allow_write.value);
         assert_eq!(policy.allow_write.source, PolicyValueSource::Config);
         assert_eq!(policy.allow_process.source, PolicyValueSource::Cli);
-        assert_eq!(policy.allow_process.value, true);
+        assert!(policy.allow_process.value);
         assert_eq!(policy.allow_shell.source, PolicyValueSource::Cli);
-        assert_eq!(policy.allow_shell.value, true);
+        assert!(policy.allow_shell.value);
         assert_eq!(policy.shell_path.source, PolicyValueSource::Config);
         assert_eq!(
             policy.shell_path.value.selection,

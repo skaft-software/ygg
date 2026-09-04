@@ -770,16 +770,7 @@ fn render_session_picker(
         let ordering = session_picker_ordering(picker);
         if matches!(
             &picker.surface.lifecycle,
-            OrdinarySurfaceLifecycle::Loading(_)
-        ) {
-            if let Some(status) =
-                render_ordinary_status(&state.theme, &picker.surface.lifecycle, Instant::now())
-            {
-                lines.push(fit_line(&format!("{inset}{status}"), width));
-            }
-        } else if matches!(
-            &picker.surface.lifecycle,
-            OrdinarySurfaceLifecycle::Empty(_)
+            OrdinarySurfaceLifecycle::Loading(_) | OrdinarySurfaceLifecycle::Empty(_)
         ) {
             if let Some(status) =
                 render_ordinary_status(&state.theme, &picker.surface.lifecycle, Instant::now())
