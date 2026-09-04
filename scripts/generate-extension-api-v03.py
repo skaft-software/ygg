@@ -352,7 +352,7 @@ def validate_schema(schema: dict[str, Any]) -> None:
         if not isinstance(method.get("notification"), bool):
             raise ValueError(f"method {method['name']} must declare notification semantics")
         for key in ("params", "result"):
-            if method.get(key) is not None and method[key] not in record_models:
+            if method.get(key) is not None and method[key] not in model_names:
                 raise ValueError(f"method {method['name']} references unknown {key} model")
     required_method_models = {
         "initialize": ("InitializeRequest", "InitializeResponse", "initialized", False),
@@ -1331,7 +1331,7 @@ def render_docs(schema: dict[str, Any], source_hash: str) -> str:
     lines.extend(["", "## Methods and terminal semantics", "", "| Method | Direction | Params | Result | Terminal | Notification | Status |", "| --- | --- | --- | --- | --- | :---: | --- |"])
     for entry in schema["methods"]:
         lines.append(f"| `{entry['name']}` | `{entry['direction']}` | `{entry['params'] or '—'}` | `{entry['result'] or '—'}` | `{entry['terminal']}` | {'yes' if entry['notification'] else 'no'} | {entry['status']} |")
-    lines.extend(["", "Deferred capabilities and methods are represented in this schema but are unavailable and cannot publish commands, hooks, context, UI, renderers, notifications, confirmations, or dynamic catalogs.", "", "## Errors", "", "| Name | Code | Message | Meaning |", "| --- | ---: | --- | --- |"])
+    lines.extend(["", "Deferred capabilities and methods are represented in this schema but remain unavailable; only the listed foundation methods and capabilities may be negotiated.", "", "## Errors", "", "| Name | Code | Message | Meaning |", "| --- | ---: | --- | --- |"])
     for entry in schema["errors"]:
         lines.append(f"| `{entry['name']}` | `{entry['code']}` | {entry['message']} | {entry['description']} |")
     lines.extend(["", "## Dispositions", "", "| Kind | Reason | Meaning |", "| --- | --- | --- |"])

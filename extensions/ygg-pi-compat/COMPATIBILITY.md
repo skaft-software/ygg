@@ -24,14 +24,14 @@ Status meanings:
 | --- | --- | --- |
 | `project_trust` | not implemented | Ygg trust remains host-owned. |
 | `resources_discover` | not implemented | No resource-discovery return channel. |
-| `session_start` | safe divergence | Emitted from `session/started`; Pi session-manager state is unavailable. |
+| `session_start` | safe divergence | API `0.2` bridge emits it from `session/started`; API `0.3` declared hooks can provide the same activation boundary, but Pi session-manager state is unavailable. |
 | `session_info_changed` | not implemented | No matching lifecycle input. |
 | `session_before_switch` | not implemented | Session replacement remains host-owned. |
 | `session_before_fork` | not implemented | Session replacement remains host-owned. |
 | `session_before_compact` | not implemented | No cancel/override compaction boundary. |
 | `session_compact` | not implemented | No Pi compaction payload. |
 | `session_compact_failed` | not implemented | No Pi compaction failure payload. |
-| `session_shutdown` | safe divergence | Emitted once from Ygg settlement/shutdown with a synthetic reason. |
+| `session_shutdown` | safe divergence | API `0.2` bridge emits it from settlement/shutdown; API `0.3` end hooks add bounded outcome/reason but cannot expose Pi session-manager state. |
 | `session_before_tree` | not implemented | No tree-navigation boundary. |
 | `session_tree` | not implemented | No Pi tree result. |
 | `context` | safe divergence | Additions can become bounded Ygg context; filtering/replacing canonical history is unavailable. |

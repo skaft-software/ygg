@@ -67,7 +67,8 @@ Three exact manifest-selected protocol versions are implemented:
 - API `0.3` is the current schema-generated canonical foundation. Its exact
   capabilities, methods, bounds, errors, and availability are defined only by
   the generated [API `0.3` reference](extensions/API-0.3-REFERENCE.md); it is
-  not an implicit upgrade of either legacy wire.
+  not an implicit upgrade of either legacy wire. It also supports the optional,
+  declared `session_start`/`session_end` cleanup pair described below.
 
 API `0.2` remains the stateful transport foundation for existing trusted daily
 use within those boundaries. API `0.3` adds no operating-system sandbox or
@@ -236,6 +237,20 @@ directory is the active workspace. Ygg supplies `YGG_EXTENSION_API_VERSION`,
 host-verified artifact publication. To keep an existing extension on the
 frozen wire, leave `api_version = "0.1"` in its manifest. Semantic
 `presentation` is API `0.2`-only and is rejected on a frozen `0.1` manifest.
+
+An API `0.3` extension may instead declare the paired session lifecycle hooks:
+
+```toml
+api_version = "0.3"
+
+[contributes]
+hooks = ["session_start", "session_end"]
+```
+
+The pair is all-or-nothing: API `0.1`/`0.2` reject either name, and API `0.3`
+rejects a partial pair or any legacy request-path hook alongside it. During
+initialization the extension must select both optional `lifecycle_events` and
+`hook/run`, or neither; the host rejects a declaration/selection mismatch.
 
 `[capabilities].secrets` is a duplicate-free allowlist, not a request to copy
 credentials into the launch environment. Each name is at most 64 ASCII bytes,
@@ -827,6 +842,34 @@ each admitted turn. Notifications are best effort; host cleanup and persistence
 remain authoritative. Both API versions keep `after_response` success-only;
 API `0.2` uses it only for bounded response-content synchronization and relies
 on settled lifecycle events for terminal cleanup.
+
+### Declared API `0.3` session hooks
+
+A negotiated declaration receives one `hook/run` request with
+`hook: "session_start"` when the coding product activates its durable session
+owner, and one `hook: "session_end"` when that binding settles. The generated
+payload is intentionally small: `SessionBinding` carries only the opaque
+SHA-256-derived owner key, a host-created extension-instance fence, and the
+process generation. `SessionEnd` adds a generated outcome, a reason chosen from
+`shutdown`, `reload`, `crash`, or `cancelled`, and elapsed
+milliseconds. It never exposes a session path, mutable `Session`, prompt,
+host-state snapshot, or request-path context.
+
+The host records ownership before sending start, so retries cannot duplicate a
+pair. Each dispatch is capped at 250 ms; malformed results, timeouts, and
+remote errors become bounded diagnostics. A valid `deny` or `defer` disposition
+is recorded but cannot veto host lifecycle ownership. Final settlement is
+idempotent and occurs before child shutdown. On an accepted reload the old
+generation receives `interrupted`/`reload` end before the replacement gets its
+new start; after a detected crash, the replacement receives the old
+`interrupted`/`crash` end (with the old binding generation) before its own
+start. This keeps cleanup generation-fenced even when the crashed child cannot
+receive a request.
+
+These hooks are not API `0.2` `session/started` or `session/settled`
+observations and never enter the prompt/tool request hot path. The current
+Python runtime remains a legacy API `0.1`/`0.2` adapter; generated API `0.3`
+types alone do not add an API `0.3` Python runtime.
 
 For an admitted, running full-access extension, reload starts and fully
 initializes a replacement while the existing process remains ready. Launch,

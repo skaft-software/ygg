@@ -189,6 +189,12 @@
       "value": 100000,
       "description": "Maximum events accepted for one extension-provider stream.",
       "negotiated": false
+    },
+    {
+      "name": "max_session_hook_id_bytes",
+      "value": 256,
+      "description": "Maximum UTF-8 bytes in one opaque session-hook binding identifier.",
+      "negotiated": false
     }
   ],
   "capabilities": [
@@ -212,9 +218,9 @@
     },
     {
       "name": "lifecycle_events",
-      "description": "Host lifecycle observations for extension cleanup.",
-      "host_offer": "unavailable",
-      "status": "deferred"
+      "description": "Declared SessionStart/SessionEnd hooks for host-owned session lifecycle cleanup.",
+      "host_offer": "optional",
+      "status": "foundation"
     },
     {
       "name": "migration.adapter.v1",
@@ -280,11 +286,11 @@
       "name": "hook/run",
       "direction": "host_to_extension",
       "capability": "lifecycle_events",
-      "host_offer": "unavailable",
-      "status": "deferred",
-      "params": null,
-      "result": null,
-      "terminal": "deferred",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionHookParams",
+      "result": "SessionHookResult",
+      "terminal": "result_or_error",
       "notification": false
     },
     {
@@ -800,6 +806,135 @@
           "type": "json",
           "presence": "optional",
           "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "SessionBinding",
+      "description": "Opaque, host-owned session and extension-generation identity for one declared session-hook binding.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_session_hook_id_bytes"
+        },
+        {
+          "name": "extension_instance_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_session_hook_id_bytes"
+        },
+        {
+          "name": "process_generation",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionStart",
+      "description": "Sanitized payload delivered once when an eligible declared session-hook binding becomes active.",
+      "fields": [
+        {
+          "name": "binding",
+          "type": "SessionBinding",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionEnd",
+      "description": "Sanitized terminal payload delivered once when an eligible declared session-hook binding settles.",
+      "fields": [
+        {
+          "name": "binding",
+          "type": "SessionBinding",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "outcome",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "frontend_disconnected",
+            "shutdown",
+            "limit_reached"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "shutdown",
+            "reload",
+            "crash",
+            "cancelled"
+          ]
+        },
+        {
+          "name": "duration_ms",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionHookParams",
+      "description": "Typed host-to-extension parameters for one declared session lifecycle hook; no mutable session state is exposed.",
+      "kind": "tagged_union",
+      "tag": "hook",
+      "variants": [
+        {
+          "name": "SessionStart",
+          "wire": "session_start",
+          "status": "foundation",
+          "fields": [
+            {
+              "name": "payload",
+              "type": "SessionStart",
+              "presence": "required",
+              "nullable": false
+            }
+          ]
+        },
+        {
+          "name": "SessionEnd",
+          "wire": "session_end",
+          "status": "foundation",
+          "fields": [
+            {
+              "name": "payload",
+              "type": "SessionEnd",
+              "presence": "required",
+              "nullable": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SessionHookResult",
+      "description": "Terminal result for a declared session hook. Non-continue dispositions are recorded but never veto host lifecycle ownership.",
+      "fields": [
+        {
+          "name": "disposition",
+          "type": "Disposition",
+          "presence": "required",
+          "nullable": false
         }
       ]
     },
@@ -1774,6 +1909,7 @@
             "tool_call"
           ],
           "optional_capabilities": [
+            "lifecycle_events",
             "migration.adapter.v1",
             "provider_auth",
             "provider_catalog",
@@ -1786,6 +1922,7 @@
             "tool/call"
           ],
           "optional_methods": [
+            "hook/run",
             "migration/detect",
             "migration/import",
             "provider/auth/request",
@@ -1875,6 +2012,43 @@
         "metadata": {},
         "structured_content": {
           "value": "hello"
+        }
+      }
+    },
+    {
+      "name": "session-hook-start-params",
+      "value": {
+        "hook": "session_start",
+        "payload": {
+          "binding": {
+            "session_id": "session-0123456789abcdef",
+            "extension_instance_id": "0123456789abcdef0123456789abcdef",
+            "process_generation": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "session-hook-end-params",
+      "value": {
+        "hook": "session_end",
+        "payload": {
+          "binding": {
+            "session_id": "session-0123456789abcdef",
+            "extension_instance_id": "0123456789abcdef0123456789abcdef",
+            "process_generation": 1
+          },
+          "outcome": "shutdown",
+          "reason": "shutdown",
+          "duration_ms": 17
+        }
+      }
+    },
+    {
+      "name": "session-hook-result",
+      "value": {
+        "disposition": {
+          "kind": "continue"
         }
       }
     },

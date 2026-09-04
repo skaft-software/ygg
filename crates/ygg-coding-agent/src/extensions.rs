@@ -1711,22 +1711,32 @@ impl ExecutableExtensions {
     }
 
     fn start_session_lifecycle(&mut self) {
-        let Some(session_id) = self.session_id.clone() else {
-            return;
-        };
         if self.processes.is_empty() || self.session_lifecycle_started {
             return;
         }
         let processes = self.processes.clone();
-        let event = ExtensionLifecycleEvent::SessionStarted {
-            session_id,
-            run_id: None,
-        };
-        match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await }) {
-            Ok(messages) => self.diagnostics.extend(messages),
-            Err(error) => self.diagnostics.push(format!(
-                "warning: extension session lifecycle could not start: {error}"
-            )),
+        if let Some(session_id) = self.session_id.clone() {
+            let event = ExtensionLifecycleEvent::SessionStarted {
+                session_id,
+                run_id: None,
+            };
+            match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await }) {
+                Ok(messages) => self.diagnostics.extend(messages),
+                Err(error) => self.diagnostics.push(format!(
+                    "warning: extension session lifecycle could not start: {error}"
+                )),
+            }
+        }
+        if let Some(resource_owner) = self.resource_owner.clone() {
+            let processes = self.processes.clone();
+            match block_on_runtime(async move {
+                start_session_hooks_all(&processes, &resource_owner).await
+            }) {
+                Ok(messages) => self.diagnostics.extend(messages),
+                Err(error) => self.diagnostics.push(format!(
+                    "warning: extension session hooks could not start: {error}"
+                )),
+            }
         }
         self.session_lifecycle_started = true;
         self.session_started_at = Instant::now();
@@ -3068,15 +3078,21 @@ impl ExecutableExtensions {
 
     async fn settle_session_lifecycle(&mut self) {
         if self.session_lifecycle_started {
+            let outcome = self
+                .last_lifecycle_outcome
+                .unwrap_or(ExtensionLifecycleOutcome::Shutdown);
+            if let Some(resource_owner) = self.resource_owner.clone() {
+                let diagnostics =
+                    settle_session_hooks_all(&self.processes, &resource_owner, outcome).await;
+                self.diagnostics.extend(diagnostics);
+            }
             if let Some(session_id) = self.session_id.clone() {
                 let diagnostics = notify_lifecycle_all(
                     &self.processes,
                     ExtensionLifecycleEvent::SessionSettled {
                         session_id,
                         run_id: None,
-                        outcome: self
-                            .last_lifecycle_outcome
-                            .unwrap_or(ExtensionLifecycleOutcome::Shutdown),
+                        outcome,
                         duration_ms: duration_millis(self.session_started_at.elapsed()),
                         reason: None,
                     },
@@ -3954,6 +3970,75 @@ async fn notify_lifecycle_all(
             }
         }
     }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn start_session_hooks_all(
+    processes: &[ExtensionProcess],
+    resource_owner: &str,
+) -> Vec<String> {
+    futures_util::future::join_all(
+        processes
+            .iter()
+            .filter(|process| process.declares_session_hooks())
+            .map(|process| {
+                let process = process.clone();
+                let resource_owner = resource_owner.to_owned();
+                async move {
+                    match tokio::time::timeout(
+                        LIFECYCLE_NOTIFY_DEADLINE,
+                        process.start_session_hook_binding(resource_owner),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => None,
+                        Err(_) => Some(format!(
+                            "warning: extension {:?} session_start hook exceeded {LIFECYCLE_NOTIFY_DEADLINE:?}",
+                            process.descriptor().manifest.name
+                        )),
+                        Ok(Err(_)) => Some(format!(
+                            "warning: extension {:?} session_start hook failed",
+                            process.descriptor().manifest.name
+                        )),
+                    }
+                }
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn settle_session_hooks_all(
+    processes: &[ExtensionProcess],
+    resource_owner: &str,
+    outcome: ExtensionLifecycleOutcome,
+) -> Vec<String> {
+    futures_util::future::join_all(
+        processes
+            .iter()
+            .filter(|process| process.declares_session_hooks())
+            .map(|process| {
+                let process = process.clone();
+                let resource_owner = resource_owner.to_owned();
+                async move {
+                    match process
+                        .settle_session_hook_binding(&resource_owner, outcome)
+                        .await
+                    {
+                        Ok(()) => None,
+                        Err(_) => Some(format!(
+                            "warning: extension {:?} session_end hook failed",
+                            process.descriptor().manifest.name
+                        )),
+                    }
+                }
+            }),
+    )
     .await
     .into_iter()
     .flatten()

@@ -188,6 +188,8 @@ static NEXT_EXTENSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 /// delayed frontend answer from targeting a later request with the same ID.
 pub const MAX_EXTENSION_CHILD_REQUEST_IDS_PER_GENERATION: usize = 65_536;
 const MAX_LIFECYCLE_REASON_BYTES: usize = 4 * 1024;
+/// A declared session hook is a bounded lifecycle finalizer, never a request-path interceptor.
+const SESSION_HOOK_DEADLINE: Duration = Duration::from_millis(250);
 /// Maximum UTF-8 prompt bytes admitted by an API `0.2` input request.
 pub const MAX_EXTENSION_INPUT_PROMPT_BYTES: usize = 16 * 1024;
 /// Maximum UTF-8 answer bytes returned to an API `0.2` input request.
@@ -1420,20 +1422,42 @@ if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.
                 "provider catalogs require extension API 0.3".into(),
             ));
         }
-        if self.api_version == EXTENSION_API_VERSION_0_3
-            && (!self.contributes.commands.is_empty()
-                || !self.contributes.hooks.is_empty()
+        let declares_session_start = self
+            .contributes
+            .hooks
+            .contains(&ExtensionHook::SessionStart);
+        let declares_session_end = self.contributes.hooks.contains(&ExtensionHook::SessionEnd);
+        if self.api_version != EXTENSION_API_VERSION_0_3
+            && (declares_session_start || declares_session_end)
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "session_start and session_end hooks require extension API 0.3".into(),
+            ));
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_3 {
+            if declares_session_start != declares_session_end {
+                return Err(ExtensionRuntimeError::InvalidManifest(
+                    "API 0.3 session_start and session_end hooks must be declared together".into(),
+                ));
+            }
+            if !self.contributes.commands.is_empty()
+                || self
+                    .contributes
+                    .hooks
+                    .iter()
+                    .any(|hook| !hook.is_session_hook())
                 || !self.contributes.ui.is_empty()
                 || self.contributes.context
                 || !self.contributes.tool_renderers.is_empty()
                 || self.contributes.notifications
                 || self.contributes.confirmations
-                || self.contributes.presentation)
-        {
-            return Err(ExtensionRuntimeError::InvalidManifest(
-                "API 0.3 currently implements only its negotiated initial tool catalog; commands, hooks, context, UI, renderers, notifications, confirmations, and presentation are deferred"
-                    .into(),
-            ));
+                || self.contributes.presentation
+            {
+                return Err(ExtensionRuntimeError::InvalidManifest(
+                    "API 0.3 currently implements only its negotiated initial tool catalog, secret-free provider catalogs, and declared session_start/session_end hooks; commands, other hooks, context, UI, renderers, notifications, confirmations, and presentation are deferred"
+                        .into(),
+                ));
+            }
         }
         if self.entrypoint.command.trim().is_empty()
             || self.entrypoint.command.chars().any(char::is_control)
@@ -1599,6 +1623,16 @@ pub enum ExtensionHook {
     /// Observes a completed host resource mutation and may request a bounded
     /// rescan of its declared affected resource identifiers.
     PostMutation,
+    /// Runs once for an API `0.3` declared session-hook binding.
+    SessionStart,
+    /// Runs once when an API `0.3` declared session-hook binding settles.
+    SessionEnd,
+}
+
+impl ExtensionHook {
+    fn is_session_hook(self) -> bool {
+        matches!(self, Self::SessionStart | Self::SessionEnd)
+    }
 }
 
 /// Semantic terminal surfaces an extension may populate.
@@ -4006,6 +4040,7 @@ struct ExtensionProcessInner {
     artifact_store: ArtifactStore,
     approval_store: Arc<ExtensionApprovalStore>,
     lifecycle: StdMutex<ActiveLifecycleState>,
+    session_hooks: StdMutex<BTreeMap<String, ActiveSessionHookBinding>>,
     dynamic_tool_registration: StdMutex<Option<DynamicToolRegistration>>,
     dynamic_tool_registration_ready: Notify,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
@@ -4035,6 +4070,15 @@ struct ActiveLifecycleState {
 struct LifecycleEndpoint {
     generation: u64,
     connection: Arc<ProcessConnection>,
+}
+
+/// Host-owned lifecycle state for one typed API `0.3` session-hook binding.
+/// The payload contains only the opaque owner key and generation fence.
+#[derive(Clone)]
+struct ActiveSessionHookBinding {
+    session_id: String,
+    started_at: Instant,
+    endpoint: LifecycleEndpoint,
 }
 
 #[derive(Clone)]
@@ -4235,6 +4279,7 @@ impl ExtensionProcess {
                 artifact_store,
                 approval_store,
                 lifecycle: StdMutex::new(ActiveLifecycleState::default()),
+                session_hooks: StdMutex::new(BTreeMap::new()),
                 dynamic_tool_registration: StdMutex::new(None),
                 dynamic_tool_registration_ready: Notify::new(),
                 delegation_service,
@@ -4402,6 +4447,227 @@ impl ExtensionProcess {
             });
         }
         context
+    }
+
+    /// Returns whether this API `0.3` process declared the paired typed
+    /// `session_start` and `session_end` lifecycle hooks.
+    pub fn declares_session_hooks(&self) -> bool {
+        self.api_version() == EXTENSION_API_VERSION_0_3
+            && self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::SessionStart)
+            && self
+                .inner
+                .contributions
+                .hooks
+                .contains(&ExtensionHook::SessionEnd)
+    }
+
+    /// Starts one declared, owner-scoped session-hook binding exactly once.
+    ///
+    /// The supplied ID must be the host's opaque session owner key. The typed
+    /// wire payload never carries a session path, mutable `Session`, prompt,
+    /// or host-state snapshot.
+    pub async fn start_session_hook_binding(
+        &self,
+        session_id: impl Into<String>,
+    ) -> Result<(), ExtensionRuntimeError> {
+        if !self.declares_session_hooks() {
+            return Err(self.undeclared("session hook", "session_start/session_end".to_owned()));
+        }
+        let session_id = session_id.into();
+        validate_session_hook_id(&session_id)?;
+        let _guard = self.inner.reload_guard.lock().await;
+        let connection = read_std_lock(&self.inner.connection).clone();
+        if connection.draining.load(Ordering::Acquire) {
+            return Err(ExtensionRuntimeError::Closed(
+                "extension generation is draining".into(),
+            ));
+        }
+        connection.require_api_v03_host_method(methods::HOOK_RUN)?;
+        let binding = {
+            let mut bindings = lock_std_mutex(&self.inner.session_hooks);
+            if bindings.contains_key(&session_id) {
+                return Ok(());
+            }
+            let binding = ActiveSessionHookBinding {
+                session_id: session_id.clone(),
+                started_at: Instant::now(),
+                endpoint: LifecycleEndpoint {
+                    generation: connection.generation,
+                    connection,
+                },
+            };
+            // Retain ownership before awaiting the remote result. A timed-out
+            // start may have reached the extension, so the finalizer must
+            // still issue exactly one terminal attempt rather than retrying.
+            bindings.insert(session_id, binding.clone());
+            binding
+        };
+        self.dispatch_session_hook_start(&binding).await
+    }
+
+    /// Settles one declared session-hook binding exactly once.
+    ///
+    /// Repeated calls are idempotent. A valid non-continue disposition is
+    /// diagnostic-only and cannot veto this host-owned finalizer.
+    pub async fn settle_session_hook_binding(
+        &self,
+        session_id: &str,
+        outcome: ExtensionLifecycleOutcome,
+    ) -> Result<(), ExtensionRuntimeError> {
+        if !self.declares_session_hooks() {
+            return Err(self.undeclared("session hook", "session_start/session_end".to_owned()));
+        }
+        let _guard = self.inner.reload_guard.lock().await;
+        let binding = lock_std_mutex(&self.inner.session_hooks).remove(session_id);
+        let Some(binding) = binding else {
+            return Ok(());
+        };
+        self.dispatch_session_hook_end(
+            &binding,
+            &binding.endpoint,
+            outcome,
+            session_hook_shutdown_reason(outcome),
+        )
+        .await
+    }
+
+    async fn settle_all_session_hook_bindings_locked(
+        &self,
+        outcome: ExtensionLifecycleOutcome,
+        reason: &'static str,
+    ) {
+        let bindings = std::mem::take(&mut *lock_std_mutex(&self.inner.session_hooks))
+            .into_values()
+            .collect::<Vec<_>>();
+        let results = futures_util::future::join_all(bindings.iter().map(|binding| {
+            self.dispatch_session_hook_end(binding, &binding.endpoint, outcome, reason)
+        }))
+        .await;
+        for result in results {
+            if let Err(error) = result {
+                self.emit_session_hook_failure("session_end", &error);
+            }
+        }
+    }
+
+    fn take_session_hook_bindings_for_generation(
+        &self,
+        generation: u64,
+    ) -> Vec<ActiveSessionHookBinding> {
+        let mut bindings = lock_std_mutex(&self.inner.session_hooks);
+        let session_ids = bindings
+            .iter()
+            .filter_map(|(session_id, binding)| {
+                (binding.endpoint.generation == generation).then_some(session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        session_ids
+            .into_iter()
+            .filter_map(|session_id| bindings.remove(&session_id))
+            .collect()
+    }
+
+    fn install_replacement_session_hook_bindings(
+        &self,
+        settled_bindings: Vec<ActiveSessionHookBinding>,
+        endpoint: LifecycleEndpoint,
+    ) -> Vec<ActiveSessionHookBinding> {
+        let mut bindings = lock_std_mutex(&self.inner.session_hooks);
+        settled_bindings
+            .into_iter()
+            .map(|binding| {
+                let replacement = ActiveSessionHookBinding {
+                    session_id: binding.session_id,
+                    started_at: Instant::now(),
+                    endpoint: endpoint.clone(),
+                };
+                bindings.insert(replacement.session_id.clone(), replacement.clone());
+                replacement
+            })
+            .collect()
+    }
+
+    async fn dispatch_session_hook_start(
+        &self,
+        binding: &ActiveSessionHookBinding,
+    ) -> Result<(), ExtensionRuntimeError> {
+        let params = api_v03::SessionHookParams::SessionStart {
+            payload: api_v03::SessionStart {
+                binding: session_hook_wire_binding(binding, &self.inner.instance_id)?,
+            },
+        };
+        self.dispatch_session_hook(&binding.endpoint, &binding.session_id, params)
+            .await
+    }
+
+    async fn dispatch_session_hook_end(
+        &self,
+        binding: &ActiveSessionHookBinding,
+        endpoint: &LifecycleEndpoint,
+        outcome: ExtensionLifecycleOutcome,
+        reason: &'static str,
+    ) -> Result<(), ExtensionRuntimeError> {
+        let params = api_v03::SessionHookParams::SessionEnd {
+            payload: api_v03::SessionEnd {
+                binding: session_hook_wire_binding(binding, &self.inner.instance_id)?,
+                outcome: session_hook_outcome(outcome).to_owned(),
+                reason: reason.to_owned(),
+                duration_ms: session_hook_duration_millis(binding.started_at.elapsed()),
+            },
+        };
+        self.dispatch_session_hook(endpoint, &binding.session_id, params)
+            .await
+    }
+
+    async fn dispatch_session_hook(
+        &self,
+        endpoint: &LifecycleEndpoint,
+        session_id: &str,
+        params: api_v03::SessionHookParams,
+    ) -> Result<(), ExtensionRuntimeError> {
+        endpoint
+            .connection
+            .require_api_v03_host_method(methods::HOOK_RUN)?;
+        let params = serde_json::to_value(params)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let params = api_v03::parse_session_hook_params(params).map_err(api_v03_protocol_error)?;
+        let params = serde_json::to_value(params)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let resource_owner = ExtensionResourceOwner {
+            session_id: session_id.to_owned(),
+            extension_instance_id: self.inner.instance_id.clone(),
+            process_generation: endpoint.generation,
+        };
+        let result = endpoint
+            .connection
+            .request_lifecycle(
+                methods::HOOK_RUN,
+                params,
+                self.inner.config.request_timeout.min(SESSION_HOOK_DEADLINE),
+                resource_owner,
+            )
+            .await?;
+        let result = api_v03::parse_session_hook_result(result).map_err(api_v03_protocol_error)?;
+        api_v03::validate_disposition(&result.disposition).map_err(api_v03_protocol_error)?;
+        if result.disposition.kind != "continue" {
+            let _ = self.inner.events.send(ExtensionEvent::Diagnostic {
+                message: format!(
+                    "session hook returned non-veto disposition `{}`; ignored",
+                    result.disposition.kind
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn emit_session_hook_failure(&self, phase: &str, error: &ExtensionRuntimeError) {
+        let _ = self.inner.events.send(ExtensionEvent::Diagnostic {
+            message: format!("{phase} hook failed ({})", session_hook_error_kind(error)),
+        });
     }
 
     /// Invokes a manifest-declared model tool.
@@ -4741,6 +5007,11 @@ impl ExtensionProcess {
         payload: serde_json::Value,
         context: ExtensionExecutionContext,
     ) -> Result<ExtensionHookOutput, ExtensionRuntimeError> {
+        if hook.is_session_hook() {
+            return Err(ExtensionRuntimeError::Protocol(
+                "session_start and session_end are host-owned API 0.3 lifecycle hooks".into(),
+            ));
+        }
         if !self.inner.contributions.hooks.contains(&hook) {
             return Err(self.undeclared("hook", format!("{hook:?}").to_ascii_lowercase()));
         }
@@ -5598,6 +5869,35 @@ impl ExtensionProcess {
             )));
         }
 
+        let replacement_endpoint = LifecycleEndpoint {
+            generation,
+            connection: Arc::clone(&replacement),
+        };
+        let previous_crashed = previous.closed.load(Ordering::Acquire);
+        let session_hook_end_reason = if previous_crashed { "crash" } else { "reload" };
+        let settled_session_hook_bindings =
+            self.take_session_hook_bindings_for_generation(previous.generation);
+        let session_hook_ends =
+            futures_util::future::join_all(settled_session_hook_bindings.iter().map(|binding| {
+                let endpoint = if previous_crashed {
+                    &replacement_endpoint
+                } else {
+                    &binding.endpoint
+                };
+                self.dispatch_session_hook_end(
+                    binding,
+                    endpoint,
+                    ExtensionLifecycleOutcome::Interrupted,
+                    session_hook_end_reason,
+                )
+            }))
+            .await;
+        for result in session_hook_ends {
+            if let Err(error) = result {
+                self.emit_session_hook_failure("session_end", &error);
+            }
+        }
+
         let (old_turns, old_sessions) = {
             let _active = write_std_lock(&self.inner.connection);
             let previous_generation = previous.generation;
@@ -5690,10 +5990,6 @@ impl ExtensionProcess {
         // shut down immediately after the new generation becomes authoritative.
         {
             let mut active = write_std_lock(&self.inner.connection);
-            let replacement_endpoint = LifecycleEndpoint {
-                generation,
-                connection: Arc::clone(&replacement),
-            };
             let mut lifecycle = lock_std_mutex(&self.inner.lifecycle);
             for (session_key, session) in old_sessions {
                 let event = ExtensionLifecycleEvent::SessionStarted {
@@ -5771,6 +6067,21 @@ impl ExtensionProcess {
                 });
             }
         }
+        let replacement_session_hook_bindings = self.install_replacement_session_hook_bindings(
+            settled_session_hook_bindings,
+            replacement_endpoint,
+        );
+        let session_hook_starts = futures_util::future::join_all(
+            replacement_session_hook_bindings
+                .iter()
+                .map(|binding| self.dispatch_session_hook_start(binding)),
+        )
+        .await;
+        for result in session_hook_starts {
+            if let Err(error) = result {
+                self.emit_session_hook_failure("session_start", &error);
+            }
+        }
         let previous_shutdown_graceful = previous.shutdown().await;
         self.inner
             .approval_store
@@ -5793,6 +6104,11 @@ impl ExtensionProcess {
         self.inner.generation_changed.notify_waiters();
         let _guard = self.inner.reload_guard.lock().await;
         let connection = read_std_lock(&self.inner.connection).clone();
+        self.settle_all_session_hook_bindings_locked(
+            ExtensionLifecycleOutcome::Shutdown,
+            "shutdown",
+        )
+        .await;
         let _ = connection.drain(self.inner.config.shutdown_timeout).await;
         let graceful = connection.shutdown().await;
         self.inner
@@ -7519,6 +7835,30 @@ impl ProcessConnection {
         .await
     }
 
+    /// Sends one host-owned lifecycle finalizer while a generation is draining.
+    /// It deliberately bypasses ordinary request admission so an accepted
+    /// replacement can settle the old binding before the old child exits.
+    async fn request_lifecycle(
+        self: &Arc<Self>,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+        resource_owner: ExtensionResourceOwner,
+    ) -> Result<serde_json::Value, ExtensionRuntimeError> {
+        self.request_inner(
+            method,
+            params,
+            timeout,
+            false,
+            false,
+            None,
+            None,
+            Some(resource_owner),
+            None,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn request_inner(
         self: &Arc<Self>,
@@ -9171,6 +9511,78 @@ fn api_v03_protocol_error(error: api_v03::ContractError) -> ExtensionRuntimeErro
     ))
 }
 
+fn validate_session_hook_id(value: &str) -> Result<(), ExtensionRuntimeError> {
+    if value.is_empty()
+        || value.len() > api_v03::MAX_SESSION_HOOK_ID_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "session hook identifiers must be bounded opaque ASCII tokens".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn session_hook_wire_binding(
+    binding: &ActiveSessionHookBinding,
+    extension_instance_id: &str,
+) -> Result<api_v03::SessionBinding, ExtensionRuntimeError> {
+    validate_session_hook_id(&binding.session_id)?;
+    validate_session_hook_id(extension_instance_id)?;
+    let max_generation = (api_v03::MAX_PORTABLE_JSON_INTEGER as u64).min(usize::MAX as u64);
+    if binding.endpoint.generation > max_generation {
+        return Err(ExtensionRuntimeError::Protocol(
+            "session hook process generation exceeds the API 0.3 portable integer bound".into(),
+        ));
+    }
+    Ok(api_v03::SessionBinding {
+        session_id: binding.session_id.clone(),
+        extension_instance_id: extension_instance_id.to_owned(),
+        process_generation: binding.endpoint.generation as usize,
+    })
+}
+
+fn session_hook_duration_millis(duration: Duration) -> usize {
+    duration
+        .as_millis()
+        .min((api_v03::MAX_PORTABLE_JSON_INTEGER as u64).min(usize::MAX as u64) as u128)
+        as usize
+}
+
+fn session_hook_outcome(outcome: ExtensionLifecycleOutcome) -> &'static str {
+    match outcome {
+        ExtensionLifecycleOutcome::Completed => "completed",
+        ExtensionLifecycleOutcome::Failed => "failed",
+        ExtensionLifecycleOutcome::Cancelled => "cancelled",
+        ExtensionLifecycleOutcome::Interrupted => "interrupted",
+        ExtensionLifecycleOutcome::FrontendDisconnected => "frontend_disconnected",
+        ExtensionLifecycleOutcome::Shutdown => "shutdown",
+        ExtensionLifecycleOutcome::LimitReached => "limit_reached",
+    }
+}
+
+fn session_hook_shutdown_reason(outcome: ExtensionLifecycleOutcome) -> &'static str {
+    if outcome == ExtensionLifecycleOutcome::Cancelled {
+        "cancelled"
+    } else {
+        "shutdown"
+    }
+}
+
+fn session_hook_error_kind(error: &ExtensionRuntimeError) -> &'static str {
+    match error {
+        ExtensionRuntimeError::Timeout { .. } => "timeout",
+        ExtensionRuntimeError::Cancelled { .. } => "cancelled",
+        ExtensionRuntimeError::Closed(_) => "closed",
+        ExtensionRuntimeError::Remote { .. } => "remote_error",
+        ExtensionRuntimeError::Protocol(_) => "protocol_error",
+        ExtensionRuntimeError::MessageTooLarge { .. } => "message_too_large",
+        _ => "internal_error",
+    }
+}
+
 fn negotiate_api_v03_contributions(
     manifest: &ExtensionManifest,
     offer: &api_v03::ContractOffer,
@@ -9250,8 +9662,32 @@ fn negotiate_api_v03_contributions(
             "API 0.3 provider authorization requires the provider_catalog capability".into(),
         ));
     }
+    let declares_session_hooks = manifest
+        .contributes
+        .hooks
+        .contains(&ExtensionHook::SessionStart)
+        && manifest
+            .contributes
+            .hooks
+            .contains(&ExtensionHook::SessionEnd);
+    let selected_lifecycle_events = contract
+        .capabilities
+        .contains(EXTENSION_FEATURE_LIFECYCLE_EVENTS);
+    let selected_hook_run = contract.methods.contains(methods::HOOK_RUN);
+    if declares_session_hooks != selected_lifecycle_events
+        || declares_session_hooks != selected_hook_run
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 declared session hooks and lifecycle_events/hook/run negotiation must agree"
+                .into(),
+        ));
+    }
     if !manifest.contributes.commands.is_empty()
-        || !manifest.contributes.hooks.is_empty()
+        || manifest
+            .contributes
+            .hooks
+            .iter()
+            .any(|hook| !hook.is_session_hook())
         || !manifest.contributes.ui.is_empty()
         || manifest.contributes.context
         || !manifest.contributes.tool_renderers.is_empty()
@@ -9293,6 +9729,7 @@ fn negotiate_api_v03_contributions(
             tools,
             providers: manifest.contributes.providers
                 && contract.capabilities.contains("provider_catalog"),
+            hooks: manifest.contributes.hooks.clone(),
             ..ExtensionContributions::default()
         },
         protocol,
@@ -14205,6 +14642,47 @@ confirmations = true
     }
 
     #[test]
+    fn api_v03_session_hooks_require_the_declared_pair_and_no_legacy_hook_surface() {
+        let base = r#"name = "session-hooks"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "session-hooks"
+[contributes]
+hooks = ["session_start", "session_end"]
+"#;
+        let manifest = ExtensionManifest::parse(base).expect("paired API 0.3 hooks");
+        assert_eq!(
+            manifest.contributes.hooks,
+            vec![ExtensionHook::SessionStart, ExtensionHook::SessionEnd]
+        );
+        let missing_end = base.replace(
+            "hooks = [\"session_start\", \"session_end\"]",
+            "hooks = [\"session_start\"]",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&missing_end),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("must be declared together")
+        ));
+        let legacy = base.replace("api_version = \"0.3\"", "api_version = \"0.2\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&legacy),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("require extension API 0.3")
+        ));
+        let deferred = base.replace(
+            "hooks = [\"session_start\", \"session_end\"]",
+            "hooks = [\"session_start\", \"session_end\", \"before_prompt\"]",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&deferred),
+            Err(ExtensionRuntimeError::InvalidManifest(message))
+                if message.contains("other hooks")
+        ));
+    }
+
+    #[test]
     fn manifest_accepts_matching_optional_ygg_requirement_and_rejects_mismatch() {
         let matching = VALID_MANIFEST.replace(
             "api_version = \"0.1\"",
@@ -14636,6 +15114,384 @@ tools = ["echo"]
         }
         assert_eq!(output.expect("checked above").content, "canonical API 0.3");
         assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_declared_session_hooks_are_typed_sanitized_and_exact_once() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("session-hooks.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip("\n") == canonical(value), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+initialize = receive()
+contract = initialize["params"]["contract"]
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": contract["required_capabilities"] + ["lifecycle_events"],
+    "methods": contract["required_methods"] + ["hook/run"],
+    "limits": contract["limits"],
+}
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {"api_version": "0.3", "tools": [], "contract": selection},
+})
+
+seen = []
+while True:
+    message = receive()
+    if message["method"] == "hook/run":
+        params = message["params"]
+        assert set(params) == {"hook", "payload"}, params
+        payload = params["payload"]
+        assert set(payload) == ({"binding"} if params["hook"] == "session_start" else {"binding", "outcome", "reason", "duration_ms"}), payload
+        binding = payload["binding"]
+        assert set(binding) == {"session_id", "extension_instance_id", "process_generation"}, binding
+        assert binding["session_id"] == "session-owner-1", binding
+        assert binding["process_generation"] == 1, binding
+        assert 0 < len(binding["extension_instance_id"]) <= 256, binding
+        assert all(character.isalnum() or character in "-_" for character in binding["extension_instance_id"]), binding
+        if params["hook"] == "session_end":
+            assert payload["outcome"] == "completed", payload
+            assert payload["reason"] == "shutdown", payload
+            assert isinstance(payload["duration_ms"], int), payload
+        seen.append(params["hook"])
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"disposition": {"kind": "continue"}},
+        })
+    else:
+        assert message["method"] == "shutdown", message
+        assert seen == ["session_start", "session_end"], seen
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"terminal": "shutdown"}})
+        break
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03-session-hooks"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "session-hooks.py"
+[contributes]
+hooks = ["session_start", "session_end"]
+"#,
+        )
+        .expect("API 0.3 session hook manifest");
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .expect("start API 0.3 session hook process");
+        assert!(process.declares_session_hooks());
+        assert!(matches!(
+            process
+                .run_hook(
+                    ExtensionHook::SessionStart,
+                    serde_json::json!({}),
+                    process.current_context(),
+                )
+                .await,
+            Err(ExtensionRuntimeError::Protocol(message))
+                if message.contains("host-owned API 0.3 lifecycle hooks")
+        ));
+        assert!(matches!(
+            process.start_session_hook_binding("session/with/a/path").await,
+            Err(ExtensionRuntimeError::Protocol(message))
+                if message.contains("bounded opaque ASCII tokens")
+        ));
+        process
+            .start_session_hook_binding("session-owner-1")
+            .await
+            .expect("start declared hook");
+        process
+            .start_session_hook_binding("session-owner-1")
+            .await
+            .expect("idempotent start");
+        process
+            .settle_session_hook_binding("session-owner-1", ExtensionLifecycleOutcome::Completed)
+            .await
+            .expect("settle declared hook");
+        process
+            .settle_session_hook_binding("session-owner-1", ExtensionLifecycleOutcome::Completed)
+            .await
+            .expect("idempotent settlement");
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_session_hooks_settle_and_rebind_per_reload_generation() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("session-hook-reload.py");
+        let wire_log = temp.path().join("session-hook-reload.jsonl");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip("\n") == canonical(value), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+initialize = receive()
+contract = initialize["params"]["contract"]
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": contract["required_capabilities"] + ["lifecycle_events"],
+    "methods": contract["required_methods"] + ["hook/run"],
+    "limits": contract["limits"],
+}
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {"api_version": "0.3", "tools": [], "contract": selection},
+})
+
+while True:
+    message = receive()
+    if message["method"] == "hook/run":
+        with open(os.path.join(os.environ["YGG_WORKSPACE"], "session-hook-reload.jsonl"), "a", encoding="utf-8") as wire_log:
+            wire_log.write(canonical(message) + "\n")
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"disposition": {"kind": "continue"}},
+        })
+    else:
+        assert message["method"] == "shutdown", message
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"terminal": "shutdown"}})
+        break
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03-session-hook-reload"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "session-hook-reload.py"
+[contributes]
+hooks = ["session_start", "session_end"]
+"#,
+        )
+        .expect("API 0.3 reload manifest");
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .expect("start API 0.3 session hook process");
+        process
+            .start_session_hook_binding("session-owner-reload")
+            .await
+            .expect("initial session start");
+        let report = process.reload().await.expect("reload session hook process");
+        assert_eq!(report.generation, 2);
+        process
+            .settle_session_hook_binding(
+                "session-owner-reload",
+                ExtensionLifecycleOutcome::Completed,
+            )
+            .await
+            .expect("final session settlement");
+        assert!(process.shutdown().await);
+
+        let hooks = std::fs::read_to_string(wire_log)
+            .expect("read hook log")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("hook frame"))
+            .collect::<Vec<_>>();
+        assert_eq!(hooks.len(), 4);
+        assert_eq!(hooks[0]["params"]["hook"], "session_start");
+        assert_eq!(
+            hooks[0]["params"]["payload"]["binding"]["process_generation"],
+            1
+        );
+        assert_eq!(hooks[1]["params"]["hook"], "session_end");
+        assert_eq!(
+            hooks[1]["params"]["payload"]["binding"]["process_generation"],
+            1
+        );
+        assert_eq!(hooks[1]["params"]["payload"]["outcome"], "interrupted");
+        assert_eq!(hooks[1]["params"]["payload"]["reason"], "reload");
+        assert_eq!(hooks[2]["params"]["hook"], "session_start");
+        assert_eq!(
+            hooks[2]["params"]["payload"]["binding"]["process_generation"],
+            2
+        );
+        assert_eq!(hooks[3]["params"]["hook"], "session_end");
+        assert_eq!(
+            hooks[3]["params"]["payload"]["binding"]["process_generation"],
+            2
+        );
+        assert_eq!(hooks[3]["params"]["payload"]["outcome"], "completed");
+        assert_eq!(hooks[3]["params"]["payload"]["reason"], "shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_session_hooks_recover_a_crashed_generation_on_replacement() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("session-hook-crash.py");
+        let wire_log = temp.path().join("session-hook-crash.jsonl");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip("\n") == canonical(value), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+initialize = receive()
+contract = initialize["params"]["contract"]
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": contract["required_capabilities"] + ["lifecycle_events"],
+    "methods": contract["required_methods"] + ["hook/run"],
+    "limits": contract["limits"],
+}
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {"api_version": "0.3", "tools": [], "contract": selection},
+})
+
+while True:
+    message = receive()
+    if message["method"] == "hook/run":
+        with open(os.path.join(os.environ["YGG_WORKSPACE"], "session-hook-crash.jsonl"), "a", encoding="utf-8") as wire_log:
+            wire_log.write(canonical(message) + "\n")
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"disposition": {"kind": "continue"}}})
+    else:
+        assert message["method"] == "shutdown", message
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"terminal": "shutdown"}})
+        break
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03-session-hook-crash"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "session-hook-crash.py"
+[contributes]
+hooks = ["session_start", "session_end"]
+"#,
+        )
+        .expect("API 0.3 crash manifest");
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .expect("start API 0.3 session hook process");
+        process
+            .start_session_hook_binding("session-owner-crash")
+            .await
+            .expect("initial session start");
+        let crashed = read_std_lock(&process.inner.connection).clone();
+        crashed.terminate().await;
+        let report = process.reload().await.expect("recover crashed process");
+        assert_eq!(report.generation, 2);
+        process
+            .settle_session_hook_binding(
+                "session-owner-crash",
+                ExtensionLifecycleOutcome::Cancelled,
+            )
+            .await
+            .expect("final session settlement");
+        assert!(process.shutdown().await);
+
+        let hooks = std::fs::read_to_string(wire_log)
+            .expect("read hook log")
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("hook frame"))
+            .collect::<Vec<_>>();
+        assert_eq!(hooks.len(), 4);
+        assert_eq!(hooks[0]["params"]["hook"], "session_start");
+        assert_eq!(
+            hooks[0]["params"]["payload"]["binding"]["process_generation"],
+            1
+        );
+        assert_eq!(hooks[1]["params"]["hook"], "session_end");
+        assert_eq!(
+            hooks[1]["params"]["payload"]["binding"]["process_generation"],
+            1
+        );
+        assert_eq!(hooks[1]["params"]["payload"]["outcome"], "interrupted");
+        assert_eq!(hooks[1]["params"]["payload"]["reason"], "crash");
+        assert_eq!(hooks[2]["params"]["hook"], "session_start");
+        assert_eq!(
+            hooks[2]["params"]["payload"]["binding"]["process_generation"],
+            2
+        );
+        assert_eq!(hooks[3]["params"]["hook"], "session_end");
+        assert_eq!(
+            hooks[3]["params"]["payload"]["binding"]["process_generation"],
+            2
+        );
+        assert_eq!(hooks[3]["params"]["payload"]["outcome"], "cancelled");
+        assert_eq!(hooks[3]["params"]["payload"]["reason"], "cancelled");
     }
 
     #[cfg(unix)]

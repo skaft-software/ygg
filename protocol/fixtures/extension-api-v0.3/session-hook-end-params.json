@@ -1,0 +1,1 @@
+{"hook":"session_end","payload":{"binding":{"extension_instance_id":"0123456789abcdef0123456789abcdef","process_generation":1,"session_id":"session-0123456789abcdef"},"duration_ms":17,"outcome":"shutdown","reason":"shutdown"}}
