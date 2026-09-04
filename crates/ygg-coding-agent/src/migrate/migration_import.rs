@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
 use ygg_agent::extension_api_v03 as api;
-use ygg_ai::{ModelCatalog, ModelId};
+use ygg_ai::ModelCatalog;
 use ygg_migrate_types::{
     Diagnostic as SetupDiagnostic, DiagnosticSeverity, McpServer, McpTransport, MigratedSetup,
     MigrationOutcome, Model, Skill,
@@ -43,6 +43,10 @@ const CONFIG_CANDIDATES: &[&str] = &[
     ".pi/agent/settings.json",
 ];
 const SKILL_ROOT_CANDIDATES: &[&str] = &["skills", ".pi/skills", ".pi/agent/skills"];
+const UNKNOWN_MODEL_DIAGNOSTIC: &str =
+    "Configured Pi model was skipped because no exact built-in Ygg provider/API-name match was found.";
+const AMBIGUOUS_MODEL_DIAGNOSTIC: &str =
+    "Configured Pi model was skipped because its built-in Ygg provider/API-name match is ambiguous.";
 
 /// Dispatch the public `ygg migrate import ...` command.
 pub(crate) fn run_import(
@@ -108,13 +112,22 @@ fn run_import_pi(
         return Ok(());
     }
     let paths = MigrationPaths::new(home)?;
-    let lock = MigrationLock::acquire(&paths)?;
+    // A preview must not create destination state. Real imports still acquire
+    // this before source or destination planning, so their conflict checks and
+    // writes remain serialized.
+    let lock = if dry_run {
+        None
+    } else {
+        Some(MigrationLock::acquire(&paths)?)
+    };
 
     let mut adapter = AdapterClient::start()?;
     let detected = adapter.detect(&source)?;
     if !detected.detected {
         adapter.shutdown();
-        lock.release()?;
+        if let Some(lock) = lock {
+            lock.release()?;
+        }
         emit_no_source_report(&source, json_output);
         return Ok(());
     }
@@ -124,10 +137,10 @@ fn run_import_pi(
 
     let preview = build_ingestion_plan(&paths, &setup, false)?;
     if dry_run {
-        lock.release()?;
         emit_import_report(&source, &preview, None, true, json_output);
         return Ok(());
     }
+    let lock = lock.expect("mutating imports acquire the migration lock");
     if !preview.conflicts.is_empty() && !confirm_conflicts(&preview.conflicts, yes)? {
         lock.release()?;
         anyhow::bail!("migration cancelled; no files were changed")
@@ -1137,6 +1150,25 @@ struct PlanCounts {
     skipped: usize,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct ModelImportDiagnostic {
+    path: String,
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModelSelection {
+    model: Option<String>,
+    diagnostics: Vec<ModelImportDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CatalogModelResolution {
+    Resolved(String),
+    Unknown,
+    Ambiguous,
+}
+
 #[derive(Clone, Debug)]
 struct Conflict {
     target: String,
@@ -1149,6 +1181,7 @@ struct IngestionPlan {
     conflicts: Vec<Conflict>,
     counts: PlanCounts,
     diagnostic_count: usize,
+    model_diagnostics: Vec<ModelImportDiagnostic>,
 }
 
 #[derive(Clone, Debug)]
@@ -1176,7 +1209,10 @@ fn build_ingestion_plan(
     };
     let desired_skills = desired_skills(setup, &mut counts)?;
     let desired_mcp = desired_mcp_servers(setup, &mut counts)?;
-    let selected_model = selected_model(setup, &mut counts)?;
+    let model_selection = selected_model(setup, &mut counts)?;
+    let diagnostic_count = setup.diagnostics().len() + model_selection.diagnostics.len();
+    let selected_model = model_selection.model;
+    let model_diagnostics = model_selection.diagnostics;
     let has_desired_items =
         selected_model.is_some() || !desired_skills.is_empty() || !desired_mcp.is_empty();
     if !has_desired_items {
@@ -1184,7 +1220,8 @@ fn build_ingestion_plan(
             changes: Vec::new(),
             conflicts: Vec::new(),
             counts,
-            diagnostic_count: setup.diagnostics().len(),
+            diagnostic_count,
+            model_diagnostics,
         });
     }
 
@@ -1364,7 +1401,8 @@ fn build_ingestion_plan(
         changes,
         conflicts,
         counts,
-        diagnostic_count: setup.diagnostics().len(),
+        diagnostic_count,
+        model_diagnostics,
     })
 }
 
@@ -1479,32 +1517,73 @@ fn valid_mcp_server_name(name: &str) -> bool {
 fn selected_model(
     setup: &MigratedSetup,
     counts: &mut PlanCounts,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<ModelSelection> {
     let catalog = ModelCatalog::builtin()
         .map_err(|error| anyhow::anyhow!("cannot load Ygg's static model catalog: {error}"))?;
-    let mut selected = None;
+    Ok(selected_model_in_catalog(setup, &catalog, counts))
+}
+
+fn selected_model_in_catalog(
+    setup: &MigratedSetup,
+    catalog: &ModelCatalog,
+    counts: &mut PlanCounts,
+) -> ModelSelection {
+    let mut selection = ModelSelection::default();
     for outcome in setup.models() {
-        let Some((_path, model)) = outcome.as_mapped() else {
+        // Model outcomes are ordered by source precedence. An unresolved later
+        // selection must not leave an earlier model configured by accident.
+        selection.model = None;
+        let Some((path, model)) = outcome.as_mapped() else {
             counts.skipped += 1;
             continue;
         };
-        let provider = match model.provider() {
-            "google-ai" | "google-generative-ai" => "google",
-            "openai-codex" => "codex",
-            provider => provider,
-        };
-        let route = if model.model().contains('/') {
-            model.model().to_owned()
-        } else {
-            format!("{provider}/{}", model.model())
-        };
-        if catalog.resolve(&ModelId(route.clone())).is_ok() {
-            selected = Some(route);
-        } else {
-            counts.skipped += 1;
+        match resolve_catalog_model(catalog, model.provider(), model.model()) {
+            CatalogModelResolution::Resolved(model) => selection.model = Some(model),
+            CatalogModelResolution::Unknown => {
+                counts.skipped += 1;
+                selection.diagnostics.push(ModelImportDiagnostic {
+                    path: path.to_owned(),
+                    reason: UNKNOWN_MODEL_DIAGNOSTIC,
+                });
+            }
+            CatalogModelResolution::Ambiguous => {
+                counts.skipped += 1;
+                selection.diagnostics.push(ModelImportDiagnostic {
+                    path: path.to_owned(),
+                    reason: AMBIGUOUS_MODEL_DIAGNOSTIC,
+                });
+            }
         }
     }
-    Ok(selected)
+    selection
+}
+
+/// Pi identifies models by provider API name. Select a Ygg config ID only when
+/// that pair has exactly one matching built-in endpoint and API name.
+fn resolve_catalog_model(
+    catalog: &ModelCatalog,
+    provider: &str,
+    api_name: &str,
+) -> CatalogModelResolution {
+    let provider = canonical_model_provider(provider);
+    let mut candidates = catalog
+        .models()
+        .filter(|candidate| candidate.endpoint.0 == provider && candidate.api_name == api_name);
+    let Some(candidate) = candidates.next() else {
+        return CatalogModelResolution::Unknown;
+    };
+    if candidates.next().is_some() {
+        return CatalogModelResolution::Ambiguous;
+    }
+    CatalogModelResolution::Resolved(candidate.id.0.clone())
+}
+
+fn canonical_model_provider(provider: &str) -> &str {
+    match provider {
+        "google-ai" | "google-generative-ai" => "google",
+        "openai-codex" => "codex",
+        provider => provider,
+    }
 }
 
 fn load_state(paths: &MigrationPaths) -> anyhow::Result<(Option<Vec<u8>>, PiMigrationState)> {
@@ -2107,6 +2186,8 @@ struct PublicImportReport<'a> {
     unchanged: usize,
     skipped: usize,
     diagnostics: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    model_diagnostics: Vec<ModelImportDiagnostic>,
     conflicts: usize,
     backup: Option<&'a Path>,
 }
@@ -2145,6 +2226,7 @@ fn emit_import_report(
         unchanged: plan.counts.unchanged,
         skipped: plan.counts.skipped,
         diagnostics: plan.diagnostic_count,
+        model_diagnostics: plan.model_diagnostics.clone(),
         conflicts: plan.conflicts.len(),
         backup,
     };
@@ -2172,6 +2254,12 @@ fn emit_import_report(
     ));
     crate::output::stdout_line(format!("  Unchanged: {}", report.unchanged));
     crate::output::stdout_line(format!("  Skipped: {}", report.skipped));
+    if !report.model_diagnostics.is_empty() {
+        crate::output::stdout_line("  Model diagnostics:");
+        for diagnostic in &report.model_diagnostics {
+            crate::output::stdout_line(format!("    {}: {}", diagnostic.path, diagnostic.reason));
+        }
+    }
     if report.conflicts > 0 {
         crate::output::stdout_line(format!("  Conflicts: {}", report.conflicts));
     }
@@ -2191,11 +2279,21 @@ fn emit_import_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ygg_ai::ModelId;
 
     fn paths(temp: &tempfile::TempDir) -> MigrationPaths {
         let home = temp.path().join("home");
         fs::create_dir_all(&home).unwrap();
         MigrationPaths::new(home).unwrap()
+    }
+
+    fn mapped_model(provider: &str, model: &str) -> MigrationOutcome<Model> {
+        MigrationOutcome::mapped("settings.json", Model::new(provider, model).unwrap()).unwrap()
+    }
+
+    fn setup_with_models(models: Vec<MigrationOutcome<Model>>) -> MigratedSetup {
+        MigratedSetup::with_parts("pi", models, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .unwrap()
     }
 
     fn setup() -> MigratedSetup {
@@ -2239,6 +2337,27 @@ mod tests {
     }
 
     #[test]
+    fn canonical_provider_qualified_model_uses_the_catalog_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let setup = setup_with_models(vec![mapped_model("openai", "gpt-4o-mini")]);
+
+        let plan = build_ingestion_plan(&paths, &setup, false).unwrap();
+        assert_eq!(plan.counts.models, 1);
+        assert_eq!(plan.counts.skipped, 0);
+        assert_eq!(plan.diagnostic_count, 0);
+        assert!(plan.model_diagnostics.is_empty());
+        let config = plan
+            .changes
+            .iter()
+            .find(|change| change.target == paths.config)
+            .unwrap();
+        assert!(std::str::from_utf8(&config.desired)
+            .unwrap()
+            .contains("model = \"gpt-4o-mini\""));
+    }
+
+    #[test]
     fn unsupported_source_items_do_not_create_migration_state() {
         let temp = tempfile::tempdir().unwrap();
         let paths = paths(&temp);
@@ -2258,8 +2377,72 @@ mod tests {
 
         let plan = build_ingestion_plan(&paths, &setup, false).unwrap();
         assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.skipped, 1);
+        assert_eq!(plan.diagnostic_count, 1);
+        assert_eq!(plan.model_diagnostics.len(), 1);
+        assert_eq!(plan.model_diagnostics[0].path, "settings.json");
+        assert_eq!(plan.model_diagnostics[0].reason, UNKNOWN_MODEL_DIAGNOSTIC);
         assert!(apply_ingestion_plan(&paths, &plan).unwrap().is_none());
         assert!(!paths.state.exists());
+    }
+
+    #[test]
+    fn later_unknown_model_does_not_fall_back_to_lower_precedence_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = paths(&temp);
+        let setup = setup_with_models(vec![
+            mapped_model("openai", "gpt-4o-mini"),
+            mapped_model("anthropic", "gpt-4o-mini"),
+        ]);
+
+        let plan = build_ingestion_plan(&paths, &setup, false).unwrap();
+        assert!(plan.changes.is_empty());
+        assert_eq!(plan.counts.skipped, 1);
+        assert_eq!(plan.model_diagnostics.len(), 1);
+        assert_eq!(plan.model_diagnostics[0].reason, UNKNOWN_MODEL_DIAGNOSTIC);
+    }
+
+    #[test]
+    fn catalog_model_resolution_is_provider_exact_and_rejects_custom_ids_and_ambiguity() {
+        let mut catalog = ModelCatalog::builtin().unwrap();
+        assert_eq!(
+            resolve_catalog_model(&catalog, "openai", "gpt-4o-mini"),
+            CatalogModelResolution::Resolved("gpt-4o-mini".to_owned())
+        );
+        assert_eq!(
+            resolve_catalog_model(&catalog, "anthropic", "gpt-4o-mini"),
+            CatalogModelResolution::Unknown
+        );
+
+        let template = (*catalog
+            .resolve(&ModelId("gpt-4o-mini".to_owned()))
+            .unwrap()
+            .spec)
+            .clone();
+        let mut custom_id = template.clone();
+        custom_id.id = ModelId("custom/openai/fixture".to_owned());
+        custom_id.api_name = "fixture-api".to_owned();
+        catalog.register_model(custom_id).unwrap();
+        assert_eq!(
+            resolve_catalog_model(&catalog, "openai", "custom/openai/fixture"),
+            CatalogModelResolution::Unknown
+        );
+
+        let mut first = template.clone();
+        first.id = ModelId("shared-api-one".to_owned());
+        first.api_name = "shared-api".to_owned();
+        let mut second = first.clone();
+        second.id = ModelId("shared-api-two".to_owned());
+        catalog.register_model(first).unwrap();
+        catalog.register_model(second).unwrap();
+
+        let setup = setup_with_models(vec![mapped_model("openai", "shared-api")]);
+        let mut counts = PlanCounts::default();
+        let selection = selected_model_in_catalog(&setup, &catalog, &mut counts);
+        assert_eq!(selection.model, None);
+        assert_eq!(counts.skipped, 1);
+        assert_eq!(selection.diagnostics.len(), 1);
+        assert_eq!(selection.diagnostics[0].reason, AMBIGUOUS_MODEL_DIAGNOSTIC);
     }
 
     #[test]
@@ -2303,15 +2486,12 @@ mod tests {
     }
 
     #[test]
-    fn adapter_reads_fixture_without_writing_source() {
+    fn adapter_preserves_source_and_does_not_copy_mcp_credentials() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("pi");
         fs::create_dir_all(source.join("skills/review")).unwrap();
-        fs::write(
-            source.join("settings.json"),
-            r#"{"model":"openai/gpt-4o","mcpServers":{"docs":{"command":"docs-mcp","args":["--stdio"],"env":{"TOKEN":"secret"}}}}"#,
-        )
-        .unwrap();
+        let settings = br#"{"model":"openai/gpt-4o-mini","mcpServers":{"docs":{"command":"docs-mcp","args":["--stdio"],"env":{"TOKEN":"MIGRATION_SECRET"}}}}"#;
+        fs::write(source.join("settings.json"), settings).unwrap();
         fs::write(source.join("skills/review/SKILL.md"), "Review.").unwrap();
         let before = sha256_hex(&fs::read(source.join("settings.json")).unwrap());
         let detected = pi_detect(&source).unwrap();
@@ -2324,6 +2504,20 @@ mod tests {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.reason.contains("environment")));
+
+        let paths = paths(&temp);
+        let setup = normalize_adapter_result(imported).unwrap();
+        let plan = build_ingestion_plan(&paths, &setup, false).unwrap();
+        apply_ingestion_plan(&paths, &plan).unwrap();
+        for target in [&paths.config, &paths.mcp, &paths.state] {
+            assert!(
+                !fs::read_to_string(target)
+                    .unwrap()
+                    .contains("MIGRATION_SECRET"),
+                "credential leaked into {}",
+                target.display()
+            );
+        }
         assert_eq!(
             before,
             sha256_hex(&fs::read(source.join("settings.json")).unwrap())

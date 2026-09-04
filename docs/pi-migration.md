@@ -46,6 +46,9 @@ all destination decisions and writes.
 
 The importer can select a model already known to Ygg, copy portable skills into
 `~/.ygg/skills/`, and add local stdio MCP declarations to `~/.ygg/mcp.json`.
+A Pi provider/API-model pair is selected only when it has exactly one match in
+Ygg's built-in catalog; Ygg persists that catalog entry's canonical ID. Custom,
+unknown, and ambiguous provider/model values are skipped rather than guessed.
 Every imported skill is wrapped in host-authored frontmatter with
 `disable-model-invocation: true`; every imported MCP server has `enabled: false`
 and `required: false`. Review and explicitly enable either resource only after
@@ -53,8 +56,9 @@ inspecting it.
 
 Credentials, MCP environment values, headers, working directories, and Pi
 permission decisions are never copied. Unsupported models and transports are
-reported as skipped. The command never writes the Pi source setup, contacts a
-network service, starts an imported MCP server, starts an extension, or invokes
+reported as skipped; model skips include bounded details in the text report and
+JSON `model_diagnostics`. The command never writes the Pi source setup, contacts
+a network service, starts an imported MCP server, starts an extension, or invokes
 a model.
 
 Imports track the hashes they own in `~/.ygg/migrations/pi-state.json`. A
