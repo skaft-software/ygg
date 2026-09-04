@@ -392,7 +392,7 @@ mod tests {
         assert!(matches!(
             claude.endpoint.auth,
             Auth::HeaderBearerEnv { ref name, .. }
-                if name == &http::HeaderName::from_static("cf-aig-authorization")
+                if name == http::HeaderName::from_static("cf-aig-authorization")
         ));
 
         let openai = gateway

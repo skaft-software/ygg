@@ -12942,6 +12942,7 @@ shortcuts = [{ key = "ctrl+shift+p", name = "open_panel", description = "Open th
             api_version: EXTENSION_API_VERSION_0_2.into(),
             tools: Vec::new(),
             commands: Vec::new(),
+            tool_renderers: Vec::new(),
             shortcuts,
             protocol: Some(ExtensionProtocolResponse {
                 version: EXTENSION_API_VERSION_0_2.into(),

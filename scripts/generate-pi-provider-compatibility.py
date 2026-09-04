@@ -223,7 +223,7 @@ def render(inventory: dict[str, Any]) -> str:
         "",
         inventory["inventory_basis"],
         "",
-        "A **declared** row has a deterministic catalog/route fixture. A **declared subset** row names every excluded Pi surface and its release blocker. An **unsupported** row has no native declaration and names the primitive that must land before it can be exposed. Fixture IDs are exercised by `providers::contract::tests::pinned_pi_provider_inventory_has_tested_decisions` and `providers::contract::tests::pinned_pi_provider_fixtures_send_declared_routes_without_network_access`; this is not a load-only inventory.",
+        "A **declared** row has a deterministic catalog/route fixture. A **declared subset** row names every excluded Pi surface and its release blocker. An **unsupported** row has no Pi-compatible declaration and names the missing primitive or evidence. It may name a separately supported legacy Ygg declaration; that is explicitly not evidence of Pi wire compatibility. Fixture IDs are exercised by `providers::contract::tests::pinned_pi_provider_inventory_has_tested_decisions` and `providers::contract::tests::pinned_pi_provider_fixtures_send_declared_routes_without_network_access`; this is not a load-only inventory.",
         "",
         "| Pi provider | Decision | Tested fixture | Route or missing primitive | Evidence |",
         "| --- | --- | --- | --- | --- |",
@@ -275,7 +275,7 @@ def render(inventory: dict[str, Any]) -> str:
             "",
             "## Closure guard",
             "",
-            "Do not convert an unsupported or subset row to `declared` from a successful load alone. The change needs a deterministic request/stream/auth fixture for the named primitive and an update to this source fixture; the generator and test then keep the documentation synchronized.",
+            "Do not convert an unsupported or subset row to `declared` from a successful load alone. The change needs a deterministic request/stream/auth fixture for the named primitive and an update to this source fixture; the generator and test then keep the documentation synchronized. A legacy declaration only documents a separately available Ygg route and does not establish Pi compatibility.",
             "",
         ]
     )

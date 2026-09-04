@@ -40,12 +40,13 @@
     {
       "id": "amazon-bedrock",
       "label": "Amazon Bedrock",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "amazon-bedrock-unsupported-decision",
-        "missing_primitive": "Bedrock Converse/ConverseStream codec plus AWS SigV4 credential-chain resolution",
-        "release_blocker": "#246"
+        "missing_primitive": "Pi-specific Bedrock route/model/credential evidence and deterministic request fixture",
+        "release_blocker": "#246",
+        "legacy_declaration": "bedrock"
       }
     },
     {
@@ -81,12 +82,13 @@
     {
       "id": "azure-openai-responses",
       "label": "Azure OpenAI Responses",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "azure-openai-responses-unsupported-decision",
-        "missing_primitive": "Azure resource/deployment/API-version route construction and Azure API-key presentation",
-        "release_blocker": "#247"
+        "missing_primitive": "Pi-specific Azure resource/deployment/API-version route evidence and deterministic request fixture",
+        "release_blocker": "#247",
+        "legacy_declaration": "azure-openai"
       }
     },
     {
@@ -111,23 +113,25 @@
     {
       "id": "cloudflare-ai-gateway",
       "label": "Cloudflare AI Gateway",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "cloudflare-ai-gateway-unsupported-decision",
-        "missing_primitive": "Account/gateway URL construction and gateway-specific auth/header policy",
-        "release_blocker": "#251"
+        "missing_primitive": "Pi-specific Cloudflare AI Gateway multi-protocol route/auth evidence and deterministic request fixture",
+        "release_blocker": "#251",
+        "legacy_declaration": "cloudflare-ai-gateway"
       }
     },
     {
       "id": "cloudflare-workers-ai",
       "label": "Cloudflare Workers AI",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "cloudflare-workers-ai-unsupported-decision",
-        "missing_primitive": "Account-scoped Workers AI route construction and response normalization",
-        "release_blocker": "#250"
+        "missing_primitive": "Pi-specific Cloudflare Workers AI request/stream/auth evidence and deterministic request fixture",
+        "release_blocker": "#250",
+        "legacy_declaration": "cloudflare-workers-ai"
       }
     },
     {
@@ -182,23 +186,25 @@
     {
       "id": "google",
       "label": "Google Generative AI",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "google-unsupported-decision",
-        "missing_primitive": "Google Generative AI request/stream codec and Gemini discovery",
-        "release_blocker": "#244"
+        "missing_primitive": "Pi-specific Google Generative AI request/stream/auth evidence and deterministic request fixture",
+        "release_blocker": "#244",
+        "legacy_declaration": "gemini"
       }
     },
     {
       "id": "google-vertex",
       "label": "Google Vertex AI",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "google-vertex-unsupported-decision",
-        "missing_primitive": "Vertex inference codec plus Application Default Credentials and project/location resolution",
-        "release_blocker": "#248"
+        "missing_primitive": "Pi-specific Vertex ADC/project/location route evidence and deterministic request fixture",
+        "release_blocker": "#248",
+        "legacy_declaration": "vertex"
       }
     },
     {
@@ -299,12 +305,13 @@
     {
       "id": "mistral",
       "label": "Mistral",
-      "evidence": "Pinned issue inventory entry; exact Pi package evidence is required before a native declaration.",
+      "evidence": "Pinned issue inventory entry; the separately supported Ygg declaration is not exact Pi package evidence.",
       "decision": {
         "kind": "unsupported",
         "fixture_id": "mistral-unsupported-decision",
-        "missing_primitive": "Mistral Conversations request/stream codec",
-        "release_blocker": "#245"
+        "missing_primitive": "Mistral Conversations request/stream codec and deterministic Pi fixture",
+        "release_blocker": "#245",
+        "legacy_declaration": "mistral"
       }
     },
     {

@@ -766,8 +766,7 @@ fn signature_is_bounded(signature: &str) -> bool {
 }
 
 fn cumulative_or_delta(previous: &str, next: &str) -> Option<String> {
-    if next.starts_with(previous) {
-        let delta = &next[previous.len()..];
+    if let Some(delta) = next.strip_prefix(previous) {
         (!delta.is_empty()).then(|| delta.to_owned())
     } else if previous.starts_with(next) {
         // Repeated/stale cumulative snapshot.

@@ -260,6 +260,7 @@ pub enum ModelRouteRule {
     /// Do not register an exact unsupported model identifier.
     ExcludeExact(&'static str),
     /// Do not register model identifiers with this prefix.
+    #[allow(dead_code)] // Retained for accepted `exclude_prefix` manifest rules.
     ExcludePrefix(&'static str),
     /// Select a route for model identifiers with this prefix.
     SelectPrefix {
@@ -1230,6 +1231,7 @@ mod tests {
             fixture_id: String,
             missing_primitive: String,
             release_blocker: String,
+            legacy_declaration: Option<String>,
         },
     }
 
@@ -1559,6 +1561,7 @@ mod tests {
                     fixture_id,
                     missing_primitive,
                     release_blocker,
+                    legacy_declaration,
                 } => {
                     assert!(
                         fixture_ids.insert(fixture_id),
@@ -1568,11 +1571,22 @@ mod tests {
                         !missing_primitive.is_empty() && !release_blocker.is_empty(),
                         "{fixture_id}: unsupported providers require a primitive and release blocker"
                     );
+                    if let Some(legacy_declaration) = legacy_declaration {
+                        assert!(
+                            ALL_PROVIDER_DECLARATIONS
+                                .iter()
+                                .any(|declaration| declaration.id == legacy_declaration),
+                            "{fixture_id}: unsupported Pi provider {} references an unknown legacy declaration {legacy_declaration}",
+                            provider.id
+                        );
+                    }
+                    let has_direct_declaration = ALL_PROVIDER_DECLARATIONS
+                        .iter()
+                        .any(|declaration| declaration.id == provider.id);
                     assert!(
-                        ALL_PROVIDER_DECLARATIONS
-                            .iter()
-                            .all(|declaration| declaration.id != provider.id),
-                        "{fixture_id}: unsupported Pi provider {} acquired a declaration; update its decision",
+                        !has_direct_declaration
+                            || legacy_declaration.as_deref() == Some(provider.id.as_str()),
+                        "{fixture_id}: unsupported Pi provider {} acquired a declaration; name it as its legacy declaration or update its decision",
                         provider.id
                     );
                 }

@@ -665,7 +665,7 @@ ignored key = ignored
         assert!(matches!(
             gateway,
             Auth::HeaderBearerEnv { ref name, .. }
-                if name == &http::HeaderName::from_static("cf-aig-authorization")
+                if name == http::HeaderName::from_static("cf-aig-authorization")
         ));
     }
 

@@ -466,9 +466,7 @@ async fn test_client_stream_anthropic() {
 #[tokio::test]
 async fn test_client_stream_google_generate_content() {
     let mock_server = MockServer::start().await;
-    let body = concat!(
-        "data: {\"responseId\":\"gemini-response-1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n"
-    );
+    let body = "data: {\"responseId\":\"gemini-response-1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n";
     Mock::given(method("POST"))
         .and(path(
             "/v1beta/models/gemini-2.5-flash:streamGenerateContent",

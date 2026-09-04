@@ -56,8 +56,7 @@ impl BedrockEventStreamDecoder {
             }
             let total_length = read_u32(&self.buffer[..4])? as usize;
             let headers_length = read_u32(&self.buffer[4..8])? as usize;
-            if total_length < 16
-                || total_length > MAX_EVENT_STREAM_FRAME_BYTES
+            if !(16..=MAX_EVENT_STREAM_FRAME_BYTES).contains(&total_length)
                 || headers_length > total_length.saturating_sub(16)
             {
                 return Err(invalid_frame());

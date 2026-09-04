@@ -3160,6 +3160,7 @@ mod tests {
                             id: ToolCallId(canonical_tool_id.into()),
                             name: "read".into(),
                             arguments_json: r#"{"path":"README.md"}"#.into(),
+                            argument_error: None,
                         }),
                     ],
                     model: model.spec.id.clone(),

@@ -460,7 +460,7 @@ fn websocket_open_failure_is_replay_safe(error: &AiError) -> bool {
     )
 }
 
-fn bedrock_response_stream(
+struct BedrockResponseStreamRequest {
     response: reqwest::Response,
     model: Model,
     tool_definitions: Vec<ToolDef>,
@@ -470,7 +470,20 @@ fn bedrock_response_stream(
     stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
-) -> ResponseStream {
+}
+
+fn bedrock_response_stream(request: BedrockResponseStreamRequest) -> ResponseStream {
+    let BedrockResponseStreamRequest {
+        response,
+        model,
+        tool_definitions,
+        pre_send_diagnostics,
+        buffer_ambiguous_compatibility_content,
+        diagnostic_redactor,
+        stream_initial_timeout,
+        stream_idle_timeout,
+        stream_deadline,
+    } = request;
     let raw_event_stream = try_stream! {
         let mut decoder = crate::protocol::bedrock::BedrockEventStreamDecoder::new();
         let mut state = crate::protocol::bedrock::BedrockStreamState::default();
@@ -806,9 +819,9 @@ async fn stream_http(
         .flatten();
     let model_clone = model.clone();
     if parts.streaming && model.spec.protocol == Protocol::BedrockConverse {
-        return Ok(bedrock_response_stream(
-            res,
-            model_clone,
+        return Ok(bedrock_response_stream(BedrockResponseStreamRequest {
+            response: res,
+            model: model_clone,
             tool_definitions,
             pre_send_diagnostics,
             buffer_ambiguous_compatibility_content,
@@ -816,7 +829,7 @@ async fn stream_http(
             stream_initial_timeout,
             stream_idle_timeout,
             stream_deadline,
-        ));
+        }));
     }
     if parts.streaming {
         let byte_stream = res.bytes_stream();
