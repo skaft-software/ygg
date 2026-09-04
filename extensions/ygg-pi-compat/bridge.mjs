@@ -1318,6 +1318,8 @@ async function loadBridge(params) {
       }
     }
     if (extension.shortcuts?.size) bridge.unsupported.push(`${label}: shortcuts`);
+    // Pi exposes flags only after loading extension code. Do not execute an
+    // untrusted source merely to synthesize Ygg's pre-start API 0.3 manifest flags.
     if (extension.flags?.size) bridge.unsupported.push(`${label}: flags`);
     if (extension.messageRenderers?.size) bridge.unsupported.push(`${label}: message renderers`);
     if (extension.entryRenderers?.size) bridge.unsupported.push(`${label}: entry renderers`);

@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
 use crossterm::event::Event;
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -28,10 +27,11 @@ use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
     DiscoveredExtension, ExtensionAutocompleteRequest, ExtensionEditorRequest,
-    ExtensionEditorResponse, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
-    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
-    ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
-    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
+    ExtensionEditorResponse, ExtensionEvent, ExtensionFlag, ExtensionHealthSnapshot,
+    ExtensionHealthState, ExtensionHook, ExtensionHookDisposition, ExtensionHostState,
+    ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
+    ExtensionLifecycleOutcome, ExtensionManifest, ExtensionPolicy,
+    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
     ExtensionRuntimeConfig, ExtensionSource, ExtensionTerminalInput, ExtensionTerminalResize,
     ExtensionTrust, ExtensionUiContribution, ExtensionUiSurface, ExtensionWidgetPlacement,
     ShortcutDefinition, ToolRenderRequest, ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA,
@@ -304,6 +304,45 @@ fn extension_compatibility(
     } else {
         (None, "unavailable".to_owned())
     }
+}
+
+/// Read only selected, trusted manifest metadata for CLI construction.
+///
+/// This deliberately shares the runtime resolver and policy calculation but
+/// never starts or imports an extension process.
+pub(crate) fn selected_extension_flag_declarations(
+    config: &Config,
+) -> Vec<(String, ExtensionFlag)> {
+    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
+    let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
+    let mut diagnostics = Vec::new();
+    let (policy, _) = extension_policy(config, &mut diagnostics);
+    let mut by_name = BTreeMap::<String, DiscoveredExtension>::new();
+    for resource in snapshot.resources() {
+        let Some(descriptor) =
+            load_extension_descriptor(&resolver, resource, &policy, &mut diagnostics)
+        else {
+            continue;
+        };
+        by_name
+            .entry(descriptor.manifest.name.clone())
+            .or_insert(descriptor);
+    }
+    by_name
+        .into_values()
+        .filter(|descriptor| {
+            descriptor.activation.enabled && descriptor.activation.trust == ExtensionTrust::Trusted
+        })
+        .flat_map(|descriptor| {
+            let name = descriptor.manifest.name;
+            descriptor
+                .manifest
+                .contributes
+                .flags
+                .into_iter()
+                .map(move |flag| (name.clone(), flag))
+        })
+        .collect()
 }
 
 fn load_extension_descriptor(
@@ -1425,6 +1464,7 @@ impl ExecutableExtensions {
                 let state = host_state.clone();
                 let subagents_tool_available =
                     model.spec.capabilities.tools && config.tool_available("subagent_spawn");
+                let extension_flag_values = config.extension_flag_values.clone();
                 let owner = session.resource_owner_key();
                 let startable_names = startable
                     .iter()
@@ -1439,6 +1479,10 @@ impl ExecutableExtensions {
                         .activate_eager(startable_names, |entry| {
                             let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
                             runtime.host_state = state.clone();
+                            runtime.flag_values = extension_flag_values
+                                .get(&entry.descriptor.manifest.name)
+                                .cloned()
+                                .unwrap_or_default();
                             runtime.agent_sessions = entry.descriptor.manifest.name
                                 == SUBAGENTS_EXTENSION_NAME
                                 && subagents_tool_available;
@@ -1507,7 +1551,7 @@ impl ExecutableExtensions {
             }
         }
 
-// Register tool catalogs before observers/hooks so all live processes
+        // Register tool catalogs before observers/hooks so all live processes
         // have a host-owned dynamic group. A compatible shared process was
         // detached from the previous App binding before this point.
         for process in &processes {
@@ -4812,12 +4856,51 @@ command = "does-not-exist"
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![name.to_owned()],
             experimental_streamable_http_mcp: false,
+            extension_flag_values: BTreeMap::new(),
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: false,
             offline: true,
             workspace_trusted: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_cli_flags_require_enablement_and_exact_trust_without_starting_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        for (name, flag) in [
+            ("flag-trusted", "trusted-option"),
+            ("flag-untrusted", "workspace"),
+        ] {
+            let directory = extension_root.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join(EXTENSION_MANIFEST_FILENAME),
+                format!(
+                    r#"name = {name:?}
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "must-not-run"
+[contributes]
+flags = [{{ name = {flag:?}, type = "boolean", default = false }}]
+"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut config = executable_extension_config(temp.path(), &extension_root, "flag-trusted");
+        config.enabled_extensions.push("flag-untrusted".into());
+        let selected = selected_extension_flag_declarations(&config);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(extension, flag)| (extension.as_str(), flag.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("flag-trusted", "trusted-option")]
+        );
     }
 
     #[cfg(unix)]

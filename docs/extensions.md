@@ -68,7 +68,8 @@ Three exact manifest-selected protocol versions are implemented:
   capabilities, methods, bounds, errors, and availability are defined only by
   the generated [API `0.3` reference](extensions/API-0.3-REFERENCE.md); it is
   not an implicit upgrade of either legacy wire. It also supports the optional,
-  declared `session_start`/`session_end` cleanup pair described below.
+  declared `session_start`/`session_end` cleanup pair described below and alone
+  can receive manifest-declared CLI values during initialization.
 
 API `0.2` remains the stateful transport foundation for existing trusted daily
 use within those boundaries. API `0.3` adds no operating-system sandbox or
@@ -269,6 +270,56 @@ to the trusted extension process; enable it only under the same full-access and
 OS-isolation boundary as the extension itself. Unknown names and API `0.1`
 declarations are rejected.
 
+### API `0.3` CLI flags
+
+An API `0.3` manifest may declare bounded, typed long options under
+`[contributes].flags`. Every declaration has a globally visible `name`, an
+exact `type`, and a required typed `default`:
+
+```toml
+name = "workspace-index"
+version = "0.3.0"
+api_version = "0.3"
+
+[entrypoint]
+command = "workspace-index"
+
+[contributes]
+tools = ["index_status"]
+flags = [
+  { name = "index-enabled", type = "boolean", default = true,
+    description = "Enable workspace indexing" },
+  { name = "index-root", type = "string", default = "." },
+  { name = "index-limit", type = "integer", default = 500 },
+]
+```
+
+Supported types are exactly `boolean`, `string`, and `integer`. Boolean flags
+accept both `--index-enabled` and `--no-index-enabled`; string and integer flags
+accept one value (`--index-root src`, `--index-limit 1000`). Integers are signed
+portable JSON integers, and defaults and supplied strings are bounded. A name is
+a lowercase manifest identifier (letter first; then lowercase letters, digits,
+or hyphens) of at most 64 bytes. Descriptions are optional short plain text.
+Each extension may declare at most 64 flags. Unknown fields, duplicate names,
+wrong default types, invalid identifiers, oversized values, and unsupported
+type spellings are rejected at manifest validation.
+
+Ygg reads only validated manifest metadata to construct these options; it never
+starts or imports an extension to discover flags. A flag is registered only when
+its selected extension is both enabled and trusted. Selected flags must not
+collide with a built-in option, another selected extension flag, or a generated
+boolean inverse; a collision rejects the invocation before extension startup.
+They appear in `ygg --help` for ordinary no-subcommand startup. Authentication,
+package/migration/Pi, and other early-exit command paths retain their existing
+static parsing.
+
+The host resolves every declared value (including omitted defaults) before
+startup and sends the sorted `{name, value}` list as API `0.3`
+`initialize.params.flag_values`. API `0.1` and `0.2` manifests cannot declare
+flags and retain their exact legacy initialization wires. A Pi compatibility
+link likewise cannot project Pi's runtime `registerFlag` calls into this
+pre-start manifest surface; see its explicit compatibility diagnostic.
+
 ## Transport contract
 
 Stdout is protocol-only. Human diagnostics belong on stderr, which Ygg drains
@@ -288,7 +339,9 @@ Every request and response uses the standard JSON-RPC envelope:
 The initial host request is always `initialize`. Its parameters include API and
 Ygg versions, extension identity and source, the workspace, capability and
 contribution declarations, and inspectable session/model/reasoning/active-skill
-state. The response must use the same API version and provide complete schemas
+state. API `0.3` additionally receives the host-resolved manifest CLI values as
+`flag_values`; legacy API `0.1` and `0.2` initialization fields are unchanged.
+The response must use the same API version and provide complete schemas
 for the manifest-declared tools and commands. Negotiated `dynamic_tools` makes
 the initialize tool list authoritative epoch zero; negotiated
 `runtime_commands` likewise lets a compatibility host discover that generation's

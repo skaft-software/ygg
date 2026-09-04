@@ -176,6 +176,10 @@ pub const MAX_EXTENSION_SHORTCUTS: usize = 64;
 pub const MAX_EXTENSION_SHORTCUT_KEY_BYTES: usize = 128;
 /// Maximum UTF-8 bytes in one shortcut description.
 pub const MAX_EXTENSION_SHORTCUT_DESCRIPTION_BYTES: usize = 4 * 1024;
+/// Maximum CLI flags one extension may declare in its manifest.
+pub const MAX_EXTENSION_FLAGS: usize = api_v03::MAX_EXTENSION_FLAGS;
+const MAX_EXTENSION_FLAG_STRING_BYTES: usize = 4 * 1024;
+const MAX_EXTENSION_FLAG_DESCRIPTION_BYTES: usize = 1024;
 const DYNAMIC_CATALOG_QUEUE_CAPACITY: usize = 32;
 const SUPERVISOR_BASE_BACKOFF: Duration = Duration::from_millis(250);
 const SUPERVISOR_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -1392,7 +1396,7 @@ impl ExtensionManifest {
                 "semantic presentation requires extension API 0.2".into(),
             ));
         }
-if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.is_empty() {
+        if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.is_empty() {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "shortcuts require extension API 0.2".into(),
             ));
@@ -1400,6 +1404,11 @@ if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.
         if self.api_version == EXTENSION_API_VERSION_0_3 && !self.contributes.shortcuts.is_empty() {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "shortcuts are not yet supported by extension API 0.3".into(),
+            ));
+        }
+        if !self.contributes.flags.is_empty() && self.api_version != EXTENSION_API_VERSION_0_3 {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "CLI flags require extension API 0.3".into(),
             ));
         }
         if self.api_version == EXTENSION_API_VERSION_0_1
@@ -1454,7 +1463,7 @@ if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.
                 || self.contributes.presentation
             {
                 return Err(ExtensionRuntimeError::InvalidManifest(
-                    "API 0.3 currently implements only its negotiated initial tool catalog, secret-free provider catalogs, and declared session_start/session_end hooks; commands, other hooks, context, UI, renderers, notifications, confirmations, and presentation are deferred"
+                    "API 0.3 currently implements only its negotiated initial tool catalog, secret-free provider catalogs, manifest-declared CLI flags, and declared session_start/session_end hooks; commands, other hooks, context, UI, renderers, notifications, confirmations, and presentation are deferred"
                         .into(),
                 ));
             }
@@ -1485,6 +1494,7 @@ if self.api_version == EXTENSION_API_VERSION_0_1 && !self.contributes.shortcuts.
         validate_shortcut_definitions(&self.contributes.shortcuts)
             .map_err(ExtensionRuntimeError::InvalidManifest)?;
         validate_identifiers("tool renderer", &self.contributes.tool_renderers, true)?;
+        validate_extension_flags(&self.contributes.flags)?;
         validate_identifiers("secret", &self.capabilities.secrets, true)?;
         validate_identifiers(
             "brokered environment variable",
@@ -1562,10 +1572,46 @@ pub enum ExtensionFilesystemAccess {
     Unrestricted,
 }
 
+/// One typed command-line flag declared by an API `0.3` extension.
+///
+/// The long option spelling is `--{name}`. Boolean flags additionally receive
+/// the explicit inverse spelling `--no-{name}` from the host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionFlag {
+    /// Stable global CLI long-option name.
+    pub name: String,
+    /// Runtime value type and parser selected by the host.
+    #[serde(rename = "type")]
+    pub kind: ExtensionFlagType,
+    /// Required typed fallback used when the invocation omits this flag.
+    pub default: serde_json::Value,
+    /// Optional short help text shown in `ygg --help`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Types supported by extension-declared command-line flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExtensionFlagType {
+    /// A true/false switch exposed as both `--name` and `--no-name`.
+    #[serde(rename = "boolean")]
+    Boolean,
+    /// One bounded UTF-8 command-line value.
+    #[serde(rename = "string")]
+    String,
+    /// One signed portable JSON integer command-line value.
+    #[serde(rename = "integer")]
+    Integer,
+}
+
 /// Contribution names declared in `extension.toml`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestContributions {
+    /// Typed CLI flags registered before extension startup (API `0.3` only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<ExtensionFlag>,
     /// Model-callable tool names.
     #[serde(default)]
     pub tools: Vec<String>,
@@ -3471,6 +3517,8 @@ pub struct ExtensionRuntimeConfig {
     pub workspace: PathBuf,
     /// Initial session/model/skill state.
     pub host_state: ExtensionHostState,
+    /// Manifest-declared CLI values resolved by the product before startup.
+    pub flag_values: BTreeMap<String, serde_json::Value>,
     /// Offer the optional host-owned child model-session service. The product
     /// must bind an enabled delegation runtime before the service is usable.
     pub agent_sessions: bool,
@@ -3519,6 +3567,10 @@ impl std::fmt::Debug for ExtensionRuntimeConfig {
             .debug_struct("ExtensionRuntimeConfig")
             .field("workspace", &self.workspace)
             .field("host_state", &self.host_state)
+            .field(
+                "flag_value_names",
+                &self.flag_values.keys().collect::<Vec<_>>(),
+            )
             .field("agent_sessions", &self.agent_sessions)
             .field("approvals", &self.approvals)
             .field("secret_broker_configured", &self.secret_broker.is_some())
@@ -3550,6 +3602,7 @@ impl ExtensionRuntimeConfig {
         Self {
             workspace: workspace.into(),
             host_state: ExtensionHostState::default(),
+            flag_values: BTreeMap::new(),
             agent_sessions: false,
             approvals: false,
             secret_broker: None,
@@ -4197,9 +4250,11 @@ impl ExtensionProcess {
     /// executable extension.
     pub async fn start(
         descriptor: DiscoveredExtension,
-        config: ExtensionRuntimeConfig,
+        mut config: ExtensionRuntimeConfig,
     ) -> Result<Self, ExtensionRuntimeError> {
         descriptor.ensure_startable()?;
+        config.flag_values =
+            resolve_extension_flag_values(&descriptor.manifest, &config.flag_values)?;
         if config.max_message_bytes == 0
             || config.max_pending_requests == 0
             || config.writer_queue_capacity == 0
@@ -8749,11 +8804,15 @@ fn provider_unavailable_error() -> AiError {
     })
 }
 
-fn provider_protocol_name(protocol: Protocol) -> &'static str {
+fn provider_protocol_name(protocol: Protocol) -> Option<&'static str> {
     match protocol {
-        Protocol::OpenAiChat => "openai_chat",
-        Protocol::OpenAiResponses => "openai_responses",
-        Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::OpenAiChat => Some("openai_chat"),
+        Protocol::OpenAiResponses => Some("openai_responses"),
+        Protocol::AnthropicMessages => Some("anthropic_messages"),
+        // The API 0.3 extension-provider schema intentionally declares only
+        // these three generic wire protocols. Do not coerce native host codecs
+        // into a misleading generic route.
+        Protocol::BedrockConverse | Protocol::GoogleGenerativeAi => None,
     }
 }
 
@@ -8855,9 +8914,10 @@ impl HostStreamTransport for ExtensionProviderStreamTransport {
         let Some(route) = registry.resolve(&self.provider_id, &self.model_id) else {
             return Err(provider_unavailable_error());
         };
-        if route.owner != connection.provider_owner
-            || route.model.protocol != provider_protocol_name(model.protocol)
-        {
+        let Some(provider_protocol) = provider_protocol_name(model.protocol) else {
+            return Err(provider_unavailable_error());
+        };
+        if route.owner != connection.provider_owner || route.model.protocol != provider_protocol {
             return Err(provider_unavailable_error());
         }
 
@@ -9327,6 +9387,14 @@ async fn spawn_connection(
                 .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
             contributes: serde_json::to_value(&descriptor.manifest.contributes)
                 .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            flag_values: config
+                .flag_values
+                .iter()
+                .map(|(name, value)| api_v03::InitializeFlagValue {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
             host: serde_json::to_value(&host_state)
                 .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
             contract: contract.clone(),
@@ -13458,6 +13526,107 @@ where
     Ok(())
 }
 
+/// Validates one value against a manifest-declared CLI flag type and bound.
+pub fn validate_extension_flag_value(
+    flag: &ExtensionFlag,
+    value: &serde_json::Value,
+) -> Result<(), ExtensionRuntimeError> {
+    match flag.kind {
+        ExtensionFlagType::Boolean if value.is_boolean() => Ok(()),
+        ExtensionFlagType::String => match value.as_str() {
+            Some(value) if value.len() <= MAX_EXTENSION_FLAG_STRING_BYTES => Ok(()),
+            Some(_) => Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "extension flag `{}` string value exceeds {MAX_EXTENSION_FLAG_STRING_BYTES} bytes",
+                flag.name
+            ))),
+            None => Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "extension flag `{}` value must be a string",
+                flag.name
+            ))),
+        },
+        ExtensionFlagType::Integer => match value.as_i64() {
+            Some(value) if value.unsigned_abs() <= api_v03::MAX_PORTABLE_JSON_INTEGER as u64 => {
+                Ok(())
+            }
+            Some(_) => Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "extension flag `{}` integer value exceeds the portable JSON range",
+                flag.name
+            ))),
+            None => Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "extension flag `{}` value must be an integer",
+                flag.name
+            ))),
+        },
+        ExtensionFlagType::Boolean => Err(ExtensionRuntimeError::InvalidManifest(format!(
+            "extension flag `{}` value must be a boolean",
+            flag.name
+        ))),
+    }
+}
+
+fn validate_extension_flags(flags: &[ExtensionFlag]) -> Result<(), ExtensionRuntimeError> {
+    if flags.len() > MAX_EXTENSION_FLAGS {
+        return Err(ExtensionRuntimeError::InvalidManifest(format!(
+            "extension declares {} CLI flags; limit is {MAX_EXTENSION_FLAGS}",
+            flags.len()
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for flag in flags {
+        validate_identifier("CLI flag", &flag.name, false)?;
+        if !names.insert(&flag.name) {
+            return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                "duplicate CLI flag `{}`",
+                flag.name
+            )));
+        }
+        if let Some(description) = &flag.description {
+            if description.is_empty()
+                || description.len() > MAX_EXTENSION_FLAG_DESCRIPTION_BYTES
+                || description.chars().any(char::is_control)
+            {
+                return Err(ExtensionRuntimeError::InvalidManifest(format!(
+                    "invalid CLI flag `{}` description",
+                    flag.name
+                )));
+            }
+        }
+        validate_extension_flag_value(flag, &flag.default)?;
+    }
+    Ok(())
+}
+
+fn resolve_extension_flag_values(
+    manifest: &ExtensionManifest,
+    supplied: &BTreeMap<String, serde_json::Value>,
+) -> Result<BTreeMap<String, serde_json::Value>, ExtensionRuntimeError> {
+    let declared = manifest
+        .contributes
+        .flags
+        .iter()
+        .map(|flag| (flag.name.as_str(), flag))
+        .collect::<BTreeMap<_, _>>();
+    for name in supplied.keys() {
+        if !declared.contains_key(name.as_str()) {
+            return Err(ExtensionRuntimeError::Protocol(format!(
+                "extension `{}` was given undeclared CLI flag `{name}`",
+                manifest.name
+            )));
+        }
+    }
+    declared
+        .into_iter()
+        .map(|(name, flag)| {
+            let value = supplied
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| flag.default.clone());
+            validate_extension_flag_value(flag, &value)?;
+            Ok((name.to_owned(), value))
+        })
+        .collect()
+}
+
 fn valid_environment_name(name: &str) -> bool {
     let mut characters = name.chars();
     characters
@@ -14705,6 +14874,128 @@ hooks = ["session_start", "session_end"]
     }
 
     #[test]
+    fn manifest_cli_flags_are_typed_bounded_and_api_v03_only() {
+        let source = r#"
+name = "flag-fixture"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "flag-fixture"
+[contributes]
+flags = [
+  { name = "enabled", type = "boolean", default = true, description = "Enable the fixture" },
+  { name = "label", type = "string", default = "default" },
+  { name = "count", type = "integer", default = 2 },
+]
+"#;
+        let manifest = ExtensionManifest::parse(source).expect("typed API 0.3 flags");
+        assert_eq!(manifest.contributes.flags.len(), 3);
+        assert_eq!(
+            manifest.contributes.flags[0].kind,
+            ExtensionFlagType::Boolean
+        );
+        assert_eq!(manifest.contributes.flags[2].default, serde_json::json!(2));
+
+        let legacy = source.replace("api_version = \"0.3\"", "api_version = \"0.2\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&legacy),
+            Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains("CLI flags require extension API 0.3")
+        ));
+
+        let wrong_type = source.replace("default = 2", "default = \"two\"");
+        assert!(matches!(
+            ExtensionManifest::parse(&wrong_type),
+            Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains("value must be an integer")
+        ));
+
+        let duplicate = source.replace(
+            "{ name = \"count\", type = \"integer\", default = 2 }",
+            "{ name = \"enabled\", type = \"integer\", default = 2 }",
+        );
+        assert!(matches!(
+            ExtensionManifest::parse(&duplicate),
+            Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains("duplicate CLI flag")
+        ));
+
+        let mut oversized = manifest.clone();
+        oversized.contributes.flags = vec![
+            ExtensionFlag {
+                name: "flag".into(),
+                kind: ExtensionFlagType::Boolean,
+                default: serde_json::json!(false),
+                description: None,
+            };
+            MAX_EXTENSION_FLAGS + 1
+        ];
+        assert!(matches!(
+            oversized.validate(),
+            Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains("limit is")
+        ));
+    }
+
+    #[test]
+    fn runtime_cli_flag_values_fill_defaults_and_reject_undeclared_values() {
+        let manifest = ExtensionManifest::parse(
+            r#"
+name = "flag-runtime"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "flag-runtime"
+[contributes]
+flags = [
+  { name = "enabled", type = "boolean", default = false },
+  { name = "label", type = "string", default = "default" },
+  { name = "count", type = "integer", default = 2 },
+]
+"#,
+        )
+        .expect("manifest");
+        let supplied = BTreeMap::from([
+            ("enabled".to_owned(), serde_json::json!(true)),
+            ("count".to_owned(), serde_json::json!(7)),
+        ]);
+        let values = resolve_extension_flag_values(&manifest, &supplied).expect("resolved values");
+        assert_eq!(
+            values,
+            BTreeMap::from([
+                ("count".to_owned(), serde_json::json!(7)),
+                ("enabled".to_owned(), serde_json::json!(true)),
+                ("label".to_owned(), serde_json::json!("default")),
+            ])
+        );
+
+        let undeclared = BTreeMap::from([("surprise".to_owned(), serde_json::json!(true))]);
+        assert!(matches!(
+            resolve_extension_flag_values(&manifest, &undeclared),
+            Err(ExtensionRuntimeError::Protocol(message)) if message.contains("undeclared CLI flag")
+        ));
+        let invalid = BTreeMap::from([("count".to_owned(), serde_json::json!("seven"))]);
+        assert!(matches!(
+            resolve_extension_flag_values(&manifest, &invalid),
+            Err(ExtensionRuntimeError::InvalidManifest(message)) if message.contains("value must be an integer")
+        ));
+    }
+
+    #[test]
+    fn extension_provider_protocols_reject_native_unmodeled_routes() {
+        assert_eq!(
+            provider_protocol_name(Protocol::OpenAiChat),
+            Some("openai_chat")
+        );
+        assert_eq!(
+            provider_protocol_name(Protocol::OpenAiResponses),
+            Some("openai_responses")
+        );
+        assert_eq!(
+            provider_protocol_name(Protocol::AnthropicMessages),
+            Some("anthropic_messages")
+        );
+        assert_eq!(provider_protocol_name(Protocol::BedrockConverse), None);
+        assert_eq!(provider_protocol_name(Protocol::GoogleGenerativeAi), None);
+    }
+
+    #[test]
     fn manifest_accepts_matching_optional_ygg_requirement_and_rejects_mismatch() {
         let matching = VALID_MANIFEST.replace(
             "api_version = \"0.1\"",
@@ -15032,6 +15323,11 @@ initialize = receive()
 assert initialize["method"] == "initialize", initialize
 contract = initialize["params"]["contract"]
 assert contract["schema"] == "ygg.extension.api/0.3", contract
+assert initialize["params"]["flag_values"] == [
+    {"name": "api-v03-count", "value": 7},
+    {"name": "api-v03-enabled", "value": True},
+    {"name": "api-v03-label", "value": "default"},
+], initialize
 selection = {
     "schema": contract["schema"],
     "encoding": contract["encoding"],
@@ -15093,15 +15389,22 @@ api_version = "0.3"
 command = "api-v03.py"
 [contributes]
 tools = ["echo"]
+flags = [
+  { name = "api-v03-enabled", type = "boolean", default = false },
+  { name = "api-v03-label", type = "string", default = "default" },
+  { name = "api-v03-count", type = "integer", default = 2 },
+]
 "#,
         )
         .expect("API 0.3 manifest");
-        let process = ExtensionProcess::start(
-            trusted_descriptor(temp.path(), manifest),
-            ExtensionRuntimeConfig::new(temp.path()),
-        )
-        .await
-        .expect("start API 0.3 process");
+        let mut runtime = ExtensionRuntimeConfig::new(temp.path());
+        runtime.flag_values = BTreeMap::from([
+            ("api-v03-enabled".to_owned(), serde_json::json!(true)),
+            ("api-v03-count".to_owned(), serde_json::json!(7)),
+        ]);
+        let process = ExtensionProcess::start(trusted_descriptor(temp.path(), manifest), runtime)
+            .await
+            .expect("start API 0.3 process");
         assert_eq!(process.api_version(), EXTENSION_API_VERSION_0_3);
         let protocol = process.negotiated_protocol();
         assert_eq!(protocol.version, EXTENSION_API_VERSION_0_3);

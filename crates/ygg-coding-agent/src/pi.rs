@@ -952,6 +952,7 @@ fn manifest_for_plan(
                 ExtensionHook::AfterToolCall,
             ],
             ui: vec![ExtensionUiSurface::Status],
+            flags: Vec::new(),
             context: true,
             tool_renderers: Vec::new(),
             notifications: true,

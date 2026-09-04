@@ -69,8 +69,8 @@ All non-passing rows below use decision `pi-0.84.4-dogfood-explicit-safe-diverge
 | `registerTool` | safe divergence | `extension_api:registerTool` | Initial tool registration and execution use the public Pi runner. |
 | `registerCommand` | safe divergence | `extension_api:registerCommand` | Initial commands become native Ygg commands when runtime_commands is negotiated. |
 | `registerShortcut` | safe divergence | `extension_api:registerShortcut` | Shortcut registration is diagnosed at startup; host key dispatch remains deferred. |
-| `registerFlag` | safe divergence | `extension_api:registerFlag` | Pi defaults remain local; host flag projection is deferred and registration is diagnosed at startup. |
-| `getFlag` | safe divergence | `extension_api:getFlag` | Returns Pi runtime/default values; host invocation flags are not projected. |
+| `registerFlag` | safe divergence | `extension_api:registerFlag` | Pi exposes flags only after loading extension code, while Ygg discovers trusted API `0.3` manifest flags before startup; bridge registration remains diagnosed. |
+| `getFlag` | safe divergence | `extension_api:getFlag` | Returns Pi runtime/default values; the API `0.2` bridge cannot receive Ygg's API `0.3` pre-start invocation values. |
 | `registerMessageRenderer` | safe divergence | `extension_api:registerMessageRenderer` | Remote component rendering is rejected explicitly. |
 | `registerMarkdownTransformer` | safe divergence | `extension_api:registerMarkdownTransformer` | Transcript mutation is rejected explicitly. |
 | `registerEntryRenderer` | safe divergence | `extension_api:registerEntryRenderer` | Remote component rendering is rejected explicitly. |

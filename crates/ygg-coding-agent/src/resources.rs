@@ -1498,6 +1498,7 @@ mod tests {
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![],
             experimental_streamable_http_mcp: false,
+            extension_flag_values: Default::default(),
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: true,

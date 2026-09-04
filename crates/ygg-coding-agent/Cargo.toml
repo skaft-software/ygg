@@ -43,7 +43,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-ut
 crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
 futures-util = "0.3"
 tokio-stream = "0.1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "string"] }
 serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"

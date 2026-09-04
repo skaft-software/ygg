@@ -2476,6 +2476,9 @@ fn assistant_persistence_context(
             AssistantPart::Reasoning(_) => {
                 reasoning_part_count = reasoning_part_count.saturating_add(1)
             }
+            // Opaque provider continuation metadata has no user-visible
+            // content and must not affect persistence accounting.
+            AssistantPart::ProviderMetadata(_) => {}
             AssistantPart::Media(_) => media_part_count = media_part_count.saturating_add(1),
         }
     }
@@ -7239,6 +7242,29 @@ mod tests {
             .append(user_message(UserInput::from("new durable input")))
             .unwrap();
         assert!(!prepared.is_current(&session, "system", 7));
+    }
+
+    #[test]
+    fn assistant_persistence_context_ignores_provider_metadata() {
+        use ygg_ai::{ModelId, ProviderPartMetadata};
+
+        let assistant = AssistantMessage {
+            content: vec![
+                AssistantPart::Text("visible".into()),
+                AssistantPart::ProviderMetadata(ProviderPartMetadata::GoogleThoughtSignature {
+                    signature: "opaque-continuation".into(),
+                }),
+            ],
+            model: ModelId("gemini-test".into()),
+            protocol: Protocol::GoogleGenerativeAi,
+        };
+
+        let context =
+            assistant_persistence_context("run", "owner", &assistant, StopReason::EndTurn);
+        assert_eq!(context.text_bytes, "visible".len());
+        assert_eq!(context.tool_call_count, 0);
+        assert_eq!(context.reasoning_part_count, 0);
+        assert_eq!(context.media_part_count, 0);
     }
 
     #[test]

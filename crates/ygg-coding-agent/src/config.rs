@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -480,6 +480,8 @@ pub struct Config {
     /// One-shot process-owner gate for experimental remote Streamable HTTP MCP.
     /// This is deliberately not loaded from configuration, environment, or sessions.
     pub experimental_streamable_http_mcp: bool,
+    /// Host-parsed values for manifest-declared CLI flags, keyed by extension and flag name.
+    pub extension_flag_values: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     /// One authoritative allowlist used for schema and implementation registration.
     pub tools: ToolPolicy,
     /// Optional machine-readable agent telemetry output. Disabled by default.

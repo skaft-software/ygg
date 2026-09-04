@@ -313,6 +313,7 @@ impl AdapterClient {
             workspace: "/migration-source".to_owned(),
             capabilities: json!({"filesystem":"source_read_only","network":false,"process":false}),
             contributes: json!({}),
+            flag_values: Vec::new(),
             host: json!({"migration_ingestion":"host_owned"}),
             contract: offer.clone(),
         };

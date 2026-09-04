@@ -35,6 +35,12 @@
       "negotiated": true
     },
     {
+      "name": "max_extension_flags",
+      "value": 64,
+      "description": "Maximum manifest-declared CLI flag values delivered during initialization.",
+      "negotiated": false
+    },
+    {
       "name": "max_capabilities",
       "value": 32,
       "description": "Maximum requested or selected capability names in one contract.",
@@ -1000,6 +1006,24 @@
       ]
     },
     {
+      "name": "InitializeFlagValue",
+      "description": "One host-parsed value for a manifest-declared extension CLI flag.",
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "value",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
       "name": "InitializeRequest",
       "description": "Canonical API 0.3 initialize parameters. Host-owned metadata values remain explicitly opaque JSON boundaries.",
       "fields": [
@@ -1041,6 +1065,13 @@
           "type": "json",
           "presence": "required",
           "nullable": false
+        },
+        {
+          "name": "flag_values",
+          "type": "InitializeFlagValue[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_extension_flags"
         },
         {
           "name": "host",
@@ -1939,7 +1970,17 @@
             "max_concurrent_requests": 4,
             "max_tools": 256
           }
-        }
+        },
+        "flag_values": [
+          {
+            "name": "fixture-count",
+            "value": 3
+          },
+          {
+            "name": "fixture-enabled",
+            "value": true
+          }
+        ]
       }
     },
     {

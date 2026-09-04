@@ -164,7 +164,10 @@ local Pi event-bus behavior. On a Ygg host negotiating `runtime_commands`, Pi's
 initial command catalog is exposed under its native slash names; the generated
 `/<name> COMMAND ...` route remains only as a fallback for older hosts.
 Unsupported TUI, provider, session, compaction, agent-control, and mutation
-surfaces remain explicit migration diagnostics rather than silent no-ops.
+surfaces remain explicit migration diagnostics rather than silent no-ops. Pi
+`registerFlag` is also diagnosed: its runtime registration cannot safely become
+a Ygg API `0.3` manifest flag without running the source before trust and CLI
+construction.
 
 The scanner:
 
