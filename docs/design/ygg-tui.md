@@ -13,12 +13,15 @@ uses that hierarchy without adding a second TUI.
 ## Terminal guarantees
 
 - The interactive frontend renders on the primary screen. `auto`, `terminal`,
-  and `off` use Pi's complete logical-frame renderer: the first frame writes
-  every materialized row, pure appends flow naturally into terminal scrollback,
-  and a width/height change or mutation above the previous viewport clears the
-  screen and saved lines before replaying the complete frame. PageUp transfers
-  rendering to the bounded, application-owned semantic viewport for the rest of
-  that shell. Explicit `--mouse app` selects that viewport from startup.
+  and `off` use Pi's complete logical-frame renderer. Before the first frame
+  and after a suspended renderer is restored, Ygg forces the same authoritative
+  clear-and-replay used for a structural reset, so pre-TUI diagnostics and log
+  rows cannot become retained Ygg rows. That reset deliberately clears the
+  screen and saved lines; pure appends then flow naturally into terminal
+  scrollback, while a width/height change or mutation above the previous
+  viewport repeats the complete-frame reset. PageUp transfers rendering to the
+  bounded, application-owned semantic viewport for the rest of that shell.
+  Explicit `--mouse app` selects that viewport from startup.
 - Ygg v0.6.7 uses one compiled default theme. Theme selection and runtime theme reload are disabled; terminal/background capability detection still adapts that default safely. Its model-aware accent palette changes atmosphere without changing layout or semantic status colours.
 - Raw mode, bracketed paste, keyboard enhancements, and mouse reporting are
   enabled only when supported and restored idempotently. Matching Pi, every
