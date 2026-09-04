@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
 
 try:
-    from .helpers import BridgeProcess, NODE
+    from .helpers import BridgeProcess, FAKE_PI, FIXTURES, NODE
 except ImportError:  # unittest discovery imports this file as a top-level module.
-    from helpers import BridgeProcess, NODE
+    from helpers import BridgeProcess, FAKE_PI, FIXTURES, NODE
 
 
 def single_file_source_fingerprint(path: Path) -> str:
@@ -25,6 +26,24 @@ def single_file_source_fingerprint(path: Path) -> str:
     digest.update(len(content).to_bytes(8, "big"))
     digest.update(content)
     return digest.hexdigest()
+
+
+def strict_initialize_response(bridge: BridgeProcess, workspace: Path | None = None) -> dict:
+    return bridge.request(
+        "initialize",
+        {
+            "workspace": str(workspace or Path.cwd()),
+            "host": {},
+            "protocol": {"optional_features": []},
+            "ygg_version": bridge.ygg_version,
+            "extension": {
+                "name": bridge.command_name,
+                "version": "fixture",
+                "manifest_path": str(bridge.manifest_path),
+                "source": "explicit",
+            },
+        },
+    )
 
 
 class CompatibilityProfileTests(unittest.TestCase):
@@ -224,12 +243,13 @@ class BridgeProtocolTests(unittest.TestCase):
                 relevant,
             )
             bridge.wait_for(
-                lambda _messages: any("fixture lifecycle failure" in line for line in bridge.stderr),
+                lambda _messages: any("handler failed" in line for line in bridge.stderr),
                 description="onError stderr diagnostic",
             )
-            diagnostic = next(line for line in bridge.stderr if "fixture lifecycle failure" in line)
+            diagnostic = next(line for line in bridge.stderr if "handler failed" in line)
             self.assertIn("session_start", diagnostic)
-            self.assertIn("fixture-extension.mjs", diagnostic)
+            self.assertIn("#1", diagnostic)
+            self.assertNotIn("fixture lifecycle failure", diagnostic)
 
     def test_local_tool_and_turn_terminal_events_are_not_duplicated(self) -> None:
         with BridgeProcess() as bridge:
@@ -481,7 +501,10 @@ class BridgeProtocolTests(unittest.TestCase):
                 initialized = bridge.initialize()
                 self.assertEqual("0.2", initialized["api_version"])
 
+            marker = Path(directory).resolve() / "loaded"
             extension.write_text(
+                "import { writeFileSync } from 'node:fs';\n"
+                f"writeFileSync({json.dumps(str(marker))}, 'loaded');\n"
                 "export default () => { throw new Error('changed'); };\n",
                 encoding="utf-8",
             )
@@ -499,9 +522,146 @@ class BridgeProtocolTests(unittest.TestCase):
                 )
                 self.assertEqual(-32000, response["error"]["code"])
                 self.assertIn(
-                    "source changed after link installation",
+                    "changed after link publication",
                     response["error"]["message"],
                 )
+                self.assertFalse(marker.exists())
+
+    def test_strict_aggregate_preserves_load_order_shared_globals_and_restart_state(self) -> None:
+        sources = [FIXTURES / "aggregate" / "first.mjs", FIXTURES / "aggregate" / "second.mjs"]
+        observed: list[dict] = []
+        for _ in range(2):
+            with BridgeProcess(
+                extensions=sources,
+                strict_identity=True,
+                command_name="pi-aggregate",
+            ) as bridge:
+                initialized = bridge.initialize()
+                self.assertTrue(any(tool["name"] == "aggregate_state" for tool in initialized["tools"]))
+                result = bridge.request(
+                    "tool/call",
+                    {"name": "aggregate_state", "arguments": {}, "catalog_revision": 0},
+                )
+                observed.append(json.loads(result["result"]["content"][0]["text"]))
+                self.assertTrue(any("pinned=yes" in line for line in bridge.stderr))
+        self.assertEqual(
+            {
+                "loadOrder": ["first", "second"],
+                "eventOrder": ["first-listener:second"],
+                "globalMarker": "first",
+            },
+            observed[0],
+        )
+        self.assertEqual(observed[0], observed[1])
+
+    def test_aggregate_rejects_partial_loader_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            broken = Path(directory).resolve() / "broken.mjs"
+            broken.write_text("throw new Error('private loader detail');\n", encoding="utf-8")
+            with BridgeProcess(
+                extensions=[FIXTURES / "fixture-extension.mjs", broken],
+                strict_identity=True,
+                command_name="pi-partial",
+            ) as bridge:
+                response = strict_initialize_response(bridge, broken.parent)
+                self.assertEqual(-32000, response["error"]["code"])
+                self.assertIn("did not load every pinned source", response["error"]["message"])
+                self.assertNotIn(str(broken.parent), response["error"]["message"])
+
+    def test_strict_aggregate_cancellation_propagates_to_shared_runtime(self) -> None:
+        sources = [FIXTURES / "aggregate" / "first.mjs", FIXTURES / "aggregate" / "second.mjs"]
+        with BridgeProcess(
+            extensions=sources,
+            strict_identity=True,
+            command_name="pi-aggregate",
+        ) as bridge:
+            bridge.initialize()
+            request_id = bridge.send_request(
+                "tool/call",
+                {"name": "aggregate_wait", "arguments": {}, "catalog_revision": 0},
+            )
+            prompt = bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "input/request"),
+                    None,
+                ),
+                description="aggregate input request",
+            )
+            bridge.send(
+                {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": request_id}},
+            )
+            response = bridge.wait_response(request_id, timeout=1.0)
+            self.assertEqual(-32800, response["error"]["code"])
+            self.assertTrue(
+                any(
+                    message.get("method") == "$/cancelRequest" and message.get("params", {}).get("id") == prompt["id"]
+                    for message in bridge.messages
+                )
+            )
+
+    def test_strict_identity_rejects_stale_source_lock_runtime_and_manifest_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.mjs"
+            source.write_text("export default () => {};\n", encoding="utf-8")
+            lock = root / "package-lock.json"
+            lock.write_text('{"lockfileVersion":3}\n', encoding="utf-8")
+
+            bridge = BridgeProcess(extension=source, strict_identity=True, command_name="pi-stale")
+            source.write_text("export default () => { return 'changed'; };\n", encoding="utf-8")
+            try:
+                response = strict_initialize_response(bridge, root)
+                self.assertIn("error", response)
+                self.assertIn("changed after link publication", response["error"]["message"])
+                self.assertNotIn(str(root), response["error"]["message"])
+            finally:
+                bridge.close()
+
+            source.write_text("export default () => {};\n", encoding="utf-8")
+            bridge = BridgeProcess(extension=source, strict_identity=True, command_name="pi-stale")
+            lock.write_text('{"lockfileVersion":4}\n', encoding="utf-8")
+            try:
+                response = strict_initialize_response(bridge, root)
+                self.assertIn("dependency lock changed", response["error"]["message"])
+            finally:
+                bridge.close()
+
+            lock.write_text('{"lockfileVersion":3}\n', encoding="utf-8")
+            package = root / "pi-package"
+            shutil.copytree(FAKE_PI, package)
+            bridge = BridgeProcess(
+                extension=source,
+                pi_package=package,
+                strict_identity=True,
+                command_name="pi-stale",
+            )
+            (package / "dist" / "index.js").write_text("export {}; // changed runtime\n", encoding="utf-8")
+            try:
+                response = strict_initialize_response(bridge, root)
+                self.assertIn("Pinned Pi runtime integrity changed", response["error"]["message"])
+            finally:
+                bridge.close()
+
+            bridge = BridgeProcess(extension=source, strict_identity=True, command_name="pi-stale")
+            try:
+                response = bridge.request(
+                    "initialize",
+                    {
+                        "workspace": str(root),
+                        "host": {},
+                        "protocol": {"optional_features": []},
+                        "ygg_version": bridge.ygg_version,
+                        "extension": {
+                            "name": bridge.command_name,
+                            "version": "fixture",
+                            "manifest_path": str(root / "wrong" / "extension.toml"),
+                            "source": "explicit",
+                        },
+                    },
+                )
+                self.assertIn("link identity does not match", response["error"]["message"])
+            finally:
+                bridge.close()
 
     @unittest.skipUnless(
         os.environ.get("YGG_PI_REAL_PACKAGE"),

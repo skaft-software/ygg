@@ -156,6 +156,30 @@ Status meanings:
 | replacement-context `sendMessage` | not implemented | Session replacement/messaging are unavailable. |
 | replacement-context `sendUserMessage` | not implemented | Session replacement/messaging are unavailable. |
 
+## Aggregate publication and API 0.3 evidence seam
+
+A Pi aggregate is published only from a canonical, inert plan. The plan and its
+published aggregate lock pin source order, each bounded source fingerprint,
+nearby dependency-lock fingerprints, the exact Pi runtime path and package
+integrity, bridge/Pi/Ygg versions, and the explicit-enable/explicit-trust mode.
+Preflight repeats those checks without importing source; publish repeats
+preflight immediately before writing the generated package. The bridge validates
+the aggregate/link identity before invoking Pi's loader and rechecks runtime
+integrity after loading, so a source or runtime changed between review and start
+fails closed rather than becoming a best-effort load.
+
+Published packages include `pi-runtime-evidence.json`, canonicalized with Ygg's
+API 0.3 metadata helper. It records static aggregate selection, integrity, and
+trust-binding evidence for a future runtime manager. It is not a Pi API 0.3
+process protocol, does not provide lazy activation/workspace/reload semantics,
+and does not change any status in the matrices above; live bridge protocol
+coverage remains API 0.2.
+
+`ygg pi rollback NAME` is intentionally non-destructive: it only moves a
+validated generated package out of discovery into a rollback directory. It does
+not delete reviewed Pi sources, rewrite an arbitrary extension, or grant/revoke
+Ygg extension trust.
+
 ## Release gates
 
 Ygg may call this profile **complete Pi 0.84.4 compatibility** only when all of
@@ -163,8 +187,9 @@ the following are true:
 
 1. Every row above is `passing` or has an explicitly approved safe divergence;
    no `not implemented` row remains in the supported profile.
-2. A generated link, under the real Ygg API 0.2 host, passes cancellation,
-   bounds, restart, trust, source-change, and sanitized-environment tests.
+2. A generated aggregate link, under the real Ygg API 0.2 host, passes
+   cancellation, bounds, restart, trust, source-change, dependency-lock-change,
+   runtime-integrity-change, ordered-load, and sanitized-environment tests.
 3. Pi's official `examples/extensions/plan-mode/` passes unchanged through
    toggle, tool policy, interception, persistence/resume, dialogs, widgets,
    messaging, commands, flags, and shortcut journeys. The current load plus
@@ -173,9 +198,9 @@ the following are true:
    single-file and 9 directory examples, excluding the README) load unchanged;
    every example exercising a supported surface has a behavioral assertion
    rather than a load-only assertion.
-5. Enabled Pi sources are consolidated into one source/hash/load-order-locked
-   compatibility process so event bus, `globalThis`, and registration ordering
-   match Pi.
+5. Enabled Pi sources are consolidated from a source/lock/runtime-integrity-
+   pinned aggregate into one load-order-locked compatibility process so event
+   bus, `globalThis`, and registration ordering match Pi.
 6. `sexy-tui-rs` is updated to the matching `pi-tui@0.84.4` behavior and remote
    Pi component focus/render/input/resize transport passes bounded tests.
 7. Provider registration, interception, stream proxying, and OAuth either pass

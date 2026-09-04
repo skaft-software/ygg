@@ -1,5 +1,10 @@
 // Deliberately tiny, deterministic stand-in for Pi's public extension loader.
-// It implements only the public methods consumed by bridge.mjs.
+// It implements only the public methods consumed by bridge.mjs. The aggregate
+// hooks deliberately model ordered source loading and one shared event bus.
+
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -21,26 +26,62 @@ function makeTool(name, execute) {
 }
 
 export function createEventBus() {
-  return {};
+  const listeners = new Map();
+  return {
+    on(event, handler) {
+      const handlers = listeners.get(event) ?? [];
+      handlers.push(handler);
+      listeners.set(event, handlers);
+    },
+    emit(event, payload) {
+      for (const handler of listeners.get(event) ?? []) handler(payload);
+    },
+  };
 }
 
-export async function discoverAndLoadExtensions(paths) {
-  console.log("fixture loader wrote to console.log");
-  process.stdout.write("fixture loader wrote directly to stdout\n");
-  const extension = {
-    path: paths[0],
+function fixtureExtension(path) {
+  return {
+    path,
     shortcuts: new Map(),
     flags: new Map(),
     messageRenderers: new Map(),
     entryRenderers: new Map(),
     markdownTransformer: null,
   };
-  return { extensions: [extension], runtime: {} };
+}
+
+export async function discoverAndLoadExtensions(paths, _cwd, _agentDir, eventBus) {
+  console.log("fixture loader wrote to console.log");
+  process.stdout.write("fixture loader wrote directly to stdout\n");
+  delete globalThis.__yggPiAggregateShared;
+  const runtime = {
+    aggregate: {
+      loadOrder: [],
+      eventOrder: [],
+      globalMarker: null,
+    },
+  };
+  const extensions = [];
+  const errors = [];
+  for (const path of paths) {
+    try {
+      const entrypoint = existsSync(join(path, "index.mjs")) ? join(path, "index.mjs") : path;
+      const module = await import(pathToFileURL(entrypoint).href);
+      if (typeof module.installFakePiAggregate === "function") {
+        await module.installFakePiAggregate({ eventBus, runtime });
+      }
+      extensions.push(fixtureExtension(path));
+    } catch (error) {
+      errors.push({ path, error });
+    }
+  }
+  return { extensions, runtime, errors };
 }
 
 export class ExtensionRunner {
-  constructor(extensions) {
+  constructor(extensions, runtime) {
     this.extensions = extensions;
+    this.runtime = runtime;
     this.ui = null;
     this.actions = null;
     this.commandContext = null;
@@ -66,6 +107,17 @@ export class ExtensionRunner {
         return { content: [{ type: "text", text: "complete" }] };
       }),
     ];
+    if (this.runtime?.aggregate?.loadOrder.length) {
+      this.tools.push(
+        makeTool("aggregate_state", async () => ({
+          content: [{ type: "text", text: JSON.stringify(this.runtime.aggregate) }],
+        })),
+        makeTool("aggregate_wait", async (_id, _input, _signal, _update, context) => {
+          const value = await context.ui.input("aggregate input");
+          return { content: [{ type: "text", text: value ?? "missing" }] };
+        }),
+      );
+    }
   }
 
   bindCore(actions, contextActions) {

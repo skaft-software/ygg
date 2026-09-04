@@ -70,42 +70,83 @@ ygg migrate restore ~/.ygg/backups/migrate/IMPORT-DIRECTORY
 ygg migrate restore ~/.ygg/backups/migrate/IMPORT-DIRECTORY --yes
 ```
 
-## Link a compatible extension
+## Plan, preflight, and publish a compatible extension
 
-Once a local Pi extension or installed Pi package has been reviewed, create an
-inert Ygg wrapper without running its code:
+Once a local Pi extension or installed Pi package has been reviewed, compile an
+inert aggregate plan. `--with` is ordered: the first source loads first and all
+sources share one Pi process, event bus, `globalThis`, and registry set.
 
 ```console
-ygg pi install ./path/to/extension.ts
-ygg pi install ./path/to/pi-package
-# Preserve Pi load order and shared state in one process:
-ygg pi install ./first.ts --with ./second-package --with ./third.ts \
-  --name pi-compat-0-84-4
+ygg pi plan ./first.ts --with ./second-package --with ./third.ts \
+  --name pi-compat-0-84-4 --pi-package /reviewed/pi-coding-agent \
+  --output /private/review/pi-aggregate-plan.json
+ygg pi preflight --plan /private/review/pi-aggregate-plan.json
+ygg pi publish --plan /private/review/pi-aggregate-plan.json
 ygg pi list
 ```
 
-The wrapper lives under `~/.ygg/extensions/`, points at the existing source, and
-uses the persistent `ygg-pi-compat` host. It does not install npm dependencies,
-run lifecycle scripts, copy the Pi package, or enable/trust the resulting Ygg
-extension. Schema-v2 link metadata records the bridge profile, exact Pi and Ygg
-versions, and a bounded source fingerprint; `ygg pi list` marks legacy or changed
-links stale without asserting trust, and a generated bridge rejects a fingerprint
-mismatch before importing extension code. The source digest excludes `.git`,
-`node_modules`, `target`, and recognized cache directories; dependency/runtime
-changes remain part of the separately reviewed Pi installation rather than the
-source-link digest. Start a current link explicitly after
-verifying its source:
+`ygg pi install ...` remains a shorthand for compile, preflight, and publish in
+one local command. It is useful for a reviewed one-off source; the explicit
+three-step form leaves an auditable handoff between review and publication.
+`--output` requires an existing non-symlink parent and a new file, so a plan is
+never silently replaced. Without `--output`, stdout is only canonical JSON (the
+inertness note is written to stderr), so it can be redirected into a plan file.
+Compilation requires exactly
+`@earendil-works/pi-coding-agent@0.84.4`, either selected with `--pi-package`
+or found by the bounded local discovery rules. It never downloads, installs, or
+executes a package. Prefer `--pi-package` in automation so the selected runtime
+is unambiguous.
+
+The canonical plan pins, in order:
+
+- every canonical source path, bounded source SHA-256, and supported adjacent
+  dependency-lock SHA-256 (`package-lock.json`, npm shrinkwrap, pnpm, Yarn, or
+  Bun lock files);
+- the canonical Pi package root and a package-integrity SHA-256 over its exact
+  `package.json` bytes and reviewed `dist/` tree;
+- the bridge, Pi, and Ygg versions, the `pi_aggregate` lifecycle profile, and
+  the explicit-enable/explicit-trust requirement.
+
+`preflight` re-reads all of those inputs without importing a source. `publish`
+runs that same preflight immediately before creating a discoverable package and
+rolls back a partial package on write failure. A changed source, lock, package,
+plan digest, or selected runtime is rejected with a replacement-plan action.
+Generated schema-v3 link records and aggregate-lock schema-v2 records bind the
+source order, package integrity, manifest path, and explicit trust requirement
+through a link identity. The bridge checks those values before and after its Pi
+loader imports source, and rejects a startup whose source/runtime changed during
+that interval.
+
+The generated wrapper lives under `~/.ygg/extensions/`, points at existing
+sources, and does not install npm dependencies, run lifecycle scripts, copy the
+Pi package, or enable/trust itself. It remains disabled and untrusted until the
+user makes both decisions:
 
 ```console
 ygg --enable-extension pi-extension-name --trust-extension pi-extension-name
 ```
 
-Bridge profile `0.2.0` targets exactly
-`@earendil-works/pi-coding-agent@0.84.4` and Node 22.19 or newer. The bridge
-validates that profile before importing extension code instead of silently using
-a newer runtime found on `PATH`. Pass `ygg pi install --pi-package DIR ...` when
-the package is not in a conventional location; the generated inert link records
-and forwards that exact path across Ygg's sanitized subprocess environment.
+`ygg pi list` reports metadata freshness only; it deliberately does **not** claim
+that the user has enabled or trusted a link. To remove a generated link from
+discovery without deleting the reviewed package, use the reversible local
+rollback action:
+
+```console
+ygg pi rollback pi-extension-name
+```
+
+The command moves only a validated generated package into a private rollback
+directory beside the extension root and leaves Ygg's enable/trust policy intact.
+Review its records before manually restoring it.
+
+Bridge profile `0.3.0` targets exactly Pi `0.84.4` and Node 22.19 or newer. Its
+live Pi protocol remains API `0.2`: API `0.3` currently has no available
+lifecycle-event or dynamic-command surface for this bridge. Publication also
+writes a canonical `pi-runtime-evidence.json` sidecar using the generated API
+`0.3` canonical JSON helper. That small, static selection/evidence seam is for
+the future runtime manager; it is **not** a claim that Pi lifecycle behavior has
+been upgraded to API `0.3`.
+
 The exhaustive per-event/API/UI ledger and completion gates are maintained in
 [`extensions/ygg-pi-compat/COMPATIBILITY.md`](../extensions/ygg-pi-compat/COMPATIBILITY.md).
 It supports Pi tools, transformed result details/error/usage, live tool catalogs,
@@ -220,21 +261,23 @@ scanner/compiler
 
 ### Deterministic scanner/compiler
 
-The shipped dry run is the inventory front end for this stage. `ygg pi install`
-now creates an inert generated wrapper for an existing local source; it does not
-install dependencies or execute package code. Future recipes can copy compatible
-skills/prompts, transform known configuration, and cache intermediate results by
-source and lock hash. Those operations should remain deterministic and
-model-free.
+The shipped dry run is the inventory front end for this stage. `ygg pi plan`
+compiles an inert source/lock/runtime-integrity aggregate; `preflight` verifies
+it and `publish` creates the generated wrapper only after that verification.
+`ygg pi install` is the one-command shorthand. None installs dependencies or
+executes package code. Future recipes can copy compatible skills/prompts,
+transform known configuration, and cache intermediate results by source and lock
+hash. Those operations should remain deterministic and model-free.
 
 ### Compatibility process
 
-The generated `ygg pi install` link hosts a deliberately bounded subset of Pi's
-`ExtensionAPI` through the persistent `ygg-pi-compat` process. Repeated `--with`
-arguments record an ordered, source-fingerprinted set in one aggregate lock and
-load those sources through one real `ExtensionRunner`, preserving their local
-event bus, `globalThis`, and shared registries. Automatically selecting and
-locking an entire reviewed Pi setup remains future migration work.
+A generated Pi aggregate hosts a deliberately bounded subset of Pi's
+`ExtensionAPI` through one persistent `ygg-pi-compat` process. Ordered `--with`
+sources are compiled into a source/lock/runtime-integrity plan, preflighted, and
+published as one aggregate lock. The one real `ExtensionRunner` preserves their
+local event bus, `globalThis`, and shared registries. Runtime-manager-owned lazy
+activation, workspace sharing, and hot reload remain future work; the published
+sidecar is only a narrow API `0.3` evidence seam for that manager.
 
 Unsupported Pi APIs must raise a clear compatibility error. The bridge must not
 silently discard a policy, mutation, lifecycle, or UI call. Static and runtime

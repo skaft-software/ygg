@@ -1,9 +1,9 @@
 # `ygg-pi-compat`
 
-This directory contains the Node compatibility host used by `ygg pi install`.
-It runs Pi extension source through Pi's public loader while Ygg continues to
-own the model loop, JSON-RPC transport, trust gates, persistence, and process
-cleanup.
+This directory contains the Node compatibility host used by published `ygg pi`
+aggregate plans. It runs Pi extension source through Pi's public loader while
+Ygg continues to own the model loop, JSON-RPC transport, trust gates,
+persistence, and process cleanup.
 
 ## Pinned compatibility profile
 
@@ -15,12 +15,26 @@ public surface names, and the 78-example corpus live in the machine-readable
 [`profiles/0.84.4.json`](profiles/0.84.4.json); the human status ledger and
 completion gates live in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-Generated links are inert until separately enabled and trusted. Schema-v2 link
-metadata records the bridge profile, Pi and Ygg versions, and a bounded source
-fingerprint. `ygg pi list` marks legacy, changed, or otherwise stale links, and
-generated links re-verify that fingerprint before Pi imports extension code.
-Dependency/build/cache directories are excluded from this source digest and
-remain part of the separately reviewed runtime installation.
+Use `ygg pi plan`, `ygg pi preflight --plan FILE`, then `ygg pi publish --plan
+FILE` to create an aggregate link; `ygg pi install` is the equivalent local
+one-command shorthand. Plans are inert and pin source order, source fingerprints,
+nearby dependency-lock fingerprints, the canonical selected runtime path, and its
+package integrity. Preflight and publish revalidate every pin without importing
+source. Schema-v3 generated links and schema-v2 aggregate locks bind those values
+plus the manifest path and explicit-enable/explicit-trust requirement into a
+link identity. The bridge verifies the identity before the Pi loader runs and
+rechecks runtime integrity afterward. `ygg pi list` marks legacy, changed, or
+otherwise stale links; it never claims that a link is trusted.
+
+The live Pi process protocol remains API `0.2`. Every published aggregate also
+has a canonical API `0.3` `pi-runtime-evidence.json` sidecar containing static
+selection and integrity evidence for a future runtime manager. It deliberately
+does not claim API `0.3` lifecycle or dynamic-command support.
+
+Generated links remain inert until separately enabled and trusted. Dependency,
+build, and cache directories are excluded from source fingerprints; supported
+adjacent dependency locks and the separately reviewed runtime installation are
+bound independently.
 
 ## Current supported surface
 
@@ -46,10 +60,12 @@ names. Unknown APIs fail closed instead of being labeled bridge-compatible.
 ## Tests
 
 ```sh
-python3 -m unittest extensions.ygg-pi-compat.tests.test_bridge_protocol
+python3 -m unittest discover -s extensions/ygg-pi-compat/tests \
+  -p 'test_bridge_protocol.py'
 
 YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
-  python3 -m unittest extensions.ygg-pi-compat.tests.test_bridge_protocol
+  python3 -m unittest discover -s extensions/ygg-pi-compat/tests \
+  -p 'test_bridge_protocol.py'
 
 YGG_PI_REAL_PACKAGE=/path/to/@earendil-works/pi-coding-agent \
   cargo test -p ygg-coding-agent \
@@ -62,7 +78,10 @@ parity: flags, shortcuts, active-tool overlays, widgets, and durable custom
 entries remain release blockers.
 
 The bridge uses the selected Pi package's own loader and does not install npm
-dependencies. `ygg pi install --pi-package DIR` validates, records, and forwards
-an exact nonstandard package location without relying on ambient extension
-environment inheritance. Package code still runs with the launching user's
-operating-system authority under Ygg's executable-extension trust model.
+dependencies. `ygg pi plan --pi-package DIR` validates and records an exact
+nonstandard package location without relying on ambient extension environment
+inheritance. `ygg pi rollback NAME` removes only a validated generated package
+from discovery by renaming it into a local rollback directory; it does not delete
+reviewed sources or modify trust policy. Package code still runs with the
+launching user's operating-system authority under Ygg's executable-extension
+trust model.

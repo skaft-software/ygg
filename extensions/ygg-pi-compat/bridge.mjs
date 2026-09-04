@@ -29,11 +29,25 @@ import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const API_VERSION = "0.2";
+const BRIDGE_VERSION = "0.3.0";
 const SUPPORTED_PI_PACKAGE = "@earendil-works/pi-coding-agent";
 const SUPPORTED_PI_VERSION = "0.84.4";
 const MINIMUM_NODE_VERSION = [22, 19, 0];
 const MAX_PI_PACKAGE_MANIFEST_BYTES = 256 * 1024;
 const SOURCE_FINGERPRINT_FORMAT = 1;
+const SOURCE_LOCK_FINGERPRINT_FORMAT = 1;
+const PI_RUNTIME_INTEGRITY_FORMAT = 1;
+const LINK_IDENTITY_FORMAT = 1;
+const EXPLICIT_TRUST_MODE = "explicit_enable_and_trust_required";
+const MAX_LOCK_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_LOCK_BYTES = 64 * 1024 * 1024;
+const SUPPORTED_LOCK_FILES = [
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lockb",
+];
 const MAX_SOURCE_FILES = 4096;
 const MAX_SOURCE_ENTRIES = 8192;
 const MAX_SOURCE_DEPTH = 64;
@@ -120,39 +134,72 @@ function parseArgs(argv) {
   const result = {
     extensions: [],
     sourceFingerprints: [],
+    sourceLockFingerprints: [],
     agentDir: null,
     cwd: null,
     commandName: "pi",
     piPackage: null,
+    piRuntimeIntegrity: null,
+    aggregateDigest: null,
+    linkManifest: null,
+    linkIdentity: null,
+    yggVersion: null,
+  };
+  const sha256 = (value, flag) => {
+    if (!/^[0-9a-f]{64}$/.test(value ?? "")) {
+      throw new Error(`${flag} requires a lowercase SHA-256 digest`);
+    }
+    return value;
+  };
+  const requiredValue = (flag, index) => {
+    const value = argv[index + 1];
+    if (!value) throw new Error(`${flag} requires a value`);
+    return value;
   };
   for (let index = 0; index < argv.length; index += 1) {
     const value = argv[index];
     if (value === "--extension" || value === "-e") {
-      const extension = argv[++index];
-      if (!extension) throw new Error("--extension requires a path");
+      const extension = requiredValue(value, index);
+      index += 1;
       result.extensions.push(extension);
     } else if (value === "--source-fingerprint") {
-      const fingerprint = argv[++index];
-      if (!fingerprint) throw new Error("--source-fingerprint requires a SHA-256 digest");
-      if (!/^[0-9a-f]{64}$/.test(fingerprint)) {
-        throw new Error("--source-fingerprint requires a lowercase SHA-256 digest");
-      }
+      const fingerprint = sha256(requiredValue(value, index), value);
+      index += 1;
       result.sourceFingerprints.push(fingerprint);
+    } else if (value === "--source-lock-fingerprint") {
+      const fingerprint = sha256(requiredValue(value, index), value);
+      index += 1;
+      result.sourceLockFingerprints.push(fingerprint);
     } else if (value === "--agent-dir") {
-      result.agentDir = argv[++index];
-      if (!result.agentDir) throw new Error("--agent-dir requires a path");
+      result.agentDir = requiredValue(value, index);
+      index += 1;
     } else if (value === "--cwd") {
-      result.cwd = argv[++index];
-      if (!result.cwd) throw new Error("--cwd requires a path");
+      result.cwd = requiredValue(value, index);
+      index += 1;
     } else if (value === "--pi-package") {
-      result.piPackage = argv[++index];
-      if (!result.piPackage) throw new Error("--pi-package requires a path");
+      result.piPackage = requiredValue(value, index);
+      index += 1;
+    } else if (value === "--pi-runtime-integrity") {
+      result.piRuntimeIntegrity = sha256(requiredValue(value, index), value);
+      index += 1;
+    } else if (value === "--aggregate-digest") {
+      result.aggregateDigest = sha256(requiredValue(value, index), value);
+      index += 1;
+    } else if (value === "--link-manifest") {
+      result.linkManifest = requiredValue(value, index);
+      index += 1;
+    } else if (value === "--link-identity") {
+      result.linkIdentity = sha256(requiredValue(value, index), value);
+      index += 1;
+    } else if (value === "--ygg-version") {
+      result.yggVersion = requiredValue(value, index);
+      index += 1;
     } else if (value === "--command") {
-      result.commandName = argv[++index];
-      if (!result.commandName) throw new Error("--command requires a name");
+      result.commandName = requiredValue(value, index);
+      index += 1;
     } else if (value === "--help" || value === "-h") {
       process.stdout.write(
-        "Usage: bridge.mjs --extension PATH [--source-fingerprint SHA256] [--extension PATH ...] [--agent-dir DIR] [--pi-package DIR]\n",
+        "Usage: bridge.mjs --extension PATH [--source-fingerprint SHA256] [--source-lock-fingerprint SHA256] [--extension PATH ...] [--agent-dir DIR] [--pi-package DIR]\n",
       );
       process.exit(0);
     } else {
@@ -170,6 +217,32 @@ function parseArgs(argv) {
     && result.sourceFingerprints.length !== result.extensions.length
   ) {
     throw new Error("provide exactly one --source-fingerprint for each --extension");
+  }
+  if (
+    result.sourceLockFingerprints.length !== 0
+    && result.sourceLockFingerprints.length !== result.extensions.length
+  ) {
+    throw new Error("provide exactly one --source-lock-fingerprint for each --extension");
+  }
+  const identityFields = [
+    result.piRuntimeIntegrity,
+    result.aggregateDigest,
+    result.linkManifest,
+    result.linkIdentity,
+    result.yggVersion,
+  ];
+  result.strictIdentity = identityFields.some(Boolean);
+  if (result.strictIdentity) {
+    if (
+      !result.piPackage
+      || result.sourceFingerprints.length !== result.extensions.length
+      || result.sourceLockFingerprints.length !== result.extensions.length
+      || identityFields.some((value) => !value)
+    ) {
+      throw new Error(
+        "pinned Pi aggregate identity requires --pi-package, per-source source/lock fingerprints, runtime integrity, aggregate digest, link manifest, link identity, and Ygg version",
+      );
+    }
   }
   return result;
 }
@@ -649,16 +722,147 @@ function fingerprintSource(source) {
   return hash.digest("hex");
 }
 
+function hashFramed(hash, value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+  hash.update(unsignedBigEndian(bytes.length, 8));
+  hash.update(bytes);
+}
+
+function sourceLabel(index) {
+  return `#${index + 1}`;
+}
+
+function sourceVerificationError(index, reason) {
+  return new Error(`Pi source ${sourceLabel(index)} ${reason}; review it and publish a replacement link`);
+}
+
+function sourceLockEntries(root) {
+  const entries = [];
+  for (const name of SUPPORTED_LOCK_FILES) {
+    const path = join(root, name);
+    try {
+      const metadata = lstatSync(path);
+      if (metadata.isSymbolicLink() || !metadata.isFile()) {
+        throw new Error("dependency lock is not a regular non-symlink file");
+      }
+      if (metadata.size > MAX_LOCK_FILE_BYTES) {
+        throw new Error("dependency lock exceeds the supported size limit");
+      }
+      entries.push({ name, path });
+    } catch (error) {
+      if (error?.code === "ENOENT") continue;
+      throw error;
+    }
+  }
+  return entries;
+}
+
+function fingerprintSourceLocks(source) {
+  const absolute = resolve(source);
+  const metadata = lstatSync(absolute);
+  if (metadata.isSymbolicLink() || (!metadata.isFile() && !metadata.isDirectory())) {
+    throw new Error("Pi source lock fingerprint requires a regular source");
+  }
+  if (realpathSync(absolute) !== absolute) {
+    throw new Error("Pi source lock fingerprint requires a canonical source path");
+  }
+  const root = metadata.isDirectory() ? absolute : dirname(absolute);
+  const before = sourceLockEntries(root);
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-source-lock-fingerprint\0"));
+  hash.update(unsignedBigEndian(SOURCE_LOCK_FINGERPRINT_FORMAT, 4));
+  hash.update(unsignedBigEndian(before.length, 4));
+  let total = 0;
+  for (const entry of before) {
+    hashFramed(hash, entry.name);
+    total += hashSourceFile(hash, entry.path, MAX_LOCK_BYTES - total);
+  }
+  const after = sourceLockEntries(root);
+  if (before.length !== after.length || before.some((entry, index) => entry.name !== after[index].name)) {
+    throw new Error("Pi source dependency lock set changed while it was being fingerprinted");
+  }
+  return hash.digest("hex");
+}
+
+function piRuntimeIntegrity(root) {
+  const manifest = Buffer.from(readRegularUtf8Bounded(join(root, "package.json"), MAX_PI_PACKAGE_MANIFEST_BYTES));
+  const distribution = fingerprintSource(join(root, "dist"));
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-runtime-integrity\0"));
+  hash.update(unsignedBigEndian(PI_RUNTIME_INTEGRITY_FORMAT, 4));
+  hashFramed(hash, manifest);
+  hashFramed(hash, distribution);
+  return hash.digest("hex");
+}
+
+function calculateLinkIdentity(piRuntime) {
+  const hash = createHash("sha256");
+  hash.update(Buffer.from("ygg-pi-aggregate-link-identity\0"));
+  hash.update(unsignedBigEndian(LINK_IDENTITY_FORMAT, 4));
+  for (const value of [
+    BRIDGE_VERSION,
+    SUPPORTED_PI_VERSION,
+    args.yggVersion,
+    args.commandName,
+    resolve(args.linkManifest),
+    piRuntime.root,
+    args.piRuntimeIntegrity,
+    args.aggregateDigest,
+    EXPLICIT_TRUST_MODE,
+    bridge.agentDir,
+  ]) {
+    hashFramed(hash, value);
+  }
+  hash.update(unsignedBigEndian(args.extensions.length, 4));
+  for (let index = 0; index < args.extensions.length; index += 1) {
+    hashFramed(hash, resolve(args.extensions[index]));
+    hashFramed(hash, args.sourceFingerprints[index]);
+    hashFramed(hash, args.sourceLockFingerprints[index]);
+  }
+  return hash.digest("hex");
+}
+
 function verifySourceFingerprints() {
   if (!args.sourceFingerprints.length) return;
   for (let index = 0; index < args.extensions.length; index += 1) {
-    const actual = fingerprintSource(args.extensions[index]);
-    const expected = args.sourceFingerprints[index];
-    if (actual !== expected) {
-      throw new Error(
-        `Pi extension source changed after link installation: ${args.extensions[index]} (expected ${expected}, found ${actual})`,
-      );
+    let actual;
+    try {
+      actual = fingerprintSource(args.extensions[index]);
+    } catch {
+      throw sourceVerificationError(index, "cannot be verified");
     }
+    if (actual !== args.sourceFingerprints[index]) {
+      throw sourceVerificationError(index, "changed after link publication");
+    }
+    if (!args.sourceLockFingerprints.length) continue;
+    let lock;
+    try {
+      lock = fingerprintSourceLocks(args.extensions[index]);
+    } catch {
+      throw sourceVerificationError(index, "dependency lock cannot be verified");
+    }
+    if (lock !== args.sourceLockFingerprints[index]) {
+      throw sourceVerificationError(index, "dependency lock changed after link publication");
+    }
+  }
+}
+
+function verifyRuntimeIdentity(piRuntime, params) {
+  if (!args.strictIdentity) return;
+  if (piRuntime.integrity !== args.piRuntimeIntegrity) {
+    throw new Error("Pinned Pi runtime integrity changed; review the selected package and publish a replacement link");
+  }
+  const extension = params.extension;
+  if (
+    !extension
+    || extension.name !== args.commandName
+    || resolve(extension.manifest_path ?? "") !== resolve(args.linkManifest)
+    || params.ygg_version !== args.yggVersion
+  ) {
+    throw new Error("Pi link identity does not match the selected trusted manifest; review trust/enablement and publish a replacement link");
+  }
+  if (calculateLinkIdentity(piRuntime) !== args.linkIdentity) {
+    throw new Error("Pi link identity changed; review trust/enablement and publish a replacement link");
   }
 }
 
@@ -736,7 +940,13 @@ function inspectPiPackage(candidate) {
       error: `cannot validate dist/index.js: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
-  return { root, version: manifest.version };
+  let integrity;
+  try {
+    integrity = piRuntimeIntegrity(root);
+  } catch (error) {
+    return { root, error: `cannot verify runtime integrity: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  return { root, version: manifest.version, integrity };
 }
 
 function findPiPackageRoot(extensionPaths, selectedPackage) {
@@ -1019,7 +1229,10 @@ async function loadBridge(params) {
   }
 
   const piRuntime = findPiPackageRoot(bridge.extensionPaths, args.piPackage);
+  verifyRuntimeIdentity(piRuntime, params);
+  verifySourceFingerprints();
   bridge.piRuntimeVersion = piRuntime.version;
+  bridge.piRuntimeIntegrity = piRuntime.integrity;
   const pi = await import(pathToFileURL(join(piRuntime.root, "dist/index.js")).href);
   if (typeof pi.discoverAndLoadExtensions !== "function") {
     throw new Error("installed Pi runtime does not expose discoverAndLoadExtensions");
@@ -1032,11 +1245,16 @@ async function loadBridge(params) {
     eventBus,
   );
   verifySourceFingerprints();
-  for (const error of loaded.errors ?? []) {
-    diagnostic(`Pi extension load failed at ${error.path}: ${error.error}`);
+  if (args.strictIdentity && piRuntimeIntegrity(piRuntime.root) !== args.piRuntimeIntegrity) {
+    throw new Error("Pinned Pi runtime integrity changed during startup; review the package and publish a replacement link");
   }
-  if (!loaded.extensions?.length) {
-    throw new Error("Pi loader found no extension modules");
+  const loadErrors = loaded.errors ?? [];
+  for (const error of loadErrors) {
+    const index = bridge.extensionPaths.findIndex((path) => path === resolve(error?.path ?? ""));
+    diagnostic(`Pi source ${sourceLabel(index >= 0 ? index : 0)} failed to load; review it and publish a replacement link`);
+  }
+  if (loadErrors.length || loaded.extensions?.length !== bridge.extensionPaths.length) {
+    throw new Error("Pi aggregate loader did not load every pinned source; review the sources and publish a replacement link");
   }
 
   bridge.runner = new pi.ExtensionRunner(
@@ -1047,9 +1265,9 @@ async function loadBridge(params) {
     makeModelRegistry(),
   );
   bridge.runner.onError((error) => {
-    const location = error?.extensionPath ? ` in ${error.extensionPath}` : "";
-    const event = error?.event ? ` during ${error.event}` : "";
-    boundedDiagnostic(`Pi extension handler failed${location}${event}: ${error?.error ?? error}`);
+    const index = bridge.extensionPaths.findIndex((path) => path === resolve(error?.extensionPath ?? ""));
+    const event = error?.event ? ` during ${String(error.event).replace(/[^A-Za-z0-9_/-]/g, "?")}` : "";
+    boundedDiagnostic(`Pi source ${sourceLabel(index >= 0 ? index : 0)} handler failed${event}; review the source and publish a replacement link`);
   });
   bridge.runner.bindCore(makeExtensionActions(), makeExtensionContextActions(), {
     registerProvider: () => unsupported("pi.registerProvider"),
@@ -1070,12 +1288,13 @@ async function loadBridge(params) {
   setCurrentTools(initialTools, 0);
   bridge.commands = bridge.runner.getRegisteredCommands();
   bridge.unsupported = [];
-  for (const extension of loaded.extensions) {
-    if (extension.shortcuts.size) bridge.unsupported.push(`${extension.path}: shortcuts`);
-    if (extension.flags.size) bridge.unsupported.push(`${extension.path}: flags`);
-    if (extension.messageRenderers.size) bridge.unsupported.push(`${extension.path}: message renderers`);
-    if (extension.entryRenderers?.size) bridge.unsupported.push(`${extension.path}: entry renderers`);
-    if (extension.markdownTransformer) bridge.unsupported.push(`${extension.path}: markdown transformer`);
+  for (const [index, extension] of loaded.extensions.entries()) {
+    const label = sourceLabel(index);
+    if (extension.shortcuts.size) bridge.unsupported.push(`${label}: shortcuts`);
+    if (extension.flags.size) bridge.unsupported.push(`${label}: flags`);
+    if (extension.messageRenderers.size) bridge.unsupported.push(`${label}: message renderers`);
+    if (extension.entryRenderers?.size) bridge.unsupported.push(`${label}: entry renderers`);
+    if (extension.markdownTransformer) bridge.unsupported.push(`${label}: markdown transformer`);
   }
 }
 
@@ -1097,6 +1316,9 @@ async function handleInitialize(message) {
         },
       ];
   for (const warning of bridge.unsupported) diagnostic(`Pi compatibility: ${warning} is unavailable in Ygg`);
+  diagnostic(
+    `Pi compatibility readiness profile=pi_aggregate bridge_api=${API_VERSION} evidence_api=0.3 sources=${bridge.extensionPaths.length} pinned=${args.strictIdentity ? "yes" : "legacy"}`,
+  );
   diagnostic(`Pi compatibility profile ${bridge.piRuntimeVersion} initialized`);
   return {
     api_version: API_VERSION,

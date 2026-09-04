@@ -12,8 +12,9 @@ failure report
 the complete token-efficiency audit
 ([token-efficiency-v0.6.2-2026-08-28.md](token-efficiency-v0.6.2-2026-08-28.md)),
 the scoped coding-agent
-[runtime-footprint comparison](runtime-footprint-2026-08-29.md), and the opt-in
-beta protocol ([beta-protocol.md](beta-protocol.md)).
+[runtime-footprint comparison](runtime-footprint-2026-08-29.md), the
+credential-free [Pi runtime evidence harness](pi-runtime-evidence.md), and the
+opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
 
 ## Optional agent telemetry
 
@@ -104,6 +105,18 @@ Those cases require a harness-specific driver and should be supplied with
 `--command` or an additional checked-in adapter. A comparison must use the
 same task, endpoint, model weights, context limit, timeout, hardware, and
 concurrency for every harness.
+
+## Pi runtime fixture evidence
+
+[`scripts/bench-pi-runtime.py`](../../scripts/bench-pi-runtime.py) is the
+checked-in, stdlib-only driver for Pi aggregate lifecycle evidence. It runs no
+network/provider/model request, inherits no credentials, uses a temporary home,
+and writes bounded raw resource samples plus a checksum. It measures fixture
+representations of no-extension, legacy-eager, lazy activation, shared-workspace,
+and ordered-Pi-aggregate paths; it is intentionally hold-only until a real API
+0.3 runtime-manager adapter is available. See [Pi runtime evidence
+harness](pi-runtime-evidence.md) for invocation, exact candidate/fixture identity,
+Linux/macOS limits, separate inference/GPU attribution, and publication rules.
 
 ## Publication boundary
 
