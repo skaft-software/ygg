@@ -1434,6 +1434,15 @@ impl EventTranslator {
             // The final TurnFinished message carries generated media in the
             // Pi-compatible content array; no provisional RPC event exists.
             AgentEvent::OutputMedia { .. } => {}
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // Deliberately outside assistant-message updates: readiness is
+                // transient endpoint telemetry, never model content.
+                output.send(json!({
+                    "type": "provider_lifecycle",
+                    "state": lifecycle.state.as_str(),
+                    "detail": lifecycle.detail,
+                }))?;
+            }
             AgentEvent::ProviderRetry {
                 attempt,
                 max_attempts,

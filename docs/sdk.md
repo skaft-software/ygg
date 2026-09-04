@@ -185,6 +185,7 @@ A successful run normally emits:
 Streaming events currently include:
 
 - `model_delta` and `output_media`;
+- opt-in `provider_lifecycle` readiness telemetry;
 - `provider_retry` and `candidate_rejected`;
 - `tool_start`, `tool_policy`, `tool_progress`, and `tool_finish`; `tool_policy`
   carries secret-safe allowed/denied admission metadata and stable denial codes,
@@ -205,6 +206,11 @@ share the same schema. `effect_policy`, `workspace_confinement`, `allow_edit`,
 A decision contains an optional effect, `allowed`, `authorization` when allowed,
 and a stable `denial_code` when denied. Allowed evidence is emitted only after
 all host hooks and reservation commit gates complete.
+
+`provider_lifecycle.data` has a `state` of `queued`, `loading`, or `ready` and
+nullable bounded `detail`. It is emitted only when the selected configured
+endpoint explicitly opted in; it is advisory endpoint telemetry, never model
+output or durable session content.
 
 `final_result.data` contains `status`, `output`, `error`, `filesChanged`,
 `toolCalls`, `steps`, and `sessionFile`. Status is `completed`, `blocked`, or

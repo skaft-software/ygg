@@ -193,6 +193,7 @@ async fn run_auth_command(provider: &str, command: AuthCommand) -> anyhow::Resul
                         api_key_env: None,
                         cache: None,
                         startup_timeout_secs: None,
+                        lifecycle_feedback: false,
                     };
                     store.save_registry(&CustomRegistry::single("local", provider))?;
                     crate::output::stdout_multiline(format!(

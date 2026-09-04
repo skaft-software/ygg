@@ -833,7 +833,7 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
         for route in &provider.routes {
             writeln!(
                 generated,
-                "        ProviderRoute {{ endpoint_id: {}, protocol: {}, auth_presentation: {}, transport: {}, runtime: RequestRuntime {{ body_encoding: {}, responses_profile: {} }} }},",
+                "        ProviderRoute {{ endpoint_id: {}, protocol: {}, auth_presentation: {}, transport: {}, runtime: RequestRuntime {{ body_encoding: {}, responses_profile: {}, lifecycle_feedback: false }} }},",
                 quote(&route.endpoint_id),
                 protocol_expression(&route.protocol).expect("validated protocol"),
                 auth_presentation_expression(&route.auth_presentation)

@@ -987,6 +987,7 @@ mod tests {
             runtime: RequestRuntime {
                 body_encoding: RequestBodyEncoding::Identity,
                 responses_profile: ResponsesRuntimeProfile::Codex,
+                lifecycle_feedback: false,
             },
         }];
         const DEFAULT_RULE: &[ModelRouteRule] = &[ModelRouteRule::Default { route: 0 }];

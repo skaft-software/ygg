@@ -65,7 +65,7 @@ pub use responses::{
     ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
     ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
-pub use stream::{ResponseStream, StreamEvent};
+pub use stream::{ProviderLifecycle, ProviderLifecycleState, ResponseStream, StreamEvent};
 pub use transform::transform_messages;
 pub use types::{
     AgentDelegation, AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,

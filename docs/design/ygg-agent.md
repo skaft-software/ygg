@@ -6,7 +6,7 @@
 
 ## Commit and cancellation invariants
 
-1. Streaming deltas are provisional and never enter the session.
+1. Streaming deltas are provisional and never enter the session. Opt-in provider lifecycle feedback is likewise forwarded only as transient `AgentEvent` telemetry; it does not mutate context, assembled assistant content, durable telemetry, or session records.
 2. A complete assistant message is persisted before any emitted tool is executed.
 3. Each tool result is persisted immediately after its execution outcome is committed.
 4. A completed call marked schema-invalid by `ygg-ai`'s request snapshot receives a static bounded paired error; it never reaches speculative execution, effect classification, hooks, or the tool implementation.

@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EffectBroker, EffectPolicy,
@@ -29,8 +29,9 @@ use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
     AudioVoice, Auth, Capabilities, Endpoint, EndpointId, Media, Message, Modality, ModalitySet,
     Model, ModelId, ModelLimits, ModelSpec, OutputModalities, Pricing, Protocol,
-    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffortBudgets, TokenRate,
-    ToolCall, ToolCallArgumentError, Usage, UserMessage, UserPart,
+    ProviderLifecycleState, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffortBudgets, TokenRate, ToolCall, ToolCallArgumentError, Usage, UserMessage,
+    UserPart,
 };
 
 const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 6;
@@ -2383,6 +2384,70 @@ async fn run_context_snapshot_updates_without_a_presentation_layer() {
     assert!(snapshot.response_text_bytes >= "streamed context".len() as u64);
     assert!(snapshot.response_usage.total_tokens > 0);
     assert_eq!(snapshot.run_usage, snapshot.response_usage);
+}
+
+#[tokio::test]
+async fn openai_lifecycle_feedback_is_forwarded_but_not_persisted() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        ": ygg-lifecycle: loading; warming test-key\n\n",
+        "data: {\"id\":\"lifecycle\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Ready\"}}]}\n\n",
+        "data: {\"id\":\"lifecycle\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; accepted test-key"),
+        )
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let session_path = sessions.path().join("lifecycle.jsonl");
+    let mut model = openai_multimodal_model(&server.uri());
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut agent = build_agent_with_reasoning(
+        model,
+        &session_path,
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let mut run = agent.prompt("wait for the local endpoint").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderLifecycle { lifecycle } => Some(lifecycle),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle.len(), 2);
+    assert_eq!(lifecycle[0].state, ProviderLifecycleState::Queued);
+    assert_eq!(lifecycle[1].state, ProviderLifecycleState::Loading);
+    assert!(lifecycle.iter().all(|lifecycle| {
+        lifecycle
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("[REDACTED]"))
+    }));
+
+    let persisted = std::fs::read_to_string(&session_path).unwrap();
+    assert!(persisted.contains("Ready"));
+    assert!(!persisted.contains("provider_lifecycle"));
+    assert!(!persisted.contains("warming test-key"));
+    assert!(!persisted.contains("accepted test-key"));
 }
 
 #[tokio::test]

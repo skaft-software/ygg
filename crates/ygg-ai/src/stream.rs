@@ -9,6 +9,55 @@ use crate::types::{
 };
 use std::collections::{HashMap, HashSet};
 
+use serde::Serialize;
+
+/// A bounded advisory state reported by an opt-in OpenAI-compatible endpoint
+/// while it prepares a cold model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderLifecycleState {
+    /// The endpoint accepted the request but has not started loading it.
+    Queued,
+    /// The endpoint is loading or initializing the requested model.
+    Loading,
+    /// The endpoint is ready to generate the requested response.
+    Ready,
+}
+
+impl ProviderLifecycleState {
+    /// Stable lowercase wire and serialization value for this state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Loading => "loading",
+            Self::Ready => "ready",
+        }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "queued" => Some(Self::Queued),
+            "loading" => Some(Self::Loading),
+            "ready" => Some(Self::Ready),
+            _ => None,
+        }
+    }
+}
+
+/// Sanitized, non-semantic lifecycle feedback from an opt-in provider.
+///
+/// This advisory value is never included in an assembled [`Response`] and is
+/// not suitable for replay or persistence. `detail`, when present, has already
+/// crossed the client transport sanitization and byte bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProviderLifecycle {
+    /// Endpoint-reported preparation state.
+    pub state: ProviderLifecycleState,
+    /// Optional bounded status detail.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Hard cap on accumulated tool-call argument bytes before assembly (design §20).
 /// Crossing it is a [`DecodeError::ToolArgumentsTooLarge`], never a panic.
 pub(crate) const MAX_TOOL_ARGUMENT_BYTES: usize = 16 * 1024 * 1024;
@@ -31,6 +80,12 @@ pub enum StreamEvent {
         /// Provider-assigned response identifier.
         response_id: Option<String>,
     },
+
+    /// Advisory lifecycle feedback from an opt-in provider.
+    ///
+    /// This is transport telemetry, not assistant content, and therefore is
+    /// never assembled into a [`Response`].
+    ProviderLifecycle(ProviderLifecycle),
 
     /// Text generation segment started.
     TextStart {
@@ -755,7 +810,7 @@ where
             }
 
             match &ev {
-                StreamEvent::Started { .. } => {}
+                StreamEvent::Started { .. } | StreamEvent::ProviderLifecycle(_) => {}
                 StreamEvent::TextStart { index } => {
                     if part_states.contains_key(index) {
                         Err(AiError::StreamProtocol(StreamProtocolError::UnexpectedEvent(format!("TextStart on index {}", index))))?;
@@ -1162,6 +1217,22 @@ mod tests {
     #[tokio::test]
     async fn test_guard_missing_start() {
         let raw_stream = futures_util::stream::iter(vec![Ok(StreamEvent::TextStart { index: 0 })]);
+        let mut guarded = guard(raw_stream);
+        let res = guarded.next().await.unwrap();
+        assert!(matches!(
+            res,
+            Err(AiError::StreamProtocol(StreamProtocolError::MissingStart))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_guard_rejects_lifecycle_before_start() {
+        let raw_stream = futures_util::stream::iter(vec![Ok(StreamEvent::ProviderLifecycle(
+            ProviderLifecycle {
+                state: ProviderLifecycleState::Loading,
+                detail: Some("warming".into()),
+            },
+        ))]);
         let mut guarded = guard(raw_stream);
         let res = guarded.next().await.unwrap();
         assert!(matches!(

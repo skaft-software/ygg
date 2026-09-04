@@ -1349,6 +1349,11 @@ pub(crate) fn decode_stream_event(
         // provider-assigned id is then simply unknown (None).
         let response_id = (!chunk.id.is_empty()).then_some(chunk.id.clone());
         emit_event(&mut events, builder, StreamEvent::Started { response_id })?;
+    } else if builder.response_id.is_none() && !chunk.id.is_empty() {
+        // Lifecycle feedback may have seeded a synthetic `Started` before the
+        // first provider chunk. Retain the eventual provider id in the final
+        // response without emitting a duplicate start event.
+        builder.response_id = Some(chunk.id.clone());
     }
 
     for choice in chunk.choices {

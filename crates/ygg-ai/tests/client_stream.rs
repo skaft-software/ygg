@@ -8,13 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
-use wiremock::matchers::{header_exists, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use ygg_ai::{
     AiClient, AiError, Auth, Capabilities, CompatibilityMode::Strict, Endpoint, EndpointId, Media,
     Message, Modality, ModalitySet, Model, ModelId, ModelLimits, ModelSpec, OutputFormat,
-    OutputModalities, Protocol, Request, StreamEvent, UserMessage, UserPart,
+    OutputModalities, Protocol, ProviderLifecycleState, Request, StreamEvent, UserMessage,
+    UserPart,
 };
 
 fn make_test_model(base_url_str: &str, protocol: Protocol, is_audio: bool) -> Model {
@@ -121,6 +122,155 @@ async fn test_client_stream_sse_openai_chat() {
     } else {
         panic!("Expected TextDelta Hello");
     }
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_is_opt_in_sanitized_and_keeps_stream_invariants() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/openai_chat/lifecycle_feedback.sse"))
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; warming test-api-key"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ProviderLifecycle(lifecycle) => Some(lifecycle),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle.len(),
+        3,
+        "the trailing lifecycle comment after [DONE] must not follow Finished"
+    );
+    assert_eq!(lifecycle[0].state, ProviderLifecycleState::Queued);
+    assert_eq!(lifecycle[1].state, ProviderLifecycleState::Loading);
+    assert_eq!(lifecycle[2].state, ProviderLifecycleState::Ready);
+    assert!(lifecycle.iter().all(|status| {
+        status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("[REDACTED]"))
+            && status
+                .detail
+                .as_deref()
+                .is_none_or(|detail| !detail.contains("test-api-key"))
+    }));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+    let finished = events.iter().find_map(|event| match event {
+        StreamEvent::Finished(response) => Some(response),
+        _ => None,
+    });
+    assert_eq!(
+        finished.and_then(|response| response.response_id.as_deref()),
+        Some("chatcmpl-lifecycle"),
+        "synthetic lifecycle start must not discard the provider response ID"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StreamEvent::TextDelta { delta, .. } if delta.contains("loading model")
+    )));
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_caps_endpoint_updates() {
+    let mock_server = MockServer::start().await;
+    let comments = (0..65)
+        .map(|index| format!(": ygg-lifecycle: loading; update {index}\n\n"))
+        .collect::<String>();
+    let body = format!(
+        "{comments}{}",
+        include_str!("fixtures/openai_chat/plain_text.sse")
+    );
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ProviderLifecycle(_)))
+            .count(),
+        64
+    );
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_is_ignored_without_opt_in() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/openai_chat/lifecycle_feedback.sse"))
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; ignored test-api-key"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ProviderLifecycle(_))),
+        "headers and comments from a non-negotiated endpoint must remain invisible"
+    );
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].headers.contains_key("x-ygg-lifecycle"),
+        "ordinary OpenAI-compatible requests must not carry the extension header"
+    );
 }
 
 // f1: the client stops reading the HTTP body the instant the codec emits

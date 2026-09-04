@@ -1,0 +1,12 @@
+: ordinary keepalive comment that must remain invisible
+: ygg-lifecycle: loading; loading model for test-api-key
+
+data: {"id":"chatcmpl-lifecycle","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"Ready"}}]}
+
+: ygg-lifecycle: ready; ready for test-api-key
+
+data: {"id":"chatcmpl-lifecycle","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+: ygg-lifecycle: loading; must ignore test-api-key after terminal

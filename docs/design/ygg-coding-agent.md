@@ -89,6 +89,23 @@ uses `--yes` to commit. `--offline --manual-model` is the no-probe recovery
 path. Cancellation, review-only operation, offline discovery rejection, and a
 stale registry snapshot do not write the registry.
 
+## Custom endpoint lifecycle feedback
+
+A custom registry provider may set `lifecycle_feedback: true`. Bootstrap copies
+that explicit opt-in into the selected route's `RequestRuntime`; legacy and
+built-in declarations remain false. The HTTP client then owns negotiation and
+parsing, so product configuration never changes an ordinary endpoint's wire
+behavior.
+
+The product treats accepted readiness updates as nonpersistent activity. The TUI
+replaces its mutable `Working` row with a bounded provider-status label until
+model output or settlement; plain and print modes write the diagnostic to stderr
+so print stdout stays response-only. RPC and the native host expose a structured
+`provider_lifecycle` event for clients that choose to render it. Session records,
+serve item projections, and durable telemetry deliberately omit this endpoint
+telemetry. It is observational only and does not change retry or timeout
+semantics.
+
 ## System prompt
 
 The stable, model-agnostic base contract gives both local and cloud models an

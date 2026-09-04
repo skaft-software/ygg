@@ -448,6 +448,35 @@ If an endpoint cannot provide a useful `GET /v1/models`, set
 Protect the credential file with `chmod 600`. Use `--offline` to skip optional
 model discovery during startup; inference still reaches the selected endpoint.
 
+### Cold-start lifecycle feedback
+
+Set `lifecycle_feedback` to `true` only for an OpenAI-compatible endpoint that
+implements Ygg's optional readiness extension:
+
+```json
+{ "providers": { "cold-local": { "lifecycle_feedback": true } } }
+```
+
+On streaming Chat Completions requests, Ygg then sends `x-ygg-lifecycle: 1`.
+The endpoint may return the same header and/or SSE comments such as
+`: ygg-lifecycle: loading; warming model`.
+The accepted states are `queued`, `loading`, and `ready`; malformed values and
+ordinary SSE comments remain invisible. Unconfigured endpoints receive no
+header and keep their ordinary behavior, while ordinary OpenAI clients ignore
+both the optional header and SSE comments.
+
+Feedback is advisory only: Ygg redacts and bounds its detail, displays it as a
+transient readiness status, and never puts it in assistant content, session
+history, or model context. Plain and print modes send it to stderr; `--print`
+stdout remains response-only. It adds no retry or POST-replay behavior,
+including no cold-start-specific handling of a `503` response.
+
+`startup_timeout_secs` still limits how long Ygg waits for response headers. An
+endpoint must return those headers before that timeout; readiness feedback does
+not extend it. Once a successful streaming response has begun, ordinary body
+idle/deadline limits still apply. Non-streaming requests use the normal
+completed-response path and do not negotiate or emit lifecycle feedback.
+
 Custom models are treated as free for cost guardrails: each model gets trusted
 zero pricing by default, so subagents and other features that require trusted
 model pricing work out of the box on local and self-hosted servers. To track

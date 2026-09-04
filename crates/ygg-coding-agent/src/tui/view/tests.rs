@@ -6643,6 +6643,66 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
 }
 
 #[test]
+fn provider_lifecycle_status_is_transient_and_cannot_regress_output() {
+    use ygg_agent::{EntryId, FinishReason};
+    use ygg_ai::{ProviderLifecycle, ProviderLifecycleState};
+
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("custom-openai");
+    shell.set_awaiting_provider(run_id);
+    let lifecycle = |state| AgentEvent::ProviderLifecycle {
+        lifecycle: ProviderLifecycle {
+            state,
+            detail: Some("warming".into()),
+        },
+    };
+    let rendered = |shell: &InteractiveShell| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+    };
+
+    shell.on_run_event(run_id, &lifecycle(ProviderLifecycleState::Loading));
+    assert!(rendered(&shell)
+        .iter()
+        .any(|line| line.contains("Loading local endpoint · warming")));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Answer".into(),
+        },
+    );
+    // A delayed readiness comment is advisory only; it cannot replace a
+    // streaming response's trailing generic liveness row.
+    shell.on_run_event(run_id, &lifecycle(ProviderLifecycleState::Ready));
+    let after_output = rendered(&shell);
+    assert!(after_output.iter().any(|line| line.contains("Answer")));
+    assert!(after_output
+        .iter()
+        .any(|line| line.starts_with("• Working (")));
+    assert!(!after_output
+        .iter()
+        .any(|line| line.contains("ready · warming")));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::RunFinished {
+            head: EntryId("head".into()),
+            reason: FinishReason::Completed,
+        },
+    );
+    assert!(!rendered(&shell)
+        .iter()
+        .any(|line| line.contains("Loading local endpoint")));
+}
+
+#[test]
 fn removing_a_tail_status_preserves_an_older_semantic_selection() {
     let mut shell = InteractiveShell::test_shell();
     {

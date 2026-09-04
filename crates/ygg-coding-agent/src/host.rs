@@ -946,6 +946,19 @@ async fn run_request(
                     .emit("output_media", media_payload(index, &media))
                     .await?;
             }
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // This is a structured protocol event, not human-facing stdout
+                // diagnostics or assistant content.
+                emitter
+                    .emit(
+                        "provider_lifecycle",
+                        serde_json::json!({
+                            "state": lifecycle.state.as_str(),
+                            "detail": lifecycle.detail.as_deref().map(|detail| clip_text(detail, 512)),
+                        }),
+                    )
+                    .await?;
+            }
             AgentEvent::ProviderRetry {
                 attempt,
                 max_attempts,

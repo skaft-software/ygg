@@ -883,6 +883,7 @@ fn login_custom(shell: &mut InteractiveShell) -> anyhow::Result<()> {
         api_key_env: None,
         cache: None,
         startup_timeout_secs: None,
+        lifecycle_feedback: false,
     };
     store.save_registry(&CustomRegistry::single("local", provider))?;
     shell.notice(format!(

@@ -1515,6 +1515,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
         api_key_env: None,
         cache: None,
         startup_timeout_secs: None,
+        lifecycle_feedback: false,
     };
     let mut registry = CustomRegistry::single(
         "apple-fm",
@@ -1525,6 +1526,11 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
             Some(CustomAuthConfig::None),
         ),
     );
+    registry
+        .providers
+        .get_mut("apple-fm")
+        .unwrap()
+        .lifecycle_feedback = true;
     registry.providers.insert(
         "home-server".into(),
         provider(
@@ -1576,6 +1582,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
         "http://127.0.0.1:1976/v1/"
     );
     assert!(matches!(apple.endpoint.auth, Auth::None));
+    assert!(apple.endpoint.runtime.lifecycle_feedback);
 
     let home = catalog
         .resolve(&ModelId("custom/home-server/shared-model".into()))
@@ -1589,6 +1596,7 @@ fn custom_registry_registers_labeled_providers_with_isolated_auth_and_models() {
         home.endpoint.auth,
         Auth::BearerEnv { ref var } if var == "YGG_TEST_HOME_SERVER_KEY"
     ));
+    assert!(!home.endpoint.runtime.lifecycle_feedback);
 
     // Undeclared custom-model pricing defaults to trusted zero rates so
     // cost-ceiling guardrails (such as subagent budgets) stay enforceable.

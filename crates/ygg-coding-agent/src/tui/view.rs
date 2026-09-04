@@ -29,8 +29,9 @@ use crate::hydrate::{
 #[cfg(test)]
 use crate::presentation::summarize_tool;
 use crate::presentation::{
-    summarize_tool_with_workspace, tool_failure_reason, tool_result_is_failure,
-    ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker, ToolDisplay,
+    provider_lifecycle_label, summarize_tool_with_workspace, tool_failure_reason,
+    tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker,
+    ToolDisplay,
 };
 use crate::session_store::SessionMeta;
 use crate::tui::composer::{self, ComposedInput};
@@ -968,6 +969,14 @@ fn status_rainbow_strength_at(reasoning: Option<&str>, elapsed: Option<Duration>
     (remaining_ms.saturating_mul(100) / duration_ms).min(100) as u16
 }
 
+/// Lifecycle labels are generated locally from a finite state enum. This
+/// recognizer is used only to avoid retaining them as transcript history at a
+/// turn boundary; it deliberately excludes unrelated activity labels.
+fn is_provider_lifecycle_status(heading: &str) -> bool {
+    let base = heading.split_once(" · ").map_or(heading, |(base, _)| base);
+    base.starts_with("Loading ") || base.ends_with(" queued") || base.ends_with(" ready")
+}
+
 impl ShellState {
     /// Borrow the one app-owned safe display map and generic visual layout for
     /// the current composer source and chrome-aware text cell width.
@@ -1453,6 +1462,30 @@ impl ShellState {
         self.open_activity_status(Some("Working"), false);
     }
 
+    /// Replace the current transient liveness row with an opted-in provider
+    /// readiness label. It remains presentation-only and is removed when real
+    /// model output or a terminal run outcome arrives.
+    fn set_provider_lifecycle_status(&mut self, label: String) {
+        if let Some(index) = self.active_reasoning {
+            if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index) {
+                let replaceable = reasoning.text.is_empty()
+                    && !reasoning.show_reasoning_hint
+                    && reasoning
+                        .reasoning_heading
+                        .as_deref()
+                        .is_some_and(|heading| {
+                            heading == "Working" || is_provider_lifecycle_status(heading)
+                        });
+                if replaceable {
+                    reasoning.reasoning_heading = Some(label);
+                    self.touch_block(index);
+                }
+            }
+            return;
+        }
+        self.open_activity_status(Some(&label), false);
+    }
+
     fn open_activity_status(&mut self, label: Option<&str>, show_reasoning_hint: bool) {
         if self.active_reasoning.is_some() {
             return;
@@ -1539,10 +1572,16 @@ impl ShellState {
                 {
                     if existing.text.is_empty()
                         && !existing.show_reasoning_hint
-                        && existing.reasoning_heading.as_deref() == Some("Working")
+                        && existing
+                            .reasoning_heading
+                            .as_deref()
+                            .is_some_and(|heading| {
+                                heading == "Working" || is_provider_lifecycle_status(heading)
+                            })
                     {
-                        // A generic request placeholder becomes `Thinking` only
-                        // when the provider actually emits reasoning content.
+                        // A generic or lifecycle request placeholder becomes
+                        // `Thinking` only when the provider actually emits
+                        // reasoning content.
                         existing.reasoning_heading = None;
                         existing.show_reasoning_hint = true;
                     }
@@ -1694,10 +1733,23 @@ impl ShellState {
                 Some(TranscriptBlock::Reasoning(reasoning))
                     if reasoning.text.is_empty()
                         && !reasoning.show_reasoning_hint
-                        && reasoning.reasoning_heading.as_deref() == Some("Working")
+                        && reasoning.reasoning_heading.as_deref().is_some_and(|heading| {
+                            heading == "Working" || is_provider_lifecycle_status(heading)
+                        })
             )
         });
-        if !working {
+        if working {
+            if let Some(index) = self.active_reasoning {
+                if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
+                {
+                    // Lifecycle labels are ephemeral; turn completion resumes
+                    // the ordinary generic liveness row rather than retaining
+                    // endpoint telemetry in the transcript.
+                    reasoning.reasoning_heading = Some("Working".into());
+                    self.touch_block(index);
+                }
+            }
+        } else {
             if let Some(index) = self.active_reasoning.take() {
                 self.unregister_active_event(index);
                 if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
@@ -2440,6 +2492,25 @@ impl InteractiveShell {
                 // Generated media is binary and may still be invalidated by a
                 // provider retry. TurnFinished carries the durable assembled
                 // message; embedded callers receive the payload here directly.
+            }
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // The run tracker accepts the event but deliberately refuses a
+                // late readiness update once real output or tool work began.
+                // Keep the mutable transcript status aligned with that phase.
+                let visible = matches!(
+                    state.run.current().map(|run| run.phase()),
+                    Some(crate::presentation::RunPhase::ProviderLifecycle { .. })
+                );
+                if visible {
+                    let provider = state
+                        .run
+                        .current()
+                        .map(|run| run.endpoint())
+                        .unwrap_or(state.provider.as_str())
+                        .to_owned();
+                    let label = provider_lifecycle_label(&provider, lifecycle);
+                    state.set_provider_lifecycle_status(label);
+                }
             }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();

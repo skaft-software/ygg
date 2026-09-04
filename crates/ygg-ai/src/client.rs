@@ -13,7 +13,9 @@ use crate::error::{
     TransportError, TransportPhase,
 };
 use crate::responses_ws::{ResponsesWsLiveness, ResponsesWsPool};
-use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
+use crate::stream::{
+    ProviderLifecycle, ProviderLifecycleState, ResponseBuilder, ResponseStream, StreamEvent,
+};
 use crate::types::{Protocol, Request, Response, ToolDef};
 use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
@@ -62,6 +64,53 @@ fn truncate_transport_message(message: &mut String, max_bytes: usize) {
 
 const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
 const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 512;
+/// A stream can surface only a finite amount of advisory endpoint telemetry.
+const MAX_PROVIDER_LIFECYCLE_EVENTS: usize = 64;
+/// Lifecycle detail remains brief enough for a status row and cannot retain an
+/// endpoint-controlled unbounded string.
+const MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES: usize = 160;
+const LIFECYCLE_HEADER: &str = "x-ygg-lifecycle";
+const LIFECYCLE_REQUEST_VALUE: &str = "1";
+const LIFECYCLE_COMMENT_PREFIX: &str = "ygg-lifecycle:";
+
+/// Parses Ygg's explicitly negotiated OpenAI-compatible lifecycle value.
+///
+/// The wire form is `state` or `state; detail`, where state is one of
+/// `queued`, `loading`, or `ready`. Unknown states and malformed namespaces
+/// are deliberately ignored: this is advisory telemetry, never assistant text.
+fn parse_provider_lifecycle(
+    value: &str,
+    diagnostic_redactor: &CredentialRedactor,
+) -> Option<ProviderLifecycle> {
+    let (state, detail) = value
+        .split_once(';')
+        .map_or((value, None), |(state, detail)| (state, Some(detail)));
+    let state = ProviderLifecycleState::from_wire(state)?;
+    let detail = detail.and_then(|detail| {
+        let detail = detail.trim();
+        (!detail.is_empty()).then(|| {
+            sanitize_diagnostic(
+                diagnostic_redactor,
+                detail,
+                MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES,
+            )
+        })
+    });
+    Some(ProviderLifecycle { state, detail })
+}
+
+/// Extracts a lifecycle comment without treating ordinary SSE comments as
+/// provider data. The `ygg-lifecycle:` namespace is accepted only after the
+/// endpoint explicitly opted in through the request header.
+fn lifecycle_from_sse_comment(
+    comment: &str,
+    diagnostic_redactor: &CredentialRedactor,
+) -> Option<ProviderLifecycle> {
+    parse_provider_lifecycle(
+        comment.strip_prefix(LIFECYCLE_COMMENT_PREFIX)?.trim_start(),
+        diagnostic_redactor,
+    )
+}
 
 fn is_bidi_format_control(character: char) -> bool {
     matches!(
@@ -428,6 +477,15 @@ async fn stream_http(
         buffer_ambiguous_compatibility_content,
         diagnostic_redactor,
     } = request;
+    let lifecycle_feedback = parts.streaming
+        && model.spec.protocol == Protocol::OpenAiChat
+        && model.endpoint.runtime.lifecycle_feedback;
+    if lifecycle_feedback {
+        headers.insert(
+            http::HeaderName::from_static(LIFECYCLE_HEADER),
+            http::HeaderValue::from_static(LIFECYCLE_REQUEST_VALUE),
+        );
+    }
     let request_body =
         prepare_request_body(model.endpoint.runtime, &mut headers, parts.body.clone()).await;
 
@@ -536,10 +594,19 @@ async fn stream_http(
     }
 
     // 5. Decode ResponseStream
+    let initial_lifecycle = lifecycle_feedback
+        .then(|| {
+            res.headers()
+                .get(LIFECYCLE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_provider_lifecycle(value, &diagnostic_redactor))
+        })
+        .flatten();
     let model_clone = model.clone();
     if parts.streaming {
         let byte_stream = res.bytes_stream();
         let diags = pre_send_diagnostics;
+        let lifecycle_redactor = diagnostic_redactor.clone();
         let raw_event_stream = try_stream! {
             let mut sse_decoder = crate::protocol::sse::SseDecoder::new();
             let mut builder = ResponseBuilder::new(
@@ -553,6 +620,20 @@ async fn stream_http(
             );
             for d in &diags {
                 builder.add_diagnostic(d.clone());
+            }
+
+            let mut lifecycle_stream_started = false;
+            let mut lifecycle_events_emitted = 0usize;
+            if let Some(lifecycle) = initial_lifecycle {
+                // Header feedback arrives before any provider SSE event. Seed
+                // the canonical stream first so advisory telemetry still obeys
+                // the `Started`-is-first invariant.
+                let started = StreamEvent::Started { response_id: None };
+                builder.on_event(&started)?;
+                yield started;
+                lifecycle_stream_started = true;
+                lifecycle_events_emitted += 1;
+                yield StreamEvent::ProviderLifecycle(lifecycle);
             }
 
             let mut stream = byte_stream;
@@ -632,7 +713,17 @@ async fn stream_http(
                         .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
 
-                let sse_events = sse_decoder.push(&chunk).map_err(|error| {
+                let sse_frames = if lifecycle_feedback {
+                    sse_decoder.push_frames(&chunk)
+                } else {
+                    sse_decoder.push(&chunk).map(|events| {
+                        events
+                            .into_iter()
+                            .map(crate::protocol::sse::SseFrame::Event)
+                            .collect()
+                    })
+                }
+                .map_err(|error| {
                     annotate_stream_failure(
                         AiError::Decode(error),
                         &builder,
@@ -641,72 +732,162 @@ async fn stream_http(
                         last_event_at,
                     )
                 })?;
-                if !sse_events.is_empty() {
+                let lifecycle_frame_seen = lifecycle_feedback
+                    && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                    && sse_frames.iter().any(|frame| {
+                        matches!(
+                            frame,
+                            crate::protocol::sse::SseFrame::Comment(comment)
+                                if lifecycle_from_sse_comment(comment, &lifecycle_redactor).is_some()
+                        )
+                    });
+                if sse_frames.iter().any(|frame| matches!(frame, crate::protocol::sse::SseFrame::Event(_)))
+                    || lifecycle_frame_seen
+                {
                     provider_event_seen = true;
                     last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
                 }
 
-                for sse in sse_events {
-                    let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
-                    }
-                    .map_err(|error| {
-                        annotate_stream_failure(
-                            error,
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
-                        )
-                    })?;
-                    for ev in stream_events {
-                        let terminal = matches!(ev, StreamEvent::Finished(_));
-                        yield ev;
-                        if terminal {
-                            terminal_seen = true;
-                            break 'read;
+                for frame in sse_frames {
+                    match frame {
+                        crate::protocol::sse::SseFrame::Comment(comment) => {
+                            if lifecycle_feedback
+                                && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                            {
+                                if let Some(lifecycle) =
+                                    lifecycle_from_sse_comment(&comment, &lifecycle_redactor)
+                                {
+                                    if !lifecycle_stream_started {
+                                        let started = StreamEvent::Started { response_id: None };
+                                        builder.on_event(&started)?;
+                                        yield started;
+                                        lifecycle_stream_started = true;
+                                    }
+                                    lifecycle_events_emitted += 1;
+                                    yield StreamEvent::ProviderLifecycle(lifecycle);
+                                }
+                            }
+                        }
+                        crate::protocol::sse::SseFrame::Event(sse) => {
+                            let stream_events = match model_clone.spec.protocol {
+                                Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                            }
+                            .map_err(|error| {
+                                annotate_stream_failure(
+                                    error,
+                                    &builder,
+                                    first_body_chunk,
+                                    started_at,
+                                    last_event_at,
+                                )
+                            })?;
+                            for ev in stream_events {
+                                let started = matches!(ev, StreamEvent::Started { .. });
+                                let terminal = matches!(ev, StreamEvent::Finished(_));
+                                yield ev;
+                                lifecycle_stream_started |= started;
+                                if terminal {
+                                    terminal_seen = true;
+                                    break 'read;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Only flush a trailing partial SSE frame if no terminal event was
-            // seen; after `Finished` the stream is closed and any residue is
-            // ignored rather than decoded into post-terminal events.
+            // Only flush trailing SSE frames if no terminal event was seen;
+            // after `Finished` the stream is closed and any residue is ignored
+            // rather than decoded into post-terminal events.
             if !terminal_seen {
-                if let Some(sse) =
-                    sse_decoder.finish().map_err(|error| {
-                        annotate_stream_failure(
-                            AiError::Decode(error),
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
+                let trailing_frames = if lifecycle_feedback {
+                    sse_decoder.finish_frames()
+                } else {
+                    sse_decoder.finish().map(|event| {
+                        event
+                            .into_iter()
+                            .map(crate::protocol::sse::SseFrame::Event)
+                            .collect()
+                    })
+                }
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        AiError::Decode(error),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+                let lifecycle_frame_seen = lifecycle_feedback
+                    && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                    && trailing_frames.iter().any(|frame| {
+                        matches!(
+                            frame,
+                            crate::protocol::sse::SseFrame::Comment(comment)
+                                if lifecycle_from_sse_comment(comment, &lifecycle_redactor).is_some()
                         )
-                    })?
+                    });
+                if trailing_frames.iter().any(|frame| matches!(frame, crate::protocol::sse::SseFrame::Event(_)))
+                    || lifecycle_frame_seen
                 {
                     provider_event_seen = true;
                     last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
-                    let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                }
+
+                for frame in trailing_frames {
+                    if terminal_seen {
+                        break;
                     }
-                    .map_err(|error| {
-                        annotate_stream_failure(
-                            error,
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
-                        )
-                    })?;
-                    for ev in stream_events {
-                        yield ev;
+                    match frame {
+                        crate::protocol::sse::SseFrame::Comment(comment) => {
+                            if lifecycle_feedback
+                                && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                            {
+                                if let Some(lifecycle) =
+                                    lifecycle_from_sse_comment(&comment, &lifecycle_redactor)
+                                {
+                                    if !lifecycle_stream_started {
+                                        let started = StreamEvent::Started { response_id: None };
+                                        builder.on_event(&started)?;
+                                        yield started;
+                                        lifecycle_stream_started = true;
+                                    }
+                                    lifecycle_events_emitted += 1;
+                                    yield StreamEvent::ProviderLifecycle(lifecycle);
+                                }
+                            }
+                        }
+                        crate::protocol::sse::SseFrame::Event(sse) => {
+                            let stream_events = match model_clone.spec.protocol {
+                                Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                            }
+                            .map_err(|error| {
+                                annotate_stream_failure(
+                                    error,
+                                    &builder,
+                                    first_body_chunk,
+                                    started_at,
+                                    last_event_at,
+                                )
+                            })?;
+                            for ev in stream_events {
+                                let started = matches!(ev, StreamEvent::Started { .. });
+                                let terminal = matches!(ev, StreamEvent::Finished(_));
+                                yield ev;
+                                lifecycle_stream_started |= started;
+                                if terminal {
+                                    terminal_seen = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1602,6 +1783,27 @@ mod tests {
         assert!(!error.message.contains(secret));
         assert!(!error.message.contains("/private/catalog"));
         assert!(!error.message.contains(&address.to_string()));
+    }
+
+    #[test]
+    fn lifecycle_details_are_redacted_control_safe_and_bounded() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", "Bearer lifecycle-secret".parse().unwrap());
+        let mut redactor = CredentialRedactor::default();
+        redactor.include_header_values(&headers);
+        let detail = format!("Bearer lifecycle-secret \x1b{}", "é".repeat(200));
+
+        let lifecycle = parse_provider_lifecycle(&format!("loading; {detail}"), &redactor)
+            .expect("known lifecycle state");
+        assert_eq!(lifecycle.state, ProviderLifecycleState::Loading);
+        let detail = lifecycle.detail.expect("nonempty detail");
+        assert!(detail.len() <= MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES);
+        assert!(detail.is_char_boundary(detail.len()));
+        assert!(detail.contains("[REDACTED]"));
+        assert!(!detail.contains("lifecycle-secret"));
+        assert!(!detail.chars().any(char::is_control));
+        assert!(lifecycle_from_sse_comment("ordinary keepalive", &redactor).is_none());
+        assert!(parse_provider_lifecycle("unknown; ignored", &redactor).is_none());
     }
 
     #[test]

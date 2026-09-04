@@ -269,6 +269,12 @@ impl EventObserver for TelemetryObserver {
     }
 
     fn on_event_for_owner(&self, event: &AgentEvent, resource_owner: &str) {
+        // Endpoint readiness is presentation-only transport telemetry. Do not
+        // write it to the durable agent telemetry log, even for legacy callers
+        // that never registered a run-start hook.
+        if matches!(event, AgentEvent::ProviderLifecycle { .. }) {
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
@@ -779,7 +785,9 @@ impl EventObserver for TelemetryObserver {
                     fields,
                 );
             }
-            AgentEvent::ToolProgress { .. } | AgentEvent::OutputMedia { .. } => {}
+            AgentEvent::ToolProgress { .. }
+            | AgentEvent::OutputMedia { .. }
+            | AgentEvent::ProviderLifecycle { .. } => {}
         }
     }
 }
@@ -879,6 +887,7 @@ fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStarted { .. } => "compaction_started",
         AgentEvent::CompactionFinished { .. } => "compaction_finished",
         AgentEvent::TurnStarted => "model_request_started",
+        AgentEvent::ProviderLifecycle { .. } => "provider_lifecycle",
         AgentEvent::ToolStarted { .. } => "tool_started",
         AgentEvent::ToolPolicyDecision { .. } => "tool_policy_decision",
         AgentEvent::ToolFinished { .. } => "tool_finished",

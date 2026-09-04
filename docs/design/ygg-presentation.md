@@ -43,6 +43,12 @@ Structured telemetry is evidence for measurement; it is not a one-row-per-event
 rendering instruction. Presentation code coalesces activity by stable request,
 tool, and worker identity.
 
+Opt-in provider readiness (`queued`, `loading`, or `ready`) is live activity,
+not a fourth transcript layer. It replaces one mutable request-status row with a
+friendly provider label and bounded sanitized detail; real model output or a
+terminal outcome removes it. It is never retained as conversation text, session
+content, or default telemetry.
+
 ## Surface and geometry contract
 
 Transcript surfaces, the composer, footer, and pickers resolve one shared

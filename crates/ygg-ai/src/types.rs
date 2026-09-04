@@ -135,6 +135,14 @@ pub struct RequestRuntime {
     /// Responses-family behavior selected by the endpoint declaration.
     #[serde(default)]
     pub responses_profile: ResponsesRuntimeProfile,
+    /// Opt into Ygg's OpenAI-compatible cold-start lifecycle extension.
+    ///
+    /// When enabled on a streaming OpenAI Chat HTTP/SSE request, Ygg advertises
+    /// support with `x-ygg-lifecycle: 1` and accepts the documented response
+    /// header and SSE comment updates. Endpoints that do not explicitly enable
+    /// this keep the ordinary OpenAI-compatible request and response behavior.
+    #[serde(default)]
+    pub lifecycle_feedback: bool,
 }
 
 /// Endpoint behavior for an existing OpenAI Responses codec.

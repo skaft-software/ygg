@@ -184,6 +184,14 @@ display. The shimmer advances on the renderer thread at a bounded 80 ms cadence,
 changes style rather than text or geometry, and invalidates only the active
 status block.
 
+Before any model delta, an opted-in endpoint readiness update may temporarily
+replace `Working` with `Provider queued`, `Loading Provider`, or `Provider
+ready`, plus bounded sanitized detail. It reuses the active status block rather
+than creating reasoning or transcript content. The first real model delta,
+retry, compaction, and authoritative terminal outcome remove that endpoint
+label; a completed provider turn restores generic `Working` while the run stays
+active.
+
 Visible assistant text does not prove that the owning run has settled. Exactly
 one trailing `Working (<elapsed> • esc to interrupt)` row remains while the run
 is active, including after public text; its timer is measured from the latest

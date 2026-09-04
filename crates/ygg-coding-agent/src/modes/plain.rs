@@ -18,8 +18,9 @@ use sexy_tui_rs::{sanitize_text, ControlPictures, SanitizeOptions};
 use crate::app::bootstrap::{build_app, resolve_launch_print, Bootstrap};
 use crate::modes::{timestamp, HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::{
-    format_duration, is_hidden_tool_detail, summarize_tool_with_workspace, tool_failure_reason,
-    tool_result_is_failure, RunOutcome, RunPhase, RunTracker,
+    format_duration, is_hidden_tool_detail, provider_lifecycle_label,
+    summarize_tool_with_workspace, tool_failure_reason, tool_result_is_failure, RunOutcome,
+    RunPhase, RunTracker,
 };
 use crate::resources::{compose_instructions, expand_skill_command};
 use crate::tui::theme::YggTheme;
@@ -317,6 +318,15 @@ async fn run_prompt(
                         }
                     }
                     AgentEvent::OutputMedia { .. } => {}
+                    AgentEvent::ProviderLifecycle { lifecycle } => {
+                        // Lifecycle telemetry is diagnostic-only. Keep it out
+                        // of this mode's response/log stdout so a caller can
+                        // still separate answer text from endpoint readiness.
+                        crate::output::stderr!(
+                            "[working] {}",
+                            provider_lifecycle_label(&app.model.endpoint.id.0, lifecycle)
+                        );
+                    }
                     AgentEvent::ProviderRetry {
                         attempt,
                         max_attempts,
@@ -496,6 +506,22 @@ async fn run_prompt(
                     let label = match current.phase() {
                         RunPhase::Preparing { summary } => summary.clone(),
                         RunPhase::AwaitingProvider { provider } => format!("waiting for {provider}"),
+                        RunPhase::ProviderLifecycle {
+                            provider,
+                            state,
+                            detail,
+                        } => {
+                            let lifecycle = ygg_ai::ProviderLifecycle {
+                                state: *state,
+                                detail: detail.clone(),
+                            };
+                            crate::output::stderr!(
+                                "[working] {} - {}",
+                                provider_lifecycle_label(provider, &lifecycle),
+                                format_duration(current.phase_elapsed_at(std::time::Instant::now()))
+                            );
+                            continue;
+                        }
                         RunPhase::Thinking => "thinking".into(),
                         RunPhase::StreamingResponse => "writing response".into(),
                         RunPhase::PreparingToolCall => "preparing tool call".into(),

@@ -8343,6 +8343,10 @@ async fn project_agent_event(
 ) -> Result<Option<HostRunOutcome>, ServiceError> {
     match agent_event {
         AgentEvent::TurnStarted => {}
+        AgentEvent::ProviderLifecycle { .. } => {
+            // Serve's durable item protocol intentionally has no endpoint-status
+            // item. Keep transport readiness out of session projections.
+        }
         AgentEvent::OutputDelta { channel, text } => {
             let text = bounded_text(&text, MAX_ITEM_TEXT_BYTES);
             let turn_id = projection.turn_id(run_id)?;

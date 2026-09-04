@@ -5782,6 +5782,11 @@ impl Agent {
                         Next::Event(Some(Ok(event))) => {
                             stream_context.observe_stream(&event);
                             match event {
+                            StreamEvent::ProviderLifecycle(lifecycle) => {
+                                let ev = AgentEvent::ProviderLifecycle { lifecycle };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                            }
                             StreamEvent::TextDelta { delta, .. } => {
                                 attempt_saw_generation = true;
                                 let ev = AgentEvent::OutputDelta {

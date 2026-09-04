@@ -110,6 +110,11 @@ pub struct CustomProvider {
     /// Maximum time to wait for initial response headers from a cold endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_timeout_secs: Option<u64>,
+    /// Opt into the bounded HTTP/SSE lifecycle feedback extension for this
+    /// OpenAI-compatible endpoint. Ordinary endpoint behavior is unchanged
+    /// unless this is explicitly enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lifecycle_feedback: bool,
 }
 
 impl CustomProvider {
@@ -123,6 +128,7 @@ impl CustomProvider {
             api_key_env: None,
             cache: None,
             startup_timeout_secs: None,
+            lifecycle_feedback: false,
         }
     }
 }
@@ -137,6 +143,7 @@ impl fmt::Debug for CustomProvider {
             .field("api_key_env", &self.api_key_env)
             .field("cache", &self.cache)
             .field("startup_timeout_secs", &self.startup_timeout_secs)
+            .field("lifecycle_feedback", &self.lifecycle_feedback)
             .finish()
     }
 }
@@ -551,6 +558,7 @@ impl CredentialStore {
                 provider.api_key_env = previous.api_key_env.clone();
                 provider.cache = previous.cache.clone();
                 provider.startup_timeout_secs = previous.startup_timeout_secs;
+                provider.lifecycle_feedback = previous.lifecycle_feedback;
             }
         }
         self.save_registry(&CustomRegistry::single(LEGACY_PROVIDER_ID, provider))
@@ -634,6 +642,15 @@ fn parse_registry(bytes: &[u8], path: &Path) -> Result<CustomRegistry> {
                     .with_context(|| format!("invalid startup timeout in {}", path.display()))
             })
             .transpose()?;
+        let lifecycle_feedback = value
+            .get("lifecycle_feedback")
+            .map(|enabled| {
+                serde_json::from_value(enabled.clone()).with_context(|| {
+                    format!("invalid lifecycle feedback setting in {}", path.display())
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
         let mut registry = CustomRegistry::single(
             LEGACY_PROVIDER_ID,
             CustomProvider {
@@ -643,6 +660,7 @@ fn parse_registry(bytes: &[u8], path: &Path) -> Result<CustomRegistry> {
                 api_key_env: None,
                 cache,
                 startup_timeout_secs,
+                lifecycle_feedback,
             },
         );
         registry.legacy_single_endpoint = true;
@@ -848,6 +866,7 @@ mod tests {
                 api_key_env: None,
                 cache: None,
                 startup_timeout_secs: Some(420),
+                lifecycle_feedback: false,
             };
         let mut registry = CustomRegistry::single(
             "apple-fm",
@@ -1080,6 +1099,39 @@ mod tests {
         };
         store.save(&credential).unwrap();
         assert_eq!(store.load_startup_timeout_secs().unwrap(), Some(420));
+    }
+
+    #[test]
+    fn lifecycle_feedback_defaults_false_and_is_preserved_for_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        write_private_fixture(
+            &path,
+            r#"{
+                "base_url": "http://localhost:1234/v1/",
+                "lifecycle_feedback": true
+            }"#,
+        );
+
+        let store = CredentialStore::new(&path);
+        let registry = store.load_registry().unwrap().unwrap();
+        assert!(registry.providers[LEGACY_PROVIDER_ID].lifecycle_feedback);
+
+        let credential = CustomCredential {
+            base_url: "http://localhost:5678/v1/".to_string(),
+            api_key: String::new(),
+            api_name: "local".to_string(),
+            headers: vec![],
+            models: vec![],
+            auto_discover: false,
+        };
+        store.save(&credential).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("\"lifecycle_feedback\": true"));
+
+        let defaulted: CustomProvider =
+            serde_json::from_str(r#"{"base_url":"http://localhost:1234/v1/"}"#).unwrap();
+        assert!(!defaulted.lifecycle_feedback);
     }
 
     #[test]

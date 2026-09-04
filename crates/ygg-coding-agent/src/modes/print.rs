@@ -142,6 +142,17 @@ pub async fn run_print(boot: Bootstrap, prompt: String) -> anyhow::Result<()> {
                 channel: OutputChannel::Reasoning,
                 text,
             } if show_reasoning => pending_output.push_str(&text),
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // `--print` stdout is response-only. Surface opt-in endpoint
+                // telemetry only as a separate stderr diagnostic.
+                crate::output::stderr!(
+                    "provider lifecycle: {}",
+                    crate::presentation::provider_lifecycle_label(
+                        &app.model.endpoint.id.0,
+                        &lifecycle
+                    )
+                );
+            }
             // stdout cannot retract bytes. Keep each provider attempt buffered
             // until `TurnFinished`, then a transient reconnect can discard its
             // provisional output without corrupting print-mode results.

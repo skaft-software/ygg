@@ -2269,6 +2269,7 @@ fn default_apple_foundation_models_provider() -> crate::auth::custom::CustomProv
         api_key_env: None,
         cache: None,
         startup_timeout_secs: Some(CUSTOM_ENDPOINT_STARTUP_TIMEOUT.as_secs()),
+        lifecycle_feedback: false,
     }
 }
 
@@ -2423,7 +2424,10 @@ fn register_custom_openai_provider(
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
-        runtime: ygg_ai::RequestRuntime::default(),
+        runtime: ygg_ai::RequestRuntime {
+            lifecycle_feedback: provider.lifecycle_feedback,
+            ..ygg_ai::RequestRuntime::default()
+        },
         timeout: startup_timeout,
     })?;
     let label = provider.label.trim();

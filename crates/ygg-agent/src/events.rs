@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use serde::Serialize;
-use ygg_ai::{AssistantMessage, Cost, Media, ToolCallId, Usage};
+use ygg_ai::{AssistantMessage, Cost, Media, ProviderLifecycle, ToolCallId, Usage};
 
 use crate::agent::AgentError;
 use crate::effect::{EffectAuthorization, ToolEffect, ToolPolicyDenialCode};
@@ -258,6 +258,17 @@ pub enum AgentEvent {
     ///
     /// Advisory only: never persisted in the session.
     TurnStarted,
+
+    /// Transient provider readiness feedback from an explicitly opted-in
+    /// transport extension.
+    ///
+    /// This is neither assistant content nor a retry signal. It is forwarded
+    /// only while the current provider stream is live and is never persisted in
+    /// the session or replayed to a model.
+    ProviderLifecycle {
+        /// Bounded, credential-redacted endpoint status.
+        lifecycle: ProviderLifecycle,
+    },
 
     /// A tool call was emitted by the model and host-side admission begins now.
     /// A matching [`ToolFinished`](Self::ToolFinished) is emitted even when
