@@ -40,6 +40,9 @@ pub struct EndpointConfig {
     /// Preferred response transport.
     #[serde(default)]
     pub transport: crate::types::EndpointTransport,
+    /// Endpoint-specific request runtime behavior selected by a provider declaration.
+    #[serde(default)]
+    pub runtime: crate::types::RequestRuntime,
     /// Maximum time to send a request and receive response headers, in seconds.
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
@@ -58,6 +61,13 @@ pub enum AuthConfig {
     },
     /// Custom header credentials referenced by an environment variable.
     HeaderEnv {
+        /// Header name.
+        name: String,
+        /// Env var name.
+        var: String,
+    },
+    /// Bearer token forwarded in a custom header referenced by an environment variable.
+    HeaderBearerEnv {
         /// Header name.
         name: String,
         /// Env var name.
@@ -250,6 +260,34 @@ impl ModelCatalog {
         self.endpoints.contains_key(id)
     }
 
+    /// Removes a model only when it still belongs to the supplied endpoint.
+    ///
+    /// Dynamic host-owned catalogs use this fence to avoid deleting a model
+    /// which another catalog source registered under the same identifier.
+    pub fn remove_model_if_endpoint(&mut self, id: &ModelId, endpoint: &EndpointId) -> bool {
+        let belongs_to_endpoint = self
+            .models
+            .get(id)
+            .is_some_and(|model| &model.endpoint == endpoint);
+        if belongs_to_endpoint {
+            self.models.remove(id);
+        }
+        belongs_to_endpoint
+    }
+
+    /// Removes an endpoint only when no remaining model uses it.
+    ///
+    /// Returns `true` when an endpoint was removed. Endpoint labels are
+    /// removed with the endpoint so a future registration cannot inherit a
+    /// stale presentation label.
+    pub fn remove_endpoint_if_unused(&mut self, id: &EndpointId) -> bool {
+        if self.models.values().any(|model| &model.endpoint == id) {
+            return false;
+        }
+        self.endpoint_labels.remove(id);
+        self.endpoints.remove(id).is_some()
+    }
+
     /// Removes models whose endpoint has no usable credentials.
     ///
     /// Endpoints are retained because they may be shared with models registered
@@ -265,6 +303,17 @@ impl ModelCatalog {
     }
 }
 
+/// Google request URLs interpolate `api_name` into one fixed path segment.
+/// Restrict it at catalog ingress so discovery/configuration cannot escape the
+/// configured Gemini or Vertex endpoint scope.
+fn google_api_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
     if spec.api_name.is_empty()
         || !spec.capabilities.input_modalities.is_valid()
@@ -272,6 +321,8 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
         || spec.limits.context_window == 0
         || spec.limits.max_output_tokens == 0
         || spec.limits.max_output_tokens > spec.limits.context_window
+        || (spec.protocol == Protocol::GoogleGenerativeAi
+            && !google_api_name_is_safe(&spec.api_name))
         || (spec.protocol != Protocol::OpenAiChat
             && (spec.capabilities.input_modalities.contains(Modality::Audio)
                 || spec
@@ -307,7 +358,11 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
                 reasoning.control,
                 ReasoningControl::Effort | ReasoningControl::AlwaysOn | ReasoningControl::Toggle
             ),
-            Protocol::OpenAiResponses => reasoning.control == ReasoningControl::Effort,
+            Protocol::OpenAiResponses | Protocol::GoogleGenerativeAi => {
+                reasoning.control == ReasoningControl::Effort
+            }
+            // Converse has no portable reasoning control in this codec.
+            Protocol::BedrockConverse => false,
         };
         let chat_mode_matches = reasoning.openai_chat_mode == OpenAiChatReasoningMode::Standard
             || (spec.protocol == Protocol::OpenAiChat
@@ -354,21 +409,31 @@ pub(crate) fn validate_endpoint(endpoint: &Endpoint) -> Result<(), ConfigError> 
 }
 
 fn validate_base_url(url: &url::Url) -> Result<(), ConfigError> {
+    let allowed_version_query = url.query_pairs().collect::<Vec<_>>();
+    let has_only_api_version = allowed_version_query.len() == 1
+        && allowed_version_query[0].0 == "api-version"
+        && !allowed_version_query[0].1.is_empty()
+        && allowed_version_query[0].1.len() <= 128
+        && allowed_version_query[0]
+            .1
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
     if !url.cannot_be_a_base()
         && (url.scheme() == "http" || url.scheme() == "https")
         && url.username().is_empty()
         && url.password().is_none()
-        && url.query().is_none()
+        && (url.query().is_none() || has_only_api_version)
         && url.fragment().is_none()
         && url.path().ends_with('/')
     {
         Ok(())
     } else {
-        // Invalid URLs may contain userinfo or query credentials. Return the
-        // contract, not attacker-controlled URL text, because catalog errors
-        // can be persisted or presented directly by downstream applications.
+        // Invalid URLs may contain userinfo or query credentials. The only
+        // query accepted on an endpoint base is Azure's non-secret
+        // `api-version`; return the contract, not attacker-controlled URL text,
+        // because catalog errors can be persisted or presented directly.
         Err(ConfigError::InvalidBaseUrl(
-            "expected an absolute HTTP(S) URL without userinfo, query, or fragment and with a trailing slash"
+            "expected an absolute HTTP(S) URL without userinfo or fragment, with a trailing slash and at most one non-secret api-version query"
                 .to_owned(),
         ))
     }
@@ -385,6 +450,11 @@ fn resolve_auth(
             let header_name = http::HeaderName::from_bytes(name.as_bytes())
                 .map_err(|e| ConfigError::InvalidHeader(e.to_string()))?;
             Ok(crate::auth::Auth::header_env(header_name, var))
+        }
+        AuthConfig::HeaderBearerEnv { name, var } => {
+            let header_name = http::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| ConfigError::InvalidHeader(e.to_string()))?;
+            Ok(crate::auth::Auth::header_bearer_env(header_name, var))
         }
         AuthConfig::Dynamic { resolver_id } => {
             let resolver = resolvers
@@ -428,6 +498,7 @@ fn translate_endpoint(
         auth,
         default_headers,
         transport: cfg.transport,
+        runtime: cfg.runtime,
         timeout: std::time::Duration::from_secs(cfg.timeout_secs),
     })
 }
@@ -451,6 +522,58 @@ mod tests {
     }
 
     #[test]
+    fn builtin_gpt_6_astra_matches_the_public_openai_contract() {
+        let catalog = ModelCatalog::builtin().unwrap();
+        let model = catalog.resolve(&ModelId("gpt-6-astra".to_owned())).unwrap();
+        assert_eq!(model.spec.api_name, "gpt-6-astra");
+        assert_eq!(model.spec.display_name.as_deref(), Some("GPT-6 Astra"));
+        assert_eq!(model.spec.endpoint.0, "openai");
+        assert_eq!(model.spec.protocol, crate::types::Protocol::OpenAiResponses);
+        assert_eq!(model.spec.limits.context_window, 1_050_000);
+        assert_eq!(model.spec.limits.max_output_tokens, 128_000);
+
+        let capabilities = &model.spec.capabilities;
+        assert!(capabilities
+            .input_modalities
+            .contains(crate::types::Modality::Image));
+        assert!(!capabilities
+            .input_modalities
+            .contains(crate::types::Modality::Audio));
+        assert_eq!(
+            capabilities.output_modalities,
+            crate::types::ModalitySet::none()
+        );
+        assert!(capabilities.tools);
+        assert!(capabilities.parallel_tool_calls);
+        assert!(capabilities.structured_output);
+        assert!(!capabilities.responses_lite);
+        assert_eq!(capabilities.agent_delegation, None);
+        let reasoning = capabilities.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.control, ReasoningControl::Effort);
+        assert_eq!(reasoning.min_effort, crate::types::ReasoningEffort::Low);
+        assert_eq!(reasoning.max_effort, crate::types::ReasoningEffort::Max);
+
+        let pricing = model.spec.pricing.as_ref().unwrap();
+        assert_eq!(pricing.input, crate::pricing::TokenRate(10_000_000));
+        assert_eq!(pricing.cache_read, crate::pricing::TokenRate(1_000_000));
+        assert_eq!(
+            pricing.cache_write_5m,
+            crate::pricing::TokenRate(12_500_000)
+        );
+        assert_eq!(pricing.output, crate::pricing::TokenRate(50_000_000));
+        assert_eq!(pricing.tiers.len(), 1);
+        let tier = &pricing.tiers[0];
+        assert_eq!(tier.min_input_tokens, 272_001);
+        assert_eq!(tier.input, Some(crate::pricing::TokenRate(20_000_000)));
+        assert_eq!(tier.cache_read, Some(crate::pricing::TokenRate(2_000_000)));
+        assert_eq!(
+            tier.cache_write_5m,
+            Some(crate::pricing::TokenRate(25_000_000))
+        );
+        assert_eq!(tier.output, Some(crate::pricing::TokenRate(75_000_000)));
+    }
+
+    #[test]
     fn endpoint_labels_are_presentation_only_and_follow_endpoint_identity() {
         let mut catalog = ModelCatalog::default();
         let endpoint_id = EndpointId("custom-apple-fm".into());
@@ -461,6 +584,7 @@ mod tests {
                 auth: crate::auth::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(300),
             })
             .unwrap();
@@ -502,6 +626,7 @@ mod tests {
                 auth: crate::auth::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(1),
             })
             .unwrap();
@@ -516,6 +641,7 @@ mod tests {
                 )),
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(1),
             })
             .unwrap();
@@ -535,6 +661,7 @@ mod tests {
         for id in [
             "gpt-4o-mini",
             "gpt-5.4-mini-responses",
+            "gpt-6-astra",
             "claude-sonnet-4-5",
             "claude-fable-5",
             "claude-opus-4-8",
@@ -656,6 +783,7 @@ mod tests {
             auth: AuthConfig::None,
             default_headers: BTreeMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout_secs: 10,
         }];
 
@@ -679,6 +807,7 @@ mod tests {
             auth: AuthConfig::None,
             default_headers: BTreeMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout_secs: 10,
         }];
         let cfg_slash = CatalogConfig {
@@ -706,6 +835,7 @@ mod tests {
                 },
                 default_headers,
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout_secs: 10,
             }],
             models: vec![],
@@ -740,6 +870,7 @@ mod tests {
                 },
                 default_headers: BTreeMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout_secs: 10,
             }],
             models: vec![],

@@ -64,6 +64,48 @@ under the same byte/record bounds, cache failures fall back to JSONL, and
 normally dropped `App` instances refresh their already-replayed active session
 without reopening it. The catalog is never a prerequisite for resume.
 
+## Provider setup and readiness
+
+The custom credential registry and the canonical `ModelCatalog` are the sole
+provider state. `ProviderSetupService` captures a registry snapshot, validates
+one explicitly selected OpenAI-compatible endpoint, optionally performs one
+bounded `/models` probe, presents a secret-free receipt, and persists through a
+private compare-and-swap only after final confirmation. It then rebuilds the
+same canonical catalog and verifies the selected `ModelId`; it never constructs
+a partial `Agent`, scans localhost, follows discovery redirects, writes setup
+telemetry, or creates a parallel catalog/store.
+
+Interactive startup opens the ordinary guided setup surfaces only when bootstrap
+has no runnable model inventory and there is no explicit `--model`; cancellation
+continues in existing read-only model-less mode. A successful setup installs the
+rebuilt catalog and selected default in memory, while keeping resumed-session
+model provenance eligible to win under normal startup precedence. Print and RPC
+never open a picker: unresolved and unavailable models return a deterministic
+secret-safe diagnostic that names `ygg setup --yes` and available model IDs.
+
+The non-interactive `ygg setup` adapter shares the transaction. It requires an
+explicit `--endpoint` or explicit `--preset lm-studio`, reviews by default, and
+uses `--yes` to commit. `--offline --manual-model` is the no-probe recovery
+path. Cancellation, review-only operation, offline discovery rejection, and a
+stale registry snapshot do not write the registry.
+
+## Custom endpoint lifecycle feedback
+
+A custom registry provider may set `lifecycle_feedback: true`. Bootstrap copies
+that explicit opt-in into the selected route's `RequestRuntime`; legacy and
+built-in declarations remain false. The HTTP client then owns negotiation and
+parsing, so product configuration never changes an ordinary endpoint's wire
+behavior.
+
+The product treats accepted readiness updates as nonpersistent activity. The TUI
+replaces its mutable `Working` row with a bounded provider-status label until
+model output or settlement; plain and print modes write the diagnostic to stderr
+so print stdout stays response-only. RPC and the native host expose a structured
+`provider_lifecycle` event for clients that choose to render it. Session records,
+serve item projections, and durable telemetry deliberately omit this endpoint
+telemetry. It is observational only and does not change retry or timeout
+semantics.
+
 ## System prompt
 
 The stable, model-agnostic base contract gives both local and cloud models an
@@ -156,15 +198,24 @@ A consuming rebuild drops the old Agent before reopening its session, so only
 one append handle owns a session file. Every Agent also receives a product-owned
 `EffectBroker`. Its default uses `UnsafeHost`, where authoritatively classified
 effects use the current user's host authority subject to the remaining tool and
-sandbox gates. `--safe-mode` selects `ControlledBashApproval`, where workspace
-mutation and every `bash` process call are approved interactively while other
-ambient host/process, network, delegation, and extension effects remain denied.
-Executable-extension startup is gated separately at the product boundary: even
-enabled, trusted extensions are discovered but never launched under `--safe-mode`.
-Delegated children inherit the same broker policy through the root's delegation
-template.
+sandbox gates. `effect_policy` / `YGG_EFFECT_POLICY` / `--effect-policy` select
+`controlled_bash_approval`, `controlled`, or `unsafe_host`; a trusted project may
+tighten, but not relax, the global profile, while environment and CLI use normal
+precedence. `--safe-mode` conflicts with `--effect-policy` and selects
+`ControlledBashApproval`, where workspace mutation and every `bash` process call
+are approved interactively while other ambient host/process, network, delegation,
+and extension effects remain denied. Invalid profile errors are generic and never
+echo the supplied value. Executable-extension startup is gated separately at the
+product boundary: even enabled, trusted extensions are discovered but never
+launched under `--safe-mode`. Delegated children inherit the same broker policy
+through the root's delegation template.
 
 For explicit capability/orchestration boundaries (search vs browser vs computer use, hosted vs in-harness delegation, trust/cwd/approval/sandbox inheritance, and scope non-goals), see [`docs/design/extension-capability-and-orchestration-boundaries.md`](extension-capability-and-orchestration-boundaries.md).
+
+Serve currently has no policy-decision item in its graphical protocol, so its
+projection intentionally ignores `ToolPolicyDecision`; the matching
+`ToolFinished` remains visible. Exposing policy evidence there requires an
+explicit Serve protocol addition rather than silently changing the projection.
 
 The coding host creates an extension-only V2 delegation manager whenever the
 trusted, enabled `ygg-subagents` extension successfully negotiates its
@@ -178,6 +229,10 @@ enforces execution, isolation, provenance, limits, and cancellation;
 `ygg-ai` only reports the provider capability. Delegated children inherit the
 root's approved extensions, sandbox, model/reasoning and cache settings,
 compaction/completion/output policy, retry and turn bounds, and cost ceiling.
+Their bounded status, spawn/list result, and durable spawn record include the
+same effective tool-policy snapshot plus source-only parent-inherited versus
+child-override orchestration provenance; they never expose paths, environment
+values, approval material, extension identities, or model arguments.
 During an active interactive run, the product schedules one nonblocking
 owner-scoped subagent status refresh every 250 ms, reduces the resulting fenced
 semantic snapshot, and renders the complete bounded worker roster as one
@@ -285,24 +340,27 @@ closed.
 
 ## OpenAI Codex discovery and Ultra
 
-Authenticated Codex discovery sends client version `0.147.0` and parses the
-provider's reasoning levels, `use_responses_lite`, and
-`multi_agent_version: "v2"`. Cache schema version 3 preserves those fields and
-the 272K Codex request-window cap, and is scoped to the authenticated account
-context. Only fresh, complete,
-account-matched metadata is registered. Stale or future-dated cache entries are
-refreshed synchronously before online catalog construction; malformed,
-incomplete, duplicate, or inconsistent entries fail closed. Offline launches
-may retain fresh cached model identities and limits but strip Ultra, Responses
-Lite, and delegation. Ygg never infers those dynamic capabilities from model
-names or OAuth plans.
+Authenticated Codex discovery sends compatibility client version `0.153.2` and
+parses the provider's string/object reasoning levels, `use_responses_lite`, and
+`multi_agent_version: "v2"`. Cache schema version 4 invalidates inventories
+queried with older compatibility versions, preserves those fields and the 272K
+Codex request-window cap, and is scoped to the authenticated account context.
+Only fresh, complete, account-matched metadata is registered. Stale or
+future-dated cache entries are refreshed synchronously before online catalog
+construction; malformed, incomplete, duplicate, or inconsistent entries fail
+closed. Offline launches may retain fresh cached model identities and limits but
+strip Ultra, Responses Lite, and delegation. Ygg never infers those dynamic
+capabilities from model names or OAuth plans. Astra additionally retains its
+872K advertised input maximum while ordinary request budgeting stays at 272K.
 
-Ultra is selectable only when the selected model advertises the `ultra` effort
-and V2 delegation and the linked `ygg-agent` host reports an executable V2
-runtime. This avoids advertising “maximum reasoning with automatic task
-delegation” when only the model-side label is present. The legacy persisted
-`ReasoningMode::Pro` value remains readable for durable sessions, but no picker
-or new configuration writes it and no codec serializes `reasoning.mode`.
+Ultra is selectable only when a complete live-derived reasoning range
+explicitly includes `ultra`, V2 delegation is present, and the linked
+`ygg-agent` host reports an executable V2 runtime. An advertised `max` level is
+never promoted to Ultra. This avoids advertising “maximum reasoning with
+automatic task delegation” when only the model-side maximum is present. The
+legacy persisted `ReasoningMode::Pro` value remains readable for durable
+sessions, but no picker or new configuration writes it and no codec serializes
+`reasoning.mode`.
 Eligible legacy selections migrate at startup to Ultra; ineligible ones retain
 their effort with Pro cleared and a warning. At every idle rebuild boundary, an
 explicit effort selection likewise supersedes and clears any restored legacy
@@ -314,6 +372,31 @@ parallel-tool-call bit. This product layer only discovers and propagates the
 capability; it does not reconstruct the wire format or infer support from the
 endpoint identity.
 
+## Host-owned GitHub Copilot
+
+GitHub Copilot is deliberately a host-owned provider rather than a generated
+CLI preset. `CopilotHost` retains GitHub device-flow/OAuth credentials, token
+exchange/refresh state, discovery transport, and any durable storage; Ygg
+receives only a bounded device-display payload, safe availability result,
+credential-free model metadata, and a short-lived in-memory inference session.
+The public provider definition contains only route and setup metadata, and the
+normal environment-backed bootstrap skips host-owned discovery entirely.
+
+An embedding host explicitly binds a vetted origin root and calls
+`CopilotProvider::register_models`. Registration checks availability, exchanges
+a session, bounds and validates the authenticated inventory, selects Chat or
+Responses routes from each model's declared protocol, rejects other protocols,
+stages it, and fails closed on an existing route/model identity. Dynamic
+credentials and headers remain behind
+`ygg_ai::Auth::Dynamic`; they are sensitive request headers and never enter
+provider definitions, catalog model metadata, logs, or persistence. The resolver
+serializes exchange/refresh and refreshes before its short-lived session expires.
+
+The standalone CLI and NDJSON host intentionally provide no Copilot login or
+configuration path. GitHub OAuth endpoint behavior, Enterprise policy, and live
+integration testing remain embedding-host responsibilities; the product covers
+only deterministic fake-host/transport behavior.
+
 ## Authentication
 
 Codex OAuth credentials live in an owner-only directory and file. Writes use a
@@ -321,6 +404,17 @@ same-directory temporary file, flush and sync it, atomically replace the target,
 and sync the directory on Unix. Token-bearing types redact both tokens from
 `Debug`; token endpoint failures expose only status and a constrained OAuth
 error code, never the raw response body.
+
+Gemini Developer API presets are registered only while bounded `GEMINI_API_KEY`
+is nonempty and use `x-goog-api-key` at request time. Vertex presets are
+registered only after an owner-private, bounded Application Default Credentials
+file and validated `GOOGLE_CLOUD_PROJECT` plus `GOOGLE_CLOUD_LOCATION` (or
+`GOOGLE_CLOUD_REGION`) are present. The product accepts `authorized_user` and
+PKCS#8 service-account ADC files, builds the regional Google authority from
+single safe path segments, ignores credential-controlled token URLs, refreshes
+into memory under a mutex, and sends refreshes only to the fixed Google OAuth
+token endpoint with redirects disabled. It neither runs `gcloud` nor persists
+ADC credentials or access tokens.
 
 ## Frontends
 

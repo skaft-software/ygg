@@ -8,13 +8,14 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, Mutex};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
-use wiremock::matchers::{header_exists, method, path};
+use wiremock::matchers::{header, header_exists, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use ygg_ai::{
     AiClient, AiError, Auth, Capabilities, CompatibilityMode::Strict, Endpoint, EndpointId, Media,
     Message, Modality, ModalitySet, Model, ModelId, ModelLimits, ModelSpec, OutputFormat,
-    OutputModalities, Protocol, Request, StreamEvent, UserMessage, UserPart,
+    OutputModalities, Protocol, ProviderLifecycleState, Request, StreamEvent, UserMessage,
+    UserPart,
 };
 
 fn make_test_model(base_url_str: &str, protocol: Protocol, is_audio: bool) -> Model {
@@ -53,6 +54,7 @@ fn make_test_model(base_url_str: &str, protocol: Protocol, is_audio: bool) -> Mo
         auth: Auth::bearer("test-api-key"),
         default_headers: http::HeaderMap::new(),
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: Duration::from_secs(2),
     };
 
@@ -120,6 +122,155 @@ async fn test_client_stream_sse_openai_chat() {
     } else {
         panic!("Expected TextDelta Hello");
     }
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_is_opt_in_sanitized_and_keeps_stream_invariants() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/openai_chat/lifecycle_feedback.sse"))
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; warming test-api-key"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::ProviderLifecycle(lifecycle) => Some(lifecycle),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle.len(),
+        3,
+        "the trailing lifecycle comment after [DONE] must not follow Finished"
+    );
+    assert_eq!(lifecycle[0].state, ProviderLifecycleState::Queued);
+    assert_eq!(lifecycle[1].state, ProviderLifecycleState::Loading);
+    assert_eq!(lifecycle[2].state, ProviderLifecycleState::Ready);
+    assert!(lifecycle.iter().all(|status| {
+        status
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("[REDACTED]"))
+            && status
+                .detail
+                .as_deref()
+                .is_none_or(|detail| !detail.contains("test-api-key"))
+    }));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+    let finished = events.iter().find_map(|event| match event {
+        StreamEvent::Finished(response) => Some(response),
+        _ => None,
+    });
+    assert_eq!(
+        finished.and_then(|response| response.response_id.as_deref()),
+        Some("chatcmpl-lifecycle"),
+        "synthetic lifecycle start must not discard the provider response ID"
+    );
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        StreamEvent::TextDelta { delta, .. } if delta.contains("loading model")
+    )));
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_caps_endpoint_updates() {
+    let mock_server = MockServer::start().await;
+    let comments = (0..65)
+        .map(|index| format!(": ygg-lifecycle: loading; update {index}\n\n"))
+        .collect::<String>();
+    let body = format!(
+        "{comments}{}",
+        include_str!("fixtures/openai_chat/plain_text.sse")
+    );
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let mut model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::ProviderLifecycle(_)))
+            .count(),
+        64
+    );
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+}
+
+#[tokio::test]
+async fn lifecycle_feedback_is_ignored_without_opt_in() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(include_str!("fixtures/openai_chat/lifecycle_feedback.sse"))
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; ignored test-api-key"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let client = AiClient::new();
+    let model = make_test_model(&mock_server.uri(), Protocol::OpenAiChat, false);
+    let mut stream = client.stream(&model, text_request()).await.unwrap();
+    let mut events = Vec::new();
+    while let Some(event) = stream.next().await {
+        events.push(event.unwrap());
+    }
+
+    assert!(matches!(events.first(), Some(StreamEvent::Started { .. })));
+    assert!(matches!(events.last(), Some(StreamEvent::Finished(_))));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ProviderLifecycle(_))),
+        "headers and comments from a non-negotiated endpoint must remain invisible"
+    );
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        !requests[0].headers.contains_key("x-ygg-lifecycle"),
+        "ordinary OpenAI-compatible requests must not carry the extension header"
+    );
 }
 
 // f1: the client stops reading the HTTP body the instant the codec emits
@@ -310,6 +461,54 @@ async fn test_client_stream_anthropic() {
         .await
         .unwrap();
     assert_eq!(response.response_id.as_deref(), Some("msg_1"));
+}
+
+#[tokio::test]
+async fn test_client_stream_google_generate_content() {
+    let mock_server = MockServer::start().await;
+    let body = "data: {\"responseId\":\"gemini-response-1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n";
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ))
+        .and(wiremock::matchers::header(
+            "x-goog-api-key",
+            "test-google-key",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut model = make_test_model(
+        &format!("{}/v1beta/", mock_server.uri()),
+        Protocol::GoogleGenerativeAi,
+        false,
+    );
+    let mut spec = (*model.spec).clone();
+    spec.api_name = "gemini-2.5-flash".to_owned();
+    model.spec = Arc::new(spec);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.auth = Auth::header(
+        http::HeaderName::from_static("x-goog-api-key"),
+        "test-google-key",
+    );
+    model.endpoint = Arc::new(endpoint);
+
+    let response = AiClient::new()
+        .complete(&model, text_request())
+        .await
+        .expect("Google fixture response");
+    assert_eq!(response.response_id.as_deref(), Some("gemini-response-1"));
+    assert_eq!(response.usage.input_tokens, 2);
+    assert_eq!(response.usage.output_tokens, 1);
+    assert!(matches!(
+        response.message.content.as_slice(),
+        [ygg_ai::AssistantPart::Text(text)] if text == "hello"
+    ));
 }
 
 fn text_request() -> Request {

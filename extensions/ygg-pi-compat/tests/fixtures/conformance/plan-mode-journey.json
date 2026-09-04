@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "source": "examples/extensions/plan-mode/index.ts",
+  "journeys": [
+    {
+      "id": "plan-toggle-and-policy",
+      "fixture": "plan-mode:toggle-policy",
+      "assertion": "Deferred: Active-tool policy and widget mutation are rejected explicitly; status contributions remain available."
+    },
+    {
+      "id": "plan-interception",
+      "fixture": "plan-mode:interception",
+      "assertion": "Supported: Bounded tool-call interception routes through the declared mutation hook."
+    },
+    {
+      "id": "plan-persistence-resume",
+      "fixture": "plan-mode:persistence-resume",
+      "assertion": "Deferred: Durable custom entries and session snapshots remain host-owned and reject explicitly."
+    },
+    {
+      "id": "plan-dialogs-and-widgets",
+      "fixture": "plan-mode:dialogs-widgets",
+      "assertion": "Deferred: Select/input dialogs remain available, while editor and widget transport reject explicitly."
+    },
+    {
+      "id": "plan-messaging",
+      "fixture": "plan-mode:messaging",
+      "assertion": "Deferred: Root-session message delivery and session-name mutation reject explicitly."
+    },
+    {
+      "id": "plan-commands-flags-shortcuts",
+      "fixture": "plan-mode:commands-flags-shortcuts",
+      "assertion": "Deferred: Native command catalog remains available; flag projection and shortcut dispatch reject explicitly."
+    }
+  ],
+  "deferred_host_seams": [
+    "tool_policy",
+    "session_state",
+    "messages",
+    "widgets",
+    "editor",
+    "shortcuts",
+    "flags"
+  ]
+}

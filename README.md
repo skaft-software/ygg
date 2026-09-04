@@ -50,6 +50,8 @@ ygg --version   # ygg 0.6.7
 ygg --help
 ```
 
+> Development builds from this checkout identify as `ygg 0.7.0-dev`; this is not a released `v0.7.0` tag.
+
 No Rust toolchain is needed. Prebuilt binaries cover GNU/Linux x86-64, macOS
 x86-64, and macOS Apple silicon; Linux musl is not included. Use the same binary
 with [cloud providers](#use-a-cloud-model) or [your own local endpoint](#use-custom-openai-compatible-providers).
@@ -225,8 +227,11 @@ ygg --enable-extension ygg-web-search --trust-extension ygg-web-search
 ```
 
 The small release catalog contains `ygg-browse`, `ygg-mcp`, `ygg-subagents`,
-and `ygg-web-search`. Use
-`ygg extension update <name>` or `ygg extension remove <name>` to manage one.
+and `ygg-web-search`. `ygg-mcp` retains normal local stdio support; its remote
+Streamable HTTP transport is blocked by default and requires the conspicuous
+one-shot process-owner flag `--experimental-streamable-http-mcp` (see its
+package README before using it). Use `ygg extension update <name>` or
+`ygg extension remove <name>` to manage one.
 Offline and third-party archives can be installed with
 `ygg extension install --path ./bundle.tar.gz`. Replace one atomically with
 `ygg extension update --path ./new-bundle.tar.gz`. Ygg runs no
@@ -292,9 +297,95 @@ export OPENAI_API_KEY='...'
 ygg --model gpt-5.4
 ```
 
+The direct OpenAI catalog also includes `gpt-6-astra` on Responses with
+text/image input, a 1.05M-token context window, 128K output, and `low` through
+`max` reasoning effort. Inputs above 272K use its long-context price tier.
+Select it through the same generic path: `ygg --model gpt-6-astra`.
+
+This `0.7.0-dev` dogfood build provides baseline Astra model selection,
+text/image requests, reasoning, and ordinary/parallel tool calls. It does not
+yet implement native async tools (`async: true` with a pending-call lifecycle),
+steering an active Responses WebSocket response, or coding-loop reasoning
+changes through `configuration_update` with verified cache preservation.
+Input received during execution is queued for a later model-turn boundary;
+`parallel_tool_calls` does not imply native async tool support.
+
 ```sh
 export OPENROUTER_API_KEY='...'
 ygg --model openrouter/anthropic/claude-sonnet-4.6
+```
+
+Mistral's built-in Chat Completions preset uses its native request and reasoning
+content conventions while retaining Ygg's normal model selection:
+
+```sh
+export MISTRAL_API_KEY='...'
+ygg --model mistral/mistral-small-latest
+```
+
+Cloudflare Workers AI requires an account identifier as well as an API key:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID='...'
+export CLOUDFLARE_API_KEY='...'
+ygg --model cloudflare-workers-ai/@cf/openai/gpt-oss-120b
+```
+
+Cloudflare AI Gateway routes the built-in Claude, OpenAI, and Workers AI models
+through the gateway's documented provider paths. Set its non-secret gateway
+identifier too:
+
+```sh
+export CLOUDFLARE_ACCOUNT_ID='...'
+export CLOUDFLARE_GATEWAY_ID='...'
+export CLOUDFLARE_API_KEY='...'
+ygg --model cloudflare-ai-gateway/claude-sonnet-4-5
+```
+
+Amazon Bedrock uses SigV4 with the standard bounded AWS credential chain: an
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` pair (and optional session token),
+the selected `AWS_PROFILE`, or ECS/EC2 instance metadata. Select a region with
+`AWS_REGION` (or `YGG_BEDROCK_REGION`); model availability still depends on the
+account and region.
+
+```sh
+export AWS_REGION=us-east-1
+ygg --model 'bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0'
+```
+
+Azure OpenAI routes configured deployments through the Responses API. Set an
+API key plus either a resource name or endpoint and the deployment name.
+`AZURE_OPENAI_API_VERSION` is optional and defaults to the bundled preview
+version.
+
+```sh
+export AZURE_OPENAI_API_KEY='...'
+export AZURE_OPENAI_RESOURCE='my-resource' # or AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com/
+export AZURE_OPENAI_DEPLOYMENT='my-gpt-deployment'
+ygg --model azure-openai/my-gpt-deployment
+```
+
+Gemini uses Google's native `generateContent` API rather than an OpenAI-compatible
+translation. Set a Gemini Developer API key to expose the checked-in Gemini
+presets (including tools, structured JSON output, and supported images):
+
+```sh
+export GEMINI_API_KEY='...'
+ygg --model gemini/gemini-2.5-flash
+```
+
+Vertex AI uses Application Default Credentials and requires an explicit project
+and location. `GOOGLE_APPLICATION_CREDENTIALS`, when set, must name an absolute
+owner-private ADC file; otherwise Ygg checks the owner-private default ADC file.
+Ygg supports `authorized_user` and PKCS#8 `service_account` ADC files, refreshes
+short-lived access tokens in memory, and never invokes `gcloud` or persists
+credential values.
+
+```sh
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/adc.json
+export GOOGLE_CLOUD_PROJECT=my-project
+export GOOGLE_CLOUD_LOCATION=us-central1
+ygg --model vertex/gemini-2.5-flash
 ```
 
 ChatGPT subscription users can use the hosted device flow instead of manually managing an API key:
@@ -304,10 +395,11 @@ ygg --login codex
 ygg --model gpt-5.6
 ```
 
-When that account's live Codex catalog advertises both the `ultra` effort and
-V2 collaboration for the selected model, Ultra is available only while the
-trusted, enabled `ygg-subagents` extension is live. Install and activate that
-extension first so every child session has an observable `/subagents` surface:
+When that account's live Codex catalog explicitly advertises the `ultra`
+reasoning level and V2 collaboration for the selected model, Ygg exposes the
+host-side `ultra` tier only while the trusted, enabled `ygg-subagents` extension
+is live. Install and activate that extension first so every child session has
+an observable `/subagents` surface:
 
 ```sh
 ygg extension install ygg-subagents
@@ -323,8 +415,55 @@ The extension owns the model-facing `subagent_*` tools and the host's bounded
 child-session service; the coding product does not expose a parallel native
 collaboration tool surface. Ygg still does not infer Ultra, collaboration, or
 Responses Lite from a model name or subscription plan; missing or unusable
-account-scoped metadata falls back conservatively.
+account-scoped metadata falls back conservatively. A successful live inventory
+is authoritative: if it omits Astra, Ygg does not inject a Codex Astra route.
+When it includes Astra, the subscription route is always selectable as
+`codex/gpt-6-astra`, independently of whether a direct OpenAI preset is
+configured.
+
+The baseline dogfood limits above also apply to Codex Astra. Public API support
+does not establish OAuth feature support: additional Codex capabilities require
+fresh, account-scoped live metadata or verified behavior of that endpoint.
+
+GitHub Copilot is intentionally **not** a `ygg --login` or configuration preset.
+An embedding Rust application can own GitHub device login, OAuth storage,
+exchange, refresh, and its vetted inference origin through the credential-safe SDK seam;
+the standalone CLI and NDJSON `ygg-host` do not accept Copilot credentials or
+surface incomplete Copilot models. See [host-owned GitHub Copilot](docs/sdk.md#host-owned-github-copilot).
+
 ### Use custom OpenAI-compatible providers
+
+For a first local model, launch interactive `ygg` with no configured model and
+choose **LM Studio** or **OpenAI-compatible endpoint** in the guided setup flow.
+The flow asks for one endpoint, an optional credential source, a discovered or
+manual model ID, and a final review before it writes anything. It never scans
+localhost or a network for servers.
+
+For scripts, `ygg setup` is the same transactional operation without prompts.
+It prints a secret-free review receipt by default; add `--yes` only after
+reviewing it. Select LM Studio explicitly before using its documented default
+endpoint, or supply an endpoint yourself:
+
+```sh
+# One explicitly selected LM Studio endpoint; review only.
+ygg setup --preset lm-studio --manual-model local-model
+
+# Commit a discovered model inventory after confirmation.
+ygg setup --endpoint https://models.example.test/v1/ \
+  --api-key-env EXAMPLE_API_KEY --yes
+
+# Offline/manual recovery makes no discovery request.
+ygg setup --endpoint http://127.0.0.1:8000/v1/ \
+  --offline --manual-model Qwen3-Coder --yes
+```
+
+`--cancel`, review-only setup, offline failure, and a concurrent registry change
+leave the registry unchanged. Setup sends a bounded `GET /models` only to the
+endpoint selected in that invocation, follows no redirects, writes no setup
+telemetry, and never includes API-key or secret-header values in a receipt,
+diagnostic, session, or cache. Print and RPC modes never open the guided flow;
+when no model can be resolved they report the deterministic `ygg setup --yes`
+recovery command instead.
 
 Configure all custom endpoints together in `~/.ygg/credentials/custom.json`:
 
@@ -416,6 +555,35 @@ If an endpoint cannot provide a useful `GET /v1/models`, set
 Protect the credential file with `chmod 600`. Use `--offline` to skip optional
 model discovery during startup; inference still reaches the selected endpoint.
 
+### Cold-start lifecycle feedback
+
+Set `lifecycle_feedback` to `true` only for an OpenAI-compatible endpoint that
+implements Ygg's optional readiness extension:
+
+```json
+{ "providers": { "cold-local": { "lifecycle_feedback": true } } }
+```
+
+On streaming Chat Completions requests, Ygg then sends `x-ygg-lifecycle: 1`.
+The endpoint may return the same header and/or SSE comments such as
+`: ygg-lifecycle: loading; warming model`.
+The accepted states are `queued`, `loading`, and `ready`; malformed values and
+ordinary SSE comments remain invisible. Unconfigured endpoints receive no
+header and keep their ordinary behavior, while ordinary OpenAI clients ignore
+both the optional header and SSE comments.
+
+Feedback is advisory only: Ygg redacts and bounds its detail, displays it as a
+transient readiness status, and never puts it in assistant content, session
+history, or model context. Plain and print modes send it to stderr; `--print`
+stdout remains response-only. It adds no retry or POST-replay behavior,
+including no cold-start-specific handling of a `503` response.
+
+`startup_timeout_secs` still limits how long Ygg waits for response headers. An
+endpoint must return those headers before that timeout; readiness feedback does
+not extend it. Once a successful streaming response has begun, ordinary body
+idle/deadline limits still apply. Non-streaming requests use the normal
+completed-response path and do not negotiate or emit lifecycle feedback.
+
 Custom models are treated as free for cost guardrails: each model gets trusted
 zero pricing by default, so subagents and other features that require trusted
 model pricing work out of the box on local and self-hosted servers. To track
@@ -459,11 +627,14 @@ by default, with the access value shown in bold red. Launching with
 The model-visible schema and executable registry are built from the same final
 allowlist. A disabled tool cannot remain advertised to the model. Registration
 does not itself authorize an effect: the default policy (`UnsafeHost`) gives
-authoritatively classified effects the Ygg process's ambient host authority, subject
-to the existing tool and sandbox gates. `--safe-mode` selects
-`ControlledBashApproval`, requiring workspace-mutation approval and one-shot approval
-for every `bash` process call while denying other ambient host effects. Unknown
-effects always fail closed.
+authoritatively classified effects the Ygg process's ambient host authority,
+subject to the existing tool and sandbox gates. Set `effect_policy`,
+`YGG_EFFECT_POLICY`, or `--effect-policy` to `controlled_bash_approval`,
+`controlled`, or `unsafe_host`; a trusted project may tighten but not relax the
+global profile. `--safe-mode` selects `ControlledBashApproval`, conflicts with
+`--effect-policy`, and requires workspace-mutation approval plus one-shot
+approval for every `bash` process call while denying other ambient host effects.
+Unknown effects always fail closed.
 
 `--safe-mode` requires confirmation for every `bash` host process call and keeps
 workspace reads/mutations controlled. Without it, an enabled, trusted executable
@@ -493,6 +664,8 @@ In the default full-access mode, `bash` runs with the authority of the
 current operating-system user. Like Pi, it passes every complete command to one
 selected shell with `-c`; on Unix Ygg uses an explicit `shell_path` first, then
 `/bin/bash`, `bash` on `PATH`, and finally `sh`. It does not consult `$SHELL`.
+Secret-safe policy diagnostics report only the selected branch (`configured`,
+`system_bash`, `path_bash`, or `sh_fallback`), never a shell path or digest.
 `--no-process` and `--no-shell` remain equivalent authority gates. Use
 `--safe-mode` to require approval for each action.
 For untrusted repositories, use a container, VM, or restricted account; see
@@ -505,8 +678,9 @@ For untrusted repositories, use a container, VM, or restricted account; see
 | OpenAI Responses | ✓ | ✓ | ✓ | ✓ | ✓ |
 | OpenAI Chat Completions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Anthropic Messages | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Amazon Bedrock Converse | ✓ | ✓ | — | ✓ | — |
 
-Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, and OpenCode Zen. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
+Built-in provider presets include OpenAI, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, OpenCode Zen, Mistral, Cloudflare Workers AI, and Cloudflare AI Gateway. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
 
 Capability handling is model-specific. ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
 
@@ -748,6 +922,8 @@ color = "auto"
 mouse = "auto"
 plain = false
 
+# unsafe_host is the default. A trusted project may only tighten this profile.
+effect_policy = "unsafe_host"
 # ygg defaults to full host access. Pass --safe-mode to require approval
 # for each action. This capability setting independently keeps paths local.
 allow_external_paths = false
@@ -779,15 +955,19 @@ keep_recent_tokens = 20000
 # compact_model = "provider/model"
 ```
 
-Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
+Common environment variables mirror those fields: `YGG_MODEL`, `YGG_REASONING`, `YGG_EFFECT_POLICY`, `YGG_SYSTEM_PROMPT`, `YGG_CACHE_RETENTION`, `YGG_COLOR`, `YGG_MOUSE`, `YGG_WORKSPACE`, `YGG_SESSION_DIR`, `YGG_MAX_TURNS`, `YGG_COMPACTION_MODE`, `YGG_COMPACTION_THRESHOLD_FRACTION`, `YGG_COMPACTION_MAX_ACTIVE_TOKENS`, `YGG_SHELL_PATH`, `YGG_BASH_TIMEOUT_SECS`, `YGG_MAX_OUTPUT_BYTES`, `YGG_OFFLINE`, `YGG_TELEMETRY`, and the `YGG_ALLOW_*` capability controls. Remote URL reads specifically require `allow_remote_read = true`, `YGG_ALLOW_REMOTE_READ=true`, or `--allow-remote-read`; `--offline` always disables them. Use `--safe-mode` for approval-only execution. It resolves `allow_external_paths` to false. The previous `YGG_EXEC_TIMEOUT_SECS` name and boolean `YGG_AUTO_COMPACT` remain compatibility fallbacks.
 
 Telemetry is opt-in and separate from durable sessions. `--telemetry PATH` writes
 owner-only `ygg.telemetry.v1` JSONL records for run boundaries, model request
 latency/TTFT, disjoint input/cache/output usage, retries, tool timings and
-repetition signals, compaction outcomes, and terminal status. It hashes the
-prompt identity and tool arguments instead of recording raw prompts, arguments,
-results, or provider payloads. See [docs/benchmarks/README.md](docs/benchmarks/README.md) for
-the schema and measurement methodology.
+repetition signals, secret-safe policy admission decisions, compaction outcomes,
+and terminal status. Policy decisions identify the allowed/denied effect, stable
+denial code, and effective policy values with their configuration-source layer;
+the shell is only a non-correlating resolution branch, never a path or digest.
+Telemetry hashes the prompt identity and tool arguments instead of recording raw
+prompts, arguments, results, or provider payloads. See
+[docs/benchmarks/README.md](docs/benchmarks/README.md) for the
+schema and measurement methodology.
 
 For renderer diagnostics, `YGG_TUI_WRITE_LOG=/path/to/ansi.log` captures the
 raw ANSI stream written by the interactive TUI. An existing directory creates a
@@ -806,11 +986,12 @@ warning. New configuration should use `reasoning` alone.
 | Area | Options |
 | --- | --- |
 | Provider auth | `--login`, `--logout`, `--headless` |
+| Provider setup | `setup --preset lm-studio --manual-model ID [--yes]`, `setup --endpoint URL [--api-key-env VAR] [--model ID\|--manual-model ID] [--offline] [--yes]` |
 | Frontend | `--print`, `--plain`, `--color`, `--mouse`, `--show-reasoning` |
 | Session | `--continue`, `--resume`, `--fork`, `--session-dir`, `sessions ...` |
 | Model | `--model`, `--reasoning`, `--cache-retention`, `--max-turns` |
 | Workspace | `--workspace`, `--workspace-trusted`, `--no-context-files`, `--offline` |
-| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--safe-mode`, `--shell-path` |
+| Tools | `--tools`, `--exclude-tools`, `--no-tools`, `--no-edit`, `--no-write`, `--no-process`, `--no-shell`, `--allow-shell`, `--effect-policy`, `--safe-mode`, `--shell-path` |
 | Limits | `--bash-timeout-secs`, `--max-output-bytes`, `--telemetry` |
 | Migration inventory | `migrate pi --dry-run`, `--json`, `--pi-home`, `--project`, `--npm-root` |
 | Pi compatibility | `pi install <PATH>`, `pi list` |
@@ -973,8 +1154,8 @@ Normal builds are deterministic and use checked-in model metadata.
 ```sh
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --all-features --locked
-cargo test --workspace --all-targets --all-features --locked
-cargo test --workspace --doc --locked
+cargo test --workspace --all-targets --all-features --profile ci-test --locked
+cargo test --workspace --doc --profile ci-test --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo audit
 cargo deny check
@@ -985,6 +1166,10 @@ Build the release binary:
 ```sh
 cargo build --release --locked -p ygg-coding-agent --bin ygg
 ```
+
+CI uses the additive `ci-test` profile above; ordinary `cargo test` remains
+unchanged. Use the release-like, symbol-retaining `profiling` profile as
+[documented in docs/build-profiles.md](docs/build-profiles.md).
 
 The declared MSRV is Rust 1.86. Command execution is Unix-only. See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution scope, review expectations, and the release checklist.
 
@@ -1024,7 +1209,9 @@ third_party/              upstream license texts
 | [Product contract](docs/design/ygg-coding-agent.md) | Bootstrap, modes, configuration, resources, and UX. |
 | [TUI architecture](docs/design/ygg-tui.md) | Rendering, terminal capability handling, scrolling, and the compiled default presentation. |
 | [Presentation contract](docs/design/ygg-presentation.md) | Stable Ygg structure, adaptive model atmosphere, and durable/live/diagnostic layers. |
+| [Command and picker surface contract](docs/design/ygg-command-picker-surfaces.md) | Shared transient discovery, selection, status, action, and terminal-capability vocabulary. |
 | [Benchmarking](docs/benchmarks/README.md) | Optional telemetry, systems measurements, failure taxonomy, and shootout methodology. |
+| [Build profiles](docs/build-profiles.md) | CI test artifacts, profiler-friendly release-like builds, and comparison commands. |
 | [Beta protocol](docs/benchmarks/beta-protocol.md) | Opt-in first-ten-user daily-driver validation. |
 | [Examples](examples/README.md) | Ready-to-adapt prompts, skills, and executable extensions. |
 

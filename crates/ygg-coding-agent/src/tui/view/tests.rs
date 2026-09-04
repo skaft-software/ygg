@@ -107,6 +107,16 @@ impl sexy_tui_rs::Terminal for EmulatedTerminal {
     }
 }
 
+fn test_effective_tool_policy() -> ygg_agent::EffectiveToolPolicy {
+    ygg_agent::SandboxConfig::new(".").effective_tool_policy(ygg_agent::EffectPolicy::Controlled)
+}
+
+fn inherited_delegation_provenance() -> ygg_agent::DelegationOrchestrationProvenance {
+    ygg_agent::DelegationOrchestrationProvenance::all(
+        ygg_agent::DelegationPolicySource::ParentInherited,
+    )
+}
+
 fn emulated_shell(
     theme: YggTheme,
     width: u16,
@@ -403,7 +413,7 @@ fn panel_key_kind(
 /// Open a select-list panel with no descriptions.
 fn open_select_panel(shell: &mut InteractiveShell, items: &[&str]) {
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: items.iter().map(|item| item.to_string()).collect(),
         descriptions: vec![None; items.len()],
         selected: 0,
@@ -487,10 +497,10 @@ fn session_picker_panel_handles_scope_filter_and_selection_outbox() {
         panic!("session picker should be open");
     };
     assert!(!picker.confirming_delete);
-    assert_eq!(
-        picker.message.as_ref().map(|(message, _)| message.as_str()),
-        Some("Cannot delete the currently active session")
-    );
+    let OrdinarySurfaceLifecycle::RecoverableError(status) = &picker.surface.lifecycle else {
+        panic!("current-session delete should set a recoverable-error lifecycle");
+    };
+    assert_eq!(status.text, "cannot delete the currently active session");
     drop(state);
 
     // Clear the named/filter state and select the second row.
@@ -592,7 +602,8 @@ fn session_picker_render_shows_scope_markers_and_fork_metadata() {
     assert!(rendered.contains("^s sort"));
     assert_eq!(raw.join("\n").matches(CURSOR_MARKER).count(), 1);
     assert!(plain[1].starts_with("Resume Session"), "{plain:?}");
-    assert!(plain[2].starts_with("Filter"), "{plain:?}");
+    assert!(plain[2].starts_with("Select a saved session"), "{plain:?}");
+    assert!(plain[3].starts_with("Filter"), "{plain:?}");
     let selected = plain
         .iter()
         .find(|line| line.contains("Forked (fork)"))
@@ -700,7 +711,7 @@ fn confirmation_panel_shows_shared_detail_and_unfiltered_actions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Approve one exact `bash` tool effect?".into(),
+        surface: OrdinarySurfaceMetadata::new("Approve one exact `bash` tool effect?"),
         items: vec!["Deny".into(), "Approve".into()],
         descriptions: vec![
             Some("effect: host_process sha256: 85bc9fe8cfaf7c550880d65882f7c4142c8374875c976c58d1dd724a7f16e609".into()),
@@ -735,7 +746,7 @@ fn confirmation_requires_its_selected_action_to_be_visible() {
         let mut shell = InteractiveShell::test_shell();
         shell.set_size(80, 5);
         shell.open_panel(Panel::SelectList {
-            title: "Approve?".into(),
+            surface: OrdinarySurfaceMetadata::new("Approve?"),
             items: vec!["Deny".into(), "Approve".into()],
             descriptions: vec![Some("writes src/lib.rs".into()); 2],
             selected,
@@ -772,7 +783,7 @@ fn confirmation_allows_a_visible_action_when_the_title_is_clipped() {
     shell.set_size(46, 8);
     let title = "Approve one exact workspace mutation with a deliberately long identity?";
     shell.open_panel(Panel::SelectList {
-        title: title.into(),
+        surface: OrdinarySurfaceMetadata::new(title),
         items: vec!["Deny".into(), "Approve".into()],
         descriptions: vec![None, None],
         selected: 1,
@@ -837,7 +848,7 @@ fn live_subagent_refresh_preserves_selection_by_stable_node_id() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Subagents".into(),
+        surface: OrdinarySurfaceMetadata::new("Subagents"),
         items: vec!["alpha".into(), "beta".into()],
         descriptions: vec![Some("running".into()), Some("done".into())],
         selected: 1,
@@ -867,7 +878,7 @@ fn select_list_filter_is_case_insensitive_and_matches_descriptions() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(80, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: vec!["gpt-4o".into(), "claude-sonnet".into()],
         descriptions: vec![
             Some("openai · 128k context".into()),
@@ -962,7 +973,10 @@ fn select_list_filter_without_matches_keeps_panel_open_on_enter() {
         shell.panel_input(&panel_key(crossterm::event::KeyCode::Char(c)));
     }
     let rendered = render_shell(&shell.state.borrow(), 80).join("\n");
-    assert!(rendered.contains("No matches for"));
+    assert!(
+        rendered.contains("no matches") && rendered.contains("zzz"),
+        "{rendered}"
+    );
 
     // Enter is a no-op while nothing matches; Esc still cancels.
     assert!(
@@ -1098,7 +1112,7 @@ fn select_list_separates_model_metadata_and_drops_it_before_narrow_labels() {
     let mut shell = InteractiveShell::test_shell();
     shell.set_size(100, 24);
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         items: vec![
             "GPT-5.6".into(),
             "Claude Opus 4.8".into(),
@@ -1168,7 +1182,7 @@ fn select_list_home_end_and_page_navigation_stay_bounded() {
         .map(|index| format!("Model {index:02}"))
         .collect::<Vec<_>>();
     shell.open_panel(Panel::SelectList {
-        title: "Select model".into(),
+        surface: OrdinarySurfaceMetadata::new("Select model"),
         descriptions: vec![Some("provider · context".into()); items.len()],
         items,
         selected: 0,
@@ -1658,6 +1672,10 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         trust: crate::prompts::PromptTrust::UserInstalled,
         content_hash: "hash".into(),
     }]));
+    shell.set_skill_commands(Arc::from(vec![(
+        "workspace-review".into(),
+        "Review workspace changes".into(),
+    )]));
     shell.set_extension_commands(Arc::from(vec![
         ("checkpoint".into(), "Save checkpoint".into()),
         // A dynamic command cannot shadow a working built-in.
@@ -1672,19 +1690,37 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         .iter()
         .map(|template| template.name.as_str())
         .collect::<HashSet<_>>();
+    let skill_names = state
+        .skill_commands
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
     let extension_names = state
         .extension_commands
         .iter()
         .map(|(name, _)| name.as_str())
         .collect::<HashSet<_>>();
     for suggestion in suggestions.iter().filter(|suggestion| {
-        suggestion.description.starts_with("prompt ·")
-            || suggestion.description.starts_with("extension ·")
+        matches!(
+            suggestion.provenance,
+            super::input_overlays::SlashSuggestionProvenance::Prompt
+                | super::input_overlays::SlashSuggestionProvenance::Skill
+                | super::input_overlays::SlashSuggestionProvenance::Extension
+        )
     }) {
-        let registered = if suggestion.description.starts_with("prompt ·") {
-            prompt_names.contains(suggestion.name.as_str())
-        } else {
-            extension_names.contains(suggestion.name.as_str())
+        let registered = match suggestion.provenance {
+            super::input_overlays::SlashSuggestionProvenance::Prompt => {
+                prompt_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Skill => {
+                skill_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Extension => {
+                extension_names.contains(suggestion.name.as_str())
+            }
+            super::input_overlays::SlashSuggestionProvenance::Builtin => {
+                unreachable!("only dynamic slash suggestions should reach this registration check")
+            }
         };
         assert!(registered, "unregistered suggestion: {suggestion:?}");
     }
@@ -1697,10 +1733,16 @@ fn dynamic_slash_discovery_contains_only_registered_executable_names() {
         "dynamic command shadowed the built-in route"
     );
     assert!(suggestions.iter().any(|suggestion| {
-        suggestion.name == "local-review" && suggestion.description.starts_with("prompt ·")
+        suggestion.name == "local-review"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Prompt
     }));
     assert!(suggestions.iter().any(|suggestion| {
-        suggestion.name == "checkpoint" && suggestion.description.starts_with("extension ·")
+        suggestion.name == "workspace-review"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Skill
+    }));
+    assert!(suggestions.iter().any(|suggestion| {
+        suggestion.name == "checkpoint"
+            && suggestion.provenance == super::input_overlays::SlashSuggestionProvenance::Extension
     }));
 }
 
@@ -2182,10 +2224,283 @@ fn terminal_native_prompt_stays_within_every_viewport() {
             line.chars()
                 .any(|character| matches!(character, '┏' | '┓' | '┗' | '┛'))
         }));
-        if width >= 4 {
-            assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
-        }
+        assert!(
+            rendered.iter().any(|line| line.contains(CURSOR_MARKER)),
+            "focused cursor missing at {width}x{height}: {rendered:?}"
+        );
     }
+}
+
+#[test]
+fn narrow_composer_clips_an_oversized_grapheme_without_losing_the_cursor() {
+    for width in [3, 4] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, 8);
+        shell.state.borrow_mut().editor.set_text("界");
+
+        let rendered = render_shell(&shell.state.borrow(), width);
+        assert!(
+            rendered
+                .iter()
+                .all(|line| visible_width(line) <= usize::from(width)),
+            "{width}: {rendered:?}"
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|line| line.matches(CURSOR_MARKER).count())
+                .sum::<usize>(),
+            1,
+            "{width}: {rendered:?}"
+        );
+        let cursor_line = rendered
+            .iter()
+            .find(|line| line.contains(CURSOR_MARKER))
+            .expect("focused composer cursor");
+        let cursor_byte = cursor_line.find(CURSOR_MARKER).expect("cursor marker byte");
+        assert!(
+            visible_width(&cursor_line[..cursor_byte]) < usize::from(width),
+            "{width}: {cursor_line:?}"
+        );
+    }
+}
+
+#[test]
+fn composer_geometry_keeps_full_rows_and_visual_edges_in_one_grid() {
+    for (chrome, width) in [("boxed", 12), ("framed", 12), ("shaded", 12), ("boxed", 8)] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, 12);
+        let text_len = {
+            let mut state = shell.state.borrow_mut();
+            if chrome != "boxed" {
+                state.theme.override_token("composer", chrome);
+            }
+            let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, width);
+            state.editor.set_text("x".repeat(geometry.text_width()));
+            state.editor.text().len()
+        };
+
+        let rendered = render_shell(&shell.state.borrow(), width);
+        let cursor_line = rendered
+            .iter()
+            .find(|line| line.contains(CURSOR_MARKER))
+            .unwrap_or_else(|| panic!("{chrome} at {width} lost the cursor: {rendered:?}"));
+        let cursor_byte = cursor_line.find(CURSOR_MARKER).expect("cursor marker byte");
+        assert!(
+            visible_width(&cursor_line[..cursor_byte]) < usize::from(width),
+            "{chrome} at {width} placed the hardware cursor outside the viewport: {cursor_line:?}"
+        );
+        assert!(visible_width(cursor_line) <= usize::from(width));
+
+        // The action path uses this same cached projected layout rather than a
+        // raw-width approximation, so full rows still have a visual start/end.
+        shell.apply_edit(EditAction::Home);
+        assert_eq!(
+            shell.state.borrow().editor.cursor(),
+            0,
+            "{chrome} at {width}"
+        );
+        shell.apply_edit(EditAction::End);
+        assert_eq!(
+            shell.state.borrow().editor.cursor(),
+            text_len,
+            "{chrome} at {width}"
+        );
+    }
+}
+
+#[test]
+fn composer_visual_navigation_uses_the_same_safe_tab_and_control_projection_as_paint() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(8, 12);
+    let tabbed = "   \tabcdef";
+    shell.state.borrow_mut().editor.set_text(tabbed);
+    shell.apply_edit(EditAction::Home);
+    assert_eq!(
+        shell.state.borrow().editor.cursor(),
+        "   \ta".len(),
+        "Home must target the displayed second row after a positional tab"
+    );
+    shell.apply_edit(EditAction::End);
+    assert_eq!(shell.state.borrow().editor.cursor(), tabbed.len());
+
+    let control_plus_combining = "\x1b\u{0301}x";
+    {
+        let mut state = shell.state.borrow_mut();
+        state.editor.set_text(control_plus_combining);
+        state.editor.set_cursor("\x1b".len());
+    }
+    let rendered = render_shell(&shell.state.borrow(), 20);
+    let cursor_line = rendered
+        .iter()
+        .find(|line| line.contains(CURSOR_MARKER))
+        .expect("composer cursor row");
+    let safe_control = cursor_line.find("␛").expect("visualized ESC");
+    let cursor = cursor_line.find(CURSOR_MARKER).expect("cursor marker");
+    assert!(
+        safe_control < cursor,
+        "cursor split or preceded the joined visible control grapheme: {cursor_line:?}"
+    );
+
+    shell.apply_edit(EditAction::Home);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
+    shell.apply_edit(EditAction::End);
+    assert_eq!(
+        shell.state.borrow().editor.cursor(),
+        control_plus_combining.len()
+    );
+}
+
+#[test]
+fn native_hardware_cursor_stays_inside_full_composer_rows() {
+    fn horizontal_positions(bytes: &[u8]) -> Vec<u16> {
+        let mut positions = Vec::new();
+        let mut start = 0;
+        while start + 3 <= bytes.len() {
+            if bytes[start..].starts_with(b"\x1b[") {
+                let mut end = start + 2;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start + 2 && bytes.get(end) == Some(&b'G') {
+                    let column = std::str::from_utf8(&bytes[start + 2..end])
+                        .expect("CSI column is ASCII")
+                        .parse::<u16>()
+                        .expect("CSI column is numeric");
+                    positions.push(column);
+                }
+            }
+            start += 1;
+        }
+        positions
+    }
+
+    for (chrome, width) in [
+        ("boxed", 1),
+        ("boxed", 2),
+        ("boxed", 12),
+        ("framed", 12),
+        ("shaded", 12),
+        ("boxed", 8),
+    ] {
+        let mut theme = crate::tui::theme::test_theme();
+        if chrome != "boxed" {
+            theme.override_token("composer", chrome);
+        }
+        let (mut shell, bytes) = emulated_shell(theme, width, 12);
+        shell
+            .tui
+            .as_mut()
+            .expect("emulated shell owns a TUI")
+            .set_show_hardware_cursor(true);
+        let text_width = {
+            let state = shell.state.borrow();
+            crate::tui::composer_surface::composer_editor_geometry(&state, width).text_width()
+        };
+        shell
+            .state
+            .borrow_mut()
+            .editor
+            .set_text("x".repeat(text_width));
+        shell.render();
+
+        let output = bytes
+            .lock()
+            .expect("emulated terminal output mutex poisoned")
+            .clone();
+        let positions = horizontal_positions(&output);
+        assert!(
+            positions.iter().any(|column| *column > 0),
+            "{chrome} at {width} did not position a hardware cursor: {output:?}"
+        );
+        assert!(
+            positions.iter().all(|column| *column <= width),
+            "{chrome} at {width} emitted an out-of-viewport cursor column: {positions:?}"
+        );
+    }
+}
+
+#[test]
+fn composer_projection_cache_reuses_an_unchanged_large_draft_and_refreshes_on_changes() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 24);
+    shell
+        .state
+        .borrow_mut()
+        .editor
+        .set_text("x".repeat(256 * 1024));
+
+    let first_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let projection = state.composer_editor_projection(geometry);
+        let expected_rows = (256_usize * 1024).div_ceil(geometry.text_width());
+        assert_eq!(projection.line_count(), expected_rows);
+        let _visible_row = projection.visible_row(projection.cursor_row(), CURSOR_MARKER, 80);
+        let cache = state.composer_editor_cache.borrow();
+        let entry = cache.as_ref().expect("projection populated the cache");
+        assert_eq!(entry.text_width(), geometry.text_width());
+        entry.source()
+    };
+    let second_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let _projection = state.composer_editor_projection(geometry);
+        let cache_source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("projection retained the cache")
+            .source();
+        cache_source
+    };
+    assert_eq!(
+        first_cache, second_cache,
+        "unchanged draft rebuilt its layout"
+    );
+
+    shell.state.borrow_mut().editor.set_cursor(0);
+    let cursor_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let projection = state.composer_editor_projection(geometry);
+        assert_eq!(projection.cursor_row(), 0);
+        assert!(
+            projection
+                .visible_row(0, CURSOR_MARKER, geometry.text_width())
+                .starts_with(CURSOR_MARKER),
+            "cursor-only refresh did not update the structured projection"
+        );
+        let source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("cursor refresh retained the cache")
+            .source();
+        source
+    };
+    assert_eq!(
+        first_cache, cursor_cache,
+        "cursor movement should retain the text-keyed display cache"
+    );
+
+    shell.apply_edit(EditAction::Char('y'));
+    let refreshed_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let _projection = state.composer_editor_projection(geometry);
+        let cache_source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("edit refreshed the cache")
+            .source();
+        cache_source
+    };
+    assert_ne!(
+        first_cache, refreshed_cache,
+        "edit did not refresh cached layout"
+    );
 }
 
 #[test]
@@ -2196,14 +2511,14 @@ fn vertical_editor_navigation_snaps_to_document_boundaries_in_one_step() {
         shell.apply_edit(EditAction::Char(character));
     }
 
-    shell.state.borrow_mut().editor_cursor = 3;
+    shell.state.borrow_mut().editor.set_cursor(3);
     shell.apply_edit(EditAction::Up);
-    assert_eq!(shell.state.borrow().editor_cursor, 0);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
 
-    let editor_len = shell.state.borrow().editor.len();
-    shell.state.borrow_mut().editor_cursor = editor_len - 2;
+    let editor_len = shell.state.borrow().editor.text().len();
+    shell.state.borrow_mut().editor.set_cursor(editor_len - 2);
     shell.apply_edit(EditAction::Down);
-    assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    assert_eq!(shell.state.borrow().editor.cursor(), editor_len);
 }
 
 #[test]
@@ -2214,23 +2529,24 @@ fn vertical_editor_navigation_snaps_at_soft_wrapped_boundaries() {
         shell.apply_edit(EditAction::Char(character));
     }
 
-    shell.state.borrow_mut().editor_cursor = 3;
+    shell.state.borrow_mut().editor.set_cursor(3);
     shell.apply_edit(EditAction::Up);
-    assert_eq!(shell.state.borrow().editor_cursor, 0);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
 
-    let editor_len = shell.state.borrow().editor.len();
-    shell.state.borrow_mut().editor_cursor = editor_len - 2;
-    let (editor, cursor) = {
-        let state = shell.state.borrow();
-        (state.editor.clone(), state.editor_cursor)
-    };
+    let editor_len = shell.state.borrow().editor.text().len();
+    shell.state.borrow_mut().editor.set_cursor(editor_len - 2);
     assert_eq!(
-        editor_layout(&editor, cursor, 8).cursor_row,
+        {
+            let state = shell.state.borrow();
+            let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 8);
+            let cursor_row = state.composer_editor_projection(geometry).cursor_row();
+            cursor_row
+        },
         2,
         "fixture cursor must begin on the bottom soft-wrapped row"
     );
     shell.apply_edit(EditAction::Down);
-    assert_eq!(shell.state.borrow().editor_cursor, editor_len);
+    assert_eq!(shell.state.borrow().editor.cursor(), editor_len);
 }
 
 #[test]
@@ -2240,7 +2556,7 @@ fn clear_editor_discards_attachments_and_resets_composer_navigation() {
     assert!(!shell.state.borrow().ledger.is_empty());
     {
         let mut state = shell.state.borrow_mut();
-        state.editor_cursor = 3;
+        state.editor.set_cursor(3);
         state.slash_selection = 4;
         state.slash_scroll = 2;
         state.slash_popup_dismissed = true;
@@ -2251,7 +2567,7 @@ fn clear_editor_discards_attachments_and_resets_composer_navigation() {
     {
         let state = shell.state.borrow();
         assert!(state.editor.is_empty());
-        assert_eq!(state.editor_cursor, 0);
+        assert_eq!(state.editor.cursor(), 0);
         assert!(state.ledger.is_empty());
         assert_eq!(state.slash_selection, 0);
         assert_eq!(state.slash_scroll, 0);
@@ -2277,10 +2593,55 @@ fn bracketed_paste_preserves_multiline_editor_text_without_submitting() {
     shell.apply_edit(EditAction::Char('a'));
     shell.apply_edit(EditAction::Paste("b\r\nc\rd".into()));
     assert_eq!(shell.pending(), "ab\nc\nd");
-    assert_eq!(shell.state.borrow().editor_cursor, "ab\nc\nd".len());
+    assert_eq!(shell.state.borrow().editor.cursor(), "ab\nc\nd".len());
     let rendered = render_shell(&shell.state.borrow(), 120);
     assert!(rendered.iter().any(|line| line.contains("ab")));
     assert!(rendered.iter().any(|line| line.contains("c")));
+}
+
+#[test]
+fn composer_delegates_grapheme_edits_and_repaints_only_the_native_frame_suffix() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(24, 12);
+    shell.notice("committed transcript row");
+
+    let now = Instant::now();
+    let mut frame = ShellFrameState::default();
+    let _initial = render_shell_update(&shell.state.borrow(), 24, now, &mut frame);
+    let committed = frame.transcript_len;
+
+    shell.apply_edit(EditAction::Paste("e\u{301}👩‍💻界".into()));
+    shell.apply_edit(EditAction::Left);
+    shell.apply_edit(EditAction::Backspace);
+    assert_eq!(shell.pending(), "e\u{301}界");
+    shell.apply_edit(EditAction::Delete);
+    assert_eq!(shell.pending(), "e\u{301}");
+    assert!(shell.state.borrow().editor.cursor_is_valid());
+
+    let update = render_shell_update(&shell.state.borrow(), 24, now, &mut frame);
+    assert_eq!(update.stable_prefix, committed);
+    assert!(!update.rebuild_scrollback);
+    assert!(
+        !update
+            .replacement
+            .iter()
+            .any(|line| line.contains("committed transcript row")),
+        "draft edits must not replay committed native history"
+    );
+    assert_eq!(
+        update
+            .replacement
+            .iter()
+            .map(|line| line.matches(CURSOR_MARKER).count())
+            .sum::<usize>(),
+        1,
+        "the reusable editor projection must emit one cursor marker"
+    );
+    assert!(update
+        .replacement
+        .iter()
+        .map(|line| strip_terminal_sequences(line))
+        .any(|line| line.contains("e\u{301}")));
 }
 
 #[test]
@@ -2467,7 +2828,7 @@ fn prompt_bar_cursor_tracks_insertions_and_cursor_motion() {
     shell.apply_edit(EditAction::Left);
     shell.apply_edit(EditAction::Left);
     shell.apply_edit(EditAction::Char('X'));
-    assert_eq!(shell.state.borrow().editor, "abcdXef");
+    assert_eq!(shell.state.borrow().editor.text(), "abcdXef");
 
     let rendered = render_shell(&shell.state.borrow(), 120);
     let line = rendered
@@ -2923,6 +3284,7 @@ fn resumed_session_restores_every_write_as_a_diff_panel() {
                         "content": format!("{path} contents\n"),
                     })
                     .to_string(),
+                    argument_error: None,
                 })],
                 model: ModelId("gpt-5.6-sol".into()),
                 protocol: Protocol::OpenAiResponses,
@@ -2966,11 +3328,13 @@ fn duplicate_hydrated_tool_call_ids_never_leave_a_running_card() {
                     id: ToolCallId("duplicate".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"first"}"#.into(),
+                    argument_error: None,
                 }),
                 AssistantPart::ToolCall(ToolCall {
                     id: ToolCallId("duplicate".into()),
                     name: "read".into(),
                     arguments_json: r#"{"path":"second"}"#.into(),
+                    argument_error: None,
                 }),
             ],
             model: ModelId("test".into()),
@@ -3861,7 +4225,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
             visible
                 .lines()
                 .next()
-                .is_some_and(|line| line.contains("Context Usage")),
+                .is_some_and(|line| line.contains("Context")),
             "context heading was clipped with synchronized_output={synchronized_output}:\n{visible}"
         );
         assert!(visible.contains("Estimated usage by category"), "{visible}");
@@ -3893,7 +4257,7 @@ fn slash_popup_then_context_overlay_uses_pi_full_frame_replay() {
         terminal.set_scrollback(usize::MAX);
         let physical = terminal.screen().contents();
         assert!(
-            !physical.contains("Context Usage"),
+            !physical.contains("Estimated usage by category"),
             "overlay entered history:\n{physical}"
         );
         for index in 0..40 {
@@ -4678,7 +5042,7 @@ fn new_session_shrink_reanchors_but_picker_growth_does_not() {
     assert!(fresh.stable_prefix + fresh.replacement.len() < 14);
 
     shell.open_panel(Panel::SelectList {
-        title: "Models".into(),
+        surface: OrdinarySurfaceMetadata::new("Models"),
         items: vec!["model-a".into(), "model-b".into()],
         descriptions: vec![None, None],
         selected: 0,
@@ -5286,7 +5650,7 @@ fn transcript_events_prompt_and_composer_share_one_grid() {
     let working_row = rendered_row(&working, "Working");
     let tool_row = rendered_row(&tool, "Bash");
     let shell = InteractiveShell::test_shell();
-    shell.state.borrow_mut().editor = "draft".into();
+    shell.state.borrow_mut().editor.set_text("draft");
     let composer_row = plain_composer_surface(&shell, 80, Instant::now())
         .into_iter()
         .find(|line| line.contains("draft"))
@@ -6276,6 +6640,66 @@ fn activity_lifecycle_is_working_thinking_streaming_working_then_settled() {
     let settled = rendered(&shell);
     assert!(!settled.iter().any(|line| line.contains("Working")));
     assert!(shell.state.borrow().active_reasoning.is_none());
+}
+
+#[test]
+fn provider_lifecycle_status_is_transient_and_cannot_regress_output() {
+    use ygg_agent::{EntryId, FinishReason};
+    use ygg_ai::{ProviderLifecycle, ProviderLifecycleState};
+
+    let mut shell = InteractiveShell::test_shell();
+    let run_id = shell.begin_run("custom-openai");
+    shell.set_awaiting_provider(run_id);
+    let lifecycle = |state| AgentEvent::ProviderLifecycle {
+        lifecycle: ProviderLifecycle {
+            state,
+            detail: Some("warming".into()),
+        },
+    };
+    let rendered = |shell: &InteractiveShell| {
+        shell
+            .state
+            .borrow()
+            .rendered_transcript(80)
+            .iter()
+            .map(|line| strip_terminal_sequences(line))
+            .collect::<Vec<_>>()
+    };
+
+    shell.on_run_event(run_id, &lifecycle(ProviderLifecycleState::Loading));
+    assert!(rendered(&shell)
+        .iter()
+        .any(|line| line.contains("Loading local endpoint · warming")));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::OutputDelta {
+            channel: OutputChannel::Text,
+            text: "Answer".into(),
+        },
+    );
+    // A delayed readiness comment is advisory only; it cannot replace a
+    // streaming response's trailing generic liveness row.
+    shell.on_run_event(run_id, &lifecycle(ProviderLifecycleState::Ready));
+    let after_output = rendered(&shell);
+    assert!(after_output.iter().any(|line| line.contains("Answer")));
+    assert!(after_output
+        .iter()
+        .any(|line| line.starts_with("• Working (")));
+    assert!(!after_output
+        .iter()
+        .any(|line| line.contains("ready · warming")));
+
+    shell.on_run_event(
+        run_id,
+        &AgentEvent::RunFinished {
+            head: EntryId("head".into()),
+            reason: FinishReason::Completed,
+        },
+    );
+    assert!(!rendered(&shell)
+        .iter()
+        .any(|line| line.contains("Loading local endpoint")));
 }
 
 #[test]
@@ -7479,7 +7903,7 @@ fn reasoning_to_working_to_tool_reuses_the_cached_tail_in_long_sessions() {
         let state = shell.state.borrow();
         let rendered = state.rendered_transcript(80);
         let cache = state.transcript_cache.borrow();
-        assert_eq!(state.editor, "x");
+        assert_eq!(state.editor.text(), "x");
         assert_eq!(cache.generation, generation + 1);
         assert_eq!(cache.last_update_start, working_start);
         assert_eq!(&rendered[..working_start], history_lines.as_slice());
@@ -7540,7 +7964,7 @@ fn unrendered_working_handoff_preserves_the_long_session_cache() {
         let state = shell.state.borrow();
         let rendered = state.rendered_transcript(80);
         let cache = state.transcript_cache.borrow();
-        assert_eq!(state.editor, "x");
+        assert_eq!(state.editor.text(), "x");
         assert_eq!(cache.generation, generation + 1);
         assert_eq!(cache.last_update_start, reasoning_start);
         assert_eq!(&rendered[..reasoning_start], history_lines.as_slice());
@@ -8605,6 +9029,8 @@ fn native_subagent_telemetry_renders_failure_and_hides_generic_spawn_tools() {
             elapsed_ms: 42_000,
             failure_class: reason.map(|_| "provider_failure".into()),
             failure_reason: reason.map(str::to_owned),
+            effective_tool_policy: test_effective_tool_policy(),
+            orchestration_provenance: inherited_delegation_provenance(),
             session: Some("agent-session:opaque".into()),
         }
     };
@@ -8759,6 +9185,8 @@ fn hydrating_a_replacement_session_clears_subagent_activity() {
             elapsed_ms: 500,
             failure_class: None,
             failure_reason: None,
+            effective_tool_policy: test_effective_tool_policy(),
+            orchestration_provenance: inherited_delegation_provenance(),
             session: Some("agent-session:opaque".into()),
         }],
         total_cost_microdollars: Some(1),
@@ -8799,6 +9227,8 @@ fn terminal_subagent_snapshots_hide_the_activity_strip() {
         elapsed_ms: 500,
         failure_class: None,
         failure_reason: None,
+        effective_tool_policy: test_effective_tool_policy(),
+        orchestration_provenance: inherited_delegation_provenance(),
         session: Some("agent-session:opaque".into()),
     };
 
@@ -8894,6 +9324,8 @@ fn subagent_activity_renders_complete_roster_in_both_disclosure_modes() {
         elapsed_ms: 500,
         failure_class: None,
         failure_reason: None,
+        effective_tool_policy: test_effective_tool_policy(),
+        orchestration_provenance: inherited_delegation_provenance(),
         session: Some("agent-session:opaque".into()),
     };
     let render = |shell: &InteractiveShell| {
@@ -9828,7 +10260,7 @@ fn slash_popup_keeps_selection_visible_across_paging_filtering_and_resize() {
     shell.slash_menu(SlashMenuAction::Last);
     shell.apply_edit(EditAction::Char('m'));
     let state = shell.state.borrow();
-    assert_eq!(state.editor, "/m");
+    assert_eq!(state.editor.text(), "/m");
     assert_eq!(state.slash_selection, 0);
     assert_eq!(state.slash_scroll, 0);
     drop(state);
@@ -10479,7 +10911,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
-    assert_eq!(wide.len(), 7);
+    assert_eq!(wide.len(), 8);
     assert!(wide
         .first()
         .is_some_and(|line| line.chars().all(|ch| ch == '─')));
@@ -10491,7 +10923,7 @@ fn panel_border_layout_degrades_to_unframed_narrow_picker() {
         .into_iter()
         .map(|line| strip_terminal_sequences(&line))
         .collect::<Vec<_>>();
-    assert_eq!(narrow.len(), 5);
+    assert_eq!(narrow.len(), 6);
     assert!(narrow
         .first()
         .is_some_and(|line| line.contains("Select model")));
@@ -10551,7 +10983,7 @@ fn populate_theme_fixture(shell: &mut InteractiveShell) {
         },
         None,
     )));
-    state.editor = "draft a local patch".into();
+    state.editor.set_text("draft a local patch");
 }
 
 fn ansi_background_is_open_at_end(line: &str) -> bool {

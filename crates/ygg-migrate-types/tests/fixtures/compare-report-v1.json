@@ -1,0 +1,35 @@
+{
+  "header": {
+    "schema_version": 1,
+    "versions": {
+      "pi": "0.84.4",
+      "ygg": "0.6.7"
+    },
+    "hardware": {
+      "architecture": "arm64",
+      "cpu": "Apple M4",
+      "memory_bytes": "17179869184",
+      "operating_system": "macOS 15.0"
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "task-001",
+      "agent": "pi",
+      "wall_clock": 1234,
+      "peak_rss_bytes": 1048576,
+      "tokens_in": 100,
+      "tokens_out": 50,
+      "success": true
+    },
+    {
+      "task_id": "task-002",
+      "agent": "ygg",
+      "wall_clock": 987,
+      "peak_rss_bytes": 2097152,
+      "tokens_in": 200,
+      "tokens_out": 75,
+      "success": false
+    }
+  ]
+}

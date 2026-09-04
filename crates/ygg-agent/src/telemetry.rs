@@ -269,6 +269,12 @@ impl EventObserver for TelemetryObserver {
     }
 
     fn on_event_for_owner(&self, event: &AgentEvent, resource_owner: &str) {
+        // Endpoint readiness is presentation-only transport telemetry. Do not
+        // write it to the durable agent telemetry log, even for legacy callers
+        // that never registered a run-start hook.
+        if matches!(event, AgentEvent::ProviderLifecycle { .. }) {
+            return;
+        }
         let mut inner = self
             .inner
             .lock()
@@ -440,6 +446,29 @@ impl EventObserver for TelemetryObserver {
                     Value::Bool(repeated_recently > 0),
                 );
                 inner.emit(Some(resource_owner), Some(&run_id), "tool_started", fields);
+            }
+            AgentEvent::ToolPolicyDecision { id, name, decision } => {
+                let mut fields = Map::new();
+                fields.insert(
+                    "tool_call_id_sha256".into(),
+                    Value::String(sha256_hex(id.0.as_bytes())),
+                );
+                fields.insert("tool".into(), Value::String(name.clone()));
+                fields.insert(
+                    "decision".into(),
+                    serde_json::to_value(decision).expect(
+                        "tool policy decision contains only serializable diagnostic fields",
+                    ),
+                );
+                if let Some(active) = state.active_tools.get(&id.0) {
+                    fields.insert("step".into(), Value::Number(active.step_index.into()));
+                }
+                inner.emit(
+                    Some(resource_owner),
+                    Some(&run_id),
+                    "tool_policy_decision",
+                    fields,
+                );
             }
             AgentEvent::ToolFinished {
                 id,
@@ -756,7 +785,9 @@ impl EventObserver for TelemetryObserver {
                     fields,
                 );
             }
-            AgentEvent::ToolProgress { .. } | AgentEvent::OutputMedia { .. } => {}
+            AgentEvent::ToolProgress { .. }
+            | AgentEvent::OutputMedia { .. }
+            | AgentEvent::ProviderLifecycle { .. } => {}
         }
     }
 }
@@ -805,6 +836,8 @@ fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::OpenAiResponses => "openai_responses",
         Protocol::OpenAiChat => "openai_chat",
         Protocol::AnthropicMessages => "anthropic_messages",
+        Protocol::BedrockConverse => "bedrock_converse",
+        Protocol::GoogleGenerativeAi => "google_generative_ai",
     }
 }
 
@@ -856,7 +889,9 @@ fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::CompactionStarted { .. } => "compaction_started",
         AgentEvent::CompactionFinished { .. } => "compaction_finished",
         AgentEvent::TurnStarted => "model_request_started",
+        AgentEvent::ProviderLifecycle { .. } => "provider_lifecycle",
         AgentEvent::ToolStarted { .. } => "tool_started",
+        AgentEvent::ToolPolicyDecision { .. } => "tool_policy_decision",
         AgentEvent::ToolFinished { .. } => "tool_finished",
         AgentEvent::CandidateRejected { .. } => "candidate_rejected",
         AgentEvent::TurnFinished { .. } => "model_request_finished",
@@ -990,8 +1025,10 @@ fn tool_result_facts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::OutputChannel;
+    use crate::effect::{EffectPolicy, ToolEffect, ToolPolicyDenialCode};
+    use crate::events::{OutputChannel, ToolPolicyDecision};
     use crate::input::UserInput;
+    use crate::sandbox::SandboxConfig;
     use ygg_ai::{
         AssistantMessage, AssistantPart, Capabilities, Endpoint, EndpointId, EndpointTransport,
         ModalitySet, ModelId, ModelLimits, ModelSpec, Protocol, StopReason, ToolCallId, Usage,
@@ -1029,6 +1066,7 @@ mod tests {
                 auth: ygg_ai::Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: EndpointTransport::Http,
+                runtime: ygg_ai::RequestRuntime::default(),
                 timeout: Duration::from_secs(1),
             }),
         }
@@ -1128,6 +1166,76 @@ mod tests {
             .find(|record| record["record"] == "run_finished")
             .unwrap();
         assert_eq!(run["usage_scope"], "run_cumulative");
+    }
+
+    #[test]
+    fn policy_decision_records_are_secret_safe_and_machine_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let observer = TelemetryObserver::new(&path, "test").unwrap();
+        observer.on_run_started_for_owner(
+            "entry-1",
+            &UserInput::from("telemetry prompt secret"),
+            &model(),
+            "owner-1",
+        );
+        observer.on_event_for_owner(
+            &AgentEvent::ToolStarted {
+                id: ToolCallId("secret-tool-call-id".into()),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "echo command secret"}),
+            },
+            "owner-1",
+        );
+        let mut sandbox = SandboxConfig::new("/private/users/alice/secret-workspace");
+        sandbox.shell_path = Some("/private/users/alice/.secrets/ygg-shell".into());
+        observer.on_event_for_owner(
+            &AgentEvent::ToolPolicyDecision {
+                id: ToolCallId("secret-tool-call-id".into()),
+                name: "bash".into(),
+                decision: ToolPolicyDecision {
+                    effect: Some(ToolEffect::HostProcess),
+                    allowed: false,
+                    authorization: None,
+                    denial_code: Some(ToolPolicyDenialCode::ProcessDisabled),
+                    policy: sandbox.effective_tool_policy(EffectPolicy::Controlled),
+                },
+            },
+            "owner-1",
+        );
+        drop(observer);
+
+        let raw = std::fs::read_to_string(path).unwrap();
+        let record = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|record| record["record"] == "tool_policy_decision")
+            .expect("tool policy decision telemetry record");
+        assert_eq!(record["schema"], TELEMETRY_SCHEMA);
+        assert_eq!(record["tool"], "bash");
+        assert_eq!(record["decision"]["effect"], "host_process");
+        assert_eq!(record["decision"]["allowed"], false);
+        assert_eq!(record["decision"]["denial_code"], "process_disabled");
+        assert_eq!(
+            record["decision"]["policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            record["decision"]["policy"]["effect_policy"]["source"],
+            "default"
+        );
+        assert_eq!(
+            record["decision"]["policy"]["shell_path"]["value"]["selection"],
+            "configured"
+        );
+        assert!(record["decision"]["policy"]["shell_path"]["value"]
+            .get("sha256")
+            .is_none());
+        assert_ne!(record["tool_call_id_sha256"], "secret-tool-call-id");
+        assert!(!raw.contains("telemetry prompt secret"));
+        assert!(!raw.contains("echo command secret"));
+        assert!(!raw.contains("/private/users/alice/secret-workspace"));
+        assert!(!raw.contains("/private/users/alice/.secrets/ygg-shell"));
     }
 
     #[test]

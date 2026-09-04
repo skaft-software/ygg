@@ -15,10 +15,11 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
+use crossterm::event::Event;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::runtime::{Handle, RuntimeFlavor};
@@ -26,28 +27,58 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use ygg_agent::extension_process::{
     ConfirmationRequest, ConfirmationResponse, ContextContribution, ContextPlacement,
-    DiscoveredExtension, ExtensionEvent, ExtensionHealthSnapshot, ExtensionHealthState,
-    ExtensionHook, ExtensionHookDisposition, ExtensionHostState, ExtensionInputRequest,
-    ExtensionInputResponse, ExtensionLifecycleEvent, ExtensionLifecycleOutcome, ExtensionManifest,
-    ExtensionPolicy, ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
-    ExtensionRuntimeConfig, ExtensionSource, ExtensionTrust, ExtensionUiSurface, ToolRenderRequest,
+    DiscoveredExtension, ExtensionAutocompleteRequest, ExtensionEditorRequest,
+    ExtensionEditorResponse, ExtensionEvent, ExtensionFlag, ExtensionHealthSnapshot,
+    ExtensionHealthState, ExtensionHook, ExtensionHookDisposition, ExtensionHostState,
+    ExtensionInputRequest, ExtensionInputResponse, ExtensionLifecycleEvent,
+    ExtensionLifecycleOutcome, ExtensionManifest, ExtensionPolicy,
+    ExtensionPolicyEvaluationResponse, ExtensionProcess, ExtensionRequestId,
+    ExtensionRuntimeConfig, ExtensionRuntimeSharing, ExtensionSessionLifecycleReceiver,
+    ExtensionSessionLifecycleRequest, ExtensionSessionLifecycleService, ExtensionSource,
+    ExtensionTerminalInput, ExtensionTerminalResize, ExtensionTrust, ExtensionUiContribution,
+    ExtensionUiSurface, ExtensionWidgetPlacement, ShortcutDefinition, ToolRenderRequest,
     ToolRenderSegment, DELEGATION_TELEMETRY_SCHEMA, EXTENSION_API_VERSION_0_1,
-    EXTENSION_FEATURE_AGENT_SESSIONS, EXTENSION_FEATURE_DELEGATION_TELEMETRY,
-    EXTENSION_FEATURE_DYNAMIC_TOOLS, EXTENSION_MANIFEST_FILENAME,
+    EXTENSION_API_VERSION_0_3, EXTENSION_FEATURE_AGENT_SESSIONS,
+    EXTENSION_FEATURE_DELEGATION_TELEMETRY, EXTENSION_FEATURE_DYNAMIC_TOOLS,
+    EXTENSION_MANIFEST_FILENAME, MAX_EXTENSION_UI_ENTRIES, MAX_EXTENSION_UI_LINES,
+};
+use ygg_agent::extension_runtime::{
+    ExtensionRuntimeActivationOutcome, ExtensionRuntimeCatalog, ExtensionRuntimeDomain,
+    ExtensionRuntimeManager, ExtensionSessionBinding,
 };
 use ygg_agent::{
-    Agent, ExtensionHost, ExtensionPolicyDecision, ExtensionPresentationSnapshot, Session,
+    Agent, CancellationToken, ExtensionHost, ExtensionPolicyDecision,
+    ExtensionPresentationSnapshot, ExtensionProviderAuthorizationPolicy,
+    ExtensionProviderAuthorizationStatus, ExtensionProviderOwner, ExtensionProviderRegistry,
+    PostMutationContext, PostMutationKind, PostMutationRescan, PostMutationState, Session,
+    ToolProgress, ToolProgressSink,
 };
-use ygg_ai::{AssistantMessage, AssistantPart, Message, Model, ReasoningConfig, ToolCallId};
+use ygg_ai::{
+    AiClient, AssistantMessage, AssistantPart, Auth, CacheCompatibility, Capabilities, Endpoint,
+    EndpointId, EndpointTransport, Message, Model, ModelCatalog, ModelId, ModelLimits, ModelSpec,
+    OpenAiChatReasoningMode, Protocol, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffort, RequestRuntime, ToolCallId,
+};
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::resource_resolver::{
     ResolvedResource, ResourceDiagnosticLevel, ResourceKind, ResourceResolver, ResourceScope,
 };
 use crate::session_store::SessionStore;
+use crate::tui::keymap::{
+    extension_shortcut_key, is_reserved_extension_shortcut, parse_extension_shortcut,
+    ExtensionShortcutKey,
+};
+use crate::tui::view::{
+    InteractiveShell, ShellAutocompleteItem, ShellEditorSnapshot, ShellExtensionUi,
+    ShellExtensionUiLine, ShellExtensionWorking,
+};
 
 /// The first-party extension that owns every in-harness child-session surface.
 pub const SUBAGENTS_EXTENSION_NAME: &str = "ygg-subagents";
+/// The first-party MCP bridge whose remote transport is separately gated.
+pub const MCP_EXTENSION_NAME: &str = "ygg-mcp";
+const EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT: &str = "--experimental-streamable-http-mcp";
 const MAX_CONTEXT_CONTRIBUTION_BYTES: usize = 64 * 1024;
 /// Returns whether configuration is eligible to launch the trusted observer.
 ///
@@ -82,16 +113,51 @@ const PROMPT_RPC_DEADLINE: Duration = Duration::from_secs(5);
 const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
+/// API 0.3 reverse provider registration starts only after initialize is
+/// acknowledged. The provider completion notification settles the full initial
+/// batch (including zero providers); this remains a bounded fail-closed wait
+/// for older extensions that do not negotiate the additive notification.
+const PROVIDER_REGISTRATION_BARRIER: Duration = Duration::from_millis(500);
+/// Total per-extension deadline for the typed post-mutation hook. A timeout
+/// drops only that extension's rescan request after the host mutation settled.
+const POST_MUTATION_RPC_DEADLINE: Duration = Duration::from_millis(250);
+const MAX_SEEN_POST_MUTATION_IDS: usize = 256;
+const MAX_PENDING_POST_MUTATION_RESCANS: usize = 256;
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 const BACKGROUND_UPDATE_CAPACITY: usize = 64;
+const SHORTCUT_TASK_CONCURRENCY: usize = 8;
 const EVENT_DRAIN_BUDGET: usize = 64;
 const EVENT_DRAIN_PER_RECEIVER_BUDGET: usize = 8;
 const CONFIRMATION_DENIAL_QUEUE_CAPACITY: usize = 64;
 const CONFIRMATION_DENIAL_CONCURRENCY: usize = 8;
 const INPUT_CANCELLATION_QUEUE_CAPACITY: usize = 64;
 const INPUT_CANCELLATION_CONCURRENCY: usize = 8;
+const EXTENSION_UI_EDITOR_RESPONSE_DEADLINE: Duration = Duration::from_millis(500);
+const EXTENSION_AUTOCOMPLETE_DEADLINE: Duration = Duration::from_millis(500);
+const MAX_EXTENSION_AUTOCOMPLETE_TASKS: usize = 1;
+const MAX_PROJECTED_EXTENSION_UI_LINES: usize = if MAX_EXTENSION_UI_ENTRIES > MAX_EXTENSION_UI_LINES
+{
+    MAX_EXTENSION_UI_ENTRIES
+} else {
+    MAX_EXTENSION_UI_LINES
+};
+const SESSION_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
 const CONTROLLED_EXTENSION_START_DIAGNOSTIC: &str = "executable extensions were not started: safe mode denies extension process startup; rerun without --safe-mode only inside OS-level isolation";
 static NEXT_EXTENSION_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// The active-session driver is dispatched only by the interactive idle loop.
+/// Other frontends must not advertise an operation they cannot settle safely.
+fn active_session_lifecycle_enabled(config: &Config) -> bool {
+    matches!(&config.mode, Mode::Interactive)
+}
+
+/// A lifecycle driver belongs to exactly one interactive session, so it may
+/// only be injected into an isolated API 0.3 process. Shared and legacy
+/// processes must never retain a binding-specific reverse service.
+fn extension_session_lifecycle_eligible(descriptor: &DiscoveredExtension) -> bool {
+    descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3
+        && descriptor.manifest.runtime.sharing == ExtensionRuntimeSharing::Isolated
+}
 
 #[derive(serde::Serialize)]
 struct BeforePromptHookPayload<'a> {
@@ -179,6 +245,45 @@ fn extension_policy(
         policy.trust_for_invocation(name.clone());
     }
     (policy, grants)
+}
+
+/// Returns a copy of the product configuration narrowed to extensions that can
+/// statically negotiate API 0.3 provider catalogs.
+///
+/// Provider discovery is the only reason bootstrap may activate an extension
+/// before the final session/model exists. Keep that exceptional process set
+/// narrow: ordinary tools, hooks, and UI extensions must first observe the
+/// selected real launch state.
+pub(crate) fn provider_preflight_config(config: &Config) -> Config {
+    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
+    let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
+    let mut diagnostics = Vec::new();
+    let (policy, _) = extension_policy(config, &mut diagnostics);
+    let mut descriptors = BTreeMap::<String, DiscoveredExtension>::new();
+    for resource in snapshot.resources() {
+        let Some(descriptor) =
+            load_extension_descriptor(&resolver, resource, &policy, &mut diagnostics)
+        else {
+            continue;
+        };
+        descriptors
+            .entry(descriptor.manifest.name.clone())
+            .or_insert(descriptor);
+    }
+    let provider_names = descriptors
+        .into_values()
+        .filter(|descriptor| {
+            descriptor.activation.enabled
+                && descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3
+                && descriptor.manifest.contributes.providers
+        })
+        .map(|descriptor| descriptor.manifest.name)
+        .collect::<BTreeSet<_>>();
+    let mut preflight = config.clone();
+    preflight
+        .enabled_extensions
+        .retain(|name| provider_names.contains(name));
+    preflight
 }
 
 fn normalize_trusted_manifest_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -270,6 +375,45 @@ fn extension_compatibility(
     }
 }
 
+/// Read only selected, trusted manifest metadata for CLI construction.
+///
+/// This deliberately shares the runtime resolver and policy calculation but
+/// never starts or imports an extension process.
+pub(crate) fn selected_extension_flag_declarations(
+    config: &Config,
+) -> Vec<(String, ExtensionFlag)> {
+    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
+    let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
+    let mut diagnostics = Vec::new();
+    let (policy, _) = extension_policy(config, &mut diagnostics);
+    let mut by_name = BTreeMap::<String, DiscoveredExtension>::new();
+    for resource in snapshot.resources() {
+        let Some(descriptor) =
+            load_extension_descriptor(&resolver, resource, &policy, &mut diagnostics)
+        else {
+            continue;
+        };
+        by_name
+            .entry(descriptor.manifest.name.clone())
+            .or_insert(descriptor);
+    }
+    by_name
+        .into_values()
+        .filter(|descriptor| {
+            descriptor.activation.enabled && descriptor.activation.trust == ExtensionTrust::Trusted
+        })
+        .flat_map(|descriptor| {
+            let name = descriptor.manifest.name;
+            descriptor
+                .manifest
+                .contributes
+                .flags
+                .into_iter()
+                .map(move |flag| (name.clone(), flag))
+        })
+        .collect()
+}
+
 fn load_extension_descriptor(
     resolver: &ResourceResolver,
     resource: &ResolvedResource,
@@ -315,6 +459,15 @@ pub trait ExtensionConfirmationHandler {
         Box::pin(std::future::pending())
     }
 
+    /// Receive one bounded, request-scoped extension command progress event.
+    ///
+    /// Implementations must treat this as transient presentation only; it is
+    /// never a command result or durable session content.
+    fn progress(&mut self, _extension: &str, _progress: &ToolProgress) {}
+
+    /// Clear transient command progress after its request settles.
+    fn finish_progress(&mut self, _extension: &str) {}
+
     fn confirm<'a>(
         &'a mut self,
         extension: &'a str,
@@ -343,6 +496,14 @@ where
 {
     fn wait_for_cancel<'a>(&'a mut self) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
         self.inner.wait_for_cancel()
+    }
+
+    fn progress(&mut self, extension: &str, progress: &ToolProgress) {
+        self.inner.progress(extension, progress);
+    }
+
+    fn finish_progress(&mut self, extension: &str) {
+        self.inner.finish_progress(extension);
     }
 
     fn confirm<'a>(
@@ -383,6 +544,8 @@ pub struct ExtensionSummary {
     pub telemetry_schema: Option<String>,
     pub compatibility: String,
     pub health: Option<ExtensionHealthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<ygg_agent::extension_runtime::ExtensionRuntimeStatus>,
     pub tools: Vec<String>,
     pub commands: Vec<String>,
     pub hooks: Vec<ExtensionHook>,
@@ -621,27 +784,601 @@ fn reduce_presentation_update(
     Ok(compact)
 }
 
+/// A host-validated terminal shortcut target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExtensionShortcutInvocation {
+    pub(crate) extension: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone, Debug)]
+struct RegisteredExtensionShortcut {
+    key: ExtensionShortcutKey,
+    invocation: ExtensionShortcutInvocation,
+}
+
+fn register_extension_shortcut(
+    registered: &mut Vec<RegisteredExtensionShortcut>,
+    diagnostics: &mut Vec<String>,
+    extension: &str,
+    shortcut: &ShortcutDefinition,
+) {
+    let key = match parse_extension_shortcut(&shortcut.key) {
+        Ok(key) => key,
+        Err(error) => {
+            diagnostics.push(format!(
+                "warning: extension {extension:?} shortcut {:?} was not registered: {error}",
+                shortcut.key
+            ));
+            return;
+        }
+    };
+    if is_reserved_extension_shortcut(&key) {
+        diagnostics.push(format!(
+            "warning: extension {extension:?} shortcut {:?} was not registered: binding is reserved by Ygg",
+            shortcut.key
+        ));
+        return;
+    }
+    if let Some(existing) = registered
+        .iter()
+        .find(|existing: &&RegisteredExtensionShortcut| existing.key == key)
+    {
+        diagnostics.push(format!(
+            "warning: extension {extension:?} shortcut {:?} conflicts with {}:{}; the first binding remains active",
+            shortcut.key, existing.invocation.extension, existing.invocation.name
+        ));
+        return;
+    }
+    registered.push(RegisteredExtensionShortcut {
+        key,
+        invocation: ExtensionShortcutInvocation {
+            extension: extension.to_owned(),
+            name: shortcut.name.clone(),
+            description: shortcut.description.clone(),
+        },
+    });
+}
+
+fn register_extension_shortcuts(
+    processes: &[ExtensionProcess],
+) -> (Vec<RegisteredExtensionShortcut>, Vec<String>) {
+    let mut registered = Vec::new();
+    let mut diagnostics = Vec::new();
+    for process in processes {
+        let extension = &process.descriptor().manifest.name;
+        for shortcut in &process.contributions().shortcuts {
+            register_extension_shortcut(&mut registered, &mut diagnostics, extension, shortcut);
+        }
+    }
+    (registered, diagnostics)
+}
+
+async fn execute_shortcut_headless(
+    process: ExtensionProcess,
+    name: String,
+    execution_context: ygg_agent::extension_process::ExtensionExecutionContext,
+) -> (String, Vec<ContextContribution>, Vec<String>) {
+    let extension = process.descriptor().manifest.name.clone();
+    let mut events = process.subscribe();
+    let (request_started, started) = tokio::sync::oneshot::channel();
+    let mut started = Box::pin(started);
+    let mut operation = None;
+    let mut execution = Box::pin(process.execute_shortcut_controlled(
+        name.clone(),
+        execution_context,
+        request_started,
+    ));
+    let mut events_open = true;
+    let mut confirmation_denied = false;
+    let mut confirmation_state_uncertain = false;
+    let output = loop {
+        tokio::select! {
+            result = &mut execution => break result,
+            started = &mut started, if operation.is_none() => match started {
+                Ok(started) => operation = Some(started),
+                Err(_) => break execution.await,
+            },
+            event = events.recv(), if events_open && operation.is_some() => match event {
+                Ok(ExtensionEvent::ConfirmationRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if parent_request_id.is_some_and(|parent| {
+                    operation.is_some_and(|operation| operation.owns(generation, parent))
+                }) => {
+                    // The persistent event drain may have denied this first;
+                    // either way, a background shortcut never owns an approval UI.
+                    confirmation_denied = true;
+                    if !process.confirmation_answered(&request_id, generation) {
+                        let _ = process.respond_to_confirmation(
+                            request_id,
+                            generation,
+                            ConfirmationResponse { confirmed: false },
+                        ).await;
+                    }
+                }
+                Ok(ExtensionEvent::InputRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if operation.is_some_and(|operation| operation.owns(generation, parent_request_id)) => {
+                    if !process.input_answered(&request_id, generation) {
+                        let _ = process.respond_to_input(
+                            request_id,
+                            generation,
+                            ExtensionInputResponse { value: None },
+                        ).await;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    confirmation_state_uncertain = true;
+                }
+                Err(broadcast::error::RecvError::Closed) => events_open = false,
+            },
+        }
+    };
+    if operation.is_none() {
+        if let Ok(started) = started.as_mut().get_mut().try_recv() {
+            operation = Some(started);
+        }
+    }
+    if let Some(operation) = operation {
+        loop {
+            match events.try_recv() {
+                Ok(ExtensionEvent::ConfirmationRequested {
+                    request_id,
+                    generation,
+                    parent_request_id,
+                    ..
+                }) if parent_request_id
+                    .is_some_and(|parent| operation.owns(generation, parent)) =>
+                {
+                    // A response may already have been sent by the persistent
+                    // drain. It was necessarily a denial for this background
+                    // operation, so never admit its output or context.
+                    confirmation_denied = true;
+                    if !process.confirmation_answered(&request_id, generation) {
+                        let _ = process
+                            .respond_to_confirmation(
+                                request_id,
+                                generation,
+                                ConfirmationResponse { confirmed: false },
+                            )
+                            .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+                Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                    confirmation_state_uncertain = true;
+                }
+            }
+        }
+    } else if output.is_ok() {
+        // A successful admitted request always reports its operation token. If
+        // it did not, do not accept output that cannot be scoped safely.
+        confirmation_state_uncertain = true;
+    }
+    match output {
+        Ok(_) if confirmation_denied => {
+            let message = format!(
+                "extension shortcut {extension:?}/{name:?} requires an interactive confirmation and was denied"
+            );
+            (extension, Vec::new(), vec![message])
+        }
+        Ok(_) if confirmation_state_uncertain => (
+            extension,
+            Vec::new(),
+            vec![format!(
+                "extension shortcut {name:?} output was discarded because its confirmation state could not be verified"
+            )],
+        ),
+        Ok(output) => {
+            let mut messages = Vec::new();
+            if !output.text.trim().is_empty() {
+                messages.push(output.text);
+            }
+            messages.extend(
+                output
+                    .notifications
+                    .iter()
+                    .map(|notification| format_notification(&name, notification)),
+            );
+            (extension, output.context, messages)
+        }
+        Err(error) => (
+            extension,
+            Vec::new(),
+            vec![format!("extension shortcut {name:?} failed: {error}")],
+        ),
+    }
+}
+
+/// Product-owned authorization boundary for API 0.3 extension providers.
+///
+/// The coding agent does not currently expose a credential or OAuth setup
+/// surface for extension providers. Explicitly park those routes instead of
+/// allowing an extension declaration to imply credential authority. The
+/// registry handles unauthenticated providers without consulting this policy.
+#[derive(Default)]
+struct CodingAgentProviderAuthorizationPolicy;
+
+impl ExtensionProviderAuthorizationPolicy for CodingAgentProviderAuthorizationPolicy {
+    fn authorize(
+        &self,
+        _owner: &ExtensionProviderOwner,
+        _provider: &ygg_agent::extension_api_v03::ProviderDefinition,
+        request: &ygg_agent::extension_api_v03::ProviderAuthorizationRequest,
+    ) -> ygg_agent::extension_api_v03::ProviderAuthorizationResult {
+        ygg_agent::extension_api_v03::ProviderAuthorizationResult {
+            status: if request.action == "revoke" {
+                "revoked"
+            } else {
+                "unavailable"
+            }
+            .to_owned(),
+            lease: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProviderCatalogProjection {
+    revision: Option<usize>,
+    routes: BTreeMap<String, EndpointId>,
+}
+
+/// Shared owner for extension-provider declarations and their local catalog
+/// projection. The registry itself stores only secret-free declarations; this
+/// product layer synthesizes opaque local endpoints and host stream routes.
+#[derive(Clone)]
+pub(crate) struct ExtensionProviderRuntime {
+    registry: Arc<ExtensionProviderRegistry>,
+    projection: Arc<Mutex<ProviderCatalogProjection>>,
+}
+
+impl Default for ExtensionProviderRuntime {
+    fn default() -> Self {
+        Self {
+            registry: Arc::new(ExtensionProviderRegistry::with_authorization_policy(
+                Arc::new(CodingAgentProviderAuthorizationPolicy),
+            )),
+            projection: Arc::new(Mutex::new(ProviderCatalogProjection::default())),
+        }
+    }
+}
+
+impl ExtensionProviderRuntime {
+    fn registry(&self) -> Arc<ExtensionProviderRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    fn initial_provider_owners(processes: &[ExtensionProcess]) -> Vec<ExtensionProviderOwner> {
+        processes
+            .iter()
+            .filter(|process| process.contributions().providers)
+            .map(|process| ExtensionProviderOwner {
+                extension_instance_id: process.extension_instance_id().to_owned(),
+                generation: process.health_snapshot().generation,
+            })
+            .collect()
+    }
+
+    fn await_initial_registrations(&self, processes: &[ExtensionProcess]) {
+        let owners = Self::initial_provider_owners(processes);
+        // A completion notification follows every bridge-owned initial batch,
+        // including an empty one. Extensions predating that additive API surface
+        // time out here and their incomplete declarations remain unprojected.
+        let _ = self
+            .registry
+            .wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER);
+    }
+
+    async fn await_initial_registrations_async(&self, processes: &[ExtensionProcess]) {
+        let owners = Self::initial_provider_owners(processes);
+        if owners.is_empty() {
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        // Reload runs from the Tokio runtime. Keep its completion wait off a
+        // core worker so post-initialize reverse registration can make progress
+        // even when the runtime has only one configured worker thread.
+        let _ = tokio::task::spawn_blocking(move || {
+            registry.wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER)
+        })
+        .await;
+    }
+
+    /// Reconciles ready provider declarations into the local model catalog.
+    ///
+    /// Each synthesized endpoint is fenced by the owner instance and process
+    /// generation. A replacement or authorization revocation therefore removes
+    /// the old model and host stream transport before a newer route is made
+    /// selectable. Extension-declared URLs, headers, credentials, and leases
+    /// never enter this projection.
+    fn synchronize(
+        &self,
+        catalog: &mut ModelCatalog,
+        client: &AiClient,
+        processes: &[ExtensionProcess],
+    ) -> Vec<String> {
+        let (revision, entries) = self.registry.snapshot();
+        let desired = entries
+            .iter()
+            .filter(|entry| entry.authorization == ExtensionProviderAuthorizationStatus::Ready)
+            .flat_map(|entry| {
+                entry.models.iter().filter_map(|model| {
+                    extension_provider_protocol(&model.protocol)
+                        .map(|_| extension_provider_model_id(&entry.provider.id, &model.id).0)
+                })
+            })
+            .collect::<BTreeSet<_>>();
+        let mut projection = self
+            .projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = projection.revision == Some(revision)
+            && projection.routes.keys().collect::<BTreeSet<_>>()
+                == desired.iter().collect::<BTreeSet<_>>()
+            && projection.routes.iter().all(|(model, endpoint)| {
+                catalog
+                    .resolve(&ModelId(model.clone()))
+                    .is_ok_and(|registered| registered.endpoint.id == *endpoint)
+            });
+        if current {
+            return Vec::new();
+        }
+
+        for (model, endpoint) in std::mem::take(&mut projection.routes) {
+            let model = ModelId(model);
+            catalog.remove_model_if_endpoint(&model, &endpoint);
+            client.remove_host_stream_transport(&endpoint);
+            catalog.remove_endpoint_if_unused(&endpoint);
+        }
+
+        let mut diagnostics = Vec::new();
+        for entry in entries {
+            if entry.authorization != ExtensionProviderAuthorizationStatus::Ready {
+                continue;
+            }
+            let Some(process) = processes.iter().find(|process| {
+                process.extension_instance_id() == entry.owner.extension_instance_id
+                    && process.health_snapshot().generation == entry.owner.generation
+                    && process.is_running()
+            }) else {
+                diagnostics.push(format!(
+                    "warning: extension provider {:?} has no live owning process",
+                    entry.provider.id
+                ));
+                continue;
+            };
+
+            for provider_model in entry.models {
+                let Some(protocol) = extension_provider_protocol(&provider_model.protocol) else {
+                    diagnostics.push(format!(
+                        "warning: extension provider {:?} model {:?} declares an unsupported protocol",
+                        entry.provider.id, provider_model.id
+                    ));
+                    continue;
+                };
+                let Some(route) = self
+                    .registry
+                    .resolve(&entry.provider.id, &provider_model.id)
+                else {
+                    continue;
+                };
+                if route.owner != entry.owner || route.model != provider_model {
+                    continue;
+                }
+
+                let model_id = extension_provider_model_id(&entry.provider.id, &provider_model.id);
+                if catalog.resolve(&model_id).is_ok() {
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} conflicts with an existing catalog model",
+                        model_id.0
+                    ));
+                    continue;
+                }
+                let endpoint_id = extension_provider_endpoint_id(
+                    &entry.owner,
+                    &entry.provider.id,
+                    &provider_model.id,
+                );
+                if catalog.has_endpoint(&endpoint_id) {
+                    diagnostics.push(
+                        "warning: extension provider endpoint identity conflicts with an existing catalog endpoint"
+                            .to_owned(),
+                    );
+                    continue;
+                }
+                let (Ok(context_window), Ok(max_output_tokens)) = (
+                    u64::try_from(provider_model.context_window),
+                    u64::try_from(provider_model.max_output_tokens),
+                ) else {
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} has token limits outside the local catalog range",
+                        model_id.0
+                    ));
+                    continue;
+                };
+                let endpoint = Endpoint {
+                    id: endpoint_id.clone(),
+                    // This inert local URL is required by ModelCatalog's
+                    // endpoint invariant. AiClient dispatches the registered
+                    // host transport before any HTTP codec can inspect it.
+                    base_url: url::Url::parse("http://127.0.0.1:9/")
+                        .expect("fixed extension-provider endpoint URL is valid"),
+                    auth: Auth::None,
+                    default_headers: http::HeaderMap::new(),
+                    transport: EndpointTransport::Http,
+                    runtime: RequestRuntime::default(),
+                    timeout: Duration::from_secs(30),
+                };
+                if catalog.register_endpoint(endpoint).is_err() {
+                    diagnostics.push(
+                        "warning: extension provider endpoint could not be registered".to_owned(),
+                    );
+                    continue;
+                }
+                let _ =
+                    catalog.set_endpoint_label(endpoint_id.clone(), entry.provider.label.clone());
+                let specification = ModelSpec {
+                    id: model_id.clone(),
+                    endpoint: endpoint_id.clone(),
+                    api_name: provider_model.api_name.clone(),
+                    display_name: provider_model.display_name.clone(),
+                    protocol,
+                    capabilities: extension_provider_capabilities(&provider_model.capabilities),
+                    limits: ModelLimits {
+                        context_window,
+                        max_output_tokens,
+                    },
+                    pricing: None,
+                    cache: CacheCompatibility {
+                        supports_long_retention: false,
+                        send_session_id_header: false,
+                        send_session_affinity_headers: false,
+                        session_affinity_format: None,
+                        cache_control_format: None,
+                        supports_cache_control_on_tools: false,
+                    },
+                };
+                if catalog.register_model(specification).is_err() {
+                    catalog.remove_endpoint_if_unused(&endpoint_id);
+                    diagnostics.push(format!(
+                        "warning: extension provider model {:?} could not be registered",
+                        model_id.0
+                    ));
+                    continue;
+                }
+                client.register_host_stream_transport(
+                    endpoint_id.clone(),
+                    process.provider_stream_transport(entry.provider.id.clone(), provider_model.id),
+                );
+                projection.routes.insert(model_id.0, endpoint_id);
+            }
+        }
+        projection.revision = Some(revision);
+        diagnostics
+    }
+
+    /// Removes only routes this runtime previously projected, including their
+    /// host-stream transport registrations.
+    fn clear(&self, catalog: &mut ModelCatalog, client: &AiClient) {
+        let mut projection = self
+            .projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (model, endpoint) in std::mem::take(&mut projection.routes) {
+            catalog.remove_model_if_endpoint(&ModelId(model), &endpoint);
+            client.remove_host_stream_transport(&endpoint);
+            catalog.remove_endpoint_if_unused(&endpoint);
+        }
+        projection.revision = None;
+    }
+}
+
+fn extension_provider_model_id(provider_id: &str, model_id: &str) -> ModelId {
+    ModelId(format!("{provider_id}/{model_id}"))
+}
+
+fn extension_provider_endpoint_id(
+    owner: &ExtensionProviderOwner,
+    provider_id: &str,
+    model_id: &str,
+) -> EndpointId {
+    let mut digest = Sha256::new();
+    digest.update(b"ygg-coding-agent-extension-provider-endpoint-v1\0");
+    digest.update(owner.extension_instance_id.as_bytes());
+    digest.update([0]);
+    digest.update(owner.generation.to_le_bytes());
+    digest.update(provider_id.as_bytes());
+    digest.update([0]);
+    digest.update(model_id.as_bytes());
+    let digest = format!("{:x}", digest.finalize());
+    EndpointId(format!("extension-provider-{}", &digest[..32]))
+}
+
+fn extension_provider_protocol(protocol: &str) -> Option<Protocol> {
+    match protocol {
+        "openai_chat" => Some(Protocol::OpenAiChat),
+        "openai_responses" => Some(Protocol::OpenAiResponses),
+        "anthropic_messages" => Some(Protocol::AnthropicMessages),
+        _ => None,
+    }
+}
+
+fn extension_provider_capabilities(
+    capabilities: &ygg_agent::extension_api_v03::ProviderModelCapabilities,
+) -> Capabilities {
+    Capabilities {
+        input_modalities: Default::default(),
+        output_modalities: Default::default(),
+        tools: capabilities.tools,
+        parallel_tool_calls: capabilities.parallel_tool_calls,
+        reasoning: capabilities.reasoning.then_some(ReasoningCapability {
+            control: ReasoningControl::Effort,
+            exposes_text: true,
+            preserves_state: false,
+            effort_budgets: None,
+            openai_chat_mode: OpenAiChatReasoningMode::Standard,
+            min_effort: ReasoningEffort::Minimal,
+            max_effort: ReasoningEffort::High,
+        }),
+        responses_lite: false,
+        agent_delegation: None,
+        structured_output: capabilities.structured_output,
+        deferred_tool_loading: false,
+    }
+}
+
 pub struct ExecutableExtensions {
     processes: Vec<ExtensionProcess>,
+    provider_runtime: ExtensionProviderRuntime,
+    runtime_manager: Option<ExtensionRuntimeManager>,
+    runtime_binding: Option<ExtensionSessionBinding>,
     receivers: Vec<broadcast::Receiver<ExtensionEvent>>,
+    shortcuts: Vec<RegisteredExtensionShortcut>,
     summaries: Vec<ExtensionSummary>,
     diagnostics: BoundedDiagnostics,
     pending_context: PendingContext,
     presentations: BTreeMap<String, ExtensionPresentationView>,
+    semantic_ui: BTreeMap<String, SemanticUiView>,
+    autocomplete_registrations: BTreeMap<String, RegisteredAutocomplete>,
+    last_editor_state: Option<EditorStateDelivery>,
     background_tx: mpsc::Sender<ExtensionBackgroundUpdate>,
     background_rx: mpsc::Receiver<ExtensionBackgroundUpdate>,
     renderer_tasks: Vec<JoinHandle<()>>,
+    autocomplete_tasks: Vec<JoinHandle<()>>,
+    pending_editor_requests: VecDeque<PendingEditorRequest>,
+    shortcut_tasks: Vec<JoinHandle<()>>,
     event_drain_cursor: usize,
     confirmation_denials: VecDeque<PendingConfirmationDenial>,
     confirmation_tasks: Vec<JoinHandle<()>>,
     input_cancellations: VecDeque<PendingInputCancellation>,
     input_tasks: Vec<JoinHandle<()>>,
     policy_supervisors: Vec<JoinHandle<()>>,
+    session_lifecycle_service: Option<ExtensionSessionLifecycleService>,
+    session_lifecycle_receiver: Option<ExtensionSessionLifecycleReceiver>,
     session_id: Option<String>,
     resource_owner: Option<String>,
     session_started_at: Instant,
     session_lifecycle_started: bool,
     last_lifecycle_outcome: Option<ExtensionLifecycleOutcome>,
+    /// Stable host-created mutation identities already delivered to hooks.
+    /// Keeping this outside process generations prevents reload/restart paths
+    /// from redelivering the same completed mutation.
+    seen_post_mutation_ids: VecDeque<String>,
+    /// Bounded resolver work requested by admitted post-mutation hooks. The
+    /// product resource owner drains this queue and decides how to rescan; an
+    /// extension never receives authority to perform the host mutation.
+    pending_post_mutation_rescans: VecDeque<PostMutationRescan>,
     #[cfg(test)]
     lifecycle_delivery_test_control: Option<std::sync::Arc<LifecycleDeliveryTestControl>>,
 }
@@ -812,30 +1549,95 @@ struct PendingInputCancellation {
     generation: u64,
 }
 
+struct PendingEditorRequest {
+    process: ExtensionProcess,
+    request_id: ExtensionRequestId,
+    generation: u64,
+    request: ExtensionEditorRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditorStateDelivery {
+    state: ExtensionEditorResponse,
+    generations: BTreeMap<String, (u64, String)>,
+}
+
+#[derive(Clone)]
+struct SemanticUiStatus {
+    text: String,
+    style_role: Option<String>,
+    priority: i32,
+}
+
+#[derive(Clone)]
+struct SemanticUiWidget {
+    lines: Vec<String>,
+    placement: ExtensionWidgetPlacement,
+    style_role: Option<String>,
+    priority: i32,
+}
+
+#[derive(Default)]
+struct SemanticUiView {
+    extension_instance_id: String,
+    generation: u64,
+    statuses: BTreeMap<String, SemanticUiStatus>,
+    widgets: BTreeMap<String, SemanticUiWidget>,
+    working: Option<ShellExtensionWorking>,
+    hidden_thinking_label: Option<String>,
+}
+
+#[derive(Clone)]
+struct RegisteredAutocomplete {
+    process: ExtensionProcess,
+    generation: u64,
+    extension_instance_id: String,
+}
+
+pub(crate) struct ExtensionAutocompleteUpdate {
+    pub(crate) snapshot: ShellEditorSnapshot,
+    pub(crate) prefix: String,
+    pub(crate) items: Vec<ShellAutocompleteItem>,
+}
+
 impl Default for ExecutableExtensions {
     fn default() -> Self {
         let (background_tx, background_rx) = mpsc::channel(BACKGROUND_UPDATE_CAPACITY);
         Self {
             processes: Vec::new(),
+            provider_runtime: ExtensionProviderRuntime::default(),
+            runtime_manager: None,
+            runtime_binding: None,
             receivers: Vec::new(),
+            shortcuts: Vec::new(),
             summaries: Vec::new(),
             diagnostics: BoundedDiagnostics::default(),
             pending_context: PendingContext::default(),
             presentations: BTreeMap::new(),
+            semantic_ui: BTreeMap::new(),
+            autocomplete_registrations: BTreeMap::new(),
+            last_editor_state: None,
             background_tx,
             background_rx,
             renderer_tasks: Vec::new(),
+            autocomplete_tasks: Vec::new(),
+            pending_editor_requests: VecDeque::new(),
+            shortcut_tasks: Vec::new(),
             event_drain_cursor: 0,
             confirmation_denials: VecDeque::new(),
             confirmation_tasks: Vec::new(),
             input_cancellations: VecDeque::new(),
             input_tasks: Vec::new(),
             policy_supervisors: Vec::new(),
+            session_lifecycle_service: None,
+            session_lifecycle_receiver: None,
             session_id: None,
             resource_owner: None,
             session_started_at: Instant::now(),
             session_lifecycle_started: false,
             last_lifecycle_outcome: None,
+            seen_post_mutation_ids: VecDeque::new(),
+            pending_post_mutation_rescans: VecDeque::new(),
             #[cfg(test)]
             lifecycle_delivery_test_control: None,
         }
@@ -850,6 +1652,9 @@ pub struct ExtensionToolRenderUpdate {
 #[derive(Default)]
 pub struct ExtensionBackgroundUpdates {
     pub rendered_tools: Vec<ExtensionToolRenderUpdate>,
+    pub(crate) autocomplete: Vec<ExtensionAutocompleteUpdate>,
+    /// Completed shortcut output, ready for the interactive transcript.
+    pub shortcut_messages: Vec<String>,
 }
 
 enum ExtensionBackgroundUpdate {
@@ -857,9 +1662,63 @@ enum ExtensionBackgroundUpdate {
         update: Option<ExtensionToolRenderUpdate>,
         diagnostic: Option<String>,
     },
+    Autocomplete {
+        update: Option<ExtensionAutocompleteUpdate>,
+        diagnostic: Option<String>,
+    },
+    Shortcut {
+        extension: String,
+        context: Vec<ContextContribution>,
+        messages: Vec<String>,
+    },
+}
+
+fn opaque_extension_resource_id(name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    format!("extension:{digest:x}")
+}
+
+/// Keep the experimental transport switch at the process-owner boundary.
+///
+/// Manifest and MCP configuration are both data loaded before the extension
+/// process starts. Strip any copy supplied through that data, then add the
+/// argument only when this Ygg process received its one-shot CLI opt-in.
+fn apply_experimental_streamable_http_mcp_gate(
+    descriptor: &mut DiscoveredExtension,
+    enabled: bool,
+) {
+    if descriptor.manifest.name != MCP_EXTENSION_NAME {
+        return;
+    }
+    descriptor
+        .manifest
+        .entrypoint
+        .args
+        .retain(|argument| argument != EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT);
+    if enabled {
+        descriptor
+            .manifest
+            .entrypoint
+            .args
+            .push(EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT.to_owned());
+    }
 }
 
 impl ExecutableExtensions {
+    /// Discovers and starts extensions with a fresh ordinary-host runtime manager.
+    ///
+    /// Product bootstrap uses [`Self::discover_and_start_with_runtime_manager`]
+    /// to retain compatible workspace services across an App rebuild. This
+    /// wrapper preserves the direct construction seam used by focused tests.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the direct construction seam is exercised only by unit tests"
+        )
+    )]
     pub fn discover_and_start(
         config: &Config,
         session: &Session,
@@ -867,6 +1726,49 @@ impl ExecutableExtensions {
         reasoning: &ReasoningConfig,
         sessions: &SessionStore,
         host: &mut ExtensionHost,
+    ) -> Self {
+        Self::discover_and_start_with_runtime_manager(
+            config, session, model, reasoning, sessions, host, None,
+        )
+    }
+
+    /// Discovers a static catalog, binds the current session, and activates
+    /// eager lifecycle profiles through the supplied durable manager.
+    pub fn discover_and_start_with_runtime_manager(
+        config: &Config,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+        host: &mut ExtensionHost,
+        runtime_manager: Option<ExtensionRuntimeManager>,
+    ) -> Self {
+        Self::discover_and_start_with_provider_runtime(
+            config,
+            session,
+            model,
+            reasoning,
+            sessions,
+            host,
+            runtime_manager,
+            ExtensionProviderRuntime::default(),
+        )
+    }
+
+    /// Discovers and starts extensions using one product-owned provider runtime.
+    ///
+    /// Bootstrap and rebuild pass the same value through this seam so API 0.3
+    /// declarations keep their process-owner fences while the App is replaced.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn discover_and_start_with_provider_runtime(
+        config: &Config,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+        host: &mut ExtensionHost,
+        runtime_manager: Option<ExtensionRuntimeManager>,
+        provider_runtime: ExtensionProviderRuntime,
     ) -> Self {
         let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
         let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
@@ -934,7 +1836,13 @@ impl ExecutableExtensions {
             }
         }
 
-        let descriptors = by_name.into_values().collect::<Vec<_>>();
+        let mut descriptors = by_name.into_values().collect::<Vec<_>>();
+        for descriptor in &mut descriptors {
+            apply_experimental_streamable_http_mcp_gate(
+                descriptor,
+                config.experimental_streamable_http_mcp,
+            );
+        }
         for descriptor in &descriptors {
             if descriptor.activation.enabled
                 && descriptor.activation.trust == ExtensionTrust::Untrusted
@@ -976,61 +1884,121 @@ impl ExecutableExtensions {
             .cloned()
             .collect::<Vec<_>>();
 
-        let starts = if startable.is_empty() {
-            Vec::new()
-        } else {
-            let workspace = config.workspace.clone();
-            let state = host_state.clone();
-            let subagents_tool_available =
-                model.spec.capabilities.tools && config.tool_available("subagent_spawn");
-            match block_on_runtime(async move {
-                let starts = FuturesUnordered::new();
-                for (index, descriptor) in startable.into_iter().enumerate() {
-                    let name = descriptor.manifest.name.clone();
-                    let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
-                    runtime.host_state = state.clone();
-                    runtime.agent_sessions =
-                        name == SUBAGENTS_EXTENSION_NAME && subagents_tool_available;
-                    starts.push(async move {
-                        (
-                            index,
-                            name,
-                            ExtensionProcess::start(descriptor, runtime).await,
-                        )
-                    });
-                }
-                let mut completed = Vec::new();
-                tokio::pin!(starts);
-                while let Some((index, name, start)) = starts.next().await {
-                    if let Ok(process) = &start {
-                        // Attach only the live catalog immediately. A fast
-                        // dynamic child must not wait behind a slow sibling's
-                        // independent initialization deadline, while observer
-                        // and hook registration still follows discovery order.
-                        process.register_dynamic_tool_catalog(host);
-                    }
-                    completed.push((index, name, start));
-                }
-                completed.sort_by_key(|(index, _, _)| *index);
-                for (_, _, start) in &completed {
-                    if let Ok(process) = start {
-                        host.load(process);
-                    }
-                }
-                completed
-                    .into_iter()
-                    .map(|(_, name, start)| (name, start))
-                    .collect::<Vec<_>>()
-            }) {
-                Ok(starts) => starts,
-                Err(error) => {
-                    diagnostics.push(format!(
-                        "error: executable extensions could not start: {error}"
-                    ));
-                    Vec::new()
+        let (session_lifecycle_service, session_lifecycle_receiver) =
+            if active_session_lifecycle_enabled(config)
+                && startable.iter().any(extension_session_lifecycle_eligible)
+            {
+                let (service, receiver) =
+                    ExtensionSessionLifecycleService::channel(SESSION_LIFECYCLE_QUEUE_CAPACITY)
+                        .expect("fixed session lifecycle queue capacity is bounded");
+                (Some(service), Some(receiver))
+            } else {
+                (None, None)
+            };
+
+        // Discovery remains static. Catalog construction reads bounded source
+        // identity only; the durable manager is the sole owner allowed to
+        // activate a process after policy/trust gates have admitted it.
+        let catalog = ExtensionRuntimeCatalog::from_descriptors(descriptors.clone());
+        diagnostics.extend(catalog.diagnostics().iter().map(|diagnostic| {
+            format!(
+                "warning: extension {:?}: runtime catalog {}",
+                diagnostic.extension, diagnostic.message
+            )
+        }));
+        let mut managed_runtime = runtime_manager;
+        let mut runtime_binding = None;
+        let mut starts = Vec::<(String, Result<ExtensionProcess, String>)>::new();
+        if !descriptors.is_empty() || managed_runtime.is_some() {
+            if managed_runtime.is_none() {
+                match ExtensionRuntimeDomain::ordinary(&config.workspace) {
+                    Ok(domain) => managed_runtime = Some(ExtensionRuntimeManager::new(domain)),
+                    Err(error) => diagnostics.push(format!(
+                        "error: executable extension runtime domain could not be created: {error}"
+                    )),
                 }
             }
-        };
+            if let Some(manager) = managed_runtime.clone() {
+                let workspace = config.workspace.clone();
+                let state = host_state.clone();
+                let session_lifecycle_service = session_lifecycle_service.clone();
+                let provider_registry = provider_runtime.registry();
+                let subagents_tool_available =
+                    model.spec.capabilities.tools && config.tool_available("subagent_spawn");
+                let extension_flag_values = config.extension_flag_values.clone();
+                let owner = session.resource_owner_key();
+                let startable_names = startable
+                    .iter()
+                    .map(|descriptor| descriptor.manifest.name.clone())
+                    .collect::<Vec<_>>();
+                match block_on_runtime(async move {
+                    manager.replace_catalog(catalog).await;
+                    let binding = manager
+                        .bind_session(owner)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                    let starts = binding
+                        .activate_eager(startable_names, |entry| {
+                            let mut runtime = ExtensionRuntimeConfig::new(workspace.clone());
+                            runtime.host_state = state.clone();
+                            runtime.flag_values = extension_flag_values
+                                .get(&entry.descriptor.manifest.name)
+                                .cloned()
+                                .unwrap_or_default();
+                            runtime.agent_sessions = entry.descriptor.manifest.name
+                                == SUBAGENTS_EXTENSION_NAME
+                                && subagents_tool_available;
+                            runtime.session_lifecycle =
+                                if extension_session_lifecycle_eligible(&entry.descriptor) {
+                                    session_lifecycle_service.clone()
+                                } else {
+                                    None
+                                };
+                            runtime.provider_registry = Some(provider_registry.clone());
+                            runtime
+                        })
+                        .await;
+                    Ok::<_, anyhow::Error>((binding, starts))
+                }) {
+                    Ok(Ok((binding, activations))) => {
+                        runtime_binding = Some(binding);
+                        for activation in activations {
+                            let name = activation.extension;
+                            match (activation.outcome, activation.process) {
+                                (ExtensionRuntimeActivationOutcome::Ready, Some(process)) => {
+                                    starts.push((name, Ok(process)));
+                                }
+                                (outcome, _) => starts.push((
+                                    name,
+                                    Err(match outcome {
+                                        ExtensionRuntimeActivationOutcome::Inactive => {
+                                            "extension is not eligible for activation".to_owned()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::StaleSource => {
+                                            "extension source changed before activation".to_owned()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::ResourceExhausted(error) => {
+                                            error.to_string()
+                                        }
+                                        ExtensionRuntimeActivationOutcome::Failed(failure) => {
+                                            format!("runtime startup {failure:?}")
+                                        }
+                                        ExtensionRuntimeActivationOutcome::Ready => {
+                                            "runtime activation returned no process".to_owned()
+                                        }
+                                    }),
+                                )),
+                            }
+                        }
+                    }
+                    Ok(Err(error)) => diagnostics.push(format!(
+                        "error: executable extensions could not bind to the runtime manager: {error}"
+                    )),
+                    Err(error) => diagnostics.push(format!(
+                        "error: executable extensions could not start: {error}"
+                    )),
+                }
+            }
+        }
 
         let mut processes = Vec::new();
         let mut receivers = Vec::new();
@@ -1051,6 +2019,31 @@ impl ExecutableExtensions {
             }
         }
 
+        // API 0.3 provider declarations are reverse RPCs intentionally sent
+        // after initialize. Observe their bounded startup barrier before the
+        // caller projects models from the registry.
+        provider_runtime.await_initial_registrations(&processes);
+
+        // Register tool catalogs before observers/hooks so all live processes
+        // have a host-owned dynamic group. A compatible shared process was
+        // detached from the previous App binding before this point.
+        for process in &processes {
+            process.register_dynamic_tool_catalog(host);
+        }
+        for process in &processes {
+            host.load(process);
+        }
+
+        let (shortcuts, shortcut_diagnostics) = register_extension_shortcuts(&processes);
+        diagnostics.extend(shortcut_diagnostics);
+
+        let runtime_statuses = managed_runtime
+            .as_ref()
+            .map(ExtensionRuntimeManager::statuses)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|status| (status.provenance.extension.clone(), status))
+            .collect::<BTreeMap<_, _>>();
         let summaries = descriptors
             .into_iter()
             .map(|descriptor| {
@@ -1097,6 +2090,7 @@ impl ExecutableExtensions {
                     telemetry_schema,
                     compatibility,
                     health,
+                    runtime: runtime_statuses.get(&descriptor.manifest.name).cloned(),
                     tools: contributions
                         .map(|value| value.tools.iter().map(|tool| tool.name.clone()).collect())
                         .unwrap_or_else(|| descriptor.manifest.contributes.tools.clone()),
@@ -1117,14 +2111,77 @@ impl ExecutableExtensions {
 
         let mut extensions = Self::default();
         extensions.processes = processes;
+        extensions.provider_runtime = provider_runtime;
+        extensions.runtime_manager = managed_runtime;
+        extensions.runtime_binding = runtime_binding;
         extensions.receivers = receivers;
+        extensions.shortcuts = shortcuts;
         extensions.summaries = summaries;
         extensions.diagnostics.extend(diagnostics);
+        extensions.session_lifecycle_service = session_lifecycle_service;
+        extensions.session_lifecycle_receiver = session_lifecycle_receiver;
         extensions.session_id = host_state.session_id.clone();
         extensions.resource_owner = Some(session.resource_owner_key());
         extensions.start_policy_supervisors();
         extensions.start_session_lifecycle();
         extensions
+    }
+
+    /// Returns the durable process-fleet owner, if discovery created one.
+    ///
+    /// App rebuilds retain this exact manager and only replace their session
+    /// binding, which allows a compatible workspace service to survive without
+    /// transferring process ownership to a session object.
+    pub fn runtime_manager(&self) -> Option<ExtensionRuntimeManager> {
+        self.runtime_manager.clone()
+    }
+
+    /// Returns the shared product provider runtime retained across App rebuilds.
+    pub(crate) fn provider_runtime(&self) -> ExtensionProviderRuntime {
+        self.provider_runtime.clone()
+    }
+
+    /// Projects the current registry snapshot into this App's local catalog.
+    ///
+    /// Callers own the catalog/client mutation boundary; executable extensions
+    /// retain only declarations and process handles.
+    pub(crate) fn synchronize_provider_catalog(
+        &mut self,
+        catalog: &mut ModelCatalog,
+        client: &AiClient,
+    ) -> Vec<String> {
+        let diagnostics = self
+            .provider_runtime
+            .synchronize(catalog, client, &self.processes);
+        self.diagnostics.extend(diagnostics.clone());
+        diagnostics
+    }
+
+    /// Withdraws this host's provider projection before its processes stop.
+    pub(crate) fn clear_provider_catalog(&mut self, catalog: &mut ModelCatalog, client: &AiClient) {
+        self.provider_runtime.clear(catalog, client);
+    }
+
+    /// Enables requests only after an interactive application has a safely
+    /// bound active session. Startup and rebuild leave the queue inactive.
+    pub fn activate_session_lifecycle_driver(&self) {
+        if let Some(service) = &self.session_lifecycle_service {
+            service.activate();
+        }
+    }
+
+    /// Fences queued work before shutdown or replacement of the owning app.
+    pub fn deactivate_session_lifecycle_driver(&self) {
+        if let Some(service) = &self.session_lifecycle_service {
+            service.deactivate();
+        }
+    }
+
+    /// Takes one current active-session request at an interactive idle boundary.
+    pub fn next_session_lifecycle_request(&mut self) -> Option<ExtensionSessionLifecycleRequest> {
+        self.session_lifecycle_receiver
+            .as_mut()
+            .and_then(ExtensionSessionLifecycleReceiver::try_next)
     }
 
     pub fn bind_agent_sessions(&self, agent: &Agent) -> anyhow::Result<usize> {
@@ -1151,6 +2208,74 @@ impl ExecutableExtensions {
                 .negotiated_features()
                 .contains(EXTENSION_FEATURE_DYNAMIC_TOOLS)
         })
+    }
+
+    /// Resolve a host-validated extension shortcut from one terminal event.
+    fn shortcut_for_event(&self, event: &Event) -> Option<ExtensionShortcutInvocation> {
+        let key = extension_shortcut_key(event)?;
+        self.shortcuts
+            .iter()
+            .find(|shortcut| shortcut.key == key)
+            .map(|shortcut| shortcut.invocation.clone())
+    }
+
+    /// Schedule a shortcut without blocking terminal input. Child confirmation
+    /// and input requests are denied because a background invocation cannot
+    /// safely take ownership of the frontend confirmation surface.
+    pub(crate) fn dispatch_shortcut_for_event(
+        &mut self,
+        event: &Event,
+    ) -> Option<ExtensionShortcutInvocation> {
+        let invocation = self.shortcut_for_event(event)?;
+        let Some(process) = self
+            .processes
+            .iter()
+            .find(|process| {
+                process.descriptor().manifest.name == invocation.extension
+                    && process
+                        .contributions()
+                        .shortcuts
+                        .iter()
+                        .any(|shortcut| shortcut.name == invocation.name)
+            })
+            .cloned()
+        else {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} is no longer available",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        };
+        if Handle::try_current().is_err() {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} could not start outside the Ygg Tokio runtime",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        }
+        self.shortcut_tasks.retain(|task| !task.is_finished());
+        if self.shortcut_tasks.len() >= SHORTCUT_TASK_CONCURRENCY {
+            self.diagnostics.push(format!(
+                "warning: extension shortcut {:?}/{} was not started: {SHORTCUT_TASK_CONCURRENCY} invocations are already running",
+                invocation.extension, invocation.name
+            ));
+            return None;
+        }
+        let sender = self.background_tx.clone();
+        let context = extension_execution_context(&process, self.resource_owner.as_deref());
+        let started = invocation.clone();
+        self.shortcut_tasks.push(tokio::spawn(async move {
+            let (extension, context, messages) =
+                execute_shortcut_headless(process, invocation.name, context).await;
+            let _ = sender
+                .send(ExtensionBackgroundUpdate::Shortcut {
+                    extension,
+                    context,
+                    messages,
+                })
+                .await;
+        }));
+        Some(started)
     }
 
     fn start_policy_supervisors(&mut self) {
@@ -1189,22 +2314,32 @@ impl ExecutableExtensions {
     }
 
     fn start_session_lifecycle(&mut self) {
-        let Some(session_id) = self.session_id.clone() else {
-            return;
-        };
         if self.processes.is_empty() || self.session_lifecycle_started {
             return;
         }
         let processes = self.processes.clone();
-        let event = ExtensionLifecycleEvent::SessionStarted {
-            session_id,
-            run_id: None,
-        };
-        match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await }) {
-            Ok(messages) => self.diagnostics.extend(messages),
-            Err(error) => self.diagnostics.push(format!(
-                "warning: extension session lifecycle could not start: {error}"
-            )),
+        if let Some(session_id) = self.session_id.clone() {
+            let event = ExtensionLifecycleEvent::SessionStarted {
+                session_id,
+                run_id: None,
+            };
+            match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await }) {
+                Ok(messages) => self.diagnostics.extend(messages),
+                Err(error) => self.diagnostics.push(format!(
+                    "warning: extension session lifecycle could not start: {error}"
+                )),
+            }
+        }
+        if let Some(resource_owner) = self.resource_owner.clone() {
+            let processes = self.processes.clone();
+            match block_on_runtime(async move {
+                start_session_hooks_all(&processes, &resource_owner).await
+            }) {
+                Ok(messages) => self.diagnostics.extend(messages),
+                Err(error) => self.diagnostics.push(format!(
+                    "warning: extension session hooks could not start: {error}"
+                )),
+            }
         }
         self.session_lifecycle_started = true;
         self.session_started_at = Instant::now();
@@ -1354,8 +2489,17 @@ impl ExecutableExtensions {
 
     /// Returns discovery metadata with live protocol-health snapshots overlaid.
     pub fn summaries(&self) -> Vec<ExtensionSummary> {
+        let runtime_statuses = self
+            .runtime_manager
+            .as_ref()
+            .map(ExtensionRuntimeManager::statuses)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|status| (status.provenance.extension.clone(), status))
+            .collect::<BTreeMap<_, _>>();
         let mut summaries = self.summaries.clone();
         for summary in &mut summaries {
+            summary.runtime = runtime_statuses.get(&summary.name).cloned();
             let Some(process) = self
                 .processes
                 .iter()
@@ -1554,6 +2698,66 @@ impl ExecutableExtensions {
         lines.join("\n")
     }
 
+    /// Settles the old observational session boundary, updates every live
+    /// process snapshot, starts observation for the replacement session, and
+    /// fences queued active-session mutations from the previous snapshot. The
+    /// active agent has already changed by the time this is called.
+    pub fn transition_active_session(
+        &mut self,
+        session: &Session,
+        model: &Model,
+        reasoning: &ReasoningConfig,
+        sessions: &SessionStore,
+    ) {
+        if self.session_lifecycle_started {
+            let outcome = ExtensionLifecycleOutcome::Completed;
+            if let Some(resource_owner) = self.resource_owner.clone() {
+                let processes = self.processes.clone();
+                match block_on_runtime(async move {
+                    settle_session_hooks_all(&processes, &resource_owner, outcome).await
+                }) {
+                    Ok(messages) => self.diagnostics.extend(messages),
+                    Err(error) => self.diagnostics.push(format!(
+                        "warning: extension session hooks could not settle: {error}"
+                    )),
+                }
+            }
+            if let Some(session_id) = self.session_id.clone() {
+                let processes = self.processes.clone();
+                let event = ExtensionLifecycleEvent::SessionSettled {
+                    session_id,
+                    run_id: None,
+                    outcome,
+                    duration_ms: duration_millis(self.session_started_at.elapsed()),
+                    reason: Some("active session changed".into()),
+                };
+                match block_on_runtime(async move { notify_lifecycle_all(&processes, event).await })
+                {
+                    Ok(messages) => self.diagnostics.extend(messages),
+                    Err(error) => self.diagnostics.push(format!(
+                        "warning: extension session lifecycle could not settle: {error}"
+                    )),
+                }
+            }
+            self.session_lifecycle_started = false;
+        }
+        self.last_lifecycle_outcome = None;
+        // Contributions and owner-scoped presentation are observations of the
+        // old active session and must not bleed into the replacement.
+        self.pending_context = PendingContext::default();
+        self.session_id = host_state(session, model, reasoning, sessions).session_id;
+        self.resource_owner = Some(session.resource_owner_key());
+        let active_owner = self.resource_owner.as_deref();
+        self.presentations.retain(|_, view| {
+            view.resource_owner.is_none() || view.resource_owner.as_deref() == active_owner
+        });
+        self.refresh_host_state(session, model, reasoning, sessions);
+        self.start_session_lifecycle();
+        // The session changed in place, so requests admitted against the old
+        // snapshot must not run against this replacement.
+        self.activate_session_lifecycle_driver();
+    }
+
     pub fn refresh_host_state(
         &self,
         session: &Session,
@@ -1563,7 +2767,11 @@ impl ExecutableExtensions {
     ) {
         let state = host_state(session, model, reasoning, sessions);
         for process in &self.processes {
-            process.set_host_state(state.clone());
+            if process.descriptor().manifest.runtime.sharing
+                == ygg_agent::extension_process::ExtensionRuntimeSharing::Isolated
+            {
+                process.set_host_state(state.clone());
+            }
         }
     }
 
@@ -1925,22 +3133,27 @@ impl ExecutableExtensions {
         let execution_context =
             extension_execution_context(&process, self.resource_owner.as_deref());
         let mut events = process.subscribe();
-        let output = {
+        let output: anyhow::Result<_> = async {
             let legacy_uncorrelated = process.api_version() == EXTENSION_API_VERSION_0_1;
             let (request_started, started) = tokio::sync::oneshot::channel();
             let mut started = Box::pin(started);
             let mut operation = None;
-            let mut execution = Box::pin(process.execute_command_controlled(
+            let cancellation_token = CancellationToken::default();
+            let (progress_sink, mut progress_rx) = ToolProgressSink::bounded_channel();
+            let mut execution = Box::pin(process.execute_command_controlled_with_progress(
                 name.to_owned(),
                 arguments,
                 execution_context,
+                cancellation_token.clone(),
+                progress_sink,
                 request_started,
             ));
             let mut events_open = true;
-            loop {
+            let result = loop {
                 // The cancellation future and confirmation UI borrow the same
                 // frontend. Keep the select in its own scope so cancellation
                 // is dropped before a confirmation prompt borrows it again.
+                let mut command_progress = None;
                 let event = {
                     let cancellation = confirmations.wait_for_cancel();
                     tokio::pin!(cancellation);
@@ -1953,15 +3166,24 @@ impl ExecutableExtensions {
                             }
                             Err(_) => break execution.await?,
                         },
+                        progress = progress_rx.recv() => {
+                            command_progress = progress;
+                            None
+                        },
                         event = events.recv(), if events_open && operation.is_some() => Some(event),
                         cancelled = &mut cancellation => {
                             cancelled.with_context(|| format!(
                                 "cancellation UI failed for extension {extension_name:?}"
                             ))?;
+                            cancellation_token.cancel();
                             anyhow::bail!("extension command {name:?} cancelled");
                         }
                     }
                 };
+                if let Some(progress) = command_progress {
+                    confirmations.progress(&extension_name, &progress);
+                    continue;
+                }
                 let Some(event) = event else {
                     continue;
                 };
@@ -2032,8 +3254,12 @@ impl ExecutableExtensions {
                     }
                     Err(broadcast::error::RecvError::Closed) => events_open = false,
                 }
-            }
-        };
+            };
+            Ok::<_, anyhow::Error>(result)
+        }
+        .await;
+        confirmations.finish_progress(&extension_name);
+        let output = output?;
         self.enqueue_contexts(&extension_name, output.context);
         let mut blocks = Vec::new();
         if !output.text.trim().is_empty() {
@@ -2097,10 +3323,14 @@ impl ExecutableExtensions {
                 let (request_started, started) = tokio::sync::oneshot::channel();
                 let mut started = Box::pin(started);
                 let mut operation = None;
-                let mut execution = Box::pin(process.execute_command_controlled(
+                let cancellation_token = CancellationToken::default();
+                let (progress_sink, _progress_rx) = ToolProgressSink::bounded_channel();
+                let mut execution = Box::pin(process.execute_command_controlled_with_progress(
                     name.to_owned(),
                     arguments,
                     execution_context,
+                    cancellation_token,
+                    progress_sink,
                     request_started,
                 ));
                 let mut events_open = true;
@@ -2255,7 +3485,79 @@ impl ExecutableExtensions {
         true
     }
 
-    /// Drain completed renderer work without waiting, retaining completion order.
+    /// Start one host-mediated autocomplete request for the active editor
+    /// snapshot. A late result is fenced by the shell revision before display.
+    pub fn request_editor_autocomplete(&mut self, snapshot: ShellEditorSnapshot) -> bool {
+        self.prune_semantic_ui();
+        self.autocomplete_tasks.retain(|task| !task.is_finished());
+        if self.autocomplete_tasks.len() >= MAX_EXTENSION_AUTOCOMPLETE_TASKS {
+            return true;
+        }
+        let Some(registration) = self.autocomplete_registrations.values().next().cloned() else {
+            return false;
+        };
+        let process = registration.process;
+        if !process.is_running()
+            || process.health_snapshot().generation != registration.generation
+            || process.extension_instance_id() != registration.extension_instance_id
+        {
+            return false;
+        }
+        let request = ExtensionAutocompleteRequest {
+            text: snapshot.text.clone(),
+            cursor: snapshot.cursor,
+            revision: snapshot.revision,
+        };
+        let sender = self.background_tx.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {}: autocomplete requires the Tokio runtime",
+                process.descriptor().manifest.name
+            ));
+            return false;
+        };
+        self.autocomplete_tasks.push(handle.spawn(async move {
+            let (update, diagnostic) = match tokio::time::timeout(
+                EXTENSION_AUTOCOMPLETE_DEADLINE,
+                process.request_autocomplete(request),
+            )
+            .await
+            {
+                Err(_) => (
+                    None,
+                    Some(format!(
+                        "warning: extension autocomplete exceeded {EXTENSION_AUTOCOMPLETE_DEADLINE:?}"
+                    )),
+                ),
+                Ok(Err(error)) => (
+                    None,
+                    Some(format!("warning: extension autocomplete failed: {error}")),
+                ),
+                Ok(Ok(response)) => (
+                    Some(ExtensionAutocompleteUpdate {
+                        snapshot,
+                        prefix: response.prefix,
+                        items: response
+                            .items
+                            .into_iter()
+                            .map(|item| ShellAutocompleteItem {
+                                value: item.value,
+                                label: item.label,
+                                description: item.description,
+                            })
+                            .collect(),
+                    }),
+                    None,
+                ),
+            };
+            let _ = sender
+                .send(ExtensionBackgroundUpdate::Autocomplete { update, diagnostic })
+                .await;
+        }));
+        true
+    }
+
+    /// Drain completed renderer and autocomplete work without waiting.
     pub fn drain_background_updates(&mut self) -> ExtensionBackgroundUpdates {
         let mut updates = ExtensionBackgroundUpdates::default();
         while let Ok(update) = self.background_rx.try_recv() {
@@ -2264,6 +3566,18 @@ impl ExecutableExtensions {
                     self.diagnostics.extend(diagnostic);
                     updates.rendered_tools.extend(update);
                 }
+                ExtensionBackgroundUpdate::Autocomplete { update, diagnostic } => {
+                    self.diagnostics.extend(diagnostic);
+                    updates.autocomplete.extend(update);
+                }
+                ExtensionBackgroundUpdate::Shortcut {
+                    extension,
+                    context,
+                    messages,
+                } => {
+                    self.enqueue_contexts(&extension, context);
+                    updates.shortcut_messages.extend(messages);
+                }
             }
         }
         updates
@@ -2271,6 +3585,12 @@ impl ExecutableExtensions {
 
     fn cancel_background_work(&mut self) {
         for task in self.renderer_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.autocomplete_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.shortcut_tasks.drain(..) {
             task.abort();
         }
         for task in self.confirmation_tasks.drain(..) {
@@ -2287,21 +3607,163 @@ impl ExecutableExtensions {
         while self.background_rx.try_recv().is_ok() {}
     }
 
-    /// Gracefully stop every extension. Each protocol shutdown has its own
-    /// hard timeout in `ExtensionProcess`; the outer timeout prevents a
-    /// broken extension from delaying terminal restoration indefinitely.
-    pub async fn shutdown(&mut self) {
-        self.cancel_background_work();
+    /// Delivers one completed, host-owned mutation to declared API `0.2`
+    /// post-mutation hooks and returns only subset-validated rescan requests.
+    ///
+    /// Call this only after durable commit or completed rollback. Duplicate
+    /// mutation identities are ignored across process reloads/restarts owned by
+    /// this `ExecutableExtensions` instance. The returned requests are queued
+    /// for the product resource resolver; hooks never get paths, contents, or
+    /// permission to perform the mutation themselves.
+    pub async fn notify_post_mutation(
+        &mut self,
+        mutation: PostMutationContext,
+    ) -> Vec<PostMutationRescan> {
+        if self
+            .seen_post_mutation_ids
+            .iter()
+            .any(|seen| seen == mutation.mutation_id())
+        {
+            return Vec::new();
+        }
+        while self.seen_post_mutation_ids.len() >= MAX_SEEN_POST_MUTATION_IDS {
+            self.seen_post_mutation_ids.pop_front();
+        }
+        self.seen_post_mutation_ids
+            .push_back(mutation.mutation_id().to_owned());
+
+        let resource_owner = self.resource_owner.clone();
+        let calls = self
+            .processes
+            .iter()
+            .filter(|process| {
+                process
+                    .contributions()
+                    .hooks
+                    .contains(&ExtensionHook::PostMutation)
+            })
+            .cloned()
+            .map(|process| {
+                let name = process.descriptor().manifest.name.clone();
+                let mutation = mutation.clone();
+                let resource_owner = resource_owner.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        POST_MUTATION_RPC_DEADLINE,
+                        process.post_mutation(&mutation, resource_owner.as_deref()),
+                    )
+                    .await;
+                    (name, result)
+                }
+            });
+        let results = futures_util::future::join_all(calls).await;
+        let mut accepted = Vec::new();
+        for (extension, result) in results {
+            let disposition = match result {
+                Ok(Ok(disposition)) => disposition,
+                Ok(Err(error)) => {
+                    self.diagnostics.push(format!(
+                        "warning: extension {extension:?} post_mutation hook failed: {error}"
+                    ));
+                    continue;
+                }
+                Err(_) => {
+                    self.diagnostics.push(format!(
+                        "warning: extension {extension:?} post_mutation hook exceeded {POST_MUTATION_RPC_DEADLINE:?}"
+                    ));
+                    continue;
+                }
+            };
+            let Some(resource_ids) = disposition.resource_ids() else {
+                continue;
+            };
+            if resource_ids.iter().any(|resource| {
+                mutation
+                    .affected_resources()
+                    .binary_search(resource)
+                    .is_err()
+            }) {
+                self.diagnostics.push(format!(
+                    "warning: extension {extension:?} requested a post_mutation rescan outside the affected resource set"
+                ));
+                continue;
+            }
+            let request = PostMutationRescan {
+                extension,
+                mutation_id: mutation.mutation_id().to_owned(),
+                generation: mutation.generation(),
+                resource_ids: resource_ids.to_vec(),
+            };
+            while self.pending_post_mutation_rescans.len() >= MAX_PENDING_POST_MUTATION_RESCANS {
+                self.pending_post_mutation_rescans.pop_front();
+            }
+            self.pending_post_mutation_rescans
+                .push_back(request.clone());
+            accepted.push(request);
+        }
+        accepted
+    }
+
+    /// Convenience bridge for a future committed Pi migration ingestion.
+    ///
+    /// The current `ygg migrate pi` scanner is explicitly dry-run and must not
+    /// invoke this method because it writes nothing. A real ingestion path must
+    /// pass the same stable ID on retry and call this only after commit or a
+    /// completed rollback.
+    #[expect(
+        dead_code,
+        reason = "Pi migration remains dry-run-only until a committing ingestion path exists"
+    )]
+    pub async fn notify_migration_ingested(
+        &mut self,
+        mutation_id: impl Into<String>,
+        affected_resources: impl IntoIterator<Item = String>,
+        generation: u64,
+        state: PostMutationState,
+    ) -> Vec<PostMutationRescan> {
+        let Some(mutation) = PostMutationContext::new(
+            mutation_id,
+            PostMutationKind::MigrationIngestion,
+            affected_resources,
+            generation,
+            state,
+        ) else {
+            self.diagnostics
+                .push("warning: rejected invalid migration post_mutation notification");
+            return Vec::new();
+        };
+        self.notify_post_mutation(mutation).await
+    }
+
+    /// Drains host-validated rescan requests for the product resource owner.
+    ///
+    /// The queue contains no raw paths or contents and is bounded independently
+    /// of extension event/progress channels.
+    #[expect(
+        dead_code,
+        reason = "no committed product mutation path consumes deferred rescan requests yet"
+    )]
+    pub fn take_post_mutation_rescans(&mut self) -> Vec<PostMutationRescan> {
+        self.pending_post_mutation_rescans.drain(..).collect()
+    }
+
+    async fn settle_session_lifecycle(&mut self) {
         if self.session_lifecycle_started {
+            let outcome = self
+                .last_lifecycle_outcome
+                .unwrap_or(ExtensionLifecycleOutcome::Shutdown);
+            if let Some(resource_owner) = self.resource_owner.clone() {
+                let diagnostics =
+                    settle_session_hooks_all(&self.processes, &resource_owner, outcome).await;
+                self.diagnostics.extend(diagnostics);
+            }
             if let Some(session_id) = self.session_id.clone() {
                 let diagnostics = notify_lifecycle_all(
                     &self.processes,
                     ExtensionLifecycleEvent::SessionSettled {
                         session_id,
                         run_id: None,
-                        outcome: self
-                            .last_lifecycle_outcome
-                            .unwrap_or(ExtensionLifecycleOutcome::Shutdown),
+                        outcome,
                         duration_ms: duration_millis(self.session_started_at.elapsed()),
                         reason: None,
                     },
@@ -2311,10 +3773,34 @@ impl ExecutableExtensions {
             }
             self.session_lifecycle_started = false;
         }
-        let processes = self.processes.clone();
-        let shutdowns =
-            futures_util::future::join_all(processes.iter().map(ExtensionProcess::shutdown));
-        let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, shutdowns).await;
+    }
+
+    /// Releases this App/session's attachment to the durable process fleet.
+    ///
+    /// Isolated profiles are stopped. Explicitly shared workspace services are
+    /// deliberately left with the runtime manager so a compatible replacement
+    /// App can bind them without a stop/restart gap.
+    pub async fn release_binding(&mut self) {
+        // A replacement App must not inherit work queued against the old
+        // owner. Isolated lifecycle processes are stopped below; shared and
+        // legacy processes never receive this service.
+        self.deactivate_session_lifecycle_driver();
+        self.cancel_background_work();
+        self.settle_session_lifecycle().await;
+        for process in &self.processes {
+            process.detach_dynamic_tool_catalog();
+        }
+        if let Some(binding) = self.runtime_binding.take() {
+            // `ExtensionProcess::shutdown` is individually bounded. Do not
+            // cancel binding release midway: a dropped release future has
+            // already closed the binding and must finish detaching its keys.
+            binding.release().await;
+        } else {
+            let processes = self.processes.clone();
+            let shutdowns =
+                futures_util::future::join_all(processes.iter().map(ExtensionProcess::shutdown));
+            let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, shutdowns).await;
+        }
         self.processes.clear();
         self.receivers.clear();
         for summary in &mut self.summaries {
@@ -2322,15 +3808,66 @@ impl ExecutableExtensions {
         }
     }
 
-    /// Synchronous rebuild boundary used by the app constructor. Interactive
-    /// rebuilds run on Ygg's multi-thread runtime, so this retains graceful
-    /// protocol shutdown instead of dropping extension children.
+    /// Synchronous App rebuild boundary that preserves the durable manager.
+    pub fn release_binding_blocking(&mut self) {
+        let _ = block_on_runtime(self.release_binding());
+    }
+
+    /// Gracefully stops every runtime owned by this host after releasing the
+    /// current session binding. Each protocol shutdown has its own hard timeout
+    /// in `ExtensionProcess`; the outer timeout prevents terminal restoration
+    /// from being delayed indefinitely.
+    pub async fn shutdown(&mut self) {
+        self.release_binding().await;
+        if let Some(manager) = self.runtime_manager.take() {
+            let _ = tokio::time::timeout(SHUTDOWN_DEADLINE, manager.shutdown()).await;
+        }
+    }
+
+    /// Synchronous terminal shutdown boundary.
     pub fn shutdown_blocking(&mut self) {
         let _ = block_on_runtime(self.shutdown());
     }
 
     pub async fn reload(&mut self) -> Vec<String> {
         self.cancel_background_work();
+        if let Some(manager) = self.runtime_manager.clone() {
+            let names = self
+                .processes
+                .iter()
+                .map(|process| process.descriptor().manifest.name.clone())
+                .collect::<BTreeSet<_>>();
+            let reloads = futures_util::future::join_all(names.into_iter().map(|name| {
+                let manager = manager.clone();
+                async move { (name.clone(), manager.reload(&name).await) }
+            }))
+            .await;
+            let mut messages = Vec::new();
+            let mut reloaded = BTreeSet::new();
+            for (name, results) in reloads {
+                for result in results {
+                    match result {
+                        Ok(report) => {
+                            reloaded.insert(name.clone());
+                            messages.push(format!(
+                                "reloaded {name} (generation {}, previous shutdown {})",
+                                report.generation,
+                                if report.previous_shutdown_graceful {
+                                    "clean"
+                                } else {
+                                    "forced"
+                                }
+                            ));
+                        }
+                        Err(error) => messages.push(format!("unable to reload {name}: {error}")),
+                    }
+                }
+            }
+            self.await_reloaded_provider_registrations(&reloaded).await;
+            self.start_policy_supervisors();
+            messages.extend(self.drain_events());
+            return messages;
+        }
         let reloads = self.processes.iter().cloned().map(|process| async move {
             let name = process.descriptor().manifest.name.clone();
             (name, process.reload().await)
@@ -2340,9 +3877,12 @@ impl ExecutableExtensions {
         // extension and completion timing cannot reorder user-visible lines.
         let results = futures_util::future::join_all(reloads).await;
         let mut messages = Vec::with_capacity(results.len());
+        let mut reloaded = BTreeSet::new();
+        let mut completed_mutations = Vec::new();
         for (name, result) in results {
             match result {
                 Ok(report) => {
+                    reloaded.insert(name.clone());
                     messages.push(format!(
                         "reloaded {name} (generation {}, previous shutdown {})",
                         report.generation,
@@ -2352,13 +3892,55 @@ impl ExecutableExtensions {
                             "forced"
                         }
                     ));
+                    let resource = opaque_extension_resource_id(&name);
+                    let mutation_id = format!("resource-reload:{resource}:{}", report.generation);
+                    if let Some(mutation) = PostMutationContext::new(
+                        mutation_id,
+                        PostMutationKind::Resource,
+                        vec![resource],
+                        report.generation,
+                        PostMutationState::Committed,
+                    ) {
+                        completed_mutations.push(mutation);
+                    }
                 }
                 Err(error) => messages.push(format!("unable to reload {name}: {error}")),
             }
         }
+        self.await_reloaded_provider_registrations(&reloaded).await;
+        for mutation in completed_mutations {
+            let rescans = self.notify_post_mutation(mutation).await;
+            messages.extend(rescans.into_iter().map(|request| {
+                format!(
+                    "extension {:?} requested bounded rescan of {} resource(s)",
+                    request.extension,
+                    request.resource_ids.len()
+                )
+            }));
+        }
         self.start_policy_supervisors();
+        let (shortcuts, diagnostics) = register_extension_shortcuts(&self.processes);
+        self.shortcuts = shortcuts;
+        messages.extend(diagnostics);
         messages.extend(self.drain_events());
         messages
+    }
+
+    /// Waits for post-initialize provider declarations from just-reloaded owners
+    /// before callers can reconcile their host-owned model routes.
+    async fn await_reloaded_provider_registrations(&self, reloaded: &BTreeSet<String>) {
+        if reloaded.is_empty() {
+            return;
+        }
+        let processes = self
+            .processes
+            .iter()
+            .filter(|process| reloaded.contains(&process.descriptor().manifest.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.provider_runtime
+            .await_initial_registrations_async(&processes)
+            .await;
     }
 
     fn schedule_confirmation_denials(&mut self) {
@@ -2435,10 +4017,352 @@ impl ExecutableExtensions {
         self.schedule_input_cancellations();
     }
 
+    fn apply_semantic_ui_contribution(
+        &mut self,
+        extension: String,
+        process: &ExtensionProcess,
+        generation: u64,
+        contribution: ExtensionUiContribution,
+    ) -> Result<(), String> {
+        let health = process.health_snapshot();
+        if !process.is_running() || health.generation != generation {
+            return Err(format!(
+                "discarded semantic UI contribution from stale generation {generation}"
+            ));
+        }
+        let instance_id = process.extension_instance_id().to_owned();
+        let view = self.semantic_ui.entry(extension).or_default();
+        if view.generation != generation || view.extension_instance_id != instance_id {
+            *view = SemanticUiView {
+                extension_instance_id: instance_id,
+                generation,
+                ..SemanticUiView::default()
+            };
+        }
+        match contribution {
+            ExtensionUiContribution::Status {
+                key,
+                text,
+                style_role,
+                priority,
+            } => {
+                if let Some(text) = text {
+                    if !view.statuses.contains_key(&key)
+                        && view.statuses.len().saturating_add(view.widgets.len())
+                            >= MAX_EXTENSION_UI_ENTRIES
+                    {
+                        return Err(format!(
+                            "semantic UI entry limit {MAX_EXTENSION_UI_ENTRIES} reached"
+                        ));
+                    }
+                    view.statuses.insert(
+                        key,
+                        SemanticUiStatus {
+                            text,
+                            style_role,
+                            priority,
+                        },
+                    );
+                } else {
+                    view.statuses.remove(&key);
+                }
+            }
+            ExtensionUiContribution::Widget {
+                key,
+                lines,
+                placement,
+                style_role,
+                priority,
+            } => {
+                if let Some(lines) = lines {
+                    if !view.widgets.contains_key(&key)
+                        && view.statuses.len().saturating_add(view.widgets.len())
+                            >= MAX_EXTENSION_UI_ENTRIES
+                    {
+                        return Err(format!(
+                            "semantic UI entry limit {MAX_EXTENSION_UI_ENTRIES} reached"
+                        ));
+                    }
+                    view.widgets.insert(
+                        key,
+                        SemanticUiWidget {
+                            lines,
+                            placement,
+                            style_role,
+                            priority,
+                        },
+                    );
+                } else {
+                    view.widgets.remove(&key);
+                }
+            }
+            ExtensionUiContribution::Working {
+                message,
+                visible,
+                frames,
+                interval_ms,
+            } => {
+                view.working = Some(ShellExtensionWorking {
+                    message,
+                    visible,
+                    frames,
+                    interval_ms,
+                });
+            }
+            ExtensionUiContribution::HiddenThinking { label } => {
+                view.hidden_thinking_label = label;
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_semantic_ui(&mut self) {
+        self.semantic_ui.retain(|extension, view| {
+            self.processes.iter().any(|process| {
+                process.descriptor().manifest.name == *extension
+                    && process.is_running()
+                    && process.extension_instance_id() == view.extension_instance_id
+                    && process.health_snapshot().generation == view.generation
+            })
+        });
+        self.autocomplete_registrations
+            .retain(|extension, registration| {
+                self.processes.iter().any(|process| {
+                    process.descriptor().manifest.name == *extension
+                        && process.is_running()
+                        && process.extension_instance_id() == registration.extension_instance_id
+                        && process.health_snapshot().generation == registration.generation
+                })
+            });
+    }
+
+    fn semantic_ui_projection(&mut self) -> ShellExtensionUi {
+        self.prune_semantic_ui();
+        let mut statuses = Vec::new();
+        let mut above_editor = Vec::new();
+        let mut below_editor = Vec::new();
+        let mut working = None;
+        let mut hidden_thinking_label = None;
+        for view in self.semantic_ui.values() {
+            for status in view.statuses.values() {
+                statuses.push(ShellExtensionUiLine {
+                    text: status.text.clone(),
+                    style_role: status.style_role.clone(),
+                    priority: status.priority,
+                });
+            }
+            for widget in view.widgets.values() {
+                let target = match widget.placement {
+                    ExtensionWidgetPlacement::AboveEditor => &mut above_editor,
+                    ExtensionWidgetPlacement::BelowEditor => &mut below_editor,
+                };
+                target.extend(
+                    widget
+                        .lines
+                        .iter()
+                        .cloned()
+                        .map(|text| ShellExtensionUiLine {
+                            text,
+                            style_role: widget.style_role.clone(),
+                            priority: widget.priority,
+                        }),
+                );
+            }
+            if working.is_none() {
+                working = view.working.clone();
+            }
+            if hidden_thinking_label.is_none() {
+                hidden_thinking_label = view.hidden_thinking_label.clone();
+            }
+        }
+        let sort = |left: &ShellExtensionUiLine, right: &ShellExtensionUiLine| {
+            right
+                .priority
+                .cmp(&left.priority)
+                .then_with(|| left.text.cmp(&right.text))
+        };
+        statuses.sort_by(sort);
+        above_editor.sort_by(sort);
+        below_editor.sort_by(sort);
+        statuses.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        above_editor.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        below_editor.truncate(MAX_PROJECTED_EXTENSION_UI_LINES);
+        ShellExtensionUi {
+            statuses,
+            above_editor,
+            below_editor,
+            working,
+            hidden_thinking_label,
+        }
+    }
+
+    /// Project validated semantic extension UI into the host-owned interactive
+    /// shell. Any stale process generation is discarded before rendering.
+    pub fn sync_semantic_ui(&mut self, shell: &mut InteractiveShell) -> bool {
+        shell.set_extension_ui(self.semantic_ui_projection())
+    }
+
+    /// Notify negotiated editor-handoff extensions whenever the host-owned
+    /// editor snapshot changes. The cursor deliberately remains host-local;
+    /// autocomplete receives it only in its explicit request payload.
+    pub fn sync_editor_state(&mut self, snapshot: ShellEditorSnapshot) {
+        let state = ExtensionEditorResponse {
+            text: snapshot.text,
+            revision: snapshot.revision,
+            focused: snapshot.focused,
+        };
+        let generations = self
+            .processes
+            .iter()
+            .filter(|process| process.is_running())
+            .map(|process| {
+                (
+                    process.descriptor().manifest.name.clone(),
+                    (
+                        process.health_snapshot().generation,
+                        process.extension_instance_id().to_owned(),
+                    ),
+                )
+            })
+            .collect();
+        let delivery = EditorStateDelivery { state, generations };
+        if self.last_editor_state.as_ref() == Some(&delivery) {
+            return;
+        }
+        self.last_editor_state = Some(delivery.clone());
+        for process in &self.processes {
+            if let Err(error) = process.notify_editor_state(delivery.state.clone()) {
+                self.diagnostics.push(format!(
+                    "warning: {}: editor state notification failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    /// Broadcast one already-normalized input observation without granting any
+    /// extension an input-consumption path.
+    pub fn observe_terminal_input(&mut self, data: String) {
+        for process in &self.processes {
+            if let Err(error) =
+                process.notify_terminal_input(ExtensionTerminalInput { data: data.clone() })
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: terminal input observation failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    /// Broadcast one host-observed resize without letting extensions own layout.
+    pub fn observe_terminal_resize(&mut self, columns: u16, rows: u16) {
+        for process in &self.processes {
+            if let Err(error) =
+                process.notify_terminal_resize(ExtensionTerminalResize { columns, rows })
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: terminal resize observation failed: {error}",
+                    process.descriptor().manifest.name
+                ));
+            }
+        }
+    }
+
+    fn queue_editor_response(
+        &mut self,
+        process: ExtensionProcess,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        response: ExtensionEditorResponse,
+    ) {
+        let name = process.descriptor().manifest.name.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {name}: host-owned editor response requires the Tokio runtime"
+            ));
+            return;
+        };
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(
+                EXTENSION_UI_EDITOR_RESPONSE_DEADLINE,
+                process.respond_to_editor(request_id, generation, response),
+            )
+            .await;
+        });
+    }
+
+    fn queue_autocomplete_registration_response(
+        &mut self,
+        process: ExtensionProcess,
+        request_id: ExtensionRequestId,
+        generation: u64,
+        accepted: bool,
+    ) {
+        let name = process.descriptor().manifest.name.clone();
+        let Ok(handle) = Handle::try_current() else {
+            self.diagnostics.push(format!(
+                "warning: {name}: autocomplete registration response requires the Tokio runtime"
+            ));
+            return;
+        };
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(
+                EXTENSION_UI_EDITOR_RESPONSE_DEADLINE,
+                process.respond_to_autocomplete_registration(request_id, generation, accepted),
+            )
+            .await;
+        });
+    }
+
+    fn drain_editor_requests_into_shell(&mut self, shell: &mut InteractiveShell) {
+        while let Some(pending) = self.pending_editor_requests.pop_front() {
+            if !pending.process.is_running()
+                || pending.process.health_snapshot().generation != pending.generation
+            {
+                self.diagnostics.push(format!(
+                    "warning: {}: discarded host-owned editor request from stale generation {}",
+                    pending.process.descriptor().manifest.name,
+                    pending.generation
+                ));
+                continue;
+            }
+            let snapshot = match pending.request {
+                ExtensionEditorRequest::Get => shell.extension_editor_snapshot(),
+                ExtensionEditorRequest::Set { text } => shell.extension_set_editor(text),
+                ExtensionEditorRequest::Paste { text } => shell.extension_paste_editor(text),
+                ExtensionEditorRequest::Focus => shell.extension_focus_editor(),
+            };
+            self.queue_editor_response(
+                pending.process,
+                pending.request_id,
+                pending.generation,
+                ExtensionEditorResponse {
+                    text: snapshot.text,
+                    revision: snapshot.revision,
+                    focused: snapshot.focused,
+                },
+            );
+        }
+    }
+
+    /// Drain extension events while an interactive shell owns the editor. This
+    /// is deliberately separate from the generic event drain so headless hosts
+    /// never accidentally grant an editor lease.
+    pub fn drain_events_for_shell(&mut self, shell: &mut InteractiveShell) -> Vec<String> {
+        let messages = self.drain_events_inner(true);
+        self.drain_editor_requests_into_shell(shell);
+        messages
+    }
+
     /// Drain a fixed amount of extension work without letting a continuously
     /// ready process monopolize the input/render task. The start receiver
     /// rotates between calls and each receiver has a smaller per-call quota.
     pub fn drain_events(&mut self) -> Vec<String> {
+        self.drain_events_inner(false)
+    }
+
+    fn drain_events_inner(&mut self, interactive: bool) -> Vec<String> {
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         let receiver_count = self.receivers.len();
@@ -2477,6 +4401,98 @@ impl ExecutableExtensions {
                         // Header/status/footer contributions remain available as
                         // protocol data, but the coding TUI never turns them
                         // into ambient transcript or composer chrome.
+                    }
+                    Ok(ExtensionEvent::UiContributed {
+                        generation,
+                        contribution,
+                    }) => {
+                        let Some(process) = process.as_ref() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: semantic UI source process is unavailable"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        if let Err(error) = self.apply_semantic_ui_contribution(
+                            name.clone(),
+                            process,
+                            generation,
+                            contribution,
+                        ) {
+                            self.diagnostics.push(format!("warning: {name}: {error}"));
+                        }
+                    }
+                    Ok(ExtensionEvent::EditorRequested {
+                        request_id,
+                        generation,
+                        request,
+                    }) => {
+                        let Some(process) = process.clone() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: host-owned editor request has no process"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        if interactive && self.pending_editor_requests.len() < EVENT_DRAIN_BUDGET {
+                            self.pending_editor_requests
+                                .push_back(PendingEditorRequest {
+                                    process,
+                                    request_id,
+                                    generation,
+                                    request,
+                                });
+                        } else {
+                            self.queue_editor_response(
+                                process,
+                                request_id,
+                                generation,
+                                ExtensionEditorResponse {
+                                    text: String::new(),
+                                    revision: 0,
+                                    focused: false,
+                                },
+                            );
+                            if interactive {
+                                self.diagnostics.push(format!(
+                                    "warning: {name}: host-owned editor request queue is full"
+                                ));
+                            }
+                        }
+                    }
+                    Ok(ExtensionEvent::AutocompleteRegistered {
+                        request_id,
+                        generation,
+                        registration: _,
+                    }) => {
+                        let Some(process) = process.clone() else {
+                            self.diagnostics.push(format!(
+                                "warning: {name}: autocomplete registration has no process"
+                            ));
+                            remaining -= 1;
+                            receiver_budget -= 1;
+                            continue;
+                        };
+                        let accepted = interactive
+                            && process.is_running()
+                            && process.health_snapshot().generation == generation;
+                        if accepted {
+                            self.autocomplete_registrations.insert(
+                                name.clone(),
+                                RegisteredAutocomplete {
+                                    extension_instance_id: process
+                                        .extension_instance_id()
+                                        .to_owned(),
+                                    process: process.clone(),
+                                    generation,
+                                },
+                            );
+                        }
+                        self.queue_autocomplete_registration_response(
+                            process, request_id, generation, accepted,
+                        );
                     }
                     Ok(ExtensionEvent::PresentationUpdated {
                         generation,
@@ -2609,6 +4625,7 @@ impl ExecutableExtensions {
                         && process.health_snapshot().generation == view.generation
                 })
         });
+        self.prune_semantic_ui();
         self.schedule_confirmation_denials();
         self.schedule_input_cancellations();
         messages
@@ -2617,6 +4634,7 @@ impl ExecutableExtensions {
 
 impl Drop for ExecutableExtensions {
     fn drop(&mut self) {
+        self.deactivate_session_lifecycle_driver();
         self.cancel_background_work();
         if !self.processes.is_empty() {
             // Mode error paths still pass through this boundary. In the normal
@@ -2653,6 +4671,75 @@ async fn notify_lifecycle_all(
             }
         }
     }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn start_session_hooks_all(
+    processes: &[ExtensionProcess],
+    resource_owner: &str,
+) -> Vec<String> {
+    futures_util::future::join_all(
+        processes
+            .iter()
+            .filter(|process| process.declares_session_hooks())
+            .map(|process| {
+                let process = process.clone();
+                let resource_owner = resource_owner.to_owned();
+                async move {
+                    match tokio::time::timeout(
+                        LIFECYCLE_NOTIFY_DEADLINE,
+                        process.start_session_hook_binding(resource_owner),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => None,
+                        Err(_) => Some(format!(
+                            "warning: extension {:?} session_start hook exceeded {LIFECYCLE_NOTIFY_DEADLINE:?}",
+                            process.descriptor().manifest.name
+                        )),
+                        Ok(Err(_)) => Some(format!(
+                            "warning: extension {:?} session_start hook failed",
+                            process.descriptor().manifest.name
+                        )),
+                    }
+                }
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+async fn settle_session_hooks_all(
+    processes: &[ExtensionProcess],
+    resource_owner: &str,
+    outcome: ExtensionLifecycleOutcome,
+) -> Vec<String> {
+    futures_util::future::join_all(
+        processes
+            .iter()
+            .filter(|process| process.declares_session_hooks())
+            .map(|process| {
+                let process = process.clone();
+                let resource_owner = resource_owner.to_owned();
+                async move {
+                    match process
+                        .settle_session_hook_binding(&resource_owner, outcome)
+                        .await
+                    {
+                        Ok(()) => None,
+                        Err(_) => Some(format!(
+                            "warning: extension {:?} session_end hook failed",
+                            process.descriptor().manifest.name
+                        )),
+                    }
+                }
+            }),
+    )
     .await
     .into_iter()
     .flatten()
@@ -2980,6 +5067,141 @@ where
 mod tests {
     use super::*;
 
+    fn shortcut(key: &str, name: &str) -> ShortcutDefinition {
+        ShortcutDefinition {
+            key: key.to_owned(),
+            name: name.to_owned(),
+            description: format!("{name} action"),
+        }
+    }
+
+    #[test]
+    fn shortcut_registration_keeps_host_bindings_and_first_owner() {
+        let mut registered = Vec::new();
+        let mut diagnostics = Vec::new();
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-one",
+            &shortcut("ctrl+shift+p", "first"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-two",
+            &shortcut("control+shift+p", "second"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-three",
+            &shortcut("ctrl+d", "close"),
+        );
+        register_extension_shortcut(
+            &mut registered,
+            &mut diagnostics,
+            "trusted-four",
+            &shortcut("shift+p", "editor"),
+        );
+
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].invocation.extension, "trusted-one");
+        assert_eq!(registered[0].invocation.name, "first");
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("conflicts")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("reserved")));
+        assert!(diagnostics
+            .iter()
+            .any(|message| message.contains("must include ctrl, alt, or super")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shortcut_dispatch_runs_registered_action_in_background() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("shortcut-fixture.sh");
+        std::fs::write(
+            &fixture,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"api_version":"0.2","tools":[],"commands":[],"shortcuts":[{"key":"ctrl+shift+p","name":"open_panel","description":"Open the panel"}],"protocol":{"version":"0.2","features":["request_cancellation","content_parts"],"limits":{"max_concurrent_requests":1}}}}'
+IFS= read -r shortcut
+case "$shortcut" in
+  *'"method":"shortcut/execute"'*'"name":"open_panel"'*) ;;
+  *) exit 41 ;;
+esac
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"text":"shortcut output","notifications":[],"context":[]}}'
+IFS= read -r shutdown
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{}}'
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fixture).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&fixture, permissions).unwrap();
+
+        let manifest = ExtensionManifest::parse(
+            r#"name = "shortcut-fixture"
+version = "0.1.0"
+api_version = "0.2"
+[entrypoint]
+command = "shortcut-fixture.sh"
+[contributes]
+shortcuts = [{ key = "ctrl+shift+p", name = "open_panel", description = "Open the panel" }]
+"#,
+        )
+        .unwrap();
+        let process = ExtensionProcess::start(
+            DiscoveredExtension {
+                manifest,
+                manifest_path: temp.path().join(EXTENSION_MANIFEST_FILENAME),
+                source: ExtensionSource::Explicit,
+                activation: ygg_agent::extension_process::ExtensionActivation {
+                    enabled: true,
+                    trust: ExtensionTrust::Trusted,
+                },
+            },
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.receivers.push(process.subscribe());
+        extensions.processes.push(process);
+        let (shortcuts, diagnostics) = register_extension_shortcuts(&extensions.processes);
+        assert!(diagnostics.is_empty());
+        extensions.shortcuts = shortcuts;
+
+        let event = Event::Key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('P'),
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::SHIFT,
+        ));
+        let invocation = extensions
+            .dispatch_shortcut_for_event(&event)
+            .expect("registered shortcut is dispatched");
+        assert_eq!(invocation.extension, "shortcut-fixture");
+        assert_eq!(invocation.name, "open_panel");
+
+        let messages = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let updates = extensions.drain_background_updates();
+                if !updates.shortcut_messages.is_empty() {
+                    return updates.shortcut_messages;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shortcut result was not delivered");
+        assert_eq!(messages, vec!["shortcut output"]);
+        extensions.shutdown().await;
+    }
+
     #[test]
     fn first_party_status_marks_missing_delegation_telemetry_incompatible() {
         let (schema, compatibility) = extension_compatibility(
@@ -3002,6 +5224,42 @@ mod tests {
         );
         assert_eq!(schema.as_deref(), Some(DELEGATION_TELEMETRY_SCHEMA));
         assert_eq!(compatibility, "compatible");
+    }
+
+    #[test]
+    fn streamable_http_mcp_gate_is_host_owned() {
+        let mut descriptor = DiscoveredExtension {
+            manifest: ExtensionManifest::parse(
+                r#"
+name = "ygg-mcp"
+version = "0.1.0"
+api_version = "0.2"
+
+[entrypoint]
+command = "fixture"
+args = ["--keep", "--experimental-streamable-http-mcp"]
+"#,
+            )
+            .unwrap(),
+            manifest_path: PathBuf::from("/tmp/ygg-mcp/extension.toml"),
+            source: ExtensionSource::Explicit,
+            activation: Default::default(),
+        };
+
+        apply_experimental_streamable_http_mcp_gate(&mut descriptor, false);
+        assert_eq!(
+            descriptor.manifest.entrypoint.args,
+            vec!["--keep".to_owned()]
+        );
+
+        apply_experimental_streamable_http_mcp_gate(&mut descriptor, true);
+        assert_eq!(
+            descriptor.manifest.entrypoint.args,
+            vec![
+                "--keep".to_owned(),
+                EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT.to_owned(),
+            ]
+        );
     }
 
     #[test]
@@ -3159,6 +5417,69 @@ mod tests {
         assert_eq!(presentations["fixture-extension"].snapshot.revision, 0);
     }
 
+    #[test]
+    fn active_session_transition_discards_old_context_and_owner_presentations() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = Session::create(directory.path().join("old.jsonl")).unwrap();
+        let replacement = Session::create(directory.path().join("replacement.jsonl")).unwrap();
+        let old_owner = old.resource_owner_key();
+        let replacement_owner = replacement.resource_owner_key();
+        let sessions = SessionStore::new(&directory.path().join("sessions"), directory.path());
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let snapshot: ExtensionPresentationSnapshot =
+            serde_json::from_str(include_str!("../fixtures/extension-presentation.json")).unwrap();
+        let mut extensions = ExecutableExtensions::default();
+        extensions.session_id = Some("old".into());
+        extensions.resource_owner = Some(old_owner.clone());
+        extensions
+            .pending_context
+            .try_push(ContextContribution {
+                label: "old context".into(),
+                content: "must not reach the replacement".into(),
+                placement: ContextPlacement::PromptSuffix,
+            })
+            .unwrap();
+        extensions.presentations.insert(
+            "old-owner".into(),
+            ExtensionPresentationView {
+                extension: "fixture-extension".into(),
+                generation: 1,
+                extension_instance_id: "instance".into(),
+                resource_owner: Some(old_owner),
+                snapshot: snapshot.clone(),
+            },
+        );
+        extensions.presentations.insert(
+            "global".into(),
+            ExtensionPresentationView {
+                extension: "fixture-extension".into(),
+                generation: 1,
+                extension_instance_id: "instance".into(),
+                resource_owner: None,
+                snapshot,
+            },
+        );
+
+        extensions.transition_active_session(
+            &replacement,
+            &model,
+            &ReasoningConfig::Off,
+            &sessions,
+        );
+
+        assert!(extensions.pending_context.entries.is_empty());
+        assert_eq!(extensions.pending_context.retained_bytes, 0);
+        assert_eq!(
+            extensions.resource_owner.as_deref(),
+            Some(replacement_owner.as_str())
+        );
+        assert!(!extensions.presentations.contains_key("old-owner"));
+        assert!(extensions.presentations.contains_key("global"));
+    }
+
     fn write_extension_manifest(directory: &Path, name: &str, description: &str) {
         std::fs::create_dir_all(directory).unwrap();
         std::fs::write(
@@ -3200,6 +5521,7 @@ command = "does-not-exist"
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,
             plain: false,
+            show_images: false,
             session_dir: workspace.join("sessions"),
             compaction: crate::config::CompactionPolicy::default(),
             max_cost_microdollars: None,
@@ -3218,12 +5540,101 @@ command = "does-not-exist"
             extension_activation_overridden: false,
             trusted_extensions: vec![],
             invocation_trusted_extensions: vec![name.to_owned()],
+            experimental_streamable_http_mcp: false,
+            extension_flag_values: BTreeMap::new(),
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: false,
             offline: true,
             workspace_trusted: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_preflight_config_excludes_non_provider_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        write_extension_manifest(
+            &extension_root.join("ordinary"),
+            "ordinary",
+            "ordinary tool",
+        );
+        let provider = extension_root.join("provider");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(
+            provider.join(EXTENSION_MANIFEST_FILENAME),
+            r#"name = "provider"
+version = "0.3.0"
+api_version = "0.3"
+
+[entrypoint]
+command = "must-not-run"
+
+[contributes]
+providers = true
+"#,
+        )
+        .unwrap();
+        let mut config = executable_extension_config(temp.path(), &extension_root, "ordinary");
+        config.enabled_extensions.push("provider".into());
+
+        let preflight = provider_preflight_config(&config);
+        assert_eq!(preflight.enabled_extensions, vec!["provider"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_cli_flags_require_enablement_and_exact_trust_without_starting_processes() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        for (name, flag) in [
+            ("flag-trusted", "trusted-option"),
+            ("flag-untrusted", "workspace"),
+        ] {
+            let directory = extension_root.join(name);
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join(EXTENSION_MANIFEST_FILENAME),
+                format!(
+                    r#"name = {name:?}
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "must-not-run"
+[contributes]
+flags = [{{ name = {flag:?}, type = "boolean", default = false }}]
+"#
+                ),
+            )
+            .unwrap();
+        }
+        let mut config = executable_extension_config(temp.path(), &extension_root, "flag-trusted");
+        config.enabled_extensions.push("flag-untrusted".into());
+        let selected = selected_extension_flag_declarations(&config);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|(extension, flag)| (extension.as_str(), flag.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("flag-trusted", "trusted-option")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_session_lifecycle_is_offered_only_to_interactive_frontends() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = executable_extension_config(temp.path(), temp.path(), "fixture");
+        assert!(active_session_lifecycle_enabled(&config));
+
+        config.mode = crate::config::Mode::Print {
+            prompt: "one-shot".into(),
+        };
+        assert!(!active_session_lifecycle_enabled(&config));
+
+        config.mode = crate::config::Mode::Rpc;
+        assert!(!active_session_lifecycle_enabled(&config));
     }
 
     #[cfg(unix)]
@@ -4985,6 +7396,7 @@ context = true
                     id: ToolCallId("call-1".into()),
                     name: "read".into(),
                     arguments_json: "{}".into(),
+                    argument_error: None,
                 }),
                 AssistantPart::Text("answer".into()),
             ],

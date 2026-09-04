@@ -17,6 +17,7 @@ pub use read::ReadTool;
 pub use search::SearchTool;
 pub use write::WriteTool;
 
+use crate::effect::ToolPolicyDenialCode;
 use crate::extension::{Extension, ExtensionHost};
 use crate::tool::ToolError;
 
@@ -62,22 +63,25 @@ pub(crate) fn validate_effect_path(
             )
         })
     {
-        return Err(ToolError::new(format!(
-            "invalid arguments: absolute paths are not allowed: `{path}`"
-        )));
+        return Err(ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            format!("invalid arguments: absolute paths are not allowed: `{path}`"),
+        ));
     }
     if path_value
         .components()
         .any(|component| component == std::path::Component::ParentDir)
     {
-        return Err(ToolError::new(format!(
-            "invalid arguments: parent (`..`) path components are not allowed: `{path}`"
-        )));
+        return Err(ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            format!("invalid arguments: parent (`..`) path components are not allowed: `{path}`"),
+        ));
     }
     if matches!(path, "~") || path.starts_with("~/") || path.starts_with("~\\") {
-        return Err(ToolError::new(format!(
-            "invalid arguments: home-relative paths are not allowed: `{path}`"
-        )));
+        return Err(ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            format!("invalid arguments: home-relative paths are not allowed: `{path}`"),
+        ));
     }
     Ok(())
 }
@@ -309,6 +313,18 @@ pub(crate) fn clip_line(line: &str, max: usize) -> String {
 #[cfg(test)]
 mod unified_diff_tests {
     use super::*;
+
+    #[test]
+    fn workspace_confinement_failures_have_a_policy_code() {
+        for path in ["/private/secret", "../secret", "~/secret"] {
+            let error = validate_effect_path(path, false).unwrap_err();
+            assert_eq!(
+                error.policy_denial_code(),
+                Some(ToolPolicyDenialCode::WorkspaceConfinement),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn small_unified_diff_output_is_unchanged() {

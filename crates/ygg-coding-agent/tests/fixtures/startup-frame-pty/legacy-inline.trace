@@ -1,0 +1,6 @@
+mode=legacy-inline
+startup.synchronized=true
+startup.preexisting_rows=preserved
+shrink.stale_startup_rows=false
+shutdown.cursor_visible=true
+alternate_screen.used=false

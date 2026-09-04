@@ -2,7 +2,7 @@
 
 ## Canonical model
 
-`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. Provider DTOs do not cross the crate boundary.
+`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Amazon Bedrock Converse, and Google `generateContent`. Provider DTOs do not cross the crate boundary.
 
 ## Capability and reasoning model
 
@@ -20,6 +20,23 @@ sessions. Protocol validation rejects it in strict mode (or reports
 `ignored_reasoning_mode` in lossy mode), and no codec serializes a
 `reasoning.mode` field. The product layer must migrate legacy Pro state only
 after it has both model metadata and a live, trusted `ygg-subagents` observer.
+
+## Google generateContent
+
+Gemini Developer API, Vertex AI, and declared Google-compatible routes select the
+same native codec. It constructs the fixed `models/<safe-api-name>:streamGenerateContent`
+path under a trusted endpoint, uses Google content/function declarations and native
+JSON-schema fields, and decodes SSE candidate snapshots into canonical deltas.
+Google's opaque `thoughtSignature` is retained as position-bound
+`ProviderMetadata` immediately before its text, reasoning, or function-call part.
+It is replayed only to the same Google model; transformations to any other model
+or protocol drop it.
+
+The codec accepts only inline image bytes, never fetches a user-provided image
+URL, and rejects unsupported tool-result media. Cumulative function-call argument
+snapshots are merged before terminal assembly rather than concatenated as invalid
+JSON. Google thought text is canonical reasoning; a thought signature alone does
+not make visible content reasoning.
 
 ## Responses Lite
 
@@ -43,7 +60,26 @@ inferred from a model name, endpoint label, or authentication plan.
 
 ## Stream contract
 
-A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, and unbalanced parts are errors. Malformed tool arguments are also errors unless an authoritative max-token terminal proves the output was truncated; that case retains only the call envelope with empty arguments so the agent can pair a non-executing error result and continue safely.
+A successful guarded stream has exactly one `Started`, balanced start/delta/end events for every indexed part, at most one usage event, and exactly one terminal `Finished`. Premature EOF, events after finish, and unbalanced parts are errors. Completed parseable tool arguments are normalized and checked against the immutable request schema snapshot before their `ToolCallEnd`: an ordinary schema mismatch remains a canonical call marked for a bounded paired error, while malformed schemas, malformed arguments, and validation-limit failures are errors. An authoritative max-token terminal is the sole malformed-argument exception: it retains only the call envelope with empty arguments so the agent can pair a non-executing error result and continue safely.
+
+### Opt-in endpoint lifecycle feedback
+
+`StreamEvent::ProviderLifecycle` is bounded advisory transport telemetry, not an
+assistant part and never response-builder input. It is enabled only for a
+streaming HTTP OpenAI Chat request whose `RequestRuntime::lifecycle_feedback`
+flag is true. The client sends `x-ygg-lifecycle: 1` and accepts the same
+response header and SSE comments in the `ygg-lifecycle:` namespace. Values are
+`queued`, `loading`, or `ready`, optionally followed by `; detail`; malformed,
+unknown, and ordinary comments are ignored. Details are credential-redacted and
+terminal-safe before a 160-byte cap, and a stream emits at most 64 lifecycle
+updates.
+
+A header or lifecycle comment that precedes provider data causes a synthetic
+`Started` first, preserving the ordinary stream invariant. Lifecycle feedback
+cannot produce a `Finished`, affect assembled response content or usage, extend
+the response-header timeout, or make a request replay-safe. Non-streaming
+requests, WebSocket transports, and all endpoints without explicit opt-in keep
+the ordinary protocol path.
 
 The response builder enforces absolute limits before appending:
 
@@ -52,6 +88,10 @@ The response builder enforces absolute limits before appending:
 - 100,000 events;
 - 1,024 indexed parts;
 - protocol SSE event/body and timeout limits in the transport layer.
+
+Bedrock ConverseStream is decoded as incremental AWS EventStream frames rather
+than SSE. Both frame CRCs are verified before its bounded JSON payload is
+interpreted.
 
 Transport timeouts are phase-specific rather than one short request timer:
 connection establishment remains bounded separately, `Endpoint::timeout` covers

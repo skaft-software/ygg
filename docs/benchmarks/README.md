@@ -12,8 +12,9 @@ failure report
 the complete token-efficiency audit
 ([token-efficiency-v0.6.2-2026-08-28.md](token-efficiency-v0.6.2-2026-08-28.md)),
 the scoped coding-agent
-[runtime-footprint comparison](runtime-footprint-2026-08-29.md), and the opt-in
-beta protocol ([beta-protocol.md](beta-protocol.md)).
+[runtime-footprint comparison](runtime-footprint-2026-08-29.md), the
+credential-free [Pi runtime evidence harness](pi-runtime-evidence.md), and the
+opt-in beta protocol ([beta-protocol.md](beta-protocol.md)).
 
 ## Optional agent telemetry
 
@@ -39,6 +40,12 @@ Telemetry records:
 - `tool_started` and `tool_finished` — tool name, hashed arguments, elapsed and
   result sizes, repeated-call count, status, known built-in state changes, and
   a conservative no-progress streak. Arguments and results are not retained.
+- `tool_policy_decision` — hashed tool-call identity, allowed/denied effect
+  admission, stable denial code when denied, and effective capability/limit
+  values with their source layers. Raw command arguments, workspace paths, and
+  shell paths are not retained; shell resolution is only the non-correlating
+  `configured`, `system_bash`, `path_bash`, `sh_fallback`, or `unavailable`
+  selection label.
 - `compaction_started` and `compaction_finished` — reason and durable outcome.
 - `candidate_rejected`, `steering_delivered`, `follow_up_delivered`, and
   `delegation_updated` — control-flow accounting.
@@ -98,6 +105,18 @@ Those cases require a harness-specific driver and should be supplied with
 `--command` or an additional checked-in adapter. A comparison must use the
 same task, endpoint, model weights, context limit, timeout, hardware, and
 concurrency for every harness.
+
+## Pi runtime fixture evidence
+
+[`scripts/bench-pi-runtime.py`](../../scripts/bench-pi-runtime.py) is the
+checked-in, stdlib-only driver for Pi aggregate lifecycle evidence. It runs no
+network/provider/model request, inherits no credentials, uses a temporary home,
+and writes bounded raw resource samples plus a checksum. It measures fixture
+representations of no-extension, legacy-eager, lazy activation, shared-workspace,
+and ordered-Pi-aggregate paths; it is intentionally hold-only until a real API
+0.3 runtime-manager adapter is available. See [Pi runtime evidence
+harness](pi-runtime-evidence.md) for invocation, exact candidate/fixture identity,
+Linux/macOS limits, separate inference/GPU attribution, and publication rules.
 
 ## Publication boundary
 

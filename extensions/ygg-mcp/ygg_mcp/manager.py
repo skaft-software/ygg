@@ -38,17 +38,18 @@ from .protocol import (
     McpTimeout,
     McpTransportError,
 )
+from .streamable_http import CredentialProvider, McpStreamableHttpClient
 
 
 @dataclass
 class _ServerState:
     config: ServerConfig
     state: str
-    client: Optional[McpStdioClient] = None
+    client: Optional[Any] = None
     catalog_revision: int = 0
     host_catalog_revision: int = 0
     tools: dict[str, ToolBinding] = field(default_factory=dict)
-    catalog_client: Optional[McpStdioClient] = None
+    catalog_client: Optional[Any] = None
     restart_attempt: int = 0
     next_retry_at_ms: Optional[int] = None
     last_error: Optional[dict[str, Any]] = None
@@ -68,18 +69,10 @@ class BridgeManager:
         presentation: Optional[PresentationProducer] = None,
         scratch_directory: Optional[Path] = None,
         config_error: Optional[Mapping[str, Any]] = None,
-        client_factory: Optional[
-            Callable[
-                [
-                    ServerConfig,
-                    Limits,
-                    Callable[[McpStdioClient, McpError], None],
-                    Callable[[McpStdioClient], None],
-                ],
-                McpStdioClient,
-            ]
-        ] = None,
+        credential_provider: Optional[CredentialProvider] = None,
+        client_factory: Optional[Callable[..., Any]] = None,
         random_source: Optional[random.Random] = None,
+        experimental_streamable_http_mcp: bool = False,
     ) -> None:
         self.extension = extension
         self.config = config
@@ -88,8 +81,10 @@ class BridgeManager:
             os.environ.get("YGG_EXTENSION_SCRATCH", ".ygg-mcp-scratch")
         )
         self.config_error = dict(config_error) if config_error is not None else None
+        self._credential_provider = credential_provider
         self._client_factory = client_factory or self._default_client_factory
         self._random = random_source or random.SystemRandom()
+        self._experimental_streamable_http_mcp = experimental_streamable_http_mcp
         self._servers: dict[str, _ServerState] = {
             server.id: _ServerState(
                 config=server,
@@ -104,24 +99,62 @@ class BridgeManager:
         self._catalog_lock = threading.Lock()
         self._presentation_publish_lock = threading.Lock()
         self._calls = threading.BoundedSemaphore(config.limits.max_concurrent_calls)
-        self._executor = ThreadPoolExecutor(
-            max_workers=max(2, min(8, max(2, len(self._servers) + 1))),
-            thread_name_prefix="ygg-mcp-manager",
+        # Do not construct workers for inert or rejected configuration. In
+        # particular, the denied remote transport must fail before any worker
+        # could resolve DNS or ask a credential provider for a secret.
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    def _streamable_http_allowed(self, server: ServerConfig) -> bool:
+        return (
+            server.transport != "streamable-http"
+            or self._experimental_streamable_http_mcp
         )
 
-    @staticmethod
+    def _executor_for_work(self) -> ThreadPoolExecutor:
+        with self._lock:
+            if self._shutting_down:
+                raise RuntimeError("MCP manager is shutting down")
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=max(2, min(8, max(2, len(self._servers) + 1))),
+                    thread_name_prefix="ygg-mcp-manager",
+                )
+            return self._executor
+
+    def _submit(self, callback: Callable[..., Any], *arguments: Any) -> Future[Any]:
+        return self._executor_for_work().submit(callback, *arguments)
+
+    def _remote_transport_error(self, state: _ServerState) -> None:
+        state.state = "parked"
+        self._set_error(
+            state,
+            "experimental_streamable_http_mcp_required",
+            "Streamable HTTP MCP requires the process-owner experimental CLI opt-in",
+        )
+
     def _default_client_factory(
+        self,
         config: ServerConfig,
         limits: Limits,
-        on_failure: Callable[[McpStdioClient, McpError], None],
-        on_tools_changed: Callable[[McpStdioClient], None],
-    ) -> McpStdioClient:
-        return McpStdioClient(
-            config,
-            limits,
-            on_failure=on_failure,
-            on_tools_changed=on_tools_changed,
-        )
+        on_failure: Callable[[Any, McpError], None],
+        on_tools_changed: Callable[[Any], None],
+    ) -> Any:
+        if config.transport == "stdio":
+            return McpStdioClient(
+                config,
+                limits,
+                on_failure=on_failure,
+                on_tools_changed=on_tools_changed,
+            )
+        if config.transport == "streamable-http":
+            return McpStreamableHttpClient(
+                config,
+                limits,
+                credential_provider=self._credential_provider,
+                on_failure=on_failure,
+                on_tools_changed=on_tools_changed,
+            )
+        raise ValueError("unsupported MCP server transport")
 
     def start(self) -> None:
         """Start explicitly configured servers in bounded parallel workers."""
@@ -130,9 +163,16 @@ class BridgeManager:
             if self._started or self._shutting_down:
                 return
             self._started = True
-            states = [state for state in self._servers.values() if state.config.enabled]
+            states = []
+            for state in self._servers.values():
+                if not state.config.enabled:
+                    continue
+                if not self._streamable_http_allowed(state.config):
+                    self._remote_transport_error(state)
+                    continue
+                states.append(state)
         for state in states:
-            self._executor.submit(self._start_server, state.config.id, False)
+            self._submit(self._start_server, state.config.id, False)
         self._presentation_changed()
 
     def shutdown(self) -> None:
@@ -143,12 +183,14 @@ class BridgeManager:
                 return
             self._shutting_down = True
             states = list(self._servers.values())
+            executor = self._executor
+            self._executor = None
             for state in states:
                 if state.timer is not None:
                     state.timer.cancel()
                     state.timer = None
                 state.next_retry_at_ms = None
-        clients: list[McpStdioClient] = []
+        clients: list[Any] = []
         for state in states:
             with state.operation_lock:
                 with self._lock:
@@ -164,7 +206,8 @@ class BridgeManager:
             with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ygg-mcp-stop") as pool:
                 list(pool.map(lambda client: client.close(), clients))
         self._presentation_changed()
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def request_action(self, action: str, server_id: Optional[str] = None) -> Future[Any]:
         """Route one declared safe user action; model tool text never selects it."""
@@ -175,15 +218,30 @@ class BridgeManager:
             raise ValueError(f"{action} requires a server id")
         if server_id is not None and server_id not in self._servers:
             raise ValueError("unknown MCP server")
+        if server_id is not None and not self._streamable_http_allowed(
+            self._servers[server_id].config
+        ):
+            raise ValueError(
+                "Streamable HTTP MCP requires the process-owner experimental CLI opt-in"
+            )
         if action == "refresh" and server_id is None:
-            return self._executor.submit(self._refresh_all)
+            with self._lock:
+                all_transports_denied = all(
+                    not self._streamable_http_allowed(state.config)
+                    for state in self._servers.values()
+                )
+            if all_transports_denied:
+                completed: Future[Any] = Future()
+                completed.set_result(True)
+                return completed
+            return self._submit(self._refresh_all)
         callback = {
             "refresh": self.refresh_server,
             "restart": self.restart_server,
             "stop": self.stop_server,
         }[action]
         assert server_id is not None
-        return self._executor.submit(callback, server_id)
+        return self._submit(callback, server_id)
 
     def refresh_server(self, server_id: str) -> bool:
         state = self._server(server_id)
@@ -333,6 +391,13 @@ class BridgeManager:
     def _start_server(self, server_id: str, manual: bool) -> bool:
         state = self._server(server_id)
         with state.operation_lock:
+            if not self._streamable_http_allowed(state.config):
+                with self._lock:
+                    if self._shutting_down:
+                        return False
+                    self._remote_transport_error(state)
+                self._presentation_changed()
+                return False
             with self._lock:
                 if self._shutting_down:
                     return False
@@ -383,7 +448,7 @@ class BridgeManager:
             return True
 
     def _start_failed(
-        self, state: _ServerState, client: McpStdioClient, error: McpError
+        self, state: _ServerState, client: Any, error: McpError
     ) -> None:
         with self._lock:
             if state.client is not client:
@@ -394,7 +459,7 @@ class BridgeManager:
         self._schedule_after_failure(state, error)
 
     def _disconnect_after_failure(
-        self, state: _ServerState, client: McpStdioClient, error: McpError
+        self, state: _ServerState, client: Any, error: McpError
     ) -> None:
         with self._lock:
             if state.client is not client:
@@ -420,6 +485,12 @@ class BridgeManager:
                 self.config.limits.backoff_initial_ms * (2 ** (state.restart_attempt - 1)),
             )
             delay_ms = int(self._random.uniform(0, ceiling))
+            retry_after_ms = getattr(error, "retry_after_ms", None)
+            if isinstance(retry_after_ms, int) and not isinstance(retry_after_ms, bool):
+                delay_ms = max(
+                    delay_ms,
+                    min(self.config.limits.backoff_max_ms, retry_after_ms),
+                )
             delay_ms = max(1, delay_ms)
             state.state = "backoff"
             state.next_retry_at_ms = int(time.time() * 1000) + delay_ms
@@ -437,30 +508,34 @@ class BridgeManager:
             if self._shutting_down:
                 return
             state = self._servers.get(server_id)
-            if state is None or state.state != "backoff":
+            if (
+                state is None
+                or state.state != "backoff"
+                or not self._streamable_http_allowed(state.config)
+            ):
                 return
             state.timer = None
         try:
-            self._executor.submit(self._start_server, server_id, False)
+            self._submit(self._start_server, server_id, False)
         except RuntimeError:
             return
 
     def _on_client_failure(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         try:
-            self._executor.submit(self._handle_client_failure, server_id, client, error)
+            self._submit(self._handle_client_failure, server_id, client, error)
         except RuntimeError:
             return
 
     def _handle_client_failure(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         state = self._server(server_id)
         with state.operation_lock:
             self._disconnect_after_failure(state, client, error)
 
-    def _on_tools_changed(self, server_id: str, client: McpStdioClient) -> None:
+    def _on_tools_changed(self, server_id: str, client: Any) -> None:
         with self._lock:
             state = self._servers.get(server_id)
             if (
@@ -472,7 +547,7 @@ class BridgeManager:
                 return
             state.refresh_queued = True
         try:
-            self._executor.submit(self.refresh_server, server_id)
+            self._submit(self.refresh_server, server_id)
         except RuntimeError:
             with self._lock:
                 state.refresh_queued = False
@@ -480,7 +555,7 @@ class BridgeManager:
     def _publish_catalog(
         self,
         state: _ServerState,
-        client: McpStdioClient,
+        client: Any,
         raw_tools: list[dict[str, Any]],
     ) -> None:
         next_revision = state.catalog_revision + 1
@@ -619,7 +694,7 @@ class BridgeManager:
             server.host_catalog_revision = self._host_catalog_revision
 
     def _handler(
-        self, binding: ToolBinding, client: McpStdioClient
+        self, binding: ToolBinding, client: Any
     ) -> Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any]]:
         def call(arguments: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
             return self._call_tool(binding, client, arguments, context)
@@ -629,7 +704,7 @@ class BridgeManager:
     def _call_tool(
         self,
         binding: ToolBinding,
-        client: McpStdioClient,
+        client: Any,
         arguments: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -789,7 +864,7 @@ class BridgeManager:
             return
 
     def _mark_call_degraded(
-        self, server_id: str, client: McpStdioClient, error: McpError
+        self, server_id: str, client: Any, error: McpError
     ) -> None:
         state = self._server(server_id)
         with self._lock:
@@ -868,6 +943,7 @@ class BridgeManager:
             "connected": connected,
             "required": state.config.required,
             "scope": state.config.scope,
+            "transport": state.config.transport,
             "catalogRevision": state.catalog_revision,
             "hostCatalogRevision": state.host_catalog_revision,
             "restart": {

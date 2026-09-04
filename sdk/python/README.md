@@ -27,6 +27,12 @@ harness or test:
 ext = Extension(api_version="0.2", max_concurrent_requests=4)
 ```
 
+API `0.3` contract models and canonical-wire validators are generated in
+`ygg_extension.api_v03`; see the generated
+[API `0.3` reference](../../docs/extensions/API-0.3-REFERENCE.md). The
+`Extension` runtime remains the explicit API `0.1`/`0.2` adapter and does
+not silently translate either legacy wire onto API `0.3`.
+
 Install it from a checkout:
 
 ```console

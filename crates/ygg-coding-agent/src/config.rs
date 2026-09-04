@@ -1,11 +1,12 @@
 #![allow(missing_docs)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ygg_agent::{
-    EffectPolicy, SandboxConfig, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
+    EffectPolicy, EffectiveToolPolicy, SandboxConfig, ToolPolicyProvenance,
+    DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_MAX_OUTPUT_BYTES,
 };
 
 pub use crate::tui::terminal::ColorMode;
@@ -92,6 +93,8 @@ pub struct SandboxPolicy {
     pub shell_path: Option<PathBuf>,
     pub bash_timeout_secs: u64,
     pub max_output_bytes: usize,
+    /// Source labels for the secret-safe effective policy diagnostic.
+    pub policy_provenance: ToolPolicyProvenance,
 }
 
 impl Default for SandboxPolicy {
@@ -110,6 +113,7 @@ impl Default for SandboxPolicy {
             shell_path: None,
             bash_timeout_secs: 120,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            policy_provenance: ToolPolicyProvenance::default(),
         }
     }
 }
@@ -248,7 +252,19 @@ impl SandboxPolicy {
         sandbox.shell_path = self.shell_path.clone();
         sandbox.bash_timeout = Duration::from_secs(self.bash_timeout_secs);
         sandbox.max_output_bytes = self.max_output_bytes;
+        sandbox.policy_provenance = self.policy_provenance;
         sandbox
+    }
+
+    /// Resolve the safe policy metadata exposed by telemetry and headless
+    /// diagnostics without disclosing configured path values.
+    pub fn effective_tool_policy(
+        &self,
+        workspace: &Path,
+        effect_policy: EffectPolicy,
+    ) -> EffectiveToolPolicy {
+        self.to_sandbox_config(workspace)
+            .effective_tool_policy(effect_policy)
     }
 }
 
@@ -427,6 +443,9 @@ pub struct Config {
     pub mouse: MouseMode,
     /// Force the chronological ASCII frontend even on a capable TTY.
     pub plain: bool,
+    /// Opt in to bounded inline image placement for interactive tool results.
+    /// Plain, print, and noninteractive frontends always remain payload-free.
+    pub show_images: bool,
     pub session_dir: PathBuf,
     pub compaction: CompactionPolicy,
     /// Optional cumulative session spend limit in microdollars.
@@ -458,6 +477,11 @@ pub struct Config {
     pub trusted_extensions: Vec<String>,
     /// One-shot extension names trusted only for this process invocation.
     pub invocation_trusted_extensions: Vec<String>,
+    /// One-shot process-owner gate for experimental remote Streamable HTTP MCP.
+    /// This is deliberately not loaded from configuration, environment, or sessions.
+    pub experimental_streamable_http_mcp: bool,
+    /// Host-parsed values for manifest-declared CLI flags, keyed by extension and flag name.
+    pub extension_flag_values: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     /// One authoritative allowlist used for schema and implementation registration.
     pub tools: ToolPolicy,
     /// Optional machine-readable agent telemetry output. Disabled by default.

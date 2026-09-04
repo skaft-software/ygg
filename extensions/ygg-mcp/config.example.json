@@ -16,6 +16,13 @@
       "env": {},
       "enabled": false,
       "required": false
+    },
+    "example-remote": {
+      "transport": "streamable-http",
+      "label": "Example remote MCP",
+      "url": "https://mcp.example.invalid/mcp",
+      "enabled": false,
+      "required": false
     }
   },
   "trustedProjects": []

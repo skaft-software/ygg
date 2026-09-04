@@ -1205,6 +1205,7 @@ mod tests {
                         "client_secret": metadata_secret,
                     })
                     .to_string(),
+                    argument_error: None,
                 })],
                 model: ModelId("test".into()),
                 protocol: Protocol::OpenAiChat,
@@ -1309,6 +1310,7 @@ mod tests {
                     id: ToolCallId("ordinary-call-id".into()),
                     name: "extension-review".into(),
                     arguments_json: nested_arguments,
+                    argument_error: None,
                 })],
                 model: ModelId("test".into()),
                 protocol: Protocol::OpenAiChat,

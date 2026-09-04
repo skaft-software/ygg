@@ -1,18 +1,21 @@
 # ygg-mcp
 
-`ygg-mcp` is Ygg's first-party API `0.2` bridge for explicitly configured local
-stdio [Model Context Protocol](https://modelcontextprotocol.io/) tool servers.
-One resident extension process owns every configured server session and maps its
-live tool catalog to Ygg's transactional `tools/register` and
-`tools/unregister` API.
+`ygg-mcp` is Ygg's first-party API `0.2` bridge for explicitly configured
+[Model Context Protocol](https://modelcontextprotocol.io/) tool servers. One
+resident extension process owns every configured server session and maps its live
+tool catalog to Ygg's transactional `tools/register` and `tools/unregister` API.
 
 ```text
 Ygg <- API 0.2 JSON-RPC -> ygg-mcp <- MCP JSON-RPC stdio -> local servers
+                                 \-> MCP Streamable HTTP -> explicit remote endpoint
 ```
 
-V1 supports **local stdio servers and tools only**. It does not support
-Streamable HTTP/SSE, OAuth, resources, prompts, sampling, elicitation, automatic
-server installation, or ambient MCP discovery.
+V1 preserves local stdio servers. Streamable HTTP code exists only as a blocked-
+by-default **experimental** transport: it requires a conspicuous one-shot CLI
+opt-in from the Ygg process owner and is not suitable for production or sensitive
+credentials. It does not support legacy MCP SSE endpoints, OAuth or browser
+authorization flows, resources, prompts, sampling, elicitation, automatic server
+installation, or ambient MCP discovery.
 
 ## Security and authority
 
@@ -28,8 +31,9 @@ downloads, or installs server software.
 
 There are two separate decisions:
 
-1. **Launch trust:** the user configuration, or a user-file digest pin for a
-   trusted project configuration, names the exact direct command and arguments.
+1. **Server/endpoint trust:** the user configuration, or a user-file digest pin
+   for a trusted project configuration, names either exact direct launch
+   arguments or one exact remote endpoint.
 2. **Tool-call policy:** server trust does not approve every tool. Only an MCP
    annotation whose `readOnlyHint` value is exactly JSON `true` (and which is
    not contradicted by positive destructive/open-world hints) receives the
@@ -40,7 +44,7 @@ An explicitly read-only tool may run without an additional prompt. Every
 `unknown` or `destructive` call goes through the negotiated host
 `policy/evaluate` service. If policy intents are unavailable, evaluation fails,
 or the host denies the intent, the bridge fails closed. It uses a one-use
-approval retry only when the host actually negotiates `approvals`; Ygg `0.6.7`'s
+approval retry only when the host actually negotiates `approvals`; Ygg `0.7.0-dev`'s
 coding product does not currently enable approval issuance, so those calls are
 denied with an explanatory tool error. An MCP tool call is never automatically
 replayed after timeout, cancellation, crash, or an ambiguous disconnect.
@@ -54,14 +58,81 @@ credential-redacted in-memory ring and is not copied into frontend state.
 
 The server environment begins from a small non-secret process allowlist
 (`PATH`, locale, and temporary-directory variables) plus only the `env` entries
-in the explicit MCP configuration. It does not inherit dotenv files or ambient
+in the explicit stdio configuration. It does not inherit dotenv files or ambient
 provider/application tokens. Explicit `env` values are sensitive configuration:
-protect the file and never place secrets in labels or arguments. V1 has no
-`secretRefs` option and does not pretend a host secret broker is configured.
+protect the file and never place secrets in labels or arguments.
+
+### Experimental Streamable HTTP gate
+
+Local stdio MCP remains available through normal reviewed configuration. Remote
+Streamable HTTP MCP is denied unless the **Ygg process owner** supplies this
+one-shot command-line switch for that process:
+
+```console
+ygg --experimental-streamable-http-mcp \
+    --enable-extension ygg-mcp --trust-extension ygg-mcp
+```
+
+This is intentionally not a configuration feature. `~/.ygg/mcp.json`,
+digest-pinned project MCP files, Ygg project/global configuration, environment
+variables, session/host requests, and extension-manifest arguments cannot grant
+it. The coding product strips a manifest-supplied copy and passes the switch to
+the bridge only after parsing the product CLI. A disabled remote template stays
+inert; enabling it without the switch fails during configuration loading, before
+credential lookup, DNS, network I/O, or MCP manager workers. Lifecycle actions
+also reject a disabled-gate remote before creating a worker.
+
+For direct development/configuration validation, the same owner switch is
+required on the bridge command:
+
+```console
+ygg-mcp --experimental-streamable-http-mcp --config ~/.ygg/mcp.json --check-config
+```
+
+A remote endpoint is a separate explicit network-trust decision. Streamable HTTP
+uses the exact configured URL, TLS certificate/hostname validation, no proxy or
+cookie discovery, and no redirects. HTTPS is required except for a numeric
+loopback address, which exists for deterministic local development and tests.
+URLs cannot contain userinfo, a query, or a fragment, preventing URL-auth and
+query credential fields as well as endpoint switching by redirect. The extension
+never synthesizes a browser `Origin` header or forwards browser credentials.
+
+Remote `auth` contains only a logical credential reference, never a token or
+header value. A host/application composition may inject the narrow
+`CredentialProvider.bearer_token(reference, server_id=...)` adapter; the bridge
+asks it at request time, uses the returned token only to form that request's
+`Authorization: Bearer` header, redacts it from parsed remote data, then drops
+it. The normal bundled runtime intentionally has no provider, so such a server
+parks with `authentication_unavailable`. OAuth discovery, browser redirects,
+token acquisition/refresh, persistent token stores, static config headers, and
+secret environment fallback are not implemented.
+
+### Known Streamable HTTP defects
+
+The gate is a containment measure, not a claim that remote transport is safe.
+Do **not** enable it for production, privileged networks, or sensitive
+credentials. The known unresolved defects are:
+
+1. HTTPS SSRF remains possible through DNS rebinding; connections are not pinned
+   to a reviewed address.
+2. Credential and session state can be shared across distinct resource owners.
+3. DNS workers can outlive cancellation and shutdown (they are not reliably
+   killable).
+4. Buffered SSE handling can confuse peer identity.
+5. Control-message fanout is unbounded.
+6. Aggregate budgets can reset across remote transport paths.
+7. Truncated framing can be accepted.
+8. An empty SSE event ID can produce an incorrect resume cursor.
+9. The startup deadline can be escaped.
+
+These defects are deliberately left visible rather than hidden behind a config
+knob. The only activation path is the process-owner opt-in above; remediation of
+the defects, not broader configuration, is required before this transport can be
+made generally available.
 
 ## Requirements and installation
 
-- Ygg exactly `0.6.7` (`requires_ygg = "=0.6.7"`)
+- Ygg exactly `0.7.0-dev` (`requires_ygg = "=0.7.0-dev"`)
 - Python 3.9 or newer on `PATH`
 - separately installed MCP server executables
 
@@ -100,12 +171,19 @@ $EDITOR ~/.ygg/mcp.json
 extensions/ygg-mcp/ygg-mcp --config ~/.ygg/mcp.json --check-config
 ```
 
+If the file enables a Streamable HTTP server, add
+`--experimental-streamable-http-mcp` to that validation command and to the Ygg
+process that will own the bridge. The JSON has no equivalent setting.
+
 `config.schema.json` is the normative JSON schema. The parser also rejects
 unknown/duplicate keys, non-UTF-8 or oversized files, symlink final files,
 linked `.ygg` roots or escaping trusted-project ancestors, files writable by
 another user, files with explicit `env` values accessible by group/other users,
-duplicate server IDs, NUL/control characters, and values outside package
-ceilings. Commands are direct argument arrays and never pass through a shell.
+duplicate server IDs, NUL/control characters, mutually incompatible transport
+fields, unsafe remote URLs, and values outside package ceilings. Commands are
+direct argument arrays and never pass through a shell. Remote endpoints are exact
+URL strings rather than discovery patterns; there is no raw `headers`, token,
+password, or OAuth configuration field.
 
 A minimal user file is:
 
@@ -132,6 +210,43 @@ Server IDs are stable lowercase identifiers matching
 is never used as a UI label. Relative `cwd` values resolve from the file that
 defines the server. A missing executable or invalid MCP handshake is a
 permanent failure parked until an explicit restart/config refresh.
+
+### Streamable HTTP configuration
+
+This experimental configuration is inert without the process-owner
+`--experimental-streamable-http-mcp` flag. Adding the flag to JSON, a trusted
+project file, an environment variable, or a session does not work.
+
+A remote server must opt into `"transport": "streamable-http"` and name one
+absolute endpoint. It accepts `https`; `http` is accepted only for literal
+`127.0.0.1` or `::1` loopback endpoints. Stdio launch fields (`command`, `args`,
+`cwd`, and `env`) are rejected for this transport.
+
+```json
+{
+  "version": 1,
+  "servers": {
+    "remote-example": {
+      "transport": "streamable-http",
+      "label": "Reviewed remote MCP",
+      "url": "https://mcp.example.invalid/mcp",
+      "enabled": true,
+      "required": false,
+      "auth": {
+        "type": "bearer",
+        "credential": "reviewed_remote_mcp"
+      }
+    }
+  }
+}
+```
+
+`credential` is a bounded logical reference, not a secret. It requires an
+application-provided `CredentialProvider`; the stock executable fails closed
+without one. Omit `auth` for an endpoint that does not need authorization. Do
+not put tokens in a URL, label, argument, `env`, or any other config field. The
+parser rejects remote header/auth-value fields and this package deliberately does
+not offer static HTTP headers.
 
 ### Digest-pinned trusted project configuration
 
@@ -180,6 +295,37 @@ server ID.
 Catalog pagination is cycle-checked. Tool/schema text, structured output,
 content parts, text, individual/aggregate media, presentation nodes,
 activities, and action counts have additional fixed bounds in source.
+
+### Streamable HTTP framing and recovery
+
+The HTTP client POSTs one JSON-RPC message with `Content-Type: application/json`
+and `Accept: application/json, text/event-stream`. It accepts a bounded JSON
+response or a bounded SSE response; `202 Accepted` is accepted only for
+notifications. After a valid `initialize` response, a validated in-memory
+`Mcp-Session-Id` is sent on subsequent requests with the negotiated
+`MCP-Protocol-Version`. A changed or malformed session identity fails closed.
+A `404` for an established session is treated as expiration and triggers the
+normal fresh-session reconnect path.
+
+SSE response events are UTF-8 JSON-RPC `message` events, bounded by the existing
+frame limit both per event and in aggregate (at most 256 events). A server-issued
+SSE `id` is retained only in memory. If a POST response stream closes before its
+terminal response *after* such an ID, the bridge may perform at most the
+configured `maxRestarts` bounded GET resumptions with `Last-Event-ID`; it never
+re-POSTs the original request. Without an ID, an interrupted request is
+ambiguous and is not replayed. Server-provided SSE `retry` values are capped by
+the configured backoff maximum. This path does not open a permanent optional GET
+notification stream and does not implement the retired standalone/legacy SSE
+transport.
+
+HTTP response bodies, event streams, request slots, timeouts, and shutdown are
+bounded by the existing limits. Redirects are rejected before following a
+`Location`; 401/403 park with a generic authentication error; malformed,
+oversized, unsupported-content-type, and unsafe status responses park without
+retaining response text. Rate limits and transient transport/server failures use
+the existing bounded lifecycle backoff (honouring a capped numeric `Retry-After`
+when present). Cancellation aborts the in-flight socket and sends one bounded
+`notifications/cancelled`; it never claims rollback or replays the request.
 
 ## Catalogs, calls, and results
 
@@ -267,7 +413,8 @@ python3 -m unittest discover -s tests -t . -v
 ```
 
 The dependency-free suite covers strict config/trust, real and adversarial stdio
-servers, add/replace/remove catalogs, epoch-pinned schemas, malformed/oversized
-frames, cancellation, timeout, crash/restart/parking, bounded redacted logs,
-media artifacts, policy failure, shutdown, API `0.2` wire behavior, generic
+servers, deterministic loopback Streamable HTTP framing/session/auth/SSE fixtures,
+add/replace/remove catalogs, epoch-pinned schemas, malformed/oversized frames,
+cancellation, timeout, crash/restart/parking, bounded redacted logs, media
+artifacts, policy failure, shutdown, API `0.2` wire behavior, generic
 presentation fixtures, and release/package smoke checks.

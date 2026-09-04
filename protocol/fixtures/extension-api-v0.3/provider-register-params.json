@@ -1,0 +1,1 @@
+{"models":[{"api_name":"fixture-model","capabilities":{"parallel_tool_calls":false,"reasoning":false,"structured_output":true,"tools":true},"context_window":32768,"id":"fixture-model","max_output_tokens":4096,"protocol":"openai_chat"}],"provider":{"auth":{"kind":"none"},"id":"fixture-provider","label":"Fixture provider"}}

@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
@@ -18,8 +18,8 @@ use crate::presentation::{
 };
 use crate::session_store::{SessionMeta, SessionStorageLifecycle, SessionStore};
 use crate::tui::view::{
-    ForkMessage, InteractiveShell, MessagePicker, Panel, PanelAction, PanelRequest, PanelResult,
-    PickerState,
+    ForkMessage, InteractiveShell, MessagePicker, OrdinarySurfaceLifecycle,
+    OrdinarySurfaceMetadata, Panel, PanelAction, PanelRequest, PanelResult, PickerState,
 };
 
 const MAX_SECRET_INPUT_BYTES: usize = 4096;
@@ -246,7 +246,7 @@ where
 async fn pick_list<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
-    title: &str,
+    surface: OrdinarySurfaceMetadata,
     items: Vec<String>,
     descriptions: Vec<Option<String>>,
     initial_selected: usize,
@@ -263,7 +263,7 @@ where
 
     let initial_selected = initial_selected.min(items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
-        title: title.into(),
+        surface,
         items,
         descriptions,
         selected: initial_selected,
@@ -320,6 +320,33 @@ where
 pub async fn extension_picker<S>(
     shell: &mut InteractiveShell,
     input: &mut S,
+    surface: OrdinarySurfaceMetadata,
+    items: Vec<String>,
+    descriptions: Vec<Option<String>>,
+    initial_selected: usize,
+) -> anyhow::Result<Option<usize>>
+where
+    S: futures_util::Stream<Item = std::io::Result<Event>> + Unpin,
+{
+    let action_items = items.clone();
+    pick_list(
+        shell,
+        input,
+        surface,
+        items,
+        descriptions,
+        initial_selected,
+        PanelAction::SelectExtension(action_items),
+    )
+    .await
+}
+
+/// Select a single step in the guided provider-setup flow. This uses the
+/// ordinary select-list surface and retains cancellation as a non-mutating
+/// outcome for the caller.
+pub async fn provider_setup_picker<S>(
+    shell: &mut InteractiveShell,
+    input: &mut S,
     title: &str,
     items: Vec<String>,
     descriptions: Vec<Option<String>>,
@@ -332,11 +359,11 @@ where
     pick_list(
         shell,
         input,
-        title,
+        OrdinarySurfaceMetadata::new(title),
         items,
         descriptions,
         initial_selected,
-        PanelAction::SelectExtension(action_items),
+        PanelAction::ProviderSetup(action_items),
     )
     .await
 }
@@ -370,7 +397,7 @@ where
     }
     let selected = initial_selected.min(initial.items.len().saturating_sub(1));
     shell.open_panel(Panel::SelectList {
-        title: initial.title,
+        surface: OrdinarySurfaceMetadata::new(initial.title),
         items: initial.items,
         descriptions: initial.descriptions,
         selected,
@@ -614,23 +641,41 @@ pub async fn session_picker(
             match request {
                 PanelRequest::LoadAll => {
                     let discovery_store = store.clone();
-                    let discovered = run_blocking_lifecycle(
+                    let discovered = match run_blocking_lifecycle(
                         shell,
                         input,
                         "discovering sessions in all workspaces…",
                         move || Ok(discovery_store.list_all()),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(discovered) => discovered,
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to load all workspaces: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
+                            );
+                            shell.render();
+                            return Err(error);
+                        }
+                    };
                     all_rows = Some(picker_rows(discovered.into_iter()));
                     shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
+                    shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                        "all workspaces loaded",
+                        Instant::now() + Duration::from_secs(2),
+                    ));
                     shell.render();
                 }
                 PanelRequest::TrashSession { path, .. } => {
                     let Some(id) = session_id_from_path(&path) else {
-                        shell.set_picker_message(
-                            "Failed to trash session: path has no valid id",
-                            std::time::Duration::from_secs(3),
-                        );
+                        shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::recoverable_error(
+                            "to trash session: path has no valid id",
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                        shell.render();
                         continue;
                     };
                     let target_store = store_for_session_path(store, &path);
@@ -654,24 +699,29 @@ pub async fn session_picker(
                             rows = next_rows;
                             all_rows = next_all;
                             shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
-                            shell.set_picker_message(
-                                "Session moved to trash",
-                                std::time::Duration::from_secs(2),
+                            shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                                "session moved to trash",
+                                Instant::now() + Duration::from_secs(2),
+                            ));
+                        }
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to trash session: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
                             );
                         }
-                        Err(error) => shell.set_picker_message(
-                            format!("Failed to trash session: {error}"),
-                            std::time::Duration::from_secs(3),
-                        ),
                     }
                     shell.render();
                 }
                 PanelRequest::RenameSession { path, name, .. } => {
                     let Some(id) = session_id_from_path(&path) else {
-                        shell.set_picker_message(
-                            "Failed to rename session: path has no valid id",
-                            std::time::Duration::from_secs(3),
-                        );
+                        shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::recoverable_error(
+                            "to rename session: path has no valid id",
+                            Instant::now() + Duration::from_secs(3),
+                        ));
+                        shell.render();
                         continue;
                     };
                     let target_store = store_for_session_path(store, &path);
@@ -688,15 +738,19 @@ pub async fn session_picker(
                             rows = next_rows;
                             all_rows = next_all;
                             shell.refresh_panel_sessions(rows.clone(), all_rows.clone());
-                            shell.set_picker_message(
-                                "Session renamed",
-                                std::time::Duration::from_secs(2),
+                            shell.set_picker_lifecycle(OrdinarySurfaceLifecycle::success(
+                                "session renamed",
+                                Instant::now() + Duration::from_secs(2),
+                            ));
+                        }
+                        Err(error) => {
+                            shell.set_picker_lifecycle(
+                                OrdinarySurfaceLifecycle::recoverable_error(
+                                    format!("to rename session: {error}"),
+                                    Instant::now() + Duration::from_secs(3),
+                                ),
                             );
                         }
-                        Err(error) => shell.set_picker_message(
-                            format!("Failed to rename session: {error}"),
-                            std::time::Duration::from_secs(3),
-                        ),
                     }
                     shell.render();
                 }
@@ -890,7 +944,10 @@ pub async fn thinking_picker(
     let Some(index) = pick_list(
         shell,
         input,
-        "Select thinking level",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select thinking level",
+            "Choose the reasoning effort for subsequent prompts",
+        ),
         items,
         vec![None; levels.len()],
         0,
@@ -978,7 +1035,7 @@ where
     let selected = pick_list(
         shell,
         input,
-        &title,
+        OrdinarySurfaceMetadata::new(title),
         items,
         descriptions,
         0,
@@ -1174,7 +1231,10 @@ pub async fn optional_model_picker(
     let Some(index) = pick_list(
         shell,
         input,
-        "Select model",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select model",
+            "Choose the model used for subsequent prompts",
+        ),
         presentation.labels,
         presentation.descriptions,
         0,
@@ -1263,7 +1323,7 @@ mod tests {
         let selected = pick_list(
             &mut shell,
             &mut input,
-            "Choose",
+            OrdinarySurfaceMetadata::new("Choose"),
             vec!["one".into()],
             vec![None],
             0,
@@ -1520,6 +1580,20 @@ mod tests {
         assert!(descriptions
             .iter()
             .any(|description| description.contains("vision")));
+
+        let astra_index = presentation
+            .ids
+            .iter()
+            .position(|id| id.0 == "gpt-6-astra")
+            .expect("built-in Astra should use the generic model picker path");
+        assert_eq!(presentation.providers[astra_index], "OpenAI");
+        assert_eq!(presentation.labels[astra_index], "GPT-6 Astra");
+        let astra_description = descriptions[astra_index];
+        assert!(astra_description.contains("$10/M"));
+        assert!(astra_description.contains("$50/M"));
+        assert!(astra_description.contains("1.1M ctx"));
+        assert!(astra_description.contains("vision"));
+
         assert!(descriptions.iter().all(|description| {
             !description.contains("tools")
                 && !description.contains("reasoning")

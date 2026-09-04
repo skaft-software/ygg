@@ -60,6 +60,20 @@ fn nest_tool_output(rows: Vec<String>, theme: &YggTheme, width: u16) -> Vec<Stri
 /// Connect a wrapped tool header to its nested output. The tool label, every
 /// vertical stem cell, and the final elbow share one column; replacing one
 /// leading continuation space preserves that header's command-value column.
+fn render_progress_decoration(
+    decoration: &ygg_agent::ToolProgressDecoration,
+    theme: &YggTheme,
+    width: u16,
+) -> Vec<String> {
+    let label = sanitize_for_terminal(decoration.label());
+    let detail = decoration
+        .detail()
+        .map(sanitize_for_terminal)
+        .filter(|detail| !detail.is_empty());
+    let text = detail.map_or(label.clone(), |detail| format!("{label} · {detail}"));
+    wrap_hanging(&theme.fg("muted", &text), "", "", width)
+}
+
 fn append_nested_tool_output(
     header: &mut Vec<String>,
     rows: Vec<String>,
@@ -376,6 +390,15 @@ pub(super) fn render_block_planned_with_rainbow(
             let nested_width = width.saturating_sub(2).max(1);
             let mut output_lines = Vec::new();
 
+            if !panel.finished {
+                if let Some(decoration) = panel.progress_decoration.as_ref() {
+                    output_lines.extend(render_progress_decoration(
+                        decoration,
+                        theme,
+                        nested_width,
+                    ));
+                }
+            }
             if panel.finished && panel.is_error {
                 output_lines.extend(render_tool_failure_reason(panel, theme, nested_width, ""));
             }
@@ -406,6 +429,9 @@ pub(super) fn render_block_planned_with_rainbow(
                     )),
                 _ => {}
             }
+            // Image reservations are visual-only and deliberately remain out
+            // of `panel.output`, selection, and plain/print projections.
+            output_lines.extend(panel.image_rows(nested_width));
             append_nested_tool_output(&mut lines, output_lines, theme, width);
             finish_transcript_block(lines)
         }

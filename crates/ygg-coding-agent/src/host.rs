@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use ygg_agent::{
-    AgentEvent, EntryValue, InputPart, OutputChannel, Session, ToolProgress, UserInput,
+    AgentEvent, EntryValue, InputPart, OutputChannel, PolicyValueSource, Session,
+    ToolPolicyProvenance, ToolProgress, UserInput,
 };
 use ygg_ai::{
     AssistantMessage, AssistantPart, AudioFormat, Auth, CacheRetention, Capabilities, Endpoint,
@@ -843,6 +844,10 @@ async fn run_request(
                 "resolved_model": app.model.spec.id.0,
                 "session_file": session_path,
                 "registered_tools": app.agent.registered_tool_names(),
+                "effective_tool_policy": app.config.sandbox.effective_tool_policy(
+                    &app.config.workspace,
+                    app.config.effect_policy,
+                ),
                 "extensions": app.executable_extensions.summaries(),
             }),
         )
@@ -941,6 +946,19 @@ async fn run_request(
                     .emit("output_media", media_payload(index, &media))
                     .await?;
             }
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // This is a structured protocol event, not human-facing stdout
+                // diagnostics or assistant content.
+                emitter
+                    .emit(
+                        "provider_lifecycle",
+                        serde_json::json!({
+                            "state": lifecycle.state.as_str(),
+                            "detail": lifecycle.detail.as_deref().map(|detail| clip_text(detail, 512)),
+                        }),
+                    )
+                    .await?;
+            }
             AgentEvent::ProviderRetry {
                 attempt,
                 max_attempts,
@@ -1011,6 +1029,18 @@ async fn run_request(
                             "toolCallId": id.0,
                             "toolName": name,
                             "input": args,
+                        }),
+                    )
+                    .await?;
+            }
+            AgentEvent::ToolPolicyDecision { id, name, decision } => {
+                emitter
+                    .emit(
+                        "tool_policy",
+                        serde_json::json!({
+                            "toolCallId": id.0,
+                            "toolName": name,
+                            "decision": decision,
                         }),
                     )
                     .await?;
@@ -1265,6 +1295,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
     // workspace-relative under that effect policy.
     let mut sandbox = SandboxPolicy {
         allow_external_paths: false,
+        policy_provenance: ToolPolicyProvenance::all(PolicyValueSource::HostRequest),
         ..SandboxPolicy::default()
     };
     if !request.allow_file_mutation {
@@ -1300,6 +1331,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         color: ColorMode::Never,
         mouse: MouseMode::Off,
         plain: true,
+        show_images: false,
         session_dir,
         compaction: CompactionPolicy::default(),
         max_cost_microdollars: request.max_cost_microdollars,
@@ -1320,6 +1352,8 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         extension_activation_overridden: true,
         trusted_extensions: request.trusted_extensions.clone(),
         invocation_trusted_extensions: Vec::new(),
+        experimental_streamable_http_mcp: false,
+        extension_flag_values: Default::default(),
         tools,
         telemetry: None,
         context_files: request.context_files,
@@ -1369,6 +1403,7 @@ fn register_inline_model(
         auth,
         default_headers,
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: std::time::Duration::from_secs(30),
     })?;
     let context_window = request.context_window_tokens.unwrap_or(262_144).max(1);
@@ -1954,6 +1989,11 @@ fn progress_payload(progress: ToolProgress) -> serde_json::Value {
             "type": "status",
             "message": clip_text(&message, 16 * 1024),
         }),
+        ToolProgress::Decoration(decoration) => serde_json::json!({
+            "type": "decoration",
+            "label": clip_text(decoration.label(), 256),
+            "detail": decoration.detail().map(|detail| clip_text(detail, 4 * 1024)),
+        }),
         ToolProgress::Confirmation(request) => {
             let payload = serde_json::json!({
                 "type": "confirmation_required",
@@ -2097,6 +2137,14 @@ mod tests {
 
         assert_eq!(config.effect_policy, ygg_agent::EffectPolicy::Controlled);
         assert!(!config.sandbox.allow_external_paths);
+        assert!(
+            !config.experimental_streamable_http_mcp,
+            "the host request/session boundary cannot enable experimental remote MCP"
+        );
+        assert_eq!(
+            config.sandbox.policy_provenance,
+            ToolPolicyProvenance::all(PolicyValueSource::HostRequest)
+        );
     }
 
     #[test]
@@ -2176,6 +2224,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("allow_file_mutations");
+        request["experimental_streamable_http_mcp"] = serde_json::json!(true);
+        let error = parse_request(request.to_string().as_bytes()).unwrap_err();
+        assert!(error.contains("experimental_streamable_http_mcp"));
+        request
+            .as_object_mut()
+            .unwrap()
+            .remove("experimental_streamable_http_mcp");
         request["history"] = serde_json::json!([{
             "role": "user",
             "text": "hello",

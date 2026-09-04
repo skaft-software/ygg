@@ -8,7 +8,7 @@ use ygg_agent::{EntryId, Session};
 use super::renderer_runtime::SharedState;
 use super::transcript_hydration::append_hydrated_items;
 use super::TranscriptBlock;
-use crate::hydrate::hydrate_transcript_at;
+use crate::hydrate::hydrate_transcript_at_with_image_budget;
 
 #[derive(Clone, Copy)]
 pub(super) struct NextTranscriptCommitId(pub(super) u64);
@@ -41,7 +41,7 @@ pub(super) fn materialize_deferred_session_history(state: &SharedState) -> Resul
     // session's moving head. Blocks added by the live shell are retained
     // separately below, so this remains safe during an active run.
     let session = Session::open_read_only(&deferred.path)?;
-    let items = hydrate_transcript_at(&session, &deferred.head)?;
+    let (items, _) = hydrate_transcript_at_with_image_budget(&session, &deferred.head)?;
     let mut state = state.borrow_mut();
     if state.deferred_session_history.as_ref() != Some(&deferred) {
         return Ok(false);
@@ -161,6 +161,7 @@ pub(super) fn materialize_deferred_session_history(state: &SharedState) -> Resul
     );
     state.deferred_session_history = None;
     state.history_prepended.set(true);
+    state.rebuild_terminal_images();
     state.invalidate_transcript_layout();
     Ok(true)
 }

@@ -16,20 +16,22 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WebSocketMessage};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 use ygg_agent::{
     Agent, AgentConfig, AgentEvent, CompletionPolicy, CoreTools, EffectBroker, EffectPolicy,
     EntryId, EntryValue, ExtensionHost, FinishReason, InputPart, OutputChannel, OutputStream,
     QueueDeliveryMode, ReplaySafety, RunControl, SandboxConfig, Session, Tool, ToolCallHook,
-    ToolConcurrency, ToolContext, ToolEffect, ToolError, ToolOutput, UsageRecordKind, UserInput,
+    ToolConcurrency, ToolContext, ToolEffect, ToolError, ToolOutput, ToolPolicyDenialCode,
+    UsageRecordKind, UserInput,
 };
 use ygg_ai::{
     AiClient, AssistantMessage, AssistantPart, AudioFormat, AudioOutputOptions, AudioPayload,
     AudioVoice, Auth, Capabilities, Endpoint, EndpointId, Media, Message, Modality, ModalitySet,
     Model, ModelId, ModelLimits, ModelSpec, OutputModalities, Pricing, Protocol,
-    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffortBudgets, TokenRate,
-    ToolCall, Usage, UserMessage, UserPart,
+    ProviderLifecycleState, ReasoningCapability, ReasoningConfig, ReasoningControl,
+    ReasoningEffortBudgets, TokenRate, ToolCall, ToolCallArgumentError, Usage, UserMessage,
+    UserPart,
 };
 
 const MAX_CONNECT_ATTEMPTS_FOR_TEST: usize = 6;
@@ -793,6 +795,7 @@ fn scripted_model(uri: &str) -> Model {
             auth: Auth::bearer("test-key"),
             default_headers: http::HeaderMap::new(),
             transport: ygg_ai::EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(10),
         }),
     }
@@ -810,6 +813,7 @@ fn openai_multimodal_model(uri: &str) -> Model {
             auth: Auth::bearer("test-key"),
             default_headers: http::HeaderMap::new(),
             transport: ygg_ai::EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(10),
         }),
     }
@@ -869,6 +873,7 @@ fn scripted_responses_model(uri: &str) -> Model {
             auth: Auth::bearer("test-key"),
             default_headers: http::HeaderMap::new(),
             transport: ygg_ai::EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(10),
         }),
     }
@@ -879,6 +884,9 @@ fn scripted_model_for_protocol(uri: &str, protocol: Protocol) -> Model {
         Protocol::OpenAiResponses => scripted_responses_model(uri),
         Protocol::OpenAiChat => openai_multimodal_model(uri),
         Protocol::AnthropicMessages => scripted_model(uri),
+        Protocol::BedrockConverse | Protocol::GoogleGenerativeAi => {
+            panic!("{protocol:?} requires a codec-specific provider fixture")
+        }
     }
 }
 
@@ -2382,6 +2390,70 @@ async fn run_context_snapshot_updates_without_a_presentation_layer() {
 }
 
 #[tokio::test]
+async fn openai_lifecycle_feedback_is_forwarded_but_not_persisted() {
+    let server = MockServer::start().await;
+    let body = concat!(
+        ": ygg-lifecycle: loading; warming test-key\n\n",
+        "data: {\"id\":\"lifecycle\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"Ready\"}}]}\n\n",
+        "data: {\"id\":\"lifecycle\",\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-ygg-lifecycle", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-ygg-lifecycle", "queued; accepted test-key"),
+        )
+        .mount(&server)
+        .await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let sessions = tempfile::tempdir().unwrap();
+    let session_path = sessions.path().join("lifecycle.jsonl");
+    let mut model = openai_multimodal_model(&server.uri());
+    Arc::make_mut(&mut model.endpoint)
+        .runtime
+        .lifecycle_feedback = true;
+    let mut agent = build_agent_with_reasoning(
+        model,
+        &session_path,
+        workspace.path(),
+        ReasoningConfig::Off,
+        Some(4),
+    );
+
+    let mut run = agent.prompt("wait for the local endpoint").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    let lifecycle = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProviderLifecycle { lifecycle } => Some(lifecycle),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(lifecycle.len(), 2);
+    assert_eq!(lifecycle[0].state, ProviderLifecycleState::Queued);
+    assert_eq!(lifecycle[1].state, ProviderLifecycleState::Loading);
+    assert!(lifecycle.iter().all(|lifecycle| {
+        lifecycle
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("[REDACTED]"))
+    }));
+
+    let persisted = std::fs::read_to_string(&session_path).unwrap();
+    assert!(persisted.contains("Ready"));
+    assert!(!persisted.contains("provider_lifecycle"));
+    assert!(!persisted.contains("warming test-key"));
+    assert!(!persisted.contains("accepted test-key"));
+}
+
+#[tokio::test]
 async fn openai_compatible_agent_sends_inline_image_end_to_end() {
     let server = MockServer::start().await;
     let body = concat!(
@@ -2737,6 +2809,7 @@ async fn resumed_agent_reexecutes_only_missing_tool_results() {
                 id: ygg_ai::ToolCallId("crashed_call".into()),
                 name: "read".into(),
                 arguments_json: serde_json::json!({"path": "recover.txt"}).to_string(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -2790,6 +2863,7 @@ async fn restart_never_replays_a_mutating_tool_without_an_idempotency_contract()
                 id: ygg_ai::ToolCallId("possibly_committed".into()),
                 name: "unsafe_recovery".into(),
                 arguments_json: "{}".into(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -4482,6 +4556,7 @@ async fn crash_recovery_preserves_the_live_tool_call_execution_cap() {
                         id: ygg_ai::ToolCallId(format!("recover-{index}")),
                         name: "count_recovery".into(),
                         arguments_json: "{}".into(),
+                        argument_error: None,
                     })
                 })
                 .collect(),
@@ -4573,6 +4648,7 @@ async fn host_classification_overrides_a_safe_replay_claim() {
                 id: ygg_ai::ToolCallId("classified-recovery".into()),
                 name: "count_recovery".into(),
                 arguments_json: "{}".into(),
+                argument_error: None,
             })],
             model: ModelId("scripted".into()),
             protocol: Protocol::AnthropicMessages,
@@ -5333,6 +5409,7 @@ async fn complete_surfaces_unsupported_reasoning_as_err() {
 struct ClassifiedEffectProbe {
     name: &'static str,
     effect: ToolEffect,
+    concurrency: ToolConcurrency,
     executions: Arc<AtomicUsize>,
 }
 
@@ -5358,6 +5435,10 @@ impl Tool for ClassifiedEffectProbe {
         Ok(self.effect)
     }
 
+    fn concurrency(&self) -> ToolConcurrency {
+        self.concurrency
+    }
+
     async fn execute(
         &self,
         _args: serde_json::Value,
@@ -5365,6 +5446,47 @@ impl Tool for ClassifiedEffectProbe {
     ) -> Result<ToolOutput, ToolError> {
         self.executions.fetch_add(1, Ordering::SeqCst);
         Ok(ToolOutput::new("probe executed"))
+    }
+}
+
+struct SchemaMismatchBashProbe {
+    effect_calls: Arc<AtomicUsize>,
+    executions: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SchemaMismatchBashProbe {
+    fn definition(&self) -> ygg_ai::ToolDef {
+        ygg_ai::ToolDef {
+            name: "bash".into(),
+            description: "Records schema-rejected speculative calls".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "enum": ["pwd"]}
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+            }),
+        }
+    }
+
+    fn effect(
+        &self,
+        _args: &serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolEffect, ToolError> {
+        self.effect_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolEffect::Pure)
+    }
+
+    async fn execute(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext<'_>,
+    ) -> Result<ToolOutput, ToolError> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        Ok(ToolOutput::new("must not execute"))
     }
 }
 
@@ -5395,6 +5517,451 @@ impl ToolCallHook for AdmissionHookProbe {
     ) {
         self.after.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+struct DenyingAdmissionHook {
+    before: Arc<AtomicUsize>,
+    after: Arc<AtomicUsize>,
+}
+
+const HOOK_DENIAL_SECRET: &str = "secondary-hook-secret-marker";
+
+#[async_trait::async_trait]
+impl ToolCallHook for DenyingAdmissionHook {
+    async fn before_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _context: &ToolContext<'_>,
+    ) -> Result<(), ToolError> {
+        self.before.fetch_add(1, Ordering::SeqCst);
+        Err(ToolError::new(HOOK_DENIAL_SECRET))
+    }
+
+    async fn after_tool_call(
+        &self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _output: &str,
+        _is_error: bool,
+        _context: &ToolContext<'_>,
+    ) {
+        self.after.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+async fn assert_secondary_hook_denials(parallel: bool) {
+    let server = MockServer::start().await;
+    let calls = if parallel {
+        vec![
+            ("call_parallel_one", "pure_probe", serde_json::json!({})),
+            ("call_parallel_two", "pure_probe", serde_json::json!({})),
+        ]
+    } else {
+        vec![("call_serial", "pure_probe", serde_json::json!({}))]
+    };
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![tool_turn(&calls), text_turn("hook denial observed")],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(ClassifiedEffectProbe {
+        name: "pure_probe",
+        effect: ToolEffect::Pure,
+        concurrency: if parallel {
+            ToolConcurrency::Parallel
+        } else {
+            ToolConcurrency::Sequential
+        },
+        executions: Arc::clone(&executions),
+    });
+    extensions.tool_call_hook(DenyingAdmissionHook {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "secondary admission hook test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::Controlled),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("attempt probes").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    for (id, _, _) in &calls {
+        let decision = events
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolPolicyDecision {
+                    id: event_id,
+                    decision,
+                    ..
+                } if event_id.0 == *id => Some(decision),
+                _ => None,
+            })
+            .expect("secondary hook denial must be policy-visible");
+        assert_eq!(decision.effect, Some(ToolEffect::Pure));
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::SecondaryHookDenied)
+        );
+        assert!(!serde_json::to_string(decision)
+            .unwrap()
+            .contains(HOOK_DENIAL_SECRET));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ToolFinished { id: event_id, result: Err(error), .. }
+                if event_id.0 == *id
+                    && error.message == "tool call denied by host policy"
+                    && !error.message.contains(HOOK_DENIAL_SECRET)
+        )));
+        let started = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolStarted { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        let decided = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        let finished = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolFinished { id: event_id, .. } if event_id.0 == *id))
+            .unwrap();
+        assert!(started < decided && decided < finished);
+    }
+    assert_eq!(before.load(Ordering::SeqCst), calls.len());
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn secondary_hook_denials_are_policy_visible_in_serial_and_parallel_paths() {
+    assert_secondary_hook_denials(false).await;
+    assert_secondary_hook_denials(true).await;
+}
+
+const SCHEMA_MISMATCH_ERROR: &str =
+    "tool call was not executed because its arguments do not satisfy the advertised schema; correct the arguments and try again";
+
+#[tokio::test]
+async fn schema_rejected_bash_is_never_speculated_or_executed() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            // `ls` is otherwise a speculative reconnaissance command. The
+            // request schema accepts only `pwd`, so the stream marker must
+            // prevent both speculation and normal dispatch.
+            bodies: vec![
+                tool_turn(&[(
+                    "schema_rejected_bash",
+                    "bash",
+                    serde_json::json!({"command": "ls"}),
+                )]),
+                text_turn("schema error received"),
+            ],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let effect_calls = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(SchemaMismatchBashProbe {
+        effect_calls: Arc::clone(&effect_calls),
+        executions: Arc::clone(&executions),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session: Session::create(session_dir.path().join("session.jsonl")).unwrap(),
+        system: "schema rejection test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("try the rejected bash call").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    let error = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolFinished {
+                id,
+                result: Err(error),
+                ..
+            } if id.0 == "schema_rejected_bash" => Some(error.message.as_str()),
+            _ => None,
+        })
+        .expect("schema rejection is surfaced as a tool error");
+    assert_eq!(error, SCHEMA_MISMATCH_ERROR);
+    assert!(!error.contains("ls"));
+    let decision = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolPolicyDecision { id, decision, .. }
+                if id.0 == "schema_rejected_bash" =>
+            {
+                Some(decision)
+            }
+            _ => None,
+        })
+        .expect("schema rejection must be policy-visible");
+    assert_eq!(decision.effect, None);
+    assert!(!decision.allowed);
+    assert_eq!(decision.authorization, None);
+    assert_eq!(
+        decision.denial_code,
+        Some(ToolPolicyDenialCode::InvalidToolArguments)
+    );
+    assert!(!serde_json::to_string(decision)
+        .unwrap()
+        .contains(r#""command":"ls""#));
+    let started = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolStarted { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolStarted before schema rejection decision");
+    let decided = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolPolicyDecision for schema rejection");
+    let finished = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolFinished { id, .. } if id.0 == "schema_rejected_bash"))
+        .expect("ToolFinished after schema rejection decision");
+    assert!(started < decided && decided < finished);
+    assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+    let call = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::Assistant(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    AssistantPart::ToolCall(call) if call.id.0 == "schema_rejected_bash" => {
+                        Some(call)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("schema-rejected call is durable");
+    assert_eq!(call.arguments_json, r#"{"command":"ls"}"#);
+    assert_eq!(
+        call.argument_error,
+        Some(ToolCallArgumentError::SchemaMismatch)
+    );
+    let result = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    UserPart::ToolResult(result)
+                        if result.tool_call_id.0 == "schema_rejected_bash" =>
+                    {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("paired rejection result is durable");
+    assert!(result.is_error);
+    let text = result
+        .content
+        .iter()
+        .find_map(|part| match part {
+            ygg_ai::ToolResultPart::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("static error text");
+    assert_eq!(text, SCHEMA_MISMATCH_ERROR);
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "one rejected-tool turn and one corrective turn"
+    );
+    assert!(requests[1].to_string().contains(SCHEMA_MISMATCH_ERROR));
+}
+
+#[tokio::test]
+async fn resumed_schema_rejection_skips_hooks_effects_and_replay() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("messages"))
+        .respond_with(Script {
+            bodies: vec![text_turn("resumed after schema rejection")],
+            next: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let workspace_dir = tempfile::tempdir().unwrap();
+    let session_dir = tempfile::tempdir().unwrap();
+    let session_path = session_dir.path().join("session.jsonl");
+    {
+        let mut session = Session::create(&session_path).unwrap();
+        session
+            .append(EntryValue::Message(Message::User(UserMessage {
+                content: vec![UserPart::Text("prior request".into())],
+            })))
+            .unwrap();
+        session
+            .append(EntryValue::Message(Message::Assistant(AssistantMessage {
+                content: vec![AssistantPart::ToolCall(ToolCall {
+                    id: ygg_ai::ToolCallId("persisted_schema_rejection".into()),
+                    name: "bash".into(),
+                    arguments_json: r#"{"command":"provider-secret-value"}"#.into(),
+                    argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                })],
+                model: ModelId("scripted".into()),
+                protocol: Protocol::AnthropicMessages,
+            })))
+            .unwrap();
+    }
+    let session = Session::open(&session_path).unwrap();
+    let persisted_call = session
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::Assistant(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    AssistantPart::ToolCall(call) => Some(call),
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("reopened call");
+    assert_eq!(
+        persisted_call.argument_error,
+        Some(ToolCallArgumentError::SchemaMismatch)
+    );
+
+    let effect_calls = Arc::new(AtomicUsize::new(0));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let before = Arc::new(AtomicUsize::new(0));
+    let after = Arc::new(AtomicUsize::new(0));
+    let mut extensions = ExtensionHost::new();
+    extensions.tool(SchemaMismatchBashProbe {
+        effect_calls: Arc::clone(&effect_calls),
+        executions: Arc::clone(&executions),
+    });
+    extensions.tool_call_hook(AdmissionHookProbe {
+        before: Arc::clone(&before),
+        after: Arc::clone(&after),
+    });
+    let mut agent = Agent::new(AgentConfig {
+        client: AiClient::new(),
+        model: scripted_model(&server.uri()),
+        session,
+        system: "schema rejection resume test".into(),
+        sandbox: SandboxConfig::new(workspace_dir.path()),
+        effect_broker: EffectBroker::new(EffectPolicy::UnsafeHost),
+        extensions,
+        max_turns: Some(4),
+        reasoning: ReasoningConfig::Off,
+        reasoning_mode: ygg_ai::ReasoningMode::Standard,
+        cache_retention: ygg_ai::CacheRetention::Short,
+        session_id: None,
+    })
+    .unwrap();
+
+    let mut run = agent.prompt("continue after restart").await.unwrap();
+    let events = collect(&mut run).await;
+    drop(run);
+
+    assert!(matches!(
+        assert_single_run_finished(&events),
+        FinishReason::Completed
+    ));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolStarted { .. })));
+    assert_eq!(effect_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(executions.load(Ordering::SeqCst), 0);
+    assert_eq!(before.load(Ordering::SeqCst), 0);
+    assert_eq!(after.load(Ordering::SeqCst), 0);
+
+    let result = agent
+        .session()
+        .entries()
+        .iter()
+        .find_map(|entry| match &entry.value {
+            EntryValue::Message(Message::User(message)) => {
+                message.content.iter().find_map(|part| match part {
+                    UserPart::ToolResult(result)
+                        if result.tool_call_id.0 == "persisted_schema_rejection" =>
+                    {
+                        Some(result)
+                    }
+                    _ => None,
+                })
+            }
+            _ => None,
+        })
+        .expect("recovered schema error result");
+    assert!(result.is_error);
+    let text = result
+        .content
+        .iter()
+        .find_map(|part| match part {
+            ygg_ai::ToolResultPart::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("static error text");
+    assert_eq!(text, SCHEMA_MISMATCH_ERROR);
+    assert!(!text.contains("provider-secret-value"));
+
+    let requests = wire_requests(&server).await;
+    assert_eq!(requests.len(), 1, "recovery must not replay the old POST");
+    assert!(requests[0].to_string().contains(SCHEMA_MISMATCH_ERROR));
 }
 
 #[tokio::test]
@@ -5461,6 +6028,7 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
         extensions.tool(ClassifiedEffectProbe {
             name,
             effect,
+            concurrency: ToolConcurrency::Sequential,
             executions: Arc::clone(&executions),
         });
     }
@@ -5529,6 +6097,104 @@ async fn controlled_effects_are_denied_before_hooks_or_execution() {
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
+    let decisions = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ToolPolicyDecision { id, decision, .. } => Some((id.0.as_str(), decision)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(decisions.len(), calls.len());
+    for (id, effect, denial_code) in [
+        (
+            "call_host_read",
+            ToolEffect::HostRead,
+            ToolPolicyDenialCode::EffectHostReadDenied,
+        ),
+        (
+            "call_network",
+            ToolEffect::Network,
+            ToolPolicyDenialCode::EffectNetworkDenied,
+        ),
+        (
+            "call_search",
+            ToolEffect::HostProcess,
+            ToolPolicyDenialCode::EffectNativeProcessDenied,
+        ),
+        (
+            "call_host_mutation",
+            ToolEffect::HostMutation,
+            ToolPolicyDenialCode::EffectHostMutationDenied,
+        ),
+        (
+            "call_delegation",
+            ToolEffect::Delegation,
+            ToolPolicyDenialCode::EffectDelegationDenied,
+        ),
+        (
+            "call_extension",
+            ToolEffect::Extension,
+            ToolPolicyDenialCode::EffectExtensionDenied,
+        ),
+        (
+            "call_unknown",
+            ToolEffect::Unknown,
+            ToolPolicyDenialCode::EffectUnknown,
+        ),
+    ] {
+        let decision = decisions.get(id).expect("policy decision for denied call");
+        assert_eq!(decision.effect, Some(effect), "{id}");
+        assert!(!decision.allowed, "{id}");
+        assert_eq!(decision.authorization, None, "{id}");
+        assert_eq!(decision.denial_code, Some(denial_code), "{id}");
+        assert_eq!(
+            decision.policy.effect_policy.value,
+            EffectPolicy::Controlled,
+            "{id}"
+        );
+    }
+    let approved = decisions
+        .get("call_process")
+        .expect("policy decision for approved command");
+    assert_eq!(approved.effect, Some(ToolEffect::HostProcess));
+    assert!(approved.allowed);
+    assert!(approved.authorization.is_some());
+    assert_eq!(approved.denial_code, None);
+    assert!(approved.policy.allow_process.value);
+    assert!(approved.policy.allow_shell.value);
+
+    for &call_id in decisions.keys() {
+        let started = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolStarted { id, .. } if id.0 == call_id),
+            )
+            .expect("ToolStarted before policy decision");
+        let decided = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolPolicyDecision { id, .. } if id.0 == call_id))
+            .expect("ToolPolicyDecision");
+        let finished = events
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ToolFinished { id, .. } if id.0 == call_id),
+            )
+            .expect("ToolFinished after policy decision");
+        assert!(
+            started < decided && decided < finished,
+            "invalid lifecycle for {call_id}"
+        );
+    }
+    let decisions_json = decisions
+        .values()
+        .map(|decision| serde_json::to_string(decision).unwrap())
+        .collect::<String>();
+    assert!(!decisions_json.contains(external_file.to_str().unwrap()));
+    assert!(!decisions_json.contains(external_write.to_str().unwrap()));
+    assert!(!decisions_json.contains(bash_marker.to_str().unwrap()));
+    assert!(!decisions_json.contains("forbidden"));
+    assert!(!decisions_json.contains("https://example.com/image.png"));
+
     for id in [
         "call_host_read",
         "call_network",
@@ -5727,6 +6393,7 @@ async fn unsafe_host_still_denies_unknown_tools_before_hooks() {
     extensions.tool(ClassifiedEffectProbe {
         name: "unknown_probe",
         effect: ToolEffect::Unknown,
+        concurrency: ToolConcurrency::Sequential,
         executions: Arc::clone(&executions),
     });
     extensions.tool_call_hook(AdmissionHookProbe {

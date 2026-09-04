@@ -33,12 +33,8 @@ pub const DEVICE_VERIFICATION_URI: &str = "https://auth.openai.com/codex/device"
 pub const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 /// Device codes expire after fifteen minutes.
 pub const DEVICE_CODE_TIMEOUT_SECS: u64 = 15 * 60;
-/// Originator tag sent to the authorization server and the backend.
-pub const ORIGINATOR: &str = "ygg";
 /// JWT claim namespace carrying the ChatGPT account id.
 pub const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
-/// Subscription backend base URL (endpoint `base_url`, must end in `/`).
-pub const BACKEND_BASE_URL: &str = "https://chatgpt.com/backend-api/codex/";
 /// Endpoint id registered in the model catalog.
 pub const ENDPOINT_ID: &str = "openai-codex";
 
@@ -46,6 +42,7 @@ pub const ENDPOINT_ID: &str = "openai-codex";
 /// reached. The authenticated `/models` response is authoritative at runtime,
 /// so account-specific and newly released models are not gated on this list.
 pub const MODELS: &[&str] = &[
+    "gpt-6-astra",
     "gpt-5.6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",

@@ -5,8 +5,9 @@ from pathlib import Path
 import random
 import tempfile
 import unittest
+from unittest import mock
 
-from ygg_mcp.config import BridgeConfig
+from ygg_mcp.config import BridgeConfig, HttpAuthConfig, ServerConfig
 from ygg_mcp.manager import BridgeManager
 
 from .helpers import (
@@ -170,6 +171,43 @@ class ManagerTests(unittest.TestCase):
         self.assertNotIn(secret, status)
         self.assertRegex(status, r"^mcp \d+/1 · \d+ tools")
         self.assertEqual(snapshot["revision"], extension.presentations[-1]["revision"])
+
+    def test_remote_gate_rejects_before_credentials_dns_or_workers(self):
+        remote = ServerConfig(
+            id="remote",
+            label="Remote fixture",
+            command="",
+            args=(),
+            cwd=self.scratch,
+            environment={},
+            transport="streamable-http",
+            url="https://mcp.example.invalid/mcp",
+            auth=HttpAuthConfig(credential="remote_fixture"),
+        )
+        credential_provider = mock.Mock()
+        client_factory = mock.Mock(side_effect=AssertionError("remote client must not be built"))
+        extension = FakeExtension(self.scratch)
+        with mock.patch("socket.getaddrinfo", side_effect=AssertionError("DNS must not run")), mock.patch(
+            "ygg_mcp.manager.ThreadPoolExecutor",
+            side_effect=AssertionError("manager worker must not be constructed"),
+        ):
+            manager = BridgeManager(
+                extension,
+                BridgeConfig(servers=(remote,), limits=limits()),
+                scratch_directory=self.scratch,
+                credential_provider=credential_provider,
+                client_factory=client_factory,
+            )
+            self.managers.append(manager)
+            manager.start()
+            self.assertTrue(manager.request_action("refresh").result())
+            with self.assertRaisesRegex(ValueError, "process-owner experimental CLI opt-in"):
+                manager.request_action("restart", "remote")
+
+        self.assertIsNone(manager._executor)
+        self.assertEqual(manager._servers["remote"].state, "parked")
+        client_factory.assert_not_called()
+        credential_provider.bearer_token.assert_not_called()
 
     def test_safe_user_actions_route_through_declared_mcp_command(self):
         extension, manager = self.manager(real_server_config())

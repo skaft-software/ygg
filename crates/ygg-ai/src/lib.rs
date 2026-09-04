@@ -36,6 +36,7 @@ pub mod auth;
 pub mod catalog;
 pub mod client;
 pub mod error;
+pub mod host_transport;
 mod json_repair;
 pub mod model_metadata;
 pub mod pricing;
@@ -49,8 +50,9 @@ mod validate;
 pub(crate) mod protocol;
 
 pub use auth::{
-    Auth, CredentialResolver, CredentialResolverRegistry, CredentialScheme, ResolvedCredential,
-    Secret,
+    Auth, AwsCredentials, AwsSigV4Signer, CredentialResolver, CredentialResolverRegistry,
+    CredentialScheme, RequestSigner, ResolvedCredential, Secret, SignedRequestHeaders,
+    SigningRequest,
 };
 pub use catalog::{AuthConfig, CatalogConfig, EndpointConfig, Model, ModelCatalog, ModelConfig};
 pub use client::AiClient;
@@ -59,25 +61,46 @@ pub use error::{
     ProviderError, StreamProgress, StreamProtocolError, TransportError, TransportPhase,
     UnsupportedError, ValidationError,
 };
+pub use host_transport::{HostStreamModel, HostStreamTransport};
 pub use mime::Mime;
 pub use pricing::{Cost, Pricing, PricingTier, TokenRate, PICODOLLARS_PER_MICRODOLLAR};
 pub use responses::{
     ResponsesCompactRequest, ResponsesCompactResponse, ResponsesInput, ResponsesItem,
     ResponsesItemError, ResponsesOptions, ResponsesOutput, ResponsesReplayItem,
 };
-pub use stream::{ResponseStream, StreamEvent};
+pub use stream::{
+    CanonicalStreamAssembler, ProviderLifecycle, ProviderLifecycleState, ResponseStream,
+    StreamEvent,
+};
 pub use transform::transform_messages;
 pub use types::{
     AgentDelegation, AssistantMessage, AssistantPart, AudioCapabilities, AudioFormat, AudioMedia,
     AudioOutputDelivery, AudioOutputOptions, AudioPayload, AudioVoice, CacheCompatibility,
     CacheControlFormat, CacheRetention, Capabilities, Endpoint, EndpointId, EndpointTransport,
     ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media, Message, Modality, ModalitySet,
-    ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OutputFormat, OutputModalities,
-    Protocol, ProviderMediaRef, ReasoningCapability, ReasoningConfig, ReasoningControl,
-    ReasoningEffort, ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState,
-    ReasoningStateKind, Request, Response, SessionAffinityFormat, StopReason, ToolCall, ToolCallId,
-    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OpenAiChatRuntimeProfile,
+    OutputFormat, OutputModalities, Protocol, ProviderMediaRef, ProviderPartMetadata,
+    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffort,
+    ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState, ReasoningStateKind,
+    Request, RequestBodyEncoding, RequestRuntime, Response, ResponsesRuntimeProfile,
+    SessionAffinityFormat, StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError,
+    ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
+
+/// Validates normalized arguments against the exact tool-definition snapshot.
+///
+/// A completed JSON object that merely violates a valid schema returns
+/// [`ToolArgumentValidation::SchemaMismatch`]. Malformed schemas and bounded
+/// validation failures return a fatal [`DecodeError`]. Unknown tool names are
+/// retained as [`ToolArgumentValidation::UnknownTool`] so callers can produce
+/// their normal unknown-tool result.
+pub fn validate_tool_arguments(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: &[ToolDef],
+) -> Result<ToolArgumentValidation, DecodeError> {
+    json_repair::validate_tool_arguments(tool_name, arguments, tools)
+}
 
 /// Strictness for cross-protocol / capability degradation.
 ///

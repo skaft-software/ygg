@@ -1,32 +1,61 @@
 //! Composer-adjacent slash, mention, and queued-steering overlays.
 
-use sexy_tui_rs::{truncate_to_width, visible_width};
+use sexy_tui_rs::{strip_terminal_sequences, truncate_to_width, visible_width};
 
-use super::{activity_elbow, fit_line, semantic_separator, ShellState, ACTIVITY_DETAIL_INDENT};
+use super::{
+    activity_elbow, fit_line, fit_prioritized_footer, join_ordinary_metadata,
+    sanitize_ordinary_surface_cell, semantic_separator, FooterSegment, ShellState,
+    ACTIVITY_DETAIL_INDENT,
+};
 use crate::commands;
 use crate::tui::composer;
 
+/// Provenance remains semantic data until the display projection joins it to
+/// untrusted metadata. Raw command identity never includes this label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SlashSuggestionProvenance {
+    Builtin,
+    Prompt,
+    Skill,
+    Extension,
+}
+
+impl SlashSuggestionProvenance {
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Builtin => None,
+            Self::Prompt => Some("prompt"),
+            Self::Skill => Some("skill"),
+            Self::Extension => Some("extension"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct InputSlashSuggestion {
+    /// Raw command identity used by selection and completion.
     pub(super) name: String,
+    /// Raw descriptive metadata projected only at the terminal boundary.
     pub(super) description: String,
     pub(super) argument_hint: Option<String>,
+    pub(super) provenance: SlashSuggestionProvenance,
     pub(super) accepts_argument: bool,
 }
 
 pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSuggestion> {
-    let Some(query) = state.editor.strip_prefix('/') else {
+    let Some(query) = state.editor.text().strip_prefix('/') else {
         return Vec::new();
     };
     if query.contains(char::is_whitespace) || query.contains('\n') {
         return Vec::new();
     }
-    let mut suggestions = commands::slash_suggestions(&state.editor)
+    let mut suggestions = commands::slash_suggestions(state.editor.text())
         .into_iter()
         .map(|command| InputSlashSuggestion {
             name: command.name.to_owned(),
             description: command.description.to_owned(),
             argument_hint: None,
+            provenance: SlashSuggestionProvenance::Builtin,
             accepts_argument: command.accepts_argument,
         })
         .collect::<Vec<_>>();
@@ -43,8 +72,9 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
         }
         suggestions.push(InputSlashSuggestion {
             name: template.name.clone(),
-            description: format!("prompt · {}", template.description),
+            description: template.description.clone(),
             argument_hint: template.argument_hint.clone(),
+            provenance: SlashSuggestionProvenance::Prompt,
             accepts_argument: true,
         });
     }
@@ -61,8 +91,9 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
         }
         suggestions.push(InputSlashSuggestion {
             name: name.clone(),
-            description: format!("skill · {description}"),
+            description: description.clone(),
             argument_hint: None,
+            provenance: SlashSuggestionProvenance::Skill,
             accepts_argument: true,
         });
     }
@@ -79,8 +110,9 @@ pub(super) fn input_slash_suggestions(state: &ShellState) -> Vec<InputSlashSugge
         }
         suggestions.push(InputSlashSuggestion {
             name: name.clone(),
-            description: format!("extension · {description}"),
+            description: description.clone(),
             argument_hint: None,
+            provenance: SlashSuggestionProvenance::Extension,
             accepts_argument: true,
         });
     }
@@ -97,6 +129,43 @@ fn suggestion_key_hint(state: &ShellState, key: &str, label: &str) -> String {
 
 fn suggestion_separator(state: &ShellState) -> String {
     state.theme.fg("muted", semantic_separator(&state.theme))
+}
+
+/// Convert untrusted command metadata into one terminal-safe display cell
+/// before it contributes to width, clipping, or trusted theme styling.
+fn slash_suggestion_display_cell(state: &ShellState, value: &str) -> String {
+    sanitize_ordinary_surface_cell(value, state.theme.unicode())
+}
+
+fn slash_suggestion_display_label(state: &ShellState, command: &InputSlashSuggestion) -> String {
+    let name = slash_suggestion_display_cell(state, &command.name);
+    let argument_hint = command
+        .argument_hint
+        .as_deref()
+        .map(|hint| slash_suggestion_display_cell(state, hint))
+        .map(|hint| format!(" {hint}"))
+        .unwrap_or_default();
+    format!("/{name}{argument_hint}")
+}
+
+fn slash_suggestion_display_description(
+    state: &ShellState,
+    command: &InputSlashSuggestion,
+) -> String {
+    let description = slash_suggestion_display_cell(state, &command.description);
+    command
+        .provenance
+        .label()
+        .map_or(description.clone(), |label| {
+            join_ordinary_metadata(&state.theme, &[label, &description])
+        })
+}
+
+fn truncate_suggestion_display(value: &str, width: usize, ellipsis: &str) -> String {
+    // Input is a plain, terminal-safe cell. The ANSI-aware truncator only adds
+    // a trusted reset when clipping; strip that synthetic reset before styling
+    // so no-colour renderers never receive an escape sequence.
+    strip_terminal_sequences(&truncate_to_width(value, width, Some(ellipsis)))
 }
 
 fn slash_suggestion_footer(
@@ -122,16 +191,15 @@ fn slash_suggestion_footer(
         ("up/down", "enter")
     };
     let separator = suggestion_separator(state);
-    fit_line(
-        &format!(
-            "  {}{separator}{}{separator}{}{separator}{}",
-            state.theme.fg("muted", &scope),
-            suggestion_key_hint(state, navigation_key, "navigate"),
-            suggestion_key_hint(state, select_key, "select"),
-            suggestion_key_hint(state, "esc", "close"),
-        ),
-        width,
-    )
+    let mut segments = [
+        // Scope is visually first but is the least useful segment at compact
+        // widths, so its lower rank drops before the optional action tail.
+        FooterSegment::optional(state.theme.fg("muted", &scope), 0),
+        FooterSegment::primary(suggestion_key_hint(state, navigation_key, "navigate")),
+        FooterSegment::optional(suggestion_key_hint(state, select_key, "select"), 2),
+        FooterSegment::optional(suggestion_key_hint(state, "esc", "close"), 1),
+    ];
+    fit_prioritized_footer("  ", &separator, &mut segments, width)
 }
 
 pub(super) fn render_slash_suggestions(
@@ -172,17 +240,8 @@ pub(super) fn render_slash_suggestions(
     let marker_width = visible_width(marker).max(1);
     let label_width = suggestions[start..end]
         .iter()
-        .map(|command| {
-            visible_width(&format!(
-                "/{}{}",
-                command.name,
-                command
-                    .argument_hint
-                    .as_deref()
-                    .map(|hint| format!(" {hint}"))
-                    .unwrap_or_default()
-            ))
-        })
+        .map(|command| slash_suggestion_display_label(state, command))
+        .map(|label| visible_width(&label))
         .max()
         .unwrap_or(1)
         .min(30)
@@ -200,20 +259,9 @@ pub(super) fn render_slash_suggestions(
         } else {
             " ".repeat(marker_width)
         };
-        let raw_label = format!(
-            "/{}{}",
-            command.name,
-            command
-                .argument_hint
-                .as_deref()
-                .map(|hint| format!(" {hint}"))
-                .unwrap_or_default()
-        );
-        let label = sexy_tui_rs::truncate_to_width(
-            &raw_label,
-            label_width,
-            Some(if state.theme.unicode() { "…" } else { "..." }),
-        );
+        let display_label = slash_suggestion_display_label(state, command);
+        let label =
+            truncate_suggestion_display(&display_label, label_width, state.theme.glyph("ellipsis"));
         let label = format!(
             "{label}{}",
             " ".repeat(label_width.saturating_sub(visible_width(&label)))
@@ -226,10 +274,11 @@ pub(super) fn render_slash_suggestions(
         };
         let fixed_width = marker_width + 1 + label_width;
         let description_width = usize::from(popup_width).saturating_sub(fixed_width + 2);
-        let description = sexy_tui_rs::truncate_to_width(
-            &command.description,
+        let display_description = slash_suggestion_display_description(state, command);
+        let description = truncate_suggestion_display(
+            &display_description,
             description_width,
-            Some(if state.theme.unicode() { "…" } else { "..." }),
+            state.theme.glyph("ellipsis"),
         );
         let row = if description.is_empty() {
             choice
@@ -248,12 +297,32 @@ pub(super) fn render_slash_suggestions(
 }
 
 fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
-    if max_rows < 2 || state.editor_cursor != state.editor.len() {
+    if max_rows < 2 || state.editor.cursor() != state.editor.text().len() {
         return Vec::new();
     }
 
-    let (heading_label, matches) = if let Some(query) = composer::active_mention(&state.editor) {
-        if composer::is_path_query(query) {
+    let (heading_label, matches) =
+        if let Some(query) = composer::active_mention(state.editor.text()) {
+            if composer::is_path_query(query) {
+                let Some(root) = &state.workspace else {
+                    return Vec::new();
+                };
+                let matches = composer::path_matches(root, query, 5)
+                    .into_iter()
+                    .map(|suggestion| suggestion.completion)
+                    .collect();
+                ("paths", matches)
+            } else {
+                let Some(files) = state.file_index.as_ref() else {
+                    return Vec::new();
+                };
+                let matches = composer::mention_matches(files, query, 5)
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                ("project files", matches)
+            }
+        } else if let Some(query) = composer::active_path(state.editor.text()) {
             let Some(root) = &state.workspace else {
                 return Vec::new();
             };
@@ -263,27 +332,8 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
                 .collect();
             ("paths", matches)
         } else {
-            let Some(files) = state.file_index.as_ref() else {
-                return Vec::new();
-            };
-            let matches = composer::mention_matches(files, query, 5)
-                .into_iter()
-                .map(str::to_owned)
-                .collect();
-            ("project files", matches)
-        }
-    } else if let Some(query) = composer::active_path(&state.editor) {
-        let Some(root) = &state.workspace else {
             return Vec::new();
         };
-        let matches = composer::path_matches(root, query, 5)
-            .into_iter()
-            .map(|suggestion| suggestion.completion)
-            .collect();
-        ("paths", matches)
-    } else {
-        return Vec::new();
-    };
     let matches: Vec<String> = matches;
     if matches.is_empty() {
         return Vec::new();
@@ -297,8 +347,9 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
         .max(1);
     let mut lines = Vec::with_capacity(item_rows.saturating_add(1));
     for (index, path) in matches.into_iter().take(item_rows).enumerate() {
-        let safe_path = super::sanitize_for_terminal(&path);
-        let path = sexy_tui_rs::truncate_to_width(&safe_path, available_width, None);
+        let safe_path = sanitize_ordinary_surface_cell(&path, state.theme.unicode());
+        let path =
+            truncate_suggestion_display(&safe_path, available_width, state.theme.glyph("ellipsis"));
         let prefix = if index == 0 {
             marker.to_owned()
         } else {
@@ -314,11 +365,69 @@ fn render_path_suggestions(state: &ShellState, width: u16, max_rows: usize) -> V
     }
 
     let separator = suggestion_separator(state);
+    let mut segments = [
+        FooterSegment::optional(state.theme.fg("muted", heading_label), 0),
+        FooterSegment::primary(suggestion_key_hint(state, "tab", "complete")),
+    ];
+    lines.push(fit_prioritized_footer(
+        "  ",
+        &separator,
+        &mut segments,
+        width,
+    ));
+    lines
+}
+
+fn render_extension_autocomplete(state: &ShellState, width: u16, max_rows: usize) -> Vec<String> {
+    if max_rows < 2 || !super::normal_editor_focused(state) {
+        return Vec::new();
+    }
+    let Some(overlay) = state.extension_autocomplete.as_ref() else {
+        return Vec::new();
+    };
+    if overlay.items.is_empty()
+        || overlay.revision != state.editor.revision()
+        || overlay.text != state.editor.text()
+        || overlay.cursor != state.editor.cursor()
+    {
+        return Vec::new();
+    }
+    let item_rows = max_rows.saturating_sub(1).min(5);
+    let marker = state.theme.glyph("prompt");
+    let marker_width = visible_width(marker).max(1);
+    let available = usize::from(width).saturating_sub(marker_width + 5).max(1);
+    let mut lines = Vec::with_capacity(item_rows.saturating_add(1));
+    for (index, item) in overlay.items.iter().take(item_rows).enumerate() {
+        let prefix = if index == 0 {
+            marker.to_owned()
+        } else {
+            " ".repeat(marker_width)
+        };
+        let label = super::sanitize_for_terminal(&item.label);
+        let label = truncate_to_width(&label, available, None);
+        let choice = format!("{prefix} {label}");
+        let choice = if index == 0 {
+            state.theme.bold(&state.theme.fg("model_accent", &choice))
+        } else {
+            state.theme.fg("foreground", &choice)
+        };
+        let description = item
+            .description
+            .as_deref()
+            .map(super::sanitize_for_terminal)
+            .filter(|description| !description.is_empty())
+            .map(|description| truncate_to_width(&description, available / 2, None));
+        let line = description.map_or(choice.clone(), |description| {
+            format!("{choice}  {}", state.theme.fg("muted", &description))
+        });
+        lines.push(fit_line(&format!("  {line}"), width));
+    }
+    let separator = suggestion_separator(state);
     lines.push(fit_line(
         &format!(
             "  {}{separator}{}",
-            state.theme.fg("muted", heading_label),
-            suggestion_key_hint(state, "tab", "complete"),
+            state.theme.fg("muted", "extension suggestions"),
+            suggestion_key_hint(state, "tab", "accept")
         ),
         width,
     ));
@@ -330,6 +439,10 @@ pub(super) fn render_input_suggestions(
     width: u16,
     max_rows: usize,
 ) -> Vec<String> {
+    let extension = render_extension_autocomplete(state, width, max_rows);
+    if !extension.is_empty() {
+        return extension;
+    }
     let slash = render_slash_suggestions(state, width, max_rows);
     if slash.is_empty() {
         render_path_suggestions(state, width, max_rows)

@@ -21,9 +21,11 @@ use ygg_ai::{AssistantPart, Cost, ToolDef, Usage, PICODOLLARS_PER_MICRODOLLAR};
 use crate::agent::{Agent, AgentCompactionMode, AgentConfig, AgentError, CompletionPolicy};
 use crate::effect::ToolEffect;
 use crate::events::{
-    AgentEvent, DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason,
+    AgentEvent, DelegationOrchestrationProvenance, DelegationPolicySource,
+    DelegationTelemetryChild, DelegationTelemetrySnapshot, FinishReason,
 };
 use crate::extension::ExtensionHost;
+use crate::sandbox::EffectiveToolPolicy;
 use crate::secure_fs::{self, SecureFileError};
 use crate::session::{Session, SessionError};
 use crate::tool::{Tool, ToolContext, ToolError, ToolOutput};
@@ -374,6 +376,21 @@ pub(crate) struct ExtensionAgentSessionPolicy {
     /// wall-clock kill; the worker can still be interrupted or stopped.
     #[serde(default)]
     pub(crate) timeout_ms: Option<u64>,
+}
+
+fn child_orchestration_provenance(
+    extension_policy: Option<&ExtensionAgentSessionPolicy>,
+) -> DelegationOrchestrationProvenance {
+    let mut provenance =
+        DelegationOrchestrationProvenance::all(DelegationPolicySource::ParentInherited);
+    if extension_policy.is_some() {
+        // Extension-owned children receive a host-validated standard-tool
+        // snapshot and explicit child-run limits. The sandbox, broker,
+        // environment, cwd, and executable trust stay parent-owned.
+        provenance.tool_scope = DelegationPolicySource::ChildOverride;
+        provenance.execution_limits = DelegationPolicySource::ChildOverride;
+    }
+    provenance
 }
 
 impl ExtensionAgentSessionPolicy {
@@ -1140,6 +1157,8 @@ struct AgentRecord {
     mailbox_delivery: Option<MailboxDeliveryPlan>,
     resource_owner: Option<String>,
     extension_policy: Option<ExtensionAgentSessionPolicy>,
+    effective_tool_policy: EffectiveToolPolicy,
+    orchestration_provenance: DelegationOrchestrationProvenance,
     extension_principal: Option<String>,
     extension_profile: Option<String>,
     extension_idempotency_key: Option<String>,
@@ -1322,6 +1341,8 @@ enum ProvenanceEvent<'a> {
         session: Option<&'a Path>,
         #[serde(skip_serializing_if = "Option::is_none")]
         session_reference: Option<&'a str>,
+        effective_tool_policy: &'a EffectiveToolPolicy,
+        orchestration_provenance: &'a DelegationOrchestrationProvenance,
     },
     AgentStatus {
         timestamp_ms: u128,
@@ -1473,6 +1494,8 @@ impl DelegationManager {
                     elapsed_ms: elapsed_end.saturating_sub(started),
                     failure_class: failure_class_for_child,
                     failure_reason: failure_reason_for_child,
+                    effective_tool_policy: record.effective_tool_policy.clone(),
+                    orchestration_provenance: record.orchestration_provenance.clone(),
                     session: delegated_session_reference(&record.session_path),
                 }
             })
@@ -1805,6 +1828,11 @@ impl DelegationManager {
                 };
             }
         }
+        let orchestration_provenance = child_orchestration_provenance(extension_policy.as_ref());
+        let effective_tool_policy = self
+            .template
+            .sandbox
+            .effective_tool_policy(self.template.effect_broker.policy());
         let initial_task = message;
         if owner.depth >= self.config.limits.max_depth {
             return Err(format!(
@@ -1916,6 +1944,8 @@ impl DelegationManager {
                     .is_none()
                     .then_some(session_path.as_path()),
                 session_reference: extension_session_reference.as_deref(),
+                effective_tool_policy: &effective_tool_policy,
+                orchestration_provenance: &orchestration_provenance,
             }) {
                 Ok(encoded) => encoded,
                 Err(error) => {
@@ -1981,6 +2011,8 @@ impl DelegationManager {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: extension_policy.clone(),
+                    effective_tool_policy: effective_tool_policy.clone(),
+                    orchestration_provenance: orchestration_provenance.clone(),
                     extension_principal: extension_provenance
                         .as_ref()
                         .map(|provenance| provenance.principal.clone()),
@@ -2055,6 +2087,8 @@ impl DelegationManager {
                 .and_then(|provenance| provenance.fingerprint.as_deref()),
             "status": "pending",
             "policy": result_policy,
+            "effective_tool_policy": effective_tool_policy,
+            "orchestration_provenance": orchestration_provenance,
             "created_at_ms": created_at_ms,
             "started_at_ms": Value::Null,
             "completed_at_ms": Value::Null,
@@ -2499,6 +2533,27 @@ impl DelegationManager {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
+        // Astra's host-side Ultra tier enables V2 collaboration, but the
+        // observed child-run wire contract is xhigh. Keep root and generic
+        // Ultra lowering unchanged by translating only this child boundary.
+        let child_reasoning = if self.template.model.spec.api_name == "gpt-6-astra"
+            && self.template.model.spec.capabilities.agent_delegation
+                == Some(ygg_ai::AgentDelegation::V2)
+            && self
+                .template
+                .model
+                .spec
+                .capabilities
+                .reasoning
+                .as_ref()
+                .is_some_and(|reasoning| reasoning.max_effort == ygg_ai::ReasoningEffort::Ultra)
+            && self.template.reasoning
+                == ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra)
+        {
+            ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Xhigh)
+        } else {
+            self.template.reasoning.clone()
+        };
         let mut agent = Agent::new(AgentConfig {
             client: self.template.client.clone(),
             model: self.template.model.clone(),
@@ -2508,7 +2563,7 @@ impl DelegationManager {
             effect_broker: self.template.effect_broker.clone(),
             extensions,
             max_turns,
-            reasoning: self.template.reasoning.clone(),
+            reasoning: child_reasoning,
             reasoning_mode: self.template.reasoning_mode,
             cache_retention: self.template.cache_retention,
             session_id: None,
@@ -4859,6 +4914,8 @@ fn agent_record_value(record: &AgentRecord) -> Value {
         "session": record.session_path,
         "status": record.status,
         "policy": record.extension_policy,
+        "effective_tool_policy": record.effective_tool_policy,
+        "orchestration_provenance": record.orchestration_provenance,
         "profile": record.extension_profile,
         "idempotency_key": record.extension_idempotency_key,
         "fingerprint": record.extension_fingerprint,
@@ -5089,6 +5146,8 @@ fn cleanup_failed_team_activation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn delegated_session_references_are_stable_path_free_and_strict() {
@@ -5113,6 +5172,11 @@ mod tests {
             "/private/sessions/.delegation/team-safe/../outside.jsonl"
         ))
         .is_none());
+    }
+
+    fn test_effective_tool_policy() -> EffectiveToolPolicy {
+        crate::SandboxConfig::new("/workspace")
+            .effective_tool_policy(crate::EffectPolicy::Controlled)
     }
 
     fn test_extension_policy() -> ExtensionAgentSessionPolicy {
@@ -5233,6 +5297,67 @@ mod tests {
         manager
     }
 
+    #[tokio::test]
+    async fn delegated_astra_ultra_v2_child_uses_xhigh_wire_effort() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_bytes(
+                        b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"content_index\":0,\"delta\":\"ok\"}\n\ndata: {\"type\":\"response.output_text.done\",\"output_index\":0,\"content_index\":0}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut manager = writable_manager(directory.path());
+        {
+            let manager_mut = Arc::get_mut(&mut manager).expect("new manager is uniquely owned");
+            let mut model = ygg_ai::ModelCatalog::builtin()
+                .unwrap()
+                .resolve(&ygg_ai::ModelId("gpt-6-astra".into()))
+                .unwrap();
+            let spec = Arc::make_mut(&mut model.spec);
+            spec.id = ygg_ai::ModelId("codex/gpt-6-astra".into());
+            spec.capabilities.agent_delegation = Some(ygg_ai::AgentDelegation::V2);
+            let reasoning = spec
+                .capabilities
+                .reasoning
+                .as_mut()
+                .expect("Astra reasoning capability");
+            reasoning.max_effort = ygg_ai::ReasoningEffort::Ultra;
+            let endpoint = Arc::make_mut(&mut model.endpoint);
+            endpoint.base_url = url::Url::parse(&format!("{}/", server.uri())).unwrap();
+            endpoint.auth = ygg_ai::Auth::None;
+            manager_mut
+                .template
+                .runtime
+                .get_mut()
+                .unwrap()
+                .max_output_tokens = model.spec.limits.max_output_tokens;
+            manager_mut.template.model = model;
+            manager_mut.template.reasoning =
+                ygg_ai::ReasoningConfig::Effort(ygg_ai::ReasoningEffort::Ultra);
+        }
+
+        let (identity, _commands) = insert_test_record(&manager, DelegatedAgentStatus::Running);
+        let session = Session::create(directory.path().join("astra-child.jsonl")).unwrap();
+        let mut child = manager.build_child_agent(session, &identity, None).unwrap();
+        child
+            .complete("verify delegated wire effort")
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+    }
+
     #[cfg(unix)]
     fn writable_manager_with_workspace(
         directory: &Path,
@@ -5312,6 +5437,22 @@ mod tests {
         assert!(spawned.revision > first.revision);
         assert_eq!(child.tool_use_count, 0);
         assert_eq!(child.task_name, "explore");
+        assert_eq!(
+            child.effective_tool_policy.effect_policy.value,
+            crate::EffectPolicy::Controlled
+        );
+        assert_eq!(
+            child.orchestration_provenance.approval_authority,
+            DelegationPolicySource::ParentInherited
+        );
+        assert_eq!(
+            child.orchestration_provenance.tool_scope,
+            DelegationPolicySource::ChildOverride
+        );
+        assert_eq!(
+            child.orchestration_provenance.execution_limits,
+            DelegationPolicySource::ChildOverride
+        );
 
         manager.update_agent_tool_started(
             &agent_id,
@@ -5476,6 +5617,10 @@ mod tests {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: None,
+                    effective_tool_policy: test_effective_tool_policy(),
+                    orchestration_provenance: DelegationOrchestrationProvenance::all(
+                        DelegationPolicySource::ParentInherited,
+                    ),
                     extension_principal: None,
                     extension_profile: None,
                     extension_idempotency_key: None,
@@ -5882,6 +6027,10 @@ mod tests {
                 mailbox_delivery: None,
                 resource_owner: None,
                 extension_policy: None,
+                effective_tool_policy: test_effective_tool_policy(),
+                orchestration_provenance: DelegationOrchestrationProvenance::all(
+                    DelegationPolicySource::ParentInherited,
+                ),
                 extension_principal: None,
                 extension_profile: None,
                 extension_idempotency_key: None,
@@ -6158,6 +6307,42 @@ mod tests {
         first_request.policy.max_tokens = Some(64_000);
         first_request.policy.max_cost_microdollars = Some(500_000);
         let first = service.spawn("root-owner", first_request).unwrap();
+        assert_eq!(
+            first["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["sandbox"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["effect_policy"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["approval_authority"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["environment"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["working_directory"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["extension_trust"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            first["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         let mut second_request =
             test_extension_spawn("second", None, None, "second bounded task", "second-key");
         second_request.policy.max_tokens = Some(64_000);
@@ -6230,6 +6415,22 @@ mod tests {
             .unwrap();
         assert_eq!(record["task_name"], "first");
         assert_eq!(record["policy"]["tools"], json!(["read", "search"]));
+        assert_eq!(
+            record["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["approval_authority"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            record["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         assert_eq!(record["turn_count"], 2);
         assert_eq!(record["tool_call_count"], 3);
         assert_eq!(record["phase"], "using_tool");
@@ -6293,6 +6494,26 @@ mod tests {
         assert_eq!(persisted["extension_profile"], "review");
         assert_eq!(persisted["extension_idempotency_key"], "first-key");
         assert_eq!(persisted["extension_fingerprint"], "f".repeat(64));
+        assert_eq!(
+            persisted["effective_tool_policy"]["effect_policy"]["value"],
+            "controlled"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["sandbox"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["extension_trust"],
+            "parent_inherited"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["tool_scope"],
+            "child_override"
+        );
+        assert_eq!(
+            persisted["orchestration_provenance"]["execution_limits"],
+            "child_override"
+        );
         assert!(persisted["session_reference"]
             .as_str()
             .is_some_and(|reference| reference.starts_with("agent-session:")));
@@ -7375,6 +7596,10 @@ mod tests {
                     mailbox_delivery: None,
                     resource_owner: None,
                     extension_policy: None,
+                    effective_tool_policy: test_effective_tool_policy(),
+                    orchestration_provenance: DelegationOrchestrationProvenance::all(
+                        DelegationPolicySource::ParentInherited,
+                    ),
                     extension_principal: None,
                     extension_profile: None,
                     extension_idempotency_key: None,

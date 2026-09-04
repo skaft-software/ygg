@@ -11,7 +11,12 @@ from typing import Any, Optional
 
 from ygg_extension import Extension
 
-from .config import BridgeConfig, ConfigError, load_config
+from .config import (
+    STREAMABLE_HTTP_GATE_ERROR,
+    BridgeConfig,
+    ConfigError,
+    load_config,
+)
 from .manager import BridgeManager
 
 
@@ -24,6 +29,7 @@ SUPPORTED_FEATURES = (
     "dynamic_tools",
     "approvals",
 )
+EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT = "--experimental-streamable-http-mcp"
 
 
 class ProtocolReadyExtension(Extension):
@@ -46,20 +52,31 @@ class ProtocolReadyExtension(Extension):
 def build_runtime(
     *,
     config_path: Optional[Path] = None,
+    experimental_streamable_http_mcp: bool = False,
 ) -> tuple[ProtocolReadyExtension, BridgeManager]:
     workspace = os.environ.get("YGG_WORKSPACE")
     config_error = None
     try:
-        config = load_config(config_path, workspace=workspace)
-    except ConfigError:
-        # Stay inspectable instead of crashing the extension handshake. The
-        # bounded public error has no path, command, argument, environment, or
-        # parser-controlled text.
+        config = load_config(
+            config_path,
+            workspace=workspace,
+            experimental_streamable_http_mcp=experimental_streamable_http_mcp,
+        )
+    except ConfigError as error:
+        # Stay inspectable instead of crashing the extension handshake. Only the
+        # fixed, process-owner gate diagnostic is safe to expose verbatim; all
+        # parser-controlled errors remain bounded and generic.
         config = BridgeConfig.empty(Path(config_path) if config_path else None)
-        config_error = {
-            "code": "invalid_config",
-            "summary": "MCP configuration failed a bounded trust or schema check",
-        }
+        if str(error) == STREAMABLE_HTTP_GATE_ERROR:
+            config_error = {
+                "code": "experimental_streamable_http_mcp_required",
+                "summary": STREAMABLE_HTTP_GATE_ERROR,
+            }
+        else:
+            config_error = {
+                "code": "invalid_config",
+                "summary": "MCP configuration failed a bounded trust or schema check",
+            }
 
     extension = ProtocolReadyExtension(
         api_version="0.2",
@@ -77,6 +94,7 @@ def build_runtime(
         scratch_directory=Path(
             os.environ.get("YGG_EXTENSION_SCRATCH", ".ygg-mcp-scratch")
         ),
+        experimental_streamable_http_mcp=experimental_streamable_http_mcp,
     )
 
     @extension.command(
@@ -105,8 +123,15 @@ def build_runtime(
     return extension, manager
 
 
-def run(config_path: Optional[Path] = None) -> None:
-    extension, manager = build_runtime(config_path=config_path)
+def run(
+    config_path: Optional[Path] = None,
+    *,
+    experimental_streamable_http_mcp: bool = False,
+) -> None:
+    extension, manager = build_runtime(
+        config_path=config_path,
+        experimental_streamable_http_mcp=experimental_streamable_http_mcp,
+    )
 
     def start_after_handshake() -> None:
         if extension.protocol_ready.wait():
@@ -126,12 +151,21 @@ def run(config_path: Optional[Path] = None) -> None:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ygg-mcp",
-        description="Ygg API 0.2 bridge for explicitly configured local stdio MCP servers",
+        description="Ygg API 0.2 bridge for explicitly configured stdio and Streamable HTTP MCP servers",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--config",
         type=Path,
         help="explicit user configuration path (normal Ygg launches use ~/.ygg/mcp.json)",
+    )
+    parser.add_argument(
+        EXPERIMENTAL_STREAMABLE_HTTP_MCP_ARGUMENT,
+        action="store_true",
+        help=(
+            "EXPERIMENTAL: enable Streamable HTTP MCP only when the Ygg process "
+            "owner explicitly supplies this one-shot switch"
+        ),
     )
     parser.add_argument(
         "--check-config",
@@ -144,10 +178,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             config = load_config(
                 arguments.config,
                 workspace=os.environ.get("YGG_WORKSPACE"),
+                experimental_streamable_http_mcp=arguments.experimental_streamable_http_mcp,
             )
         except ConfigError as error:
             parser.error(str(error))
         print(f"valid MCP configuration: {len(config.servers)} configured servers")
         return 0
-    run(arguments.config)
+    run(
+        arguments.config,
+        experimental_streamable_http_mcp=arguments.experimental_streamable_http_mcp,
+    )
     return 0

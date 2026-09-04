@@ -161,6 +161,52 @@ pub fn remove_regular_file_if_exists(path: &Path) -> Result<bool, SecureFileErro
     imp::remove_regular_file_if_exists(path)
 }
 
+/// Remove a regular file only when its bytes and filesystem identity still
+/// match `expected`.
+///
+/// This is a descriptor-bound compare-and-delete operation. It rejects missing,
+/// replaced, linked, symbolic, special, or changed targets rather than deleting
+/// a concurrent writer's file.
+pub fn remove_regular_file_if_unchanged(
+    path: &Path,
+    expected: &[u8],
+    limit: usize,
+) -> Result<(), SecureFileError> {
+    validate_absolute_file_path(path)?;
+    if expected.len() > limit {
+        return Err(SecureFileError::TooLarge {
+            actual: expected.len() as u64,
+            limit,
+        });
+    }
+    let prepared = PreparedMutation::prepare(path, false, limit)?;
+    if prepared.original() != Some(expected) {
+        return Err(SecureFileError::Changed);
+    }
+    prepared.remove()
+}
+
+/// Remove an owner-only regular file only when its bytes and filesystem
+/// identity still match `expected`.
+pub fn remove_private_file_if_unchanged(
+    path: &Path,
+    expected: &[u8],
+    limit: usize,
+) -> Result<(), SecureFileError> {
+    validate_absolute_file_path(path)?;
+    if expected.len() > limit {
+        return Err(SecureFileError::TooLarge {
+            actual: expected.len() as u64,
+            limit,
+        });
+    }
+    let prepared = PreparedMutation::prepare_private(path, limit)?;
+    if prepared.original() != Some(expected) {
+        return Err(SecureFileError::Changed);
+    }
+    prepared.remove()
+}
+
 /// Remove one existing empty owner-only directory through a descriptor-bound
 /// path walk.
 ///
@@ -340,8 +386,7 @@ pub(crate) fn create_bound_private_directory(
 /// characters and the random suffix is generated from the operating system's
 /// cryptographically secure random source. The final directory create is
 /// exclusive and descriptor-relative to the validated private parent.
-#[cfg(test)]
-pub(crate) fn create_unique_private_directory(
+pub fn create_unique_private_directory(
     parent: &Path,
     prefix: &str,
 ) -> Result<PathBuf, SecureFileError> {
@@ -374,6 +419,38 @@ pub fn write_private_atomic(path: &Path, data: &[u8], limit: usize) -> Result<()
         .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?;
     imp::create_private_directory_all(parent)?;
     imp::PreparedMutation::prepare_private(path, limit)?.commit_private(data, &|| false)
+}
+
+/// Atomically publish owner-only bytes only if the target still matches an
+/// earlier caller snapshot.
+///
+/// This is the private counterpart to [`write_atomic_if_unchanged`]. Both the
+/// snapshot and final comparison are descriptor-bound, while the target and
+/// every parent retain the owner-only checks used by [`write_private_atomic`].
+/// A symlink, hard-link, ownership, permission, or concurrent replacement is
+/// rejected as [`SecureFileError::Changed`] rather than overwritten.
+pub fn write_private_atomic_if_unchanged(
+    path: &Path,
+    expected: Option<&[u8]>,
+    data: &[u8],
+    limit: usize,
+) -> Result<(), SecureFileError> {
+    validate_absolute_file_path(path)?;
+    if data.len() > limit {
+        return Err(SecureFileError::TooLarge {
+            actual: data.len() as u64,
+            limit,
+        });
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| SecureFileError::InvalidPath(path.display().to_string()))?;
+    imp::create_private_directory_all(parent)?;
+    let prepared = imp::PreparedMutation::prepare_private(path, limit)?;
+    if prepared.original() != expected {
+        return Err(SecureFileError::Changed);
+    }
+    prepared.commit_private(data, &|| false)
 }
 
 /// Atomically publish regular-file bytes only if the target still matches an
@@ -463,6 +540,13 @@ impl PreparedMutation {
         })
     }
 
+    fn prepare_private(path: &Path, limit: usize) -> Result<Self, SecureFileError> {
+        validate_absolute_file_path(path)?;
+        Ok(Self {
+            inner: imp::PreparedMutation::prepare_private(path, limit)?,
+        })
+    }
+
     /// Original target bytes, or `None` when the target did not exist.
     pub(crate) fn original(&self) -> Option<&[u8]> {
         self.inner.original()
@@ -483,6 +567,10 @@ impl PreparedMutation {
         cancelled: impl Fn() -> bool,
     ) -> Result<(), SecureFileError> {
         self.inner.commit(data, &cancelled)
+    }
+
+    fn remove(self) -> Result<(), SecureFileError> {
+        self.inner.remove()
     }
 }
 
@@ -1603,6 +1691,73 @@ mod imp {
                 }
                 _ => false,
             })
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pub(super) fn remove(self) -> Result<(), SecureFileError> {
+            let expected = self.original_identity.ok_or(SecureFileError::Changed)?;
+            if !self.unchanged()? {
+                return Err(SecureFileError::Changed);
+            }
+            for _ in 0..TEMP_NAME_ATTEMPTS {
+                let temporary = OsString::from(format!(".ygg-delete-{}", random_temp_suffix()?));
+                match rustix::fs::renameat_with(
+                    &self.parent,
+                    &self.name,
+                    &self.parent,
+                    &temporary,
+                    RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => {}
+                    Err(Errno::EXIST) => continue,
+                    Err(Errno::NOENT) => return Err(SecureFileError::Changed),
+                    Err(Errno::NOSYS | Errno::OPNOTSUPP | Errno::INVAL) => {
+                        return Err(SecureFileError::PublicationUnavailable)
+                    }
+                    Err(error) => return Err(SecureFileError::Io(io_error(error))),
+                }
+                let moved_is_expected = matches!(
+                    named_file_identity(&self.parent, &temporary, self.private),
+                    Ok(actual) if same_stable_state(actual, expected)
+                );
+                if !moved_is_expected {
+                    let _ = rustix::fs::renameat_with(
+                        &self.parent,
+                        &temporary,
+                        &self.parent,
+                        &self.name,
+                        RenameFlags::NOREPLACE,
+                    );
+                    return Err(SecureFileError::Changed);
+                }
+                match rustix::fs::unlinkat(&self.parent, &temporary, AtFlags::empty()) {
+                    Ok(()) => {
+                        rustix::fs::fsync(&self.parent)
+                            .map_err(|error| SecureFileError::Io(io_error(error)))?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = rustix::fs::renameat_with(
+                            &self.parent,
+                            &temporary,
+                            &self.parent,
+                            &self.name,
+                            RenameFlags::NOREPLACE,
+                        );
+                        return Err(SecureFileError::Io(io_error(error)));
+                    }
+                }
+            }
+            Err(SecureFileError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique secure deletion name",
+            )))
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        pub(super) fn remove(self) -> Result<(), SecureFileError> {
+            let _ = self;
+            Err(SecureFileError::PublicationUnavailable)
         }
 
         /// Atomically swap the staged file with an existing destination, then
@@ -3087,7 +3242,7 @@ mod imp {
         }
 
         pub(super) fn prepare_private(path: &Path, limit: usize) -> Result<Self, SecureFileError> {
-            Self::prepare_inner(path, true, limit, true)
+            Self::prepare_inner(path, false, limit, true)
         }
 
         fn prepare_inner(
@@ -3109,6 +3264,11 @@ mod imp {
 
         pub(super) fn original(&self) -> Option<&[u8]> {
             self.original.bytes()
+        }
+
+        pub(super) fn remove(self) -> Result<(), SecureFileError> {
+            let _ = self;
+            Err(SecureFileError::PublicationUnavailable)
         }
 
         pub(super) fn commit(
@@ -3391,6 +3551,10 @@ mod imp {
             None
         }
 
+        pub(super) fn remove(self) -> Result<(), SecureFileError> {
+            unsupported()
+        }
+
         pub(super) fn commit(
             self,
             _data: &[u8],
@@ -3543,6 +3707,28 @@ mod tests {
             Err(SecureFileError::Changed)
         ));
         assert_eq!(std::fs::read_to_string(path).unwrap(), "newer version");
+    }
+
+    #[test]
+    fn private_conditional_atomic_write_rejects_a_stale_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("private/target.json");
+        write_private_atomic(&path, b"newer version", 1024).unwrap();
+
+        assert!(matches!(
+            write_private_atomic_if_unchanged(
+                &path,
+                Some(b"older version"),
+                b"stale replacement",
+                1024,
+            ),
+            Err(SecureFileError::Changed)
+        ));
+        assert_eq!(
+            read_private_file_bounded(&path, 1024).unwrap(),
+            b"newer version"
+        );
     }
 
     #[test]

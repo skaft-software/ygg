@@ -1,0 +1,950 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "fixtures": [
+    {
+      "id": "events:project_trust",
+      "surface": "events.project_trust",
+      "kind": "event_registration",
+      "target": "project_trust",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because project_trust is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:resources_discover",
+      "surface": "events.resources_discover",
+      "kind": "event_registration",
+      "target": "resources_discover",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because resources_discover is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_start",
+      "surface": "events.session_start",
+      "kind": "lifecycle_or_hook",
+      "target": "session_start",
+      "expected": "reduced_event",
+      "assertion": "Emitted from session/started with a host-derived reason."
+    },
+    {
+      "id": "events:session_info_changed",
+      "surface": "events.session_info_changed",
+      "kind": "event_registration",
+      "target": "session_info_changed",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_info_changed is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_before_switch",
+      "surface": "events.session_before_switch",
+      "kind": "event_registration",
+      "target": "session_before_switch",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_before_switch is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_before_fork",
+      "surface": "events.session_before_fork",
+      "kind": "event_registration",
+      "target": "session_before_fork",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_before_fork is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_before_compact",
+      "surface": "events.session_before_compact",
+      "kind": "event_registration",
+      "target": "session_before_compact",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_before_compact is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_compact",
+      "surface": "events.session_compact",
+      "kind": "event_registration",
+      "target": "session_compact",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_compact is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_compact_failed",
+      "surface": "events.session_compact_failed",
+      "kind": "event_registration",
+      "target": "session_compact_failed",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_compact_failed is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_shutdown",
+      "surface": "events.session_shutdown",
+      "kind": "lifecycle_or_hook",
+      "target": "session_shutdown",
+      "expected": "reduced_event",
+      "assertion": "Emitted once from settlement or shutdown with a synthetic reason."
+    },
+    {
+      "id": "events:session_before_tree",
+      "surface": "events.session_before_tree",
+      "kind": "event_registration",
+      "target": "session_before_tree",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_before_tree is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:session_tree",
+      "surface": "events.session_tree",
+      "kind": "event_registration",
+      "target": "session_tree",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because session_tree is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:context",
+      "surface": "events.context",
+      "kind": "lifecycle_or_hook",
+      "target": "context",
+      "expected": "reduced_event",
+      "assertion": "Bounded additions become Ygg context; canonical history replacement remains host-owned."
+    },
+    {
+      "id": "events:before_provider_request",
+      "surface": "events.before_provider_request",
+      "kind": "event_registration",
+      "target": "before_provider_request",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because before_provider_request is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:before_provider_headers",
+      "surface": "events.before_provider_headers",
+      "kind": "event_registration",
+      "target": "before_provider_headers",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because before_provider_headers is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:after_provider_response",
+      "surface": "events.after_provider_response",
+      "kind": "event_registration",
+      "target": "after_provider_response",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because after_provider_response is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:before_agent_start",
+      "surface": "events.before_agent_start",
+      "kind": "lifecycle_or_hook",
+      "target": "before_agent_start",
+      "expected": "reduced_event",
+      "assertion": "Bounded system/message additions become host context suffixes."
+    },
+    {
+      "id": "events:agent_start",
+      "surface": "events.agent_start",
+      "kind": "lifecycle_or_hook",
+      "target": "agent_start",
+      "expected": "reduced_event",
+      "assertion": "Emitted from turn/started with the bridge lifecycle payload."
+    },
+    {
+      "id": "events:agent_end",
+      "surface": "events.agent_end",
+      "kind": "lifecycle_or_hook",
+      "target": "agent_end",
+      "expected": "reduced_event",
+      "assertion": "Emitted after response settlement with reduced messages."
+    },
+    {
+      "id": "events:agent_settled",
+      "surface": "events.agent_settled",
+      "kind": "lifecycle_or_hook",
+      "target": "agent_settled",
+      "expected": "reduced_event",
+      "assertion": "Emitted after the synthetic agent_end event."
+    },
+    {
+      "id": "events:ui_prompt_start",
+      "surface": "events.ui_prompt_start",
+      "kind": "event_registration",
+      "target": "ui_prompt_start",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because ui_prompt_start is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:ui_prompt_end",
+      "surface": "events.ui_prompt_end",
+      "kind": "event_registration",
+      "target": "ui_prompt_end",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because ui_prompt_end is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:turn_start",
+      "surface": "events.turn_start",
+      "kind": "lifecycle_or_hook",
+      "target": "turn_start",
+      "expected": "reduced_event",
+      "assertion": "Emitted with a synthetic turn index and timestamp."
+    },
+    {
+      "id": "events:turn_end",
+      "surface": "events.turn_end",
+      "kind": "lifecycle_or_hook",
+      "target": "turn_end",
+      "expected": "reduced_event",
+      "assertion": "Emitted with reduced tool-result and message history."
+    },
+    {
+      "id": "events:message_start",
+      "surface": "events.message_start",
+      "kind": "event_registration",
+      "target": "message_start",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because message_start is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:message_update",
+      "surface": "events.message_update",
+      "kind": "event_registration",
+      "target": "message_update",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because message_update is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:message_end",
+      "surface": "events.message_end",
+      "kind": "event_registration",
+      "target": "message_end",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because message_end is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:tool_execution_start",
+      "surface": "events.tool_execution_start",
+      "kind": "lifecycle_or_hook",
+      "target": "tool_execution_start",
+      "expected": "reduced_event",
+      "assertion": "Emitted from host tool/started lifecycle."
+    },
+    {
+      "id": "events:tool_execution_update",
+      "surface": "events.tool_execution_update",
+      "kind": "lifecycle_or_hook",
+      "target": "tool_execution_update",
+      "expected": "reduced_event",
+      "assertion": "Pi partial results route through bounded Ygg progress."
+    },
+    {
+      "id": "events:tool_execution_end",
+      "surface": "events.tool_execution_end",
+      "kind": "lifecycle_or_hook",
+      "target": "tool_execution_end",
+      "expected": "reduced_event",
+      "assertion": "Emitted from host tool/settled lifecycle with reduced result details."
+    },
+    {
+      "id": "events:model_select",
+      "surface": "events.model_select",
+      "kind": "event_registration",
+      "target": "model_select",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because model_select is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:thinking_level_select",
+      "surface": "events.thinking_level_select",
+      "kind": "event_registration",
+      "target": "thinking_level_select",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because thinking_level_select is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:user_bash",
+      "surface": "events.user_bash",
+      "kind": "event_registration",
+      "target": "user_bash",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because user_bash is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:input",
+      "surface": "events.input",
+      "kind": "event_registration",
+      "target": "input",
+      "expected": "startup_diagnostic",
+      "assertion": "Event registration is diagnosed explicitly because input is not emitted by the bounded bridge."
+    },
+    {
+      "id": "events:tool_call",
+      "surface": "events.tool_call",
+      "kind": "lifecycle_or_hook",
+      "target": "tool_call",
+      "expected": "reduced_event",
+      "assertion": "Blocks and Pi-tool argument preparation are preserved; unrepresentable mutation fails."
+    },
+    {
+      "id": "events:tool_result",
+      "surface": "events.tool_result",
+      "kind": "lifecycle_or_hook",
+      "target": "tool_result",
+      "expected": "reduced_event",
+      "assertion": "Pi-tool content/details/error/usage transforms are preserved; native mutation fails."
+    },
+    {
+      "id": "extension_api:on",
+      "surface": "extension_api.on",
+      "kind": "initialize",
+      "target": "on",
+      "expected": "registered",
+      "assertion": "Supported events are registered; unavailable events emit a startup diagnostic."
+    },
+    {
+      "id": "extension_api:registerTool",
+      "surface": "extension_api.registerTool",
+      "kind": "initialize",
+      "target": "registerTool",
+      "expected": "registered",
+      "assertion": "Initial tool registration and execution use the public Pi runner."
+    },
+    {
+      "id": "extension_api:registerCommand",
+      "surface": "extension_api.registerCommand",
+      "kind": "initialize",
+      "target": "registerCommand",
+      "expected": "registered",
+      "assertion": "Initial commands become native Ygg commands when runtime_commands is negotiated."
+    },
+    {
+      "id": "extension_api:registerShortcut",
+      "surface": "extension_api.registerShortcut",
+      "kind": "registration",
+      "target": "registerShortcut",
+      "expected": "startup_diagnostic",
+      "assertion": "Shortcut registration is diagnosed at startup; host key dispatch remains deferred."
+    },
+    {
+      "id": "extension_api:registerFlag",
+      "surface": "extension_api.registerFlag",
+      "kind": "registration",
+      "target": "registerFlag",
+      "expected": "startup_diagnostic",
+      "assertion": "Pi defaults remain local; host flag projection is deferred and registration is diagnosed at startup."
+    },
+    {
+      "id": "extension_api:getFlag",
+      "surface": "extension_api.getFlag",
+      "kind": "api_probe",
+      "target": "getFlag",
+      "expected": "explicit_or_bounded",
+      "assertion": "Returns Pi runtime/default values; host invocation flags are not projected."
+    },
+    {
+      "id": "extension_api:registerMessageRenderer",
+      "surface": "extension_api.registerMessageRenderer",
+      "kind": "registration",
+      "target": "registerMessageRenderer",
+      "expected": "startup_diagnostic",
+      "assertion": "Remote component rendering is rejected explicitly."
+    },
+    {
+      "id": "extension_api:registerMarkdownTransformer",
+      "surface": "extension_api.registerMarkdownTransformer",
+      "kind": "registration",
+      "target": "registerMarkdownTransformer",
+      "expected": "startup_diagnostic",
+      "assertion": "Transcript mutation is rejected explicitly."
+    },
+    {
+      "id": "extension_api:registerEntryRenderer",
+      "surface": "extension_api.registerEntryRenderer",
+      "kind": "registration",
+      "target": "registerEntryRenderer",
+      "expected": "startup_diagnostic",
+      "assertion": "Remote component rendering is rejected explicitly."
+    },
+    {
+      "id": "extension_api:sendMessage",
+      "surface": "extension_api.sendMessage",
+      "kind": "api_probe",
+      "target": "sendMessage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Root-session delivery is rejected explicitly; host message projection is deferred."
+    },
+    {
+      "id": "extension_api:sendUserMessage",
+      "surface": "extension_api.sendUserMessage",
+      "kind": "api_probe",
+      "target": "sendUserMessage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Root-session delivery is rejected explicitly; host message projection is deferred."
+    },
+    {
+      "id": "extension_api:appendEntry",
+      "surface": "extension_api.appendEntry",
+      "kind": "api_probe",
+      "target": "appendEntry",
+      "expected": "explicit_or_bounded",
+      "assertion": "Durable custom entries are rejected explicitly; session-state projection is deferred."
+    },
+    {
+      "id": "extension_api:setSessionName",
+      "surface": "extension_api.setSessionName",
+      "kind": "api_probe",
+      "target": "setSessionName",
+      "expected": "explicit_or_bounded",
+      "assertion": "Session-name mutation is rejected explicitly; session-state projection is deferred."
+    },
+    {
+      "id": "extension_api:getSessionName",
+      "surface": "extension_api.getSessionName",
+      "kind": "api_probe",
+      "target": "getSessionName",
+      "expected": "explicit_or_bounded",
+      "assertion": "Returns the latest host session-name snapshot."
+    },
+    {
+      "id": "extension_api:setLabel",
+      "surface": "extension_api.setLabel",
+      "kind": "api_probe",
+      "target": "setLabel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Entry-label mutation is rejected explicitly."
+    },
+    {
+      "id": "extension_api:exec",
+      "surface": "extension_api.exec",
+      "kind": "api_probe",
+      "target": "exec",
+      "expected": "explicit_or_bounded",
+      "assertion": "Runs only inside the explicitly trusted Pi extension process, never through Ygg bash."
+    },
+    {
+      "id": "extension_api:getActiveTools",
+      "surface": "extension_api.getActiveTools",
+      "kind": "api_probe",
+      "target": "getActiveTools",
+      "expected": "explicit_or_bounded",
+      "assertion": "Reports bridge-local Pi tools rather than the full Ygg policy."
+    },
+    {
+      "id": "extension_api:getAllTools",
+      "surface": "extension_api.getAllTools",
+      "kind": "api_probe",
+      "target": "getAllTools",
+      "expected": "explicit_or_bounded",
+      "assertion": "Reports bridge-local Pi tool information."
+    },
+    {
+      "id": "extension_api:setActiveTools",
+      "surface": "extension_api.setActiveTools",
+      "kind": "api_probe",
+      "target": "setActiveTools",
+      "expected": "explicit_or_bounded",
+      "assertion": "Active-tool policy mutation is rejected explicitly; host policy projection is deferred."
+    },
+    {
+      "id": "extension_api:getCommands",
+      "surface": "extension_api.getCommands",
+      "kind": "api_probe",
+      "target": "getCommands",
+      "expected": "explicit_or_bounded",
+      "assertion": "Reports commands registered by the Pi runner."
+    },
+    {
+      "id": "extension_api:setModel",
+      "surface": "extension_api.setModel",
+      "kind": "api_probe",
+      "target": "setModel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Model mutation remains host-owned and errors explicitly."
+    },
+    {
+      "id": "extension_api:getThinkingLevel",
+      "surface": "extension_api.getThinkingLevel",
+      "kind": "api_probe",
+      "target": "getThinkingLevel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Derives a read-only level from the host reasoning snapshot."
+    },
+    {
+      "id": "extension_api:setThinkingLevel",
+      "surface": "extension_api.setThinkingLevel",
+      "kind": "api_probe",
+      "target": "setThinkingLevel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Reasoning mutation remains host-owned and errors explicitly."
+    },
+    {
+      "id": "extension_api:registerProvider",
+      "surface": "extension_api.registerProvider",
+      "kind": "api_probe",
+      "target": "registerProvider",
+      "expected": "explicit_or_bounded",
+      "assertion": "Provider and OAuth registration are rejected; no credential or network proxy is implicit."
+    },
+    {
+      "id": "extension_api:unregisterProvider",
+      "surface": "extension_api.unregisterProvider",
+      "kind": "api_probe",
+      "target": "unregisterProvider",
+      "expected": "explicit_or_bounded",
+      "assertion": "Provider mutation is rejected explicitly."
+    },
+    {
+      "id": "extension_api:events.emit",
+      "surface": "extension_api.events.emit",
+      "kind": "api_probe",
+      "target": "events.emit",
+      "expected": "explicit_or_bounded",
+      "assertion": "Event bus is shared only by sources in the same bridge process."
+    },
+    {
+      "id": "extension_api:events.on",
+      "surface": "extension_api.events.on",
+      "kind": "api_probe",
+      "target": "events.on",
+      "expected": "explicit_or_bounded",
+      "assertion": "Event bus is shared only by sources in the same bridge process."
+    },
+    {
+      "id": "ui_context:select",
+      "surface": "ui_context.select",
+      "kind": "ui_probe",
+      "target": "select",
+      "expected": "explicit_or_bounded",
+      "assertion": "Uses bounded text input rather than a Pi selector component."
+    },
+    {
+      "id": "ui_context:confirm",
+      "surface": "ui_context.confirm",
+      "kind": "ui_probe",
+      "target": "confirm",
+      "expected": "explicit_or_bounded",
+      "assertion": "Uses Ygg confirmation requests."
+    },
+    {
+      "id": "ui_context:input",
+      "surface": "ui_context.input",
+      "kind": "ui_probe",
+      "target": "input",
+      "expected": "explicit_or_bounded",
+      "assertion": "Uses Ygg bounded single-line input requests."
+    },
+    {
+      "id": "ui_context:notify",
+      "surface": "ui_context.notify",
+      "kind": "ui_probe",
+      "target": "notify",
+      "expected": "notification",
+      "assertion": "Emits a declared Ygg notification without writing protocol stdout."
+    },
+    {
+      "id": "ui_context:onTerminalInput",
+      "surface": "ui_context.onTerminalInput",
+      "kind": "ui_probe",
+      "target": "onTerminalInput",
+      "expected": "explicit_or_bounded",
+      "assertion": "Raw terminal ownership stays in Ygg and errors explicitly."
+    },
+    {
+      "id": "ui_context:setStatus",
+      "surface": "ui_context.setStatus",
+      "kind": "ui_probe",
+      "target": "setStatus",
+      "expected": "explicit_or_bounded",
+      "assertion": "Publishes one semantic Ygg status contribution."
+    },
+    {
+      "id": "ui_context:setWorkingMessage",
+      "surface": "ui_context.setWorkingMessage",
+      "kind": "ui_probe",
+      "target": "setWorkingMessage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Working-label ownership stays in Ygg and errors explicitly."
+    },
+    {
+      "id": "ui_context:setWorkingVisible",
+      "surface": "ui_context.setWorkingVisible",
+      "kind": "ui_probe",
+      "target": "setWorkingVisible",
+      "expected": "explicit_or_bounded",
+      "assertion": "Working-loader visibility stays in Ygg and errors explicitly."
+    },
+    {
+      "id": "ui_context:setWorkingIndicator",
+      "surface": "ui_context.setWorkingIndicator",
+      "kind": "ui_probe",
+      "target": "setWorkingIndicator",
+      "expected": "explicit_or_bounded",
+      "assertion": "Custom loading frames are rejected explicitly."
+    },
+    {
+      "id": "ui_context:setHiddenThinkingLabel",
+      "surface": "ui_context.setHiddenThinkingLabel",
+      "kind": "ui_probe",
+      "target": "setHiddenThinkingLabel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Hidden-thinking label mutation is rejected explicitly."
+    },
+    {
+      "id": "ui_context:setWidget",
+      "surface": "ui_context.setWidget",
+      "kind": "ui_probe",
+      "target": "setWidget",
+      "expected": "explicit_or_bounded",
+      "assertion": "Widget transport is rejected explicitly; plain-text host projection is deferred."
+    },
+    {
+      "id": "ui_context:setFooter",
+      "surface": "ui_context.setFooter",
+      "kind": "ui_probe",
+      "target": "setFooter",
+      "expected": "explicit_or_bounded",
+      "assertion": "Remote footer components are rejected explicitly."
+    },
+    {
+      "id": "ui_context:setHeader",
+      "surface": "ui_context.setHeader",
+      "kind": "ui_probe",
+      "target": "setHeader",
+      "expected": "explicit_or_bounded",
+      "assertion": "Remote header components are rejected explicitly."
+    },
+    {
+      "id": "ui_context:setTitle",
+      "surface": "ui_context.setTitle",
+      "kind": "ui_probe",
+      "target": "setTitle",
+      "expected": "explicit_or_bounded",
+      "assertion": "Terminal title ownership stays in Ygg and errors explicitly."
+    },
+    {
+      "id": "ui_context:custom",
+      "surface": "ui_context.custom",
+      "kind": "ui_probe",
+      "target": "custom",
+      "expected": "explicit_or_bounded",
+      "assertion": "Focused remote components are rejected explicitly."
+    },
+    {
+      "id": "ui_context:pasteToEditor",
+      "surface": "ui_context.pasteToEditor",
+      "kind": "ui_probe",
+      "target": "pasteToEditor",
+      "expected": "explicit_or_bounded",
+      "assertion": "Composer mutation is rejected explicitly."
+    },
+    {
+      "id": "ui_context:setEditorText",
+      "surface": "ui_context.setEditorText",
+      "kind": "ui_probe",
+      "target": "setEditorText",
+      "expected": "explicit_or_bounded",
+      "assertion": "Composer mutation is rejected explicitly."
+    },
+    {
+      "id": "ui_context:getEditorText",
+      "surface": "ui_context.getEditorText",
+      "kind": "ui_probe",
+      "target": "getEditorText",
+      "expected": "explicit_or_bounded",
+      "assertion": "Composer state is rejected explicitly."
+    },
+    {
+      "id": "ui_context:editor",
+      "surface": "ui_context.editor",
+      "kind": "ui_probe",
+      "target": "editor",
+      "expected": "explicit_or_bounded",
+      "assertion": "Editor dialog transport is rejected explicitly; the host-owned editor handoff is not a Pi bridge surface."
+    },
+    {
+      "id": "ui_context:addAutocompleteProvider",
+      "surface": "ui_context.addAutocompleteProvider",
+      "kind": "ui_probe",
+      "target": "addAutocompleteProvider",
+      "expected": "explicit_or_bounded",
+      "assertion": "Autocomplete mutation is rejected explicitly."
+    },
+    {
+      "id": "ui_context:setEditorComponent",
+      "surface": "ui_context.setEditorComponent",
+      "kind": "ui_probe",
+      "target": "setEditorComponent",
+      "expected": "explicit_or_bounded",
+      "assertion": "Remote editor components are rejected explicitly."
+    },
+    {
+      "id": "ui_context:getEditorComponent",
+      "surface": "ui_context.getEditorComponent",
+      "kind": "ui_probe",
+      "target": "getEditorComponent",
+      "expected": "explicit_or_bounded",
+      "assertion": "Remote editor components are rejected explicitly."
+    },
+    {
+      "id": "ui_context:theme",
+      "surface": "ui_context.theme",
+      "kind": "ui_probe",
+      "target": "theme",
+      "expected": "explicit_or_bounded",
+      "assertion": "Text/style helpers preserve text while stripping Pi styling."
+    },
+    {
+      "id": "ui_context:getAllThemes",
+      "surface": "ui_context.getAllThemes",
+      "kind": "ui_probe",
+      "target": "getAllThemes",
+      "expected": "explicit_or_bounded",
+      "assertion": "Pi theme inventory is rejected explicitly."
+    },
+    {
+      "id": "ui_context:getTheme",
+      "surface": "ui_context.getTheme",
+      "kind": "ui_probe",
+      "target": "getTheme",
+      "expected": "explicit_or_bounded",
+      "assertion": "Pi theme lookup is rejected explicitly."
+    },
+    {
+      "id": "ui_context:setTheme",
+      "surface": "ui_context.setTheme",
+      "kind": "ui_probe",
+      "target": "setTheme",
+      "expected": "explicit_or_bounded",
+      "assertion": "Pi theme mutation is rejected explicitly."
+    },
+    {
+      "id": "ui_context:getToolsExpanded",
+      "surface": "ui_context.getToolsExpanded",
+      "kind": "ui_probe",
+      "target": "getToolsExpanded",
+      "expected": "explicit_or_bounded",
+      "assertion": "Transcript disclosure state is rejected explicitly."
+    },
+    {
+      "id": "ui_context:setToolsExpanded",
+      "surface": "ui_context.setToolsExpanded",
+      "kind": "ui_probe",
+      "target": "setToolsExpanded",
+      "expected": "explicit_or_bounded",
+      "assertion": "Transcript disclosure mutation is rejected explicitly."
+    },
+    {
+      "id": "context:ui",
+      "surface": "context.ui",
+      "kind": "context_probe",
+      "target": "ui",
+      "expected": "explicit_or_bounded",
+      "assertion": "Provides the bounded bridge UI context."
+    },
+    {
+      "id": "context:mode",
+      "surface": "context.mode",
+      "kind": "context_probe",
+      "target": "mode",
+      "expected": "explicit_or_bounded",
+      "assertion": "Always Pi RPC mode rather than an interactive Pi TUI."
+    },
+    {
+      "id": "context:hasUI",
+      "surface": "context.hasUI",
+      "kind": "context_probe",
+      "target": "hasUI",
+      "expected": "explicit_or_bounded",
+      "assertion": "True only for bridged dialogs, not arbitrary Pi components."
+    },
+    {
+      "id": "context:cwd",
+      "surface": "context.cwd",
+      "kind": "context_probe",
+      "target": "cwd",
+      "expected": "explicit_or_bounded",
+      "assertion": "Uses the canonical Ygg workspace."
+    },
+    {
+      "id": "context:sessionManager",
+      "surface": "context.sessionManager",
+      "kind": "context_probe",
+      "target": "sessionManager",
+      "expected": "explicit_or_bounded",
+      "assertion": "Session snapshots and mutation are host-owned and rejected explicitly."
+    },
+    {
+      "id": "context:modelRegistry",
+      "surface": "context.modelRegistry",
+      "kind": "context_probe",
+      "target": "modelRegistry",
+      "expected": "explicit_or_bounded",
+      "assertion": "Credential/model registry access is rejected explicitly."
+    },
+    {
+      "id": "context:model",
+      "surface": "context.model",
+      "kind": "context_probe",
+      "target": "model",
+      "expected": "explicit_or_bounded",
+      "assertion": "A Pi Model object is not reconstructed from a Ygg model id."
+    },
+    {
+      "id": "context:scopedModels",
+      "surface": "context.scopedModels",
+      "kind": "context_probe",
+      "target": "scopedModels",
+      "expected": "explicit_or_bounded",
+      "assertion": "Returns an empty read-only snapshot."
+    },
+    {
+      "id": "context:thinkingLevel",
+      "surface": "context.thinkingLevel",
+      "kind": "context_probe",
+      "target": "thinkingLevel",
+      "expected": "explicit_or_bounded",
+      "assertion": "Derives from the host reasoning snapshot."
+    },
+    {
+      "id": "context:isIdle",
+      "surface": "context.isIdle",
+      "kind": "context_probe",
+      "target": "isIdle",
+      "expected": "explicit_or_bounded",
+      "assertion": "Tracks the bridged turn lifecycle only."
+    },
+    {
+      "id": "context:isProjectTrusted",
+      "surface": "context.isProjectTrusted",
+      "kind": "context_probe",
+      "target": "isProjectTrusted",
+      "expected": "explicit_or_bounded",
+      "assertion": "Conservatively returns false because Ygg trust is not projected."
+    },
+    {
+      "id": "context:signal",
+      "surface": "context.signal",
+      "kind": "context_probe",
+      "target": "signal",
+      "expected": "explicit_or_bounded",
+      "assertion": "Binds to the active Ygg request cancellation signal."
+    },
+    {
+      "id": "context:abort",
+      "surface": "context.abort",
+      "kind": "context_probe",
+      "target": "abort",
+      "expected": "explicit_or_bounded",
+      "assertion": "Cancels the active bridged request."
+    },
+    {
+      "id": "context:hasPendingMessages",
+      "surface": "context.hasPendingMessages",
+      "kind": "context_probe",
+      "target": "hasPendingMessages",
+      "expected": "explicit_or_bounded",
+      "assertion": "Queue inspection is rejected explicitly."
+    },
+    {
+      "id": "context:shutdown",
+      "surface": "context.shutdown",
+      "kind": "context_probe",
+      "target": "shutdown",
+      "expected": "explicit_or_bounded",
+      "assertion": "Extension code cannot terminate the host and errors explicitly."
+    },
+    {
+      "id": "context:getContextUsage",
+      "surface": "context.getContextUsage",
+      "kind": "context_probe",
+      "target": "getContextUsage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Returns unknown without a bounded host usage snapshot."
+    },
+    {
+      "id": "context:compact",
+      "surface": "context.compact",
+      "kind": "context_probe",
+      "target": "compact",
+      "expected": "explicit_or_bounded",
+      "assertion": "Compaction is host-owned and errors explicitly."
+    },
+    {
+      "id": "context:getSystemPrompt",
+      "surface": "context.getSystemPrompt",
+      "kind": "context_probe",
+      "target": "getSystemPrompt",
+      "expected": "explicit_or_bounded",
+      "assertion": "Exact effective prompt disclosure is rejected explicitly."
+    },
+    {
+      "id": "context:getSystemPromptOptions",
+      "surface": "context.getSystemPromptOptions",
+      "kind": "context_probe",
+      "target": "getSystemPromptOptions",
+      "expected": "explicit_or_bounded",
+      "assertion": "Returns only canonical cwd."
+    },
+    {
+      "id": "context:waitForIdle",
+      "surface": "context.waitForIdle",
+      "kind": "context_probe",
+      "target": "waitForIdle",
+      "expected": "explicit_or_bounded",
+      "assertion": "Command dispatch is treated as idle and returns immediately."
+    },
+    {
+      "id": "context:newSession",
+      "surface": "context.newSession",
+      "kind": "context_probe",
+      "target": "newSession",
+      "expected": "explicit_or_bounded",
+      "assertion": "Session replacement is rejected explicitly."
+    },
+    {
+      "id": "context:fork",
+      "surface": "context.fork",
+      "kind": "context_probe",
+      "target": "fork",
+      "expected": "explicit_or_bounded",
+      "assertion": "Session replacement is rejected explicitly."
+    },
+    {
+      "id": "context:navigateTree",
+      "surface": "context.navigateTree",
+      "kind": "context_probe",
+      "target": "navigateTree",
+      "expected": "explicit_or_bounded",
+      "assertion": "Tree mutation is rejected explicitly."
+    },
+    {
+      "id": "context:switchSession",
+      "surface": "context.switchSession",
+      "kind": "context_probe",
+      "target": "switchSession",
+      "expected": "explicit_or_bounded",
+      "assertion": "Session replacement is rejected explicitly."
+    },
+    {
+      "id": "context:reload",
+      "surface": "context.reload",
+      "kind": "context_probe",
+      "target": "reload",
+      "expected": "explicit_or_bounded",
+      "assertion": "Runtime reload is rejected explicitly."
+    },
+    {
+      "id": "context:replacement.sendMessage",
+      "surface": "context.replacement.sendMessage",
+      "kind": "context_probe",
+      "target": "replacement.sendMessage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Replacement-session messaging is rejected explicitly."
+    },
+    {
+      "id": "context:replacement.sendUserMessage",
+      "surface": "context.replacement.sendUserMessage",
+      "kind": "context_probe",
+      "target": "replacement.sendUserMessage",
+      "expected": "explicit_or_bounded",
+      "assertion": "Replacement-session messaging is rejected explicitly."
+    }
+  ]
+}

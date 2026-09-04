@@ -88,6 +88,7 @@ fn make_model(
         auth: Auth::none(),
         default_headers: http::HeaderMap::new(),
         transport: crate::types::EndpointTransport::Http,
+        runtime: crate::types::RequestRuntime::default(),
         timeout: std::time::Duration::from_secs(10),
     };
 
@@ -111,6 +112,7 @@ fn test_cross_protocol_canonical_immutability() {
         id: ToolCallId("call_1".to_string()),
         name: "test_tool".to_string(),
         arguments_json: "{}".to_string(),
+        argument_error: None,
     };
 
     let tool_result = ToolResult {
@@ -206,7 +208,11 @@ fn test_cross_protocol_anthropic_message_merging() {
 
 #[test]
 fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+        Protocol::GoogleGenerativeAi,
+    ] {
         let model = make_model(protocol, false, false, false, false);
         let req = Request {
             system: None,
@@ -216,6 +222,7 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
                         id: ToolCallId("call_missing".to_string()),
                         name: "lookup".to_string(),
                         arguments_json: "{}".to_string(),
+                        argument_error: None,
                     })],
                     model: model.spec.id.clone(),
                     protocol,
@@ -253,7 +260,13 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
                     .body,
             )
             .unwrap(),
-            Protocol::OpenAiChat => unreachable!(),
+            Protocol::GoogleGenerativeAi => serde_json::from_slice(
+                &crate::protocol::google::build_request(&model, &req)
+                    .unwrap()
+                    .body,
+            )
+            .unwrap(),
+            Protocol::OpenAiChat | Protocol::BedrockConverse => unreachable!(),
         };
         let serialized = body.to_string();
         assert!(serialized.contains("call_missing"));

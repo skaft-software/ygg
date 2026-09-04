@@ -1,8 +1,9 @@
-"""Strict, bounded configuration loading for the local stdio MCP bridge."""
+"""Strict, bounded configuration loading for explicit MCP transports."""
 
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ from pathlib import Path
 import re
 import stat
 from typing import Any, Mapping, Optional, Union
+from urllib.parse import urlsplit
 
 
 MAX_CONFIG_BYTES = 256 * 1024
@@ -17,13 +19,21 @@ MAX_TRUSTED_PROJECTS = 8
 MAX_SERVER_ID_BYTES = 32
 MAX_LABEL_BYTES = 64
 MAX_COMMAND_BYTES = 4096
+MAX_URL_BYTES = 4096
+MAX_CREDENTIAL_REFERENCE_BYTES = 64
 MAX_ARGS = 64
 MAX_ARGUMENT_BYTES = 16 * 1024
 MAX_ENVIRONMENT_ENTRIES = 32
 MAX_ENVIRONMENT_BYTES = 64 * 1024
 _SERVER_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CREDENTIAL_REFERENCE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,63}$")
+_HOSTNAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+STREAMABLE_HTTP_GATE_ERROR = (
+    "enabled Streamable HTTP MCP requires --experimental-streamable-http-mcp "
+    "from the process owner"
+)
 
 
 class ConfigError(ValueError):
@@ -54,8 +64,15 @@ class Limits:
 
 
 @dataclass(frozen=True)
+class HttpAuthConfig:
+    """A non-secret reference resolved only by a runtime credential adapter."""
+
+    credential: str
+
+
+@dataclass(frozen=True)
 class ServerConfig:
-    """One explicitly trusted local stdio server launch descriptor."""
+    """One explicitly trusted MCP server descriptor for one supported transport."""
 
     id: str
     label: str
@@ -69,6 +86,9 @@ class ServerConfig:
     request_timeout_ms: int = 30_000
     max_restarts: int = 5
     scope: str = "user"
+    transport: str = "stdio"
+    url: Optional[str] = field(default=None, repr=False)
+    auth: Optional[HttpAuthConfig] = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -110,12 +130,15 @@ _SERVER_FIELDS = {
     "args",
     "cwd",
     "env",
+    "url",
+    "auth",
     "enabled",
     "required",
     "startupTimeoutMs",
     "requestTimeoutMs",
     "maxRestarts",
 }
+_AUTH_FIELDS = {"type", "credential"}
 
 
 def default_config_path() -> Path:
@@ -132,13 +155,17 @@ def load_config(
     path: Optional[Union[os.PathLike[str], str]] = None,
     *,
     workspace: Optional[Union[os.PathLike[str], str]] = None,
+    experimental_streamable_http_mcp: bool = False,
 ) -> BridgeConfig:
     """Load one user file and its explicitly digest-pinned project files.
 
     A missing default user file is a valid empty configuration. An explicitly
     supplied missing file is an error. Project files are considered trusted
     only when the user file names an absolute path beneath the active
-    workspace's ``.ygg`` directory and pins its exact SHA-256 digest.
+    workspace's ``.ygg`` directory and pins its exact SHA-256 digest. Enabled
+    remote Streamable HTTP descriptors are accepted only when the trusted
+    extension process received the one-shot process-owner CLI opt-in; no
+    configuration, environment, or session field can supply that value.
     """
 
     explicit = path is not None
@@ -194,6 +221,14 @@ def load_config(
         seen_ids.update(server.id for server in project_servers)
         servers.extend(project_servers)
 
+    if (
+        any(
+            server.enabled and server.transport == "streamable-http"
+            for server in servers
+        )
+        and not experimental_streamable_http_mcp
+    ):
+        raise ConfigError(STREAMABLE_HTTP_GATE_ERROR)
     if len(servers) > limits.max_servers:
         raise ConfigError(f"configured servers exceed the {limits.max_servers}-server limit")
     if limits.max_result_bytes > limits.max_frame_bytes:
@@ -448,37 +483,17 @@ def _parse_servers(
             raise ConfigError(f"server {server_id} must be an object")
         _require_keys(descriptor, _SERVER_FIELDS, f"server {server_id}")
         transport = descriptor.get("transport", "stdio")
-        if transport != "stdio":
-            raise ConfigError(f"server {server_id} transport must be stdio in V1")
-        command = _bounded_text(
-            descriptor.get("command"),
-            f"server {server_id} command",
-            MAX_COMMAND_BYTES,
-        )
+        if not isinstance(transport, str) or transport not in {"stdio", "streamable-http"}:
+            raise ConfigError(
+                f"server {server_id} transport must be stdio or streamable-http"
+            )
         label = _bounded_text(
             descriptor.get("label", server_id),
             f"server {server_id} label",
             MAX_LABEL_BYTES,
         )
-        args_value = descriptor.get("args", [])
-        if not isinstance(args_value, list) or not all(isinstance(item, str) for item in args_value):
-            raise ConfigError(f"server {server_id} args must be an array of strings")
-        if len(args_value) > MAX_ARGS:
-            raise ConfigError(f"server {server_id} args exceed the {MAX_ARGS}-argument limit")
-        args = tuple(
-            _bounded_text(item, f"server {server_id} argument", MAX_ARGUMENT_BYTES, allow_empty=True)
-            for item in args_value
-        )
-        environment = _parse_environment(descriptor.get("env", {}), server_id)
         enabled = _boolean(descriptor.get("enabled", True), f"server {server_id} enabled")
         required = _boolean(descriptor.get("required", False), f"server {server_id} required")
-        cwd_value = descriptor.get("cwd")
-        if cwd_value is None:
-            cwd = default_cwd
-        else:
-            cwd_text = _bounded_text(cwd_value, f"server {server_id} cwd", MAX_COMMAND_BYTES)
-            candidate = Path(cwd_text)
-            cwd = (candidate if candidate.is_absolute() else config_dir / candidate).resolve()
         startup = _optional_bounded_integer(
             descriptor,
             "startupTimeoutMs",
@@ -500,6 +515,60 @@ def _parse_servers(
             0,
             8,
         )
+
+        if transport == "stdio":
+            _reject_transport_fields(descriptor, server_id, {"url", "auth"}, "stdio")
+            command = _bounded_text(
+                descriptor.get("command"),
+                f"server {server_id} command",
+                MAX_COMMAND_BYTES,
+            )
+            args_value = descriptor.get("args", [])
+            if not isinstance(args_value, list) or not all(
+                isinstance(item, str) for item in args_value
+            ):
+                raise ConfigError(f"server {server_id} args must be an array of strings")
+            if len(args_value) > MAX_ARGS:
+                raise ConfigError(f"server {server_id} args exceed the {MAX_ARGS}-argument limit")
+            args = tuple(
+                _bounded_text(
+                    item,
+                    f"server {server_id} argument",
+                    MAX_ARGUMENT_BYTES,
+                    allow_empty=True,
+                )
+                for item in args_value
+            )
+            environment = _parse_environment(descriptor.get("env", {}), server_id)
+            cwd_value = descriptor.get("cwd")
+            if cwd_value is None:
+                cwd = default_cwd
+            else:
+                cwd_text = _bounded_text(
+                    cwd_value, f"server {server_id} cwd", MAX_COMMAND_BYTES
+                )
+                candidate = Path(cwd_text)
+                cwd = (candidate if candidate.is_absolute() else config_dir / candidate).resolve()
+            url = None
+            auth = None
+        else:
+            _reject_transport_fields(
+                descriptor,
+                server_id,
+                {"command", "args", "cwd", "env"},
+                "streamable-http",
+            )
+            command = ""
+            args = ()
+            cwd = default_cwd
+            environment = {}
+            url = _parse_streamable_http_url(descriptor.get("url"), server_id)
+            auth = (
+                _parse_http_auth(descriptor["auth"], server_id)
+                if "auth" in descriptor
+                else None
+            )
+
         parsed.append(
             ServerConfig(
                 id=server_id,
@@ -514,9 +583,78 @@ def _parse_servers(
                 request_timeout_ms=request,
                 max_restarts=restarts,
                 scope=scope,
+                transport=transport,
+                url=url,
+                auth=auth,
             )
         )
     return parsed
+
+
+def _reject_transport_fields(
+    descriptor: Mapping[str, Any], server_id: str, fields: set[str], transport: str
+) -> None:
+    present = sorted(fields.intersection(descriptor))
+    if present:
+        joined = ", ".join(present)
+        raise ConfigError(
+            f"server {server_id} {transport} transport does not allow {joined}"
+        )
+
+
+def _parse_streamable_http_url(value: Any, server_id: str) -> str:
+    label = f"server {server_id} url"
+    url = _bounded_text(value, label, MAX_URL_BYTES)
+    if any(character.isspace() for character in url):
+        raise ConfigError(f"{label} must not contain whitespace")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as error:
+        raise ConfigError(f"{label} is not a valid absolute HTTP(S) URL") from error
+    if parts.scheme not in {"http", "https"} or not parts.netloc or not parts.hostname:
+        raise ConfigError(f"{label} must be an absolute http or https URL")
+    if parts.username is not None or parts.password is not None:
+        raise ConfigError(f"{label} must not contain credentials")
+    if "?" in url or "#" in url or parts.query or parts.fragment:
+        raise ConfigError(f"{label} must not contain a query or fragment")
+    if port is not None and not 1 <= port <= 65535:
+        raise ConfigError(f"{label} has an invalid port")
+    host = parts.hostname
+    assert host is not None
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        if not host.isascii() or not _HOSTNAME.fullmatch(host):
+            raise ConfigError(f"{label} has an invalid host")
+        loopback = False
+    else:
+        if literal.is_unspecified or literal.is_multicast:
+            raise ConfigError(f"{label} must not target an unspecified or multicast address")
+        loopback = literal.is_loopback
+    if parts.scheme == "http" and not loopback:
+        raise ConfigError(
+            f"{label} must use https; cleartext http is limited to a numeric loopback address"
+        )
+    return url
+
+
+def _parse_http_auth(value: Any, server_id: str) -> HttpAuthConfig:
+    if not isinstance(value, dict):
+        raise ConfigError(f"server {server_id} auth must be an object")
+    _require_keys(value, _AUTH_FIELDS, f"server {server_id} auth")
+    if value.get("type") != "bearer":
+        raise ConfigError(f"server {server_id} auth type must be bearer")
+    credential = _bounded_text(
+        value.get("credential"),
+        f"server {server_id} auth credential",
+        MAX_CREDENTIAL_REFERENCE_BYTES,
+    )
+    if not _CREDENTIAL_REFERENCE.fullmatch(credential):
+        raise ConfigError(
+            f"server {server_id} auth credential must be a bounded logical reference"
+        )
+    return HttpAuthConfig(credential=credential)
 
 
 def _parse_environment(value: Any, server_id: str) -> dict[str, str]:

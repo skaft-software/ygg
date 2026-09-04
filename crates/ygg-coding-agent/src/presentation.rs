@@ -12,7 +12,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ygg_agent::{AgentEvent, FinishReason, ToolError, ToolOutput, ToolOutputMediaKind};
-use ygg_ai::{AssistantPart, ModelSpec, Pricing, TokenRate};
+use ygg_ai::{
+    AssistantPart, ModelSpec, Pricing, ProviderLifecycle, ProviderLifecycleState, TokenRate,
+};
 
 pub fn provider_status_name(canonical: &str) -> String {
     let canonical = canonical.trim();
@@ -26,6 +28,21 @@ pub fn provider_status_name(canonical: &str) -> String {
         _ => None,
     };
     friendly.unwrap_or(canonical).to_owned()
+}
+
+/// Compact transient label for an opt-in endpoint readiness update.
+pub fn provider_lifecycle_label(provider: &str, lifecycle: &ProviderLifecycle) -> String {
+    let provider = provider_status_name(provider);
+    let label = match lifecycle.state {
+        ProviderLifecycleState::Queued => format!("{provider} queued"),
+        ProviderLifecycleState::Loading => format!("Loading {provider}"),
+        ProviderLifecycleState::Ready => format!("{provider} ready"),
+    };
+    lifecycle
+        .detail
+        .as_deref()
+        .filter(|detail| !detail.is_empty())
+        .map_or(label.clone(), |detail| format!("{label} · {detail}"))
 }
 
 /// Render a token rate as dollars per million tokens.
@@ -453,6 +470,12 @@ pub enum RunPhase {
     AwaitingProvider {
         provider: String,
     },
+    /// An opted-in HTTP endpoint is preparing a cold model before generation.
+    ProviderLifecycle {
+        provider: String,
+        state: ProviderLifecycleState,
+        detail: Option<String>,
+    },
     Thinking,
     StreamingResponse,
     PreparingToolCall,
@@ -771,6 +794,25 @@ impl RunTracker {
             AgentEvent::OutputMedia { .. } => {
                 run.transition(RunPhase::StreamingResponse, now);
             }
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // Readiness feedback is useful only before model output or
+                // tool work begins. Never let a delayed advisory comment move
+                // a visible response back into a waiting state.
+                if matches!(
+                    &run.phase,
+                    RunPhase::AwaitingProvider { .. } | RunPhase::ProviderLifecycle { .. }
+                ) {
+                    let provider = run.provider.clone();
+                    run.transition(
+                        RunPhase::ProviderLifecycle {
+                            provider,
+                            state: lifecycle.state,
+                            detail: lifecycle.detail.clone(),
+                        },
+                        now,
+                    );
+                }
+            }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 let provider = run.provider.clone();
                 run.transition(RunPhase::AwaitingProvider { provider }, now);
@@ -822,7 +864,9 @@ impl RunTracker {
                     now,
                 );
             }
-            AgentEvent::ToolProgress { .. } => {}
+            // Policy diagnostics are emitted to telemetry and the host
+            // protocol; they do not alter the interactive phase machine.
+            AgentEvent::ToolPolicyDecision { .. } | AgentEvent::ToolProgress { .. } => {}
             AgentEvent::DelegationUpdated { .. } => {}
             AgentEvent::ToolFinished { id, result, .. } => {
                 run.pending_tools.remove(&id.0);
@@ -1332,6 +1376,7 @@ mod tests {
                     id: ToolCallId(id.into()),
                     name: "read".into(),
                     arguments_json: "{\"path\":\"src/lib.rs\"}".into(),
+                    argument_error: None,
                 })],
                 model: ModelId("m".into()),
                 protocol: Protocol::OpenAiChat,
@@ -1356,6 +1401,44 @@ mod tests {
         assert_eq!(provider_status_name("openai-codex"), "Codex");
         assert_eq!(provider_status_name("custom-openai"), "local endpoint");
         assert_eq!(provider_status_name("private-relay-v2"), "private-relay-v2");
+    }
+
+    #[test]
+    fn lifecycle_labels_are_friendly_and_run_phases_do_not_regress() {
+        let lifecycle = ygg_ai::ProviderLifecycle {
+            state: ygg_ai::ProviderLifecycleState::Loading,
+            detail: Some("warming".into()),
+        };
+        assert_eq!(
+            provider_lifecycle_label("custom-openai", &lifecycle),
+            "Loading local endpoint · warming"
+        );
+
+        let now = Instant::now();
+        let mut tracker = RunTracker::default();
+        let id = tracker.begin_at("custom-openai", now).unwrap();
+        tracker.awaiting_provider(id);
+        tracker.apply_event_at(
+            id,
+            &AgentEvent::ProviderLifecycle {
+                lifecycle: lifecycle.clone(),
+            },
+            now,
+        );
+        assert!(matches!(
+            tracker.current().unwrap().phase(),
+            RunPhase::ProviderLifecycle {
+                state: ygg_ai::ProviderLifecycleState::Loading,
+                ..
+            }
+        ));
+
+        tracker.apply_event_at(id, &text_event(OutputChannel::Text), now);
+        tracker.apply_event_at(id, &AgentEvent::ProviderLifecycle { lifecycle }, now);
+        assert_eq!(
+            tracker.current().unwrap().phase(),
+            &RunPhase::StreamingResponse
+        );
     }
 
     #[test]

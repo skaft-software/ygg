@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
@@ -15,23 +15,34 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, ImageAnchor,
+    ImageCapabilities, ImagePlanner, ImageRegistry, ImageViewport, RichRenderer, TextEditor, TUI,
 };
-use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
+use ygg_agent::{
+    AgentEvent, EntryValue, OutputChannel, Session, ToolProgress, ToolProgressDecoration,
+};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
 
 use crate::config::Config;
-use crate::hydrate::{hydrate_transcript_at, hydrate_transcript_tail};
+use crate::hydrate::{
+    hydrate_transcript_at_with_image_budget, hydrate_transcript_tail_with_image_budget,
+    project_tool_images, tool_image_limits, ToolImageBudget, ToolImagePlaceholder, ToolResultImage,
+};
 #[cfg(test)]
 use crate::presentation::summarize_tool;
 use crate::presentation::{
-    summarize_tool_with_workspace, tool_failure_reason, tool_result_is_failure,
-    ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker, ToolDisplay,
+    provider_lifecycle_label, summarize_tool_with_workspace, tool_failure_reason,
+    tool_result_is_failure, ModelDisplayMetadata, PriceDisplay, RunId, RunOutcome, RunTracker,
+    ToolDisplay,
 };
 use crate::session_store::SessionMeta;
 use crate::tui::composer::{self, ComposedInput};
+use crate::tui::composer_surface::{
+    composer_editor_geometry, ComposerEditorCache, ComposerEditorGeometry,
+    ComposerEditorProjection, ComposerEditorSource,
+};
 use crate::tui::keymap::{EditAction, SlashMenuAction};
-use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
+use crate::tui::terminal::{force_restore, TerminalImageStore, TerminalSize, YggTerminal};
 #[cfg(test)]
 use crate::tui::theme::ThemeSurfaceChrome;
 use crate::tui::theme::{ModelLab, ThemeDensity, YggTheme};
@@ -39,14 +50,15 @@ use crate::tui::theme::{ModelLab, ThemeDensity, YggTheme};
 #[cfg(test)]
 use self::assistant_block::reasoning_heading_from_block;
 use self::assistant_block::AssistantBlock;
-use self::editor_layout::{
-    editor_column, editor_layout, editor_offset_at_column, normalize_paste, EditorLayoutCache,
-};
 use self::input_overlays::input_slash_suggestions;
 #[cfg(test)]
 use self::input_overlays::render_slash_suggestions;
 #[cfg(test)]
 use self::native_scrollback::{render_shell, render_shell_at, render_shell_update};
+pub(crate) use self::ordinary_surface::{
+    fit_prioritized_footer, footer_width, join_ordinary_metadata, render_ordinary_status,
+    FooterSegment, OrdinarySurfaceLifecycle, OrdinarySurfaceMetadata,
+};
 use self::output_window::bounded_tail_rows;
 #[cfg(test)]
 pub(crate) use self::panel_render::panel_render_test_hook;
@@ -72,7 +84,9 @@ pub use self::terminal_text::bounded_live_append;
 use self::terminal_text::{
     normalize_carriage_return_progress, sanitize_extension_tool_render_segments,
 };
-pub(crate) use self::terminal_text::{sanitize_for_terminal, sanitized_editor};
+pub(crate) use self::terminal_text::{
+    sanitize_for_terminal, sanitize_ordinary_surface_cell, EditorDisplayMap,
+};
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
 use self::transcript_cache::TranscriptCache;
@@ -109,6 +123,8 @@ fn is_subagent_tool(name: &str) -> bool {
 
 /// Maximum physical rows retained in a collapsed command-output tail.
 const COMPACT_EXEC_OUTPUT_ROWS: usize = 5;
+/// Maximum physical rows one inline tool image can reserve inside its tool card.
+const MAX_TOOL_IMAGE_RENDER_ROWS: u16 = 16;
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -181,6 +197,23 @@ enum TranscriptBlock {
     Compaction(Box<CompactionBlock>),
 }
 
+/// Current opt-in image display mode copied into each retained tool panel.
+/// It contains capability metadata only; image bytes stay in `ToolResultImage`.
+#[derive(Clone, Copy, Debug)]
+struct ToolImageRendering {
+    enabled: bool,
+    capabilities: ImageCapabilities,
+}
+
+impl Default for ToolImageRendering {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capabilities: ImageCapabilities::forced(None, None),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ToolPanel {
     id: ToolCallId,
@@ -188,6 +221,9 @@ struct ToolPanel {
     args: String,
     display: ToolDisplay,
     output: String,
+    /// Validated opaque image media, kept separate from text/copy output.
+    images: Vec<ToolResultImage>,
+    image_rendering: ToolImageRendering,
     finished: bool,
     is_error: bool,
     /// Wall time the call took, known once the outcome is final.
@@ -197,6 +233,9 @@ struct ToolPanel {
     /// sanitized segments; roles are resolved against the current theme only
     /// while rendering. The durable provider-visible `output` stays intact.
     extension_render_segments: Vec<ygg_agent::extension_process::ToolRenderSegment>,
+    /// One bounded, replaceable live-progress annotation. This is cleared once
+    /// the immutable tool result arrives and never enters session persistence.
+    progress_decoration: Option<ToolProgressDecoration>,
     /// Presentation-only delegated-worker event. It deliberately uses the
     /// ordinary tool block lifecycle so its margin dot, scrollback stability,
     /// and disclosure behavior match real tool calls without pretending that
@@ -236,11 +275,14 @@ impl ToolPanel {
             args,
             display,
             output,
+            images: Vec::new(),
+            image_rendering: ToolImageRendering::default(),
             finished,
             is_error,
             duration: None,
             failure_reason,
             extension_render_segments: Vec::new(),
+            progress_decoration: None,
             subagent_activity: None,
             model_lab,
             cached_diff: RefCell::new(None),
@@ -272,6 +314,51 @@ impl ToolPanel {
         self.output = subagent_activity_copy_text(view);
         self.cached_disclosure_sensitive.replace(None);
     }
+
+    /// Produce visual image reservations only. The returned DCS anchor contains
+    /// stable IDs/layout metadata but never protocol payload bytes; the terminal
+    /// adapter resolves it through its private image store.
+    fn image_rows(&self, width: u16) -> Vec<String> {
+        self.images
+            .iter()
+            .flat_map(|image| {
+                if !self.image_rendering.enabled {
+                    return vec![image.fallback_text(true)];
+                }
+                let Some(id) = image.id() else {
+                    return vec![image.fallback_text(false)];
+                };
+                let Some(terminal_image) = image.terminal_image() else {
+                    return vec![image.fallback_text(false)];
+                };
+                let viewport = ImageViewport::with_capabilities(
+                    width.max(1),
+                    MAX_TOOL_IMAGE_RENDER_ROWS,
+                    self.image_rendering.capabilities,
+                )
+                .expect("fixed nonzero tool image viewport is valid");
+                let plan =
+                    ImagePlanner::new(self.image_rendering.capabilities, tool_image_limits())
+                        .plan_place(id, &terminal_image, viewport);
+                match plan {
+                    Ok(plan) => match (plan.terminal_command(), plan.layout()) {
+                        (Some(command), Some(layout)) => {
+                            let mut rows = plan.semantic_rows();
+                            if let Some(first) = rows.first_mut() {
+                                first.insert_str(
+                                    0,
+                                    &ImageAnchor::new(command.protocol(), id, layout).marker(),
+                                );
+                            }
+                            rows
+                        }
+                        _ => plan.semantic_rows(),
+                    },
+                    Err(_) => vec![image.fallback_text(false)],
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -285,8 +372,30 @@ struct QueuedSteering {
 
 #[derive(Clone, Debug)]
 enum ShellOverlay {
+    /// Legacy one-shot text overlay retained for transient compatibility paths
+    /// that do not yet own an ordinary report record.
     Text(String),
+    /// A scrollable, semantic report using the same title/purpose/status/action
+    /// contract as ordinary pickers without becoming a persistent dashboard.
+    Report(ReportOverlay),
+}
+
+/// Body data for an ordinary report. Text is sanitized at the producer boundary;
+/// only explicit, internally styled content may retain trusted theme ANSI.
+#[derive(Clone, Debug)]
+enum ReportBody {
+    Text { text: String, styled: bool },
     Context(crate::tui::context::ContextReport),
+}
+
+/// Mutable presentation state for a report over the transcript viewport.
+/// `scroll_from_top` starts at the report heading so help and accounting reports
+/// retain their task context before a reader chooses to inspect later rows.
+#[derive(Clone, Debug)]
+struct ReportOverlay {
+    surface: OrdinarySurfaceMetadata,
+    body: ReportBody,
+    scroll_from_top: usize,
 }
 
 /// Scope used by the session picker.
@@ -361,8 +470,9 @@ pub(crate) struct PickerState {
     pub(crate) confirming_delete: bool,
     /// The active rename buffer, when Ctrl+R has entered rename mode.
     pub(crate) rename: Option<String>,
-    /// `(message, expiration)` for transient picker status text.
-    pub(crate) message: Option<(String, Instant)>,
+    /// Typed ordinary title, purpose, and lifecycle state. Unlike the former
+    /// free-form message tuple, rendering cannot infer tone from its wording.
+    pub(crate) surface: OrdinarySurfaceMetadata,
     pub(crate) current_session_path: Option<PathBuf>,
 }
 
@@ -380,7 +490,10 @@ impl PickerState {
             scroll: 0,
             confirming_delete: false,
             rename: None,
-            message: None,
+            surface: OrdinarySurfaceMetadata::with_purpose(
+                "Resume Session",
+                "Select a saved session to continue",
+            ),
             current_session_path,
         }
     }
@@ -404,6 +517,7 @@ pub(crate) struct ForkMessage {
 /// State for the `/fork` message selector.
 #[derive(Clone, Debug)]
 pub(crate) struct MessagePicker {
+    pub(crate) surface: OrdinarySurfaceMetadata,
     pub(crate) messages: Vec<ForkMessage>,
     pub(crate) selected: usize,
 }
@@ -411,6 +525,10 @@ pub(crate) struct MessagePicker {
 impl MessagePicker {
     pub(crate) fn new(messages: Vec<ForkMessage>) -> Self {
         Self {
+            surface: OrdinarySurfaceMetadata::with_purpose(
+                "Fork from Message",
+                "Select a message to copy its path into a new session",
+            ),
             selected: messages.len().saturating_sub(1),
             messages,
         }
@@ -423,7 +541,7 @@ impl MessagePicker {
 pub(crate) enum Panel {
     /// Select-list panel (model picker, session picker, or thinking picker).
     SelectList {
-        title: String,
+        surface: OrdinarySurfaceMetadata,
         items: Vec<String>,
         descriptions: Vec<Option<String>>,
         selected: usize,
@@ -470,6 +588,10 @@ pub(crate) enum PanelAction {
     SelectExtension(Vec<String>),
     /// Select one subagent presentation node.
     SelectSubagent(Vec<String>),
+    /// Select one step in guided provider onboarding. Kept distinct from
+    /// extension selection so ordinary-surface consumers retain the workflow
+    /// purpose rather than inferring it from labels.
+    ProviderSetup(Vec<String>),
     /// Drive the enhanced session browser without copying its row data.
     SessionPicker,
     /// Drive the user-message fork browser without copying its row data.
@@ -502,6 +624,17 @@ pub(crate) enum PanelResult {
     Select(String),
     /// User cancelled (Esc).
     Cancel,
+}
+
+/// Result of dispatching a key to a transient report overlay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlayInputResult {
+    /// The legacy overlay owner retains its historical any-key dismissal path.
+    Legacy,
+    /// The report remains open after consuming navigation.
+    Consumed,
+    /// The report acknowledged dismissal and has closed itself.
+    Closed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -598,6 +731,54 @@ struct ViewportAnchor {
     semantic: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShellExtensionUi {
+    pub statuses: Vec<ShellExtensionUiLine>,
+    pub above_editor: Vec<ShellExtensionUiLine>,
+    pub below_editor: Vec<ShellExtensionUiLine>,
+    pub working: Option<ShellExtensionWorking>,
+    pub hidden_thinking_label: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellExtensionUiLine {
+    pub text: String,
+    pub style_role: Option<String>,
+    pub priority: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellExtensionWorking {
+    pub message: Option<String>,
+    pub visible: Option<bool>,
+    pub frames: Option<Vec<String>>,
+    pub interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellEditorSnapshot {
+    pub text: String,
+    pub cursor: usize,
+    pub revision: u64,
+    pub focused: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellAutocompleteItem {
+    pub value: String,
+    pub label: String,
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShellAutocompleteOverlay {
+    text: String,
+    cursor: usize,
+    revision: u64,
+    prefix: String,
+    items: Vec<ShellAutocompleteItem>,
+}
+
 #[derive(Default)]
 pub(crate) struct ShellState {
     /// Active interactive panel, if any.
@@ -611,6 +792,14 @@ pub(crate) struct ShellState {
     pub(crate) theme: YggTheme,
     /// Whether this session uses explicit approval gates instead of full host access.
     pub(crate) safe_mode: bool,
+    /// Opt-in terminal-image mode and conservative terminal capability state.
+    image_rendering: ToolImageRendering,
+    /// Monotonic image IDs and the private backend payload map stay separate
+    /// from semantic transcript text.
+    image_registry: ImageRegistry,
+    terminal_images: TerminalImageStore,
+    /// Session-wide retained image accounting shared by live and resumed tools.
+    tool_image_budget: ToolImageBudget,
     /// Theme swap revision. The retained terminal renderer uses this
     /// to repaint the complete visible viewport even when some logical rows
     /// (notably blank separators) are byte-identical across themes.
@@ -667,7 +856,19 @@ pub(crate) struct ShellState {
     /// Persistent rich renderers: their syntax caches survive token updates.
     rich_renderer: RefCell<Option<RichRenderer>>,
     reasoning_renderer: RefCell<Option<RichRenderer>>,
-    pub(crate) editor: String,
+    /// Reusable text model for the normal composer draft and cursor.
+    pub(crate) editor: TextEditor,
+    /// Cached app-owned display mapping and generic visual layout for the
+    /// active composer source. It is invalidated by the editor text revision,
+    /// tool prompt revision, or chrome-aware text width; cursor motion updates
+    /// only the structured projection over the shared rows.
+    composer_editor_cache: RefCell<Option<ComposerEditorCache>>,
+    /// Sticky desired visual column while moving vertically through the
+    /// composer. Horizontal/edit actions clear it.
+    composer_preferred_column: Option<usize>,
+    /// Changes whenever the ephemeral tool prompt changes without mutating the
+    /// normal editor draft.
+    tool_input_revision: u64,
     /// Ephemeral tool-owned prompt rendered in place of the editor. Secret
     /// keystrokes never enter `editor` or any transcript/session structure.
     pub(crate) tool_input_prompt: Option<String>,
@@ -690,8 +891,11 @@ pub(crate) struct ShellState {
     slash_selection: usize,
     slash_scroll: usize,
     slash_popup_dismissed: bool,
-    /// Byte offset into `editor`; always kept at a UTF-8 character boundary.
-    pub(crate) editor_cursor: usize,
+    /// Current host-projected extension UI. It contains only semantic text and
+    /// finite roles; rendering remains owned by the shell theme and layout.
+    extension_ui: ShellExtensionUi,
+    /// One bounded extension autocomplete result awaiting explicit host accept.
+    extension_autocomplete: Option<ShellAutocompleteOverlay>,
     status_detail: String,
     pub(crate) error: Option<String>,
     overlay: Option<ShellOverlay>,
@@ -807,9 +1011,6 @@ pub(crate) struct ShellState {
     /// Start of the animated invocation header. It remains mutable until the
     /// first real conversation block so model changes can recolor it in place.
     startup_card_started_at: Option<Instant>,
-    /// Cached editor layout so input and transcript updates do not repeatedly
-    /// re-wrap an unchanged prompt.
-    cached_layout: RefCell<Option<EditorLayoutCache>>,
 }
 
 const STATUS_RAINBOW_DURATION: Duration = Duration::from_secs(2);
@@ -827,7 +1028,67 @@ fn status_rainbow_strength_at(reasoning: Option<&str>, elapsed: Option<Duration>
     (remaining_ms.saturating_mul(100) / duration_ms).min(100) as u16
 }
 
+/// Lifecycle labels are generated locally from a finite state enum. This
+/// recognizer is used only to avoid retaining them as transcript history at a
+/// turn boundary; it deliberately excludes unrelated activity labels.
+fn is_provider_lifecycle_status(heading: &str) -> bool {
+    let base = heading.split_once(" · ").map_or(heading, |(base, _)| base);
+    base.starts_with("Loading ") || base.ends_with(" queued") || base.ends_with(" ready")
+}
+
+fn invalidate_extension_autocomplete(state: &mut ShellState) {
+    state.extension_autocomplete = None;
+}
+
+fn normal_editor_focused(state: &ShellState) -> bool {
+    state.panel.is_none() && state.overlay.is_none() && state.tool_input_prompt.is_none()
+}
+
 impl ShellState {
+    /// Borrow the one app-owned safe display map and generic visual layout for
+    /// the current composer source and chrome-aware text cell width.
+    pub(crate) fn composer_editor_projection(
+        &self,
+        geometry: ComposerEditorGeometry,
+    ) -> Ref<'_, ComposerEditorProjection> {
+        let (source, text, cursor) = match &self.tool_input_prompt {
+            Some(prompt) => (
+                ComposerEditorSource::ToolPrompt(self.tool_input_revision),
+                prompt.as_str(),
+                prompt.len(),
+            ),
+            None => (
+                ComposerEditorSource::Draft(self.editor.text_revision()),
+                self.editor.text(),
+                self.editor.cursor(),
+            ),
+        };
+        let text_width = geometry.text_width();
+        let needs_refresh = self
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cache| !cache.matches(source, text_width));
+        if needs_refresh {
+            self.composer_editor_cache
+                .replace(Some(ComposerEditorCache::new(
+                    source, text, cursor, text_width,
+                )));
+        } else {
+            self.composer_editor_cache
+                .borrow_mut()
+                .as_mut()
+                .expect("composer editor cache is initialized")
+                .refresh_cursor(cursor);
+        }
+        Ref::map(self.composer_editor_cache.borrow(), |cache| {
+            cache
+                .as_ref()
+                .expect("composer editor cache is initialized")
+                .projection()
+        })
+    }
+
     fn invalidate_transcript(&mut self) {
         self.transcript_cache.get_mut().dirty = true;
     }
@@ -877,7 +1138,111 @@ impl ShellState {
         self.invalidate_transcript_layout();
     }
 
-    fn push_block(&mut self, block: TranscriptBlock) {
+    fn update_image_rendering(&mut self, enabled: bool, capabilities: ImageCapabilities) {
+        self.image_rendering = ToolImageRendering {
+            enabled,
+            capabilities,
+        };
+        for block in &mut self.transcript {
+            if let TranscriptBlock::Tool(panel) = block {
+                panel.image_rendering = self.image_rendering;
+            }
+        }
+        self.invalidate_transcript_layout();
+    }
+
+    /// Assign stable IDs and register only the opaque validated payloads for
+    /// terminal placement. Registry exhaustion becomes a bounded text fallback.
+    fn register_tool_images(&mut self, mut images: Vec<ToolResultImage>) -> Vec<ToolResultImage> {
+        for image in &mut images {
+            let Some(terminal_image) = image.terminal_image() else {
+                continue;
+            };
+            match self.image_registry.place() {
+                Ok(action) => {
+                    let id = action.id();
+                    image.set_id(id);
+                    self.terminal_images.register(id, terminal_image);
+                }
+                Err(_) => {
+                    image.replace_with_placeholder(ToolImagePlaceholder::TerminalRegistryLimit)
+                }
+            }
+        }
+        images
+    }
+
+    /// Retire IDs before their semantic anchors are replaced. `ImageRegistry`
+    /// never reuses a retired value, so a replay cannot mistake stale terminal
+    /// pixels for a newly hydrated image with the same logical position.
+    fn retire_tool_image_ids(&mut self) {
+        let registry = &mut self.image_registry;
+        for block in &mut self.transcript {
+            let TranscriptBlock::Tool(panel) = block else {
+                continue;
+            };
+            for image in &mut panel.images {
+                if let Some(id) = image.id() {
+                    let _ = registry.delete(id);
+                    image.clear_id();
+                }
+            }
+        }
+    }
+
+    /// Discard terminal-owned payload references before replacing the logical
+    /// transcript. The TUI still sees old Kitty anchors and performs its normal
+    /// targeted/destructive cleanup during the next replay.
+    fn reset_terminal_images(&mut self) {
+        self.retire_tool_image_ids();
+        self.terminal_images.clear();
+        self.tool_image_budget = ToolImageBudget::default();
+    }
+
+    /// Rebuild IDs/store after deferred history materialization. The walk is
+    /// chronological, so an active local tail consumes whatever remains after
+    /// the durable snapshot and cannot exceed the same session budget.
+    fn rebuild_terminal_images(&mut self) {
+        self.retire_tool_image_ids();
+        self.terminal_images.clear();
+        let store = self.terminal_images.clone();
+        let registry = &mut self.image_registry;
+        let mut budget = ToolImageBudget::default();
+        for block in &mut self.transcript {
+            let TranscriptBlock::Tool(panel) = block else {
+                continue;
+            };
+            for image in &mut panel.images {
+                image.clear_id();
+                let Some(bytes) = image.byte_len() else {
+                    continue;
+                };
+                if let Err(reason) = budget.retain_existing(bytes) {
+                    image.replace_with_placeholder(reason);
+                    continue;
+                }
+                let Some(terminal_image) = image.terminal_image() else {
+                    continue;
+                };
+                match registry.place() {
+                    Ok(action) => {
+                        let id = action.id();
+                        image.set_id(id);
+                        store.register(id, terminal_image);
+                    }
+                    Err(_) => {
+                        image.replace_with_placeholder(ToolImagePlaceholder::TerminalRegistryLimit)
+                    }
+                }
+            }
+        }
+        self.tool_image_budget = budget;
+    }
+
+    fn push_block(&mut self, mut block: TranscriptBlock) {
+        if let TranscriptBlock::Tool(panel) = &mut block {
+            panel.image_rendering = self.image_rendering;
+        }
         let commit_id = self.next_transcript_commit_id.0;
         self.next_transcript_commit_id.0 = commit_id
             .checked_add(1)
@@ -894,7 +1259,10 @@ impl ShellState {
         self.invalidate_transcript();
     }
 
-    fn insert_block(&mut self, index: usize, block: TranscriptBlock) {
+    fn insert_block(&mut self, index: usize, mut block: TranscriptBlock) {
+        if let TranscriptBlock::Tool(panel) = &mut block {
+            panel.image_rendering = self.image_rendering;
+        }
         let index = index.min(self.transcript.len());
         let commit_id = self.next_transcript_commit_id.0;
         self.next_transcript_commit_id.0 = commit_id
@@ -1161,6 +1529,30 @@ impl ShellState {
         self.open_activity_status(Some("Working"), false);
     }
 
+    /// Replace the current transient liveness row with an opted-in provider
+    /// readiness label. It remains presentation-only and is removed when real
+    /// model output or a terminal run outcome arrives.
+    fn set_provider_lifecycle_status(&mut self, label: String) {
+        if let Some(index) = self.active_reasoning {
+            if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index) {
+                let replaceable = reasoning.text.is_empty()
+                    && !reasoning.show_reasoning_hint
+                    && reasoning
+                        .reasoning_heading
+                        .as_deref()
+                        .is_some_and(|heading| {
+                            heading == "Working" || is_provider_lifecycle_status(heading)
+                        });
+                if replaceable {
+                    reasoning.reasoning_heading = Some(label);
+                    self.touch_block(index);
+                }
+            }
+            return;
+        }
+        self.open_activity_status(Some(&label), false);
+    }
+
     fn open_activity_status(&mut self, label: Option<&str>, show_reasoning_hint: bool) {
         if self.active_reasoning.is_some() {
             return;
@@ -1247,10 +1639,16 @@ impl ShellState {
                 {
                     if existing.text.is_empty()
                         && !existing.show_reasoning_hint
-                        && existing.reasoning_heading.as_deref() == Some("Working")
+                        && existing
+                            .reasoning_heading
+                            .as_deref()
+                            .is_some_and(|heading| {
+                                heading == "Working" || is_provider_lifecycle_status(heading)
+                            })
                     {
-                        // A generic request placeholder becomes `Thinking` only
-                        // when the provider actually emits reasoning content.
+                        // A generic or lifecycle request placeholder becomes
+                        // `Thinking` only when the provider actually emits
+                        // reasoning content.
                         existing.reasoning_heading = None;
                         existing.show_reasoning_hint = true;
                     }
@@ -1402,10 +1800,23 @@ impl ShellState {
                 Some(TranscriptBlock::Reasoning(reasoning))
                     if reasoning.text.is_empty()
                         && !reasoning.show_reasoning_hint
-                        && reasoning.reasoning_heading.as_deref() == Some("Working")
+                        && reasoning.reasoning_heading.as_deref().is_some_and(|heading| {
+                            heading == "Working" || is_provider_lifecycle_status(heading)
+                        })
             )
         });
-        if !working {
+        if working {
+            if let Some(index) = self.active_reasoning {
+                if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
+                {
+                    // Lifecycle labels are ephemeral; turn completion resumes
+                    // the ordinary generic liveness row rather than retaining
+                    // endpoint telemetry in the transcript.
+                    reasoning.reasoning_heading = Some("Working".into());
+                    self.touch_block(index);
+                }
+            }
+        } else {
             if let Some(index) = self.active_reasoning.take() {
                 self.unregister_active_event(index);
                 if let Some(TranscriptBlock::Reasoning(reasoning)) = self.transcript.get_mut(index)
@@ -1861,7 +2272,13 @@ impl InteractiveShell {
         if !theme.capabilities().interactive {
             anyhow::bail!("interactive terminal capabilities are unavailable");
         }
-        let terminal = YggTerminal::enter_with_mouse(size.clone(), capture_mouse)?;
+        let image_store = TerminalImageStore::default();
+        let terminal = YggTerminal::enter_with_mouse_and_images(
+            size.clone(),
+            capture_mouse,
+            image_store.clone(),
+        )?;
+        let image_capabilities = terminal.image_capabilities();
         let initial_size = *size.lock().expect("terminal size mutex poisoned");
         let state = SharedState::new(ShellState {
             theme,
@@ -1869,6 +2286,11 @@ impl InteractiveShell {
             follow_tail: true,
             application_viewport_requested: capture_mouse,
             startup_card_started_at: Some(Instant::now()),
+            image_rendering: ToolImageRendering {
+                enabled: false,
+                capabilities: image_capabilities,
+            },
+            terminal_images: image_store,
             ..ShellState::default()
         });
         let (render_tx, render_rx) = mpsc::sync_channel(1);
@@ -1950,7 +2372,18 @@ impl InteractiveShell {
         if self.render_thread.is_some() || self.tui.is_some() {
             return Ok(());
         }
-        let terminal = YggTerminal::enter_with_mouse(self.size.clone(), self.capture_mouse)?;
+        let image_store = self.state.borrow().terminal_images.clone();
+        let terminal = YggTerminal::enter_with_mouse_and_images(
+            self.size.clone(),
+            self.capture_mouse,
+            image_store,
+        )?;
+        let image_capabilities = terminal.image_capabilities();
+        {
+            let mut state = self.state.borrow_mut();
+            let enabled = state.image_rendering.enabled;
+            state.update_image_rendering(enabled, image_capabilities);
+        }
         let current_size = *self.size.lock().expect("terminal size mutex poisoned");
         self.set_size(current_size.0, current_size.1);
         let (render_tx, render_rx) = mpsc::sync_channel(1);
@@ -2127,6 +2560,25 @@ impl InteractiveShell {
                 // provider retry. TurnFinished carries the durable assembled
                 // message; embedded callers receive the payload here directly.
             }
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // The run tracker accepts the event but deliberately refuses a
+                // late readiness update once real output or tool work began.
+                // Keep the mutable transcript status aligned with that phase.
+                let visible = matches!(
+                    state.run.current().map(|run| run.phase()),
+                    Some(crate::presentation::RunPhase::ProviderLifecycle { .. })
+                );
+                if visible {
+                    let provider = state
+                        .run
+                        .current()
+                        .map(|run| run.endpoint())
+                        .unwrap_or(state.provider.as_str())
+                        .to_owned();
+                    let label = provider_lifecycle_label(&provider, lifecycle);
+                    state.set_provider_lifecycle_status(label);
+                }
+            }
             AgentEvent::ProviderRetry { .. } | AgentEvent::CandidateRejected { .. } => {
                 state.discard_streaming_blocks();
                 state.open_working_status();
@@ -2241,12 +2693,17 @@ impl InteractiveShell {
                     state.register_active_event(index);
                 }
             }
+            // The tool panel retains the model-facing failure text; detailed
+            // policy diagnostics are intentionally available through telemetry
+            // and the native host protocol instead of the transcript.
+            AgentEvent::ToolPolicyDecision { .. } => {}
             AgentEvent::ToolProgress { id, progress } => {
                 let index = state.tool_panels.get(id).copied();
                 let refreshes_compact_tail = matches!(
                     progress,
                     ToolProgress::Output { .. }
                         | ToolProgress::Status(_)
+                        | ToolProgress::Decoration(_)
                         | ToolProgress::Dropped { .. }
                 );
                 if let Some(panel) = state.tool_output_mut(id) {
@@ -2256,6 +2713,9 @@ impl InteractiveShell {
                         }
                         ToolProgress::Status(message) => {
                             bounded_live_append(&mut panel.output, &format!("{message}\n"));
+                        }
+                        ToolProgress::Decoration(decoration) => {
+                            panel.progress_decoration = Some(decoration.clone());
                         }
                         ToolProgress::Confirmation(request) => {
                             bounded_live_append(
@@ -2294,6 +2754,22 @@ impl InteractiveShell {
                 result,
                 duration,
             } => {
+                let index = state.tool_panels.get(id).copied();
+                let completed_images = if index.is_some() {
+                    match result {
+                        Ok(output) => project_tool_images(
+                            output.content_parts().iter().filter_map(|part| match part {
+                                ygg_agent::ToolOutputContentPart::Media(media) => Some(media),
+                                ygg_agent::ToolOutputContentPart::Text(_) => None,
+                            }),
+                            &mut state.tool_image_budget,
+                        ),
+                        Err(_) => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                let completed_images = state.register_tool_images(completed_images);
                 let estimated_result_tokens = match result {
                     Ok(output) => output.media().iter().fold(
                         crate::compaction::estimate_text_tokens(&output.text),
@@ -2304,7 +2780,6 @@ impl InteractiveShell {
                     Err(error) => crate::compaction::estimate_text_tokens(&error.message),
                 }
                 .saturating_add(8);
-                let index = state.tool_panels.get(id).copied();
                 let mut completed_name = String::new();
                 if let Some(panel) = state.tool_output_mut(id) {
                     completed_name = panel.name.clone();
@@ -2312,6 +2787,8 @@ impl InteractiveShell {
                     panel.duration = Some(*duration);
                     panel.is_error = tool_result_is_failure(&panel.name, result);
                     panel.failure_reason = tool_failure_reason(&panel.name, result);
+                    panel.images = completed_images;
+                    panel.progress_decoration = None;
                     match result {
                         Ok(output) => {
                             panel.display.mark_media_read(output.media_kinds());
@@ -2545,15 +3022,15 @@ impl InteractiveShell {
         }
         state.ledger.restore(attachments);
         let restored = displays.join("\n\n");
-        let current = std::mem::take(&mut state.editor);
-        state.editor = if current.trim().is_empty() {
+        let current = state.editor.take_text();
+        state.editor.set_text(if current.trim().is_empty() {
             restored
         } else if restored.is_empty() {
             current
         } else {
             format!("{restored}\n\n{current}")
-        };
-        state.editor_cursor = state.editor.len();
+        });
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn apply_edit(&mut self, action: EditAction) {
@@ -2566,128 +3043,66 @@ impl InteractiveShell {
                 | EditAction::Newline
         );
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = state.editor_cursor.min(state.editor.len());
-        match action {
-            EditAction::Char(character) => {
-                let cursor = state.editor_cursor;
-                state.editor.insert(cursor, character);
-                state.editor_cursor = cursor + character.len_utf8();
+        let geometry = composer_editor_geometry(&state, state.size.0);
+        let visual_navigation = matches!(
+            &action,
+            EditAction::Up | EditAction::Down | EditAction::Home | EditAction::End
+        );
+
+        if visual_navigation && state.tool_input_prompt.is_none() {
+            // The display copy can differ from source when controls are
+            // visualized or tabs use a row-relative width. Ask the cached
+            // generic projection for visual movement, then map the trusted
+            // display boundary back into the source editor.
+            let mut preferred_column = state.composer_preferred_column;
+            let target = {
+                let projection = state.composer_editor_projection(geometry);
+                projection.visual_source_target(&action, &mut preferred_column)
+            };
+            state.composer_preferred_column = preferred_column;
+            if let Some(target) = target {
+                state.editor.set_cursor(target);
             }
-            EditAction::Paste(text) => {
-                let pasted = normalize_paste(&text);
-                match composer::classify_paste(&pasted) {
-                    composer::PasteKind::Verbatim => {
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &pasted);
-                        state.editor_cursor = cursor + pasted.len();
-                    }
-                    composer::PasteKind::LargeText => {
-                        let chip = state.ledger.attach_pasted_text(pasted);
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &chip);
-                        state.editor_cursor = cursor + chip.len();
-                    }
-                    composer::PasteKind::MediaFile(path) => {
-                        let modalities = state.input_modalities;
-                        match state.ledger.attach_media(&path, modalities) {
-                            Ok(chip) => {
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &chip);
-                                state.editor_cursor = cursor + chip.len();
-                            }
-                            Err(error) => {
-                                state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &pasted);
-                                state.editor_cursor = cursor + pasted.len();
+        } else {
+            state.composer_preferred_column = None;
+            match action {
+                EditAction::Paste(text) => {
+                    // Attachment policy remains shell-owned, but the reusable
+                    // editor is the sole authority for normalized text insertion
+                    // and cursor movement.
+                    let pasted = TextEditor::normalize_paste(&text);
+                    let inserted = match composer::classify_paste(&pasted) {
+                        composer::PasteKind::Verbatim | composer::PasteKind::NonMediaFile(_) => {
+                            pasted
+                        }
+                        composer::PasteKind::LargeText => state.ledger.attach_pasted_text(pasted),
+                        composer::PasteKind::MediaFile(path) => {
+                            let modalities = state.input_modalities;
+                            match state.ledger.attach_media(&path, modalities) {
+                                Ok(chip) => chip,
+                                Err(error) => {
+                                    state.push_block(TranscriptBlock::Notice(error.to_string()));
+                                    pasted
+                                }
                             }
                         }
-                    }
-                    composer::PasteKind::DocumentFile(path) => {
-                        match state.ledger.attach_file_reference(&path) {
-                            Ok(chip) => {
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &chip);
-                                state.editor_cursor = cursor + chip.len();
-                            }
-                            Err(error) => {
-                                state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                let cursor = state.editor_cursor;
-                                state.editor.insert_str(cursor, &pasted);
-                                state.editor_cursor = cursor + pasted.len();
+                        composer::PasteKind::DocumentFile(path) => {
+                            match state.ledger.attach_file_reference(&path) {
+                                Ok(chip) => chip,
+                                Err(error) => {
+                                    state.push_block(TranscriptBlock::Notice(error.to_string()));
+                                    pasted
+                                }
                             }
                         }
-                    }
-                    composer::PasteKind::NonMediaFile(_) => {
-                        let cursor = state.editor_cursor;
-                        state.editor.insert_str(cursor, &pasted);
-                        state.editor_cursor = cursor + pasted.len();
-                    }
-                }
-            }
-            EditAction::Backspace => {
-                if state.editor_cursor > 0 {
-                    let previous = state.editor[..state.editor_cursor]
-                        .char_indices()
-                        .last()
-                        .map_or(0, |(offset, _)| offset);
-                    let cursor = state.editor_cursor;
-                    state.editor.replace_range(previous..cursor, "");
-                    state.editor_cursor = previous;
-                }
-            }
-            EditAction::Delete => {
-                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
-                    let end = state.editor_cursor + character.len_utf8();
-                    let cursor = state.editor_cursor;
-                    state.editor.replace_range(cursor..end, "");
-                }
-            }
-            EditAction::Newline => {
-                let cursor = state.editor_cursor;
-                state.editor.insert(cursor, '\n');
-                state.editor_cursor = cursor + 1;
-            }
-            EditAction::Left => {
-                if state.editor_cursor > 0 {
-                    state.editor_cursor = state.editor[..state.editor_cursor]
-                        .char_indices()
-                        .last()
-                        .map_or(0, |(offset, _)| offset);
-                }
-            }
-            EditAction::Right => {
-                if let Some(character) = state.editor[state.editor_cursor..].chars().next() {
-                    state.editor_cursor += character.len_utf8();
-                }
-            }
-            EditAction::Up | EditAction::Down => {
-                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
-                let last_row = layout.lines.len().saturating_sub(1);
-                if matches!(action, EditAction::Up) && layout.cursor_row == 0 {
-                    state.editor_cursor = 0;
-                } else if matches!(action, EditAction::Down) && layout.cursor_row == last_row {
-                    state.editor_cursor = state.editor.len();
-                } else {
-                    let current = &layout.lines[layout.cursor_row];
-                    let target_row = if matches!(action, EditAction::Up) {
-                        layout.cursor_row - 1
-                    } else {
-                        layout.cursor_row + 1
                     };
-                    let column = editor_column(&state.editor, current, state.editor_cursor);
-                    state.editor_cursor =
-                        editor_offset_at_column(&state.editor, &layout.lines[target_row], column);
+                    state
+                        .editor
+                        .apply(EditAction::Paste(inserted), geometry.text_width());
                 }
-            }
-            EditAction::Home | EditAction::End => {
-                let layout = editor_layout(&state.editor, state.editor_cursor, state.size.0);
-                let line = &layout.lines[layout.cursor_row];
-                state.editor_cursor = if matches!(action, EditAction::Home) {
-                    line.start
-                } else {
-                    line.visible_end
-                };
+                action => {
+                    state.editor.apply(action, geometry.text_width());
+                }
             }
         }
 
@@ -2696,8 +3111,8 @@ impl InteractiveShell {
             state.slash_scroll = 0;
             state.slash_popup_dismissed = false;
         }
-        if state.editor_cursor == state.editor.len()
-            && composer::active_mention(&state.editor)
+        if state.editor.cursor() == state.editor.text().len()
+            && composer::active_mention(state.editor.text())
                 .is_some_and(|query| !composer::is_path_query(query))
             && state.file_index.is_none()
         {
@@ -2705,12 +3120,13 @@ impl InteractiveShell {
                 state.file_index = Some(composer::workspace_files(&root, 10_000));
             }
         }
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Complete a unique slash-command prefix at the end of the prompt.
     pub fn complete_slash_command(&mut self) {
         let mut state = self.state.borrow_mut();
-        if state.editor_cursor != state.editor.len() {
+        if state.editor.cursor() != state.editor.text().len() {
             return;
         }
         let suggestions = input_slash_suggestions(&state);
@@ -2720,9 +3136,9 @@ impl InteractiveShell {
                 suggestion.name,
                 if suggestion.accepts_argument { " " } else { "" }
             );
-            state.editor = completed;
-            state.editor_cursor = state.editor.len();
+            state.editor.set_text(completed);
             state.slash_popup_dismissed = true;
+            invalidate_extension_autocomplete(&mut state);
         }
     }
 
@@ -2766,13 +3182,13 @@ impl InteractiveShell {
             }
             SlashMenuAction::Select => {
                 let command = &suggestions[state.slash_selection];
-                state.editor = format!(
+                state.editor.set_text(format!(
                     "/{}{}",
                     command.name,
                     if command.accepts_argument { " " } else { "" }
-                );
-                state.editor_cursor = state.editor.len();
+                ));
                 state.slash_popup_dismissed = true;
+                invalidate_extension_autocomplete(&mut state);
                 return;
             }
             SlashMenuAction::Close => {
@@ -2923,18 +3339,20 @@ impl InteractiveShell {
         false
     }
 
-    /// behavior; literal paths are inserted as text. Directory completions omit
+    /// Complete one trailing mention or literal path at the end of the draft.
+    /// Media and PDF completions remain composer policy and become attachment
+    /// chips; literal paths are inserted as text. Directory completions omit
     /// the trailing space so another Tab can descend into them.
     pub fn complete_path(&mut self) {
         let mut state = self.state.borrow_mut();
-        if state.editor_cursor != state.editor.len() {
+        if state.editor.cursor() != state.editor.text().len() {
             return;
         }
         let Some(root) = state.workspace.clone() else {
             return;
         };
 
-        if let Some(query) = composer::active_mention(&state.editor).map(str::to_owned) {
+        if let Some(query) = composer::active_mention(state.editor.text()).map(str::to_owned) {
             let suggestion = if composer::is_path_query(&query) {
                 composer::path_matches(&root, &query, 1).into_iter().next()
             } else {
@@ -2957,54 +3375,49 @@ impl InteractiveShell {
             let Some(suggestion) = suggestion else {
                 return;
             };
-            let token_start = state.editor.len() - (query.len() + 1);
-
-            if suggestion.is_dir {
-                state
-                    .editor
-                    .replace_range(token_start.., &format!("@{}", suggestion.completion));
+            let token_start = state.editor.text().len() - (query.len() + 1);
+            let replacement = if suggestion.is_dir {
+                format!("@{}", suggestion.completion)
             } else if composer::media_kind_for_path(&suggestion.path).is_some() {
                 let modalities = state.input_modalities;
                 match state.ledger.attach_media(&suggestion.path, modalities) {
-                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Ok(chip) => chip,
                     Err(error) => {
                         state.push_block(TranscriptBlock::Notice(error.to_string()));
-                        state
-                            .editor
-                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                        format!("@{} ", suggestion.completion)
                     }
                 }
             } else if composer::file_kind_for_path(&suggestion.path).is_some() {
                 match state.ledger.attach_file_reference(&suggestion.path) {
-                    Ok(chip) => state.editor.replace_range(token_start.., &chip),
+                    Ok(chip) => chip,
                     Err(error) => {
                         state.push_block(TranscriptBlock::Notice(error.to_string()));
-                        state
-                            .editor
-                            .replace_range(token_start.., &format!("@{} ", suggestion.completion));
+                        format!("@{} ", suggestion.completion)
                     }
                 }
             } else {
-                state
-                    .editor
-                    .replace_range(token_start.., &format!("@{} ", suggestion.completion));
-            }
-            state.editor_cursor = state.editor.len();
+                format!("@{} ", suggestion.completion)
+            };
+            let end = state.editor.text().len();
+            let _ = state.editor.replace_range(token_start..end, &replacement);
+            state.editor.move_to_end();
+            invalidate_extension_autocomplete(&mut state);
             return;
         }
 
-        let Some(query) = composer::active_path(&state.editor).map(str::to_owned) else {
+        let Some(query) = composer::active_path(state.editor.text()).map(str::to_owned) else {
             return;
         };
         let Some(suggestion) = composer::path_matches(&root, &query, 1).into_iter().next() else {
             return;
         };
-        let token_start = state.editor.len() - query.len();
+        let token_start = state.editor.text().len() - query.len();
         let suffix = if suggestion.is_dir { "" } else { " " };
-        state
-            .editor
-            .replace_range(token_start.., &format!("{}{suffix}", suggestion.completion));
-        state.editor_cursor = state.editor.len();
+        let replacement = format!("{}{suffix}", suggestion.completion);
+        let end = state.editor.text().len();
+        let _ = state.editor.replace_range(token_start..end, &replacement);
+        state.editor.move_to_end();
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn set_identity(&mut self, provider: &str, model: &str, reasoning: &str) {
@@ -3134,9 +3547,148 @@ impl InteractiveShell {
     }
 
     pub fn set_runtime_config(&mut self, config: Config) {
+        let show_images = config.show_images;
         let mut state = self.state.borrow_mut();
         state.safe_mode = config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost;
         state.max_session_cost_microdollars = config.max_cost_microdollars;
+        drop(state);
+        self.set_show_images(show_images);
+    }
+
+    /// Toggle opt-in inline image placement for the current interactive shell.
+    /// The setting affects only visual reservations; transcript text, copy,
+    /// plain/print output, and durable payload handling remain unchanged.
+    pub fn set_show_images(&mut self, enabled: bool) {
+        let mut state = self.state.borrow_mut();
+        let capabilities = state.image_rendering.capabilities;
+        state.update_image_rendering(enabled, capabilities);
+    }
+
+    /// Replace the complete host-projected semantic extension UI. The caller
+    /// owns stale-generation filtering; this shell only retains data and keeps
+    /// all terminal rendering/theme decisions host-side.
+    pub fn set_extension_ui(&mut self, ui: ShellExtensionUi) -> bool {
+        let mut state = self.state.borrow_mut();
+        if state.extension_ui == ui {
+            return false;
+        }
+        state.extension_ui = ui;
+        true
+    }
+
+    /// Snapshot the normal host editor for a bounded extension handoff.
+    pub fn extension_editor_snapshot(&self) -> ShellEditorSnapshot {
+        let state = self.state.borrow();
+        ShellEditorSnapshot {
+            text: state.editor.text().to_owned(),
+            cursor: state.editor.cursor(),
+            revision: state.editor.revision(),
+            focused: normal_editor_focused(&state),
+        }
+    }
+
+    /// Replace editor text only while the ordinary host editor owns input.
+    /// Attachments are deliberately cleared because extension text cannot refer
+    /// to opaque attachment ledger entries.
+    pub fn extension_set_editor(&mut self, text: String) -> ShellEditorSnapshot {
+        let mut state = self.state.borrow_mut();
+        if normal_editor_focused(&state) {
+            state.editor.set_text(text);
+            state.ledger.clear();
+            state.slash_selection = 0;
+            state.slash_scroll = 0;
+            state.slash_popup_dismissed = false;
+            invalidate_extension_autocomplete(&mut state);
+        }
+        ShellEditorSnapshot {
+            text: state.editor.text().to_owned(),
+            cursor: state.editor.cursor(),
+            revision: state.editor.revision(),
+            focused: normal_editor_focused(&state),
+        }
+    }
+
+    /// Paste through the same host policy used for terminal bracketed paste.
+    pub fn extension_paste_editor(&mut self, text: String) -> ShellEditorSnapshot {
+        if self.extension_editor_snapshot().focused {
+            self.apply_edit(EditAction::Paste(text));
+        }
+        self.extension_editor_snapshot()
+    }
+
+    /// Focus requests are advisory: exclusive host panels and tool-input
+    /// pickers remain owners until they finish, so an extension cannot steal
+    /// terminal input or bypass the keymap.
+    pub fn extension_focus_editor(&self) -> ShellEditorSnapshot {
+        self.extension_editor_snapshot()
+    }
+
+    /// Install a bounded autocomplete response only if the exact host snapshot
+    /// that originated it is still current. This is the frontend half of the
+    /// revision fence and rejects late/reordered extension replies.
+    pub fn set_extension_autocomplete(
+        &mut self,
+        snapshot: &ShellEditorSnapshot,
+        prefix: String,
+        items: Vec<ShellAutocompleteItem>,
+    ) -> bool {
+        let mut state = self.state.borrow_mut();
+        let current = {
+            let editor = &state.editor;
+            normal_editor_focused(&state)
+                && editor.revision() == snapshot.revision
+                && editor.text() == snapshot.text.as_str()
+                && editor.cursor() == snapshot.cursor
+                && snapshot.cursor >= prefix.len()
+                && editor.text()[..snapshot.cursor].ends_with(&prefix)
+        };
+        if !current || items.is_empty() {
+            return false;
+        }
+        state.extension_autocomplete = Some(ShellAutocompleteOverlay {
+            text: snapshot.text.clone(),
+            cursor: snapshot.cursor,
+            revision: snapshot.revision,
+            prefix,
+            items,
+        });
+        true
+    }
+
+    /// Accept the first extension autocomplete choice through a normal host
+    /// editor mutation. Selection/navigation remains host-owned for now.
+    pub fn accept_extension_autocomplete(&mut self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(overlay) = state.extension_autocomplete.clone() else {
+            return false;
+        };
+        let current = {
+            let editor = &state.editor;
+            normal_editor_focused(&state)
+                && editor.revision() == overlay.revision
+                && editor.text() == overlay.text.as_str()
+                && editor.cursor() == overlay.cursor
+                && overlay.cursor >= overlay.prefix.len()
+                && editor.text()[..overlay.cursor].ends_with(&overlay.prefix)
+        };
+        if !current {
+            state.extension_autocomplete = None;
+            return false;
+        }
+        let Some(item) = overlay.items.first() else {
+            state.extension_autocomplete = None;
+            return false;
+        };
+        let start = overlay.cursor - overlay.prefix.len();
+        if !state
+            .editor
+            .replace_range(start..overlay.cursor, &item.value)
+        {
+            state.extension_autocomplete = None;
+            return false;
+        }
+        invalidate_extension_autocomplete(&mut state);
+        true
     }
 
     pub fn pending_is_empty(&self) -> bool {
@@ -3144,17 +3696,19 @@ impl InteractiveShell {
     }
 
     pub fn pending(&self) -> String {
-        self.state.borrow().editor.clone()
+        self.state.borrow().editor.text().to_owned()
     }
 
     pub fn set_tool_input_prompt(&mut self, prompt: Option<String>) {
-        self.state.borrow_mut().tool_input_prompt = prompt.map(|prompt| {
+        let mut state = self.state.borrow_mut();
+        state.tool_input_prompt = prompt.map(|prompt| {
             sanitize_for_terminal(&prompt)
                 .lines()
                 .next()
                 .unwrap_or_default()
                 .to_owned()
         });
+        state.tool_input_revision = state.tool_input_revision.saturating_add(1);
     }
 
     pub fn set_input_modalities(&mut self, modalities: ModalitySet) {
@@ -3164,8 +3718,8 @@ impl InteractiveShell {
     /// Drain the editor and resolve chips into ordered parts.
     pub fn drain_composed(&mut self) -> ComposedInput {
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = 0;
-        let mut text = std::mem::take(&mut state.editor);
+        let mut text = state.editor.take_text();
+        invalidate_extension_autocomplete(&mut state);
 
         // Drag/drop is not consistently delivered as a bracketed-paste event.
         // When it arrives as ordinary keys, promote every existing media path
@@ -3223,29 +3777,30 @@ impl InteractiveShell {
     /// must be observationally equivalent to a validation error.
     pub fn restore_composed(&mut self, composed: ComposedInput) {
         let mut state = self.state.borrow_mut();
-        state.editor = composed.display_text;
-        state.editor_cursor = state.editor.len();
+        state.editor.set_text(composed.display_text);
         state.ledger.restore(composed.attachments);
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Discard the current draft and every attachment it owns.
     pub fn clear_editor(&mut self) {
         let mut state = self.state.borrow_mut();
         state.editor.clear();
-        state.editor_cursor = 0;
         state.ledger.clear();
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
+        invalidate_extension_autocomplete(&mut state);
     }
 
     pub fn drain_editor(&mut self) -> String {
         let mut state = self.state.borrow_mut();
-        state.editor_cursor = 0;
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
-        std::mem::take(&mut state.editor)
+        let text = state.editor.take_text();
+        invalidate_extension_autocomplete(&mut state);
+        text
     }
 
     fn materialize_deferred_history(&mut self) -> Result<bool> {
@@ -3606,6 +4161,45 @@ impl InteractiveShell {
         self.state.borrow_mut().overlay = Some(ShellOverlay::Text(sanitize_for_terminal(&text)));
     }
 
+    fn show_report(&mut self, surface: OrdinarySurfaceMetadata, body: ReportBody) {
+        self.state.borrow_mut().overlay = Some(ShellOverlay::Report(ReportOverlay {
+            surface,
+            body,
+            scroll_from_top: 0,
+        }));
+    }
+
+    /// Show a terminal-safe read-only report using ordinary title, purpose,
+    /// status, and footer chrome. Report text remains outside transcript copy.
+    pub fn show_report_text(
+        &mut self,
+        title: impl Into<String>,
+        purpose: impl Into<String>,
+        text: String,
+    ) {
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(title, purpose),
+            ReportBody::Text {
+                text: sanitize_for_terminal(&text),
+                styled: false,
+            },
+        );
+    }
+
+    /// Styled report text must already have been terminal-sanitized at its
+    /// producing boundary. Only Ygg-owned theme SGR is retained while wrapping.
+    pub fn show_styled_report_text(
+        &mut self,
+        title: impl Into<String>,
+        purpose: impl Into<String>,
+        text: String,
+    ) {
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(title, purpose),
+            ReportBody::Text { text, styled: true },
+        );
+    }
+
     /// Extension slash-command output, framed with heading chrome. The body
     /// is sanitized; only trusted theme styling added here survives.
     pub fn show_extension_output(&mut self, command: &str, text: String) {
@@ -3618,7 +4212,13 @@ impl InteractiveShell {
     }
 
     pub fn show_context_report(&mut self, report: crate::tui::context::ContextReport) {
-        self.state.borrow_mut().overlay = Some(ShellOverlay::Context(report));
+        self.show_report(
+            OrdinarySurfaceMetadata::with_purpose(
+                "Context",
+                "Review the estimated request context before the next turn",
+            ),
+            ReportBody::Context(report),
+        );
     }
 
     /// Toggle the one global transcript disclosure mode (ctrl+o).
@@ -3649,9 +4249,16 @@ impl InteractiveShell {
     }
 
     pub fn show_status_text_with_telemetry(&mut self, text: String) {
-        let mut state = self.state.borrow_mut();
-        let text = format!("{text}\n\n{}", status_telemetry(&state, Instant::now()));
-        state.overlay = Some(ShellOverlay::Text(styled_status_text(&state.theme, &text)));
+        let (theme, text) = {
+            let state = self.state.borrow();
+            let text = format!("{text}\n\n{}", status_telemetry(&state, Instant::now()));
+            (state.theme.clone(), text)
+        };
+        self.show_styled_report_text(
+            "Status",
+            "Review active model, session, and safety diagnostics",
+            styled_status_text(&theme, &text),
+        );
     }
 
     pub fn close_overlay(&mut self) {
@@ -3660,6 +4267,67 @@ impl InteractiveShell {
 
     pub fn has_overlay(&self) -> bool {
         self.state.borrow().overlay.is_some()
+    }
+
+    /// Let a shared report retain navigation while preserving the legacy
+    /// one-shot overlay dismissal semantics for every other transient overlay.
+    pub(crate) fn overlay_input(&mut self, event: &crossterm::event::Event) -> OverlayInputResult {
+        let mut state = self.state.borrow_mut();
+        if !matches!(state.overlay.as_ref(), Some(ShellOverlay::Report(_))) {
+            return OverlayInputResult::Legacy;
+        }
+        let (maximum, page_rows) =
+            self::viewport::report_scroll_metrics_for_state(&state).unwrap_or((0, 1));
+        let mut close = false;
+        if let crossterm::event::Event::Key(key) = event {
+            if crate::tui::keymap::accepts_key_event(key) {
+                let Some(ShellOverlay::Report(report)) = state.overlay.as_mut() else {
+                    return OverlayInputResult::Legacy;
+                };
+                report.scroll_from_top = report.scroll_from_top.min(maximum);
+                match key.code {
+                    crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Left
+                        if key.modifiers.is_empty() =>
+                    {
+                        close = true;
+                    }
+                    crossterm::event::KeyCode::Up if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report.scroll_from_top.saturating_sub(1);
+                    }
+                    crossterm::event::KeyCode::Down if key.modifiers.is_empty() => {
+                        report.scroll_from_top =
+                            report.scroll_from_top.saturating_add(1).min(maximum);
+                    }
+                    crossterm::event::KeyCode::PageUp if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report.scroll_from_top.saturating_sub(page_rows);
+                    }
+                    crossterm::event::KeyCode::PageDown if key.modifiers.is_empty() => {
+                        report.scroll_from_top = report
+                            .scroll_from_top
+                            .saturating_add(page_rows)
+                            .min(maximum);
+                    }
+                    crossterm::event::KeyCode::Home if key.modifiers.is_empty() => {
+                        report.scroll_from_top = 0;
+                    }
+                    crossterm::event::KeyCode::End if key.modifiers.is_empty() => {
+                        report.scroll_from_top = maximum;
+                    }
+                    _ => close = true,
+                }
+            }
+        } else {
+            // Legacy overlays dismiss on arbitrary input. A report retains
+            // that familiar escape hatch for non-navigation events without
+            // letting text leak into the composer behind it.
+            close = true;
+        }
+        if close {
+            state.overlay = None;
+            OverlayInputResult::Closed
+        } else {
+            OverlayInputResult::Consumed
+        }
     }
 
     /// Requests a coordinated interactive close at the next owning boundary.
@@ -3731,25 +4399,27 @@ impl InteractiveShell {
             })
             .unwrap_or_else(|| old_selected.min(ordering.len().saturating_sub(1)));
         picker.scroll = 0;
+        if picker.surface.lifecycle.is_loading() {
+            picker.surface.lifecycle = OrdinarySurfaceLifecycle::Ready;
+        }
     }
 
-    /// Set transient text in the session-picker hint row.
-    pub(crate) fn set_picker_message(&mut self, message: impl Into<String>, ttl: Duration) {
+    /// Set an explicit semantic lifecycle status on the session picker.
+    pub(crate) fn set_picker_lifecycle(&mut self, lifecycle: OrdinarySurfaceLifecycle) {
         let mut state = self.state.borrow_mut();
         if let Some(Panel::SessionPicker { picker }) = state.panel.as_mut() {
-            picker.message = Some((message.into(), Instant::now() + ttl));
+            picker.surface.lifecycle = lifecycle;
         }
     }
 
     /// Put a selected user message back into the ordinary composer.
     pub(crate) fn prefill_editor(&mut self, text: String) {
         let mut state = self.state.borrow_mut();
-        state.editor = text;
-        state.editor_cursor = state.editor.len();
+        state.editor.set_text(text);
         state.slash_selection = 0;
         state.slash_scroll = 0;
         state.slash_popup_dismissed = false;
-        *state.cached_layout.get_mut() = None;
+        invalidate_extension_autocomplete(&mut state);
     }
 
     /// Replace a live subagent list without losing its filter or stable-node
@@ -3763,7 +4433,7 @@ impl InteractiveShell {
     ) {
         let mut state = self.state.borrow_mut();
         let Some(Panel::SelectList {
-            title: current_title,
+            surface: current_surface,
             items: current_items,
             descriptions: current_descriptions,
             selected,
@@ -3783,7 +4453,7 @@ impl InteractiveShell {
             .and_then(|index| current_ids.get(index))
             .cloned();
 
-        *current_title = title;
+        current_surface.title = title;
         *current_items = items;
         *current_descriptions = descriptions;
         *current_ids = node_ids;
@@ -3928,6 +4598,7 @@ impl InteractiveShell {
             }
             _ => 0,
         };
+        let unicode = state.theme.unicode();
         let panel = state.panel.as_mut()?;
         // Snapshot the action before we potentially mutate/drop the panel.
         let action = match panel {
@@ -3969,6 +4640,7 @@ impl InteractiveShell {
                                             confirmation_render.as_ref(),
                                             index,
                                             &items[index],
+                                            unicode,
                                         )
                                     {
                                         return None;
@@ -4077,6 +4749,10 @@ impl InteractiveShell {
                             match key.code {
                                 KeyCode::Esc if key.modifiers.is_empty() => {
                                     picker.rename = None;
+                                    picker.surface.lifecycle = OrdinarySurfaceLifecycle::cancelled(
+                                        "rename",
+                                        Instant::now() + Duration::from_secs(2),
+                                    );
                                 }
                                 KeyCode::Backspace if key.modifiers.is_empty() => {
                                     if let Some(rename) = picker.rename.as_mut() {
@@ -4142,6 +4818,10 @@ impl InteractiveShell {
                                 }
                                 KeyCode::Esc if key.modifiers.is_empty() => {
                                     picker.confirming_delete = false;
+                                    picker.surface.lifecycle = OrdinarySurfaceLifecycle::cancelled(
+                                        "delete",
+                                        Instant::now() + Duration::from_secs(2),
+                                    );
                                 }
                                 _ => {}
                             }
@@ -4154,6 +4834,8 @@ impl InteractiveShell {
                                 picker.selected = 0;
                                 picker.scroll = 0;
                                 if picker.scope == PickerScope::All && picker.all_rows.is_none() {
+                                    picker.surface.lifecycle =
+                                        OrdinarySurfaceLifecycle::loading("all workspaces");
                                     state.pending_panel_requests.push(PanelRequest::LoadAll);
                                 }
                             }
@@ -4186,11 +4868,11 @@ impl InteractiveShell {
                                     if let Some(meta) = picker.active_rows().get(index) {
                                         if picker.current_session_path.as_ref() == Some(&meta.path)
                                         {
-                                            picker.message = Some((
-                                                "Cannot delete the currently active session"
-                                                    .to_owned(),
-                                                Instant::now() + Duration::from_secs(3),
-                                            ));
+                                            picker.surface.lifecycle =
+                                                OrdinarySurfaceLifecycle::recoverable_error(
+                                                    "cannot delete the currently active session",
+                                                    Instant::now() + Duration::from_secs(3),
+                                                );
                                         } else {
                                             picker.confirming_delete = true;
                                         }
@@ -4538,19 +5220,21 @@ impl InteractiveShell {
         let entry_budget = usize::from(self.state.borrow().size.1)
             .saturating_mul(4)
             .clamp(64, 256);
-        let (items, history_deferred) = if self.capture_mouse {
+        let (items, history_deferred, image_budget) = if self.capture_mouse {
             // Explicit application-owned mode can hydrate older rows when its
             // semantic viewport reaches the bounded first-paint tail.
-            hydrate_transcript_tail(session, entry_budget)?
+            hydrate_transcript_tail_with_image_budget(session, entry_budget)?
         } else {
             // Pi's primary-screen renderer writes the complete logical frame.
             // Native terminal scrollback cannot prepend deferred rows later, so
             // materialize the active branch before rendering it.
-            let items = match session.head() {
-                Some(head) => hydrate_transcript_at(session, &head)?,
-                None => Vec::new(),
-            };
-            (items, false)
+            match session.head() {
+                Some(head) => {
+                    let (items, budget) = hydrate_transcript_at_with_image_budget(session, &head)?;
+                    (items, false, budget)
+                }
+                None => (Vec::new(), false, ToolImageBudget::default()),
+            }
         };
         let deferred_snapshot = history_deferred.then(|| DeferredSessionHistory {
             path: session.path().to_owned(),
@@ -4584,6 +5268,8 @@ impl InteractiveShell {
                 });
         state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
         state.next_transcript_commit_id = NextTranscriptCommitId::default();
+        state.reset_terminal_images();
+        state.tool_image_budget = image_budget;
         state.transcript.clear();
         state.active_event_blocks.clear();
         state.transcript_commit_ids.clear();
@@ -4741,9 +5427,9 @@ impl sexy_tui_rs::Terminal for TestTerminal {
 
 mod assistant_block;
 mod bash_render;
-mod editor_layout;
 mod input_overlays;
 mod native_scrollback;
+mod ordinary_surface;
 mod outcome_render;
 mod output_window;
 mod panel_render;
@@ -4766,4 +5452,53 @@ mod viewport;
 mod welcome_card;
 
 #[cfg(test)]
+mod ordinary_surface_contract_tests;
+#[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod extension_handoff_tests {
+    use super::*;
+
+    #[test]
+    fn extension_autocomplete_is_revision_fenced_before_acceptance() {
+        let mut shell = InteractiveShell::test_shell();
+        shell.apply_edit(EditAction::Char('@'));
+        let snapshot = shell.extension_editor_snapshot();
+        assert!(shell.set_extension_autocomplete(
+            &snapshot,
+            "@".into(),
+            vec![ShellAutocompleteItem {
+                value: "file".into(),
+                label: "file".into(),
+                description: None,
+            }],
+        ));
+
+        shell.apply_edit(EditAction::Char('x'));
+        assert!(!shell.accept_extension_autocomplete());
+        assert_eq!(shell.pending(), "@x");
+
+        let current = shell.extension_editor_snapshot();
+        assert!(!shell.set_extension_autocomplete(
+            &snapshot,
+            "@".into(),
+            vec![ShellAutocompleteItem {
+                value: "stale".into(),
+                label: "stale".into(),
+                description: None,
+            }],
+        ));
+        assert!(shell.set_extension_autocomplete(
+            &current,
+            "@x".into(),
+            vec![ShellAutocompleteItem {
+                value: "file".into(),
+                label: "file".into(),
+                description: None,
+            }],
+        ));
+        assert!(shell.accept_extension_autocomplete());
+        assert_eq!(shell.pending(), "file");
+    }
+}

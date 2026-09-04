@@ -51,6 +51,12 @@
   },
   "$defs": {
     "server": {
+      "oneOf": [
+        {"$ref": "#/$defs/stdioServer"},
+        {"$ref": "#/$defs/streamableHttpServer"}
+      ]
+    },
+    "stdioServer": {
       "type": "object",
       "additionalProperties": false,
       "required": ["command"],
@@ -75,6 +81,45 @@
         "startupTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 30000},
         "requestTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 120000},
         "maxRestarts": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    },
+    "streamableHttpServer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "url"],
+      "properties": {
+        "transport": {
+          "const": "streamable-http",
+          "description": "EXPERIMENTAL and blocked by default. Enabling this server also requires the Ygg process-owner --experimental-streamable-http-mcp CLI flag; no JSON, environment, project, or session field can substitute."
+        },
+        "label": {"type": "string", "minLength": 1, "maxLength": 64},
+        "url": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "format": "uri",
+          "description": "Absolute HTTP(S) URL; cleartext HTTP is accepted only for numeric loopback addresses. Queries, fragments, and userinfo are rejected by the strict loader."
+        },
+        "auth": {"$ref": "#/$defs/bearerAuth"},
+        "enabled": {"type": "boolean"},
+        "required": {"type": "boolean"},
+        "startupTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 30000},
+        "requestTimeoutMs": {"type": "integer", "minimum": 10, "maximum": 120000},
+        "maxRestarts": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    },
+    "bearerAuth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "credential"],
+      "properties": {
+        "type": {"const": "bearer"},
+        "credential": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z_][A-Za-z0-9_.-]{0,63}$"
+        }
       }
     }
   }

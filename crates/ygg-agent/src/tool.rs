@@ -10,7 +10,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use ygg_ai::{Media, ToolDef};
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 use crate::sandbox::{self, SandboxConfig};
 /// Whether an unresolved call may be executed automatically after reopening a
 /// session whose previous process stopped before persisting its result.
@@ -183,6 +183,61 @@ pub const MAX_PROGRESS_CHUNK_BYTES: usize = 8 * 1024;
 /// At `MAX_PROGRESS_CHUNK_BYTES` per message the maximum buffered live
 /// progress is ~512 KB.
 pub(crate) const PROGRESS_CHANNEL_CAPACITY: usize = 64;
+/// Maximum bytes in an ephemeral tool-progress decoration label.
+pub const MAX_PROGRESS_DECORATION_LABEL_BYTES: usize = 256;
+/// Maximum bytes in an ephemeral tool-progress decoration detail.
+pub const MAX_PROGRESS_DECORATION_DETAIL_BYTES: usize = 4 * 1024;
+
+/// A bounded semantic annotation for the currently running tool panel.
+///
+/// Decorations are intentionally one replaceable slot rather than arbitrary
+/// UI payloads. They are never persisted or sent to the model; the immutable
+/// final [`ToolOutput`] remains the durable evidence of a tool call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolProgressDecoration {
+    label: String,
+    detail: Option<String>,
+}
+
+impl ToolProgressDecoration {
+    /// Builds a bounded, terminal-safe decoration.
+    ///
+    /// Returns `None` for empty labels, oversized fields, or control
+    /// characters. Frontends still sanitize text defensively, but rejecting
+    /// these values at the tool boundary prevents progress from becoming an
+    /// unbounded or arbitrary rendering surface.
+    pub fn new(label: impl Into<String>, detail: Option<String>) -> Option<Self> {
+        let label = label.into();
+        let detail = detail.filter(|detail| !detail.is_empty());
+        let valid = |text: &str, maximum: usize| {
+            !text.is_empty() && text.len() <= maximum && !text.chars().any(char::is_control)
+        };
+        if !valid(&label, MAX_PROGRESS_DECORATION_LABEL_BYTES)
+            || detail
+                .as_deref()
+                .is_some_and(|detail| !valid(detail, MAX_PROGRESS_DECORATION_DETAIL_BYTES))
+        {
+            return None;
+        }
+        Some(Self { label, detail })
+    }
+
+    /// Short current-state label.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Optional bounded detail shown under the label.
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+
+    fn byte_len(&self) -> usize {
+        self.label
+            .len()
+            .saturating_add(self.detail.as_ref().map_or(0, String::len))
+    }
+}
 
 /// Reply channel for session-entry append operations.
 type SessionReplyTx = Arc<
@@ -301,6 +356,9 @@ pub enum ToolProgress {
     },
     /// A human-readable status message (e.g. `"Running tests… 3/15"`).
     Status(String),
+    /// A bounded replaceable annotation for the currently running tool panel.
+    /// This is frontend-only and is never persisted or placed in model context.
+    Decoration(ToolProgressDecoration),
     /// A typed yes/no request. Frontends that do not handle it deny by
     /// dropping the event; tools never receive implicit approval.
     Confirmation(ToolConfirmation),
@@ -330,6 +388,7 @@ impl std::fmt::Debug for ToolProgress {
                 .field("bytes", bytes)
                 .finish(),
             Self::Status(s) => f.debug_tuple("Status").field(s).finish(),
+            Self::Decoration(decoration) => f.debug_tuple("Decoration").field(decoration).finish(),
             Self::Confirmation(request) => f.debug_tuple("Confirmation").field(request).finish(),
             Self::Input(request) => f.debug_tuple("Input").field(request).finish(),
             Self::Dropped { bytes, events } => f
@@ -380,6 +439,16 @@ impl ToolProgressSink {
             dropped_bytes: Arc::new(AtomicU64::new(0)),
             dropped_events: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Creates a bounded live-progress channel.
+    ///
+    /// This is intended for host-owned request adapters, such as executable
+    /// extension commands, that need the same bounded ephemeral channel as
+    /// model tools without manufacturing a durable tool result.
+    pub fn bounded_channel() -> (Self, mpsc::Receiver<ToolProgress>) {
+        let (tx, receiver) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+        (Self::live(tx), receiver)
     }
 
     /// Creates a live sink backed by the given bounded sender.
@@ -442,6 +511,19 @@ impl ToolProgressSink {
         }
     }
 
+    /// Replace the current ephemeral tool-panel annotation.
+    ///
+    /// Returns `false` when the supplied fields violate the bounded decoration
+    /// contract. Channel saturation remains non-blocking and is reported with
+    /// the ordinary dropped-progress accounting.
+    pub fn decoration(&self, label: impl Into<String>, detail: Option<String>) -> bool {
+        let Some(decoration) = ToolProgressDecoration::new(label, detail) else {
+            return false;
+        };
+        self.send_one(ToolProgress::Decoration(decoration));
+        true
+    }
+
     /// Request explicit user confirmation and wait for the frontend answer.
     /// A missing, lagged, or non-interactive consumer deterministically denies.
     pub async fn confirmation(
@@ -488,6 +570,7 @@ impl ToolProgressSink {
         let (bytes, events) = match &msg {
             ToolProgress::Output { bytes, .. } => (bytes.len() as u64, 0),
             ToolProgress::Status(s) => (s.len() as u64, 0),
+            ToolProgress::Decoration(decoration) => (decoration.byte_len() as u64, 0),
             ToolProgress::Confirmation(_) => (0, 1),
             ToolProgress::Input(_) => (0, 1),
             ToolProgress::Dropped { .. } => (0, 0),
@@ -582,14 +665,14 @@ impl ToolContext<'_> {
     /// paths, `~/…`, parent components, and external symlinks.
     pub fn resolve_existing(&self, path: &str) -> Result<PathBuf, ToolError> {
         sandbox::resolve_existing(self.workspace, path, self.sandbox.allow_external_paths)
-            .map_err(ToolError::new)
+            .map_err(path_resolution_tool_error)
     }
 
     /// Resolves a local path for creation. Relative paths use the workspace as
     /// their base; external path access follows the host's sandbox policy.
     pub fn resolve_create(&self, path: &str) -> Result<PathBuf, ToolError> {
         sandbox::resolve_create(self.workspace, path, self.sandbox.allow_external_paths)
-            .map_err(ToolError::new)
+            .map_err(path_resolution_tool_error)
     }
 
     /// Returns a stable display spelling without changing the path used for
@@ -615,6 +698,17 @@ impl ToolContext<'_> {
             .await
             .map_err(|_| ToolError::new("Session channel closed without response"))?
             .map_err(ToolError::new)
+    }
+}
+
+fn path_resolution_tool_error(error: sandbox::SandboxPathError) -> ToolError {
+    if error.is_workspace_confinement() {
+        ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            error.to_string(),
+        )
+    } else {
+        ToolError::new(error.to_string())
     }
 }
 
@@ -1158,6 +1252,9 @@ impl ToolOutput {
 pub struct ToolError {
     /// Compact description of the failure, written for the model.
     pub message: String,
+    /// Stable machine-readable policy reason, kept separate from model-facing
+    /// error wording and never serialized into a tool result.
+    policy_denial_code: Option<ToolPolicyDenialCode>,
 }
 
 impl ToolError {
@@ -1165,7 +1262,23 @@ impl ToolError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            policy_denial_code: None,
         }
+    }
+
+    /// Creates a model-facing error that also carries a stable policy code for
+    /// secret-safe diagnostics.
+    pub fn policy_denied(code: ToolPolicyDenialCode, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            policy_denial_code: Some(code),
+        }
+    }
+
+    /// Stable policy code associated with this error, if it was denied at a
+    /// tool capability boundary.
+    pub(crate) fn policy_denial_code(&self) -> Option<ToolPolicyDenialCode> {
+        self.policy_denial_code
     }
 }
 
@@ -1186,6 +1299,22 @@ pub fn content_hash(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_resolution_denials_keep_a_stable_policy_code() {
+        let error = path_resolution_tool_error(sandbox::SandboxPathError::WorkspaceConfinement(
+            "path escapes the workspace".into(),
+        ));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
+
+        let error = path_resolution_tool_error(sandbox::SandboxPathError::Other(
+            "path does not exist".into(),
+        ));
+        assert_eq!(error.policy_denial_code(), None);
+    }
 
     #[test]
     fn content_hash_is_deterministic_and_content_sensitive() {

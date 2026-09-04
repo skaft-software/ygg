@@ -393,6 +393,8 @@ fn protocol_name(protocol: &Protocol) -> &'static str {
         Protocol::OpenAiResponses => "openai-responses",
         Protocol::OpenAiChat => "openai-completions",
         Protocol::AnthropicMessages => "anthropic-messages",
+        Protocol::BedrockConverse => "bedrock-converse",
+        Protocol::GoogleGenerativeAi => "google-generative-ai",
     }
 }
 
@@ -519,18 +521,21 @@ fn assistant_content(message: &AssistantMessage) -> Vec<Value> {
     message
         .content
         .iter()
-        .map(|part| match part {
-            AssistantPart::Text(text) => json!({"type": "text", "text": text}),
-            AssistantPart::Reasoning(reasoning) => {
-                json!({"type": "thinking", "thinking": reasoning.text.as_deref().unwrap_or_default()})
-            }
-            AssistantPart::ToolCall(call) => json!({
+        .filter_map(|part| match part {
+            AssistantPart::Text(text) => Some(json!({"type": "text", "text": text})),
+            AssistantPart::Reasoning(reasoning) => Some(
+                json!({"type": "thinking", "thinking": reasoning.text.as_deref().unwrap_or_default()}),
+            ),
+            AssistantPart::ToolCall(call) => Some(json!({
                 "type": "toolCall",
                 "id": call.id.0,
                 "name": call.name,
                 "arguments": serde_json::from_str::<Value>(&call.arguments_json).unwrap_or(Value::Null)
-            }),
-            AssistantPart::Media(media) => media_content(media),
+            })),
+            AssistantPart::Media(media) => Some(media_content(media)),
+            // Thought signatures are opaque continuation credentials. They stay
+            // in the persisted canonical message but never cross the RPC view.
+            AssistantPart::ProviderMetadata(_) => None,
         })
         .collect()
 }
@@ -1434,6 +1439,15 @@ impl EventTranslator {
             // The final TurnFinished message carries generated media in the
             // Pi-compatible content array; no provisional RPC event exists.
             AgentEvent::OutputMedia { .. } => {}
+            AgentEvent::ProviderLifecycle { lifecycle } => {
+                // Deliberately outside assistant-message updates: readiness is
+                // transient endpoint telemetry, never model content.
+                output.send(json!({
+                    "type": "provider_lifecycle",
+                    "state": lifecycle.state.as_str(),
+                    "detail": lifecycle.detail,
+                }))?;
+            }
             AgentEvent::ProviderRetry {
                 attempt,
                 max_attempts,
@@ -1492,6 +1506,9 @@ impl EventTranslator {
                     "args": args
                 }))?;
             }
+            // Keep the Pi-compatible RPC event vocabulary unchanged. Native
+            // host clients receive this secret-safe diagnostic as `tool_policy`.
+            AgentEvent::ToolPolicyDecision { .. } => {}
             AgentEvent::ToolProgress { id, progress } => {
                 if let Some((name, args, accumulated)) = self.tools.get_mut(&id.0) {
                     match progress {
@@ -1503,6 +1520,16 @@ impl EventTranslator {
                                 accumulated.push('\n');
                             }
                             accumulated.push_str(&status);
+                        }
+                        ToolProgress::Decoration(decoration) => {
+                            if !accumulated.is_empty() {
+                                accumulated.push('\n');
+                            }
+                            accumulated.push_str(decoration.label());
+                            if let Some(detail) = decoration.detail() {
+                                accumulated.push_str(" · ");
+                                accumulated.push_str(detail);
+                            }
                         }
                         ToolProgress::Dropped { bytes, events } => {
                             accumulated.push_str(&format!(
@@ -2607,6 +2634,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
         app.agent.set_system_prompt(app.system.clone());
         if finish.shutdown_requested() {
             let _ = app.executable_extensions.drain_events();
+            app.synchronize_extension_provider_catalog();
             let extension_presentations = app.executable_extensions.presentation_views();
             output.send(json!({
                 "type": "extension_presentations",
@@ -2635,6 +2663,7 @@ pub async fn run_rpc(boot: Bootstrap) -> anyhow::Result<()> {
             }
         }
         let _ = app.executable_extensions.drain_events();
+        app.synchronize_extension_provider_catalog();
         let extension_presentations = app.executable_extensions.presentation_views();
         output.send(json!({
             "type": "extension_presentations",

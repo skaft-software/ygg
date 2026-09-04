@@ -43,6 +43,7 @@ fn make_test_model(base_url_str: &str, protocol: Protocol) -> Model {
         auth: Auth::bearer("test-api-key"),
         default_headers: http::HeaderMap::new(),
         transport: ygg_ai::EndpointTransport::Http,
+        runtime: ygg_ai::RequestRuntime::default(),
         timeout: Duration::from_secs(2),
     };
 

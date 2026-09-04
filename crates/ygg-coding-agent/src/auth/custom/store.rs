@@ -110,6 +110,11 @@ pub struct CustomProvider {
     /// Maximum time to wait for initial response headers from a cold endpoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_timeout_secs: Option<u64>,
+    /// Opt into the bounded HTTP/SSE lifecycle feedback extension for this
+    /// OpenAI-compatible endpoint. Ordinary endpoint behavior is unchanged
+    /// unless this is explicitly enabled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lifecycle_feedback: bool,
 }
 
 impl CustomProvider {
@@ -123,6 +128,7 @@ impl CustomProvider {
             api_key_env: None,
             cache: None,
             startup_timeout_secs: None,
+            lifecycle_feedback: false,
         }
     }
 }
@@ -137,6 +143,7 @@ impl fmt::Debug for CustomProvider {
             .field("api_key_env", &self.api_key_env)
             .field("cache", &self.cache)
             .field("startup_timeout_secs", &self.startup_timeout_secs)
+            .field("lifecycle_feedback", &self.lifecycle_feedback)
             .finish()
     }
 }
@@ -321,6 +328,46 @@ pub struct CredentialStore {
     path: PathBuf,
 }
 
+/// One registry read bound to the exact private bytes that produced it.
+///
+/// The raw snapshot never crosses the custom credential boundary: setup uses it
+/// only as an optimistic-concurrency token for a final private atomic write.
+pub(crate) struct RegistrySnapshot {
+    registry: Option<CustomRegistry>,
+    bytes: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for RegistrySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RegistrySnapshot")
+            .field("configured", &self.registry.is_some())
+            .field("bytes", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl RegistrySnapshot {
+    pub(crate) fn registry(&self) -> Option<&CustomRegistry> {
+        self.registry.as_ref()
+    }
+
+    fn expected_bytes(&self) -> Option<&[u8]> {
+        self.bytes.as_deref()
+    }
+}
+
+/// Result of a compare-and-swap registry publication.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RegistryCommitError {
+    /// Another writer changed the registry after setup read its snapshot.
+    #[error("custom provider registry changed while setup was in progress")]
+    Changed,
+    /// The owner-private registry could not be published.
+    #[error("could not save custom provider registry")]
+    Storage,
+}
+
 impl CredentialStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
@@ -351,61 +398,52 @@ impl CredentialStore {
     /// `custom-openai` provider. It is never treated as a separate runtime
     /// abstraction.
     pub fn load_registry(&self) -> Result<Option<CustomRegistry>> {
-        let Some(bytes) = crate::auth::read_bounded_private(&self.path, MAX_CREDENTIAL_BYTES)
-            .with_context(|| format!("reading {}", self.path.display()))?
-        else {
-            return Ok(None);
-        };
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
-            .with_context(|| format!("corrupt credential file {}", self.path.display()))?;
+        Ok(self.load_registry_snapshot()?.registry)
+    }
 
-        if value.get("providers").is_some() {
-            let registry: CustomRegistry = serde_json::from_value(value).with_context(|| {
-                format!("invalid custom provider registry {}", self.path.display())
-            })?;
-            if registry.version != REGISTRY_VERSION {
-                anyhow::bail!(
-                    "unsupported custom provider registry version {} in {}",
-                    registry.version,
-                    self.path.display()
-                );
-            }
-            Ok(Some(registry))
-        } else {
-            let credential: CustomCredential =
-                serde_json::from_value(value.clone()).with_context(|| {
-                    format!("invalid legacy custom credential {}", self.path.display())
-                })?;
-            let cache = value
-                .get("cache")
-                .map(|cache| {
-                    serde_json::from_value(cache.clone()).with_context(|| {
-                        format!("invalid cache compatibility in {}", self.path.display())
-                    })
-                })
-                .transpose()?;
-            let startup_timeout_secs = value
-                .get("startup_timeout_secs")
-                .map(|timeout| {
-                    serde_json::from_value(timeout.clone()).with_context(|| {
-                        format!("invalid startup timeout in {}", self.path.display())
-                    })
-                })
-                .transpose()?;
-            let mut registry = CustomRegistry::single(
-                LEGACY_PROVIDER_ID,
-                CustomProvider {
-                    label: String::new(),
-                    credential,
-                    auth: None,
-                    api_key_env: None,
-                    cache,
-                    startup_timeout_secs,
-                },
-            );
-            registry.legacy_single_endpoint = true;
-            Ok(Some(registry))
+    /// Load a registry with the private byte snapshot needed for an atomic
+    /// read/validate/merge/publish setup transaction.
+    pub(crate) fn load_registry_snapshot(&self) -> Result<RegistrySnapshot> {
+        let bytes = crate::auth::read_bounded_private(&self.path, MAX_CREDENTIAL_BYTES)
+            .with_context(|| format!("reading {}", self.path.display()))?;
+        let registry = bytes
+            .as_deref()
+            .map(|bytes| parse_registry(bytes, &self.path))
+            .transpose()?;
+        Ok(RegistrySnapshot { registry, bytes })
+    }
+
+    /// Publish a complete registry only if it still matches a previously read
+    /// snapshot. Callers use `Changed` to offer an explicit reload/merge path;
+    /// they must never silently overwrite another setup operation.
+    pub(crate) fn save_registry_if_unchanged(
+        &self,
+        snapshot: &RegistrySnapshot,
+        registry: &CustomRegistry,
+    ) -> std::result::Result<(), RegistryCommitError> {
+        if registry.version != REGISTRY_VERSION {
+            return Err(RegistryCommitError::Storage);
         }
+        let bytes =
+            serde_json::to_vec_pretty(registry).map_err(|_| RegistryCommitError::Storage)?;
+        match ygg_agent::secure_fs::write_private_atomic_if_unchanged(
+            &self.path,
+            snapshot.expected_bytes(),
+            &bytes,
+            MAX_CREDENTIAL_BYTES,
+        ) {
+            Ok(()) => Ok(()),
+            Err(ygg_agent::secure_fs::SecureFileError::Changed) => {
+                Err(RegistryCommitError::Changed)
+            }
+            Err(_) => Err(RegistryCommitError::Storage),
+        }
+    }
+
+    /// Private path used only in receipts and catalog rebuilding. No caller can
+    /// use it to bypass the store's owner-only persistence operations.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Compatibility accessor for callers that only support one provider.
@@ -520,6 +558,7 @@ impl CredentialStore {
                 provider.api_key_env = previous.api_key_env.clone();
                 provider.cache = previous.cache.clone();
                 provider.startup_timeout_secs = previous.startup_timeout_secs;
+                provider.lifecycle_feedback = previous.lifecycle_feedback;
             }
         }
         self.save_registry(&CustomRegistry::single(LEGACY_PROVIDER_ID, provider))
@@ -568,6 +607,64 @@ impl CredentialStore {
             }
         }
         Ok(())
+    }
+}
+
+fn parse_registry(bytes: &[u8], path: &Path) -> Result<CustomRegistry> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("corrupt credential file {}", path.display()))?;
+
+    if value.get("providers").is_some() {
+        let registry: CustomRegistry = serde_json::from_value(value)
+            .with_context(|| format!("invalid custom provider registry {}", path.display()))?;
+        if registry.version != REGISTRY_VERSION {
+            anyhow::bail!(
+                "unsupported custom provider registry version {} in {}",
+                registry.version,
+                path.display()
+            );
+        }
+        Ok(registry)
+    } else {
+        let credential: CustomCredential = serde_json::from_value(value.clone())
+            .with_context(|| format!("invalid legacy custom credential {}", path.display()))?;
+        let cache = value
+            .get("cache")
+            .map(|cache| {
+                serde_json::from_value(cache.clone())
+                    .with_context(|| format!("invalid cache compatibility in {}", path.display()))
+            })
+            .transpose()?;
+        let startup_timeout_secs = value
+            .get("startup_timeout_secs")
+            .map(|timeout| {
+                serde_json::from_value(timeout.clone())
+                    .with_context(|| format!("invalid startup timeout in {}", path.display()))
+            })
+            .transpose()?;
+        let lifecycle_feedback = value
+            .get("lifecycle_feedback")
+            .map(|enabled| {
+                serde_json::from_value(enabled.clone()).with_context(|| {
+                    format!("invalid lifecycle feedback setting in {}", path.display())
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        let mut registry = CustomRegistry::single(
+            LEGACY_PROVIDER_ID,
+            CustomProvider {
+                label: String::new(),
+                credential,
+                auth: None,
+                api_key_env: None,
+                cache,
+                startup_timeout_secs,
+                lifecycle_feedback,
+            },
+        );
+        registry.legacy_single_endpoint = true;
+        Ok(registry)
     }
 }
 
@@ -769,6 +866,7 @@ mod tests {
                 api_key_env: None,
                 cache: None,
                 startup_timeout_secs: Some(420),
+                lifecycle_feedback: false,
             };
         let mut registry = CustomRegistry::single(
             "apple-fm",
@@ -1001,6 +1099,39 @@ mod tests {
         };
         store.save(&credential).unwrap();
         assert_eq!(store.load_startup_timeout_secs().unwrap(), Some(420));
+    }
+
+    #[test]
+    fn lifecycle_feedback_defaults_false_and_is_preserved_for_legacy_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials/custom.json");
+        write_private_fixture(
+            &path,
+            r#"{
+                "base_url": "http://localhost:1234/v1/",
+                "lifecycle_feedback": true
+            }"#,
+        );
+
+        let store = CredentialStore::new(&path);
+        let registry = store.load_registry().unwrap().unwrap();
+        assert!(registry.providers[LEGACY_PROVIDER_ID].lifecycle_feedback);
+
+        let credential = CustomCredential {
+            base_url: "http://localhost:5678/v1/".to_string(),
+            api_key: String::new(),
+            api_name: "local".to_string(),
+            headers: vec![],
+            models: vec![],
+            auto_discover: false,
+        };
+        store.save(&credential).unwrap();
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("\"lifecycle_feedback\": true"));
+
+        let defaulted: CustomProvider =
+            serde_json::from_str(r#"{"base_url":"http://localhost:1234/v1/"}"#).unwrap();
+        assert!(!defaulted.lifecycle_feedback);
     }
 
     #[test]

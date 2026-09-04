@@ -2,6 +2,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
+use crate::images::{ImageAnchor, ImageProtocol};
 use crate::scrollback::reset_and_replay;
 use crate::terminal::{key_to_string, Terminal, TerminalInput};
 use crate::utils::visible_width;
@@ -13,6 +14,9 @@ pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 /// Whether a rendered row carries a Kitty graphics placement.
 pub(crate) fn is_image_line(line: &str) -> bool {
     line.contains("\x1b_G")
+        || ImageAnchor::parse_all(line)
+            .iter()
+            .any(|anchor| anchor.protocol() == ImageProtocol::Kitty)
 }
 
 /// Kitty graphics protocol escape that deletes every placed image. Destructive
@@ -67,16 +71,29 @@ fn parse_kitty_image_headers(line: &str) -> Vec<KittyImageHeader> {
 }
 
 fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
-    parse_kitty_image_headers(line)
+    let mut ids = parse_kitty_image_headers(line)
         .into_iter()
         .flat_map(|header| header.ids)
-        .collect()
+        .collect::<Vec<_>>();
+    ids.extend(
+        ImageAnchor::parse_all(line)
+            .into_iter()
+            .filter(|anchor| anchor.protocol() == ImageProtocol::Kitty)
+            .map(|anchor| anchor.id().get()),
+    );
+    ids
 }
 
 fn extract_kitty_image_rows(line: &str) -> usize {
     parse_kitty_image_headers(line)
         .into_iter()
         .map(|header| header.rows)
+        .chain(
+            ImageAnchor::parse_all(line)
+                .into_iter()
+                .filter(|anchor| anchor.protocol() == ImageProtocol::Kitty)
+                .map(|anchor| usize::from(anchor.layout().rows())),
+        )
         .max()
         .unwrap_or(1)
 }

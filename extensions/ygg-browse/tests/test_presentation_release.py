@@ -206,7 +206,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-browse")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.7")
+        self.assertEqual(manifest["requires_ygg"], "=0.7.0-dev")
         self.assertEqual(set(manifest["contributes"]["tools"]), TOOLS)
         self.assertEqual(manifest["contributes"]["commands"], ["browse"])
         self.assertTrue(manifest["contributes"]["confirmations"])
@@ -241,7 +241,10 @@ class PackageTests(unittest.TestCase):
     def test_vendored_sdk_is_byte_synchronized_and_has_revision_guard(self) -> None:
         shared = REPOSITORY / "sdk" / "python" / "ygg_extension"
         vendor = PACKAGE / "vendor" / "ygg_extension"
-        for name in ("__init__.py", "extension.py", "protocol.py"):
+        shared_files = {path.name for path in shared.glob("*.py")}
+        vendor_files = {path.name for path in vendor.glob("*.py")}
+        self.assertEqual(vendor_files, shared_files)
+        for name in sorted(shared_files):
             self.assertEqual((vendor / name).read_bytes(), (shared / name).read_bytes(), name)
         self.assertIn(
             b"MAX_PRESENTATION_REVISION = (2**53) - 1",
@@ -282,7 +285,7 @@ class PackageTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.6.7",
+                    "ygg_version": "0.7.0-dev",
                     "extension": {
                         "name": "ygg-browse",
                         "version": "0.1.0",

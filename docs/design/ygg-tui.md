@@ -5,7 +5,10 @@
 The interactive frontend owns terminal setup/restoration and presentation only;
 `Agent` remains the sole model/tool runtime. The companion
 [presentation contract](ygg-presentation.md) defines the visual hierarchy,
-approval, and terminal-outcome semantics shared by these mechanics.
+approval, and terminal-outcome semantics shared by these mechanics. The
+[ordinary command and picker surface contract](ygg-command-picker-surfaces.md)
+defines the transient discovery, selection, read-only report, status, and action
+vocabulary that uses that hierarchy without adding a second TUI.
 
 ## Terminal guarantees
 
@@ -103,6 +106,11 @@ the active match and hint keys use the active model's adaptive accent, matching
 picker focus and the composer without treating the focused item as provider
 provenance.
 Executable-extension status/header/footer contributions never occupy that row.
+Read-only `/help`, `/status`, `/context`, `/cost`, and `/cache` reports use the
+same title/purpose/status/footer vocabulary as ordinary pickers. They occupy a
+temporary viewport surface rather than transcript history, start at their first
+semantic body row, and support Up/Down, PageUp/PageDown, Home, and End scrolling;
+Escape or Left returns to the composer.
 Generic presentation snapshots do not create persistent chrome. The first-party
 `ygg-subagents` observation surface is the bounded exception: while an owning
 run has workers, the host renders its complete owner-fenced `subagent` roster in
@@ -175,6 +183,14 @@ body prose is never inferred as a label, and provider text is sanitized before
 display. The shimmer advances on the renderer thread at a bounded 80 ms cadence,
 changes style rather than text or geometry, and invalidates only the active
 status block.
+
+Before any model delta, an opted-in endpoint readiness update may temporarily
+replace `Working` with `Provider queued`, `Loading Provider`, or `Provider
+ready`, plus bounded sanitized detail. It reuses the active status block rather
+than creating reasoning or transcript content. The first real model delta,
+retry, compaction, and authoritative terminal outcome remove that endpoint
+label; a completed provider turn restores generic `Working` while the run stays
+active.
 
 Visible assistant text does not prove that the owning run has settled. Exactly
 one trailing `Working (<elapsed> • esc to interrupt)` row remains while the run

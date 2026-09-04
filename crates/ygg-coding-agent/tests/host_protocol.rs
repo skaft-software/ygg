@@ -385,6 +385,7 @@ fn inline_provider_run_streams_and_resumes_a_native_session() {
     host.send(&first_request);
     let mut sequence = 0;
     let mut kinds = Vec::new();
+    let mut accepted = None;
     let first_result = loop {
         let message = host.recv();
         sequence += 1;
@@ -393,11 +394,41 @@ fn inline_provider_run_streams_and_resumes_a_native_session() {
         assert_eq!(message["session_id"], "session-1");
         assert_eq!(message["seq"], sequence);
         kinds.push(message["type"].as_str().unwrap().to_owned());
+        if message["type"] == "accepted" {
+            accepted = Some(message.clone());
+        }
         if message["type"] == "final_result" {
             break message;
         }
     };
     assert!(kinds.starts_with(&["accepted".to_owned()]));
+    let accepted = accepted.expect("accepted event");
+    let policy = &accepted["data"]["effective_tool_policy"];
+    assert_eq!(policy["effect_policy"]["value"], "controlled");
+    assert_eq!(policy["workspace_confinement"]["value"], true);
+    for field in [
+        "effect_policy",
+        "workspace_confinement",
+        "allow_edit",
+        "allow_write",
+        "allow_process",
+        "allow_shell",
+        "shell_path",
+        "bash_timeout_ms",
+        "max_output_bytes",
+        "allow_remote_read",
+    ] {
+        assert_eq!(policy[field]["source"], "host_request", "{field}");
+    }
+    assert_eq!(policy["allow_edit"]["value"], false);
+    assert_eq!(policy["allow_write"]["value"], false);
+    assert_eq!(policy["allow_process"]["value"], false);
+    assert_eq!(policy["allow_shell"]["value"], false);
+    assert!(matches!(
+        policy["shell_path"]["value"]["selection"].as_str(),
+        Some("system_bash" | "path_bash" | "sh_fallback" | "unavailable")
+    ));
+    assert!(policy["shell_path"]["value"].get("sha256").is_none());
     assert!(kinds.contains(&"started".to_owned()));
     assert!(kinds.contains(&"model_delta".to_owned()));
     assert!(kinds.contains(&"model_step".to_owned()));

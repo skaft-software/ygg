@@ -1,0 +1,9 @@
+data: {"id":"copilot-chat-1","choices":[{"delta":{"content":"hello"}}]}
+
+data: {"id":"copilot-chat-1","choices":[{"delta":{"content":" from Copilot"}}]}
+
+data: {"id":"copilot-chat-1","choices":[{"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"copilot-chat-1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}
+
+data: [DONE]

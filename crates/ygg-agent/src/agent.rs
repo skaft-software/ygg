@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_core::Stream;
@@ -16,8 +16,8 @@ use ygg_ai::{
     CompatibilityMode, Cost, DecodeError, ImageSource, Media, Message, Model, OutputFormat,
     OutputModalities, Protocol, ReasoningConfig, ReasoningMode, Request, ResponsesCompactRequest,
     ResponsesInput, ResponsesOptions, ResponsesReplayItem, StopReason, StreamEvent, ToolCall,
-    ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
-    PICODOLLARS_PER_MICRODOLLAR,
+    ToolCallArgumentError, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage,
+    UserPart, PICODOLLARS_PER_MICRODOLLAR,
 };
 
 use crate::compaction::{
@@ -30,18 +30,25 @@ use crate::delegation::{
     enable_root_delegation, DelegationBinding, DelegationConfig, DelegationError,
     DelegationRuntimeSettings, DelegationTemplate,
 };
-use crate::effect::{EffectBroker, EffectIntent, EffectReservation, ToolEffect};
+use crate::effect::{
+    EffectBroker, EffectIntent, EffectReservation, ToolEffect, ToolPolicyDenialCode,
+};
 use crate::events::{
     AgentEvent, CompactionInfo, CompactionKind, CompactionReason, Control,
     DelegationTelemetrySnapshot, FinishReason, OutputChannel, QueueDeliveryMode,
+    ToolPolicyDecision,
 };
-use crate::extension::{EventObserver, ExtensionHost, ToolCallHook};
+use crate::extension::{
+    AssistantPersistenceContext, EventObserver, ExtensionHost, ProviderRetryAdvice,
+    ProviderRetryContext, ProviderRetryHook, ProviderRetryKind, RegisteredPersistenceMetadataHook,
+    ToolCallHook, MAX_PROVIDER_RETRY_ADDITIONAL_DELAY,
+};
 use crate::extension_process::{ExtensionProcess, EXTENSION_FEATURE_AGENT_SESSIONS};
 use crate::input::UserInput;
 use crate::sandbox::SandboxConfig;
 use crate::session::{
-    DelegatedUsage, EntryId, EntryMetadata, EntryValue, Session, SessionError, SessionRunOutcome,
-    UsageRecordKind,
+    DelegatedUsage, EntryId, EntryMetadata, EntryValue, ExtensionEntryMetadata,
+    ExtensionMetadataProvenance, Session, SessionError, SessionRunOutcome, UsageRecordKind,
 };
 use crate::speculation::is_speculatable_recon_bash;
 use crate::tool::{
@@ -78,6 +85,10 @@ pub enum AgentError {
     /// Two tools were registered under the same name.
     #[error("duplicate tool name registered: {0}")]
     DuplicateTool(String),
+    /// An extension attempted to register an invalid or colliding durable
+    /// metadata namespace.
+    #[error("invalid extension metadata namespace: {0}")]
+    ExtensionMetadataNamespace(String),
     /// The configured collaboration runtime could not start an owning run.
     #[error("delegation error: {0}")]
     Delegation(String),
@@ -425,6 +436,7 @@ fn provider_failure_phase(error: &AgentError) -> Option<&'static str> {
         AgentError::IncompleteResponse { .. } => Some("response completion"),
         AgentError::Session(_)
         | AgentError::DuplicateTool(_)
+        | AgentError::ExtensionMetadataNamespace(_)
         | AgentError::Delegation(_)
         | AgentError::Workspace(_)
         | AgentError::TokenLimit { .. }
@@ -899,6 +911,13 @@ const TOOL_TRUNCATION_MARKER: &str = "\n[tool output truncated]\n";
 /// assistant message is persisted only after `Finished`, and tools are not
 /// executed until that point.
 const MAX_PROVIDER_RETRIES: usize = 3;
+/// Total time one retry decision may spend in extension advisory hooks.
+/// Hooks run only after the host has independently admitted the retry.
+const PROVIDER_RETRY_HOOK_BUDGET: Duration = Duration::from_millis(200);
+/// Total time a completed assistant turn may spend collecting extension-owned
+/// metadata before its atomic durable append. Timeout or cancellation drops
+/// only extension metadata, never the canonical assistant result.
+const PERSISTENCE_METADATA_HOOK_BUDGET: Duration = Duration::from_millis(200);
 /// Non-timeout network failures are usually short-lived connection loss. Five
 /// visible, cancellable replacement attempts give the connection time to
 /// recover without charging usage or consuming an autonomous model turn.
@@ -925,6 +944,9 @@ struct TerminalActionReceipt {
 
 struct CompletedToolExecution {
     result: Result<ToolOutput, ToolError>,
+    /// Host-owned effect admission result, absent only when the call never
+    /// reached a registered tool's effect boundary.
+    policy_decision: Option<ToolPolicyDecision>,
     /// Wall time taken for the call.
     duration: std::time::Duration,
     /// Unix milliseconds just before the tool's effects were admitted
@@ -935,6 +957,147 @@ struct CompletedToolExecution {
     progress_rx: mpsc::Receiver<ToolProgress>,
     progress_sink: ToolProgressSink,
     cancellation_won: bool,
+}
+
+/// Synthetic, secret-safe result for a normalized call rejected by the exact
+/// request schema. Keep this static: provider arguments may contain secrets.
+const SCHEMA_MISMATCH_TOOL_ERROR: &str =
+    "tool call was not executed because its arguments do not satisfy the advertised schema; correct the arguments and try again";
+
+fn rejected_argument_tool_error(error: ToolCallArgumentError) -> ToolError {
+    let message = match error {
+        ToolCallArgumentError::SchemaMismatch => SCHEMA_MISMATCH_TOOL_ERROR,
+    };
+    ToolError::new(message)
+}
+
+fn rejected_argument_tool_execution(
+    error: ToolCallArgumentError,
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+) -> CompletedToolExecution {
+    let (progress_tx, progress_rx) = mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
+    CompletedToolExecution {
+        result: Err(rejected_argument_tool_error(error)),
+        // The exact request schema rejected this call before tool effect
+        // classification. Still expose the host-owned pre-admission denial so
+        // policy diagnostics remain complete without exposing provider args.
+        policy_decision: Some(policy_decision(
+            sandbox,
+            broker,
+            None,
+            None,
+            Some(ToolPolicyDenialCode::InvalidToolArguments),
+        )),
+        duration: std::time::Duration::ZERO,
+        started_unix_ms: None,
+        finished_unix_ms: Some(crate::session::now_unix_millis()),
+        progress_rx,
+        progress_sink: ToolProgressSink::live(progress_tx),
+        cancellation_won: false,
+    }
+}
+
+struct ToolEffectAdmission {
+    intent: EffectIntent,
+    reservation: EffectReservation,
+    effect: ToolEffect,
+}
+
+struct ToolEffectAdmissionError {
+    error: ToolError,
+    decision: ToolPolicyDecision,
+}
+
+fn policy_decision(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+    authorization: Option<crate::effect::EffectAuthorization>,
+    denial_code: Option<ToolPolicyDenialCode>,
+) -> ToolPolicyDecision {
+    ToolPolicyDecision {
+        effect,
+        allowed: authorization.is_some(),
+        authorization,
+        denial_code,
+        policy: sandbox.effective_tool_policy(broker.policy()),
+    }
+}
+
+fn denied_tool_policy(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+    denial_code: ToolPolicyDenialCode,
+    message: impl Into<String>,
+) -> (ToolError, ToolPolicyDecision) {
+    let decision = policy_decision(sandbox, broker, effect, None, Some(denial_code));
+    let error = ToolError::policy_denied(denial_code, message);
+    (error, decision)
+}
+
+/// Classify pre-admission argument parsing failures without retaining provider
+/// argument text in an error result or diagnostic.
+fn invalid_tool_arguments_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        None,
+        ToolPolicyDenialCode::InvalidToolArguments,
+        "invalid tool arguments",
+    )
+}
+
+/// Classify a trusted hook veto without exposing hook-provided text to the model.
+fn secondary_hook_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: Option<ToolEffect>,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        effect,
+        ToolPolicyDenialCode::SecondaryHookDenied,
+        "tool call denied by host policy",
+    )
+}
+
+/// Classify a reservation that was invalidated between admission and dispatch.
+fn effect_reservation_commit_denial(
+    sandbox: &SandboxConfig,
+    broker: &EffectBroker,
+    effect: ToolEffect,
+    error: &crate::effect::EffectBrokerError,
+) -> (ToolError, ToolPolicyDecision) {
+    denied_tool_policy(
+        sandbox,
+        broker,
+        Some(effect),
+        error.policy_denial_code(),
+        "effect reservation could not be committed",
+    )
+}
+
+/// Replace an earlier broker admission with a later trusted tool-boundary
+/// denial, such as a resolved symlink escaping workspace confinement.
+fn apply_execution_policy_denial(
+    policy_decision: &mut Option<ToolPolicyDecision>,
+    result: &Result<ToolOutput, ToolError>,
+) {
+    let (Some(decision), Err(error)) = (policy_decision, result) else {
+        return;
+    };
+    let Some(denial_code) = error.policy_denial_code() else {
+        return;
+    };
+    decision.allowed = false;
+    decision.authorization = None;
+    decision.denial_code = Some(denial_code);
 }
 
 fn effect_is_repeatable_observation(effect: ToolEffect) -> bool {
@@ -953,8 +1116,16 @@ async fn reserve_tool_effect(
     generation: u64,
     request_id: &ygg_ai::ToolCallId,
     interactive: bool,
-) -> Result<(EffectIntent, EffectReservation), ToolError> {
-    let effect = tool.effect(arguments, context)?;
+) -> Result<ToolEffectAdmission, ToolEffectAdmissionError> {
+    let effect = tool.effect(arguments, context).map_err(|error| {
+        let denial_code = error
+            .policy_denial_code()
+            .unwrap_or(ToolPolicyDenialCode::InvalidToolArguments);
+        ToolEffectAdmissionError {
+            decision: policy_decision(context.sandbox, broker, None, None, Some(denial_code)),
+            error,
+        }
+    })?;
     let intent = EffectIntent::new(
         principal,
         run_id,
@@ -964,12 +1135,40 @@ async fn reserve_tool_effect(
         effect,
         arguments,
     )
-    .map_err(|error| ToolError::new(error.to_string()))?;
+    .map_err(|error| {
+        let denial_code = error.policy_denial_code();
+        ToolEffectAdmissionError {
+            decision: policy_decision(
+                context.sandbox,
+                broker,
+                Some(effect),
+                None,
+                Some(denial_code),
+            ),
+            error: ToolError::new(error.to_string()),
+        }
+    })?;
     let reservation = broker
         .reserve(&intent, interactive.then_some(&context.progress))
         .await
-        .map_err(|error| ToolError::new(error.to_string()))?;
-    Ok((intent, reservation))
+        .map_err(|error| {
+            let denial_code = error.policy_denial_code();
+            ToolEffectAdmissionError {
+                decision: policy_decision(
+                    context.sandbox,
+                    broker,
+                    Some(effect),
+                    None,
+                    Some(denial_code),
+                ),
+                error: ToolError::new(error.to_string()),
+            }
+        })?;
+    Ok(ToolEffectAdmission {
+        intent,
+        reservation,
+        effect,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1017,14 +1216,17 @@ async fn execute_parallel_tool_call(
         false,
     )
     .await;
-    let mut reservation = None;
-    let mut hook_denial = match admission {
-        Ok(admission) => {
-            reservation = Some(admission);
-            None
+    let (mut reservation, effect, mut decision, admission_error) = match admission {
+        Ok(ToolEffectAdmission {
+            intent,
+            reservation: effect_reservation,
+            effect,
+        }) => (Some((intent, effect_reservation)), Some(effect), None, None),
+        Err(ToolEffectAdmissionError { error, decision }) => {
+            (None, None, Some(decision), Some(error))
         }
-        Err(error) => Some(error),
     };
+    let mut hook_denial = None;
     if reservation.is_some() {
         for hook in hooks {
             if let Err(error) = hook.before_tool_call(name, &arguments, &tool_ctx).await {
@@ -1036,11 +1238,20 @@ async fn execute_parallel_tool_call(
 
     let mut committed = false;
     let mut cancellation_won = false;
-    let result = if let Some(error) = hook_denial {
+    let result = if let Some(error) = admission_error {
         if cancellation.is_cancelled() {
             cancellation_won = true;
             Err(cancelled_tool_error())
         } else {
+            Err(error)
+        }
+    } else if hook_denial.is_some() {
+        if cancellation.is_cancelled() {
+            cancellation_won = true;
+            Err(cancelled_tool_error())
+        } else {
+            let (error, hook_decision) = secondary_hook_denial(sandbox, broker, effect);
+            decision = Some(hook_decision);
             Err(error)
         }
     } else if cancellation.is_cancelled() {
@@ -1054,6 +1265,7 @@ async fn execute_parallel_tool_call(
             cancellation_won = true;
             return CompletedToolExecution {
                 result: Err(cancelled_tool_error()),
+                policy_decision: decision,
                 progress_rx,
                 progress_sink,
                 cancellation_won,
@@ -1066,8 +1278,24 @@ async fn execute_parallel_tool_call(
             .take()
             .expect("successful admission retains its exact reservation");
         match effect_reservation.commit(&intent) {
-            Err(error) => Err(ToolError::new(error.to_string())),
-            Ok(_receipt) => {
+            Err(error) => {
+                let (error, commit_decision) = effect_reservation_commit_denial(
+                    sandbox,
+                    broker,
+                    effect.expect("successful admission retains an effect classification"),
+                    &error,
+                );
+                decision = Some(commit_decision);
+                Err(error)
+            }
+            Ok(receipt) => {
+                decision = Some(policy_decision(
+                    sandbox,
+                    broker,
+                    effect,
+                    Some(receipt.authorization()),
+                    None,
+                ));
                 committed = true;
                 started_unix_ms = Some(crate::session::now_unix_millis());
                 let execute = tool.execute(execute_arguments, &tool_ctx);
@@ -1100,6 +1328,7 @@ async fn execute_parallel_tool_call(
 
     CompletedToolExecution {
         result,
+        policy_decision: decision,
         progress_rx,
         progress_sink,
         cancellation_won,
@@ -1169,6 +1398,12 @@ impl SpeculativeBash {
         if let Some(partial) = self.partial.get_mut(&index) {
             partial.args_json.push_str(delta);
         }
+    }
+
+    /// Drops an unchecked or schema-rejected partial call before it can enter
+    /// the speculative execution path.
+    fn discard(&mut self, index: usize) {
+        self.partial.remove(&index);
     }
 
     /// Completes a tracked call: parses the accumulated arguments and removes
@@ -1259,6 +1494,7 @@ fn spawn_speculative_execution(
                     mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
                 CompletedToolExecution {
                     result: Err(cancelled_tool_error()),
+                    policy_decision: None,
                     progress_rx,
                     progress_sink: ToolProgressSink::live(progress_tx),
                     cancellation_won: true,
@@ -1334,7 +1570,9 @@ fn message_visible_text(message: &Message) -> Option<String> {
                     .filter(|transcript| !transcript.trim().is_empty())
                     .or(Some("[generated audio]")),
                 AssistantPart::Media(Media::Image(_)) => Some("[generated image]"),
-                AssistantPart::Reasoning(_) | AssistantPart::ToolCall(_) => None,
+                AssistantPart::Reasoning(_)
+                | AssistantPart::ProviderMetadata(_)
+                | AssistantPart::ToolCall(_) => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1631,7 +1869,13 @@ fn annotate_repeated_tool_result(
         Err(error) if serde_json::from_str::<serde_json::Value>(&error.message).is_ok() => {
             Err(error)
         }
-        Err(error) => Err(ToolError::new(format!("{}{}", error.message, annotation))),
+        Err(error) => {
+            let message = format!("{}{}", error.message, annotation);
+            match error.policy_denial_code() {
+                Some(code) => Err(ToolError::policy_denied(code, message)),
+                None => Err(ToolError::new(message)),
+            }
+        }
     }
 }
 
@@ -1639,7 +1883,7 @@ fn assistant_has_terminal_content(assistant: &AssistantMessage) -> bool {
     assistant.content.iter().any(|part| match part {
         AssistantPart::Text(text) => !text.trim().is_empty(),
         AssistantPart::ToolCall(_) | AssistantPart::Media(_) => true,
-        AssistantPart::Reasoning(_) => false,
+        AssistantPart::Reasoning(_) | AssistantPart::ProviderMetadata(_) => false,
     })
 }
 
@@ -1922,7 +2166,10 @@ fn persist_pending_cancellations(session: &mut Session) -> Result<(), AgentError
         .into_iter()
         .filter(|call| !persisted.contains(&call.id));
     for call in unresolved {
-        let text = cancelled_tool_error().message;
+        let text = match call.argument_error {
+            Some(argument_error) => rejected_argument_tool_error(argument_error).message,
+            None => cancelled_tool_error().message,
+        };
         session.append(EntryValue::Message(Message::User(UserMessage {
             content: vec![UserPart::ToolResult(ToolResult {
                 tool_call_id: call.id,
@@ -2145,6 +2392,140 @@ fn retry_after(error: &AiError, attempt: usize) -> Duration {
     // rand dependency. The provider's Retry-After always takes precedence.
     let base = 200u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(base + (attempt as u64 * 37) % 100)
+}
+
+struct ProviderRetryDecision {
+    proceed: bool,
+    additional_delay: Duration,
+}
+
+struct ProviderRetryRequest<'a> {
+    hooks: &'a [Arc<dyn ProviderRetryHook>],
+    context: ProviderRetryContext,
+    abort: &'a AbortFlag,
+}
+
+async fn provider_retry_decision(request: ProviderRetryRequest<'_>) -> ProviderRetryDecision {
+    let ProviderRetryRequest {
+        hooks,
+        context,
+        abort,
+    } = request;
+    if abort.is_set() {
+        return ProviderRetryDecision {
+            proceed: false,
+            additional_delay: Duration::ZERO,
+        };
+    }
+    let deadline = tokio::time::Instant::now() + PROVIDER_RETRY_HOOK_BUDGET;
+    let mut additional_delay = Duration::ZERO;
+    for hook in hooks {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let advice = tokio::select! {
+            biased;
+            _ = abort.wait() => return ProviderRetryDecision {
+                proceed: false,
+                additional_delay: Duration::ZERO,
+            },
+            result = tokio::time::timeout(remaining, hook.provider_retry(&context)) => result.ok(),
+        };
+        match advice {
+            Some(ProviderRetryAdvice::Stop) => {
+                return ProviderRetryDecision {
+                    proceed: false,
+                    additional_delay: Duration::ZERO,
+                };
+            }
+            Some(ProviderRetryAdvice::Delay { additional }) => {
+                additional_delay = additional_delay
+                    .saturating_add(additional)
+                    .min(MAX_PROVIDER_RETRY_ADDITIONAL_DELAY);
+            }
+            Some(ProviderRetryAdvice::NoOpinion | ProviderRetryAdvice::Retry) | None => {}
+        }
+    }
+    ProviderRetryDecision {
+        proceed: !abort.is_set(),
+        additional_delay,
+    }
+}
+
+fn assistant_persistence_context(
+    run_id: &str,
+    resource_owner: &str,
+    assistant: &AssistantMessage,
+    stop_reason: StopReason,
+) -> AssistantPersistenceContext {
+    let mut text_bytes = 0usize;
+    let mut tool_call_count = 0usize;
+    let mut reasoning_part_count = 0usize;
+    let mut media_part_count = 0usize;
+    for part in &assistant.content {
+        match part {
+            AssistantPart::Text(text) => text_bytes = text_bytes.saturating_add(text.len()),
+            AssistantPart::ToolCall(_) => tool_call_count = tool_call_count.saturating_add(1),
+            AssistantPart::Reasoning(_) => {
+                reasoning_part_count = reasoning_part_count.saturating_add(1)
+            }
+            // Opaque provider continuation metadata has no user-visible
+            // content and must not affect persistence accounting.
+            AssistantPart::ProviderMetadata(_) => {}
+            AssistantPart::Media(_) => media_part_count = media_part_count.saturating_add(1),
+        }
+    }
+    AssistantPersistenceContext {
+        run_id: run_id.to_owned(),
+        resource_owner: resource_owner.to_owned(),
+        model: assistant.model.clone(),
+        protocol: assistant.protocol,
+        stop_reason,
+        text_bytes,
+        tool_call_count,
+        reasoning_part_count,
+        media_part_count,
+    }
+}
+
+async fn collect_persistence_metadata(
+    hooks: &[RegisteredPersistenceMetadataHook],
+    context: &AssistantPersistenceContext,
+    abort: &AbortFlag,
+) -> Option<EntryMetadata> {
+    if hooks.is_empty() || abort.is_set() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now() + PERSISTENCE_METADATA_HOOK_BUDGET;
+    let mut metadata = EntryMetadata::default();
+    for registered in hooks {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() || abort.is_set() {
+            break;
+        }
+        let proposal = tokio::select! {
+            biased;
+            _ = abort.wait() => break,
+            result = tokio::time::timeout(remaining, registered.hook.before_assistant_persist(context)) => result.ok().flatten(),
+        };
+        let Some(proposal) = proposal else {
+            continue;
+        };
+        let process_generation = proposal.process_generation();
+        metadata.extension_metadata.insert(
+            registered.namespace.clone(),
+            ExtensionEntryMetadata {
+                public: proposal.public,
+                value: proposal.value,
+                provenance: ExtensionMetadataProvenance {
+                    extension: registered.namespace.clone(),
+                    process_generation,
+                },
+            },
+        );
+    }
+    (!metadata.extension_metadata.is_empty()).then_some(metadata)
 }
 
 fn provider_retry_diagnostic(model: &Model, error: &AiError) -> String {
@@ -3947,6 +4328,9 @@ impl Agent {
         if let Some(duplicate) = config.extensions.duplicate_tools.first() {
             return Err(AgentError::DuplicateTool(duplicate.clone()));
         }
+        if let Some(namespace) = config.extensions.invalid_metadata_namespaces.first() {
+            return Err(AgentError::ExtensionMetadataNamespace(namespace.clone()));
+        }
         let workspace = config.sandbox.workspace.canonicalize().map_err(|e| {
             AgentError::Workspace(format!("{}: {e}", config.sandbox.workspace.display()))
         })?;
@@ -4286,6 +4670,7 @@ impl Agent {
             tool_started_unix_ms: None,
             tool_finished_unix_ms: None,
             local_synthetic_assistant: false,
+            extension_metadata: Default::default(),
         }
     }
 
@@ -4643,6 +5028,36 @@ impl Agent {
         })
     }
 
+    /// Replaces the durable active session at an idle boundary.
+    ///
+    /// Active V2 delegation owns session-scoped child resources, so callers
+    /// must rebuild that runtime instead of retargeting it in place.
+    pub fn replace_session_at_idle(&mut self, session: Session) -> Result<(), AgentError> {
+        if self.delegation.is_some() {
+            return Err(AgentError::Delegation(
+                "active session changes require a rebuild while V2 delegation is enabled".into(),
+            ));
+        }
+        if self
+            .last_run_lifecycle
+            .as_ref()
+            .is_some_and(|lifecycle| lifecycle.dropped.load(Ordering::Acquire))
+        {
+            // Match `Drop`: preserve an interrupted old session before its
+            // owner is replaced.
+            persist_pending_cancellations(&mut self.session)?;
+        }
+        let resource_owner = session.resource_owner_key();
+        self.session_id = resource_owner.clone();
+        self.resource_owner = resource_owner;
+        self.session = session;
+        self.last_run_lifecycle = None;
+        // This is a one-shot transcript projection for a future prompt in the
+        // old session, not a durable cross-session setting.
+        self.prompt_display_text = None;
+        Ok(())
+    }
+
     /// Mutable access to the session for history operations between runs
     /// (checkout, manual compaction, config entries).
     pub fn session_mut(&mut self) -> &mut Session {
@@ -4725,7 +5140,11 @@ impl Agent {
         let effect_broker = self.effect_broker.clone();
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
         for (call_index, call) in unresolved {
-            let result = if call_index >= MAX_TOOL_CALLS_PER_TURN {
+            let result = if let Some(argument_error) = call.argument_error {
+                // A schema-rejected call was never admitted for execution in
+                // the live path; retain that fact across a restart as well.
+                Err(rejected_argument_tool_error(argument_error))
+            } else if call_index >= MAX_TOOL_CALLS_PER_TURN {
                 Err(ToolError::new(
                     "tool call skipped: per-turn tool-call limit reached",
                 ))
@@ -4893,6 +5312,8 @@ impl Agent {
             resource_owner: self.resource_owner.clone(),
         };
         let tool_call_hooks = self.extensions.tool_call_hooks.clone();
+        let provider_retry_hooks = self.extensions.provider_retry_hooks.clone();
+        let persistence_metadata_hooks = self.extensions.persistence_metadata_hooks.clone();
         let max_turns = self.max_turns;
         let reasoning = self.reasoning.clone();
         let reasoning_mode = self.reasoning_mode;
@@ -5239,12 +5660,36 @@ impl Agent {
                                 && stream_retries < provider_retry_limit(&error)
                                 && retryable_before_generation(&error) =>
                         {
-                            let delay = retry_after(&error, stream_retries);
+                            let retry_limit = provider_retry_limit(&error);
+                            if abort.is_set() {
+                                break Ok(None);
+                            }
+                            let host_delay = retry_after(&error, stream_retries);
+                            let retry_decision = provider_retry_decision(ProviderRetryRequest {
+                                hooks: &provider_retry_hooks,
+                                context: ProviderRetryContext {
+                                    run_id: effect_run_id.clone(),
+                                    resource_owner: resource_owner.clone(),
+                                    attempt: stream_retries.saturating_add(1),
+                                    max_attempts: retry_limit,
+                                    host_delay,
+                                    kind: ProviderRetryKind::BeforeGeneration,
+                                },
+                                abort: &abort,
+                            })
+                            .await;
+                            if !retry_decision.proceed {
+                                if abort.is_set() {
+                                    break Ok(None);
+                                }
+                                break Err(error);
+                            }
+                            let delay = host_delay.saturating_add(retry_decision.additional_delay);
                             stream_retries += 1;
                             stream_context.provider_retry();
                             let ev = AgentEvent::ProviderRetry {
                                 attempt: stream_retries,
-                                max_attempts: provider_retry_limit(&error),
+                                max_attempts: retry_limit,
                                 delay,
                                 error: provider_retry_diagnostic(&model, &error),
                             };
@@ -5381,12 +5826,36 @@ impl Agent {
                             let error = AiError::StreamProtocol(
                                 ygg_ai::StreamProtocolError::MissingFinish,
                             );
-                            if provider_retries_enabled
+                            let retry_candidate = provider_retries_enabled
                                 && !attempt_saw_generation
                                 && stream_retries < MAX_PROVIDER_RETRIES
-                                && retryable_stream_start(&error)
-                            {
-                                let delay = retry_after(&error, stream_retries);
+                                && retryable_stream_start(&error);
+                            let host_delay = retry_after(&error, stream_retries);
+                            let retry_decision = if retry_candidate {
+                                provider_retry_decision(ProviderRetryRequest {
+                                    hooks: &provider_retry_hooks,
+                                    context: ProviderRetryContext {
+                                        run_id: effect_run_id.clone(),
+                                        resource_owner: resource_owner.clone(),
+                                        attempt: stream_retries.saturating_add(1),
+                                        max_attempts: MAX_PROVIDER_RETRIES,
+                                        host_delay,
+                                        kind: ProviderRetryKind::StreamStart,
+                                    },
+                                    abort: &abort,
+                                })
+                                .await
+                            } else {
+                                ProviderRetryDecision {
+                                    proceed: false,
+                                    additional_delay: Duration::ZERO,
+                                }
+                            };
+                            if abort.is_set() {
+                                break 'consume Err(FinishReason::Aborted);
+                            }
+                            if retry_decision.proceed {
+                                let delay = host_delay.saturating_add(retry_decision.additional_delay);
                                 stream_retries += 1;
                                 stream_context.provider_retry();
                                 let ev = AgentEvent::ProviderRetry {
@@ -5496,7 +5965,30 @@ impl Agent {
                                 && retryable_stream_start(&error)
                             {
                                 let retry_limit = provider_retry_limit(&error);
-                                let delay = retry_after(&error, stream_retries);
+                                if abort.is_set() {
+                                    break 'consume Err(FinishReason::Aborted);
+                                }
+                                let host_delay = retry_after(&error, stream_retries);
+                                let retry_decision = provider_retry_decision(ProviderRetryRequest {
+                                    hooks: &provider_retry_hooks,
+                                    context: ProviderRetryContext {
+                                        run_id: effect_run_id.clone(),
+                                        resource_owner: resource_owner.clone(),
+                                        attempt: stream_retries.saturating_add(1),
+                                        max_attempts: retry_limit,
+                                        host_delay,
+                                        kind: ProviderRetryKind::StreamStart,
+                                    },
+                                    abort: &abort,
+                                })
+                                .await;
+                                if !retry_decision.proceed {
+                                    if abort.is_set() {
+                                        break 'consume Err(FinishReason::Aborted);
+                                    }
+                                    break;
+                                }
+                                let delay = host_delay.saturating_add(retry_decision.additional_delay);
                                 stream_retries += 1;
                                 stream_context.provider_retry();
                                 let ev = AgentEvent::ProviderRetry {
@@ -5549,6 +6041,11 @@ impl Agent {
                         Next::Event(Some(Ok(event))) => {
                             stream_context.observe_stream(&event);
                             match event {
+                            StreamEvent::ProviderLifecycle(lifecycle) => {
+                                let ev = AgentEvent::ProviderLifecycle { lifecycle };
+                                notify_observers(&observers, &ev);
+                                yield ev;
+                            }
                             StreamEvent::TextDelta { delta, .. } => {
                                 attempt_saw_generation = true;
                                 let ev = AgentEvent::OutputDelta {
@@ -5585,12 +6082,21 @@ impl Agent {
                                 attempt_saw_generation = true;
                                 speculative_bash.note_args_delta(index, &delta);
                             }
-                            StreamEvent::ToolCallEnd { index } => {
+                            StreamEvent::ToolCallEnd {
+                                index,
+                                argument_error,
+                            } => {
                                 attempt_saw_generation = true;
+                                // `ygg-ai` validates completed parseable calls
+                                // against the immutable request snapshot before
+                                // emitting this event. A rejected call must
+                                // never reach even read-only speculation.
+                                if argument_error.is_some() {
+                                    speculative_bash.discard(index);
                                 // Speculative bash: start shallow read-only
                                 // commands while generation continues, so
                                 // their latency hides inside streaming time.
-                                if tool_call_hooks.is_empty() {
+                                } else if !answer_only && tool_call_hooks.is_empty() {
                                     if let Some((call_id, arguments)) =
                                         speculative_bash.complete(index)
                                     {
@@ -5687,7 +6193,19 @@ impl Agent {
                     });
                 }
 
-                if let Err(error) = session.append_assistant_turn(
+                let persistence_context = assistant_persistence_context(
+                    &effect_run_id,
+                    &resource_owner,
+                    &assistant,
+                    stop_reason.clone(),
+                );
+                let persistence_metadata = collect_persistence_metadata(
+                    &persistence_metadata_hooks,
+                    &persistence_context,
+                    &abort,
+                )
+                .await;
+                if let Err(error) = session.append_assistant_turn_with_metadata(
                     assistant.clone(),
                     model.endpoint.id.clone(),
                     model.spec.id.clone(),
@@ -5695,6 +6213,7 @@ impl Agent {
                     response.cost,
                     stop_reason.clone(),
                     raw_responses_output,
+                    persistence_metadata,
                 ) {
                     break 'run FinishReason::Failed(error.into());
                 }
@@ -5985,7 +6504,8 @@ impl Agent {
                     && calls.len() > 1
                     && calls.len() <= MAX_TOOL_CALLS_PER_TURN
                     && calls.iter().all(|call| {
-                        call.arguments_value().is_ok_and(|arguments| {
+                        call.argument_error.is_none()
+                            && call.arguments_value().is_ok_and(|arguments| {
                             tool_map.get(&call.name).is_some_and(|tool| {
                                 tool.concurrency() == ToolConcurrency::Parallel
                                     && tool
@@ -6072,6 +6592,7 @@ impl Agent {
                 // no-progress loop; only compare against earlier responses.
                 let batch_fingerprints: Vec<(String, String)> = calls
                     .iter()
+                    .filter(|call| call.argument_error.is_none())
                     .filter_map(|call| {
                         call.arguments_value().ok().map(|args| {
                             (
@@ -6084,13 +6605,18 @@ impl Agent {
 
                 // ── Commit tool results in emitted order ───────────────────
                 for (call_index, call) in calls.into_iter().enumerate() {
+                    let argument_error = call.argument_error;
                     let parsed = call.arguments_value();
-                    let call_fingerprint = parsed.as_ref().ok().map(|args| {
-                        (
-                            call.name.clone(),
-                            tool_call_arguments_fingerprint(&call.name, args),
-                        )
-                    });
+                    let call_fingerprint = if argument_error.is_none() {
+                        parsed.as_ref().ok().map(|args| {
+                            (
+                                call.name.clone(),
+                                tool_call_arguments_fingerprint(&call.name, args),
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     let repeated_recently = call_fingerprint.as_ref().map_or(0, |fingerprint| {
                         recent_tool_calls
                             .iter()
@@ -6117,7 +6643,7 @@ impl Agent {
                         // result only on an exact argument match with the
                         // authoritative call; otherwise cancel it and fall
                         // through to normal serial execution.
-                        preexecuted = if output_truncated {
+                        preexecuted = if output_truncated || argument_error.is_some() {
                             let _ = speculative_bash.take_matched(&call.id, None).await;
                             None
                         } else {
@@ -6128,13 +6654,24 @@ impl Agent {
                     }
                     let CompletedToolExecution {
                         result,
+                        mut policy_decision,
                         duration,
                         mut progress_rx,
                         progress_sink,
                         cancellation_won,
                         started_unix_ms,
                         finished_unix_ms,
-                    } = if let Some(execution) = preexecuted {
+                    } = if let Some(argument_error) = argument_error {
+                        // Do not classify effects, run hooks, or invoke the
+                        // tool for a call already rejected by the request's
+                        // schema snapshot. The paired static error is durable
+                        // and safe to show back to the model.
+                        rejected_argument_tool_execution(
+                            argument_error,
+                            &sandbox,
+                            &effect_broker,
+                        )
+                    } else if let Some(execution) = preexecuted {
                         execution
                     } else {
                         // Create a fresh progress channel for every sequential
@@ -6146,6 +6683,7 @@ impl Agent {
                         let start = std::time::Instant::now();
                         let started_at = Arc::new(AtomicU64::new(u64::MAX));
                         let started_at_marker = Arc::clone(&started_at);
+                        let policy_decision_slot = Arc::new(Mutex::new(None));
                         let result: Result<ToolOutput, ToolError> = if answer_only {
                             Err(ToolError::new(format!(
                                 "tool call `{}` was not executed: the user requested an immediate final answer without tools",
@@ -6168,8 +6706,13 @@ impl Agent {
                             (None, _) => {
                                 Err(ToolError::new(format!("unknown tool: {}", call.name)))
                             }
-                            (Some(_), Err(e)) => {
-                                Err(ToolError::new(format!("invalid tool arguments: {e}")))
+                            (Some(_), Err(_)) => {
+                                let (error, decision) =
+                                    invalid_tool_arguments_denial(&sandbox, &effect_broker);
+                                *policy_decision_slot
+                                    .lock()
+                                    .expect("policy decision slot is not poisoned") = Some(decision);
+                                Err(error)
                             }
                             (Some(tool), Ok(args)) => {
                                 let active_skills = session
@@ -6190,8 +6733,9 @@ impl Agent {
                                 let hook_arguments = args.clone();
                                 let effect_committed = Arc::new(AtomicBool::new(false));
                                 let committed_marker = Arc::clone(&effect_committed);
+                                let policy_decision_marker = Arc::clone(&policy_decision_slot);
                                 let operation = async {
-                                    let (intent, effect_reservation) = reserve_tool_effect(
+                                    let admission = reserve_tool_effect(
                                         &effect_broker,
                                         tool.as_ref(),
                                         &call.name,
@@ -6203,21 +6747,72 @@ impl Agent {
                                         &call.id,
                                         true,
                                     )
-                                    .await?;
+                                    .await;
+                                    let ToolEffectAdmission {
+                                        intent,
+                                        reservation: effect_reservation,
+                                        effect,
+                                    } = match admission {
+                                        Ok(admission) => admission,
+                                        Err(ToolEffectAdmissionError { error, decision }) => {
+                                            *policy_decision_marker
+                                                .lock()
+                                                .expect("policy decision slot is not poisoned") =
+                                                Some(decision);
+                                            return Err(error);
+                                        }
+                                    };
                                     for hook in &tool_call_hooks {
-                                        hook.before_tool_call(
-                                            &call.name,
-                                            &hook_arguments,
-                                            &tool_ctx,
-                                        )
-                                        .await?;
+                                        if hook
+                                            .before_tool_call(
+                                                &call.name,
+                                                &hook_arguments,
+                                                &tool_ctx,
+                                            )
+                                            .await
+                                            .is_err()
+                                        {
+                                            if tool_ctx.cancellation.is_cancelled() {
+                                                return Err(cancelled_tool_error());
+                                            }
+                                            let (error, decision) = secondary_hook_denial(
+                                                &sandbox,
+                                                &effect_broker,
+                                                Some(effect),
+                                            );
+                                            *policy_decision_marker
+                                                .lock()
+                                                .expect("policy decision slot is not poisoned") =
+                                                Some(decision);
+                                            return Err(error);
+                                        }
                                     }
                                     if tool_ctx.cancellation.is_cancelled() {
                                         return Err(cancelled_tool_error());
                                     }
-                                    effect_reservation
-                                        .commit(&intent)
-                                        .map_err(|error| ToolError::new(error.to_string()))?;
+                                    let receipt = effect_reservation.commit(&intent).map_err(|error| {
+                                        let (error, decision) = effect_reservation_commit_denial(
+                                            &sandbox,
+                                            &effect_broker,
+                                            effect,
+                                            &error,
+                                        );
+                                        *policy_decision_marker
+                                            .lock()
+                                            .expect("policy decision slot is not poisoned") =
+                                            Some(decision);
+                                        error
+                                    })?;
+                                    *policy_decision_marker
+                                        .lock()
+                                        .expect("policy decision slot is not poisoned") =
+                                        Some(policy_decision(
+                                            &sandbox,
+                                            &effect_broker,
+                                            Some(effect),
+                                            Some(receipt.authorization()),
+                                            None,
+                                        ));
                                     committed_marker.store(true, Ordering::Release);
                                     started_at_marker
                                         .store(crate::session::now_unix_millis(), Ordering::Release);
@@ -6321,11 +6916,16 @@ impl Agent {
                             }
                         }
                         };
+                        let policy_decision = policy_decision_slot
+                            .lock()
+                            .expect("policy decision slot is not poisoned")
+                            .take();
                         let started_at_value = started_at.load(Ordering::Acquire);
                         let started_unix_ms =
                             (started_at_value != u64::MAX).then_some(started_at_value);
                         CompletedToolExecution {
                             result,
+                            policy_decision,
                             duration: start.elapsed(),
                             started_unix_ms,
                             finished_unix_ms: Some(crate::session::now_unix_millis()),
@@ -6339,6 +6939,21 @@ impl Agent {
                     } else {
                         result
                     };
+
+                    apply_execution_policy_denial(&mut policy_decision, &result);
+
+                    // Emit policy metadata before the durable result commit: a
+                    // session-write failure must not hide a decision already
+                    // made for this exact call.
+                    if let Some(decision) = policy_decision {
+                        let ev = AgentEvent::ToolPolicyDecision {
+                            id: call.id.clone(),
+                            name: call.name.clone(),
+                            decision,
+                        };
+                        notify_observers(&observers, &ev);
+                        yield ev;
+                    }
 
                     // ── COMMIT BOUNDARY ──────────────────────────────────
                     // Tool::execute resolved (or an immediate error was
@@ -6660,6 +7275,68 @@ mod tests {
     }
 
     #[test]
+    fn assistant_persistence_context_ignores_provider_metadata() {
+        use ygg_ai::{ModelId, ProviderPartMetadata};
+
+        let assistant = AssistantMessage {
+            content: vec![
+                AssistantPart::Text("visible".into()),
+                AssistantPart::ProviderMetadata(ProviderPartMetadata::GoogleThoughtSignature {
+                    signature: "opaque-continuation".into(),
+                }),
+            ],
+            model: ModelId("gemini-test".into()),
+            protocol: Protocol::GoogleGenerativeAi,
+        };
+
+        let context =
+            assistant_persistence_context("run", "owner", &assistant, StopReason::EndTurn);
+        assert_eq!(context.text_bytes, "visible".len());
+        assert_eq!(context.tool_call_count, 0);
+        assert_eq!(context.reasoning_part_count, 0);
+        assert_eq!(context.media_part_count, 0);
+    }
+
+    #[test]
+    fn idle_session_replacement_updates_the_durable_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first.jsonl");
+        let replacement_path = directory.path().join("replacement.jsonl");
+        let first = Session::create(&first_path).unwrap();
+        let replacement = Session::create(&replacement_path).unwrap();
+        let replacement_owner = replacement.resource_owner_key();
+        let model = ygg_ai::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ygg_ai::ModelId("gpt-4o-mini".into()))
+            .unwrap();
+        let mut agent = Agent::new(AgentConfig {
+            client: AiClient::new(),
+            model,
+            session: first,
+            system: "system".into(),
+            sandbox: SandboxConfig::new(directory.path()),
+            effect_broker: EffectBroker::default(),
+            extensions: ExtensionHost::new(),
+            max_turns: Some(1),
+            reasoning: ReasoningConfig::Off,
+            reasoning_mode: ReasoningMode::Standard,
+            cache_retention: CacheRetention::Short,
+            session_id: None,
+        })
+        .unwrap();
+        let first_owner = agent.resource_owner.clone();
+        agent.set_prompt_display_text(Some("old session draft".into()));
+
+        agent.replace_session_at_idle(replacement).unwrap();
+
+        assert_eq!(agent.session().path(), replacement_path);
+        assert_eq!(agent.resource_owner, replacement_owner);
+        assert_eq!(agent.session_id, replacement_owner);
+        assert_eq!(agent.prompt_display_text, None);
+        assert_ne!(agent.resource_owner, first_owner);
+    }
+
+    #[test]
     fn request_output_uses_provider_ceiling_then_clamps_to_remaining_context() {
         assert_eq!(
             resolve_request_max_output_tokens(200_000, 20_000, 65_536),
@@ -6687,6 +7364,7 @@ mod tests {
                 mpsc::channel::<ToolProgress>(PROGRESS_CHANNEL_CAPACITY);
             CompletedToolExecution {
                 result: Ok(ToolOutput::new(text)),
+                policy_decision: None,
                 duration: std::time::Duration::ZERO,
                 started_unix_ms: None,
                 finished_unix_ms: None,
@@ -6783,6 +7461,108 @@ mod tests {
         let original = r#"{"timed_out":false,"messages":[]}"#;
         let result = annotate_repeated_tool_result(Ok(ToolOutput::new(original)), 2).unwrap();
         assert_eq!(result.text, original);
+    }
+
+    #[test]
+    fn malformed_registered_arguments_create_a_secret_safe_policy_denial() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::new(workspace.path());
+        let broker = EffectBroker::new(crate::effect::EffectPolicy::Controlled);
+        let sensitive_argument = "sensitive-argument-marker";
+        let call = ToolCall {
+            id: ygg_ai::ToolCallId("call_malformed".into()),
+            name: "bash".into(),
+            arguments_json: format!(r#"{{"command":"{sensitive_argument}""#),
+            argument_error: None,
+        };
+        assert!(call.arguments_value().is_err());
+
+        let (error, decision) = invalid_tool_arguments_denial(&sandbox, &broker);
+
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::InvalidToolArguments)
+        );
+        assert_eq!(error.message, "invalid tool arguments");
+        assert_eq!(decision.effect, None);
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::InvalidToolArguments)
+        );
+        let diagnostic = serde_json::to_string(&decision).unwrap();
+        assert!(!diagnostic.contains(sensitive_argument));
+        assert!(!error.message.contains(sensitive_argument));
+    }
+
+    #[test]
+    fn reservation_commit_rejection_keeps_final_policy_denied() {
+        let workspace = tempfile::tempdir().unwrap();
+        let sandbox = SandboxConfig::new(workspace.path());
+        let broker = EffectBroker::new(crate::effect::EffectPolicy::Controlled);
+        let (error, decision) = effect_reservation_commit_denial(
+            &sandbox,
+            &broker,
+            ToolEffect::WorkspaceMutation,
+            &crate::effect::EffectBrokerError::GrantRejected,
+        );
+
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::EffectReservationCommitDenied)
+        );
+        assert_eq!(error.message, "effect reservation could not be committed");
+        assert_eq!(decision.effect, Some(ToolEffect::WorkspaceMutation));
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::EffectReservationCommitDenied)
+        );
+    }
+
+    #[test]
+    fn execution_policy_denial_replaces_prior_admission() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut decision = Some(ToolPolicyDecision {
+            effect: Some(ToolEffect::WorkspaceRead),
+            allowed: true,
+            authorization: Some(crate::effect::EffectAuthorization::Policy),
+            denial_code: None,
+            policy: SandboxConfig::new(workspace.path())
+                .effective_tool_policy(crate::effect::EffectPolicy::Controlled),
+        });
+        let result: Result<ToolOutput, ToolError> = Err(ToolError::policy_denied(
+            ToolPolicyDenialCode::WorkspaceConfinement,
+            "path escapes the workspace",
+        ));
+
+        apply_execution_policy_denial(&mut decision, &result);
+
+        let decision = decision.unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(decision.authorization, None);
+        assert_eq!(
+            decision.denial_code,
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
+    }
+
+    #[test]
+    fn repeated_tool_annotation_preserves_policy_denial_code() {
+        let error = annotate_repeated_tool_result(
+            Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::WorkspaceConfinement,
+                "path escapes the workspace",
+            )),
+            REPEATED_TOOL_CALL_THRESHOLD,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
     }
 
     #[test]
@@ -8061,6 +8841,7 @@ mod tests {
                         id: ygg_ai::ToolCallId(index.into()),
                         name: "read".into(),
                         arguments_json: "{}".into(),
+                        argument_error: None,
                     })],
                     model: ModelId("test".into()),
                     protocol: Protocol::AnthropicMessages,

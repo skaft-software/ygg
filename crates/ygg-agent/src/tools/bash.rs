@@ -8,7 +8,7 @@
 #[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Stdio;
 #[cfg(unix)]
@@ -25,9 +25,11 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use ygg_ai::ToolDef;
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 #[cfg(unix)]
-use crate::extension_process::ProcessGroupGuard;
+use crate::extension_process::{wait_for_bash_process, BashProcessLaunch};
+#[cfg(unix)]
+use crate::sandbox::resolve_shell;
 use crate::tool::{OutputStream, Tool, ToolContext, ToolError, ToolOutput, ToolProgressSink};
 #[cfg(unix)]
 use crate::tools::parse_args;
@@ -96,8 +98,17 @@ impl Tool for BashTool {
         arguments: &serde_json::Value,
         ctx: &ToolContext<'_>,
     ) -> Result<ToolEffect, ToolError> {
-        if !(ctx.sandbox.allow_process && ctx.sandbox.allow_shell) {
-            return Err(ToolError::new(
+        if !ctx.sandbox.allow_process {
+            return Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::ProcessDisabled,
+                "error not_permitted\ncommand execution is disabled by sandbox policy; \
+                 arbitrary process execution has shell-equivalent authority and requires \
+                 both allow_process=true and allow_shell=true",
+            ));
+        }
+        if !ctx.sandbox.allow_shell {
+            return Err(ToolError::policy_denied(
+                ToolPolicyDenialCode::ShellDisabled,
                 "error not_permitted\ncommand execution is disabled by sandbox policy; \
                  arbitrary process execution has shell-equivalent authority and requires \
                  both allow_process=true and allow_shell=true",
@@ -179,9 +190,8 @@ impl BashTool {
         self.effect(&args, ctx)?;
         let args: BashArgs = parse_args(args)?;
 
-        let shell = resolve_shell(ctx.sandbox.shell_path.as_deref());
+        let shell = resolve_shell(ctx.sandbox.shell_path.as_deref()).path;
         let mut command = tokio::process::Command::new(&shell);
-        command.arg("-c").arg(&args.command);
 
         // Honour the per-call timeout when present, bounded by sandbox max.
         let effective_timeout = match args.timeout_ms {
@@ -215,6 +225,13 @@ impl BashTool {
         // can terminate the whole tree, not just the direct child.
         #[cfg(unix)]
         command.process_group(0);
+        let launch = BashProcessLaunch::prepare(&mut command, &args.command).map_err(|error| {
+            ToolError::new(format!(
+                "error spawn\nfailed to prepare shell {} for lifecycle supervision: {error}",
+                shell.display()
+            ))
+        })?;
+        command.arg("-c").arg(launch.source());
 
         let start = Instant::now();
         let mut child = command.spawn().map_err(|e| {
@@ -223,7 +240,16 @@ impl BashTool {
                 shell.display()
             ))
         })?;
-        let guard = ProcessGroupGuard::bash(child.id());
+        let (guard, handoff) = match launch.register(child.id()).await {
+            Ok(registered) => registered,
+            Err(error) => {
+                let _ = child.wait().await;
+                return Err(ToolError::new(format!(
+                    "error spawn\nfailed to register shell {} for lifecycle supervision: {error}",
+                    shell.display()
+                )));
+            }
+        };
 
         let mut stdout_pipe = child.stdout.take();
         let mut stderr_pipe = child.stderr.take();
@@ -251,7 +277,7 @@ impl BashTool {
                     &stderr_progress,
                     OutputStream::Stderr
                 ),
-                child.wait(),
+                wait_for_bash_process(&mut child, handoff),
             );
             (out, err, status)
         };
@@ -344,35 +370,6 @@ impl BashTool {
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn resolve_shell(configured: Option<&Path>) -> PathBuf {
-    if let Some(configured) = configured {
-        return configured.to_path_buf();
-    }
-    let system_bash = PathBuf::from("/bin/bash");
-    if is_executable_file(&system_bash) {
-        return system_bash;
-    }
-    find_on_path("bash").unwrap_or_else(|| PathBuf::from("sh"))
-}
-
-#[cfg(unix)]
-fn find_on_path(program: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|directory| directory.join(program))
-            .find(|candidate| is_executable_file(candidate))
-    })
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 /// Byte-bounded stream capture keeping the head and tail halves of the budget.
@@ -586,8 +583,7 @@ mod tests {
     }
 
     fn process_is_alive(pid: i32) -> bool {
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+        crate::extension_process::process_is_live_for_test(pid)
     }
 
     async fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
@@ -629,11 +625,25 @@ mod tests {
 
         let mut disabled = fixture();
         disabled.sandbox.allow_shell = false;
-        assert!(BashTool
+        let error = BashTool
             .effect(&json!({"command": "printf ok"}), &disabled.ctx())
-            .unwrap_err()
-            .message
-            .contains("allow_shell=true"));
+            .unwrap_err();
+        assert!(error.message.contains("allow_shell=true"));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::ShellDisabled)
+        );
+
+        disabled.sandbox.allow_shell = true;
+        disabled.sandbox.allow_process = false;
+        let error = BashTool
+            .effect(&json!({"command": "printf ok"}), &disabled.ctx())
+            .unwrap_err();
+        assert!(error.message.contains("allow_process=true"));
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::ProcessDisabled)
+        );
     }
 
     #[tokio::test]
@@ -702,7 +712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirected_background_descendant_remains_supervised_after_leader_exit() {
+    async fn detached_setsid_descendant_remains_supervised_after_leader_exit() {
         let f = fixture();
         let mut sandbox = f.sandbox.clone();
         sandbox.bash_timeout = Duration::from_secs(2);
@@ -721,7 +731,11 @@ mod tests {
         let output = BashTool
             .execute(
                 json!({
-                    "command": "printf '%s' $$ > leader.pid; sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' $! > descendant.pid"
+                    "command": r#"printf '%s' $$ > leader.pid
+mkfifo descendant.ready
+python3 -c 'import os,sys,time; os.setsid(); open(sys.argv[1], "w").write(str(os.getpid())); os.write(os.open(sys.argv[2], os.O_WRONLY), b"ready\n"); time.sleep(30)' descendant.pid descendant.ready </dev/null >/dev/null 2>&1 &
+IFS= read -r _ < descendant.ready
+rm descendant.ready"#
                 }),
                 &ctx,
             )

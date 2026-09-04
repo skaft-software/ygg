@@ -78,6 +78,55 @@
       }
     },
     {
+      "id": "gpt-6-astra",
+      "endpoint": "openai",
+      "api_name": "gpt-6-astra",
+      "display_name": "GPT-6 Astra",
+      "protocol": "open_ai_responses",
+      "capabilities": {
+        "input_modalities": {"bits": 1},
+        "output_modalities": {"bits": 0},
+        "tools": true,
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "control": "effort",
+          "exposes_text": true,
+          "preserves_state": true,
+          "effort_budgets": null,
+          "min_effort": "low",
+          "max_effort": "max"
+        },
+        "structured_output": true
+      },
+      "limits": {
+        "context_window": 1050000,
+        "max_output_tokens": 128000
+      },
+      "pricing": {
+        "input": 10000000,
+        "output": 50000000,
+        "cache_read": 1000000,
+        "cache_write_5m": 12500000,
+        "cache_write_1h": null,
+        "reasoning": null,
+        "tiers": [
+          {
+            "min_input_tokens": 272001,
+            "input": 20000000,
+            "output": 75000000,
+            "cache_read": 2000000,
+            "cache_write_5m": 25000000,
+            "cache_write_1h": null,
+            "reasoning": null
+          }
+        ]
+      },
+      "cache": {
+        "send_session_affinity_headers": true,
+        "session_affinity_format": "open_ai"
+      }
+    },
+    {
       "id": "gpt-5.4-mini-responses",
       "endpoint": "openai",
       "api_name": "gpt-5.4-mini",

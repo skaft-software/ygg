@@ -2,7 +2,9 @@
 
 use async_stream::try_stream;
 use futures_util::StreamExt;
+use std::collections::HashMap;
 use std::error::Error as _;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -12,9 +14,12 @@ use crate::error::{
     AiError, DecodeError, HttpError, ProviderError, StreamProgress, StreamProtocolError,
     TransportError, TransportPhase,
 };
+use crate::host_transport::{HostStreamModel, HostStreamTransport};
 use crate::responses_ws::{ResponsesWsLiveness, ResponsesWsPool};
-use crate::stream::{ResponseBuilder, ResponseStream, StreamEvent};
-use crate::types::{Protocol, Request, Response, ToolDef};
+use crate::stream::{
+    ProviderLifecycle, ProviderLifecycleState, ResponseBuilder, ResponseStream, StreamEvent,
+};
+use crate::types::{EndpointId, Protocol, Request, Response, ToolDef};
 use crate::{ResponsesCompactRequest, ResponsesCompactResponse};
 
 /// Hard cap on a buffered non-streaming response body before JSON decode
@@ -62,6 +67,53 @@ fn truncate_transport_message(message: &mut String, max_bytes: usize) {
 
 const MAX_PROVIDER_DIAGNOSTIC_BYTES: usize = 4096;
 const MAX_DIAGNOSTIC_METADATA_BYTES: usize = 512;
+/// A stream can surface only a finite amount of advisory endpoint telemetry.
+const MAX_PROVIDER_LIFECYCLE_EVENTS: usize = 64;
+/// Lifecycle detail remains brief enough for a status row and cannot retain an
+/// endpoint-controlled unbounded string.
+const MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES: usize = 160;
+const LIFECYCLE_HEADER: &str = "x-ygg-lifecycle";
+const LIFECYCLE_REQUEST_VALUE: &str = "1";
+const LIFECYCLE_COMMENT_PREFIX: &str = "ygg-lifecycle:";
+
+/// Parses Ygg's explicitly negotiated OpenAI-compatible lifecycle value.
+///
+/// The wire form is `state` or `state; detail`, where state is one of
+/// `queued`, `loading`, or `ready`. Unknown states and malformed namespaces
+/// are deliberately ignored: this is advisory telemetry, never assistant text.
+fn parse_provider_lifecycle(
+    value: &str,
+    diagnostic_redactor: &CredentialRedactor,
+) -> Option<ProviderLifecycle> {
+    let (state, detail) = value
+        .split_once(';')
+        .map_or((value, None), |(state, detail)| (state, Some(detail)));
+    let state = ProviderLifecycleState::from_wire(state)?;
+    let detail = detail.and_then(|detail| {
+        let detail = detail.trim();
+        (!detail.is_empty()).then(|| {
+            sanitize_diagnostic(
+                diagnostic_redactor,
+                detail,
+                MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES,
+            )
+        })
+    });
+    Some(ProviderLifecycle { state, detail })
+}
+
+/// Extracts a lifecycle comment without treating ordinary SSE comments as
+/// provider data. The `ygg-lifecycle:` namespace is accepted only after the
+/// endpoint explicitly opted in through the request header.
+fn lifecycle_from_sse_comment(
+    comment: &str,
+    diagnostic_redactor: &CredentialRedactor,
+) -> Option<ProviderLifecycle> {
+    parse_provider_lifecycle(
+        comment.strip_prefix(LIFECYCLE_COMMENT_PREFIX)?.trim_start(),
+        diagnostic_redactor,
+    )
+}
 
 fn is_bidi_format_control(character: char) -> bool {
     matches!(
@@ -302,22 +354,20 @@ fn provider_error_from_success_body(body: &[u8]) -> Option<ProviderError> {
     })
 }
 
-/// Compress the private ChatGPT Codex Responses request body.
+/// Apply the request runtime selected by the endpoint declaration.
 ///
-/// This is deliberately endpoint-specific. OpenAI-compatible gateways do not
-/// uniformly accept request `Content-Encoding`, while the Codex SSE endpoint
-/// explicitly supports zstd. Compression failure is only an optimization miss:
-/// preserve the valid uncompressed request instead of failing the model turn.
-///
-/// The zstd work runs on the blocking thread pool so multi-hundred-KB request
-/// bodies never stall the async runtime worker.
+/// Codecs produce canonical bodies. Endpoint declarations independently opt
+/// into documented transport behavior, so providers sharing a codec never need
+/// a provider-name branch here. Compression failure is only an optimization
+/// miss: preserve the valid uncompressed request instead of failing the model
+/// turn. The zstd work runs on the blocking thread pool so multi-hundred-KB
+/// request bodies never stall the async runtime worker.
 async fn prepare_request_body(
-    endpoint_id: &crate::types::EndpointId,
-    protocol: Protocol,
+    runtime: crate::types::RequestRuntime,
     headers: &mut http::HeaderMap,
     body: bytes::Bytes,
 ) -> bytes::Bytes {
-    if endpoint_id.0 != "openai-codex" || protocol != Protocol::OpenAiResponses {
+    if runtime.body_encoding != crate::types::RequestBodyEncoding::Zstd {
         return body;
     }
 
@@ -413,6 +463,197 @@ fn websocket_open_failure_is_replay_safe(error: &AiError) -> bool {
     )
 }
 
+struct BedrockResponseStreamRequest {
+    response: reqwest::Response,
+    model: Model,
+    tool_definitions: Vec<ToolDef>,
+    pre_send_diagnostics: Vec<crate::error::Diagnostic>,
+    buffer_ambiguous_compatibility_content: bool,
+    diagnostic_redactor: CredentialRedactor,
+    stream_initial_timeout: Duration,
+    stream_idle_timeout: Duration,
+    stream_deadline: Duration,
+}
+
+fn bedrock_response_stream(request: BedrockResponseStreamRequest) -> ResponseStream {
+    let BedrockResponseStreamRequest {
+        response,
+        model,
+        tool_definitions,
+        pre_send_diagnostics,
+        buffer_ambiguous_compatibility_content,
+        diagnostic_redactor,
+        stream_initial_timeout,
+        stream_idle_timeout,
+        stream_deadline,
+    } = request;
+    let raw_event_stream = try_stream! {
+        let mut decoder = crate::protocol::bedrock::BedrockEventStreamDecoder::new();
+        let mut state = crate::protocol::bedrock::BedrockStreamState::default();
+        let mut builder = ResponseBuilder::new(
+            model.spec.id.clone(),
+            model.spec.protocol,
+            model.spec.pricing.clone(),
+        );
+        builder.set_tool_definitions(&tool_definitions)?;
+        builder.set_buffer_ambiguous_compatibility_content(
+            buffer_ambiguous_compatibility_content,
+        );
+        for diagnostic in &pre_send_diagnostics {
+            builder.add_diagnostic(diagnostic.clone());
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut terminal_seen = false;
+        let mut provider_event_seen = false;
+        let mut successful_body_prefix = Vec::new();
+        let mut first_body_chunk = true;
+        let started_at = Instant::now();
+        let mut last_event_at = None;
+        'read: loop {
+            let remaining = stream_deadline.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                Err(annotate_stream_failure(
+                    AiError::Transport(TransportError {
+                        phase: TransportPhase::Body,
+                        timeout: true,
+                        message: "stream exceeded its overall deadline".to_owned(),
+                    }),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                ))?;
+            }
+            let quiet_timeout = if first_body_chunk {
+                stream_initial_timeout
+            } else {
+                stream_idle_timeout
+            };
+            let wait_for = remaining.min(quiet_timeout);
+            let chunk_result = tokio::time::timeout(wait_for, stream.next())
+                .await
+                .map_err(|_| {
+                    annotate_stream_failure(
+                        AiError::Transport(TransportError {
+                            phase: TransportPhase::Body,
+                            timeout: true,
+                            message: if remaining <= quiet_timeout {
+                                "stream exceeded its overall deadline".to_owned()
+                            } else if first_body_chunk {
+                                "stream was idle beyond its initial timeout".to_owned()
+                            } else {
+                                "stream was idle beyond its timeout".to_owned()
+                            },
+                        }),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+            let Some(chunk_result) = chunk_result else {
+                break;
+            };
+            let chunk = chunk_result.map_err(|error| {
+                annotate_stream_failure(
+                    reqwest_transport_error(error, TransportPhase::Body, "Bedrock response body"),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            first_body_chunk = false;
+            if !provider_event_seen && successful_body_prefix.len() < MAX_SUCCESS_ERROR_BODY_BYTES {
+                let remaining = MAX_SUCCESS_ERROR_BODY_BYTES - successful_body_prefix.len();
+                successful_body_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let messages = decoder.push(&chunk).map_err(|error| {
+                annotate_stream_failure(
+                    AiError::Decode(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            if !messages.is_empty() {
+                provider_event_seen = true;
+                last_event_at = Some(Instant::now());
+                successful_body_prefix.clear();
+            }
+            for message in messages {
+                let events = crate::protocol::bedrock::decode_stream_event(
+                    &model,
+                    &message,
+                    &mut builder,
+                    &mut state,
+                )
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        error,
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+                for event in events {
+                    let terminal = matches!(event, StreamEvent::Finished(_));
+                    yield event;
+                    if terminal {
+                        terminal_seen = true;
+                        break 'read;
+                    }
+                }
+            }
+        }
+
+        if !terminal_seen {
+            decoder.finish().map_err(|error| {
+                annotate_stream_failure(
+                    AiError::Decode(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            let mut final_events = Vec::new();
+            crate::protocol::bedrock::finish_stream(&mut builder, &mut state, &mut final_events)
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        error,
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+            for event in final_events {
+                let terminal = matches!(event, StreamEvent::Finished(_));
+                yield event;
+                terminal_seen |= terminal;
+            }
+        }
+        if !terminal_seen && !provider_event_seen {
+            if let Some(error) = provider_error_from_success_body(&successful_body_prefix) {
+                Err(annotate_stream_failure(
+                    AiError::Provider(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                ))?;
+            }
+        }
+    };
+    let sanitized = raw_event_stream
+        .map(move |event| event.map_err(|error| sanitize_ai_error(&diagnostic_redactor, error)));
+    crate::stream::guard(sanitized)
+}
+
 async fn stream_http(
     http: reqwest::Client,
     request: HttpStreamRequest,
@@ -428,15 +669,41 @@ async fn stream_http(
         tool_definitions,
         pre_send_diagnostics,
         buffer_ambiguous_compatibility_content,
-        diagnostic_redactor,
+        mut diagnostic_redactor,
     } = request;
-    let request_body = prepare_request_body(
-        &model.endpoint.id,
-        model.spec.protocol,
-        &mut headers,
-        parts.body.clone(),
-    )
-    .await;
+    let lifecycle_feedback = parts.streaming
+        && model.spec.protocol == Protocol::OpenAiChat
+        && model.endpoint.runtime.lifecycle_feedback;
+    if lifecycle_feedback {
+        headers.insert(
+            http::HeaderName::from_static(LIFECYCLE_HEADER),
+            http::HeaderValue::from_static(LIFECYCLE_REQUEST_VALUE),
+        );
+    }
+    let request_body =
+        prepare_request_body(model.endpoint.runtime, &mut headers, parts.body.clone()).await;
+    if matches!(&model.endpoint.auth, crate::auth::Auth::RequestSigner(_)) {
+        let resolved = crate::auth::resolve_headers_for_request(
+            &model.endpoint.auth,
+            http::Method::POST,
+            parts.url.clone(),
+            request_body.clone(),
+            headers.clone(),
+        )
+        .await
+        .map_err(AiError::Auth)?;
+        diagnostic_redactor = resolved.redactor;
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
+        let mut current_key = None;
+        for (key, value) in resolved.headers {
+            if let Some(key) = key {
+                current_key = Some(key.clone());
+                headers.insert(key, value);
+            } else if let Some(key) = &current_key {
+                headers.append(key.clone(), value);
+            }
+        }
+    }
 
     // 3. Send the HTTP request
     let builder = http
@@ -469,6 +736,7 @@ async fn stream_http(
         let request_id = res
             .headers()
             .get("x-request-id")
+            .or_else(|| res.headers().get("x-amzn-requestid"))
             .or_else(|| res.headers().get("request-id"))
             .and_then(|h| h.to_str().ok())
             .map(String::from);
@@ -519,6 +787,7 @@ async fn stream_http(
         let retryable = matches!(
             status,
             http::StatusCode::REQUEST_TIMEOUT
+                | http::StatusCode::INTERNAL_SERVER_ERROR
                 | http::StatusCode::TOO_MANY_REQUESTS
                 | http::StatusCode::BAD_GATEWAY
                 | http::StatusCode::SERVICE_UNAVAILABLE
@@ -543,10 +812,32 @@ async fn stream_http(
     }
 
     // 5. Decode ResponseStream
+    let initial_lifecycle = lifecycle_feedback
+        .then(|| {
+            res.headers()
+                .get(LIFECYCLE_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| parse_provider_lifecycle(value, &diagnostic_redactor))
+        })
+        .flatten();
     let model_clone = model.clone();
+    if parts.streaming && model.spec.protocol == Protocol::BedrockConverse {
+        return Ok(bedrock_response_stream(BedrockResponseStreamRequest {
+            response: res,
+            model: model_clone,
+            tool_definitions,
+            pre_send_diagnostics,
+            buffer_ambiguous_compatibility_content,
+            diagnostic_redactor,
+            stream_initial_timeout,
+            stream_idle_timeout,
+            stream_deadline,
+        }));
+    }
     if parts.streaming {
         let byte_stream = res.bytes_stream();
         let diags = pre_send_diagnostics;
+        let lifecycle_redactor = diagnostic_redactor.clone();
         let raw_event_stream = try_stream! {
             let mut sse_decoder = crate::protocol::sse::SseDecoder::new();
             let mut builder = ResponseBuilder::new(
@@ -560,6 +851,20 @@ async fn stream_http(
             );
             for d in &diags {
                 builder.add_diagnostic(d.clone());
+            }
+
+            let mut lifecycle_stream_started = false;
+            let mut lifecycle_events_emitted = 0usize;
+            if let Some(lifecycle) = initial_lifecycle {
+                // Header feedback arrives before any provider SSE event. Seed
+                // the canonical stream first so advisory telemetry still obeys
+                // the `Started`-is-first invariant.
+                let started = StreamEvent::Started { response_id: None };
+                builder.on_event(&started)?;
+                yield started;
+                lifecycle_stream_started = true;
+                lifecycle_events_emitted += 1;
+                yield StreamEvent::ProviderLifecycle(lifecycle);
             }
 
             let mut stream = byte_stream;
@@ -639,7 +944,17 @@ async fn stream_http(
                         .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
                 }
 
-                let sse_events = sse_decoder.push(&chunk).map_err(|error| {
+                let sse_frames = if lifecycle_feedback {
+                    sse_decoder.push_frames(&chunk)
+                } else {
+                    sse_decoder.push(&chunk).map(|events| {
+                        events
+                            .into_iter()
+                            .map(crate::protocol::sse::SseFrame::Event)
+                            .collect()
+                    })
+                }
+                .map_err(|error| {
                     annotate_stream_failure(
                         AiError::Decode(error),
                         &builder,
@@ -648,72 +963,166 @@ async fn stream_http(
                         last_event_at,
                     )
                 })?;
-                if !sse_events.is_empty() {
+                let lifecycle_frame_seen = lifecycle_feedback
+                    && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                    && sse_frames.iter().any(|frame| {
+                        matches!(
+                            frame,
+                            crate::protocol::sse::SseFrame::Comment(comment)
+                                if lifecycle_from_sse_comment(comment, &lifecycle_redactor).is_some()
+                        )
+                    });
+                if sse_frames.iter().any(|frame| matches!(frame, crate::protocol::sse::SseFrame::Event(_)))
+                    || lifecycle_frame_seen
+                {
                     provider_event_seen = true;
                     last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
                 }
 
-                for sse in sse_events {
-                    let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
-                    }
-                    .map_err(|error| {
-                        annotate_stream_failure(
-                            error,
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
-                        )
-                    })?;
-                    for ev in stream_events {
-                        let terminal = matches!(ev, StreamEvent::Finished(_));
-                        yield ev;
-                        if terminal {
-                            terminal_seen = true;
-                            break 'read;
+                for frame in sse_frames {
+                    match frame {
+                        crate::protocol::sse::SseFrame::Comment(comment) => {
+                            if lifecycle_feedback
+                                && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                            {
+                                if let Some(lifecycle) =
+                                    lifecycle_from_sse_comment(&comment, &lifecycle_redactor)
+                                {
+                                    if !lifecycle_stream_started {
+                                        let started = StreamEvent::Started { response_id: None };
+                                        builder.on_event(&started)?;
+                                        yield started;
+                                        lifecycle_stream_started = true;
+                                    }
+                                    lifecycle_events_emitted += 1;
+                                    yield StreamEvent::ProviderLifecycle(lifecycle);
+                                }
+                            }
+                        }
+                        crate::protocol::sse::SseFrame::Event(sse) => {
+                            let stream_events = match model_clone.spec.protocol {
+                                Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
+                                Protocol::GoogleGenerativeAi => crate::protocol::google::decode_stream_event(&model_clone, &sse, &mut builder),
+                            }
+                            .map_err(|error| {
+                                annotate_stream_failure(
+                                    error,
+                                    &builder,
+                                    first_body_chunk,
+                                    started_at,
+                                    last_event_at,
+                                )
+                            })?;
+                            for ev in stream_events {
+                                let started = matches!(ev, StreamEvent::Started { .. });
+                                let terminal = matches!(ev, StreamEvent::Finished(_));
+                                yield ev;
+                                lifecycle_stream_started |= started;
+                                if terminal {
+                                    terminal_seen = true;
+                                    break 'read;
+                                }
+                            }
                         }
                     }
                 }
             }
 
-            // Only flush a trailing partial SSE frame if no terminal event was
-            // seen; after `Finished` the stream is closed and any residue is
-            // ignored rather than decoded into post-terminal events.
+            // Only flush trailing SSE frames if no terminal event was seen;
+            // after `Finished` the stream is closed and any residue is ignored
+            // rather than decoded into post-terminal events.
             if !terminal_seen {
-                if let Some(sse) =
-                    sse_decoder.finish().map_err(|error| {
-                        annotate_stream_failure(
-                            AiError::Decode(error),
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
+                let trailing_frames = if lifecycle_feedback {
+                    sse_decoder.finish_frames()
+                } else {
+                    sse_decoder.finish().map(|event| {
+                        event
+                            .into_iter()
+                            .map(crate::protocol::sse::SseFrame::Event)
+                            .collect()
+                    })
+                }
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        AiError::Decode(error),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+                let lifecycle_frame_seen = lifecycle_feedback
+                    && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                    && trailing_frames.iter().any(|frame| {
+                        matches!(
+                            frame,
+                            crate::protocol::sse::SseFrame::Comment(comment)
+                                if lifecycle_from_sse_comment(comment, &lifecycle_redactor).is_some()
                         )
-                    })?
+                    });
+                if trailing_frames.iter().any(|frame| matches!(frame, crate::protocol::sse::SseFrame::Event(_)))
+                    || lifecycle_frame_seen
                 {
                     provider_event_seen = true;
                     last_event_at = Some(Instant::now());
                     successful_body_prefix.clear();
-                    let stream_events = match model_clone.spec.protocol {
-                        Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
-                        Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                }
+
+                for frame in trailing_frames {
+                    if terminal_seen {
+                        break;
                     }
-                    .map_err(|error| {
-                        annotate_stream_failure(
-                            error,
-                            &builder,
-                            first_body_chunk,
-                            started_at,
-                            last_event_at,
-                        )
-                    })?;
-                    for ev in stream_events {
-                        yield ev;
+                    match frame {
+                        crate::protocol::sse::SseFrame::Comment(comment) => {
+                            if lifecycle_feedback
+                                && lifecycle_events_emitted < MAX_PROVIDER_LIFECYCLE_EVENTS
+                            {
+                                if let Some(lifecycle) =
+                                    lifecycle_from_sse_comment(&comment, &lifecycle_redactor)
+                                {
+                                    if !lifecycle_stream_started {
+                                        let started = StreamEvent::Started { response_id: None };
+                                        builder.on_event(&started)?;
+                                        yield started;
+                                        lifecycle_stream_started = true;
+                                    }
+                                    lifecycle_events_emitted += 1;
+                                    yield StreamEvent::ProviderLifecycle(lifecycle);
+                                }
+                            }
+                        }
+                        crate::protocol::sse::SseFrame::Event(sse) => {
+                            let stream_events = match model_clone.spec.protocol {
+                                Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
+                                Protocol::GoogleGenerativeAi => crate::protocol::google::decode_stream_event(&model_clone, &sse, &mut builder),
+                            }
+                            .map_err(|error| {
+                                annotate_stream_failure(
+                                    error,
+                                    &builder,
+                                    first_body_chunk,
+                                    started_at,
+                                    last_event_at,
+                                )
+                            })?;
+                            for ev in stream_events {
+                                let started = matches!(ev, StreamEvent::Started { .. });
+                                let terminal = matches!(ev, StreamEvent::Finished(_));
+                                yield ev;
+                                lifecycle_stream_started |= started;
+                                if terminal {
+                                    terminal_seen = true;
+                                    break;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -794,6 +1203,7 @@ async fn stream_http(
             let mut index_counter = 0;
             for part in &message.content {
                 match part {
+                    crate::types::AssistantPart::ProviderMetadata(_) => {}
                     crate::types::AssistantPart::Text(text) => {
                         let idx = index_counter;
                         index_counter += 1;
@@ -827,7 +1237,10 @@ async fn stream_http(
                             index: idx,
                             delta: tc.arguments_json.clone(),
                         };
-                        yield StreamEvent::ToolCallEnd { index: idx };
+                        yield StreamEvent::ToolCallEnd {
+                            index: idx,
+                            argument_error: tc.argument_error,
+                        };
                     }
                 }
             }
@@ -981,6 +1394,7 @@ fn responses_websocket_stream(
 pub struct AiClient {
     http: reqwest::Client,
     responses_ws: ResponsesWsPool,
+    host_stream_transports: Arc<StdMutex<HashMap<EndpointId, Arc<dyn HostStreamTransport>>>>,
     stream_initial_timeout: Duration,
     stream_idle_timeout: Duration,
     stream_deadline: Duration,
@@ -1016,6 +1430,7 @@ impl AiClient {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             responses_ws: ResponsesWsPool::default(),
+            host_stream_transports: Arc::new(StdMutex::new(HashMap::new())),
             stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
@@ -1027,10 +1442,36 @@ impl AiClient {
         Self {
             http,
             responses_ws: ResponsesWsPool::default(),
+            host_stream_transports: Arc::new(StdMutex::new(HashMap::new())),
             stream_initial_timeout: DEFAULT_STREAM_INITIAL_TIMEOUT,
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
             stream_deadline: DEFAULT_STREAM_DEADLINE,
         }
+    }
+
+    /// Registers a host-owned stream transport for one catalog endpoint.
+    ///
+    /// The registration is shared by clones of this client. The transport sees
+    /// only canonical request data and [`crate::HostStreamModel`]; resolved
+    /// credentials, endpoint URLs, and headers are deliberately not exposed.
+    /// Replacing a transport is an explicit host authority action.
+    pub fn register_host_stream_transport(
+        &self,
+        endpoint: EndpointId,
+        transport: Arc<dyn HostStreamTransport>,
+    ) {
+        self.host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(endpoint, transport);
+    }
+
+    /// Removes a host-owned stream transport for one endpoint.
+    pub fn remove_host_stream_transport(&self, endpoint: &EndpointId) {
+        self.host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(endpoint);
     }
 
     /// Sets the maximum quiet interval and absolute lifetime of response bodies,
@@ -1095,6 +1536,7 @@ impl AiClient {
         };
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
+        crate::json_repair::validate_tool_definitions(&req.tools).map_err(AiError::Decode)?;
         let parts = crate::protocol::openai_responses::build_request(model, &req)?;
         let mut headers = http::HeaderMap::new();
         for (key, value) in &model.endpoint.default_headers {
@@ -1121,7 +1563,12 @@ impl AiClient {
                 headers.append(key.clone(), value);
             }
         }
-        if model.endpoint.id.0 == "openai-codex" {
+        if model
+            .endpoint
+            .runtime
+            .responses_profile
+            .sends_websocket_beta_header()
+        {
             headers.insert(
                 http::HeaderName::from_static("openai-beta"),
                 http::HeaderValue::from_static(ResponsesWsPool::beta_header_value()),
@@ -1158,6 +1605,38 @@ impl AiClient {
             return Err(crate::ConfigError::UnknownEndpoint(model.spec.endpoint.clone()).into());
         }
 
+        let host_transport = self
+            .host_stream_transports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&model.endpoint.id)
+            .cloned();
+        if let Some(transport) = host_transport {
+            // Keep host-mediated transports on the canonical side of the same
+            // replay-history and capability boundary as HTTP codecs. Unlike a
+            // protocol codec they cannot safely perform lossy wire-specific
+            // degradation, so validate strictly rather than exposing an
+            // unsupported canonical feature to an extension transport.
+            let mut request = req;
+            request.messages =
+                crate::transform::transform_request_messages_owned(request.messages, model);
+            let request =
+                crate::validate::normalize_request_reasoning(&request, &model.spec.capabilities)
+                    .into_owned();
+            let diagnostics = crate::validate::validate_request(
+                &request,
+                &model.spec.capabilities,
+                &model.spec.limits,
+                model.spec.protocol,
+                &model.spec.id,
+                crate::CompatibilityMode::Strict,
+            )?;
+            let stream = transport
+                .stream(HostStreamModel::from(model), request, diagnostics)
+                .await?;
+            return Ok(crate::stream::guard(stream));
+        }
+
         // Derive target-compatible replay history without mutating the caller's
         // canonical conversation. This must happen before strict validation:
         // cross-model reasoning, unsupported historical media, and interrupted
@@ -1165,6 +1644,10 @@ impl AiClient {
         let mut req = req;
         req.messages = crate::transform::transform_request_messages_owned(req.messages, model);
         let tool_definitions = req.tools.clone();
+        // Reject malformed schemas before a provider request can consume them.
+        // The same immutable snapshot is retained by response assembly below.
+        crate::json_repair::validate_tool_definitions(&tool_definitions)
+            .map_err(AiError::Decode)?;
         // Ambiguous bare JSON must remain visible in the default strict stream.
         // Lossy mode is the explicit opt-in for holding it to EOF and
         // interpreting a provider's text as compatibility tool syntax.
@@ -1182,6 +1665,8 @@ impl AiClient {
             Protocol::OpenAiResponses => {
                 crate::protocol::openai_responses::build_request(model, &req)?
             }
+            Protocol::BedrockConverse => crate::protocol::bedrock::build_request(model, &req)?,
+            Protocol::GoogleGenerativeAi => crate::protocol::google::build_request(model, &req)?,
         };
 
         // Pre-send Lossy diagnostics (capability drops computed in `build_request`)
@@ -1207,21 +1692,28 @@ impl AiClient {
             headers.insert(k.clone(), v.clone());
         }
 
-        let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
-            .await
-            .map_err(AiError::Auth)?;
-        let mut diagnostic_redactor = resolved_headers.redactor;
-        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
-
-        let mut current_key = None;
-        for (key, value) in resolved_headers.headers {
-            if let Some(key) = key {
-                current_key = Some(key.clone());
-                headers.insert(key, value);
-            } else if let Some(key) = &current_key {
-                headers.append(key.clone(), value);
+        // Request-aware signers (SigV4) must run after body encoding, so the
+        // exact body and final header set are covered. Ordinary auth remains
+        // resolved here so the Responses WebSocket path can use it directly.
+        let request_aware_signer =
+            matches!(&model.endpoint.auth, crate::auth::Auth::RequestSigner(_));
+        let mut diagnostic_redactor = CredentialRedactor::default();
+        if !request_aware_signer {
+            let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+                .await
+                .map_err(AiError::Auth)?;
+            diagnostic_redactor = resolved_headers.redactor;
+            let mut current_key = None;
+            for (key, value) in resolved_headers.headers {
+                if let Some(key) = key {
+                    current_key = Some(key.clone());
+                    headers.insert(key, value);
+                } else if let Some(key) = &current_key {
+                    headers.append(key.clone(), value);
+                }
             }
         }
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
 
         let fallback_request = HttpStreamRequest {
             model: model.clone(),
@@ -1243,13 +1735,19 @@ impl AiClient {
             model.endpoint.transport,
             crate::types::EndpointTransport::WebSocketPreferred
         ) && model.spec.protocol == Protocol::OpenAiResponses
+            && !request_aware_signer
             && fallback_request.parts.streaming
         {
             let session_key = req.session_id.as_deref().filter(|id| !id.is_empty());
             let websocket_key = session_key
                 .map(|session| format!("{}:{}:{session}", model.endpoint.id.0, model.spec.id.0));
             let mut ws_headers = fallback_request.headers.clone();
-            if model.endpoint.id.0 == "openai-codex" {
+            if model
+                .endpoint
+                .runtime
+                .responses_profile
+                .sends_websocket_beta_header()
+            {
                 ws_headers.insert(
                     http::HeaderName::from_static("openai-beta"),
                     http::HeaderValue::from_static(ResponsesWsPool::beta_header_value()),
@@ -1335,7 +1833,11 @@ impl AiClient {
             ))
             .into());
         }
-        let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+        let rich_codex_schema = model
+            .endpoint
+            .runtime
+            .responses_profile
+            .supports_rich_compact_schema()
             || model.spec.cache.session_affinity_format
                 == Some(crate::types::SessionAffinityFormat::Codex)
             || model.spec.capabilities.responses_lite;
@@ -1534,12 +2036,14 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn codex_responses_body_is_zstd_compressed_and_other_routes_are_untouched() {
+    async fn declared_request_runtime_compresses_without_provider_identity() {
         let original = bytes::Bytes::from(vec![b'a'; 128 * 1024]);
         let mut headers = http::HeaderMap::new();
         let compressed = prepare_request_body(
-            &crate::types::EndpointId("openai-codex".to_owned()),
-            Protocol::OpenAiResponses,
+            crate::types::RequestRuntime {
+                body_encoding: crate::types::RequestBodyEncoding::Zstd,
+                ..crate::types::RequestRuntime::default()
+            },
             &mut headers,
             original.clone(),
         )
@@ -1553,8 +2057,7 @@ mod tests {
 
         let mut generic_headers = http::HeaderMap::new();
         let generic = prepare_request_body(
-            &crate::types::EndpointId("openai".to_owned()),
-            Protocol::OpenAiResponses,
+            crate::types::RequestRuntime::default(),
             &mut generic_headers,
             original.clone(),
         )
@@ -1586,6 +2089,27 @@ mod tests {
         assert!(!error.message.contains(secret));
         assert!(!error.message.contains("/private/catalog"));
         assert!(!error.message.contains(&address.to_string()));
+    }
+
+    #[test]
+    fn lifecycle_details_are_redacted_control_safe_and_bounded() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("authorization", "Bearer lifecycle-secret".parse().unwrap());
+        let mut redactor = CredentialRedactor::default();
+        redactor.include_header_values(&headers);
+        let detail = format!("Bearer lifecycle-secret \x1b{}", "é".repeat(200));
+
+        let lifecycle = parse_provider_lifecycle(&format!("loading; {detail}"), &redactor)
+            .expect("known lifecycle state");
+        assert_eq!(lifecycle.state, ProviderLifecycleState::Loading);
+        let detail = lifecycle.detail.expect("nonempty detail");
+        assert!(detail.len() <= MAX_PROVIDER_LIFECYCLE_DETAIL_BYTES);
+        assert!(detail.is_char_boundary(detail.len()));
+        assert!(detail.contains("[REDACTED]"));
+        assert!(!detail.contains("lifecycle-secret"));
+        assert!(!detail.chars().any(char::is_control));
+        assert!(lifecycle_from_sse_comment("ordinary keepalive", &redactor).is_none());
+        assert!(parse_provider_lifecycle("unknown; ignored", &redactor).is_none());
     }
 
     #[test]

@@ -302,7 +302,12 @@ fn map_responses_text(
             strict: schema.strict,
         }),
     };
-    let verbosity = (model.endpoint.id.0 == "openai-codex").then_some("low");
+    let verbosity = model
+        .endpoint
+        .runtime
+        .responses_profile
+        .uses_low_verbosity()
+        .then_some("low");
     (text_format.is_some() || verbosity.is_some()).then_some(ResponsesTextConfig {
         format: text_format,
         verbosity,
@@ -326,7 +331,11 @@ pub(crate) fn build_compact_request(
     // currently exposes a narrower schema and may reject these extra fields.
     let responses_lite = model.spec.capabilities.responses_lite;
     let reasoning = normalize_reasoning_config(reasoning, &model.spec.capabilities);
-    let rich_codex_schema = model.endpoint.id.0 == "openai-codex"
+    let rich_codex_schema = model
+        .endpoint
+        .runtime
+        .responses_profile
+        .supports_rich_compact_schema()
         || model.spec.cache.session_affinity_format
             == Some(crate::types::SessionAffinityFormat::Codex)
         || responses_lite;
@@ -401,6 +410,9 @@ pub(crate) fn responses_affinity_headers(
         Some(crate::types::SessionAffinityFormat::OpenRouter) => {
             headers.insert(http::HeaderName::from_static("x-session-id"), value);
         }
+        // Mistral is a Chat route; accept the configuration here without
+        // applying a Chat-only header to a Responses request.
+        Some(crate::types::SessionAffinityFormat::Mistral) => {}
         Some(crate::types::SessionAffinityFormat::Codex) => {
             headers.insert(http::HeaderName::from_static("session-id"), value.clone());
             headers.insert(http::HeaderName::from_static("x-client-request-id"), value);
@@ -638,6 +650,7 @@ fn map_assistant_input(
                 }
             }
             AssistantPart::Media(_) => {}
+            AssistantPart::ProviderMetadata(_) => {}
         }
     }
     flush_assistant_text(&mut input, &mut text_parts);
@@ -815,14 +828,16 @@ pub(crate) fn build_request(
     // Only forward an explicit caller cap. The Responses API treats this as
     // optional, and the ChatGPT Codex backend rejects it outright
     // (`{"detail":"Unsupported parameter: max_output_tokens"}`), so we never
-    // synthesize a default from the local capacity limit. Additionally, the
-    // Codex endpoint (ID "openai-codex") does not support this parameter at
-    // all, so we always omit it for that endpoint.
-    let max_output_tokens = if model.endpoint.id.0 == "openai-codex" {
-        None
-    } else {
-        req.max_output_tokens
-    };
+    // synthesize a default from the local capacity limit. Subscription
+    // endpoints that reject this parameter select omission through runtime
+    // metadata rather than a codec-side provider identity check.
+    let max_output_tokens = (!model
+        .endpoint
+        .runtime
+        .responses_profile
+        .omits_max_output_tokens())
+    .then_some(req.max_output_tokens)
+    .flatten();
 
     let responses_options = req.responses.as_ref();
     let raw_input = responses_options.and_then(|options| options.input.as_ref());
@@ -860,7 +875,17 @@ pub(crate) fn build_request(
                 .then_some(model.spec.capabilities.parallel_tool_calls)
         },
         max_output_tokens,
-        temperature: req.temperature,
+        // Verified Astra routes reject sampling controls; all other Responses
+        // models remain unchanged. `top_p` and `logprobs` have no Responses
+        // DTO fields and remain absent.
+        temperature: if matches!(
+            model.spec.id.0.as_str(),
+            "gpt-6-astra" | "codex/gpt-6-astra"
+        ) {
+            None
+        } else {
+            req.temperature
+        },
         reasoning: reasoning_opt,
         text: text_opt,
         prompt_cache_key: prompt_cache_key(&req),
@@ -875,11 +900,7 @@ pub(crate) fn build_request(
     let body_bytes = serde_json::to_vec(&responses_req)
         .map_err(|e| AiError::Decode(DecodeError::Json(e.to_string())))?;
 
-    let url = model
-        .endpoint
-        .base_url
-        .join("responses")
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let url = crate::protocol::endpoint_url(&model.endpoint.base_url, "responses")?;
 
     let headers = responses_affinity_headers(model, cache_session_id(&req))?;
 
@@ -1167,7 +1188,14 @@ fn close_open_tool_calls(
         .filter(|index| !builder.ended_indices.contains(index))
         .collect();
     for index in open {
-        emit_event(events, builder, StreamEvent::ToolCallEnd { index })?;
+        emit_event(
+            events,
+            builder,
+            StreamEvent::ToolCallEnd {
+                index,
+                argument_error: None,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1424,6 +1452,7 @@ pub(crate) fn decode_stream_event(
                     builder,
                     StreamEvent::ToolCallEnd {
                         index: canonical_idx,
+                        argument_error: None,
                     },
                 )?;
             }
@@ -1510,6 +1539,7 @@ pub(crate) fn decode_stream_event(
                         builder,
                         StreamEvent::ToolCallEnd {
                             index: canonical_idx,
+                            argument_error: None,
                         },
                     )?;
                 }
@@ -1636,7 +1666,8 @@ mod tests {
     use crate::types::{
         Capabilities, Endpoint, EndpointId, ImageMedia, ImageSource, JsonSchemaFormat, Media,
         Message, ModalitySet, ModelId, ModelLimits, ModelSpec, OutputFormat, OutputModalities,
-        ProviderMediaRef, ReasoningConfig, Request, ToolChoice, UserMessage, UserPart,
+        ProviderMediaRef, ReasoningConfig, Request, ResponsesRuntimeProfile, ToolChoice,
+        UserMessage, UserPart,
     };
     use crate::CompatibilityMode;
     use std::sync::Arc;
@@ -1714,6 +1745,7 @@ mod tests {
             auth: crate::auth::Auth::none(),
             default_headers: http::HeaderMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout: std::time::Duration::from_secs(30),
         };
 
@@ -1752,6 +1784,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&parts.body).unwrap();
         assert_eq!(body["model"], "o1-2024-12-17");
         assert_eq!(body["max_output_tokens"], 1000);
+        assert_eq!(body["temperature"], 0.5);
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
         assert!(body.get("parallel_tool_calls").is_none());
@@ -1768,6 +1801,42 @@ mod tests {
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][1]["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn gpt_6_astra_preserves_default_reasoning_and_emits_top_wire_efforts() {
+        let model = crate::catalog::ModelCatalog::builtin()
+            .unwrap()
+            .resolve(&ModelId("gpt-6-astra".to_owned()))
+            .unwrap();
+        let mut req = user_req(
+            vec![UserPart::Text("Hello".to_owned())],
+            CompatibilityMode::Strict,
+        );
+
+        req.temperature = Some(0.7);
+        let body: serde_json::Value =
+            serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+        assert_eq!(body["model"], "gpt-6-astra");
+        assert!(body.get("reasoning").is_none());
+        for unsupported in ["temperature", "top_p", "logprobs"] {
+            assert!(
+                body.get(unsupported).is_none(),
+                "Astra request unexpectedly included {unsupported}"
+            );
+        }
+
+        for (effort, expected) in [
+            (crate::types::ReasoningEffort::Minimal, "low"),
+            (crate::types::ReasoningEffort::Low, "low"),
+            (crate::types::ReasoningEffort::Xhigh, "xhigh"),
+            (crate::types::ReasoningEffort::Max, "max"),
+        ] {
+            req.reasoning = ReasoningConfig::Effort(effort);
+            let body: serde_json::Value =
+                serde_json::from_slice(&build_request(&model, &req).unwrap().body).unwrap();
+            assert_eq!(body["reasoning"]["effort"], expected);
+        }
     }
 
     #[test]
@@ -2319,12 +2388,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_wire_defaults_to_low_verbosity_and_gates_parallel_tools() {
+    fn declared_responses_runtime_defaults_to_low_verbosity_and_gates_parallel_tools() {
         let mut model = make_test_model(false);
-        Arc::make_mut(&mut model.endpoint).id = EndpointId("openai-codex".to_owned());
-        let spec = Arc::make_mut(&mut model.spec);
-        spec.endpoint = EndpointId("openai-codex".to_owned());
-        spec.capabilities.parallel_tool_calls = false;
+        Arc::make_mut(&mut model.endpoint).runtime.responses_profile =
+            ResponsesRuntimeProfile::Codex;
+        Arc::make_mut(&mut model.spec)
+            .capabilities
+            .parallel_tool_calls = false;
 
         let mut req = user_req(
             vec![UserPart::Text("hello".to_string())],
@@ -2523,7 +2593,9 @@ mod fixture_tests {
     use crate::error::{AiError, StreamProtocolError};
     use crate::protocol::harness;
     use crate::stream::StreamEvent;
-    use crate::types::{AssistantPart, Protocol, ReasoningStateKind, StopReason};
+    use crate::types::{
+        AssistantPart, Protocol, ReasoningStateKind, StopReason, ToolCallArgumentError, ToolDef,
+    };
 
     macro_rules! fx {
         ($name:literal) => {
@@ -2650,6 +2722,47 @@ mod fixture_tests {
         assert_eq!(
             tc.arguments_value().unwrap(),
             serde_json::json!({"pattern":"foo"})
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_mismatch_is_marked_before_tool_call_end() {
+        let model = harness::model(Protocol::OpenAiResponses, None);
+        let tools = [ToolDef {
+            name: "grep".to_owned(),
+            description: String::new(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "integer"}},
+                "required": ["pattern"],
+                "additionalProperties": false,
+            }),
+        }];
+        let events =
+            harness::drive_with_tools(&model, decode_stream_event, fx!("tool_call.sse"), 0, &tools)
+                .await
+                .unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallEnd {
+                argument_error: Some(ToolCallArgumentError::SchemaMismatch),
+                ..
+            }
+        )));
+        let call = harness::finished(&events)
+            .message
+            .content
+            .iter()
+            .find_map(|part| match part {
+                AssistantPart::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .expect("schema-rejected call is retained");
+        assert_eq!(call.id.0, "call_1");
+        assert_eq!(call.arguments_json, r#"{"pattern":"foo"}"#);
+        assert_eq!(
+            call.argument_error,
+            Some(ToolCallArgumentError::SchemaMismatch)
         );
     }
 

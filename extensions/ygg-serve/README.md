@@ -59,8 +59,12 @@ The eventual Ygg adapter must:
     nonsecret command shape, preserving exact idempotency without retaining
     plaintext.
 
-Run focused checks with:
+Run focused checks with the CI profile:
 
 ```console
-cargo test --manifest-path extensions/ygg-serve/Cargo.toml
+cargo test --manifest-path extensions/ygg-serve/Cargo.toml --profile ci-test --locked
 ```
+
+Omit `--profile ci-test` for Cargo's normal local test profile. The profiler
+build command and profile settings are documented in
+[docs/build-profiles.md](../../docs/build-profiles.md).

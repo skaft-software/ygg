@@ -95,6 +95,8 @@ pub enum SessionAffinityFormat {
     OpenRouter,
     /// Codex's `session-id` and `x-client-request-id` headers.
     Codex,
+    /// Mistral's `x-affinity` header.
+    Mistral,
 }
 
 /// Supported wire protocols.
@@ -107,10 +109,14 @@ pub enum Protocol {
     OpenAiChat,
     /// Anthropic Messages protocol.
     AnthropicMessages,
+    /// Amazon Bedrock Converse/ConverseStream protocol.
+    BedrockConverse,
+    /// Google Generative AI / Vertex `generateContent` protocol.
+    GoogleGenerativeAi,
 }
 
 /// Preferred transport for streaming provider responses.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointTransport {
     /// Use the provider's ordinary HTTP/SSE transport.
@@ -119,6 +125,97 @@ pub enum EndpointTransport {
     /// Prefer WebSocket when the protocol implements it, with HTTP/SSE as a
     /// compatibility fallback.
     WebSocketPreferred,
+}
+
+/// Per-endpoint request-runtime behavior that is independent of the wire codec.
+///
+/// A provider declaration selects an existing [`Protocol`] codec and may opt
+/// into transport behavior documented by that endpoint. This keeps provider
+/// identity out of the request loop: a new provider using an existing API
+/// family needs data, not a client branch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestRuntime {
+    /// Encoding applied to a complete request body before it is sent.
+    #[serde(default)]
+    pub body_encoding: RequestBodyEncoding,
+    /// Responses-family behavior selected by the endpoint declaration.
+    #[serde(default)]
+    pub responses_profile: ResponsesRuntimeProfile,
+    /// Chat-Completions-family behavior selected by the endpoint declaration.
+    #[serde(default)]
+    pub openai_chat_profile: OpenAiChatRuntimeProfile,
+    /// Opt into Ygg's OpenAI-compatible cold-start lifecycle extension.
+    ///
+    /// When enabled on a streaming OpenAI Chat HTTP/SSE request, Ygg advertises
+    /// support with `x-ygg-lifecycle: 1` and accepts the documented response
+    /// header and SSE comment updates. Endpoints that do not explicitly enable
+    /// this keep the ordinary OpenAI-compatible request and response behavior.
+    #[serde(default)]
+    pub lifecycle_feedback: bool,
+}
+
+/// Endpoint behavior for an existing OpenAI Chat Completions codec.
+///
+/// This is endpoint data rather than a provider identity. Mistral's chat
+/// endpoint retains the OpenAI Chat transport and stream envelope while using
+/// a few documented request and content conventions of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenAiChatRuntimeProfile {
+    /// Public OpenAI Chat Completions behavior.
+    #[default]
+    Default,
+    /// Mistral Chat Completions compatibility behavior.
+    Mistral,
+}
+
+/// Endpoint behavior for an existing OpenAI Responses codec.
+///
+/// This is intentionally endpoint data rather than a provider identifier: a
+/// provider using the standard Responses codec can select a documented runtime
+/// profile without adding a branch to the codec or client loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesRuntimeProfile {
+    /// Public OpenAI Responses behavior.
+    #[default]
+    Default,
+    /// ChatGPT Codex subscription behavior over the existing Responses codec.
+    Codex,
+}
+
+impl ResponsesRuntimeProfile {
+    /// Whether WebSocket requests require the private Responses beta marker.
+    pub const fn sends_websocket_beta_header(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether Responses text should request the profile's low verbosity.
+    pub const fn uses_low_verbosity(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether this endpoint accepts the richer compact request envelope.
+    pub const fn supports_rich_compact_schema(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Whether the endpoint rejects `max_output_tokens` outright.
+    pub const fn omits_max_output_tokens(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
+/// Content encoding supported by an endpoint's request runtime.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestBodyEncoding {
+    /// Send the codec-produced body without a content encoding.
+    #[default]
+    Identity,
+    /// Compress the codec-produced body with Zstandard and set
+    /// `Content-Encoding: zstd`.
+    Zstd,
 }
 
 /// Endpoint configuration for connecting to a provider.
@@ -134,6 +231,8 @@ pub struct Endpoint {
     pub default_headers: http::HeaderMap,
     /// Preferred response transport.
     pub transport: EndpointTransport,
+    /// Endpoint-specific request runtime selected by the provider declaration.
+    pub runtime: RequestRuntime,
     /// Maximum time to send a request and receive response headers. Streaming
     /// body idle and overall deadlines are owned by [`crate::AiClient`].
     pub timeout: std::time::Duration,
@@ -147,6 +246,7 @@ impl std::fmt::Debug for Endpoint {
             .field("auth", &self.auth)
             .field("default_headers", &"<redacted>")
             .field("transport", &self.transport)
+            .field("runtime", &self.runtime)
             .field("timeout", &self.timeout)
             .finish()
     }
@@ -668,10 +768,31 @@ pub enum AssistantPart {
     Text(String),
     /// Intermediate reasoning text and state.
     Reasoning(ReasoningPart),
+    /// Opaque metadata for the immediately following assistant part.
+    ///
+    /// This is retained only by a matching provider/model codec. It has no
+    /// visible content and must not be moved across assistant parts during
+    /// replay.
+    ProviderMetadata(ProviderPartMetadata),
     /// Request to execute a tool.
     ToolCall(ToolCall),
     /// Generated output media (e.g. spoken audio).
     Media(Media),
+}
+
+/// Opaque provider metadata associated with the next assistant part.
+///
+/// The metadata marker is intentionally a distinct canonical part rather than
+/// a property of text or tool calls: providers can attach continuation data to
+/// several unrelated wire part kinds, and preserving its position is required
+/// for replay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ProviderPartMetadata {
+    /// Google Gemini/Vertex opaque thought signature for the following part.
+    GoogleThoughtSignature {
+        /// Base64-encoded provider continuation value.
+        signature: String,
+    },
 }
 
 /// Execution outcome of a tool call.
@@ -701,6 +822,32 @@ pub enum ToolResultPart {
     Media(Media),
 }
 
+/// Recoverable validation failure retained with a completed tool call.
+///
+/// This marker is assigned only after the provider arguments have been parsed
+/// and normalized. It tells an agent to persist a paired error result instead
+/// of invoking the tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCallArgumentError {
+    /// The normalized argument object does not satisfy the request's exact
+    /// tool-parameter schema.
+    SchemaMismatch,
+}
+
+/// Result of validating one normalized argument object against a tool snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolArgumentValidation {
+    /// The named tool exists and its schema accepts the arguments.
+    Valid,
+    /// The named tool exists but its schema rejects the arguments.
+    SchemaMismatch,
+    /// The named tool is absent from the snapshot, so no schema was available
+    /// to validate. The caller can retain the call for normal unknown-tool
+    /// recovery.
+    UnknownTool,
+}
+
 /// Call to a tool.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -710,6 +857,11 @@ pub struct ToolCall {
     pub name: String,
     /// Raw JSON arguments string.
     pub arguments_json: String,
+    /// Recoverable validation failure found while assembling this completed
+    /// call. The canonical id and normalized arguments remain intact so a
+    /// durable error result can still be paired with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_error: Option<ToolCallArgumentError>,
 }
 
 impl ToolCall {
@@ -1389,6 +1541,7 @@ mod tests {
             id: ToolCallId("call_1".to_string()),
             name: "grep".to_string(),
             arguments_json: r#"{"pattern": "test"}"#.to_string(),
+            argument_error: None,
         };
         let parsed = tc.arguments_value().unwrap();
         assert_eq!(parsed["pattern"], "test");
@@ -1397,6 +1550,7 @@ mod tests {
             id: ToolCallId("call_2".to_string()),
             name: "grep".to_string(),
             arguments_json: r#""just a string""#.to_string(),
+            argument_error: None,
         };
         assert!(tc_invalid.arguments_value().is_err());
     }

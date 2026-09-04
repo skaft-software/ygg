@@ -1,8 +1,9 @@
 # Executable extensions
 
 > **Protocol reference:** [`docs/extensions/PROTOCOL-REFERENCE.md`](extensions/PROTOCOL-REFERENCE.md)
-> contains the complete specification of every JSON-RPC method, request/response
-> shape, type reference, and lifecycle timing.
+> contains the complete API `0.1`/`0.2` JSON-RPC method, request/response,
+> type, and lifecycle reference. API `0.3` is separately generated from its
+> schema at [`docs/extensions/API-0.3-REFERENCE.md`](extensions/API-0.3-REFERENCE.md).
 
 Ygg supports trusted local extension processes alongside native Rust
 `Extension` implementations. Process extensions use JSON-RPC 2.0 messages,
@@ -49,23 +50,36 @@ The extra local hop is intentional. It preserves language neutrality,
 replaceability, failure isolation, and a kernel that does not grow a special
 manager for every external protocol.
 
-Two exact manifest-selected protocol versions are implemented:
+Three exact manifest-selected protocol versions are implemented:
 
 - API `0.1` is frozen for existing trusted, bounded, text-oriented
   extensions. Its initialization wire remains unchanged. It does not inherit
   API `0.2` cancellation, progress, structured/media retention, correlation,
   or terminal lifecycle guarantees; optional `metadata` is accepted but
   discarded by the native subprocess adapter.
-- API `0.2` is the current stateful foundation. It negotiates cooperative
-  cancellation and typed content as required features, plus scoped progress,
-  artifacts, lifecycle observations, policy intents, and live tool catalogs as
-  optional features. Bounded child model sessions, single-use approval
-  capabilities, and owner-scoped secret lookup are offered conditionally;
-  parent-correlated ephemeral input is part of the base `0.2` contract.
+- API `0.2` remains the supported stateful legacy foundation. It negotiates
+  cooperative cancellation and typed content as required features, plus scoped
+  progress, artifacts, lifecycle observations, policy intents, and live tool
+  catalogs as optional features. Bounded child model sessions, single-use
+  approval capabilities, and owner-scoped secret lookup are offered
+  conditionally; parent-correlated ephemeral input is part of the base `0.2`
+  contract.
+- API `0.3` is the current schema-generated canonical foundation. Its exact
+  capabilities, methods, bounds, errors, and availability are defined only by
+  the generated [API `0.3` reference](extensions/API-0.3-REFERENCE.md); it is
+  not an implicit upgrade of either legacy wire. It also supports the optional,
+  declared `session_start`/`session_end` cleanup pair described below and alone
+  can receive manifest-declared CLI values during initialization. Its optional
+  `session_lifecycle` capability is advertised only when the interactive product
+  configures an active-session driver, which admits work only after a safe
+  active-session binding. `session/create` and `session/fork` return durable
+  IDs without switching; `session/switch` is limited to an existing workspace
+  session ID, and `session/reload` rereads the active durable session at an idle
+  boundary.
 
-API `0.2` supplies the stateful transport foundation for trusted daily use
-within those boundaries. It does not add an operating-system sandbox or move a
-domain capability into the host.
+API `0.2` remains the stateful transport foundation for existing trusted daily
+use within those boundaries. API `0.3` adds no operating-system sandbox or
+implicit access beyond negotiated host capabilities.
 
 Pi migration is capability-oriented rather than a promise to reproduce Pi's
 in-process ABI. `ygg migrate pi --dry-run` inventories package resources and
@@ -160,7 +174,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.7"
+requires_ygg = "=0.7.0-dev"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -184,7 +198,43 @@ tool_renderers = ["git_status"]
 notifications = true
 confirmations = true
 presentation = true # API 0.2 frontend-neutral activity/list/tree/detail snapshots
+
+# Optional. Omitting this preserves the legacy isolated resident process.
+[runtime]
+lifecycle = "workspace_service"
+sharing = "workspace"
 ```
+
+### Runtime lifecycle and sharing
+
+Discovery builds a bounded static catalog and never launches an entrypoint. The
+host runtime manager activates only profiles admitted by the host's existing
+enablement, trust, effect-policy, and process-policy gates.
+
+`[runtime]` is optional and defaults to `lifecycle = "legacy_resident"` plus
+`sharing = "isolated"`, preserving existing manifests. Valid lifecycle values
+are `legacy_resident`, `lazy_resident`, `oneshot`, `session`,
+`workspace_service`, `always`, and `pi_aggregate`.
+
+- `legacy_resident` and `session` start with an admitted session binding;
+  `session` and every isolated resident stop when that binding is released.
+- `lazy_resident` is cataloged but starts only after explicit host activation.
+  It may be isolated or explicitly workspace shared.
+- `oneshot` is isolated and stops when its admitted operation settles.
+- `workspace_service`, `always`, and `pi_aggregate` require
+  `sharing = "workspace"`; their manager-owned process may survive a compatible
+  App/session rebuild until the host shuts down or the catalog changes.
+
+Workspace sharing is never inferred from an extension name or language. It
+requires a canonical workspace, an explicit host trust partition, manifest
+opt-in, a matching content digest, and a directly verified local entrypoint.
+Ordinary and Serve hosts use disjoint trust partitions; Serve also separates
+project and authority profiles. PATH-only commands are allowed for isolated
+legacy compatibility but cannot be shared. API `0.1` does not carry
+resource-owner fences and is therefore always isolated. A source or catalog
+change retires a shared runtime fail-closed. Runtime status and
+`resource_exhausted` outcomes expose only extension and digest provenance; they
+do not expose workspace paths, trust inputs, child stderr, or secrets.
 
 Bare entrypoint commands are first resolved beside the manifest, then through
 `PATH`. Arguments are passed directly without a shell. The child working
@@ -194,6 +244,20 @@ directory is the active workspace. Ygg supplies `YGG_EXTENSION_API_VERSION`,
 host-verified artifact publication. To keep an existing extension on the
 frozen wire, leave `api_version = "0.1"` in its manifest. Semantic
 `presentation` is API `0.2`-only and is rejected on a frozen `0.1` manifest.
+
+An API `0.3` extension may instead declare the paired session lifecycle hooks:
+
+```toml
+api_version = "0.3"
+
+[contributes]
+hooks = ["session_start", "session_end"]
+```
+
+The pair is all-or-nothing: API `0.1`/`0.2` reject either name, and API `0.3`
+rejects a partial pair or any legacy request-path hook alongside it. During
+initialization the extension must select both optional `lifecycle_events` and
+`hook/run`, or neither; the host rejects a declaration/selection mismatch.
 
 `[capabilities].secrets` is a duplicate-free allowlist, not a request to copy
 credentials into the launch environment. Each name is at most 64 ASCII bytes,
@@ -211,6 +275,56 @@ present, is never persisted or logged by the host, and grants signing authority
 to the trusted extension process; enable it only under the same full-access and
 OS-isolation boundary as the extension itself. Unknown names and API `0.1`
 declarations are rejected.
+
+### API `0.3` CLI flags
+
+An API `0.3` manifest may declare bounded, typed long options under
+`[contributes].flags`. Every declaration has a globally visible `name`, an
+exact `type`, and a required typed `default`:
+
+```toml
+name = "workspace-index"
+version = "0.3.0"
+api_version = "0.3"
+
+[entrypoint]
+command = "workspace-index"
+
+[contributes]
+tools = ["index_status"]
+flags = [
+  { name = "index-enabled", type = "boolean", default = true,
+    description = "Enable workspace indexing" },
+  { name = "index-root", type = "string", default = "." },
+  { name = "index-limit", type = "integer", default = 500 },
+]
+```
+
+Supported types are exactly `boolean`, `string`, and `integer`. Boolean flags
+accept both `--index-enabled` and `--no-index-enabled`; string and integer flags
+accept one value (`--index-root src`, `--index-limit 1000`). Integers are signed
+portable JSON integers, and defaults and supplied strings are bounded. A name is
+a lowercase manifest identifier (letter first; then lowercase letters, digits,
+or hyphens) of at most 64 bytes. Descriptions are optional short plain text.
+Each extension may declare at most 64 flags. Unknown fields, duplicate names,
+wrong default types, invalid identifiers, oversized values, and unsupported
+type spellings are rejected at manifest validation.
+
+Ygg reads only validated manifest metadata to construct these options; it never
+starts or imports an extension to discover flags. A flag is registered only when
+its selected extension is both enabled and trusted. Selected flags must not
+collide with a built-in option, another selected extension flag, or a generated
+boolean inverse; a collision rejects the invocation before extension startup.
+They appear in `ygg --help` for ordinary no-subcommand startup. Authentication,
+package/migration/Pi, and other early-exit command paths retain their existing
+static parsing.
+
+The host resolves every declared value (including omitted defaults) before
+startup and sends the sorted `{name, value}` list as API `0.3`
+`initialize.params.flag_values`. API `0.1` and `0.2` manifests cannot declare
+flags and retain their exact legacy initialization wires. A Pi compatibility
+link likewise cannot project Pi's runtime `registerFlag` calls into this
+pre-start manifest surface; see its explicit compatibility diagnostic.
 
 ## Transport contract
 
@@ -231,7 +345,9 @@ Every request and response uses the standard JSON-RPC envelope:
 The initial host request is always `initialize`. Its parameters include API and
 Ygg versions, extension identity and source, the workspace, capability and
 contribution declarations, and inspectable session/model/reasoning/active-skill
-state. The response must use the same API version and provide complete schemas
+state. API `0.3` additionally receives the host-resolved manifest CLI values as
+`flag_values`; legacy API `0.1` and `0.2` initialization fields are unchanged.
+The response must use the same API version and provide complete schemas
 for the manifest-declared tools and commands. Negotiated `dynamic_tools` makes
 the initialize tool list authoritative epoch zero; negotiated
 `runtime_commands` likewise lets a compatibility host discover that generation's
@@ -786,6 +902,34 @@ remain authoritative. Both API versions keep `after_response` success-only;
 API `0.2` uses it only for bounded response-content synchronization and relies
 on settled lifecycle events for terminal cleanup.
 
+### Declared API `0.3` session hooks
+
+A negotiated declaration receives one `hook/run` request with
+`hook: "session_start"` when the coding product activates its durable session
+owner, and one `hook: "session_end"` when that binding settles. The generated
+payload is intentionally small: `SessionBinding` carries only the opaque
+SHA-256-derived owner key, a host-created extension-instance fence, and the
+process generation. `SessionEnd` adds a generated outcome, a reason chosen from
+`shutdown`, `reload`, `crash`, or `cancelled`, and elapsed
+milliseconds. It never exposes a session path, mutable `Session`, prompt,
+host-state snapshot, or request-path context.
+
+The host records ownership before sending start, so retries cannot duplicate a
+pair. Each dispatch is capped at 250 ms; malformed results, timeouts, and
+remote errors become bounded diagnostics. A valid `deny` or `defer` disposition
+is recorded but cannot veto host lifecycle ownership. Final settlement is
+idempotent and occurs before child shutdown. On an accepted reload the old
+generation receives `interrupted`/`reload` end before the replacement gets its
+new start; after a detected crash, the replacement receives the old
+`interrupted`/`crash` end (with the old binding generation) before its own
+start. This keeps cleanup generation-fenced even when the crashed child cannot
+receive a request.
+
+These hooks are not API `0.2` `session/started` or `session/settled`
+observations and never enter the prompt/tool request hot path. The current
+Python runtime remains a legacy API `0.1`/`0.2` adapter; generated API `0.3`
+types alone do not add an API `0.3` Python runtime.
+
 For an admitted, running full-access extension, reload starts and fully
 initializes a replacement while the existing process remains ready. Launch,
 handshake, or contribution mismatch leaves the existing process active. A
@@ -875,14 +1019,18 @@ ygg-web-search/
         └── SKILL.md
 ```
 
-A packaged manifest must select current API `0.2` and add exact Ygg
-compatibility alongside its independent extension version:
+A packaged manifest must select a bundle-supported API version and add exact
+Ygg compatibility alongside its independent extension version. New API `0.3`
+packages must follow the generated
+[API `0.3` reference](extensions/API-0.3-REFERENCE.md); existing API `0.2`
+packages remain installable. API `0.1` remains supported only for unpackaged
+legacy runtime compatibility and cannot be installed as a bundle:
 
 ```toml
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.7"
+requires_ygg = "=0.7.0-dev"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present

@@ -299,7 +299,8 @@ impl ContextTracker {
             | StreamEvent::TextEnd { .. }
             | StreamEvent::ReasoningStart { .. }
             | StreamEvent::ReasoningEnd { .. }
-            | StreamEvent::MediaCompleted { .. } => changed = false,
+            | StreamEvent::MediaCompleted { .. }
+            | StreamEvent::ProviderLifecycle(_) => changed = false,
         }
         if changed {
             state.revision = state.revision.saturating_add(1);
@@ -490,6 +491,26 @@ mod tests {
         assert_eq!(snapshot.run_usage.total_tokens, 4);
         assert_eq!(snapshot.tool_executions_started, 1);
         assert_eq!(snapshot.tool_executions_finished, 1);
+    }
+
+    #[test]
+    fn lifecycle_feedback_does_not_change_context_state() {
+        let tracker = ContextTracker::default();
+        tracker.observe_stream(&StreamEvent::Started {
+            response_id: Some("r1".into()),
+        });
+        let before = tracker.snapshot();
+
+        tracker.observe_stream(&StreamEvent::ProviderLifecycle(ygg_ai::ProviderLifecycle {
+            state: ygg_ai::ProviderLifecycleState::Loading,
+            detail: Some("warming".into()),
+        }));
+
+        let after = tracker.snapshot();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.phase, before.phase);
+        assert_eq!(after.responses_started, before.responses_started);
+        assert_eq!(after.response_usage, before.response_usage);
     }
 
     #[test]

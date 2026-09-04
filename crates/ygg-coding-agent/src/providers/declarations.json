@@ -1,0 +1,1339 @@
+{
+  "schema_version": 2,
+  "providers": [
+    {
+      "const_name": "OPENAI",
+      "id": "openai",
+      "name": "OpenAI",
+      "base_url": "https://api.openai.com/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "prefix",
+          "values": [
+            "gpt-",
+            "chatgpt-",
+            "codex-",
+            "o"
+          ]
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "openai",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "exclude_exact",
+          "value": "gpt-5.6"
+        },
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "openai",
+      "pricing": "openai",
+      "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "ANTHROPIC",
+      "id": "anthropic",
+      "name": "Anthropic",
+      "base_url": "https://api.anthropic.com/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "ANTHROPIC_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "anthropic_models",
+        "filter": {
+          "kind": "prefix",
+          "values": [
+            "claude-"
+          ]
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "anthropic",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "anthropic",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "DEEPSEEK",
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "base_url": "https://api.deepseek.com/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "DEEPSEEK_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "deepseek_models"
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "deepseek",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "short_retention",
+      "pricing": "deepseek",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "OPENROUTER",
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "OPENROUTER_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openrouter_models"
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "openrouter",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "openrouter",
+      "pricing": "openrouter",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "GROQ",
+      "id": "groq",
+      "name": "Groq",
+      "base_url": "https://api.groq.com/openai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "GROQ_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "groq",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "CEREBRAS",
+      "id": "cerebras",
+      "name": "Cerebras",
+      "base_url": "https://api.cerebras.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "CEREBRAS_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "cerebras",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "XAI",
+      "id": "xai",
+      "name": "xAI",
+      "base_url": "https://api.x.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XAI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "xai",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "TOGETHER",
+      "id": "together",
+      "name": "Together AI",
+      "base_url": "https://api.together.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "TOGETHER_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "together",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "short_retention",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "FIREWORKS",
+      "id": "fireworks",
+      "name": "Fireworks AI",
+      "base_url": "https://api.fireworks.ai/inference/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "FIREWORKS_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "fireworks",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "fireworks",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "select_ascii_insensitive_contains",
+          "fragment": "glm-5p2",
+          "route": 1
+        },
+        {
+          "kind": "select_ascii_insensitive_contains",
+          "fragment": "glm-5.2",
+          "route": 1
+        },
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "fireworks",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "NVIDIA",
+      "id": "nvidia",
+      "name": "NVIDIA",
+      "base_url": "https://integrate.api.nvidia.com/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "NVIDIA_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "nvidia",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [
+        [
+          "NVCF-POLL-SECONDS",
+          "3600"
+        ]
+      ],
+      "compatibility": "short_retention",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "HUGGINGFACE",
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "base_url": "https://router.huggingface.co/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "HF_TOKEN"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "huggingface",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "MOONSHOTAI",
+      "id": "moonshotai",
+      "name": "Moonshot AI",
+      "base_url": "https://api.moonshot.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MOONSHOT_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "moonshotai",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "XIAOMI",
+      "id": "xiaomi",
+      "name": "Xiaomi",
+      "base_url": "https://api.xiaomimimo.com/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "MINIMAX",
+      "id": "minimax",
+      "name": "MiniMax",
+      "base_url": "https://api.minimax.io/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MINIMAX_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "minimax",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "minimax",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "minimax",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "GEMINI",
+      "id": "gemini",
+      "name": "Google Gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "GEMINI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "google",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "gemini",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "google_api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "google",
+      "pricing": "google",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "VERTEX",
+      "id": "vertex",
+      "name": "Google Vertex AI",
+      "base_url": "https://us-central1-aiplatform.googleapis.com/v1/projects/placeholder/locations/us-central1/publishers/google/",
+      "authentication": {
+        "kind": "application_default_credentials"
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "google",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "vertex",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "dynamic",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "google",
+      "pricing": "google",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "OPENCODE",
+      "id": "opencode",
+      "name": "OpenCode Zen",
+      "base_url": "https://opencode.ai/zen/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "OPENCODE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "opencode",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "opencode",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "opencode-anthropic",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "opencode",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "opencode-google",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "select_prefix",
+          "prefix": "gemini-",
+          "route": 3
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "claude-",
+          "route": 1
+        },
+        {
+          "kind": "select_prefix_and_suffix",
+          "prefix": "qwen3.",
+          "suffix": "-plus",
+          "route": 1
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "gpt-",
+          "route": 2
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "codex-",
+          "route": 2
+        },
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "opencode",
+      "pricing": "opencode",
+      "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "CODEX",
+      "id": "codex",
+      "name": "OpenAI Codex",
+      "base_url": "https://chatgpt.com/backend-api/codex/",
+      "authentication": {
+        "kind": "subscription",
+        "login": "codex"
+      },
+      "model_discovery": {
+        "kind": "codex_subscription"
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "openai-codex",
+          "protocol": "openai_responses",
+          "transport": "websocket_preferred",
+          "body_encoding": "zstd",
+          "auth_presentation": "dynamic",
+          "responses_profile": "codex"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [
+        [
+          "openai-beta",
+          "responses=experimental"
+        ],
+        [
+          "originator",
+          "ygg"
+        ]
+      ],
+      "compatibility": "codex",
+      "pricing": "subscription",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "MISTRAL",
+      "id": "mistral",
+      "name": "Mistral",
+      "base_url": "https://api.mistral.ai/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MISTRAL_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "mistral",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "mistral",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default",
+          "openai_chat_profile": "mistral"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "mistral",
+      "pricing": "mistral",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "CLOUDFLARE_WORKERS_AI",
+      "id": "cloudflare-workers-ai",
+      "name": "Cloudflare Workers AI",
+      "base_url": "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1/",
+      "base_url_environment": [
+        "CLOUDFLARE_ACCOUNT_ID"
+      ],
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "CLOUDFLARE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "cloudflare_workers_ai",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "cloudflare-workers-ai",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "cloudflare",
+      "pricing": "cloudflare_workers_ai",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "CLOUDFLARE_AI_GATEWAY",
+      "id": "cloudflare-ai-gateway",
+      "name": "Cloudflare AI Gateway",
+      "base_url": "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}/",
+      "base_url_environment": [
+        "CLOUDFLARE_ACCOUNT_ID",
+        "CLOUDFLARE_GATEWAY_ID"
+      ],
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "CLOUDFLARE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "cloudflare_ai_gateway",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "cloudflare-ai-gateway-compat",
+          "base_path": "compat/",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "cloudflare-ai-gateway-openai",
+          "base_path": "openai/",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "cloudflare-ai-gateway-anthropic",
+          "base_path": "anthropic/",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "cloudflare_ai_gateway",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "select_prefix",
+          "prefix": "claude-",
+          "route": 2
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "workers-ai/",
+          "route": 0
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "gpt-",
+          "route": 1
+        },
+        {
+          "kind": "select_prefix",
+          "prefix": "o",
+          "route": 1
+        },
+        {
+          "kind": "default",
+          "route": 1
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "cloudflare",
+      "pricing": "cloudflare_ai_gateway",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "BEDROCK",
+      "id": "bedrock",
+      "name": "Amazon Bedrock",
+      "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/",
+      "authentication": {
+        "kind": "aws",
+        "variables": [
+          "AWS_ACCESS_KEY_ID",
+          "AWS_SECRET_ACCESS_KEY",
+          "AWS_PROFILE",
+          "AWS_REGION"
+        ]
+      },
+      "runtime_configuration": "aws_bedrock",
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "bedrock",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "bedrock",
+          "protocol": "bedrock_converse",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "aws_sigv4",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "AZURE_OPENAI",
+      "id": "azure-openai",
+      "name": "Azure OpenAI",
+      "base_url": "https://azure.openai.com/openai/?api-version=2025-04-01-preview",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "AZURE_OPENAI_API_KEY"
+        ]
+      },
+      "runtime_configuration": "azure_openai",
+      "model_discovery": {
+        "kind": "none"
+      },
+      "static_models": "none",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "azure-openai",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "header",
+          "auth_header": "api-key",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "openai",
+      "pricing": "reference",
+      "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "KIMI_CODING",
+      "id": "kimi-coding",
+      "name": "Kimi Coding",
+      "base_url": "https://api.kimi.com/coding/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "KIMI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "kimi_coding",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "kimi-coding",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [
+        [
+          "User-Agent",
+          "KimiCLI/1.5"
+        ]
+      ],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "MINIMAX_CN",
+      "id": "minimax-cn",
+      "name": "MiniMax China",
+      "base_url": "https://api.minimaxi.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MINIMAX_CN_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "minimax_cn",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "minimax-cn",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "minimax",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "MOONSHOTAI_CN",
+      "id": "moonshotai-cn",
+      "name": "Moonshot AI China",
+      "base_url": "https://api.moonshot.cn/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "MOONSHOT_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "openai_models",
+        "filter": {
+          "kind": "all"
+        }
+      },
+      "static_models": "none",
+      "inventory_cache": "required",
+      "routes": [
+        {
+          "endpoint_id": "moonshotai-cn",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "OPENCODE_GO",
+      "id": "opencode-go",
+      "name": "OpenCode Zen Go",
+      "base_url": "https://opencode.ai/zen/go/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "OPENCODE_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "opencode_go",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "opencode-go",
+          "protocol": "openai_chat",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "opencode",
+      "pricing": "opencode",
+      "discovery_capabilities": "gpt_vision_fallback"
+    },
+    {
+      "const_name": "VERCEL_AI_GATEWAY",
+      "id": "vercel-ai-gateway",
+      "name": "Vercel AI Gateway",
+      "base_url": "https://ai-gateway.vercel.sh/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "AI_GATEWAY_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "vercel_ai_gateway",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "vercel-ai-gateway",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_AMS",
+      "id": "xiaomi-token-plan-ams",
+      "name": "Xiaomi Token Plan (AMS)",
+      "base_url": "https://token-plan-ams.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_AMS_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-ams",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_CN",
+      "id": "xiaomi-token-plan-cn",
+      "name": "Xiaomi Token Plan (CN)",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-cn",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "XIAOMI_TOKEN_PLAN_SGP",
+      "id": "xiaomi-token-plan-sgp",
+      "name": "Xiaomi Token Plan (SGP)",
+      "base_url": "https://token-plan-sgp.xiaomimimo.com/anthropic/v1/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "XIAOMI_TOKEN_PLAN_SGP_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "xiaomi_token_plan",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "xiaomi-token-plan-sgp",
+          "protocol": "anthropic_messages",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "assume_image_input"
+    }
+  ]
+}

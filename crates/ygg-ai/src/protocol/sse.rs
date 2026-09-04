@@ -13,6 +13,21 @@ pub(crate) struct SseEvent {
     pub data: String,
 }
 
+/// A parsed SSE frame.
+///
+/// Comments normally carry no application semantics and callers using
+/// [`SseDecoder::push`] continue to receive only data events. HTTP transports
+/// that explicitly negotiate a namespaced extension may use
+/// [`SseDecoder::push_frames`] to inspect comments without exposing them to a
+/// provider codec as `data:`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SseFrame {
+    /// A complete data event.
+    Event(SseEvent),
+    /// A comment line without its leading colon.
+    Comment(String),
+}
+
 /// A stateful push-based decoder for SSE streams.
 pub(crate) struct SseDecoder {
     buf: Vec<u8>,
@@ -32,9 +47,25 @@ impl SseDecoder {
         }
     }
 
-    /// Pushes a chunk of bytes into the decoder, returning any fully parsed events.
+    /// Pushes a chunk of bytes into the decoder, returning any fully parsed data events.
+    ///
+    /// SSE comments remain intentionally invisible to ordinary callers. Use
+    /// [`Self::push_frames`] only when an explicitly negotiated extension
+    /// needs to inspect them.
     pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseEvent>, DecodeError> {
-        let mut events = Vec::new();
+        Ok(self
+            .push_frames(bytes)?
+            .into_iter()
+            .filter_map(|frame| match frame {
+                SseFrame::Event(event) => Some(event),
+                SseFrame::Comment(_) => None,
+            })
+            .collect())
+    }
+
+    /// Pushes a chunk of bytes, retaining data events and comment frames.
+    pub(crate) fn push_frames(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, DecodeError> {
+        let mut frames = Vec::new();
         let mut start = 0;
 
         for (index, byte) in bytes.iter().enumerate() {
@@ -45,11 +76,11 @@ impl SseDecoder {
             self.ensure_pending_size(incoming.len().saturating_add(1))?;
 
             if self.buf.is_empty() {
-                self.process_line(incoming, 1, &mut events)?;
+                self.process_line(incoming, 1, &mut frames)?;
             } else {
                 self.buf.extend_from_slice(incoming);
                 let line = std::mem::take(&mut self.buf);
-                let result = self.process_line(&line, 1, &mut events);
+                let result = self.process_line(&line, 1, &mut frames);
                 self.buf = line;
                 self.buf.clear();
                 result?;
@@ -60,17 +91,32 @@ impl SseDecoder {
         let trailing = &bytes[start..];
         self.ensure_pending_size(trailing.len())?;
         self.buf.extend_from_slice(trailing);
-        Ok(events)
+        Ok(frames)
     }
 
     /// Flushes any remaining data at the end of the stream as a final event.
-    pub(crate) fn finish(mut self) -> Result<Option<SseEvent>, DecodeError> {
-        let mut events = Vec::new();
+    pub(crate) fn finish(self) -> Result<Option<SseEvent>, DecodeError> {
+        Ok(self
+            .finish_frames()?
+            .into_iter()
+            .rev()
+            .find_map(|frame| match frame {
+                SseFrame::Event(event) => Some(event),
+                SseFrame::Comment(_) => None,
+            }))
+    }
+
+    /// Flushes all remaining data and comment frames at the end of the stream.
+    pub(crate) fn finish_frames(mut self) -> Result<Vec<SseFrame>, DecodeError> {
+        let mut frames = Vec::new();
         if !self.buf.is_empty() {
             let line = std::mem::take(&mut self.buf);
-            self.process_line(&line, 0, &mut events)?;
+            self.process_line(&line, 0, &mut frames)?;
         }
-        Ok(events.pop().or_else(|| self.dispatch_current()))
+        if let Some(event) = self.dispatch_current() {
+            frames.push(SseFrame::Event(event));
+        }
+        Ok(frames)
     }
 
     fn ensure_pending_size(&self, additional: usize) -> Result<(), DecodeError> {
@@ -89,7 +135,7 @@ impl SseDecoder {
         &mut self,
         line_bytes: &[u8],
         line_ending_bytes: usize,
-        events: &mut Vec<SseEvent>,
+        frames: &mut Vec<SseFrame>,
     ) -> Result<(), DecodeError> {
         self.current_event_bytes = self
             .current_event_bytes
@@ -104,11 +150,12 @@ impl SseDecoder {
         let line = std::str::from_utf8(line_bytes).map_err(|_| DecodeError::InvalidUtf8)?;
         if line.is_empty() {
             if let Some(event) = self.dispatch_current() {
-                events.push(event);
+                frames.push(SseFrame::Event(event));
             }
             return Ok(());
         }
-        if line.starts_with(':') {
+        if let Some(comment) = line.strip_prefix(':') {
+            frames.push(SseFrame::Comment(comment.trim_start().to_owned()));
             return Ok(());
         }
 
@@ -169,6 +216,32 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, Some("message".to_string()));
         assert_eq!(events[0].data, "first line\nsecond line");
+    }
+
+    #[test]
+    fn push_frames_preserves_comments_without_changing_ordinary_callers() {
+        let payload = b": ygg-lifecycle: loading; warming\ndata: hello\n\n";
+
+        let mut framed = SseDecoder::new();
+        assert_eq!(
+            framed.push_frames(payload).unwrap(),
+            vec![
+                SseFrame::Comment("ygg-lifecycle: loading; warming".into()),
+                SseFrame::Event(SseEvent {
+                    event: None,
+                    data: "hello".into(),
+                }),
+            ]
+        );
+
+        let mut ordinary = SseDecoder::new();
+        assert_eq!(
+            ordinary.push(payload).unwrap(),
+            vec![SseEvent {
+                event: None,
+                data: "hello".into(),
+            }]
+        );
     }
 
     #[test]

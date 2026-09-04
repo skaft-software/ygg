@@ -74,10 +74,10 @@ jobs:
           test ! -e "$RUNNER_TEMP/ygg-container-context/.git"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --doc --locked
+      - run: cargo test --workspace --doc --profile ci-test --locked
       - run: cargo fmt --manifest-path extensions/ygg-serve/Cargo.toml -- --check
       - run: cargo clippy --manifest-path extensions/ygg-serve/Cargo.toml --all-targets --locked -- -D warnings
-      - run: cargo test --manifest-path extensions/ygg-serve/Cargo.toml --locked
+      - run: cargo test --manifest-path extensions/ygg-serve/Cargo.toml --profile ci-test --locked
       # Cargo 1.90 stabilized packaging interdependent workspace crates. Keep
       # the dedicated compilation check on the 1.86 MSRV in the job below; use
       # 1.90 only to assemble the publishable crates together. The serve feature depends on the
@@ -109,6 +109,31 @@ jobs:
             fi
           done < <(grep -Ev '^[[:space:]]*(#|$)' extensions/release-catalog.txt)
 
+  extension-api-v03:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version-file: apps/web/.node-version
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Verify generated API 0.3 artifacts and language conformance
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python3 scripts/generate-extension-api-v03.py --check
+          cargo test -p ygg-agent --test extension_api_v03_conformance --locked
+          cargo test -p ygg-agent --lib api_v03_ --locked
+          PYTHONPATH=sdk/python python3 -m unittest sdk/python/tests/test_extension_api_v03.py
+          node sdk/typescript/tests/api_v03_conformance.mjs
+          node sdk/typescript/tests/package_conformance.mjs
+          npm ci --prefix apps/web
+          apps/web/node_modules/.bin/tsc -p sdk/typescript/tsconfig.json
+
   test:
     strategy:
       fail-fast: false
@@ -119,7 +144,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: dtolnay/rust-toolchain@52699249a776424c51ebc9ee197baf0f9dbf0d8a
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c
-      - run: cargo test --workspace --all-targets --all-features --locked
+      - run: cargo test --workspace --all-targets --all-features --profile ci-test --locked
       - run: cargo check --workspace --all-targets --no-default-features --locked
 
   msrv:

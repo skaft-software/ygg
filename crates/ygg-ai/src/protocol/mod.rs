@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::error::AiError;
+use crate::error::{AiError, ConfigError};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{CacheCompatibility, CacheRetention, Request};
 
@@ -57,10 +57,42 @@ pub(crate) fn cache_control(
 }
 
 pub(crate) mod anthropic;
+pub(crate) mod bedrock;
+pub(crate) mod google;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_responses;
 
 pub(crate) mod sse;
+
+/// Resolves a protocol path while preserving the narrowly allowed version query
+/// attached to an endpoint base URL. Azure's versioned API uses this shape;
+/// the catalog validates that the query cannot contain credentials.
+pub(crate) fn endpoint_url(base_url: &url::Url, path: &str) -> Result<url::Url, ConfigError> {
+    let query = base_url.query().map(str::to_owned);
+    let mut url = base_url
+        .join(path)
+        .map_err(|error| ConfigError::Parse(error.to_string()))?;
+    url.set_query(query.as_deref());
+    Ok(url)
+}
+
+#[cfg(test)]
+mod endpoint_url_tests {
+    use super::endpoint_url;
+
+    #[test]
+    fn preserves_the_single_version_query_when_resolving_a_codec_path() {
+        let base = url::Url::parse(
+            "https://enterprise-resource.openai.azure.com/openai/?api-version=2025-04-01-preview",
+        )
+        .unwrap();
+        let url = endpoint_url(&base, "responses").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://enterprise-resource.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
+        );
+    }
+}
 
 #[cfg(test)]
 mod cross_protocol_tests;
@@ -174,9 +206,16 @@ pub(crate) fn normalize_tool_call_id_owned(id: String) -> String {
 pub(crate) fn emit_event(
     events: &mut Vec<StreamEvent>,
     builder: &mut ResponseBuilder,
-    ev: StreamEvent,
+    mut ev: StreamEvent,
 ) -> Result<(), AiError> {
     builder.on_event(&ev)?;
+    if let StreamEvent::ToolCallEnd {
+        index,
+        argument_error,
+    } = &mut ev
+    {
+        *argument_error = builder.tool_call_argument_error(*index);
+    }
     events.push(ev);
     Ok(())
 }
@@ -303,7 +342,7 @@ pub(crate) mod harness {
     use crate::stream::{guard, ResponseBuilder, StreamEvent};
     use crate::types::{
         Capabilities, Endpoint, EndpointId, Modality, ModalitySet, ModelId, ModelLimits, ModelSpec,
-        Protocol, ReasoningCapability, ReasoningControl, Response,
+        Protocol, ReasoningCapability, ReasoningControl, Response, ToolDef,
     };
 
     /// A codec's per-event streaming decoder.
@@ -355,6 +394,7 @@ pub(crate) mod harness {
             auth: crate::auth::Auth::none(),
             default_headers: http::HeaderMap::new(),
             transport: crate::types::EndpointTransport::Http,
+            runtime: crate::types::RequestRuntime::default(),
             timeout: std::time::Duration::from_secs(30),
         };
         Model {
@@ -372,6 +412,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
         buffer_ambiguous_compatibility_content: bool,
+        tool_definitions: Option<&[ToolDef]>,
     ) -> (Vec<StreamEvent>, Option<AiError>) {
         let mut dec = SseDecoder::new();
         let mut builder = ResponseBuilder::new(
@@ -379,6 +420,11 @@ pub(crate) mod harness {
             model.spec.protocol,
             model.spec.pricing.clone(),
         );
+        if let Some(tool_definitions) = tool_definitions {
+            if let Err(error) = builder.set_tool_definitions(tool_definitions) {
+                return (Vec::new(), Some(error));
+            }
+        }
         builder.set_buffer_ambiguous_compatibility_content(buffer_ambiguous_compatibility_content);
         let mut out = Vec::new();
 
@@ -416,7 +462,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
     ) -> (Vec<StreamEvent>, Option<AiError>) {
-        drive_raw_configured(model, decode, data, chunk, false)
+        drive_raw_configured(model, decode, data, chunk, false, None)
     }
 
     /// Like [`drive_raw`] but pipes the events through [`guard`], surfacing
@@ -432,6 +478,20 @@ pub(crate) mod harness {
         collect_guarded(events, trailing_err).await
     }
 
+    /// Like [`drive`], but installs the immutable request schema snapshot used
+    /// by production response assembly.
+    pub(crate) async fn drive_with_tools(
+        model: &Model,
+        decode: DecodeFn,
+        data: &[u8],
+        chunk: usize,
+        tool_definitions: &[ToolDef],
+    ) -> Result<Vec<StreamEvent>, AiError> {
+        let (events, trailing_err) =
+            drive_raw_configured(model, decode, data, chunk, false, Some(tool_definitions));
+        collect_guarded(events, trailing_err).await
+    }
+
     /// Drives a codec with ambiguous content-tool compatibility explicitly
     /// enabled, mirroring a lossy production request.
     pub(crate) async fn drive_with_compatibility_buffering(
@@ -440,7 +500,7 @@ pub(crate) mod harness {
         data: &[u8],
         chunk: usize,
     ) -> Result<Vec<StreamEvent>, AiError> {
-        let (events, trailing_err) = drive_raw_configured(model, decode, data, chunk, true);
+        let (events, trailing_err) = drive_raw_configured(model, decode, data, chunk, true, None);
         collect_guarded(events, trailing_err).await
     }
 

@@ -5,11 +5,12 @@ members = [
     "crates/ygg-ai",
     "crates/ygg-agent",
     "crates/ygg-coding-agent",
+    "crates/ygg-migrate-types",
 ]
 exclude = ["extensions/ygg-serve"]
 
 [workspace.package]
-version = "0.6.7"
+version = "0.7.0-dev"
 edition = "2021"
 authors = ["Skaft Software"]
 repository = "https://github.com/skaft-software/ygg"
@@ -39,6 +40,21 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+[profile.ci-test]
+# CI does not benefit from keeping incremental state between clean runners.
+# Limited debug info retains useful backtraces without test-profile-sized DWARF.
+inherits = "test"
+debug = "limited"
+incremental = false
+
+[profile.profiling]
+# Keep release-like optimization while retaining symbols and full debug data for
+# profilers. `off`, unlike `false`, also disables local ThinLTO.
+inherits = "release"
+debug = "full"
+lto = "off"
+strip = "none"
 
 # Keep the audited lopdf 0.42.0 parser compatible with the Rust 1.86 MSRV.
 # Upstream 0.42.0 declares 1.85 but uses let-chain syntax stabilized later;

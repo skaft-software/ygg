@@ -41,9 +41,16 @@ MAX_PRESENTATION_ACTIVITIES = 128
 MAX_PRESENTATION_NODES = 256
 MAX_PRESENTATION_ACTIONS = 64
 MAX_PRESENTATION_REVISION = (2**53) - 1
+MAX_PROGRESS_DECORATION_LABEL_BYTES = 256
+MAX_PROGRESS_DECORATION_DETAIL_BYTES = 4 * 1024
+MAX_POST_MUTATION_RESOURCES = 32
+_TYPED_MUTATION_HOOKS = frozenset(
+    {"provider_retry", "before_persistence", "post_mutation"}
+)
 API_V02_FEATURES = (
     "request_cancellation",
     "request_progress",
+    "progress_decoration",
     "content_parts",
     "artifacts",
     "lifecycle_events",
@@ -169,6 +176,54 @@ def _valid_extension_identifier(value: Any) -> bool:
         and (character.isalnum() or character in {"_", "-", "."})
         for character in rest
     )
+
+
+def provider_retry_delay(additional_delay_ms: int) -> dict[str, Any]:
+    """Build bounded-delay advice for a ``provider_retry`` hook result.
+
+    The host remains authoritative: it clamps this additive delay and never
+    lets an extension increase the retry budget or shorten host backoff.
+    """
+
+    if (
+        not isinstance(additional_delay_ms, int)
+        or isinstance(additional_delay_ms, bool)
+        or additional_delay_ms < 0
+        or additional_delay_ms > (2**64) - 1
+    ):
+        raise ValueError("additional_delay_ms must be an unsigned 64-bit integer")
+    return {"delay": {"additional_delay_ms": additional_delay_ms}}
+
+
+def persistence_metadata(value: Any, *, public: bool = False) -> dict[str, Any]:
+    """Build one ``before_persistence`` metadata proposal.
+
+    The host attaches namespace/provenance and applies its JSON shape and size
+    limits at the durable assistant-turn boundary.
+    """
+
+    if not isinstance(public, bool):
+        raise TypeError("public must be a boolean")
+    try:
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError) as error:
+        raise ValueError("metadata value must be JSON-serializable") from error
+    return {"public": public, "value": value}
+
+
+def post_mutation_rescan(resource_ids: Sequence[str]) -> dict[str, Any]:
+    """Build a selected-resource ``post_mutation`` rescan disposition.
+
+    The host accepts only a bounded subset of opaque resource IDs it disclosed
+    in the settled mutation notification.
+    """
+
+    values = list(resource_ids)
+    if not values or len(values) > MAX_POST_MUTATION_RESOURCES:
+        raise ValueError("resource_ids must contain 1 through 32 values")
+    if not all(isinstance(value, str) and value for value in values):
+        raise ValueError("resource_ids must contain non-empty strings")
+    return {"action": "request_rescan", "resource_ids": values}
 
 
 def text_content(text: Any) -> dict[str, Any]:
@@ -558,6 +613,8 @@ class Extension:
 
     def hook(self, name: str) -> Callable[[Handler], Handler]:
         self._validate_name("hook", name)
+        if name in _TYPED_MUTATION_HOOKS and self.api_version != "0.2":
+            raise ValueError(f"{name} requires extension API 0.2")
 
         def decorate(handler: Handler) -> Handler:
             if name in self._hooks:
@@ -1082,6 +1139,8 @@ class Extension:
             event = value
         if not isinstance(event, Mapping):
             raise TypeError("progress event must be an object")
+        if event.get("type") == "decoration":
+            self._require_feature("progress_decoration")
         normalized = self._validate_progress_event(dict(event))
         sequence = token._next_sequence()
         self._send(
@@ -1098,6 +1157,20 @@ class Extension:
         return sequence
 
     report_progress = progress
+
+    def progress_decoration(
+        self,
+        label: str,
+        detail: Optional[str] = None,
+        *,
+        request_id: Any = _MISSING,
+    ) -> int:
+        """Replace the active request's bounded semantic progress decoration."""
+
+        event: dict[str, Any] = {"type": "decoration", "label": label}
+        if detail is not None:
+            event["detail"] = detail
+        return self.progress(event, request_id=request_id)
 
     def publish_artifact(
         self,
@@ -1981,7 +2054,7 @@ class Extension:
         except Exception as error:
             self.logger.error("hook handler failed", hook=name, error=str(error))
             raise RpcError(-32603, "internal error") from error
-        return self._hook_result(value)
+        return self._hook_result(name, value)
 
     def _collect_context(self, params: Any) -> list[Any]:
         request = self._object_params(params, "context/collect")
@@ -2182,17 +2255,79 @@ class Extension:
             }
         return {"text": str(value), "notifications": [], "context": []}
 
-    @staticmethod
-    def _hook_result(value: Any) -> dict[str, Any]:
+    def _hook_result(self, hook: str, value: Any) -> dict[str, Any]:
         if value is None:
             return {"disposition": {"action": "continue"}, "context": [], "notifications": []}
-        if isinstance(value, Mapping):
-            return {
-                "disposition": value.get("disposition", {"action": "continue"}),
-                "context": value.get("context", []),
-                "notifications": value.get("notifications", []),
-            }
-        raise RpcError(-32603, "hook handler must return an object")
+        if not isinstance(value, Mapping):
+            raise RpcError(-32603, "hook handler must return an object")
+        result: dict[str, Any] = {
+            "disposition": value.get("disposition", {"action": "continue"}),
+            "context": value.get("context", []),
+            "notifications": value.get("notifications", []),
+        }
+        if hook == "provider_retry" and "provider_retry" in value:
+            result["provider_retry"] = self._validate_provider_retry_advice(
+                value["provider_retry"]
+            )
+        elif hook == "before_persistence" and "persistence_metadata" in value:
+            result["persistence_metadata"] = self._validate_persistence_metadata(
+                value["persistence_metadata"]
+            )
+        elif hook == "post_mutation" and "post_mutation" in value:
+            result["post_mutation"] = self._validate_post_mutation_disposition(
+                value["post_mutation"]
+            )
+        return result
+
+    @staticmethod
+    def _validate_provider_retry_advice(value: Any) -> Any:
+        if isinstance(value, str) and value in {"retry", "stop"}:
+            return value
+        if not isinstance(value, Mapping) or set(value) != {"delay"}:
+            raise RpcError(-32603, "invalid provider_retry advice")
+        delay = value["delay"]
+        if (
+            not isinstance(delay, Mapping)
+            or set(delay) != {"additional_delay_ms"}
+            or not isinstance(delay["additional_delay_ms"], int)
+            or isinstance(delay["additional_delay_ms"], bool)
+            or delay["additional_delay_ms"] < 0
+            or delay["additional_delay_ms"] > (2**64) - 1
+        ):
+            raise RpcError(-32603, "invalid provider_retry delay")
+        return {"delay": {"additional_delay_ms": delay["additional_delay_ms"]}}
+
+    @staticmethod
+    def _validate_persistence_metadata(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping) or set(value) - {"public", "value"} or "value" not in value:
+            raise RpcError(-32603, "invalid persistence_metadata proposal")
+        public = value.get("public", False)
+        if not isinstance(public, bool):
+            raise RpcError(-32603, "persistence_metadata public must be a boolean")
+        try:
+            json.dumps(value["value"], ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as error:
+            raise RpcError(-32603, "persistence_metadata value must be JSON") from error
+        return {"public": public, "value": value["value"]}
+
+    @staticmethod
+    def _validate_post_mutation_disposition(value: Any) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise RpcError(-32603, "invalid post_mutation disposition")
+        action = value.get("action")
+        if action == "no_rescan" and set(value) == {"action"}:
+            return {"action": "no_rescan"}
+        resource_ids = value.get("resource_ids")
+        if (
+            action != "request_rescan"
+            or set(value) != {"action", "resource_ids"}
+            or not isinstance(resource_ids, list)
+            or not resource_ids
+            or len(resource_ids) > MAX_POST_MUTATION_RESOURCES
+            or not all(isinstance(resource, str) and resource for resource in resource_ids)
+        ):
+            raise RpcError(-32603, "invalid post_mutation rescan request")
+        return {"action": "request_rescan", "resource_ids": list(resource_ids)}
 
     @staticmethod
     def _status_result(value: Any) -> Optional[dict[str, Any]]:
@@ -2426,8 +2561,26 @@ class Extension:
                 except ValueError as error:
                     raise ValueError("output progress data is not valid base64") from error
             allowed = {"type", "stream", "encoding", "data"}
+        elif kind == "decoration":
+            label = event.get("label")
+            detail = event.get("detail")
+            if (
+                not isinstance(label, str)
+                or not label
+                or len(label.encode("utf-8")) > MAX_PROGRESS_DECORATION_LABEL_BYTES
+                or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in label)
+            ):
+                raise ValueError("decoration progress label is invalid")
+            if detail is not None and (
+                not isinstance(detail, str)
+                or not detail
+                or len(detail.encode("utf-8")) > MAX_PROGRESS_DECORATION_DETAIL_BYTES
+                or any(ord(character) < 32 or 127 <= ord(character) <= 159 for character in detail)
+            ):
+                raise ValueError("decoration progress detail is invalid")
+            allowed = {"type", "label", "detail"}
         else:
-            raise ValueError("progress event type must be status or output")
+            raise ValueError("progress event type must be status, output, or decoration")
         unknown = set(event) - allowed
         if unknown:
             raise ValueError(f"unknown progress event fields: {sorted(unknown)}")

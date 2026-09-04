@@ -21,7 +21,19 @@ mod output;
 mod pi;
 mod presentation;
 mod prompts;
+mod provider_setup;
 mod providers;
+/// Credential-free provider definition and canonical catalog contribution API.
+pub mod provider {
+    pub use crate::providers::{
+        builtin_provider_definitions, CompatibilityProfile, CopilotAvailabilityError,
+        CopilotCredentialScheme, CopilotDeviceLogin, CopilotDeviceLoginStatus,
+        CopilotDynamicHeader, CopilotEndpoint, CopilotHost, CopilotModel, CopilotProvider,
+        CopilotSession, PricingProfile, ProviderAccess, ProviderAvailability,
+        ProviderCatalogContributor, ProviderCatalogKind, ProviderDefinition,
+        ProviderDefinitionError, ProviderDiagnostic, ProviderRouteDefinition,
+    };
+}
 mod resource_resolver;
 mod resources;
 mod session_catalog;
@@ -48,7 +60,15 @@ pub async fn run_cli() -> std::process::ExitCode {
 }
 
 async fn run() -> anyhow::Result<()> {
-    let cli = cli::Cli::parse();
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let (cli, extension_flag_values, parsed_cwd) = if cli::uses_runtime_extension_flag_parser(&args)
+    {
+        let cwd = std::env::current_dir()?;
+        let (cli, extension_flag_values) = cli::parse_with_extension_flags(args, &cwd)?;
+        (cli, extension_flag_values, Some(cwd))
+    } else {
+        (cli::Cli::parse(), Default::default(), None)
+    };
     let top_level_command = cli.command.clone();
 
     // Subscription auth commands run and exit before any run configuration is
@@ -92,7 +112,10 @@ async fn run() -> anyhow::Result<()> {
         return extension_package::run_serve(no_open, port, web_root);
     }
 
-    let cwd = std::env::current_dir()?;
+    let cwd = match parsed_cwd {
+        Some(cwd) => cwd,
+        None => std::env::current_dir()?,
+    };
     #[cfg(feature = "serve")]
     let is_serve = matches!(&top_level_command, Some(cli::TopLevelCommand::Serve { .. }));
     #[cfg(not(feature = "serve"))]
@@ -103,12 +126,16 @@ async fn run() -> anyhow::Result<()> {
         tui::terminal::install_panic_hook();
         tui::terminal::install_signal_restore()?;
     }
-    let config = cli::build_config(cli, &cwd)?;
+    let mut config = cli::build_config(cli, &cwd)?;
+    config.extension_flag_values = extension_flag_values;
     if matches!(&top_level_command, Some(cli::TopLevelCommand::Doctor)) {
         return doctor::run(&config);
     }
     if let Some(cli::TopLevelCommand::Sessions { command }) = top_level_command.clone() {
         return session_commands::run(command, &config);
+    }
+    if let Some(cli::TopLevelCommand::Setup { options }) = top_level_command.clone() {
+        return provider_setup::run_cli(&options, &config);
     }
     extension_package::migrate_v0_6_2_packages().await;
     #[cfg(feature = "serve")]
@@ -181,6 +208,7 @@ async fn run_auth_command(provider: &str, command: AuthCommand) -> anyhow::Resul
                         api_key_env: None,
                         cache: None,
                         startup_timeout_secs: None,
+                        lifecycle_feedback: false,
                     };
                     store.save_registry(&CustomRegistry::single("local", provider))?;
                     crate::output::stdout_multiline(format!(

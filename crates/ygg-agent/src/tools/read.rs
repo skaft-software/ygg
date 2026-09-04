@@ -9,7 +9,7 @@ use bytes::Bytes;
 use serde::Deserialize;
 use ygg_ai::{AudioFormat, Media, Mime, ToolDef};
 
-use crate::effect::ToolEffect;
+use crate::effect::{ToolEffect, ToolPolicyDenialCode};
 use crate::sandbox::RemoteReadRetryPolicy;
 use crate::secure_fs::{read_regular_file_bounded_by, SecureFileError};
 use crate::tool::{
@@ -176,7 +176,8 @@ impl Tool for ReadTool {
                 });
             match url.scheme() {
                 "http" if test_loopback_http && !ctx.sandbox.allow_remote_read => {
-                    return Err(ToolError::new(
+                    return Err(ToolError::policy_denied(
+                        ToolPolicyDenialCode::RemoteReadDisabled,
                         "remote URL reads are disabled; enable `allow_remote_read` \
                          (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
                     ));
@@ -186,7 +187,8 @@ impl Tool for ReadTool {
                     return Err(ToolError::new("remote media URLs must use HTTPS"));
                 }
                 "https" if !ctx.sandbox.allow_remote_read => {
-                    return Err(ToolError::new(
+                    return Err(ToolError::policy_denied(
+                        ToolPolicyDenialCode::RemoteReadDisabled,
                         "remote URL reads are disabled; enable `allow_remote_read` \
                          (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
                     ));
@@ -257,7 +259,8 @@ impl Tool for ReadTool {
                         ) => result,
                     }
                 }
-                "http" | "https" => Err(ToolError::new(
+                "http" | "https" => Err(ToolError::policy_denied(
+                    ToolPolicyDenialCode::RemoteReadDisabled,
                     "remote URL reads are disabled; enable `allow_remote_read` \
                      (or pass `--allow-remote-read`) to permit public HTTPS image/audio fetches",
                 )),
@@ -1170,6 +1173,10 @@ mod tests {
             error.message.contains("absolute paths are not allowed"),
             "{error}"
         );
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::WorkspaceConfinement)
+        );
     }
 
     #[tokio::test]
@@ -1188,6 +1195,10 @@ mod tests {
         assert!(
             error.message.contains("remote URL reads are disabled"),
             "{error}"
+        );
+        assert_eq!(
+            error.policy_denial_code(),
+            Some(ToolPolicyDenialCode::RemoteReadDisabled)
         );
         assert!(server.received_requests().await.unwrap().is_empty());
     }

@@ -11,17 +11,22 @@ use anyhow::Context;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::{Stream, StreamExt};
 use tokio::time::{Instant, Interval, MissedTickBehavior};
+use ygg_agent::extension_api_v03::MAX_JSON_RPC_ID_BYTES;
 #[cfg(unix)]
-use ygg_agent::extension_process::ProcessGroupGuard;
+use ygg_agent::extension_process::{wait_for_bash_process, BashProcessLaunch};
+use ygg_agent::extension_process::{
+    ExtensionInputRequest, ExtensionSessionLifecycleError, ExtensionSessionLifecycleOperation,
+    ExtensionSessionLifecycleRequest, MAX_EXTENSION_TERMINAL_INPUT_BYTES,
+};
 use ygg_agent::{
     analyze_session_cache_stats, AgentCompactionMode, AgentError, AgentEvent, EntryId,
-    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session,
+    GoalDecision, GoalStatus, GoalTurnSource, Run, RunControl, Session, ToolProgress,
 };
 use ygg_ai::{ModelId, ReasoningConfig, ReasoningMode, ToolCallId};
 
 use crate::app::bootstrap::{
-    build_app, effective_compaction_threshold_fraction, estimate_text_tokens, rebuild_app,
-    resolve_launch_interactive, Bootstrap,
+    build_app, effective_compaction_threshold_fraction, estimate_text_tokens, open_launch_session,
+    rebuild_app, resolve_launch_interactive, terminal_goal_session_id, Bootstrap, SessionSelection,
 };
 use crate::app::{
     apply_reconfig, level_from_reasoning, reasoning_label, supported_levels_with_subagents,
@@ -35,20 +40,25 @@ use crate::config::{CompactionMode, ThinkingLevel};
 use crate::modes::{HostRunOutcome, RUN_STREAM_LOST_MESSAGE};
 use crate::presentation::RunId;
 use crate::prompts::{render_and_record, RenderedPrompt};
+use crate::provider_setup::{
+    CompletedSetup, ProviderSetupError, ProviderSetupService, ProviderSetupState,
+    SetupAuthentication, SetupAuthority, SetupDraft,
+};
 use crate::resources::{compose_instructions, expand_skill_command};
 use crate::session_tree::render_session_tree;
 use crate::tui::composer::ComposedInput;
 use crate::tui::keymap::{self, InputAction};
 use crate::tui::pickers::{
     confirmation_picker, extension_confirmation_picker, extension_input_picker, extension_picker,
-    message_picker, optional_model_picker, read_only_document, read_only_document_live_styled,
-    session_picker, subagent_picker, thinking_picker, tool_input_picker, SubagentPickerSnapshot,
+    message_picker, optional_model_picker, provider_setup_picker, read_only_document,
+    read_only_document_live_styled, session_picker, subagent_picker, thinking_picker,
+    tool_input_picker, SubagentPickerSnapshot,
 };
 use crate::tui::theme::YggTheme;
 use crate::tui::theme::{
     background_from_terminal_rgb, load_theme, load_theme_for_background, TerminalBackground,
 };
-use crate::tui::view::InteractiveShell;
+use crate::tui::view::{InteractiveShell, OrdinarySurfaceMetadata, OverlayInputResult};
 
 /// Ordered controls sent to the frozen Agent during an active run.
 #[derive(Debug)]
@@ -95,6 +105,28 @@ impl crate::extensions::ExtensionConfirmationHandler for InteractiveExtensionCon
                 }
             }
         })
+    }
+
+    fn progress(&mut self, extension: &str, progress: &ToolProgress) {
+        // Raw command output and status are intentionally not transcript
+        // content. The typed decoration is already bounded and terminal-safe,
+        // so it is the one semantic progress surface suitable for Pi's live
+        // status detail.
+        let ToolProgress::Decoration(decoration) = progress else {
+            return;
+        };
+        let detail = decoration
+            .detail()
+            .map(|detail| format!(" · {detail}"))
+            .unwrap_or_default();
+        self.shell
+            .set_status_detail(format!("{extension}: {}{detail}", decoration.label()));
+        self.shell.render();
+    }
+
+    fn finish_progress(&mut self, _extension: &str) {
+        self.shell.set_status_detail(String::new());
+        self.shell.render();
     }
 
     fn confirm<'a>(
@@ -197,10 +229,10 @@ pub fn push_pending_action(queue: &mut VecDeque<PendingIdleAction>, action: Pend
     queue.push_back(action);
 }
 
-#[derive(Debug)]
 enum Idle {
     Submit(ComposedInput),
     Command(String),
+    SessionLifecycle(ExtensionSessionLifecycleRequest),
     GoalContinuation,
     CycleThinking,
     Quit,
@@ -233,6 +265,7 @@ where
                     Some(Err(error)) => return Err(error.into()),
                     None => return Ok(Idle::Quit),
                 };
+                observe_extension_terminal_event(executable_extensions, &event);
                 if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
                     shell.request_close();
                     return Ok(Idle::Quit);
@@ -265,13 +298,32 @@ where
                             shell.render();
                             continue;
                         }
-                        _ => {
-                            shell.close_overlay();
-                            shell.clear_error();
-                            shell.render();
-                            continue;
-                        }
+                        _ => match shell.overlay_input(&event) {
+                            OverlayInputResult::Consumed => {
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Closed => {
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Legacy => {
+                                shell.close_overlay();
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                        },
                     }
+                }
+                if let Some(shortcut) = executable_extensions.dispatch_shortcut_for_event(&event) {
+                    shell.notice(format!(
+                        "running extension shortcut {}: {}",
+                        shortcut.extension, shortcut.description
+                    ));
+                    shell.render();
+                    continue;
                 }
                 let pending = if shell.pending_is_empty() {
                     String::new()
@@ -293,8 +345,14 @@ where
                         shell.render();
                     }
                     InputAction::CompletePath => {
-                        shell.complete_path();
-                        shell.render();
+                        if shell.accept_extension_autocomplete() {
+                            shell.render();
+                        } else if !executable_extensions
+                            .request_editor_autocomplete(shell.extension_editor_snapshot())
+                        {
+                            shell.complete_path();
+                            shell.render();
+                        }
                     }
                     InputAction::Edit(action) => {
                         shell.apply_edit(action);
@@ -377,6 +435,14 @@ where
                 }
             } => return Ok(Idle::GoalContinuation),
             _ = extension_tick.tick() => {
+                // A modal is an in-progress interactive action, not a safe
+                // active-session replacement boundary. Keep the bounded
+                // request queued until the frontend returns to its prompt.
+                if !shell.has_panel() && !shell.has_overlay() {
+                    if let Some(request) = executable_extensions.next_session_lifecycle_request() {
+                        return Ok(Idle::SessionLifecycle(request));
+                    }
+                }
                 if apply_extension_background(shell, executable_extensions) {
                     shell.render();
                 }
@@ -454,12 +520,18 @@ fn apply_goal_command(
     use ygg_agent::GoalAction as DurableGoalAction;
 
     match command {
-        commands::GoalCommand::Help => shell.show_overlay_text(
+        commands::GoalCommand::Help => shell.show_report_text(
+            "Goal help",
+            "Browse commands for the current session goal",
             "Goal commands\n\n/goal <objective>\n/goal status\n/goal pause\n/goal resume\n/goal clear"
                 .to_owned(),
         ),
         commands::GoalCommand::Status => match goal_status_text(app) {
-            Ok(status) => shell.show_overlay_text(status),
+            Ok(status) => shell.show_report_text(
+                "Goal status",
+                "Review the current session goal",
+                status,
+            ),
             Err(error) => shell.error(format!("unable to read goal: {error}")),
         },
         commands::GoalCommand::Set(objective) => match app
@@ -634,6 +706,45 @@ fn is_ctrl_c(key: &crossterm::event::KeyEvent) -> bool {
     matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
         && key.code == KeyCode::Char('c')
         && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Forward only normalized, bounded observations. Extensions never receive the
+/// terminal event itself and cannot influence the host keymap or resize path.
+fn observe_extension_terminal_event(
+    executable_extensions: &mut crate::extensions::ExecutableExtensions,
+    event: &Event,
+) {
+    match event {
+        Event::Resize(columns, rows) => {
+            executable_extensions.observe_terminal_resize(*columns, *rows);
+        }
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            // Debug formatting escapes control characters in `KeyCode::Char`,
+            // so this never turns a terminal escape sequence into extension data.
+            executable_extensions
+                .observe_terminal_input(format!("key:{:?}:{:?}", key.modifiers, key.code));
+        }
+        Event::Paste(text) => {
+            let mut normalized = String::from("paste:");
+            for character in text.chars() {
+                let encoded = match character {
+                    '\n' => "\\n".to_owned(),
+                    '\r' => "\\r".to_owned(),
+                    '\t' => "\\t".to_owned(),
+                    character if character.is_control() => "�".to_owned(),
+                    character => character.to_string(),
+                };
+                if normalized.len().saturating_add(encoded.len())
+                    > MAX_EXTENSION_TERMINAL_INPUT_BYTES
+                {
+                    break;
+                }
+                normalized.push_str(&encoded);
+            }
+            executable_extensions.observe_terminal_input(normalized);
+        }
+        _ => {}
+    }
 }
 
 /// Keep raw-terminal input, resize handling, rendering, and termination
@@ -860,6 +971,7 @@ fn login_custom(shell: &mut InteractiveShell) -> anyhow::Result<()> {
         api_key_env: None,
         cache: None,
         startup_timeout_secs: None,
+        lifecycle_feedback: false,
     };
     store.save_registry(&CustomRegistry::single("local", provider))?;
     shell.notice(format!(
@@ -1104,6 +1216,7 @@ where
                         continue;
                     }
                 };
+                observe_extension_terminal_event(executable_extensions, &event);
                 if matches!(&event, Event::Key(key) if keymap::is_close_key(key)) {
                     request_active_close(
                         control,
@@ -1145,13 +1258,32 @@ where
                             shell.render();
                             continue;
                         }
-                        _ => {
-                            shell.close_overlay();
-                            shell.clear_error();
-                            shell.render();
-                            continue;
-                        }
+                        _ => match shell.overlay_input(&event) {
+                            OverlayInputResult::Consumed => {
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Closed => {
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                            OverlayInputResult::Legacy => {
+                                shell.close_overlay();
+                                shell.clear_error();
+                                shell.render();
+                                continue;
+                            }
+                        },
                     }
+                }
+                if let Some(shortcut) = executable_extensions.dispatch_shortcut_for_event(&event) {
+                    shell.notice(format!(
+                        "running extension shortcut {}: {}",
+                        shortcut.extension, shortcut.description
+                    ));
+                    shell.render();
+                    continue;
                 }
                 let pending = if shell.pending_is_empty() {
                     String::new()
@@ -1169,8 +1301,14 @@ where
                         shell.render();
                     }
                     InputAction::CompletePath => {
-                        shell.complete_path();
-                        shell.render();
+                        if shell.accept_extension_autocomplete() {
+                            shell.render();
+                        } else if !executable_extensions
+                            .request_editor_autocomplete(shell.extension_editor_snapshot())
+                        {
+                            shell.complete_path();
+                            shell.render();
+                        }
                     }
                     InputAction::Abort => {
                         control.abort();
@@ -1582,9 +1720,12 @@ fn request_extension_ui(shell: &mut InteractiveShell, app: &mut App) {
         &app.reasoning,
         &app.sessions,
     );
-    for message in app.executable_extensions.drain_events() {
+    for message in app.executable_extensions.drain_events_for_shell(shell) {
         shell.notice(message);
     }
+    let _ = app.executable_extensions.sync_semantic_ui(shell);
+    app.executable_extensions
+        .sync_editor_state(shell.extension_editor_snapshot());
 }
 
 fn apply_extension_background(
@@ -1597,10 +1738,23 @@ fn apply_extension_background(
         shell.apply_extension_tool_renderer(&update.id, &update.segments);
         changed = true;
     }
-    for message in executable_extensions.drain_events() {
+    for update in updates.autocomplete {
+        if shell.set_extension_autocomplete(&update.snapshot, update.prefix, update.items) {
+            changed = true;
+        }
+    }
+    for message in updates.shortcut_messages {
         shell.notice(message);
         changed = true;
     }
+    for message in executable_extensions.drain_events_for_shell(shell) {
+        shell.notice(message);
+        changed = true;
+    }
+    if executable_extensions.sync_semantic_ui(shell) {
+        changed = true;
+    }
+    executable_extensions.sync_editor_state(shell.extension_editor_snapshot());
     // Extension contributions can arrive (or change) after the initial
     // handshake; keep the composer's slash-command list in step so commands
     // like /subagents are enterable as soon as their owning process is ready.
@@ -1770,6 +1924,8 @@ async fn reload_resources(
     shell.set_theme(theme);
     shell.set_runtime_config(app.config.clone());
     shell.hydrate(app.agent.session())?;
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     update_status(shell, &app);
     Ok(app)
 }
@@ -1965,7 +2121,10 @@ async fn web_search_management_menu(
     let Some(index) = extension_picker(
         shell,
         input,
-        "Web search provider · Enter selects · Esc returns",
+        OrdinarySurfaceMetadata::with_purpose(
+            "Select web search provider",
+            "Choose a provider for web search or disable the extension",
+        ),
         items,
         descriptions,
         0,
@@ -2039,7 +2198,10 @@ async fn extension_management_menu(
         let Some(index) = extension_picker(
             shell,
             input,
-            "Extensions · Enter manages/toggles · Esc closes",
+            OrdinarySurfaceMetadata::with_purpose(
+                "Manage extensions",
+                "Select a bundle to inspect or manage its activation",
+            ),
             items,
             descriptions,
             selected,
@@ -2484,7 +2646,8 @@ async fn subagents_view(
     }
     let mut selected_node_id = None::<String>;
     loop {
-        let notices = app.executable_extensions.drain_events();
+        let mut notices = app.executable_extensions.drain_events();
+        notices.extend(app.synchronize_extension_provider_catalog());
         let Some((title, entries)) = subagent_view_entries(&app.executable_extensions) else {
             for notice in notices {
                 shell.notice(notice);
@@ -2544,7 +2707,9 @@ async fn subagents_view(
 
         // Revalidate the stable node and typed reference against the newest
         // accepted presentation revision immediately before opening it.
-        for notice in app.executable_extensions.drain_events() {
+        let mut notices = app.executable_extensions.drain_events();
+        notices.extend(app.synchronize_extension_provider_catalog());
+        for notice in notices {
             shell.notice(notice);
         }
         let Some((_, current_entries)) = subagent_view_entries(&app.executable_extensions) else {
@@ -2700,6 +2865,8 @@ async fn checkout_entry(
         return Err(error);
     }
     update_status(shell, &app);
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     shell.notice(format!(
         "checked out entry {display_id}; future messages will create a branch"
     ));
@@ -2718,7 +2885,179 @@ async fn transition(
     .await?;
     shell.hydrate(app.agent.session())?;
     update_status(shell, &app);
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     Ok(app)
+}
+
+fn bounded_extension_session_id(session_id: String) -> anyhow::Result<String> {
+    if session_id.len() > MAX_JSON_RPC_ID_BYTES {
+        anyhow::bail!("session identifier exceeds the API 0.3 result bound");
+    }
+    Ok(session_id)
+}
+
+fn session_id_for_path(path: &Path) -> anyhow::Result<String> {
+    let session_id = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("session path has no valid identifier"))?;
+    bounded_extension_session_id(session_id)
+}
+
+async fn create_extension_session(
+    app: &App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<String> {
+    let path = app.sessions.new_path(&crate::modes::timestamp());
+    run_blocking_lifecycle(shell, input, "creating session…", move || {
+        let mut prepared = None;
+        let session = open_launch_session(&mut prepared, SessionSelection::CreateNew(path))?;
+        bounded_extension_session_id(terminal_goal_session_id(&session)?)
+    })
+    .await
+}
+
+async fn fork_extension_session(
+    app: &App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+) -> anyhow::Result<String> {
+    let sessions = app.sessions.clone();
+    let source_path = app.agent.session().path().to_owned();
+    let destination = sessions.new_path(&crate::modes::timestamp());
+    let checkpoint = app.agent.session().head();
+    run_blocking_lifecycle(shell, input, "forking session…", move || {
+        let path = fork_active_session(&sessions, &source_path, destination, checkpoint.as_ref())?;
+        session_id_for_path(&path)
+    })
+    .await
+}
+
+async fn open_extension_session(
+    path: PathBuf,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    label: &'static str,
+) -> anyhow::Result<Session> {
+    run_blocking_lifecycle(shell, input, label, move || {
+        let mut prepared = None;
+        open_launch_session(&mut prepared, SessionSelection::OpenExisting(path))
+    })
+    .await
+}
+
+fn replace_extension_active_session(app: &mut App, session: Session) -> anyhow::Result<String> {
+    let session_id = bounded_extension_session_id(terminal_goal_session_id(&session)?)?;
+    app.agent.replace_session_at_idle(session)?;
+    app.goal_session_id = session_id.clone();
+    let goal_store: Arc<dyn ygg_agent::GoalStore> = app.goal_store.clone();
+    app.goal_driver = ygg_agent::GoalDriver::new(goal_store, session_id.clone());
+    app.executable_extensions.transition_active_session(
+        app.agent.session(),
+        &app.model,
+        &app.reasoning,
+        &app.sessions,
+    );
+    Ok(session_id)
+}
+
+async fn switch_extension_session(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: &ExtensionSessionLifecycleRequest,
+    session_id: String,
+) -> anyhow::Result<Option<String>> {
+    let path = app.sessions.path_by_id(&session_id)?;
+    let session = open_extension_session(path, shell, input, "switching session…").await?;
+    if request.is_cancelled() {
+        return Ok(None);
+    }
+    replace_extension_active_session(app, session).map(Some)
+}
+
+async fn reload_extension_session(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: &ExtensionSessionLifecycleRequest,
+) -> anyhow::Result<Option<String>> {
+    let path = app.agent.session().path().to_owned();
+    let session = open_extension_session(path, shell, input, "reloading session…").await?;
+    if request.is_cancelled() {
+        return Ok(None);
+    }
+    replace_extension_active_session(app, session).map(Some)
+}
+
+async fn execute_extension_session_lifecycle(
+    app: &mut App,
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    request: ExtensionSessionLifecycleRequest,
+) -> bool {
+    if request.is_cancelled() {
+        return false;
+    }
+    let operation = request.operation().clone();
+    let mut result = match operation.clone() {
+        ExtensionSessionLifecycleOperation::Create => {
+            create_extension_session(app, shell, input).await.map(Some)
+        }
+        ExtensionSessionLifecycleOperation::Fork => {
+            fork_extension_session(app, shell, input).await.map(Some)
+        }
+        ExtensionSessionLifecycleOperation::Switch { session_id } => {
+            switch_extension_session(app, shell, input, &request, session_id).await
+        }
+        ExtensionSessionLifecycleOperation::Reload => {
+            reload_extension_session(app, shell, input, &request).await
+        }
+    };
+    let active_session_operation = match &operation {
+        ExtensionSessionLifecycleOperation::Switch { .. }
+        | ExtensionSessionLifecycleOperation::Reload => true,
+        ExtensionSessionLifecycleOperation::Create | ExtensionSessionLifecycleOperation::Fork => {
+            false
+        }
+    };
+    let active_session_replaced =
+        active_session_operation && result.as_ref().is_ok_and(|session_id| session_id.is_some());
+    if active_session_replaced {
+        // A cancelled response must not leave the visible transcript bound to
+        // the discarded session, so hydrate before observing cancellation.
+        if let Err(error) = shell.hydrate(app.agent.session()) {
+            result = Err(error);
+        }
+    }
+    if request.is_cancelled() {
+        return active_session_replaced;
+    }
+    let method = match operation {
+        ExtensionSessionLifecycleOperation::Create => "create",
+        ExtensionSessionLifecycleOperation::Fork => "fork",
+        ExtensionSessionLifecycleOperation::Switch { .. } => "switch",
+        ExtensionSessionLifecycleOperation::Reload => "reload",
+    };
+    match result {
+        Ok(Some(session_id)) => {
+            request.respond(Ok(session_id));
+            request_extension_ui(shell, app);
+            update_status(shell, app);
+            shell.notice(format!("extension session {method} completed"));
+        }
+        Ok(None) => return false,
+        Err(error) => {
+            request.respond(Err(ExtensionSessionLifecycleError::Failed));
+            shell.error(format!("extension session {method} failed: {error:#}"));
+        }
+    }
+    shell.render();
+    active_session_replaced
 }
 
 async fn pick_session_path(
@@ -3259,7 +3598,11 @@ async fn run_idle_command(
 ) -> anyhow::Result<IdleCommandOutcome> {
     match command {
         Command::Help(topic) => {
-            shell.show_overlay_text(commands::help_text(&app.config.workspace, topic.as_deref()));
+            shell.show_report_text(
+                "Help",
+                "Browse commands and keyboard shortcuts",
+                commands::help_text(&app.config.workspace, topic.as_deref()),
+            );
         }
         Command::Status => {
             shell.show_status_text_with_telemetry(commands::status_text(&app, None));
@@ -3267,10 +3610,16 @@ async fn run_idle_command(
         Command::Context => {
             shell.show_context_report(crate::tui::context::ContextReport::capture(&app, &[]));
         }
-        Command::Cost => {
-            shell.show_overlay_text(commands::cost_text(app.agent.session(), &app.model))
-        }
-        Command::Cache => shell.show_overlay_text(commands::cache_text(app.agent.session())),
+        Command::Cost => shell.show_report_text(
+            "Cost",
+            "Review session token usage and estimated cost",
+            commands::cost_text(app.agent.session(), &app.model),
+        ),
+        Command::Cache => shell.show_report_text(
+            "Cache",
+            "Review session cache accounting",
+            commands::cache_text(app.agent.session()),
+        ),
         Command::Update => {
             match await_lifecycle(shell, input, "checking for updates…", async {
                 crate::update::check().await
@@ -3374,10 +3723,11 @@ async fn run_idle_command(
             shell.show_overlay_text(app.executable_extensions.inspect_text());
         }
         Command::Extensions(commands::ExtensionsSubcommand::Reload) => {
-            let messages = await_lifecycle(shell, input, "reloading extensions…", async {
+            let mut messages = await_lifecycle(shell, input, "reloading extensions…", async {
                 Ok(app.executable_extensions.reload().await)
             })
             .await?;
+            messages.extend(app.synchronize_extension_provider_catalog());
             if messages.is_empty() {
                 shell.notice("no running executable extensions to reload");
             } else {
@@ -3387,6 +3737,7 @@ async fn run_idle_command(
         }
         Command::Extensions(commands::ExtensionsSubcommand::Inspect { reference }) => {
             let _ = app.executable_extensions.drain_events();
+            app.synchronize_extension_provider_catalog();
             let principal = app
                 .executable_extensions
                 .presentation_session_reference_principal(&reference);
@@ -4058,6 +4409,9 @@ async fn run_interactive_without_model(
                 shell.render();
             }
             Idle::GoalContinuation => unreachable!("model-less mode has no goal deadline"),
+            Idle::SessionLifecycle(request) => {
+                request.respond(Err(ExtensionSessionLifecycleError::Unavailable));
+            }
             Idle::Submit(_) => {
                 shell.error(
                     "no configured model; set an API key and restart before submitting prompts"
@@ -4068,11 +4422,17 @@ async fn run_interactive_without_model(
             Idle::Command(raw) => match commands::parse(&raw) {
                 Command::Quit => return Ok(resume_command),
                 Command::Help(topic) => {
-                    shell.show_overlay_text(commands::help_text(&workspace, topic.as_deref()));
+                    shell.show_report_text(
+                        "Help",
+                        "Browse commands and keyboard shortcuts",
+                        commands::help_text(&workspace, topic.as_deref()),
+                    );
                     shell.render();
                 }
                 Command::Status => {
-                    shell.show_overlay_text(
+                    shell.show_report_text(
+                        "Status",
+                        "Review the read-only session configuration",
                         "No model is configured. The session can be read, but prompts are disabled."
                             .to_owned(),
                     );
@@ -4168,8 +4528,452 @@ fn schedule_responses_prewarm(app: &App) {
     });
 }
 
+#[derive(Clone, Copy)]
+enum GuidedSetupPreset {
+    LmStudio,
+    OpenAiCompatible,
+}
+
+async fn guided_setup_input(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    prompt: &str,
+    secret: bool,
+) -> anyhow::Result<Option<String>> {
+    // This is the existing bounded temporary-input surface. Secret values are
+    // never copied into the ordinary composer or rendered frame.
+    extension_input_picker(
+        shell,
+        input,
+        &ExtensionInputRequest {
+            parent_request_id: 0,
+            prompt: prompt.to_owned(),
+            secret,
+        },
+    )
+    .await
+}
+
+fn valid_guided_manual_model(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
+/// First-run interactive onboarding for an explicitly selected compatible
+/// endpoint. Every path before `commit_and_rebuild` is in-memory only.
+async fn guided_provider_setup(
+    shell: &mut InteractiveShell,
+    input: &mut EventStream,
+    config: &crate::config::Config,
+) -> anyhow::Result<Option<CompletedSetup>> {
+    let mut replace_existing = false;
+    'setup: loop {
+        let Some(preset) = provider_setup_picker(
+            shell,
+            input,
+            "Set up a provider",
+            vec![
+                "LM Studio".to_owned(),
+                "OpenAI-compatible endpoint".to_owned(),
+                "Continue without a provider".to_owned(),
+            ],
+            vec![
+                Some("Use an explicitly selected local OpenAI-compatible endpoint".to_owned()),
+                Some("Use one endpoint you enter; Ygg will not scan for services".to_owned()),
+                Some("Open the session read-only; no provider data is written".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        let preset = match preset {
+            0 => GuidedSetupPreset::LmStudio,
+            1 => GuidedSetupPreset::OpenAiCompatible,
+            _ => return Ok(None),
+        };
+
+        let endpoint = match preset {
+            GuidedSetupPreset::LmStudio => {
+                let Some(choice) = provider_setup_picker(
+                    shell,
+                    input,
+                    "LM Studio endpoint",
+                    vec![
+                        "Use http://localhost:1234/v1/".to_owned(),
+                        "Enter a different endpoint".to_owned(),
+                        "Back".to_owned(),
+                    ],
+                    vec![
+                        Some("The default LM Studio OpenAI-compatible server".to_owned()),
+                        Some("Only the endpoint you enter will be contacted".to_owned()),
+                        Some("Return to provider selection without writing state".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                else {
+                    continue 'setup;
+                };
+                match choice {
+                    0 => "http://localhost:1234/v1/".to_owned(),
+                    1 => {
+                        let Some(endpoint) =
+                            guided_setup_input(shell, input, "Endpoint URL:", false).await?
+                        else {
+                            continue 'setup;
+                        };
+                        endpoint
+                    }
+                    _ => continue 'setup,
+                }
+            }
+            GuidedSetupPreset::OpenAiCompatible => {
+                let Some(endpoint) =
+                    guided_setup_input(shell, input, "Endpoint URL:", false).await?
+                else {
+                    continue 'setup;
+                };
+                endpoint
+            }
+        };
+
+        let Some(authentication_choice) = provider_setup_picker(
+            shell,
+            input,
+            "Credential source",
+            vec![
+                "No authentication".to_owned(),
+                "Enter an API key".to_owned(),
+                "Read an API key from an environment variable".to_owned(),
+                "Back".to_owned(),
+            ],
+            vec![
+                Some("Do not send or store a credential".to_owned()),
+                Some("The key is hidden and stored only after final confirmation".to_owned()),
+                Some("The environment value is read only at runtime and is not stored".to_owned()),
+                Some("Return to provider selection without writing state".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        else {
+            continue 'setup;
+        };
+        let authentication = match authentication_choice {
+            0 => SetupAuthentication::no_authentication(),
+            1 => {
+                let Some(value) = guided_setup_input(shell, input, "API key:", true).await? else {
+                    continue 'setup;
+                };
+                SetupAuthentication::api_key(value)
+            }
+            2 => {
+                let Some(variable) =
+                    guided_setup_input(shell, input, "Environment variable name:", false).await?
+                else {
+                    continue 'setup;
+                };
+                SetupAuthentication::environment(variable)
+            }
+            _ => continue 'setup,
+        };
+
+        let is_default_lm_studio = matches!(preset, GuidedSetupPreset::LmStudio)
+            && endpoint == "http://localhost:1234/v1/"
+            && matches!(&authentication, SetupAuthentication::None);
+        let draft = if is_default_lm_studio {
+            SetupDraft::lm_studio().replace_existing(replace_existing)
+        } else {
+            let (provider_id, label) = match preset {
+                GuidedSetupPreset::LmStudio => ("local", "LM Studio"),
+                GuidedSetupPreset::OpenAiCompatible => ("custom", "OpenAI-compatible endpoint"),
+            };
+            SetupDraft::new(provider_id, label, endpoint, authentication)
+                .replace_existing(replace_existing)
+        };
+        let service = ProviderSetupService::new(
+            crate::auth::custom::CredentialStore::new(crate::auth::custom::default_path()),
+            config.offline,
+        );
+        let transaction = match service.begin(draft) {
+            Ok(transaction) => transaction,
+            Err(error)
+                if matches!(
+                    &error,
+                    ProviderSetupError::State(ProviderSetupState::ProviderAlreadyConfigured)
+                ) =>
+            {
+                shell.error(error.to_string());
+                shell.render();
+                match provider_setup_picker(
+                    shell,
+                    input,
+                    "Provider already configured",
+                    vec![
+                        "Replace the existing provider after review".to_owned(),
+                        "Edit setup values".to_owned(),
+                        "Cancel setup".to_owned(),
+                    ],
+                    vec![
+                        Some(
+                            "The existing provider is changed only after final confirmation"
+                                .to_owned(),
+                        ),
+                        Some("Return to endpoint and credential selection".to_owned()),
+                        Some("No provider state is written".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                {
+                    Some(0) => {
+                        replace_existing = true;
+                        continue 'setup;
+                    }
+                    Some(1) => {
+                        replace_existing = false;
+                        continue 'setup;
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            Err(error) => {
+                shell.error(error.to_string());
+                shell.render();
+                match provider_setup_picker(
+                    shell,
+                    input,
+                    "Provider setup needs attention",
+                    vec!["Edit setup values".to_owned(), "Cancel setup".to_owned()],
+                    vec![
+                        Some("Correct the endpoint or credential source and try again".to_owned()),
+                        Some("No provider state is written".to_owned()),
+                    ],
+                    0,
+                )
+                .await?
+                {
+                    Some(0) => continue 'setup,
+                    _ => return Ok(None),
+                }
+            }
+        };
+
+        let mut transaction = transaction;
+        let mut discover = if config.offline {
+            false
+        } else {
+            let Some(choice) =
+                provider_setup_picker(
+                    shell,
+                    input,
+                    "Model inventory",
+                    vec![
+                        "Discover models from this endpoint".to_owned(),
+                        "Enter a model ID manually".to_owned(),
+                        "Back".to_owned(),
+                    ],
+                    vec![
+                    Some("Send one bounded request only to this selected endpoint's /models path"
+                        .to_owned()),
+                    Some("Do not contact the endpoint; useful for offline or unsupported discovery"
+                        .to_owned()),
+                    Some("Return to provider selection without writing state".to_owned()),
+                ],
+                    0,
+                )
+                .await?
+            else {
+                let _ = transaction.cancel();
+                continue 'setup;
+            };
+            match choice {
+                0 => true,
+                1 => false,
+                _ => {
+                    let _ = transaction.cancel();
+                    continue 'setup;
+                }
+            }
+        };
+
+        let prepared = 'prepare: loop {
+            if !discover {
+                let Some(model) = guided_setup_input(shell, input, "Model ID:", false).await?
+                else {
+                    let _ = transaction.cancel();
+                    continue 'setup;
+                };
+                if !valid_guided_manual_model(&model) {
+                    shell.error("provider setup configuration is invalid".to_owned());
+                    shell.render();
+                    continue 'prepare;
+                }
+                break 'prepare service.prepare_manual(transaction, &model)?;
+            }
+
+            let discovery_service = service.clone();
+            let (returned_transaction, discovery) =
+                run_blocking_lifecycle(shell, input, "discovering models…", move || {
+                    let mut transaction = transaction;
+                    let result = discovery_service.discover(&mut transaction);
+                    Ok((transaction, result))
+                })
+                .await?;
+            transaction = returned_transaction;
+            match discovery {
+                Ok(models) => {
+                    let items = models
+                        .iter()
+                        .map(|model| model.display_name.clone())
+                        .collect::<Vec<_>>();
+                    let descriptions = models
+                        .iter()
+                        .map(|model| Some(model.api_name.clone()))
+                        .collect::<Vec<_>>();
+                    let Some(selected) = provider_setup_picker(
+                        shell,
+                        input,
+                        "Select a discovered model",
+                        items,
+                        descriptions,
+                        0,
+                    )
+                    .await?
+                    else {
+                        let _ = transaction.cancel();
+                        continue 'setup;
+                    };
+                    break 'prepare service
+                        .prepare_discovered(transaction, &models[selected].api_name)?;
+                }
+                Err(error) => {
+                    let diagnostic = error
+                        .state()
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| error.to_string());
+                    shell.error(diagnostic.clone());
+                    shell.render();
+                    match provider_setup_picker(
+                        shell,
+                        input,
+                        "Model discovery needs attention",
+                        vec![
+                            "Retry this endpoint".to_owned(),
+                            "Enter a model ID manually".to_owned(),
+                            "Edit endpoint or credentials".to_owned(),
+                            "Cancel setup".to_owned(),
+                        ],
+                        vec![
+                            Some(diagnostic),
+                            Some("Continue without any additional endpoint request".to_owned()),
+                            Some("Return to provider selection without writing state".to_owned()),
+                            Some("No provider state is written".to_owned()),
+                        ],
+                        0,
+                    )
+                    .await?
+                    {
+                        Some(0) => {
+                            discover = true;
+                            continue 'prepare;
+                        }
+                        Some(1) => {
+                            discover = false;
+                            continue 'prepare;
+                        }
+                        Some(2) => {
+                            let _ = transaction.cancel();
+                            continue 'setup;
+                        }
+                        _ => {
+                            let _ = transaction.cancel();
+                            return Ok(None);
+                        }
+                    }
+                }
+            }
+        };
+
+        let receipt = prepared
+            .receipt()
+            .render(Some(&SetupAuthority::from_config(config)));
+        match provider_setup_picker(
+            shell,
+            input,
+            "Review provider setup",
+            vec![
+                "Confirm and save".to_owned(),
+                "Edit setup values".to_owned(),
+                "Cancel setup".to_owned(),
+            ],
+            vec![
+                Some(receipt),
+                Some("Discard this review and return to provider selection".to_owned()),
+                Some("Discard this review; no provider state is written".to_owned()),
+            ],
+            0,
+        )
+        .await?
+        {
+            Some(0) => {
+                let commit_service = service.clone();
+                match run_blocking_lifecycle(shell, input, "saving provider setup…", move || {
+                    commit_service
+                        .commit_and_rebuild(prepared)
+                        .map_err(Into::into)
+                })
+                .await
+                {
+                    Ok(completed) => {
+                        if let Err(error) = crate::cli::persist_model(&completed.model.0) {
+                            shell.error(format!(
+                                "provider saved, but the selected model preference could not be saved: {error}"
+                            ));
+                            shell.render();
+                        }
+                        return Ok(Some(completed));
+                    }
+                    Err(error) => {
+                        shell.error(format!("provider setup could not be finalized: {error}"));
+                        shell.render();
+                        match provider_setup_picker(
+                            shell,
+                            input,
+                            "Provider setup needs attention",
+                            vec!["Start over".to_owned(), "Cancel setup".to_owned()],
+                            vec![
+                                Some(
+                                    "Reload current provider state and review it again".to_owned(),
+                                ),
+                                Some("Return without making another change".to_owned()),
+                            ],
+                            0,
+                        )
+                        .await?
+                        {
+                            Some(0) => continue 'setup,
+                            _ => return Ok(None),
+                        }
+                    }
+                }
+            }
+            Some(1) => {
+                let _ = prepared.cancel();
+                continue 'setup;
+            }
+            _ => {
+                let _ = prepared.cancel();
+                return Ok(None);
+            }
+        }
+    }
+}
+
 /// Run the interactive frontend with explicit idle and active borrow phases.
-pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
+pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
     let initial_prompt = boot.config.initial_prompt.clone();
     let theme = load_theme(&boot.config);
     let size = Arc::new(Mutex::new(crossterm::terminal::size().unwrap_or((80, 24))));
@@ -4178,6 +4982,22 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     shell.set_runtime_config(boot.config.clone());
     apply_detected_terminal_background(&mut shell, &boot.config);
     let mut input = EventStream::new();
+    // Offer setup only when bootstrap has no runnable provider inventory. An
+    // explicit --model remains authoritative, and resumed provenance is still
+    // resolved after this optional first-run transaction.
+    if !boot.config.model_explicit && boot.catalog.models().next().is_none() {
+        let config = boot.config.clone();
+        if let Some(completed) = guided_provider_setup(&mut shell, &mut input, &config).await? {
+            boot.catalog = completed.catalog;
+            boot.config.model = Some(completed.model.clone());
+            // Keep this as a persisted default rather than an invocation
+            // override, so an existing session's provenance remains eligible.
+            boot.config.model_explicit = false;
+            shell.set_runtime_config(boot.config.clone());
+            shell.notice(format!("provider setup saved · {}", completed.model.0));
+            shell.render();
+        }
+    }
     // The shell owns a dedicated renderer thread, but sexy-tui still renders
     // synchronously when that thread receives a request. This clock only
     // coalesces high-rate wheel input on the input loop.
@@ -4225,6 +5045,8 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
     }
     let mut startup_input = startup_prompt.map(ComposedInput::from_text);
     shell.hydrate(app.agent.session())?;
+    app.executable_extensions
+        .activate_session_lifecycle_driver();
     update_status(&mut shell, &app);
     request_extension_ui(&mut shell, &mut app);
     shell.render();
@@ -4256,6 +5078,18 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
             Idle::Quit => {
                 shutdown_for_exit(&mut app).await;
                 break;
+            }
+            Idle::SessionLifecycle(request) => {
+                let active_session_replaced =
+                    execute_extension_session_lifecycle(&mut app, &mut shell, &mut input, request)
+                        .await;
+                if active_session_replaced {
+                    // Replacement installs a fresh GoalDriver. Re-arm it from
+                    // the current durable session instead of letting a stale
+                    // deadline target the discarded driver.
+                    goal_deadline = recovered_goal_deadline(&app)?;
+                    next_prompt_source = GoalTurnSource::User;
+                }
             }
             Idle::GoalContinuation => {
                 goal_deadline = None;
@@ -4356,8 +5190,6 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     // Spawn the child process with piped output.
                     let mut process = tokio::process::Command::new("sh");
                     process
-                        .arg("-c")
-                        .arg(&cmd)
                         .current_dir(&workspace)
                         .stdout(std::process::Stdio::piped())
                         .stderr(std::process::Stdio::piped())
@@ -4365,6 +5197,23 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         .kill_on_drop(true);
                     #[cfg(unix)]
                     process.process_group(0);
+                    #[cfg(unix)]
+                    let launch = match BashProcessLaunch::prepare(&mut process, &cmd) {
+                        Ok(launch) => launch,
+                        Err(error) => {
+                            shell.finalize_shell(
+                                &shell_id,
+                                format!("failed to prepare lifecycle supervision: {error}"),
+                                -1,
+                            );
+                            shell.render();
+                            continue;
+                        }
+                    };
+                    #[cfg(unix)]
+                    process.arg("-c").arg(launch.source());
+                    #[cfg(not(unix))]
+                    process.arg("-c").arg(&cmd);
                     let mut child = match process.spawn() {
                         Ok(child) => child,
                         Err(error) => {
@@ -4378,7 +5227,19 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                         }
                     };
                     #[cfg(unix)]
-                    let group_guard = ProcessGroupGuard::bash(child.id());
+                    let (group_guard, handoff) = match launch.register(child.id()).await {
+                        Ok(registered) => registered,
+                        Err(error) => {
+                            let _ = child.wait().await;
+                            shell.finalize_shell(
+                                &shell_id,
+                                format!("failed to register lifecycle supervision: {error}"),
+                                -1,
+                            );
+                            shell.render();
+                            continue;
+                        }
+                    };
 
                     let mut stdout_pipe = child.stdout.take();
                     let mut stderr_pipe = child.stderr.take();
@@ -4400,6 +5261,13 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     let stdout_updates = output_tx.clone();
                     let stderr_updates = output_tx;
                     let work = async {
+                        #[cfg(unix)]
+                        let (_, _, status) = tokio::join!(
+                            drain_shell_pipe(&mut stdout_pipe, &stdout_capture, &stdout_updates,),
+                            drain_shell_pipe(&mut stderr_pipe, &stderr_capture, &stderr_updates,),
+                            wait_for_bash_process(&mut child, handoff),
+                        );
+                        #[cfg(not(unix))]
                         let (_, _, status) = tokio::join!(
                             drain_shell_pipe(&mut stdout_pipe, &stdout_capture, &stdout_updates,),
                             drain_shell_pipe(&mut stderr_pipe, &stderr_capture, &stderr_updates,),
@@ -4648,6 +5516,23 @@ pub async fn run_interactive(boot: Bootstrap) -> anyhow::Result<()> {
                     estimate_next_request_tokens(&app, &composed.parts),
                     context_window(&app.model),
                 );
+                // Do this directly at the request boundary. A provider update
+                // can remove the old host-stream transport; never let an Agent
+                // retaining its inert endpoint fall through to localhost.
+                let provider_diagnostics =
+                    match app.synchronize_extension_provider_catalog_for_request() {
+                        Ok(diagnostics) => diagnostics,
+                        Err(error) => {
+                            app.agent.set_system_prompt(app.system.clone());
+                            shell.restore_composed(retry_composed);
+                            shell.error(format!("prompt was not saved: {error}"));
+                            shell.render();
+                            continue;
+                        }
+                    };
+                for diagnostic in provider_diagnostics {
+                    shell.notice(diagnostic);
+                }
 
                 let mut run = {
                     let user_input = composed.into_user_input();
@@ -4896,6 +5781,58 @@ mod tests {
     }
 
     #[test]
+    fn extension_lifecycle_fork_copies_the_active_head_and_records_provenance() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let sessions =
+            crate::session_store::SessionStore::new(&directory.path().join("sessions"), &workspace);
+        let source_path = sessions.new_path("2026-03-16");
+        let mut prepared = None;
+        let mut source = open_launch_session(
+            &mut prepared,
+            SessionSelection::CreateNew(source_path.clone()),
+        )
+        .unwrap();
+        let head = source
+            .append(EntryValue::Message(ygg_ai::Message::User(
+                ygg_ai::UserMessage {
+                    content: vec![ygg_ai::UserPart::Text("current head".into())],
+                },
+            )))
+            .unwrap();
+        drop(source);
+
+        let destination = sessions.new_path("2026-03-17");
+        let fork_path =
+            fork_active_session(&sessions, &source_path, destination, Some(&head)).unwrap();
+        let fork = Session::open(&fork_path).unwrap();
+        let source_id = session_id_for_path(&source_path).unwrap();
+        let fork_id = session_id_for_path(&fork_path).unwrap();
+
+        assert_eq!(fork.head(), Some(head.clone()));
+        assert!(fork.entry(&head).is_some());
+        let metadata = sessions.load_metadata(&fork_id).unwrap();
+        assert_eq!(
+            metadata.forked_from_session_id.as_deref(),
+            Some(source_id.as_str())
+        );
+        assert_eq!(
+            metadata.forked_from_entry_id.as_deref(),
+            Some(head.0.as_str())
+        );
+    }
+
+    #[test]
+    fn extension_lifecycle_session_ids_fit_the_generated_result_bound() {
+        assert_eq!(
+            bounded_extension_session_id("x".repeat(MAX_JSON_RPC_ID_BYTES)).unwrap(),
+            "x".repeat(MAX_JSON_RPC_ID_BYTES)
+        );
+        assert!(bounded_extension_session_id("x".repeat(MAX_JSON_RPC_ID_BYTES + 1)).is_err());
+    }
+
+    #[test]
     fn web_search_menu_recommends_brave_and_keeps_searxng_and_disable() {
         let (items, descriptions) = web_search_menu_entries(true);
         assert_eq!(
@@ -5017,6 +5954,7 @@ mod tests {
                             "content": "pub fn worker() {}\n",
                         })
                         .to_string(),
+                        argument_error: None,
                     })],
                     model: ygg_ai::ModelId("worker-test".into()),
                     protocol: ygg_ai::Protocol::OpenAiChat,
@@ -5389,6 +6327,7 @@ mod tests {
                 auth: Auth::None,
                 default_headers: http::HeaderMap::new(),
                 transport: ygg_ai::EndpointTransport::Http,
+                runtime: ygg_ai::RequestRuntime::default(),
                 timeout: Duration::from_secs(5),
             }),
         }

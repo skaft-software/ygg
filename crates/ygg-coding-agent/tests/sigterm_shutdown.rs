@@ -620,17 +620,24 @@ fn sigterm_stops_detached_descendant_after_shell_leader_exits() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let directory = tempfile::tempdir().expect("tempdir");
     let marker = directory.path().join("detached-descendant.pid");
+    let leader_marker = directory.path().join("detached-shell-leader.pid");
     let mut ygg = PtyYgg::spawn(directory.path());
     ygg.write_input(
         format!(
-            "!python3 -c 'import os,time; os.setsid(); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' </dev/null >/dev/null 2>&1 &\r",
+            "!printf '%s' $$ > {}; python3 -c 'import os,time; os.setsid(); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' </dev/null >/dev/null 2>&1 &\r",
+            leader_marker.display(),
             marker.display()
         )
         .as_bytes(),
     );
-    ygg.wait_until(READY_DEADLINE, |_| pid_marker_ready(&marker));
+    ygg.wait_until(READY_DEADLINE, |_| {
+        pid_marker_ready(&marker) && pid_marker_ready(&leader_marker)
+    });
     let descendant = read_pid(&marker);
-    std::thread::sleep(Duration::from_millis(150));
+    let leader = read_pid(&leader_marker);
+    // The fixture publishes its PID only after `setsid`. Wait for the direct
+    // shell to be genuinely gone, rather than sleeping through the handoff.
+    ygg.wait_until(READY_DEADLINE, |_| !process_exists(leader));
     assert!(
         process_exists(descendant),
         "detached descendant exited before shutdown"
@@ -1091,7 +1098,55 @@ fn pid_marker_ready(path: &Path) -> bool {
         .is_some()
 }
 
+/// Returns live-process status; `kill(pid, 0)` alone also reports zombies.
 fn process_exists(pid: i32) -> bool {
     let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    (result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+        && !process_is_zombie(pid)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn process_is_zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.get(stat.rfind(") ")?.saturating_add(2)..)?
+                .bytes()
+                .next()
+        })
+        == Some(b'Z')
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn process_is_zombie(pid: i32) -> bool {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let Ok(size_i32) = i32::try_from(size) else {
+        return false;
+    };
+    // SAFETY: `info` points to `size_i32` writable bytes for proc_pidinfo.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size_i32,
+        )
+    };
+    // SAFETY: an exact-size result proves proc_bsdinfo initialization.
+    read == size_i32 && unsafe { info.assume_init() }.pbi_status == libc::SZOMB
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))
+))]
+fn process_is_zombie(_pid: i32) -> bool {
+    false
 }

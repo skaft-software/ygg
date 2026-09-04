@@ -1,8 +1,8 @@
 name = "ygg-mcp"
 version = "0.1.0"
 api_version = "0.2"
-requires_ygg = "=0.6.7"
-description = "Resident bridge for explicitly configured local stdio MCP tool servers"
+requires_ygg = "=0.7.0-dev"
+description = "Resident bridge for explicitly configured stdio and Streamable HTTP MCP tool servers"
 
 [entrypoint]
 command = "ygg-mcp"
@@ -10,7 +10,7 @@ command = "ygg-mcp"
 [capabilities]
 filesystem = "unrestricted"
 process = true
-network = false
+network = true
 
 [contributes]
 commands = ["mcp"]

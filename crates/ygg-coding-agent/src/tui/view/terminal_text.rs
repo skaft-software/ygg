@@ -1,4 +1,5 @@
-use sexy_tui_rs::strip_terminal_sequences;
+use sexy_tui_rs::{strip_terminal_sequences, WidthPolicy};
+use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_LIVE_PANEL_BYTES: usize = 64 * 1024;
 const MAX_EXTENSION_RENDER_BYTES: usize = 64 * 1024;
@@ -78,6 +79,148 @@ pub(crate) fn sanitize_for_terminal(raw: &str) -> String {
     out
 }
 
+fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = chars.next() {
+        if character.is_ascii() && (0x40..=0x7e).contains(&(character as u8)) {
+            break;
+        }
+        if character == '\u{009c}' {
+            break;
+        }
+        if character == '\x1b' {
+            // A malformed CSI can contain another control introducer. Consume
+            // that complete control too instead of allowing its bytes to fall
+            // back into visible metadata.
+            let _ = consume_escape_sequence(chars);
+        }
+    }
+}
+
+fn consume_control_string(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    while let Some(character) = chars.next() {
+        match character {
+            // BEL is an OSC terminator. Treating it as a terminator for every
+            // ECMA-48 string type is intentionally conservative: metadata
+            // must never turn a malformed DCS/APC payload into terminal text.
+            '\x07' | '\u{009c}' => break,
+            '\x1b' if chars.peek() == Some(&'\\') => {
+                chars.next();
+                break;
+            }
+            '\x1b' => {
+                let _ = consume_escape_sequence(chars);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Consume the remainder of a 7-bit escape sequence.
+///
+/// A non-ASCII follower is not an ECMA-48 final byte, so returning it lets the
+/// ordinary-cell caller retain harmless user text after discarding the raw ESC.
+fn consume_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<char> {
+    let next = chars.next()?;
+    match next {
+        '[' => consume_csi(chars),
+        '\u{009b}' => consume_csi(chars),
+        // OSC, DCS, SOS, PM, and APC all carry arbitrary bytes until BEL/ST.
+        ']' | 'P' | 'X' | '^' | '_' => consume_control_string(chars),
+        '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+            consume_control_string(chars)
+        }
+        '\\' => {}
+        intermediate
+            if intermediate.is_ascii() && (0x20..=0x2f).contains(&(intermediate as u8)) =>
+        {
+            while chars.peek().is_some_and(|character| {
+                character.is_ascii() && (0x20..=0x2f).contains(&(*character as u8))
+            }) {
+                chars.next();
+            }
+            if chars.peek().is_some_and(|character| {
+                character.is_ascii() && (0x30..=0x7e).contains(&(*character as u8))
+            }) {
+                chars.next();
+            }
+        }
+        final_byte if final_byte.is_ascii() => {}
+        visible if !visible.is_control() => return Some(visible),
+        _ => {}
+    }
+    None
+}
+
+fn push_ordinary_control(out: &mut String, character: char, unicode: bool) {
+    let replacement = match character {
+        '\x00' => {
+            if unicode {
+                "␀"
+            } else {
+                "[NUL]"
+            }
+        }
+        '\x07' => {
+            if unicode {
+                "␇"
+            } else {
+                "[BEL]"
+            }
+        }
+        '\r' => {
+            if unicode {
+                "␍"
+            } else {
+                "[CR]"
+            }
+        }
+        '\x1b' => {
+            if unicode {
+                "␛"
+            } else {
+                "[ESC]"
+            }
+        }
+        _ if unicode => "·",
+        _ => "[CTL]",
+    };
+    out.push_str(replacement);
+}
+
+/// Sanitize untrusted ordinary-surface metadata into one display cell.
+///
+/// This parser consumes complete and malformed 7-bit/C1 CSI and string
+/// controls before width measurement or theme styling. Newlines cannot inject
+/// a row; visible control diagnostics use only ASCII fallbacks when Unicode is
+/// disabled. It intentionally does not preserve ANSI because callers apply
+/// trusted theme styling only after this boundary.
+pub(crate) fn sanitize_ordinary_surface_cell(raw: &str, unicode: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\x1b' => {
+                if let Some(visible) = consume_escape_sequence(&mut chars) {
+                    out.push(visible);
+                }
+            }
+            '\u{009b}' => consume_csi(&mut chars),
+            '\u{0090}' | '\u{0098}' | '\u{009d}' | '\u{009e}' | '\u{009f}' => {
+                consume_control_string(&mut chars)
+            }
+            '\n' => out.push(' '),
+            '\r' if chars.peek() == Some(&'\n') => {
+                chars.next();
+                out.push(' ');
+            }
+            '\t' => out.push_str("    "),
+            control if control.is_control() => push_ordinary_control(&mut out, control, unicode),
+            visible => out.push(visible),
+        }
+    }
+    out
+}
+
 /// Project carriage-return progress into the terminal-visible text state.
 /// CRLF remains a newline; a bare CR replaces the current logical line instead
 /// of retaining every intermediate progress frame and allowing it to wrap.
@@ -143,18 +286,176 @@ pub(super) fn sanitize_extension_tool_render_segments(
     sanitized
 }
 
-fn visualize_editor_controls(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(character) = chars.next() {
+/// A grapheme-safe mapping from the editable source buffer to a safe layout
+/// buffer. The layout buffer retains literal tabs so [`WidthPolicy`] can apply
+/// tab stops at the visual row where the tab is painted;
+/// [`Self::terminal_row_bounded`] expands those tabs only when materializing a
+/// visible terminal row.
+#[derive(Clone, Debug)]
+pub(crate) struct EditorDisplayMap {
+    layout_text: String,
+    boundaries: Vec<EditorDisplayBoundary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditorDisplayBoundary {
+    source: usize,
+    display: usize,
+}
+
+impl EditorDisplayMap {
+    /// Visualize controls without mutating the editable source buffer.
+    #[must_use]
+    pub(crate) fn from_source(source: &str) -> Self {
+        let mut layout_text = String::with_capacity(source.len());
+        let mut boundaries = Vec::with_capacity(source.graphemes(true).count().saturating_add(1));
+        boundaries.push(EditorDisplayBoundary {
+            source: 0,
+            display: 0,
+        });
+
+        for (start, grapheme) in source.grapheme_indices(true) {
+            append_visualized_editor_grapheme(&mut layout_text, grapheme);
+            boundaries.push(EditorDisplayBoundary {
+                source: start + grapheme.len(),
+                display: layout_text.len(),
+            });
+        }
+
+        // Replacing a control can make a following combining mark join the
+        // visible control-picture grapheme. Map every source boundary forward
+        // to a valid display boundary rather than placing a caret in that new
+        // grapheme's byte interior. Multiple source boundaries may safely map
+        // to one display boundary; reverse mapping chooses the latest source
+        // boundary for that visible location. Both lists are monotonic, so this
+        // normalization stays linear for large restored drafts.
+        let mut display_boundaries = layout_text
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(layout_text.len()));
+        let mut display_boundary = display_boundaries
+            .next()
+            .expect("a display buffer always has its zero boundary");
+        for boundary in &mut boundaries {
+            while display_boundary < boundary.display {
+                display_boundary = display_boundaries
+                    .next()
+                    .expect("source transformation cannot exceed display length");
+            }
+            boundary.display = display_boundary;
+        }
+
+        Self {
+            layout_text,
+            boundaries,
+        }
+    }
+
+    /// Safe text used for layout. It can contain literal tabs, so it must be
+    /// materialized through [`Self::terminal_row_bounded`] before terminal
+    /// output.
+    #[must_use]
+    pub(crate) fn layout_text(&self) -> &str {
+        &self.layout_text
+    }
+
+    /// Map a source grapheme boundary to a display grapheme boundary.
+    #[must_use]
+    pub(crate) fn source_to_display(&self, source: usize) -> usize {
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.source <= source)
+            .saturating_sub(1);
+        self.boundaries[index].display
+    }
+
+    /// Map a display grapheme boundary back to a source grapheme boundary.
+    ///
+    /// Intermediate tab cells map to the preceding source boundary. Exact
+    /// display boundaries shared by transformed graphemes map to the latest
+    /// source boundary, avoiding a stale cursor inside a source sequence.
+    #[must_use]
+    pub(crate) fn display_to_source(&self, display: usize) -> usize {
+        let display = floor_to_grapheme_boundary(&self.layout_text, display);
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.display <= display)
+            .saturating_sub(1);
+        self.boundaries[index].source
+    }
+
+    /// Materialize one row without splitting a grapheme or overflowing
+    /// `max_columns` text cells.
+    ///
+    /// `cursor` is an optional layout-text byte offset in `start..=end`. The
+    /// caller owns the trusted marker and focus policy; this method never
+    /// derives a cursor from source content.
+    ///
+    /// The trusted cursor marker is zero-cell terminal chrome and is retained
+    /// even when an oversized source grapheme cannot fit. In that case its
+    /// location is clamped to the last materialized text boundary rather than
+    /// being dropped by a later generic string truncator.
+    #[must_use]
+    pub(crate) fn terminal_row_bounded(
+        &self,
+        start: usize,
+        end: usize,
+        cursor: Option<usize>,
+        cursor_marker: &str,
+        max_columns: usize,
+    ) -> String {
+        let Some(row) = self.layout_text.get(start..end) else {
+            return String::new();
+        };
+        let cursor = cursor.filter(|offset| *offset >= start && *offset <= end);
+        let mut rendered = String::with_capacity(row.len().saturating_add(cursor_marker.len()));
+        let mut column = 0usize;
+        let mut inserted_cursor = false;
+        if cursor == Some(start) {
+            rendered.push_str(cursor_marker);
+            inserted_cursor = true;
+        }
+        let policy = WidthPolicy::default();
+        for (relative, grapheme) in row.grapheme_indices(true) {
+            let offset = start + relative;
+            let width = policy.grapheme_width(grapheme, column);
+            if column.saturating_add(width) > max_columns {
+                break;
+            }
+            if grapheme == "\t" {
+                rendered.push_str(&" ".repeat(width));
+            } else {
+                rendered.push_str(grapheme);
+            }
+            column = column.saturating_add(width);
+            if cursor == Some(offset + grapheme.len()) {
+                rendered.push_str(cursor_marker);
+                inserted_cursor = true;
+            }
+        }
+        if cursor.is_some() && !inserted_cursor {
+            // The cursor was after text that could not fit. Keep its trusted
+            // token at the clipped row edge; an embedding reserves its cell.
+            rendered.push_str(cursor_marker);
+        }
+        rendered
+    }
+}
+
+fn append_visualized_editor_grapheme(out: &mut String, grapheme: &str) {
+    if grapheme == "\r\n" {
+        out.push('\n');
+        return;
+    }
+    for character in grapheme.chars() {
         match character {
             '\n' => out.push('\n'),
-            '\r' if chars.peek() == Some(&'\n') => {
-                chars.next();
-                out.push('\n');
-            }
+            // A bare CR is visible source text in the composer. CRLF is
+            // handled above as one source grapheme and one hard line feed.
             '\r' => out.push('␍'),
-            '\t' => out.push_str("    "),
+            // Keep tabs for width-aware visual layout; expand them only in a
+            // row with a known starting column.
+            '\t' => out.push('\t'),
             '\x00' => out.push('␀'),
             '\x07' => out.push('␇'),
             '\x1b' => out.push('␛'),
@@ -162,21 +463,18 @@ fn visualize_editor_controls(raw: &str) -> String {
             visible => out.push(visible),
         }
     }
-    out
 }
 
-pub(crate) fn sanitized_editor(raw: &str, cursor: usize) -> (String, usize) {
-    let mut cursor = cursor.min(raw.len());
-    while cursor > 0 && !raw.is_char_boundary(cursor) {
-        cursor -= 1;
+fn floor_to_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() {
+        return offset;
     }
-    // Composer input remains authoritative and editable. Unlike command logs,
-    // controls are visualized rather than removed so cursor offsets can map to
-    // every source byte without executing it.
-    let before = visualize_editor_controls(&raw[..cursor]);
-    let safe_cursor = before.len();
-    let after = visualize_editor_controls(&raw[cursor..]);
-    (before + &after, safe_cursor)
+    text.grapheme_indices(true)
+        .take_while(|(index, _)| *index <= offset)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0)
 }
 
 /// Append ephemeral live display output while retaining only the newest 64 KiB.
@@ -252,6 +550,69 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_surface_cells_consume_complete_and_malformed_terminal_controls() {
+        let complete_sequences = [
+            ("before\x1b[31mred\x1b[0mafter", "beforeredafter"),
+            ("before\u{009b}31mred\u{009b}0mafter", "beforeredafter"),
+            ("before\x1b\u{009b}31mredafter", "beforeredafter"),
+            ("before\x1b]0;forged-title\x07after", "beforeafter"),
+            ("before\u{009d}0;forged-title\u{009c}after", "beforeafter"),
+            ("before\x1bPprivate-data\x1b\\after", "beforeafter"),
+            ("before\u{0090}private-data\u{009c}after", "beforeafter"),
+            ("before\x1bXignored\x1b\\after", "beforeafter"),
+            ("before\x1b^ignored\x1b\\after", "beforeafter"),
+            ("before\x1b_ignored\x1b\\after", "beforeafter"),
+            ("before\u{0098}ignored\u{009c}after", "beforeafter"),
+            ("before\u{009e}ignored\u{009c}after", "beforeafter"),
+            ("before\u{009f}ignored\u{009c}after", "beforeafter"),
+        ];
+        for (raw, expected) in complete_sequences {
+            for unicode in [true, false] {
+                let sanitized = sanitize_ordinary_surface_cell(raw, unicode);
+                assert_eq!(sanitized, expected, "{raw:?}, unicode={unicode}");
+                assert!(
+                    !sanitized.chars().any(char::is_control),
+                    "control survived: {raw:?} -> {sanitized:?}"
+                );
+                assert!(
+                    !sanitized.contains('\x1b'),
+                    "escape survived: {raw:?} -> {sanitized:?}"
+                );
+                if !unicode {
+                    assert!(
+                        sanitized.is_ascii(),
+                        "ASCII cell leaked Unicode: {sanitized:?}"
+                    );
+                }
+            }
+        }
+
+        // An unterminated introducer consumes the remainder rather than letting
+        // parameter or string bytes regain terminal meaning in an ordinary row.
+        for raw in [
+            "before\x1b[38;5",
+            "before\u{009b}?25",
+            "before\x1b]8;;https://example.invalid",
+            "before\x1bPpayload",
+            "before\u{009d}payload",
+        ] {
+            for unicode in [true, false] {
+                assert_eq!(
+                    sanitize_ordinary_surface_cell(raw, unicode),
+                    "before",
+                    "{raw:?}"
+                );
+            }
+        }
+
+        let unicode = sanitize_ordinary_surface_cell("a\x07b\nc\r\nd\rex\tz\x00q\x01e", true);
+        assert_eq!(unicode, "a␇b c d␍ex    z␀q·e");
+        let ascii = sanitize_ordinary_surface_cell("a\x07b\nc\r\nd\rex\tz\x00q\x01e", false);
+        assert_eq!(ascii, "a[BEL]b c d[CR]ex    z[NUL]q[CTL]e");
+        assert!(ascii.is_ascii());
+    }
+
+    #[test]
     fn carriage_return_progress_replaces_the_current_logical_line() {
         assert_eq!(
             normalize_carriage_return_progress("phase\n0%\r10%\r100%\r\ndone"),
@@ -261,14 +622,130 @@ mod tests {
     }
 
     #[test]
-    fn composer_sanitization_preserves_the_cursor_without_mutating_input() {
+    fn composer_display_map_preserves_the_cursor_without_mutating_input() {
         let raw = "before \x1b[31m after";
         let cursor = "before \x1b".len();
-        let (safe, safe_cursor) = sanitized_editor(raw, cursor);
+        let map = EditorDisplayMap::from_source(raw);
+        let safe = map.layout_text();
+        let safe_cursor = map.source_to_display(cursor);
         assert_eq!(raw, "before \x1b[31m after");
         assert_eq!(&safe[..safe_cursor], "before ␛");
         assert_eq!(safe, "before ␛[31m after");
-        assert!(safe.is_char_boundary(safe_cursor));
+        assert!(safe
+            .grapheme_indices(true)
+            .any(|(offset, _)| offset == safe_cursor));
+        assert_eq!(
+            map.terminal_row_bounded(0, safe.len(), Some(safe_cursor), "<cursor>", usize::MAX),
+            "before ␛<cursor>[31m after"
+        );
+    }
+
+    #[test]
+    fn composer_display_map_never_maps_a_cursor_into_joined_display_graphemes() {
+        // The source ESC and following combining mark are separate source
+        // boundaries, but visualizing ESC as U+241B makes them one displayed
+        // grapheme. Mapping must advance rather than split it.
+        let raw = "\x1b\u{0301}x";
+        let map = EditorDisplayMap::from_source(raw);
+        let display_cursor = map.source_to_display("\x1b".len());
+        assert_eq!(map.layout_text(), "␛\u{0301}x");
+        assert_eq!(display_cursor, "␛\u{0301}".len());
+        assert!(map
+            .layout_text()
+            .grapheme_indices(true)
+            .any(|(offset, _)| offset == display_cursor));
+        let source_cursor = map.display_to_source(display_cursor);
+        assert!(raw
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(raw.len()))
+            .any(|offset| offset == source_cursor));
+    }
+
+    #[test]
+    fn composer_display_map_keeps_complex_grapheme_boundaries_safe() {
+        let source = "e\u{301}👩‍💻❤\u{fe0f}🇦🇧界\t\x1b\u{0301}\r\n";
+        let source_boundaries = source
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(source.len()))
+            .collect::<Vec<_>>();
+        let map = EditorDisplayMap::from_source(source);
+        let display_boundaries = map
+            .layout_text()
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(map.layout_text().len()))
+            .collect::<Vec<_>>();
+
+        let mut previous_display = 0;
+        for source in source_boundaries.iter().copied() {
+            let display = map.source_to_display(source);
+            assert!(display_boundaries.contains(&display));
+            assert!(display >= previous_display);
+            assert!(source_boundaries.contains(&map.display_to_source(display)));
+            previous_display = display;
+        }
+    }
+
+    #[test]
+    fn composer_display_map_expands_tabs_only_in_the_visible_row() {
+        let map = EditorDisplayMap::from_source("ab\tc");
+        assert_eq!(map.layout_text(), "ab\tc");
+        assert_eq!(
+            map.terminal_row_bounded(0, 4, None, "", usize::MAX),
+            "ab  c"
+        );
+
+        let map = EditorDisplayMap::from_source("x\t");
+        assert_eq!(
+            map.terminal_row_bounded(0, 2, Some(2), "<cursor>", usize::MAX),
+            "x   <cursor>"
+        );
+    }
+
+    #[test]
+    fn bounded_composer_rows_clip_before_wide_graphemes_and_keep_the_cursor() {
+        let map = EditorDisplayMap::from_source("a界b");
+        let cursor = "a界".len();
+        let row = map.terminal_row_bounded(
+            0,
+            map.layout_text().len(),
+            Some(cursor),
+            sexy_tui_rs::CURSOR_MARKER,
+            2,
+        );
+        assert_eq!(row, format!("a{}", sexy_tui_rs::CURSOR_MARKER));
+        assert_eq!(
+            sexy_tui_rs::visible_width(&row.replace(sexy_tui_rs::CURSOR_MARKER, "")),
+            1
+        );
+
+        let map = EditorDisplayMap::from_source("界a");
+        let row = map.terminal_row_bounded(
+            0,
+            map.layout_text().len(),
+            Some("界".len()),
+            sexy_tui_rs::CURSOR_MARKER,
+            2,
+        );
+        assert_eq!(row, format!("界{}", sexy_tui_rs::CURSOR_MARKER));
+    }
+
+    #[test]
+    fn composer_display_map_cannot_confuse_source_with_the_trusted_cursor_token() {
+        let source = format!("source {} token", sexy_tui_rs::CURSOR_MARKER);
+        let map = EditorDisplayMap::from_source(&source);
+        assert!(!map.layout_text().contains(sexy_tui_rs::CURSOR_MARKER));
+        let row = map.terminal_row_bounded(
+            0,
+            map.layout_text().len(),
+            Some(map.layout_text().len()),
+            sexy_tui_rs::CURSOR_MARKER,
+            usize::MAX,
+        );
+        assert_eq!(row.matches(sexy_tui_rs::CURSOR_MARKER).count(), 1);
+        assert!(row.contains("source ␛_pi:c␇ token"));
     }
 
     #[test]

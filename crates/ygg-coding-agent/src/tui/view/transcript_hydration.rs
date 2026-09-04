@@ -1,5 +1,6 @@
 //! Durable transcript-item projection into the interactive shell model.
 
+use std::collections::hash_map::Entry;
 use std::time::Duration;
 
 use super::{
@@ -76,6 +77,7 @@ pub(super) fn append_hydrated_items(
                 text,
                 is_error,
                 duration_ms,
+                images,
             } => {
                 // Malformed provider output can reuse one call ID within the
                 // same assistant turn. The durable protocol cannot identify
@@ -96,36 +98,50 @@ pub(super) fn append_hydrated_items(
                     .collect::<Vec<_>>();
                 if !pending.is_empty() {
                     for index in pending {
+                        let registered_images = state.register_tool_images(images.clone());
                         if let Some(TranscriptBlock::Tool(panel)) = state.transcript.get_mut(index)
                         {
                             apply_hydrated_tool_result(panel, &text, is_error);
+                            panel.images = registered_images;
                             panel.duration = duration_ms.map(Duration::from_millis);
                         }
                     }
-                } else if let Some(panel) = state.tool_output_mut(&id) {
-                    apply_hydrated_tool_result(panel, &text, is_error);
-                    panel.duration = duration_ms.map(Duration::from_millis);
                 } else {
                     let index = state.transcript.len();
-                    let model_lab = state.model_lab;
-                    state.push_block(TranscriptBlock::Tool(Box::new(ToolPanel::new(
-                        id.clone(),
-                        "tool result".into(),
-                        String::new(),
-                        summarize_tool("tool result", &serde_json::Value::Null),
-                        sanitize_for_terminal(&text),
-                        true,
-                        is_error,
-                        is_error.then(|| {
-                            tool_failure_reason(
-                                "tool result",
-                                &Err(ygg_agent::ToolError::new(text.clone())),
-                            )
-                            .unwrap_or_else(|| "tool failed".into())
-                        }),
-                        model_lab,
-                    ))));
-                    state.tool_panels.insert(id, index);
+                    match state.tool_panels.entry(id.clone()) {
+                        Entry::Occupied(_) => {
+                            let registered_images = state.register_tool_images(images);
+                            if let Some(panel) = state.tool_output_mut(&id) {
+                                apply_hydrated_tool_result(panel, &text, is_error);
+                                panel.images = registered_images;
+                                panel.duration = duration_ms.map(Duration::from_millis);
+                            }
+                        }
+                        Entry::Vacant(entry) => {
+                            entry.insert(index);
+                            let model_lab = state.model_lab;
+                            let registered_images = state.register_tool_images(images);
+                            let mut panel = ToolPanel::new(
+                                id,
+                                "tool result".into(),
+                                String::new(),
+                                summarize_tool("tool result", &serde_json::Value::Null),
+                                sanitize_for_terminal(&text),
+                                true,
+                                is_error,
+                                is_error.then(|| {
+                                    tool_failure_reason(
+                                        "tool result",
+                                        &Err(ygg_agent::ToolError::new(text.clone())),
+                                    )
+                                    .unwrap_or_else(|| "tool failed".into())
+                                }),
+                                model_lab,
+                            );
+                            panel.images = registered_images;
+                            state.push_block(TranscriptBlock::Tool(Box::new(panel)));
+                        }
+                    }
                 }
             }
             TranscriptItem::CompactionMarker { summary } => {

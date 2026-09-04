@@ -1,0 +1,2651 @@
+{
+  "schema_format": "ygg.extension.protocol.schema/v1",
+  "api_version": "0.3",
+  "schema_id": "ygg.extension.api/0.3",
+  "canonical_encoding": "ygg-canonical-json-v1",
+  "legacy_adapters": [
+    {
+      "version": "0.1",
+      "status": "frozen",
+      "wire": "legacy-json-rpc"
+    },
+    {
+      "version": "0.2",
+      "status": "supported",
+      "wire": "legacy-json-rpc"
+    }
+  ],
+  "bounds": [
+    {
+      "name": "max_frame_bytes",
+      "value": 1048576,
+      "description": "Maximum UTF-8 JSON-RPC payload bytes, excluding the line delimiter.",
+      "negotiated": true
+    },
+    {
+      "name": "max_concurrent_requests",
+      "value": 64,
+      "description": "Maximum concurrently admitted host-to-extension requests.",
+      "negotiated": true
+    },
+    {
+      "name": "max_tools",
+      "value": 256,
+      "description": "Maximum complete tool catalog entries.",
+      "negotiated": true
+    },
+    {
+      "name": "max_extension_flags",
+      "value": 64,
+      "description": "Maximum manifest-declared CLI flag values delivered during initialization.",
+      "negotiated": false
+    },
+    {
+      "name": "max_capabilities",
+      "value": 32,
+      "description": "Maximum requested or selected capability names in one contract.",
+      "negotiated": false
+    },
+    {
+      "name": "max_methods",
+      "value": 64,
+      "description": "Maximum requested or selected method names in one contract.",
+      "negotiated": false
+    },
+    {
+      "name": "max_capability_name_bytes",
+      "value": 64,
+      "description": "Maximum UTF-8 bytes in one capability name.",
+      "negotiated": false
+    },
+    {
+      "name": "max_method_name_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in one method name.",
+      "negotiated": false
+    },
+    {
+      "name": "max_reason_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in an inspectable disposition reason.",
+      "negotiated": false
+    },
+    {
+      "name": "max_json_depth",
+      "value": 32,
+      "description": "Maximum nested JSON container depth for canonical protocol values.",
+      "negotiated": false
+    },
+    {
+      "name": "max_portable_json_integer",
+      "value": 9007199254740991,
+      "description": "Largest exactly portable JSON integer accepted by canonical encoding.",
+      "negotiated": false
+    },
+    {
+      "name": "max_content_parts",
+      "value": 256,
+      "description": "Maximum ordered API 0.3 tool-result content parts.",
+      "negotiated": false
+    },
+    {
+      "name": "max_tool_name_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in an API 0.3 tool name.",
+      "negotiated": false
+    },
+    {
+      "name": "max_tool_description_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in an API 0.3 tool description.",
+      "negotiated": false
+    },
+    {
+      "name": "max_json_rpc_id_bytes",
+      "value": 256,
+      "description": "Maximum UTF-8 bytes in a string JSON-RPC identifier.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_items",
+      "value": 128,
+      "description": "Maximum source items in one migration adapter category.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_path_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in a migration source-root or source-relative path.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_name_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in one migration model, skill, or server name.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_skill_bytes",
+      "value": 131072,
+      "description": "Maximum UTF-8 bytes in one migrated skill payload.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_command_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in one migrated stdio command.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_argument_bytes",
+      "value": 16384,
+      "description": "Maximum UTF-8 bytes in one migrated stdio argument.",
+      "negotiated": false
+    },
+    {
+      "name": "max_migration_diagnostic_bytes",
+      "value": 4096,
+      "description": "Maximum UTF-8 bytes in one migration diagnostic reason.",
+      "negotiated": false
+    },
+    {
+      "name": "max_providers",
+      "value": 32,
+      "description": "Maximum live extension-provider declarations across one host registry.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_models",
+      "value": 256,
+      "description": "Maximum live extension-provider model declarations across one host registry.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_id_bytes",
+      "value": 64,
+      "description": "Maximum UTF-8 bytes in an extension provider or model identifier.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_label_bytes",
+      "value": 128,
+      "description": "Maximum UTF-8 bytes in an extension provider or model display label.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_auth_scopes",
+      "value": 32,
+      "description": "Maximum OAuth or credential scopes in one host-policy request.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_auth_lease_bytes",
+      "value": 256,
+      "description": "Maximum UTF-8 bytes in an opaque host-issued authorization lease.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_stream_event_bytes",
+      "value": 65536,
+      "description": "Maximum canonical bytes in one provider stream event payload.",
+      "negotiated": false
+    },
+    {
+      "name": "max_provider_stream_events",
+      "value": 100000,
+      "description": "Maximum events accepted for one extension-provider stream.",
+      "negotiated": false
+    },
+    {
+      "name": "max_session_hook_id_bytes",
+      "value": 256,
+      "description": "Maximum UTF-8 bytes in one opaque session-hook binding identifier.",
+      "negotiated": false
+    }
+  ],
+  "capabilities": [
+    {
+      "name": "content_parts",
+      "description": "Typed text/media tool-result parts and structured result details.",
+      "host_offer": "required",
+      "status": "foundation"
+    },
+    {
+      "name": "core",
+      "description": "Versioned initialization, explicit errors, bounds, and canonical encoding.",
+      "host_offer": "required",
+      "status": "foundation"
+    },
+    {
+      "name": "dynamic_tools",
+      "description": "Live transactional tool-catalog mutation.",
+      "host_offer": "unavailable",
+      "status": "deferred"
+    },
+    {
+      "name": "lifecycle_events",
+      "description": "Declared SessionStart/SessionEnd hooks for host-owned session lifecycle cleanup.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "migration.adapter.v1",
+      "description": "Bounded read-only setup detection and import conversion for host-owned migration ingestion.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_auth",
+      "description": "Explicit host-policy OAuth and credential authorization requests with opaque leases only.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_catalog",
+      "description": "Lifecycle-owned registration of secret-free extension provider and model catalogs.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "provider_stream",
+      "description": "Bounded host-mediated inference stream proxying for registered extension models.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "request_cancellation",
+      "description": "Cooperative cancellation with explicit terminal disposition.",
+      "host_offer": "required",
+      "status": "foundation"
+    },
+    {
+      "name": "session_lifecycle",
+      "description": "Bounded extension requests to create, fork, switch, or reload a host session.",
+      "host_offer": "optional",
+      "status": "foundation"
+    },
+    {
+      "name": "tool_call",
+      "description": "Bounded host-to-extension model tool invocation.",
+      "host_offer": "required",
+      "status": "foundation"
+    }
+  ],
+  "methods": [
+    {
+      "name": "$/cancelRequest",
+      "direction": "bidirectional",
+      "capability": "request_cancellation",
+      "host_offer": "required",
+      "status": "foundation",
+      "params": "CancelRequestParams",
+      "result": "CancelRequestResult",
+      "terminal": "original_request_cancelled",
+      "notification": true
+    },
+    {
+      "name": "context/collect",
+      "direction": "host_to_extension",
+      "capability": "lifecycle_events",
+      "host_offer": "unavailable",
+      "status": "deferred",
+      "params": null,
+      "result": null,
+      "terminal": "deferred",
+      "notification": false
+    },
+    {
+      "name": "hook/run",
+      "direction": "host_to_extension",
+      "capability": "lifecycle_events",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionHookParams",
+      "result": "SessionHookResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "initialize",
+      "direction": "host_to_extension",
+      "capability": "core",
+      "host_offer": "required",
+      "status": "foundation",
+      "params": "InitializeRequest",
+      "result": "InitializeResponse",
+      "terminal": "initialized",
+      "notification": false
+    },
+    {
+      "name": "migration/detect",
+      "direction": "host_to_extension",
+      "capability": "migration.adapter.v1",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "MigrationDetectParams",
+      "result": "MigrationDetectResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "migration/import",
+      "direction": "host_to_extension",
+      "capability": "migration.adapter.v1",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "MigrationImportParams",
+      "result": "MigrationImportResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/auth/request",
+      "direction": "extension_to_host",
+      "capability": "provider_auth",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderAuthorizationRequest",
+      "result": "ProviderAuthorizationResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/auth/revoke",
+      "direction": "extension_to_host",
+      "capability": "provider_auth",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderAuthorizationRequest",
+      "result": "ProviderAuthorizationResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "provider/cancel",
+      "direction": "host_to_extension",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamCancelParams",
+      "result": null,
+      "terminal": "stream_event",
+      "notification": true
+    },
+    {
+      "name": "provider/event",
+      "direction": "extension_to_host",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamEvent",
+      "result": null,
+      "terminal": "stream_event",
+      "notification": true
+    },
+    {
+      "name": "provider/stream",
+      "direction": "host_to_extension",
+      "capability": "provider_stream",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderStreamRequest",
+      "result": "ProviderStreamAccepted",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/complete",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderCatalogCompleteParams",
+      "result": null,
+      "terminal": "catalog_complete",
+      "notification": true
+    },
+    {
+      "name": "providers/register",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderRegisterParams",
+      "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/unregister",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderUnregisterParams",
+      "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "providers/update",
+      "direction": "extension_to_host",
+      "capability": "provider_catalog",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "ProviderUpdateParams",
+      "result": "ProviderCatalogResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/create",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionCreateParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/fork",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionForkParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/reload",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionReloadParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "session/switch",
+      "direction": "extension_to_host",
+      "capability": "session_lifecycle",
+      "host_offer": "optional",
+      "status": "foundation",
+      "params": "SessionSwitchParams",
+      "result": "SessionLifecycleResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "shutdown",
+      "direction": "host_to_extension",
+      "capability": "core",
+      "host_offer": "required",
+      "status": "foundation",
+      "params": "ShutdownParams",
+      "result": "ShutdownResult",
+      "terminal": "shutdown",
+      "notification": false
+    },
+    {
+      "name": "tool/call",
+      "direction": "host_to_extension",
+      "capability": "tool_call",
+      "host_offer": "required",
+      "status": "foundation",
+      "params": "ToolCallParams",
+      "result": "ToolCallResult",
+      "terminal": "result_or_error",
+      "notification": false
+    },
+    {
+      "name": "tools/register",
+      "direction": "extension_to_host",
+      "capability": "dynamic_tools",
+      "host_offer": "unavailable",
+      "status": "deferred",
+      "params": null,
+      "result": null,
+      "terminal": "deferred",
+      "notification": false
+    },
+    {
+      "name": "tools/unregister",
+      "direction": "extension_to_host",
+      "capability": "dynamic_tools",
+      "host_offer": "unavailable",
+      "status": "deferred",
+      "params": null,
+      "result": null,
+      "terminal": "deferred",
+      "notification": false
+    }
+  ],
+  "errors": [
+    {
+      "name": "parse_error",
+      "code": -32700,
+      "message": "parse error",
+      "description": "Invalid JSON was received."
+    },
+    {
+      "name": "invalid_request",
+      "code": -32600,
+      "message": "invalid request",
+      "description": "The JSON-RPC envelope is invalid."
+    },
+    {
+      "name": "unknown_method",
+      "code": -32601,
+      "message": "unknown or unnegotiated method",
+      "description": "The method is absent from the negotiated API 0.3 contract."
+    },
+    {
+      "name": "invalid_params",
+      "code": -32602,
+      "message": "invalid params",
+      "description": "Parameters violate a canonical wire type or bound."
+    },
+    {
+      "name": "internal_error",
+      "code": -32603,
+      "message": "internal error",
+      "description": "The implementation could not complete a valid request."
+    },
+    {
+      "name": "version_mismatch",
+      "code": -32010,
+      "message": "extension API version mismatch",
+      "description": "The peer did not select exactly API 0.3 and this wire cannot be adapted."
+    },
+    {
+      "name": "capability_mismatch",
+      "code": -32011,
+      "message": "extension capability mismatch",
+      "description": "A required capability or method is missing, duplicated, unknown, or not offered."
+    },
+    {
+      "name": "resource_exhausted",
+      "code": -32012,
+      "message": "extension resource exhausted",
+      "description": "A declared aggregate or per-contract bound was exhausted."
+    },
+    {
+      "name": "request_cancelled",
+      "code": -32800,
+      "message": "request cancelled",
+      "description": "Cooperative cancellation won the terminal race."
+    }
+  ],
+  "dispositions": [
+    {
+      "name": "continue",
+      "requires_reason": false,
+      "description": "Continue the operation without a veto."
+    },
+    {
+      "name": "deny",
+      "requires_reason": true,
+      "description": "Deny an interceptable operation with an inspectable reason."
+    },
+    {
+      "name": "defer",
+      "requires_reason": true,
+      "description": "Defer a supported operation until a host-owned boundary resolves."
+    }
+  ],
+  "models": [
+    {
+      "name": "ProtocolLimits",
+      "description": "Negotiated maxima selected by the extension and capped by the host.",
+      "fields": [
+        {
+          "name": "max_frame_bytes",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "max_concurrent_requests",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "max_tools",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ContractOffer",
+      "description": "Host offer for the API 0.3 capability and method contract.",
+      "fields": [
+        {
+          "name": "schema",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "encoding",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "required_capabilities",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_capabilities"
+        },
+        {
+          "name": "optional_capabilities",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_capabilities"
+        },
+        {
+          "name": "required_methods",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_methods"
+        },
+        {
+          "name": "optional_methods",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_methods"
+        },
+        {
+          "name": "limits",
+          "type": "ProtocolLimits",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ContractSelection",
+      "description": "Extension selection from one API 0.3 contract offer.",
+      "fields": [
+        {
+          "name": "schema",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "encoding",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "capabilities",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_capabilities"
+        },
+        {
+          "name": "methods",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_methods"
+        },
+        {
+          "name": "limits",
+          "type": "ProtocolLimits",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ToolDefinition",
+      "description": "A complete API 0.3 model tool definition returned at initialization.",
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_tool_name_bytes"
+        },
+        {
+          "name": "description",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_tool_description_bytes"
+        },
+        {
+          "name": "parameters",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "output_schema",
+          "type": "json",
+          "presence": "optional",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ContentPart",
+      "description": "One ordered, typed API 0.3 tool-result content part.",
+      "kind": "tagged_union",
+      "tag": "type",
+      "variants": [
+        {
+          "name": "Text",
+          "wire": "text",
+          "fields": [
+            {
+              "name": "text",
+              "type": "string",
+              "presence": "required",
+              "nullable": false
+            }
+          ]
+        },
+        {
+          "name": "Image",
+          "wire": "image",
+          "status": "deferred",
+          "fields": [
+            {
+              "name": "artifact_id",
+              "type": "string",
+              "presence": "required",
+              "nullable": false,
+              "max_bytes": "max_json_rpc_id_bytes"
+            },
+            {
+              "name": "mime_type",
+              "type": "string",
+              "presence": "required",
+              "nullable": false,
+              "max_bytes": "max_method_name_bytes"
+            },
+            {
+              "name": "alt",
+              "type": "string",
+              "presence": "optional",
+              "nullable": false
+            }
+          ]
+        },
+        {
+          "name": "Audio",
+          "wire": "audio",
+          "status": "deferred",
+          "fields": [
+            {
+              "name": "artifact_id",
+              "type": "string",
+              "presence": "required",
+              "nullable": false,
+              "max_bytes": "max_json_rpc_id_bytes"
+            },
+            {
+              "name": "mime_type",
+              "type": "string",
+              "presence": "required",
+              "nullable": false,
+              "max_bytes": "max_method_name_bytes"
+            },
+            {
+              "name": "transcript",
+              "type": "string",
+              "presence": "optional",
+              "nullable": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ToolCallParams",
+      "description": "Host-to-extension bounded API 0.3 tool invocation parameters.",
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_tool_name_bytes"
+        },
+        {
+          "name": "arguments",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "context",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ToolCallResult",
+      "description": "Terminal successful API 0.3 tool-call result; failures use the generated JSON-RPC error envelope.",
+      "fields": [
+        {
+          "name": "content",
+          "type": "ContentPart[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_content_parts"
+        },
+        {
+          "name": "is_error",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "metadata",
+          "type": "json",
+          "presence": "required",
+          "nullable": true
+        },
+        {
+          "name": "structured_content",
+          "type": "json",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "SessionBinding",
+      "description": "Opaque, host-owned session and extension-generation identity for one declared session-hook binding.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_session_hook_id_bytes"
+        },
+        {
+          "name": "extension_instance_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_session_hook_id_bytes"
+        },
+        {
+          "name": "process_generation",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionStart",
+      "description": "Sanitized payload delivered once when an eligible declared session-hook binding becomes active.",
+      "fields": [
+        {
+          "name": "binding",
+          "type": "SessionBinding",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionEnd",
+      "description": "Sanitized terminal payload delivered once when an eligible declared session-hook binding settles.",
+      "fields": [
+        {
+          "name": "binding",
+          "type": "SessionBinding",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "outcome",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted",
+            "frontend_disconnected",
+            "shutdown",
+            "limit_reached"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "shutdown",
+            "reload",
+            "crash",
+            "cancelled"
+          ]
+        },
+        {
+          "name": "duration_ms",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "SessionHookParams",
+      "description": "Typed host-to-extension parameters for one declared session lifecycle hook; no mutable session state is exposed.",
+      "kind": "tagged_union",
+      "tag": "hook",
+      "variants": [
+        {
+          "name": "SessionStart",
+          "wire": "session_start",
+          "status": "foundation",
+          "fields": [
+            {
+              "name": "payload",
+              "type": "SessionStart",
+              "presence": "required",
+              "nullable": false
+            }
+          ]
+        },
+        {
+          "name": "SessionEnd",
+          "wire": "session_end",
+          "status": "foundation",
+          "fields": [
+            {
+              "name": "payload",
+              "type": "SessionEnd",
+              "presence": "required",
+              "nullable": false
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SessionHookResult",
+      "description": "Terminal result for a declared session hook. Non-continue dispositions are recorded but never veto host lifecycle ownership.",
+      "fields": [
+        {
+          "name": "disposition",
+          "type": "Disposition",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "CancelRequestParams",
+      "description": "Idempotent cancellation notification parameters for an active request.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "rpc_id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "CancelRequestResult",
+      "description": "The terminal cancellation fact attached to the original request outcome.",
+      "fields": [
+        {
+          "name": "terminal",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "cancelled"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "SessionCreateParams",
+      "description": "Empty parameters for creating one durable host session without switching to it.",
+      "fields": []
+    },
+    {
+      "name": "SessionForkParams",
+      "description": "Empty parameters for forking the active host session at its current durable head without switching to it.",
+      "fields": []
+    },
+    {
+      "name": "SessionSwitchParams",
+      "description": "Bounded opaque identifier of a session in the active workspace to make active.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        }
+      ]
+    },
+    {
+      "name": "SessionReloadParams",
+      "description": "Empty parameters for reopening the active host session from disk.",
+      "fields": []
+    },
+    {
+      "name": "SessionLifecycleResult",
+      "description": "Terminal successful session-lifecycle result containing the affected session identifier.",
+      "fields": [
+        {
+          "name": "session_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ShutdownParams",
+      "description": "Empty graceful-shutdown parameters; unknown fields are rejected.",
+      "fields": []
+    },
+    {
+      "name": "ShutdownResult",
+      "description": "Terminal graceful-shutdown acknowledgement.",
+      "fields": [
+        {
+          "name": "terminal",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "shutdown"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "InitializeFlagValue",
+      "description": "One host-parsed value for a manifest-declared extension CLI flag.",
+      "fields": [
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "value",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "InitializeRequest",
+      "description": "Canonical API 0.3 initialize parameters. Host-owned metadata values remain explicitly opaque JSON boundaries.",
+      "fields": [
+        {
+          "name": "api_version",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "0.3"
+          ]
+        },
+        {
+          "name": "ygg_version",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "extension",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "workspace",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "capabilities",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "contributes",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "flag_values",
+          "type": "InitializeFlagValue[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_extension_flags"
+        },
+        {
+          "name": "host",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "contract",
+          "type": "ContractOffer",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "InitializeResponse",
+      "description": "Canonical API 0.3 initialize result with the complete selected tool catalog.",
+      "fields": [
+        {
+          "name": "api_version",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "0.3"
+          ]
+        },
+        {
+          "name": "tools",
+          "type": "ToolDefinition[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_tools"
+        },
+        {
+          "name": "contract",
+          "type": "ContractSelection",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "MigrationDiagnostic",
+      "description": "A bounded non-secret diagnostic emitted while a migration adapter reads a source setup.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "severity",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "warning",
+            "error"
+          ]
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_diagnostic_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationDetectParams",
+      "description": "Host-authorized source root for read-only migration detection.",
+      "fields": [
+        {
+          "name": "source_root",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationDetectResult",
+      "description": "Bounded result of read-only migration source detection. Config paths are source-relative.",
+      "fields": [
+        {
+          "name": "detected",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "config_paths",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "diagnostics",
+          "type": "MigrationDiagnostic[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        }
+      ]
+    },
+    {
+      "name": "MigrationImportParams",
+      "description": "Host-authorized source root and previously detected source-relative config paths for read-only conversion.",
+      "fields": [
+        {
+          "name": "source_root",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "config_paths",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_path_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationModel",
+      "description": "A non-secret source model selection with its source-relative provenance path.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "provider",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "model",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationSkill",
+      "description": "A bounded source skill payload with its source-relative provenance path.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "content",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_skill_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationMcpServer",
+      "description": "A non-secret local stdio MCP declaration. Environment variables, headers, credentials, and working directories are intentionally absent.",
+      "fields": [
+        {
+          "name": "path",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_path_bytes"
+        },
+        {
+          "name": "name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_name_bytes"
+        },
+        {
+          "name": "command",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_migration_command_bytes"
+        },
+        {
+          "name": "args",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items",
+          "max_bytes": "max_migration_argument_bytes"
+        }
+      ]
+    },
+    {
+      "name": "MigrationImportResult",
+      "description": "Bounded typed migration conversion. The adapter never returns credentials, environment values, headers, or permission grants.",
+      "fields": [
+        {
+          "name": "models",
+          "type": "MigrationModel[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "skills",
+          "type": "MigrationSkill[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "mcp_servers",
+          "type": "MigrationMcpServer[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        },
+        {
+          "name": "diagnostics",
+          "type": "MigrationDiagnostic[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_migration_items"
+        }
+      ]
+    },
+    {
+      "name": "ErrorObject",
+      "description": "Bounded JSON-RPC error object using an API 0.3 error-table code. Its data field preserves absent versus explicit null.",
+      "fields": [
+        {
+          "name": "code",
+          "type": "signed_integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "message",
+          "type": "string",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "data",
+          "type": "json",
+          "presence": "optional",
+          "nullable": true
+        }
+      ]
+    },
+    {
+      "name": "Disposition",
+      "description": "Explicit API 0.3 operation disposition. Reason is optional but never nullable when present.",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "disposition",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "JsonRpcRequest",
+      "description": "Strict JSON-RPC 2.0 request envelope.",
+      "fields": [
+        {
+          "name": "jsonrpc",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "2.0"
+          ]
+        },
+        {
+          "name": "id",
+          "type": "rpc_id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "method",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_method_name_bytes"
+        },
+        {
+          "name": "params",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "JsonRpcNotification",
+      "description": "Strict JSON-RPC 2.0 notification envelope.",
+      "fields": [
+        {
+          "name": "jsonrpc",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "2.0"
+          ]
+        },
+        {
+          "name": "method",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_method_name_bytes"
+        },
+        {
+          "name": "params",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "JsonRpcSuccessResponse",
+      "description": "Strict JSON-RPC 2.0 successful response envelope.",
+      "fields": [
+        {
+          "name": "jsonrpc",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "2.0"
+          ]
+        },
+        {
+          "name": "id",
+          "type": "rpc_id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "result",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "JsonRpcErrorResponse",
+      "description": "Strict JSON-RPC 2.0 error response envelope.",
+      "fields": [
+        {
+          "name": "jsonrpc",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "2.0"
+          ]
+        },
+        {
+          "name": "id",
+          "type": "rpc_id",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "error",
+          "type": "ErrorObject",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderAuthRequirement",
+      "description": "Secret-free authentication class requested by an extension provider. Credential values and authorization URLs are never protocol fields.",
+      "fields": [
+        {
+          "name": "kind",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "none",
+            "oauth",
+            "host_credential"
+          ]
+        },
+        {
+          "name": "subject",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "scopes",
+          "type": "string[]",
+          "presence": "optional",
+          "nullable": false,
+          "max_items": "max_provider_auth_scopes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderDefinition",
+      "description": "One secret-free provider declaration owned by the current extension process generation.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "label",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_label_bytes"
+        },
+        {
+          "name": "auth",
+          "type": "ProviderAuthRequirement",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderModelCapabilities",
+      "description": "Capability subset advertised for a provider-owned model. Media and endpoint configuration remain host policy.",
+      "fields": [
+        {
+          "name": "tools",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "parallel_tool_calls",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "structured_output",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reasoning",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderModelDefinition",
+      "description": "A model in a provider-owned catalog. It contains no endpoint, header, credential, or URL material.",
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "api_name",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "protocol",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "openai_chat",
+            "openai_responses",
+            "anthropic_messages"
+          ]
+        },
+        {
+          "name": "context_window",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "max_output_tokens",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "capabilities",
+          "type": "ProviderModelCapabilities",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "display_name",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_label_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderRegisterParams",
+      "description": "Atomic initial registration of one provider and its complete current model set.",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "ProviderDefinition",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "models",
+          "type": "ProviderModelDefinition[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderUpdateParams",
+      "description": "Atomic replacement of one owned provider and its complete current model set.",
+      "fields": [
+        {
+          "name": "provider",
+          "type": "ProviderDefinition",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "models",
+          "type": "ProviderModelDefinition[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderUnregisterParams",
+      "description": "Removal of a provider owned by the current extension process generation.",
+      "fields": [
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderCatalogCompleteParams",
+      "description": "Idempotent empty notification emitted after an extension has settled its complete initial provider-registration batch, including an empty catalog. Later catalog mutations remain permitted.",
+      "fields": []
+    },
+    {
+      "name": "ProviderCatalogResult",
+      "description": "Acknowledgement of an atomic provider catalog mutation. IDs are inspectable only; no secret data is retained.",
+      "fields": [
+        {
+          "name": "revision",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "provider_ids",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_providers"
+        },
+        {
+          "name": "model_ids",
+          "type": "string[]",
+          "presence": "required",
+          "nullable": false,
+          "max_items": "max_provider_models"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamRequest",
+      "description": "Host-to-extension inference request using canonical request JSON and an optional opaque host authorization lease.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "model_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "request",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "authorization_lease",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_auth_lease_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamAccepted",
+      "description": "Explicit acceptance fact for a provider stream. Acceptance ambiguity never authorizes an automatic replay.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "accepted",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamEvent",
+      "description": "One ordered, bounded canonical provider stream event. Payload shape is selected by kind and decoded by the host.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "sequence",
+          "type": "integer",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "kind",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "started",
+            "text_start",
+            "text_delta",
+            "text_end",
+            "reasoning_start",
+            "reasoning_delta",
+            "reasoning_end",
+            "tool_call_start",
+            "tool_call_args_delta",
+            "tool_call_end",
+            "usage",
+            "finished",
+            "error",
+            "heartbeat"
+          ]
+        },
+        {
+          "name": "payload",
+          "type": "json",
+          "presence": "required",
+          "nullable": false
+        }
+      ]
+    },
+    {
+      "name": "ProviderStreamCancelParams",
+      "description": "Best-effort cancellation notification for an accepted provider stream.",
+      "fields": [
+        {
+          "name": "stream_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_json_rpc_id_bytes"
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_reason_bytes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderAuthorizationRequest",
+      "description": "Explicit extension request for host-policy authorization. It never carries credential values, URLs, or callback endpoints.",
+      "fields": [
+        {
+          "name": "provider_id",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "max_bytes": "max_provider_id_bytes"
+        },
+        {
+          "name": "action",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "authorize",
+            "refresh",
+            "revoke"
+          ]
+        },
+        {
+          "name": "interactive",
+          "type": "boolean",
+          "presence": "required",
+          "nullable": false
+        },
+        {
+          "name": "scopes",
+          "type": "string[]",
+          "presence": "optional",
+          "nullable": false,
+          "max_items": "max_provider_auth_scopes"
+        }
+      ]
+    },
+    {
+      "name": "ProviderAuthorizationResult",
+      "description": "Host-policy authorization state and an optional opaque, non-secret request-scoped lease.",
+      "fields": [
+        {
+          "name": "status",
+          "type": "string",
+          "presence": "required",
+          "nullable": false,
+          "values": [
+            "ready",
+            "pending",
+            "denied",
+            "unavailable",
+            "revoked"
+          ]
+        },
+        {
+          "name": "lease",
+          "type": "string",
+          "presence": "optional",
+          "nullable": false,
+          "max_bytes": "max_provider_auth_lease_bytes"
+        }
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "name": "initialize-request",
+      "value": {
+        "api_version": "0.3",
+        "ygg_version": "0.7.0-dev",
+        "extension": {
+          "name": "fixture",
+          "source": "explicit",
+          "version": "0.3.0"
+        },
+        "workspace": "/workspace",
+        "capabilities": {
+          "filesystem": "workspace",
+          "network": false,
+          "process": false
+        },
+        "contributes": {
+          "tools": [
+            "echo"
+          ]
+        },
+        "host": {
+          "label": "café"
+        },
+        "contract": {
+          "schema": "ygg.extension.api/0.3",
+          "encoding": "ygg-canonical-json-v1",
+          "required_capabilities": [
+            "content_parts",
+            "core",
+            "request_cancellation",
+            "tool_call"
+          ],
+          "optional_capabilities": [
+            "lifecycle_events",
+            "migration.adapter.v1",
+            "provider_auth",
+            "provider_catalog",
+            "provider_stream"
+          ],
+          "required_methods": [
+            "$/cancelRequest",
+            "initialize",
+            "shutdown",
+            "tool/call"
+          ],
+          "optional_methods": [
+            "hook/run",
+            "migration/detect",
+            "migration/import",
+            "provider/auth/request",
+            "provider/auth/revoke",
+            "provider/cancel",
+            "provider/event",
+            "provider/stream",
+            "providers/complete",
+            "providers/register",
+            "providers/unregister",
+            "providers/update"
+          ],
+          "limits": {
+            "max_frame_bytes": 1048576,
+            "max_concurrent_requests": 4,
+            "max_tools": 256
+          }
+        },
+        "flag_values": [
+          {
+            "name": "fixture-count",
+            "value": 3
+          },
+          {
+            "name": "fixture-enabled",
+            "value": true
+          }
+        ]
+      }
+    },
+    {
+      "name": "initialize-response",
+      "value": {
+        "api_version": "0.3",
+        "tools": [
+          {
+            "name": "echo",
+            "description": "Return the supplied value.",
+            "parameters": {
+              "additionalProperties": false,
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "value"
+              ],
+              "type": "object"
+            }
+          }
+        ],
+        "contract": {
+          "schema": "ygg.extension.api/0.3",
+          "encoding": "ygg-canonical-json-v1",
+          "capabilities": [
+            "content_parts",
+            "core",
+            "request_cancellation",
+            "tool_call"
+          ],
+          "methods": [
+            "$/cancelRequest",
+            "initialize",
+            "shutdown",
+            "tool/call"
+          ],
+          "limits": {
+            "max_frame_bytes": 1048576,
+            "max_concurrent_requests": 4,
+            "max_tools": 256
+          }
+        }
+      }
+    },
+    {
+      "name": "tool-call-params",
+      "value": {
+        "name": "echo",
+        "arguments": {
+          "value": "hello"
+        },
+        "context": {
+          "workspace": "/workspace"
+        }
+      }
+    },
+    {
+      "name": "tool-call-result",
+      "value": {
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ],
+        "is_error": false,
+        "metadata": {},
+        "structured_content": {
+          "value": "hello"
+        }
+      }
+    },
+    {
+      "name": "session-hook-start-params",
+      "value": {
+        "hook": "session_start",
+        "payload": {
+          "binding": {
+            "session_id": "session-0123456789abcdef",
+            "extension_instance_id": "0123456789abcdef0123456789abcdef",
+            "process_generation": 1
+          }
+        }
+      }
+    },
+    {
+      "name": "session-hook-end-params",
+      "value": {
+        "hook": "session_end",
+        "payload": {
+          "binding": {
+            "session_id": "session-0123456789abcdef",
+            "extension_instance_id": "0123456789abcdef0123456789abcdef",
+            "process_generation": 1
+          },
+          "outcome": "shutdown",
+          "reason": "shutdown",
+          "duration_ms": 17
+        }
+      }
+    },
+    {
+      "name": "session-hook-result",
+      "value": {
+        "disposition": {
+          "kind": "continue"
+        }
+      }
+    },
+    {
+      "name": "cancel-request-params",
+      "value": {
+        "id": 17,
+        "reason": "user"
+      }
+    },
+    {
+      "name": "cancel-request-result",
+      "value": {
+        "terminal": "cancelled",
+        "reason": "user"
+      }
+    },
+    {
+      "name": "session-create-params",
+      "value": {}
+    },
+    {
+      "name": "session-fork-params",
+      "value": {}
+    },
+    {
+      "name": "session-switch-params",
+      "value": {
+        "session_id": "2026-03-16-0001"
+      }
+    },
+    {
+      "name": "session-reload-params",
+      "value": {}
+    },
+    {
+      "name": "session-lifecycle-result",
+      "value": {
+        "session_id": "2026-03-16-0001"
+      }
+    },
+    {
+      "name": "shutdown-params",
+      "value": {}
+    },
+    {
+      "name": "shutdown-result",
+      "value": {
+        "terminal": "shutdown"
+      }
+    },
+    {
+      "name": "request-envelope",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "tool/call",
+        "params": {
+          "name": "echo",
+          "arguments": {},
+          "context": {}
+        }
+      }
+    },
+    {
+      "name": "notification-envelope",
+      "value": {
+        "jsonrpc": "2.0",
+        "method": "$/cancelRequest",
+        "params": {
+          "id": 17
+        }
+      }
+    },
+    {
+      "name": "success-envelope",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "result": {
+          "terminal": "shutdown"
+        }
+      }
+    },
+    {
+      "name": "error-envelope",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "error": {
+          "code": -32601,
+          "message": "unknown or unnegotiated method",
+          "data": {
+            "method": "future/call"
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown-method-error",
+      "value": {
+        "code": -32601,
+        "message": "unknown or unnegotiated method",
+        "data": {
+          "method": "future/call"
+        }
+      }
+    },
+    {
+      "name": "version-mismatch-error",
+      "value": {
+        "code": -32010,
+        "message": "extension API version mismatch",
+        "data": {
+          "expected": "0.3",
+          "received": "0.2"
+        }
+      }
+    },
+    {
+      "name": "error-data-absent",
+      "value": {
+        "code": -32600,
+        "message": "invalid request"
+      }
+    },
+    {
+      "name": "error-data-null",
+      "value": {
+        "code": -32600,
+        "message": "invalid request",
+        "data": null
+      }
+    },
+    {
+      "name": "deny-disposition",
+      "value": {
+        "kind": "deny",
+        "reason": "host approval is required"
+      }
+    },
+    {
+      "name": "continue-disposition",
+      "value": {
+        "kind": "continue"
+      }
+    },
+    {
+      "name": "canonical-value",
+      "value": {
+        "z": [
+          0,
+          -17,
+          9007199254740991
+        ],
+        "": "private-use key sorts before emoji",
+        "😀": "emoji key",
+        "é": "café",
+        "control": "line\n\ttab\bbackspace\fpage\rreturn\\slash/quote\"",
+        "nested": {
+          "β": "two",
+          "a": "one"
+        }
+      }
+    },
+    {
+      "name": "migration-detect-params",
+      "value": {
+        "source_root": "/home/alice/.pi/agent"
+      }
+    },
+    {
+      "name": "migration-import-result",
+      "value": {
+        "models": [
+          {
+            "path": "settings.json",
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-5"
+          }
+        ],
+        "skills": [
+          {
+            "path": "skills/review/SKILL.md",
+            "name": "review",
+            "content": "Review changes."
+          }
+        ],
+        "mcp_servers": [
+          {
+            "path": "settings.json",
+            "name": "docs",
+            "command": "docs-mcp",
+            "args": [
+              "--stdio"
+            ]
+          }
+        ],
+        "diagnostics": [
+          {
+            "path": "settings.json",
+            "severity": "warning",
+            "reason": "MCP environment entries were not imported."
+          }
+        ]
+      }
+    },
+    {
+      "name": "provider-register-params",
+      "value": {
+        "provider": {
+          "auth": {
+            "kind": "none"
+          },
+          "id": "fixture-provider",
+          "label": "Fixture provider"
+        },
+        "models": [
+          {
+            "api_name": "fixture-model",
+            "capabilities": {
+              "parallel_tool_calls": false,
+              "reasoning": false,
+              "structured_output": true,
+              "tools": true
+            },
+            "context_window": 32768,
+            "id": "fixture-model",
+            "max_output_tokens": 4096,
+            "protocol": "openai_chat"
+          }
+        ]
+      }
+    },
+    {
+      "name": "provider-catalog-complete-params",
+      "value": {}
+    },
+    {
+      "name": "provider-catalog-result",
+      "value": {
+        "revision": 1,
+        "provider_ids": [
+          "fixture-provider"
+        ],
+        "model_ids": [
+          "fixture-provider/fixture-model"
+        ]
+      }
+    },
+    {
+      "name": "provider-stream-params",
+      "value": {
+        "stream_id": "stream-1",
+        "provider_id": "fixture-provider",
+        "model_id": "fixture-model",
+        "request": {
+          "messages": [],
+          "tools": []
+        }
+      }
+    },
+    {
+      "name": "provider-stream-accepted",
+      "value": {
+        "stream_id": "stream-1",
+        "accepted": true
+      }
+    },
+    {
+      "name": "provider-stream-event",
+      "value": {
+        "stream_id": "stream-1",
+        "sequence": 0,
+        "kind": "started",
+        "payload": {
+          "response_id": "fixture-response"
+        }
+      }
+    },
+    {
+      "name": "provider-authorization-request",
+      "value": {
+        "provider_id": "fixture-provider",
+        "action": "authorize",
+        "interactive": true,
+        "scopes": [
+          "inference"
+        ]
+      }
+    },
+    {
+      "name": "provider-authorization-result",
+      "value": {
+        "status": "ready",
+        "lease": "opaque-lease"
+      }
+    }
+  ],
+  "canonical_profile": {
+    "utf8": "required",
+    "object_key_order": "unicode_scalar",
+    "numbers": "portable_integers_only",
+    "whitespace": "none"
+  },
+  "version_policy": [
+    {
+      "version": "0.1",
+      "status": "frozen",
+      "wire": "legacy-json-rpc",
+      "runtime": "supported",
+      "bundles": "unavailable"
+    },
+    {
+      "version": "0.2",
+      "status": "supported",
+      "wire": "legacy-json-rpc",
+      "runtime": "supported",
+      "bundles": "supported"
+    },
+    {
+      "version": "0.3",
+      "status": "current",
+      "wire": "canonical-json-rpc",
+      "runtime": "supported",
+      "bundles": "supported"
+    }
+  ],
+  "envelopes": [
+    {
+      "name": "request",
+      "model": "JsonRpcRequest",
+      "id": "required",
+      "method": "required",
+      "result": "forbidden",
+      "error": "forbidden"
+    },
+    {
+      "name": "notification",
+      "model": "JsonRpcNotification",
+      "id": "forbidden",
+      "method": "required",
+      "result": "forbidden",
+      "error": "forbidden"
+    },
+    {
+      "name": "success_response",
+      "model": "JsonRpcSuccessResponse",
+      "id": "required",
+      "method": "forbidden",
+      "result": "required",
+      "error": "forbidden"
+    },
+    {
+      "name": "error_response",
+      "model": "JsonRpcErrorResponse",
+      "id": "required",
+      "method": "forbidden",
+      "result": "forbidden",
+      "error": "required",
+      "semantic_validator": "error_object"
+    }
+  ],
+  "negative_fixtures": [
+    {
+      "name": "envelope-both-result-error",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {},
+        "error": {
+          "code": -32600,
+          "message": "invalid request"
+        }
+      }
+    },
+    {
+      "name": "envelope-neither-result-nor-error",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 1
+      }
+    },
+    {
+      "name": "envelope-null-id",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": null,
+        "result": {}
+      }
+    },
+    {
+      "name": "envelope-request-with-result",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tool/call",
+        "params": {},
+        "result": {}
+      }
+    },
+    {
+      "name": "notification-with-id",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "$/cancelRequest",
+        "params": {
+          "id": 1
+        }
+      }
+    },
+    {
+      "name": "optional-reason-null",
+      "value": {
+        "kind": "continue",
+        "reason": null
+      }
+    },
+    {
+      "name": "error-envelope-noncanonical-error",
+      "value": {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "error": {
+          "code": -32601,
+          "message": "wrong message"
+        }
+      }
+    },
+    {
+      "name": "duplicate-key",
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":1,\"id\":1,\"result\":{}}"
+    },
+    {
+      "name": "lone-high-surrogate-value",
+      "raw": "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\\ud800\"}"
+    },
+    {
+      "name": "lone-low-surrogate-key",
+      "raw": "{\"\\udc00\":1}"
+    },
+    {
+      "name": "provider-auth-credential-field",
+      "value": {
+        "kind": "host_credential",
+        "credential": "not-allowed"
+      }
+    }
+  ]
+}

@@ -1,7 +1,8 @@
 # Ygg Extension Protocol Reference
 
-> **API versions:** `0.1` (frozen compatibility) and `0.2` (current,
-> `EXTENSION_API_VERSION`)
+> **Legacy API versions:** `0.1` (frozen compatibility) and `0.2`
+> (supported stateful wire). API `0.3` is defined by the generated
+> [`API-0.3-REFERENCE.md`](API-0.3-REFERENCE.md).
 >
 > Every request and response uses the standard JSON-RPC 2.0 envelope with
 > exactly one JSON object per line on **stdout**. Human diagnostics belong on
@@ -78,7 +79,7 @@ The **first** host request, sent immediately after the child process starts.
   "method": "initialize",
   "params": {
     "api_version": "0.1",
-    "ygg_version": "0.6.7",
+    "ygg_version": "0.7.0-dev",
     "extension": {
       "name": "hello-world",
       "version": "0.1.0",

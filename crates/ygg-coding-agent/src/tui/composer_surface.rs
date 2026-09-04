@@ -3,17 +3,161 @@
 
 use std::time::Instant;
 
-use sexy_tui_rs::{visible_width, CURSOR_MARKER};
+use sexy_tui_rs::{visible_width, TextEditAction, TextEditor, TextEditorProjection, CURSOR_MARKER};
 
 use crate::presentation::compact_context_limit;
 use crate::tui::layout::PresentationLayout;
-use crate::tui::view::fit_line;
+use crate::tui::view::{fit_line, footer_width, EditorDisplayMap, FooterSegment};
+
+/// Keep one physical cell after every laid-out text row for the terminal cursor.
+const CURSOR_CELL_RESERVATION: usize = 1;
 
 fn composer_cursor_marker(state: &super::view::ShellState) -> &'static str {
     if state.panel.is_some() {
         ""
     } else {
         CURSOR_MARKER
+    }
+}
+
+/// Cache key for one Ygg-owned composer source. The generic editor's revision
+/// lets the shell reuse a transformed layout without hashing a full draft on
+/// every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ComposerEditorSource {
+    Draft(u64),
+    ToolPrompt(u64),
+}
+
+/// One transformed display layout for the current source and text-cell width.
+pub(crate) struct ComposerEditorCache {
+    // Text identity and width own the expensive display-map/wrap work. Cursor
+    // motion updates only the structured projection over those shared rows.
+    source: ComposerEditorSource,
+    source_cursor: usize,
+    text_width: usize,
+    projection: ComposerEditorProjection,
+}
+
+impl ComposerEditorCache {
+    #[must_use]
+    pub(crate) fn new(
+        source: ComposerEditorSource,
+        text: &str,
+        cursor: usize,
+        text_width: usize,
+    ) -> Self {
+        Self {
+            source,
+            source_cursor: cursor,
+            text_width,
+            projection: ComposerEditorProjection::new(text, cursor, text_width),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn matches(&self, source: ComposerEditorSource, text_width: usize) -> bool {
+        self.source == source && self.text_width == text_width
+    }
+
+    pub(crate) fn refresh_cursor(&mut self, source_cursor: usize) {
+        if self.source_cursor != source_cursor {
+            self.source_cursor = source_cursor;
+            self.projection.set_source_cursor(source_cursor);
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn projection(&self) -> &ComposerEditorProjection {
+        &self.projection
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn source(&self) -> ComposerEditorSource {
+        self.source
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn text_width(&self) -> usize {
+        self.text_width
+    }
+}
+
+/// A safe, lazily materialized display projection for the composer.
+///
+/// Sanitization and source/display mapping remain Ygg policy. Visual wrapping,
+/// cursor coordinates, and visual navigation come from the generic editor.
+pub(crate) struct ComposerEditorProjection {
+    display: EditorDisplayMap,
+    projection: TextEditorProjection,
+}
+
+impl ComposerEditorProjection {
+    fn new(source: &str, source_cursor: usize, text_width: usize) -> Self {
+        let display = EditorDisplayMap::from_source(source);
+        let display_cursor = display.source_to_display(source_cursor);
+        let projection =
+            TextEditor::projection_for(display.layout_text(), display_cursor, text_width);
+        Self {
+            display,
+            projection,
+        }
+    }
+
+    fn set_source_cursor(&mut self, source_cursor: usize) {
+        let display_cursor = self.display.source_to_display(source_cursor);
+        let layout = self.projection.layout().clone();
+        self.projection =
+            TextEditor::projection_for_layout(self.display.layout_text(), &layout, display_cursor);
+    }
+
+    #[must_use]
+    pub(crate) fn line_count(&self) -> usize {
+        self.projection.lines().len()
+    }
+
+    #[must_use]
+    pub(crate) fn cursor_row(&self) -> usize {
+        self.projection.cursor_row()
+    }
+
+    #[must_use]
+    pub(crate) fn visible_row(
+        &self,
+        row: usize,
+        cursor_marker: &str,
+        max_text_width: usize,
+    ) -> String {
+        let Some(line) = self.projection.lines().get(row) else {
+            return String::new();
+        };
+        let cursor = (row == self.projection.cursor_row() && !cursor_marker.is_empty())
+            .then(|| self.projection.cursor().offset());
+        self.display.terminal_row_bounded(
+            line.start(),
+            line.visible_end(),
+            cursor,
+            cursor_marker,
+            max_text_width,
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn visual_source_target(
+        &self,
+        action: &TextEditAction,
+        preferred_column: &mut Option<usize>,
+    ) -> Option<usize> {
+        self.projection
+            .visual_target(self.display.layout_text(), action, preferred_column)
+            .map(|display| self.display.display_to_source(display))
+    }
+
+    #[must_use]
+    pub(crate) fn layout_text(&self) -> &str {
+        self.display.layout_text()
     }
 }
 
@@ -79,6 +223,68 @@ fn composer_inner_width(theme: &super::theme::YggTheme, frame_width: u16) -> u16
     .max(1)
 }
 
+/// One chrome-aware geometry decision for editor movement, sizing, layout, and
+/// rendering. The prompt glyph, its gap, continuation indentation, and one
+/// spare hardware-cursor cell are always reserved, even while a panel
+/// suppresses the marker, so focus changes never reflow a draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ComposerEditorGeometry {
+    inner_width: usize,
+    text_width: usize,
+}
+
+impl ComposerEditorGeometry {
+    #[must_use]
+    pub(crate) fn inner_width(self) -> usize {
+        self.inner_width
+    }
+
+    #[must_use]
+    pub(crate) fn text_width(self) -> usize {
+        self.text_width
+    }
+}
+
+#[must_use]
+pub(crate) fn composer_editor_geometry(
+    state: &super::view::ShellState,
+    width: u16,
+) -> ComposerEditorGeometry {
+    const PROMPT_GAP: usize = 1;
+    const CONTINUATION_PREFIX: usize = 2;
+
+    let presentation = PresentationLayout::new(&state.theme, width);
+    let compact = usize::from(width) < 12;
+    let inner_width = if compact {
+        usize::from(presentation.content_width)
+    } else {
+        usize::from(composer_inner_width(
+            &state.theme,
+            presentation.content_width,
+        ))
+    };
+    let prompt_and_gap = visible_width(state.theme.glyph("prompt")).saturating_add(PROMPT_GAP);
+    let text_prefix = prompt_and_gap.max(CONTINUATION_PREFIX);
+    let text_width = inner_width
+        .saturating_sub(text_prefix.saturating_add(CURSOR_CELL_RESERVATION))
+        .max(1);
+    ComposerEditorGeometry {
+        inner_width,
+        text_width,
+    }
+}
+
+/// Text cells a specific painted row can materialize without consuming the
+/// hardware-cursor reservation. The generic layout keeps a minimum width of
+/// one cell, while this may intentionally be zero on a three-column terminal.
+fn materialized_text_width(geometry: ComposerEditorGeometry, prefix: &str) -> usize {
+    geometry.text_width().min(
+        geometry
+            .inner_width()
+            .saturating_sub(visible_width(prefix).saturating_add(CURSOR_CELL_RESERVATION)),
+    )
+}
+
 /// Render composer content inside the shared horizontal inset. Plain boxed
 /// rules span the terminal, while explicit framed/shaded theme chrome stays
 /// on the content grid. Selected prompt text copies without chrome. Rules
@@ -89,10 +295,12 @@ fn render_composer_box(
     width: u16,
     _now: Instant,
     content_rows: usize,
+    geometry: ComposerEditorGeometry,
+    editor: &ComposerEditorProjection,
 ) -> Vec<String> {
     let terminal_width = usize::from(width);
     if terminal_width < 4 {
-        return render_plain_content(state, width);
+        return render_plain_content(state, width, geometry, editor);
     }
 
     let theme = &state.theme;
@@ -102,7 +310,7 @@ fn render_composer_box(
     let frame_prefix = " ".repeat(inset);
     let h = horiz(state);
     let chrome = composer_chrome(theme);
-    let inner_width = usize::from(composer_inner_width(theme, layout.content_width));
+    let inner_width = geometry.inner_width();
 
     // The composer always identifies the model selected for the next prompt.
     // It never follows a prior prompt or a generic application accent, and it
@@ -172,13 +380,7 @@ fn render_composer_box(
         }
     };
 
-    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
-        (prompt.clone(), prompt.len())
-    } else {
-        super::view::sanitized_editor(&state.editor, state.editor_cursor)
-    };
-
-    if editor.is_empty() {
+    if editor.layout_text().is_empty() {
         for index in 0..content_rows {
             if index == 0 {
                 lines.push(finish_row(render_row(&format!("{marker} {cursor_marker}"))));
@@ -187,20 +389,15 @@ fn render_composer_box(
             }
         }
     } else {
-        let editor_layout = state.cached_editor_layout(
-            (inner_width.saturating_sub(2) as u16).max(1),
-            Some(&editor),
-            Some(editor_cursor),
-        );
-        let total_lines = editor_layout.lines.len();
+        let total_lines = editor.line_count();
         let overflow = total_lines.saturating_sub(content_rows);
         let visible_rows = if overflow > 0 {
             (content_rows.saturating_sub(1)).max(1).min(total_lines)
         } else {
             content_rows.max(1).min(total_lines)
         };
-        let mut start = editor_layout
-            .cursor_row
+        let mut start = editor
+            .cursor_row()
             .saturating_add(1)
             .saturating_sub(visible_rows);
         let end = (start + visible_rows).min(total_lines);
@@ -221,23 +418,17 @@ fn render_composer_box(
         }
 
         for index in start..end {
-            let visual_line = &editor_layout.lines[index];
-            let content = if index == editor_layout.cursor_row {
-                let cursor = editor_cursor.clamp(visual_line.start, visual_line.visible_end);
-                format!(
-                    "{}{cursor_marker}{}",
-                    &editor[visual_line.start..cursor],
-                    &editor[cursor..visual_line.visible_end]
-                )
-            } else {
-                editor[visual_line.start..visual_line.visible_end].to_owned()
-            };
             let prefix = if index == 0 {
                 format!("{marker} ")
             } else {
                 "  ".to_owned()
             };
-            rendered.push(render_row(&format!("{prefix}{content}")));
+            let row = editor.visible_row(
+                index,
+                cursor_marker,
+                materialized_text_width(geometry, &prefix),
+            );
+            rendered.push(render_row(&format!("{prefix}{row}")));
         }
 
         if hidden_below > 0 {
@@ -271,28 +462,28 @@ fn render_composer_box(
 // Plain content fallback (very narrow terminals)
 // ---------------------------------------------------------------------------
 
-fn render_plain_content(state: &super::view::ShellState, width: u16) -> Vec<String> {
+fn render_plain_content(
+    state: &super::view::ShellState,
+    width: u16,
+    geometry: ComposerEditorGeometry,
+    editor: &ComposerEditorProjection,
+) -> Vec<String> {
     let marker = state.theme.bold(
         &state
             .theme
             .model_fg(state.model_lab, state.theme.glyph("prompt")),
     );
     let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = if let Some(prompt) = &state.tool_input_prompt {
-        (prompt.clone(), prompt.len())
-    } else {
-        super::view::sanitized_editor(&state.editor, state.editor_cursor)
-    };
-    if editor.is_empty() {
-        return vec![format!("{marker} {cursor_marker}")];
+    if editor.layout_text().is_empty() {
+        return vec![fit_line(&format!("{cursor_marker}{marker}"), width)];
     }
-    let cursor = editor_cursor.min(editor.len());
-    let line = format!(
-        "{marker} {}{cursor_marker}{}",
-        &editor[..cursor],
-        &editor[cursor..]
+    let prefix = format!("{marker} ");
+    let row = editor.visible_row(
+        editor.cursor_row(),
+        cursor_marker,
+        materialized_text_width(geometry, &prefix),
     );
-    vec![fit_line(&line, width)]
+    vec![fit_line(&format!("{prefix}{row}"), width)]
 }
 
 // ---------------------------------------------------------------------------
@@ -308,52 +499,41 @@ enum FooterKind {
     Cost,
 }
 
-struct FooterSegment {
+/// The composer retains its domain role beside the shared, production footer
+/// segment primitive. Ordinary action footers and status chrome therefore use
+/// the same width and complete-segment vocabulary without coupling their data.
+struct StatusFooterSegment {
     kind: FooterKind,
-    variants: Vec<String>,
-    variant: usize,
-    visible: bool,
+    segment: FooterSegment,
 }
 
-impl FooterSegment {
+impl StatusFooterSegment {
     fn new(kind: FooterKind, variants: Vec<String>) -> Self {
         Self {
             kind,
-            variants,
-            variant: 0,
-            visible: true,
-        }
-    }
-
-    fn text(&self) -> &str {
-        &self.variants[self.variant.min(self.variants.len().saturating_sub(1))]
-    }
-
-    fn compact_once(&mut self) {
-        if self.variant + 1 < self.variants.len() {
-            self.variant += 1;
+            segment: FooterSegment::variants(variants),
         }
     }
 }
 
-fn footer_width(segments: &[FooterSegment], gap: usize) -> usize {
-    let visible = segments.iter().filter(|segment| segment.visible);
-    let count = visible.clone().count();
-    visible
-        .map(|segment| visible_width(segment.text()))
-        .sum::<usize>()
-        + count.saturating_sub(1) * gap
+fn status_footer_width(segments: &[StatusFooterSegment], gap: usize) -> usize {
+    let segments = segments
+        .iter()
+        .filter(|segment| segment.segment.is_visible())
+        .map(|segment| segment.segment.clone())
+        .collect::<Vec<_>>();
+    footer_width(&segments, gap)
 }
 
-fn hide_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
+fn hide_footer_kind(segments: &mut [StatusFooterSegment], kind: FooterKind) {
     if let Some(segment) = segments.iter_mut().find(|segment| segment.kind == kind) {
-        segment.visible = false;
+        segment.segment.hide();
     }
 }
 
-fn compact_footer_kind(segments: &mut [FooterSegment], kind: FooterKind) {
+fn compact_footer_kind(segments: &mut [StatusFooterSegment], kind: FooterKind) {
     if let Some(segment) = segments.iter_mut().find(|segment| segment.kind == kind) {
-        segment.compact_once();
+        segment.segment.compact_once();
     }
 }
 
@@ -432,10 +612,15 @@ fn push_narrower_variant(variants: &mut Vec<String>, candidate: String) {
     }
 }
 
-fn identity_variants(full_model: &str, model_names: &[String], thinking: &str) -> Vec<String> {
+fn identity_variants(
+    full_model: &str,
+    model_names: &[String],
+    thinking: &str,
+    separator: &str,
+) -> Vec<String> {
     let mut variants = Vec::new();
     if !thinking.is_empty() && !thinking.eq_ignore_ascii_case("off") {
-        push_narrower_variant(&mut variants, format!("{full_model} · {thinking}"));
+        push_narrower_variant(&mut variants, format!("{full_model}{separator}{thinking}"));
     }
     for model in model_names {
         push_narrower_variant(&mut variants, model.clone());
@@ -519,9 +704,14 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         &state.reasoning
     }
     .trim();
-    let mut segments = vec![FooterSegment::new(
+    let mut segments = vec![StatusFooterSegment::new(
         FooterKind::Identity,
-        identity_variants(&full_model, &model_names, effort),
+        identity_variants(
+            &full_model,
+            &model_names,
+            effort,
+            super::view::semantic_separator(&state.theme),
+        ),
     )];
 
     let base_context = if active {
@@ -544,7 +734,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         let marker = if estimated { "~" } else { "" };
         let percent = context_percent(used, limit);
         let limit_display = compact_context_limit(limit);
-        segments.push(FooterSegment::new(
+        segments.push(StatusFooterSegment::new(
             FooterKind::Context,
             vec![
                 format!("context {marker}{percent}%/{limit_display}"),
@@ -568,7 +758,7 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         }
     };
     if let Some(cost) = cost {
-        segments.push(FooterSegment::new(
+        segments.push(StatusFooterSegment::new(
             FooterKind::Cost,
             vec![format!("session {cost}")],
         ));
@@ -582,41 +772,41 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
         hide_footer_kind(&mut segments, FooterKind::Cost);
     }
 
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         compact_footer_kind(&mut segments, FooterKind::Identity);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         compact_footer_kind(&mut segments, FooterKind::Context);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Cost);
     }
-    while footer_width(&segments, gap) > available {
-        let before = footer_width(&segments, gap);
+    while status_footer_width(&segments, gap) > available {
+        let before = status_footer_width(&segments, gap);
         compact_footer_kind(&mut segments, FooterKind::Identity);
-        if footer_width(&segments, gap) == before {
+        if status_footer_width(&segments, gap) == before {
             break;
         }
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Context);
     }
-    if footer_width(&segments, gap) > available {
+    if status_footer_width(&segments, gap) > available {
         hide_footer_kind(&mut segments, FooterKind::Identity);
     }
 
     let context_is_urgent = displayed_context
         .is_some_and(|(used, limit)| limit > 0 && u128::from(used) * 100 >= u128::from(limit) * 90);
-    let style_segment = |segment: &FooterSegment| match segment.kind {
-        FooterKind::Identity => state.theme.fg("foreground", segment.text()),
-        FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.text()),
+    let style_segment = |segment: &StatusFooterSegment| match segment.kind {
+        FooterKind::Identity => state.theme.fg("foreground", segment.segment.text()),
+        FooterKind::Context if context_is_urgent => state.theme.fg("error", segment.segment.text()),
         FooterKind::Cost
             if state
                 .session_cost_microdollars
                 .zip(state.max_session_cost_microdollars)
                 .is_some_and(|(cost, limit)| limit > 0 && cost >= limit.saturating_mul(9) / 10) =>
         {
-            state.theme.fg("error", segment.text())
+            state.theme.fg("error", segment.segment.text())
         }
         FooterKind::Cost
             if state
@@ -624,23 +814,23 @@ fn render_status_footer(state: &super::view::ShellState, width: u16, _now: Insta
                 .zip(state.max_session_cost_microdollars)
                 .is_some_and(|(cost, limit)| limit > 0 && cost >= limit / 2) =>
         {
-            state.theme.fg("warning", segment.text())
+            state.theme.fg("warning", segment.segment.text())
         }
-        _ => state.theme.fg("muted", segment.text()),
+        _ => state.theme.fg("muted", segment.segment.text()),
     };
 
     let identity = segments
         .iter()
-        .find(|segment| segment.visible && segment.kind == FooterKind::Identity);
+        .find(|segment| segment.segment.is_visible() && segment.kind == FooterKind::Identity);
     let metrics = segments
         .iter()
-        .filter(|segment| segment.visible && segment.kind != FooterKind::Identity)
+        .filter(|segment| segment.segment.is_visible() && segment.kind != FooterKind::Identity)
         .collect::<Vec<_>>();
     let identity_text = identity.map(style_segment).unwrap_or_default();
-    let identity_width = identity.map_or(0, |segment| visible_width(segment.text()));
+    let identity_width = identity.map_or(0, |segment| visible_width(segment.segment.text()));
     let metrics_width = metrics
         .iter()
-        .map(|segment| visible_width(segment.text()))
+        .map(|segment| visible_width(segment.segment.text()))
         .sum::<usize>()
         + metrics.len().saturating_sub(1) * gap;
     let metrics_text = metrics
@@ -699,55 +889,49 @@ pub fn render_composer_surface(
     now: Instant,
 ) -> Vec<String> {
     let w = usize::from(width);
+    let geometry = composer_editor_geometry(state, width);
+
     if w < 3 {
+        // There is no room for both prompt chrome and draft text. Put the
+        // trusted cursor token first so the terminal backend can still place
+        // its hardware cursor on a non-empty focused draft at widths 1 and 2.
         let cursor_marker = composer_cursor_marker(state);
-        let marker = state.theme.bold(
-            &state
-                .theme
-                .model_fg(state.model_lab, state.theme.glyph("prompt")),
-        );
-        let prompt = if state.editor.is_empty() {
-            fit_line(&format!("{cursor_marker}{marker}"), width)
+        let mut lines = if cursor_marker.is_empty() {
+            let editor = state.composer_editor_projection(geometry);
+            render_plain_content(state, width, geometry, &editor)
         } else {
-            let (editor, _) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
-            fit_line(&format!("{cursor_marker}{marker} {editor}"), width)
+            let prompt = state.theme.bold(
+                &state
+                    .theme
+                    .model_fg(state.model_lab, state.theme.glyph("prompt")),
+            );
+            vec![fit_line(&format!("{cursor_marker}{prompt}"), width)]
         };
-        let mut lines = vec![prompt];
         append_status_footer(&mut lines, state, width, now);
         return lines;
     }
 
-    let presentation = PresentationLayout::new(&state.theme, width);
-    // Use wrapped (visual) line count so a single long line that wraps
-    // across several rows is counted properly when deciding how tall the
-    // composer box should be.
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
-    let editor_width = if w < 12 {
-        presentation.content_width.saturating_sub(2).max(1)
-    } else {
-        composer_inner_width(&state.theme, presentation.content_width)
-            .saturating_sub(2)
-            .max(1)
-    };
-    let visual_lines = if editor.is_empty() {
-        1
-    } else {
-        state
-            .cached_editor_layout(editor_width.max(2), Some(&editor), Some(editor_cursor))
-            .lines
-            .len()
-            .max(1)
-    };
+    // One borrowed projection drives height calculation and painting. This
+    // avoids a second cache lookup/projection refresh for every normal frame.
+    let editor = state.composer_editor_projection(geometry);
+    let visual_lines = editor.line_count().max(1);
     let content_rows = composer_content_rows(state.size.1, visual_lines);
 
     if w < 12 {
-        return render_compact(state, width, now, content_rows);
+        return render_compact(state, width, now, content_rows, geometry, &editor);
     }
 
     let mut lines = Vec::with_capacity(content_rows + 4);
 
     // Unified inset frame with stable Ygg-owned focus rules.
-    lines.append(&mut render_composer_box(state, width, now, content_rows));
+    lines.append(&mut render_composer_box(
+        state,
+        width,
+        now,
+        content_rows,
+        geometry,
+        &editor,
+    ));
 
     // Stable semantic footer/status surface.
     append_status_footer(&mut lines, state, width, now);
@@ -761,6 +945,8 @@ fn render_compact(
     width: u16,
     now: Instant,
     content_rows: usize,
+    geometry: ComposerEditorGeometry,
+    editor: &ComposerEditorProjection,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     let plan = PresentationLayout::new(&state.theme, width);
@@ -774,9 +960,8 @@ fn render_compact(
         .theme
         .bold(&state.theme.model_fg(state.model_lab, marker));
     let cursor_marker = composer_cursor_marker(state);
-    let (editor, editor_cursor) = super::view::sanitized_editor(&state.editor, state.editor_cursor);
 
-    if editor.is_empty() {
+    if editor.layout_text().is_empty() {
         lines.push(fit_line(
             &format!("{padding}{marker_s} {cursor_marker}"),
             width,
@@ -785,36 +970,30 @@ fn render_compact(
         return lines;
     }
 
-    let inner_w = usize::from(plan.content_width.saturating_sub(2).max(1));
-    let layout = state.cached_editor_layout(inner_w as u16, Some(&editor), Some(editor_cursor));
-    let visible_rows = content_rows.max(1).min(layout.lines.len());
-    let mut start = layout
-        .cursor_row
+    let total_lines = editor.line_count();
+    let visible_rows = content_rows.max(1).min(total_lines);
+    let mut start = editor
+        .cursor_row()
         .saturating_add(1)
         .saturating_sub(visible_rows);
-    let end = (start + visible_rows).min(layout.lines.len());
+    let end = (start + visible_rows).min(total_lines);
     if end.saturating_sub(start) < visible_rows {
         start = end.saturating_sub(visible_rows);
     }
 
     for index in start..end {
-        let vis_line = &layout.lines[index];
-        let content = if index == layout.cursor_row {
-            let cursor = editor_cursor.clamp(vis_line.start, vis_line.visible_end);
-            format!(
-                "{}{cursor_marker}{}",
-                &editor[vis_line.start..cursor],
-                &editor[cursor..vis_line.visible_end]
-            )
+        let content_prefix = if index == 0 {
+            format!("{marker_s} ")
         } else {
-            editor[vis_line.start..vis_line.visible_end].to_owned()
+            "  ".to_owned()
         };
-        let prefix = if index == 0 {
-            format!("{padding}{marker_s} ")
-        } else {
-            format!("{padding}  ")
-        };
-        lines.push(fit_line(&format!("{prefix}{content}"), width));
+        let prefix = format!("{padding}{content_prefix}");
+        let row = editor.visible_row(
+            index,
+            cursor_marker,
+            materialized_text_width(geometry, &content_prefix),
+        );
+        lines.push(fit_line(&format!("{prefix}{row}"), width));
     }
     append_status_footer(&mut lines, state, width, now);
     lines

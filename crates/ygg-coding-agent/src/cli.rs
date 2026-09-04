@@ -1,10 +1,16 @@
 #![allow(missing_docs)]
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{
+    Arg, ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use serde::Deserialize;
+use ygg_agent::extension_process::{ExtensionFlag, ExtensionFlagType};
+use ygg_agent::{EffectPolicy, PolicyValueSource, ToolPolicyProvenance};
 use ygg_ai::ModelId;
 
 use crate::app::bootstrap::resolve_model_id;
@@ -16,6 +22,67 @@ use crate::extension_package::ExtensionCommand;
 use crate::migrate::MigrationCommand;
 use crate::pi::PiCommand;
 use crate::session_commands::SessionCommand;
+
+/// Deterministic, non-interactive setup input for one OpenAI-compatible endpoint.
+#[derive(Clone, Debug, Args)]
+pub struct SetupCommand {
+    /// Setup profile. Select `lm-studio` to use its documented URL; an explicit
+    /// --endpoint otherwise implies `openai-compatible`.
+    #[arg(long, value_enum)]
+    pub preset: Option<SetupPreset>,
+    /// Explicit OpenAI-compatible versioned base URL. This is the only endpoint
+    /// setup probes; no local or network scanning is performed.
+    #[arg(long, value_name = "URL")]
+    pub endpoint: Option<String>,
+    /// Stable custom-registry provider ID (letters, digits, '-' and '_').
+    #[arg(long, value_name = "ID")]
+    pub provider: Option<String>,
+    /// Human-facing provider label.
+    #[arg(long, value_name = "LABEL")]
+    pub label: Option<String>,
+    /// Select this ID from the discovered model inventory. Without it, setup
+    /// uses the lexicographically first discovered model deterministically.
+    #[arg(long, value_name = "ID", conflicts_with = "manual_model")]
+    pub model: Option<String>,
+    /// Store exactly this explicit model inventory without probing. Required for
+    /// a new setup in offline mode.
+    #[arg(long, value_name = "ID", conflicts_with = "model")]
+    pub manual_model: Option<String>,
+    /// Read a bearer credential from this environment variable at runtime. The
+    /// variable value is never written to the custom provider registry.
+    #[arg(long, value_name = "VAR", conflicts_with = "no_auth")]
+    pub api_key_env: Option<String>,
+    /// Explicitly use no authentication (the default for local profiles).
+    #[arg(long, conflicts_with = "api_key_env")]
+    pub no_auth: bool,
+    /// Permit replacing an already configured provider with the same ID. A
+    /// concurrent registry change still fails rather than being overwritten.
+    #[arg(long)]
+    pub replace: bool,
+    /// Persist the reviewed setup and save its selected model preference.
+    #[arg(long, conflicts_with = "cancel")]
+    pub yes: bool,
+    /// Stop after the deterministic review receipt without writing anything.
+    #[arg(long, conflicts_with = "yes")]
+    pub cancel: bool,
+    /// Disable discovery network traffic for this setup only. Pair it with
+    /// --manual-model to provide an explicit offline inventory.
+    #[arg(long)]
+    pub offline: bool,
+}
+
+/// Supported setup profiles. Native Ollama transport is deliberately not
+/// advertised here; this flow uses only explicitly selected OpenAI-compatible
+/// `/v1` endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SetupPreset {
+    /// LM Studio's documented keyless OpenAI-compatible endpoint.
+    #[value(name = "lm-studio")]
+    LmStudio,
+    /// A user-supplied OpenAI-compatible endpoint.
+    #[value(name = "openai-compatible")]
+    OpenAiCompatible,
+}
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum TopLevelCommand {
@@ -47,6 +114,12 @@ pub enum TopLevelCommand {
     },
     /// Check local prerequisites, configured providers, and model visibility.
     Doctor,
+    /// Configure one explicitly selected OpenAI-compatible provider without
+    /// prompting. Review only by default; pass --yes to persist.
+    Setup {
+        #[command(flatten)]
+        options: SetupCommand,
+    },
     /// Launch the loopback-only Ygg Serve application.
     ///
     /// Default builds dispatch to the installed extension runtime; builds with
@@ -65,7 +138,7 @@ pub enum TopLevelCommand {
 }
 
 /// Command-line launcher for `ygg`.
-#[derive(Debug, Parser)]
+#[derive(Debug, Default, Parser)]
 #[command(
     name = "ygg",
     version,
@@ -141,6 +214,9 @@ pub struct Cli {
     /// Use chronological ASCII output without cursor control.
     #[arg(long)]
     pub plain: bool,
+    /// Opt in to bounded inline tool-result images on compatible interactive terminals.
+    #[arg(long = "show-images")]
+    pub show_images: bool,
     /// Mouse ownership: auto/terminal/off preserve native gestures; app
     /// captures wheel scrolling and drag selection for the semantic viewport.
     #[arg(long, value_name = "MODE")]
@@ -196,12 +272,20 @@ pub struct Cli {
         num_args = 1..
     )]
     pub trust_extensions: Vec<String>,
+    /// Process-owner opt-in for experimental remote Streamable HTTP MCP. This
+    /// one-shot gate is never read from configuration, environment, or sessions.
+    #[arg(long = "experimental-streamable-http-mcp")]
+    pub experimental_streamable_http_mcp: bool,
     /// Trust this workspace and load its project config, AGENTS.md, and skills.
     #[arg(long = "workspace-trusted", alias = "trust-workspace")]
     pub workspace_trusted: bool,
     /// Require approval for every bash call and keep host effects controlled.
-    #[arg(long = "safe-mode", alias = "safe")]
+    #[arg(long = "safe-mode", alias = "safe", conflicts_with = "effect_policy")]
     pub safe_mode: bool,
+    /// Host-owned tool-effect admission profile: controlled,
+    /// controlled_bash_approval, or unsafe_host.
+    #[arg(long, value_name = "POLICY")]
+    pub effect_policy: Option<String>,
     /// Load only these tools (comma-separated).
     #[arg(long, value_name = "NAMES", value_delimiter = ',', num_args = 1..)]
     pub tools: Option<Vec<String>>,
@@ -249,6 +333,508 @@ pub struct Cli {
     pub max_output_bytes: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct RegisteredExtensionFlag {
+    extension: String,
+    declaration: ExtensionFlag,
+    argument_id: String,
+    negative_argument_id: Option<String>,
+}
+
+type ExtensionFlagValues = BTreeMap<String, BTreeMap<String, serde_json::Value>>;
+
+#[derive(Default)]
+struct ExtensionFlagBootstrap {
+    workspace: Option<PathBuf>,
+    extension_dirs: Vec<PathBuf>,
+    enable_extensions: Vec<String>,
+    trust_extensions: Vec<String>,
+    workspace_trusted: bool,
+}
+
+fn collect_bootstrap_list(args: &[OsString], index: &mut usize, target: &mut Vec<String>) -> bool {
+    let mut found = false;
+    while *index < args.len() {
+        let Some(value) = args[*index].to_str() else {
+            return false;
+        };
+        if value == "--" || value.starts_with('-') {
+            break;
+        }
+        target.extend(value.split(',').map(str::to_owned));
+        *index += 1;
+        found = true;
+    }
+    found
+}
+
+/// Extract only the options that select trusted extension manifests. This pass
+/// intentionally does not use clap recovery: clap stops processing after an
+/// unknown dynamic flag, which could hide later static activation options.
+fn extension_flag_bootstrap(args: &[OsString]) -> Option<ExtensionFlagBootstrap> {
+    let mut result = ExtensionFlagBootstrap::default();
+    let mut index = 1;
+    while index < args.len() {
+        let value = args[index].to_str()?;
+        if value == "--" {
+            break;
+        }
+        if value == "--workspace-trusted" || value == "--trust-workspace" {
+            result.workspace_trusted = true;
+            index += 1;
+            continue;
+        }
+        if let Some(path) = value.strip_prefix("--workspace=") {
+            result.workspace = Some(PathBuf::from(path));
+            index += 1;
+            continue;
+        }
+        if let Some(path) = value.strip_prefix("--extension-dir=") {
+            result.extension_dirs.push(PathBuf::from(path));
+            index += 1;
+            continue;
+        }
+        if let Some(names) = value.strip_prefix("--enable-extension=") {
+            result
+                .enable_extensions
+                .extend(names.split(',').map(str::to_owned));
+            index += 1;
+            continue;
+        }
+        if let Some(names) = value.strip_prefix("--trust-extension=") {
+            result
+                .trust_extensions
+                .extend(names.split(',').map(str::to_owned));
+            index += 1;
+            continue;
+        }
+        match value {
+            "--workspace" => {
+                index += 1;
+                result.workspace = Some(PathBuf::from(args.get(index)?.to_str()?));
+                index += 1;
+            }
+            "--extension-dir" => {
+                index += 1;
+                result
+                    .extension_dirs
+                    .push(PathBuf::from(args.get(index)?.to_str()?));
+                index += 1;
+            }
+            "--enable-extension" => {
+                index += 1;
+                if !collect_bootstrap_list(args, &mut index, &mut result.enable_extensions) {
+                    return None;
+                }
+            }
+            "--trust-extension" => {
+                index += 1;
+                if !collect_bootstrap_list(args, &mut index, &mut result.trust_extensions) {
+                    return None;
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    Some(result)
+}
+
+fn bootstrap_extension_config(args: &[OsString], cwd: &Path) -> Option<Config> {
+    let bootstrap = extension_flag_bootstrap(args)?;
+    let cli = Cli {
+        workspace: bootstrap.workspace,
+        extension_dirs: bootstrap.extension_dirs,
+        enable_extensions: bootstrap.enable_extensions,
+        trust_extensions: bootstrap.trust_extensions,
+        workspace_trusted: bootstrap.workspace_trusted,
+        ..Cli::default()
+    };
+    build_config_for_extension_flags(cli, cwd).ok()
+}
+
+/// Build enough layered configuration to select manifests without duplicating
+/// user-visible configuration diagnostics during the real final parse.
+fn build_config_for_extension_flags(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
+    let global = global_config_path();
+    build_config_with_global_path_and_diagnostics(cli, cwd, global.as_deref(), false)
+}
+
+fn collect_static_long_options(command: &Command, options: &mut BTreeSet<String>) {
+    for argument in command.get_arguments() {
+        if let Some(long) = argument.get_long() {
+            options.insert(long.to_owned());
+        }
+        if let Some(aliases) = argument.get_all_aliases() {
+            options.extend(aliases.into_iter().map(str::to_owned));
+        }
+    }
+    for subcommand in command.get_subcommands() {
+        collect_static_long_options(subcommand, options);
+    }
+}
+
+fn register_extension_flags(
+    declarations: Vec<(String, ExtensionFlag)>,
+) -> anyhow::Result<Vec<RegisteredExtensionFlag>> {
+    // clap adds these built-ins while building the command, after
+    // `get_arguments()` exposes derive-declared arguments.
+    let mut occupied = BTreeSet::from(["help".to_owned(), "version".to_owned()]);
+    collect_static_long_options(&Cli::command(), &mut occupied);
+    let mut registered = Vec::with_capacity(declarations.len());
+    for (extension, declaration) in declarations {
+        let argument_id = format!("extension-flag::{extension}::{}", declaration.name);
+        let negative_argument_id = (declaration.kind == ExtensionFlagType::Boolean)
+            .then(|| format!("{argument_id}::negative"));
+        let mut spellings = vec![declaration.name.clone()];
+        if declaration.kind == ExtensionFlagType::Boolean {
+            spellings.push(format!("no-{}", declaration.name));
+        }
+        for spelling in spellings {
+            if !occupied.insert(spelling.clone()) {
+                anyhow::bail!(
+                    "extension CLI flag --{spelling} from {extension:?} conflicts with an existing option"
+                );
+            }
+        }
+        registered.push(RegisteredExtensionFlag {
+            extension,
+            declaration,
+            argument_id,
+            negative_argument_id,
+        });
+    }
+    Ok(registered)
+}
+
+fn extension_flag_command(registered: &[RegisteredExtensionFlag]) -> Command {
+    let mut command = Cli::command();
+    for flag in registered {
+        let help = flag
+            .declaration
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("Extension {} option", flag.extension));
+        let argument = match flag.declaration.kind {
+            ExtensionFlagType::Boolean => Arg::new(flag.argument_id.clone())
+                .long(flag.declaration.name.clone())
+                .action(ArgAction::SetTrue)
+                .help(help)
+                .conflicts_with(
+                    flag.negative_argument_id
+                        .as_ref()
+                        .expect("boolean flags have an inverse ID"),
+                ),
+            ExtensionFlagType::String => Arg::new(flag.argument_id.clone())
+                .long(flag.declaration.name.clone())
+                .action(ArgAction::Set)
+                .value_name("STRING")
+                .help(help),
+            ExtensionFlagType::Integer => Arg::new(flag.argument_id.clone())
+                .long(flag.declaration.name.clone())
+                .action(ArgAction::Set)
+                .value_name("INTEGER")
+                .allow_negative_numbers(true)
+                .help(help),
+        };
+        command = command.arg(argument);
+        if let Some(negative_id) = &flag.negative_argument_id {
+            command = command.arg(
+                Arg::new(negative_id.clone())
+                    .long(format!("no-{}", flag.declaration.name))
+                    .action(ArgAction::SetFalse)
+                    .help(format!("Disable extension {} option", flag.extension))
+                    .conflicts_with(&flag.argument_id),
+            );
+        }
+    }
+    command
+}
+
+fn supplied_by_command_line(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches
+        .value_source(id)
+        .is_some_and(|source| source == clap::parser::ValueSource::CommandLine)
+}
+
+fn resolve_extension_flag_values(
+    matches: &clap::ArgMatches,
+    registered: &[RegisteredExtensionFlag],
+) -> anyhow::Result<ExtensionFlagValues> {
+    let mut values: ExtensionFlagValues = BTreeMap::new();
+    for flag in registered {
+        let value = match flag.declaration.kind {
+            ExtensionFlagType::Boolean if supplied_by_command_line(matches, &flag.argument_id) => {
+                serde_json::Value::Bool(true)
+            }
+            ExtensionFlagType::Boolean
+                if flag
+                    .negative_argument_id
+                    .as_deref()
+                    .is_some_and(|id| supplied_by_command_line(matches, id)) =>
+            {
+                serde_json::Value::Bool(false)
+            }
+            ExtensionFlagType::Boolean => flag.declaration.default.clone(),
+            ExtensionFlagType::String => matches
+                .get_one::<String>(&flag.argument_id)
+                .cloned()
+                .map(serde_json::Value::String)
+                .unwrap_or_else(|| flag.declaration.default.clone()),
+            ExtensionFlagType::Integer => match matches.get_one::<String>(&flag.argument_id) {
+                Some(raw) => {
+                    let value = raw.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!(
+                            "extension CLI flag --{} requires an integer",
+                            flag.declaration.name
+                        )
+                    })?;
+                    serde_json::Value::Number(value.into())
+                }
+                None => flag.declaration.default.clone(),
+            },
+        };
+        ygg_agent::extension_process::validate_extension_flag_value(&flag.declaration, &value)
+            .map_err(anyhow::Error::from)?;
+        values
+            .entry(flag.extension.clone())
+            .or_default()
+            .insert(flag.declaration.name.clone(), value);
+    }
+    Ok(values)
+}
+
+fn invocation_has_top_level_subcommand(
+    args: &[OsString],
+    registered: &[RegisteredExtensionFlag],
+) -> bool {
+    let command = Cli::command();
+    let mut dynamic_flags = BTreeMap::<String, ExtensionFlagType>::new();
+    for flag in registered {
+        dynamic_flags.insert(flag.declaration.name.clone(), flag.declaration.kind);
+        if flag.negative_argument_id.is_some() {
+            dynamic_flags.insert(
+                format!("no-{}", flag.declaration.name),
+                ExtensionFlagType::Boolean,
+            );
+        }
+    }
+
+    let mut index = 1;
+    while index < args.len() {
+        let Some(value) = args[index].to_str() else {
+            return false;
+        };
+        if value == "--" {
+            return false;
+        }
+        if let Some(long) = value.strip_prefix("--") {
+            let (name, inline_value) = long
+                .split_once('=')
+                .map_or((long, false), |(name, _)| (name, true));
+            if let Some(argument) = static_long_argument(&command, name) {
+                index += 1;
+                if !inline_value {
+                    consume_static_values(
+                        args,
+                        &mut index,
+                        static_argument_value_maximum(argument),
+                    );
+                }
+                continue;
+            }
+            if let Some(kind) = dynamic_flags.get(name) {
+                index += 1;
+                if !inline_value && *kind != ExtensionFlagType::Boolean {
+                    let Some(next) = args.get(index).and_then(|value| value.to_str()) else {
+                        continue;
+                    };
+                    let can_consume = match *kind {
+                        ExtensionFlagType::Boolean => false,
+                        ExtensionFlagType::String => next != "--" && !next.starts_with('-'),
+                        ExtensionFlagType::Integer => {
+                            next != "--" && (!next.starts_with('-') || next.parse::<i64>().is_ok())
+                        }
+                    };
+                    if can_consume {
+                        index += 1;
+                    }
+                }
+                continue;
+            }
+            // An unregistered option is invalid to the old static parser. It
+            // cannot safely consume a following word, so keep scanning for a
+            // definite subcommand that must retain static behavior.
+            index += 1;
+            continue;
+        }
+        if value == "-p" {
+            index += 1;
+            continue;
+        }
+        if value.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return command.find_subcommand(value).is_some();
+    }
+    false
+}
+
+fn parse_static_or_exit(args: Vec<OsString>) -> Cli {
+    match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    }
+}
+
+/// Parse the normal runtime command after adding trusted manifest-declared
+/// flags. Discovery reads only bounded manifests and never launches extensions.
+pub(crate) fn parse_with_extension_flags(
+    args: Vec<OsString>,
+    cwd: &Path,
+) -> anyhow::Result<(Cli, ExtensionFlagValues)> {
+    let static_args = args.clone();
+    let declarations = bootstrap_extension_config(&args, cwd)
+        .map(|config| crate::extensions::selected_extension_flag_declarations(&config))
+        .unwrap_or_default();
+    let registered = register_extension_flags(declarations)?;
+    if invocation_has_top_level_subcommand(&args, &registered) {
+        return Ok((parse_static_or_exit(static_args), BTreeMap::new()));
+    }
+    let mut command = extension_flag_command(&registered);
+    let matches = match command.try_get_matches_from_mut(args) {
+        Ok(matches) => matches,
+        Err(error) => error.exit(),
+    };
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(error) => error.exit(),
+    };
+    if cli.command.is_some() || cli.login.is_some() || cli.logout.is_some() {
+        // Dynamic flags are not part of early-exit command contracts. If an
+        // unknown option occurred before one, preserve the old static parser's
+        // behavior rather than quietly accepting it on that path.
+        return Ok((parse_static_or_exit(static_args), BTreeMap::new()));
+    }
+    let values = resolve_extension_flag_values(&matches, &registered)?;
+    Ok((cli, values))
+}
+
+fn static_long_argument<'a>(command: &'a Command, name: &str) -> Option<&'a Arg> {
+    command.get_arguments().find(|argument| {
+        argument.get_long() == Some(name)
+            || argument
+                .get_all_aliases()
+                .is_some_and(|aliases| aliases.into_iter().any(|alias| alias == name))
+    })
+}
+
+fn static_argument_value_maximum(argument: &Arg) -> usize {
+    // clap exposes `None` for derive's implicit arity. A value-taking action
+    // still consumes one value in that case.
+    argument.get_num_args().map_or_else(
+        || {
+            if argument.get_action().takes_values() {
+                1
+            } else {
+                0
+            }
+        },
+        |range| range.max_values(),
+    )
+}
+
+fn consume_static_values(args: &[OsString], index: &mut usize, maximum: usize) {
+    let mut consumed = 0;
+    while *index < args.len() && consumed < maximum {
+        let Some(value) = args[*index].to_str() else {
+            break;
+        };
+        if value == "--" || value.starts_with('-') {
+            break;
+        }
+        *index += 1;
+        consumed += 1;
+    }
+}
+
+fn has_static_early_exit_option(args: &[OsString]) -> bool {
+    for argument in args.iter().skip(1) {
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if value == "--" {
+            break;
+        }
+        if value == "--version"
+            || value.starts_with("--version=")
+            || value == "-V"
+            || value == "--login"
+            || value.starts_with("--login=")
+            || value == "--logout"
+            || value.starts_with("--logout=")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Dynamic extension flags are intentionally absent from early-exit commands.
+///
+/// This scans known static options rather than handing the raw invocation to
+/// clap with error recovery. Recovery stops at an unknown dynamic flag and can
+/// therefore misclassify later activation options or a positional prompt as a
+/// subcommand.
+pub(crate) fn uses_runtime_extension_flag_parser(args: &[OsString]) -> bool {
+    if has_static_early_exit_option(args) {
+        return false;
+    }
+    let command = Cli::command();
+    let mut index = 1;
+    while index < args.len() {
+        let Some(value) = args[index].to_str() else {
+            return true;
+        };
+        if value == "--" {
+            return true;
+        }
+        if let Some(long) = value.strip_prefix("--") {
+            let (name, inline_value) = long
+                .split_once('=')
+                .map_or((long, false), |(name, _)| (name, true));
+            let Some(argument) = static_long_argument(&command, name) else {
+                // It may be a dynamic flag. Keep parsing on the runtime path
+                // rather than guessing how many following values it consumes.
+                return true;
+            };
+            index += 1;
+            if !inline_value {
+                consume_static_values(args, &mut index, static_argument_value_maximum(argument));
+            }
+            continue;
+        }
+        if value == "-p" {
+            index += 1;
+            continue;
+        }
+        if value.starts_with('-') {
+            // The remaining short forms are either help (which should show
+            // registered flags) or invalid. Let the final parser decide.
+            return true;
+        }
+        if command
+            .get_subcommands()
+            .any(|subcommand| subcommand.get_name() == value)
+        {
+            return false;
+        }
+        // The first non-option that is not a command is the normal prompt.
+        return true;
+    }
+    true
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct CompactionLayer {
     #[serde(alias = "policy")]
@@ -267,12 +853,14 @@ struct CompactionLayer {
 struct ConfigLayer {
     model: Option<String>,
     reasoning: Option<String>,
+    effect_policy: Option<String>,
     reasoning_mode: Option<String>,
     cache_retention: Option<String>,
     theme: Option<String>,
     color: Option<String>,
     mouse: Option<String>,
     plain: Option<bool>,
+    show_images: Option<bool>,
     allow_external_paths: Option<bool>,
     allow_edit: Option<bool>,
     allow_write: Option<bool>,
@@ -308,12 +896,14 @@ impl ConfigLayer {
         }
         override_some!(model);
         override_some!(reasoning);
+        override_some!(effect_policy);
         override_some!(reasoning_mode);
         override_some!(cache_retention);
         override_some!(theme);
         override_some!(color);
         override_some!(mouse);
         override_some!(plain);
+        override_some!(show_images);
         override_some!(allow_external_paths);
         override_some!(allow_edit);
         override_some!(allow_write);
@@ -383,6 +973,26 @@ impl ConfigLayer {
                 *current = Some(current.map_or(project, |current| current.min(project)));
             }
         }
+        fn effect_policy_rank(value: &str) -> Option<u8> {
+            match value.parse::<EffectPolicy>().ok()? {
+                EffectPolicy::ControlledBashApproval => Some(0),
+                EffectPolicy::Controlled => Some(1),
+                EffectPolicy::UnsafeHost => Some(2),
+            }
+        }
+        fn tighten_effect_policy(current: &mut Option<String>, project: Option<String>) {
+            let Some(project) = project else {
+                return;
+            };
+            let current_rank = current.as_deref().and_then(effect_policy_rank).unwrap_or(2);
+            match effect_policy_rank(&project) {
+                Some(project_rank) if project_rank <= current_rank => *current = Some(project),
+                Some(_) => {}
+                // Preserve malformed values so normal configuration validation
+                // reports them instead of treating a project typo as absent.
+                None => *current = Some(project),
+            }
+        }
 
         tighten_bool(
             &mut self.allow_external_paths,
@@ -392,6 +1002,12 @@ impl ConfigLayer {
         tighten_bool(&mut self.allow_write, project.allow_write.take());
         tighten_bool(&mut self.allow_process, project.allow_process.take());
         tighten_bool(&mut self.allow_shell, project.allow_shell.take());
+        // Inline terminal images are opt-in at a user-controlled boundary. A
+        // trusted project may turn them off but cannot make retained payloads
+        // render in the user's terminal.
+        if project.show_images.take() == Some(false) {
+            self.show_images = Some(false);
+        }
         // Remote reads are opt-in. A project may revoke a user grant, but may
         // never create network authority when the user/global layer omitted it.
         if project.allow_remote_read.take() == Some(false) {
@@ -423,6 +1039,7 @@ impl ConfigLayer {
         // user-level decision and can never be granted by project config.
         let trusted_extensions = self.trusted_extensions.clone();
         project.trusted_extensions = None;
+        tighten_effect_policy(&mut self.effect_policy, project.effect_policy.take());
         self.merge(project);
         self.trusted_extensions = trusted_extensions;
     }
@@ -591,18 +1208,18 @@ fn write_config_atomically(
     })
 }
 
-fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _config_lock = config_update_lock(path)?;
-
-    let original = match std::fs::read_to_string(path) {
-        Ok(content) => Some(content),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
-    };
-    let content = original.as_deref().unwrap_or_default();
+/// Render one structural user-config key update without writing it.
+///
+/// Migration ingestion uses this same persistence transformation inside its
+/// larger compare-and-swap transaction, while interactive callers retain the
+/// ordinary locked write path below.
+pub(crate) fn render_persisted_key_update(
+    key: &str,
+    value: &str,
+    original: Option<&str>,
+    path: &std::path::Path,
+) -> anyhow::Result<String> {
+    let content = original.unwrap_or_default();
     let mut document = if content.trim().is_empty() {
         toml_edit::DocumentMut::new()
     } else {
@@ -614,7 +1231,30 @@ fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow
     // Structural TOML editing avoids partial-key matches and orphaned lines
     // from multiline values while retaining the user's comments and layout.
     document[key] = toml_edit::value(value);
-    let new_content = document.to_string();
+    Ok(document.to_string())
+}
+
+/// Render the normal global model persistence update without writing it.
+pub(crate) fn render_model_persistence_update(
+    original: Option<&str>,
+    path: &std::path::Path,
+    model: &str,
+) -> anyhow::Result<String> {
+    render_persisted_key_update("model", model, original, path)
+}
+
+fn persist_key_to_path(key: &str, value: &str, path: &std::path::Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _config_lock = config_update_lock(path)?;
+
+    let original = match std::fs::read_to_string(path) {
+        Ok(content) => Some(content),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let new_content = render_persisted_key_update(key, value, original.as_deref(), path)?;
 
     // Atomic write: write to a unique sibling temp file then rename over the
     // real path so a crash or concurrent config writer cannot leave a partial
@@ -745,12 +1385,14 @@ struct LoadedConfigLayer {
 const CONFIG_KEYS: &[&str] = &[
     "model",
     "reasoning",
+    "effect_policy",
     "reasoning_mode",
     "cache_retention",
     "theme",
     "color",
     "mouse",
     "plain",
+    "show_images",
     "allow_external_paths",
     "allow_edit",
     "allow_write",
@@ -1009,6 +1651,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer {
         model: env_value("YGG_MODEL"),
         reasoning: env_value("YGG_REASONING"),
+        effect_policy: env_value("YGG_EFFECT_POLICY"),
         reasoning_mode: env_value("YGG_REASONING_MODE"),
         cache_retention: env_value("YGG_CACHE_RETENTION")
             .or_else(|| env_value("PI_CACHE_RETENTION")),
@@ -1016,6 +1659,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         color: env_value("YGG_COLOR"),
         mouse: env_value("YGG_MOUSE"),
         plain: env_parse("YGG_PLAIN")?,
+        show_images: env_parse("YGG_SHOW_IMAGES")?,
         allow_external_paths: env_parse("YGG_ALLOW_EXTERNAL_PATHS")?,
         allow_edit: env_parse("YGG_ALLOW_EDIT")?,
         allow_write: env_parse("YGG_ALLOW_WRITE")?,
@@ -1063,10 +1707,29 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
     Ok(ConfigLayer::default())
 }
 
+fn policy_value_source(environment_set: bool, config_set: bool) -> PolicyValueSource {
+    if environment_set {
+        PolicyValueSource::Environment
+    } else if config_set {
+        PolicyValueSource::Config
+    } else {
+        PolicyValueSource::Default
+    }
+}
+
 fn build_config_with_global_path(
     cli: Cli,
     cwd: &Path,
     global_path: Option<&Path>,
+) -> anyhow::Result<Config> {
+    build_config_with_global_path_and_diagnostics(cli, cwd, global_path, true)
+}
+
+fn build_config_with_global_path_and_diagnostics(
+    cli: Cli,
+    cwd: &Path,
+    global_path: Option<&Path>,
+    report_diagnostics: bool,
 ) -> anyhow::Result<Config> {
     let invocation_cwd = cwd.canonicalize()?;
     let workspace = config::resolve_workspace(cli.workspace.as_deref(), &invocation_cwd)?;
@@ -1095,6 +1758,7 @@ fn build_config_with_global_path(
         LoadedConfigLayer::default()
     };
     let environment = environment_layer()?;
+    let policy_environment = environment.clone();
     let extension_activation_overridden = project.values.enabled_extensions.is_some()
         || environment.enabled_extensions.is_some()
         || !cli.enable_extensions.is_empty();
@@ -1103,10 +1767,12 @@ fn build_config_with_global_path(
     let mut values = global.values;
     values.merge_project(project.values);
     values.merge(environment);
-    report_config_diagnostics(
-        &diagnostics,
-        cli.strict_config || values.strict_config.unwrap_or(false),
-    )?;
+    if report_diagnostics {
+        report_config_diagnostics(
+            &diagnostics,
+            cli.strict_config || values.strict_config.unwrap_or(false),
+        )?;
+    }
 
     let model = resolve_model_id(
         cli.model.clone().map(ygg_ai::ModelId),
@@ -1142,13 +1808,72 @@ fn build_config_with_global_path(
         None => config::MouseMode::Auto,
     };
     let system_prompt = cli.system_prompt.or(values.system_prompt);
-    let effect_policy = if cli.safe_mode {
-        ygg_agent::EffectPolicy::ControlledBashApproval
+    let effect_policy_source = if cli.safe_mode || cli.effect_policy.is_some() {
+        PolicyValueSource::Cli
     } else {
-        ygg_agent::EffectPolicy::UnsafeHost
+        policy_value_source(
+            policy_environment.effect_policy.is_some(),
+            values.effect_policy.is_some(),
+        )
+    };
+    let effect_policy = if cli.safe_mode {
+        EffectPolicy::ControlledBashApproval
+    } else {
+        cli.effect_policy
+            .as_deref()
+            .or(values.effect_policy.as_deref())
+            .map(str::parse)
+            .transpose()
+            .map_err(|error: String| anyhow::anyhow!(error))?
+            .unwrap_or(EffectPolicy::UnsafeHost)
     };
 
-    let mut sandbox = SandboxPolicy::default();
+    let offline_source = policy_value_source(
+        policy_environment.offline.is_some(),
+        values.offline.is_some(),
+    );
+    let mut sandbox = SandboxPolicy {
+        policy_provenance: ToolPolicyProvenance {
+            effect_policy: effect_policy_source,
+            workspace_confinement: policy_value_source(
+                policy_environment.allow_external_paths.is_some(),
+                values.allow_external_paths.is_some(),
+            ),
+            allow_edit: policy_value_source(
+                policy_environment.allow_edit.is_some(),
+                values.allow_edit.is_some(),
+            ),
+            allow_write: policy_value_source(
+                policy_environment.allow_write.is_some(),
+                values.allow_write.is_some(),
+            ),
+            allow_process: policy_value_source(
+                policy_environment.allow_process.is_some(),
+                values.allow_process.is_some(),
+            ),
+            allow_shell: policy_value_source(
+                policy_environment.allow_shell.is_some(),
+                values.allow_shell.is_some(),
+            ),
+            shell_path: policy_value_source(
+                policy_environment.shell_path.is_some(),
+                values.shell_path.is_some(),
+            ),
+            bash_timeout: policy_value_source(
+                policy_environment.bash_timeout_secs.is_some(),
+                values.bash_timeout_secs.is_some(),
+            ),
+            max_output_bytes: policy_value_source(
+                policy_environment.max_output_bytes.is_some(),
+                values.max_output_bytes.is_some(),
+            ),
+            allow_remote_read: policy_value_source(
+                policy_environment.allow_remote_read.is_some(),
+                values.allow_remote_read.is_some(),
+            ),
+        },
+        ..SandboxPolicy::default()
+    };
     if let Some(value) = values.allow_external_paths {
         sandbox.allow_external_paths = value;
     }
@@ -1179,41 +1904,58 @@ fn build_config_with_global_path(
     if cli.no_edit {
         sandbox.allow_edit = false;
         sandbox.allow_write = false;
+        sandbox.policy_provenance.allow_edit = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_write = PolicyValueSource::Cli;
     }
     if cli.no_write {
         sandbox.allow_write = false;
+        sandbox.policy_provenance.allow_write = PolicyValueSource::Cli;
     }
     if cli.no_process || cli.no_shell {
         // Arbitrary process execution has shell-equivalent authority; these
         // flags are aliases at the enforcement boundary.
         sandbox.allow_process = false;
         sandbox.allow_shell = false;
+        sandbox.policy_provenance.allow_process = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_shell = PolicyValueSource::Cli;
     }
     if cli.allow_shell {
         sandbox.allow_process = true;
         sandbox.allow_shell = true;
+        sandbox.policy_provenance.allow_process = PolicyValueSource::Cli;
+        sandbox.policy_provenance.allow_shell = PolicyValueSource::Cli;
     }
     if cli.allow_remote_read {
         sandbox.allow_remote_read = true;
+        sandbox.policy_provenance.allow_remote_read = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.shell_path {
         sandbox.shell_path = Some(value);
+        sandbox.policy_provenance.shell_path = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.bash_timeout_secs {
         sandbox.bash_timeout_secs = value;
+        sandbox.policy_provenance.bash_timeout = PolicyValueSource::Cli;
     }
     if let Some(value) = cli.max_output_bytes {
         sandbox.max_output_bytes = value;
+        sandbox.policy_provenance.max_output_bytes = PolicyValueSource::Cli;
     }
     let offline = cli.offline || values.offline.unwrap_or(false);
     if offline {
         sandbox.allow_remote_read = false;
+        sandbox.policy_provenance.allow_remote_read = if cli.offline {
+            PolicyValueSource::Cli
+        } else {
+            offline_source
+        };
     }
     if effect_policy != ygg_agent::EffectPolicy::UnsafeHost {
         // External-path classification cannot remain stable between admission
         // and execution. Keep controlled operations workspace-relative so the
         // broker's workspace/host distinction fails closed.
         sandbox.allow_external_paths = false;
+        sandbox.policy_provenance.workspace_confinement = effect_policy_source;
     }
     sandbox.bash_timeout_secs = sandbox.bash_timeout_secs.clamp(1, 3_600);
     sandbox.max_output_bytes = sandbox.max_output_bytes.clamp(1_024, 1024 * 1024);
@@ -1337,6 +2079,7 @@ fn build_config_with_global_path(
         color,
         mouse,
         plain: cli.plain || values.plain.unwrap_or(false),
+        show_images: cli.show_images || values.show_images.unwrap_or(false),
         session_dir: cli
             .session_dir
             .or(values.session_dir)
@@ -1367,6 +2110,8 @@ fn build_config_with_global_path(
         extension_activation_overridden,
         trusted_extensions,
         invocation_trusted_extensions,
+        experimental_streamable_http_mcp: cli.experimental_streamable_http_mcp,
+        extension_flag_values: Default::default(),
         tools,
         telemetry: cli.telemetry.or(values.telemetry).map(|path| {
             if path.is_absolute() {
@@ -1390,6 +2135,7 @@ pub fn build_config(cli: Cli, cwd: &Path) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pi::PiBridgeApiVersion;
 
     fn cwd() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -1417,6 +2163,7 @@ mod tests {
             color: None,
             mouse: None,
             plain: false,
+            show_images: false,
             show_reasoning: false,
             max_turns: None,
             session_dir: None,
@@ -1428,8 +2175,10 @@ mod tests {
             extension_dirs: vec![],
             enable_extensions: vec![],
             trust_extensions: vec![],
+            experimental_streamable_http_mcp: false,
             workspace_trusted: false,
             safe_mode: false,
+            effect_policy: None,
             tools: None,
             exclude_tools: vec![],
             no_tools: false,
@@ -1451,6 +2200,242 @@ mod tests {
 
     fn config_with_empty_global(cli: Cli, directory: &Path) -> anyhow::Result<Config> {
         build_config_with_global_path(cli, directory, Some(&directory.join("missing-global.toml")))
+    }
+
+    #[test]
+    fn gpt_6_astra_uses_the_generic_cli_model_path() {
+        let directory = cwd();
+        let cli = Cli::try_parse_from(["ygg", "--model", "gpt-6-astra", "--offline"]).unwrap();
+        let config = config_with_empty_global(cli, directory.path()).unwrap();
+        assert_eq!(config.model, Some(ygg_ai::ModelId("gpt-6-astra".into())));
+        assert!(config.model_explicit);
+
+        let catalog = ygg_ai::ModelCatalog::builtin().unwrap();
+        let model = catalog.resolve(config.model.as_ref().unwrap()).unwrap();
+        assert_eq!(model.spec.api_name, "gpt-6-astra");
+        assert_eq!(model.endpoint.id.0, "openai");
+    }
+
+    fn extension_flag(
+        name: &str,
+        kind: ExtensionFlagType,
+        default: serde_json::Value,
+    ) -> ExtensionFlag {
+        ExtensionFlag {
+            name: name.to_owned(),
+            kind,
+            default,
+            description: Some(format!("{name} extension option")),
+        }
+    }
+
+    #[test]
+    fn extension_flags_parse_types_defaults_inverses_and_help() {
+        let registered = register_extension_flags(vec![
+            (
+                "flag-fixture".to_owned(),
+                extension_flag(
+                    "fixture-enabled",
+                    ExtensionFlagType::Boolean,
+                    serde_json::json!(true),
+                ),
+            ),
+            (
+                "flag-fixture".to_owned(),
+                extension_flag(
+                    "fixture-label",
+                    ExtensionFlagType::String,
+                    serde_json::json!("default"),
+                ),
+            ),
+            (
+                "flag-fixture".to_owned(),
+                extension_flag(
+                    "fixture-count",
+                    ExtensionFlagType::Integer,
+                    serde_json::json!(2),
+                ),
+            ),
+        ])
+        .expect("register fixture flags");
+
+        let default_matches = extension_flag_command(&registered)
+            .try_get_matches_from(["ygg"])
+            .expect("parse default extension flags");
+        let default_values =
+            resolve_extension_flag_values(&default_matches, &registered).expect("resolve defaults");
+        assert_eq!(
+            default_values["flag-fixture"]["fixture-enabled"],
+            serde_json::json!(true)
+        );
+
+        let matches = extension_flag_command(&registered)
+            .try_get_matches_from([
+                "ygg",
+                "--fixture-enabled",
+                "--fixture-label",
+                "custom",
+                "--fixture-count",
+                "-7",
+            ])
+            .expect("parse extension flags");
+        assert!(Cli::from_arg_matches(&matches)
+            .expect("project dynamic matches into the static CLI")
+            .command
+            .is_none());
+        assert_eq!(
+            resolve_extension_flag_values(&matches, &registered).expect("resolve values"),
+            BTreeMap::from([(
+                "flag-fixture".to_owned(),
+                BTreeMap::from([
+                    ("fixture-count".to_owned(), serde_json::json!(-7)),
+                    ("fixture-enabled".to_owned(), serde_json::json!(true)),
+                    ("fixture-label".to_owned(), serde_json::json!("custom")),
+                ]),
+            )])
+        );
+
+        let inverse_matches = extension_flag_command(&registered)
+            .try_get_matches_from(["ygg", "--no-fixture-enabled"])
+            .expect("parse inverse boolean");
+        let inverse_values = resolve_extension_flag_values(&inverse_matches, &registered)
+            .expect("resolve inverse boolean");
+        assert_eq!(
+            inverse_values["flag-fixture"]["fixture-enabled"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            inverse_values["flag-fixture"]["fixture-label"],
+            serde_json::json!("default")
+        );
+        assert_eq!(
+            inverse_values["flag-fixture"]["fixture-count"],
+            serde_json::json!(2)
+        );
+
+        let mut command = extension_flag_command(&registered);
+        let help = command.render_long_help().to_string();
+        assert!(help.contains("--fixture-enabled"));
+        assert!(help.contains("--no-fixture-enabled"));
+        assert!(help.contains("--fixture-label <STRING>"));
+        assert!(help.contains("--fixture-count <INTEGER>"));
+    }
+
+    #[test]
+    fn extension_flags_reject_static_and_cross_extension_collisions() {
+        for reserved in ["workspace", "help", "version"] {
+            let static_collision = register_extension_flags(vec![(
+                "fixture".to_owned(),
+                extension_flag(reserved, ExtensionFlagType::String, serde_json::json!(".")),
+            )])
+            .expect_err("static option collision");
+            assert!(static_collision.to_string().contains("conflicts"));
+        }
+
+        let dynamic_collision = register_extension_flags(vec![
+            (
+                "first".to_owned(),
+                extension_flag(
+                    "shared",
+                    ExtensionFlagType::Boolean,
+                    serde_json::json!(false),
+                ),
+            ),
+            (
+                "second".to_owned(),
+                extension_flag("shared", ExtensionFlagType::String, serde_json::json!("")),
+            ),
+        ])
+        .expect_err("cross-extension collision");
+        assert!(dynamic_collision.to_string().contains("--shared"));
+    }
+
+    #[test]
+    fn runtime_subcommand_scan_keeps_dynamic_flags_off_early_exit_paths() {
+        let registered = register_extension_flags(vec![
+            (
+                "fixture".to_owned(),
+                extension_flag(
+                    "fixture-enabled",
+                    ExtensionFlagType::Boolean,
+                    serde_json::json!(false),
+                ),
+            ),
+            (
+                "fixture".to_owned(),
+                extension_flag(
+                    "fixture-label",
+                    ExtensionFlagType::String,
+                    serde_json::json!("default"),
+                ),
+            ),
+            (
+                "fixture".to_owned(),
+                extension_flag(
+                    "fixture-count",
+                    ExtensionFlagType::Integer,
+                    serde_json::json!(0),
+                ),
+            ),
+        ])
+        .expect("register fixture flags");
+        let os = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+
+        assert!(!invocation_has_top_level_subcommand(
+            &os(&["ygg", "--fixture-label", "pi"]),
+            &registered,
+        ));
+        assert!(invocation_has_top_level_subcommand(
+            &os(&["ygg", "--fixture-enabled", "pi", "--help"]),
+            &registered,
+        ));
+        assert!(invocation_has_top_level_subcommand(
+            &os(&["ygg", "--fixture-count", "-7", "pi"]),
+            &registered,
+        ));
+        assert!(invocation_has_top_level_subcommand(
+            &os(&["ygg", "--workspace", "/tmp", "pi", "list"]),
+            &registered,
+        ));
+        assert!(invocation_has_top_level_subcommand(
+            &os(&["ygg", "--unknown-extension-flag", "pi", "--help"]),
+            &registered,
+        ));
+    }
+
+    #[test]
+    fn runtime_flag_parser_bypasses_only_true_early_exit_invocations() {
+        let os = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(!uses_runtime_extension_flag_parser(&os(&[
+            "ygg", "--login", "codex"
+        ])));
+        assert!(!uses_runtime_extension_flag_parser(&os(&[
+            "ygg",
+            "--workspace",
+            "/tmp",
+            "pi",
+            "list",
+        ])));
+        assert!(!uses_runtime_extension_flag_parser(&os(&[
+            "ygg",
+            "--version"
+        ])));
+        assert!(uses_runtime_extension_flag_parser(&os(&[
+            "ygg",
+            "--extension-flag",
+            "pi",
+        ])));
+        assert!(!uses_runtime_extension_flag_parser(&os(&[
+            "ygg",
+            "--extension-flag",
+            "pi",
+            "--login",
+            "codex",
+        ])));
+        assert!(uses_runtime_extension_flag_parser(&os(&[
+            "ygg", "--", "--login"
+        ])));
+        assert!(!uses_runtime_extension_flag_parser(&os(&["ygg", "pi"])));
     }
 
     #[test]
@@ -1506,6 +2491,82 @@ mod tests {
     }
 
     #[test]
+    fn policy_value_source_prefers_environment_over_config() {
+        assert_eq!(
+            policy_value_source(false, false),
+            PolicyValueSource::Default
+        );
+        assert_eq!(policy_value_source(false, true), PolicyValueSource::Config);
+        assert_eq!(
+            policy_value_source(true, false),
+            PolicyValueSource::Environment
+        );
+        assert_eq!(
+            policy_value_source(true, true),
+            PolicyValueSource::Environment
+        );
+    }
+
+    #[test]
+    fn effective_policy_provenance_tracks_config_and_cli_precedence() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(
+            &global,
+            r#"
+effect_policy = "controlled"
+allow_external_paths = false
+allow_edit = false
+allow_write = false
+allow_process = false
+allow_shell = false
+allow_remote_read = true
+shell_path = "/opt/config/bash"
+bash_timeout_secs = 30
+max_output_bytes = 4096
+"#,
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.allow_shell = true;
+        cli.bash_timeout_secs = Some(45);
+        cli.max_output_bytes = Some(8192);
+
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        let policy = config
+            .sandbox
+            .effective_tool_policy(&config.workspace, config.effect_policy);
+
+        assert_eq!(
+            policy.workspace_confinement.source,
+            PolicyValueSource::Config
+        );
+        assert!(policy.workspace_confinement.value);
+        assert_eq!(policy.effect_policy.value, EffectPolicy::Controlled);
+        assert_eq!(policy.effect_policy.source, PolicyValueSource::Config);
+        assert!(!policy.allow_edit.value);
+        assert_eq!(policy.allow_edit.source, PolicyValueSource::Config);
+        assert!(!policy.allow_write.value);
+        assert_eq!(policy.allow_write.source, PolicyValueSource::Config);
+        assert_eq!(policy.allow_process.source, PolicyValueSource::Cli);
+        assert!(policy.allow_process.value);
+        assert_eq!(policy.allow_shell.source, PolicyValueSource::Cli);
+        assert!(policy.allow_shell.value);
+        assert_eq!(policy.shell_path.source, PolicyValueSource::Config);
+        assert_eq!(
+            policy.shell_path.value.selection,
+            ygg_agent::ShellSelection::Configured
+        );
+        assert_eq!(policy.bash_timeout_ms.source, PolicyValueSource::Cli);
+        assert_eq!(policy.bash_timeout_ms.value, 45_000);
+        assert_eq!(policy.max_output_bytes.source, PolicyValueSource::Cli);
+        assert_eq!(policy.max_output_bytes.value, 8192);
+        assert_eq!(policy.allow_remote_read.source, PolicyValueSource::Config);
+        assert!(policy.allow_remote_read.value);
+    }
+
+    #[test]
     fn telemetry_path_resolves_relative_to_invocation_directory() {
         let directory = cwd();
         let mut cli = base();
@@ -1547,6 +2608,48 @@ mod tests {
     }
 
     #[test]
+    fn experimental_streamable_http_mcp_is_cli_only() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        assert!(
+            !config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .experimental_streamable_http_mcp
+        );
+
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "experimental_streamable_http_mcp = true\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        std::fs::write(
+            directory.path().join(".ygg/config.toml"),
+            "experimental_streamable_http_mcp = true\n",
+        )
+        .unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        assert!(
+            !build_config_with_global_path(cli, directory.path(), Some(&global))
+                .unwrap()
+                .experimental_streamable_http_mcp,
+            "global and trusted-project configuration cannot grant the experimental transport"
+        );
+
+        assert!(
+            Cli::try_parse_from(["ygg", "--experimental-streamable-http-m"]).is_err(),
+            "the process-owner gate must not accept an abbreviated spelling"
+        );
+        let mut cli = Cli::try_parse_from(["ygg", "--experimental-streamable-http-mcp"]).unwrap();
+        cli.workspace = Some(directory.path().into());
+        assert!(
+            config_with_empty_global(cli, directory.path())
+                .unwrap()
+                .experimental_streamable_http_mcp
+        );
+    }
+
+    #[test]
     fn project_config_cannot_grant_remote_network_authority_and_offline_revokes_it() {
         let directory = cwd();
         std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
@@ -1568,6 +2671,74 @@ mod tests {
         let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
         assert!(config.offline);
         assert!(!config.sandbox.allow_remote_read);
+    }
+
+    #[test]
+    fn effect_policy_layers_respect_project_tightening_and_cli_override() {
+        let directory = cwd();
+        let global = directory.path().join("global.toml");
+        std::fs::write(&global, "effect_policy = 'controlled'\n").unwrap();
+        std::fs::create_dir_all(directory.path().join(".ygg")).unwrap();
+        let project = directory.path().join(".ygg/config.toml");
+        std::fs::write(&project, "effect_policy = 'unsafe_host'\n").unwrap();
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.effect_policy, EffectPolicy::Controlled);
+        assert_eq!(
+            config
+                .sandbox
+                .effective_tool_policy(&config.workspace, config.effect_policy)
+                .effect_policy
+                .source,
+            PolicyValueSource::Config
+        );
+
+        std::fs::write(&project, "effect_policy = 'controlled_bash_approval'\n").unwrap();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(
+            config.effect_policy,
+            EffectPolicy::ControlledBashApproval,
+            "a trusted project may tighten the global profile"
+        );
+
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.workspace_trusted = true;
+        cli.effect_policy = Some("unsafe_host".into());
+        let config = build_config_with_global_path(cli, directory.path(), Some(&global)).unwrap();
+        assert_eq!(config.effect_policy, EffectPolicy::UnsafeHost);
+        assert_eq!(
+            config
+                .sandbox
+                .effective_tool_policy(&config.workspace, config.effect_policy)
+                .effect_policy
+                .source,
+            PolicyValueSource::Cli
+        );
+    }
+
+    #[test]
+    fn environment_effect_policy_layer_overrides_config() {
+        let mut values = ConfigLayer {
+            effect_policy: Some("controlled".into()),
+            ..ConfigLayer::default()
+        };
+        values.merge(ConfigLayer {
+            effect_policy: Some("unsafe_host".into()),
+            ..ConfigLayer::default()
+        });
+
+        assert_eq!(values.effect_policy.as_deref(), Some("unsafe_host"));
+        assert_eq!(
+            policy_value_source(true, values.effect_policy.is_some()),
+            PolicyValueSource::Environment
+        );
     }
 
     #[test]
@@ -1596,6 +2767,23 @@ mod tests {
 
         let cli = Cli::try_parse_from(["ygg", "--safe"]).unwrap();
         assert!(cli.safe_mode);
+        assert!(
+            Cli::try_parse_from(["ygg", "--safe-mode", "--effect-policy", "unsafe_host",]).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_effect_policy_is_secret_safe() {
+        let directory = cwd();
+        let mut cli = base();
+        cli.workspace = Some(directory.path().into());
+        cli.effect_policy = Some("sensitive-invalid-policy-value".into());
+
+        let error = config_with_empty_global(cli, directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid effect policy"));
+        assert!(!error.contains("sensitive-invalid-policy-value"));
     }
 
     #[test]
@@ -2445,6 +3633,50 @@ mod tests {
     }
 
     #[test]
+    fn setup_command_parses_explicit_non_interactive_inputs() {
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "setup",
+            "--endpoint",
+            "https://models.example.test/v1/",
+            "--api-key-env",
+            "EXAMPLE_API_KEY",
+            "--manual-model",
+            "example-model",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(cli.message.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Setup { options })
+                if options.preset.is_none()
+                    && options.endpoint.as_deref() == Some("https://models.example.test/v1/")
+                    && options.api_key_env.as_deref() == Some("EXAMPLE_API_KEY")
+                    && options.manual_model.as_deref() == Some("example-model")
+                    && options.yes
+        ));
+
+        let cli = Cli::try_parse_from([
+            "ygg",
+            "setup",
+            "--preset",
+            "lm-studio",
+            "--offline",
+            "--manual-model",
+            "local-model",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(TopLevelCommand::Setup { options })
+                if options.preset == Some(SetupPreset::LmStudio)
+                    && options.offline
+                    && options.manual_model.as_deref() == Some("local-model")
+        ));
+    }
+
+    #[test]
     fn sessions_subcommands_do_not_consume_the_positional_prompt() {
         let cli = Cli::try_parse_from(["ygg", "sessions", "inspect", "abc-123"]).unwrap();
         assert!(cli.message.is_none());
@@ -2555,6 +3787,43 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn pi_install_selects_api_03_only_when_explicit() {
+        let default =
+            Cli::try_parse_from(["ygg", "pi", "install", "./private-extension.ts"]).unwrap();
+        let explicit = Cli::try_parse_from([
+            "ygg",
+            "pi",
+            "install",
+            "./private-extension.ts",
+            "--api-version",
+            "0.3",
+        ])
+        .unwrap();
+        let Some(TopLevelCommand::Pi {
+            command:
+                PiCommand::Install {
+                    api_version: default_api_version,
+                    ..
+                },
+        }) = default.command
+        else {
+            panic!("expected default pi install command");
+        };
+        let Some(TopLevelCommand::Pi {
+            command:
+                PiCommand::Install {
+                    api_version: explicit_api_version,
+                    ..
+                },
+        }) = explicit.command
+        else {
+            panic!("expected explicit pi install command");
+        };
+        assert_eq!(default_api_version, PiBridgeApiVersion::V02);
+        assert_eq!(explicit_api_version, PiBridgeApiVersion::V03);
     }
 
     #[test]

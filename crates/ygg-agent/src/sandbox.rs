@@ -8,8 +8,13 @@
 //! child process may still open sockets because this crate does not ship an OS
 //! sandbox backend in v0.1.
 
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+
+use serde::Serialize;
+
+use crate::effect::EffectPolicy;
 
 /// Default maximum bytes retained for each model-visible tool result.
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -75,6 +80,204 @@ impl RemoteReadRetryPolicy {
     }
 }
 
+/// Where an effective policy value was resolved from.
+///
+/// These labels intentionally identify only a configuration layer. They never
+/// include the source value, source file path, environment variable contents,
+/// or command-line argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyValueSource {
+    /// Built-in conservative/default product value.
+    Default,
+    /// A global or trusted-project configuration layer.
+    Config,
+    /// An environment-variable configuration layer.
+    Environment,
+    /// An explicit command-line flag.
+    Cli,
+    /// A bounded headless host request.
+    HostRequest,
+}
+
+/// Source labels for the policy settings safe to expose in diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolPolicyProvenance {
+    /// Source for the effect-broker policy.
+    pub effect_policy: PolicyValueSource,
+    /// Source for the workspace-confinement switch.
+    pub workspace_confinement: PolicyValueSource,
+    /// Source for the edit capability gate.
+    pub allow_edit: PolicyValueSource,
+    /// Source for the write capability gate.
+    pub allow_write: PolicyValueSource,
+    /// Source for the process-execution switch.
+    pub allow_process: PolicyValueSource,
+    /// Source for the shell-execution switch.
+    pub allow_shell: PolicyValueSource,
+    /// Source for whether an explicit shell path was configured.
+    pub shell_path: PolicyValueSource,
+    /// Source for the Bash execution timeout.
+    pub bash_timeout: PolicyValueSource,
+    /// Source for the per-tool output cap.
+    pub max_output_bytes: PolicyValueSource,
+    /// Source for the direct remote-read switch.
+    pub allow_remote_read: PolicyValueSource,
+}
+
+impl ToolPolicyProvenance {
+    /// Attribute every policy setting to one source.
+    pub const fn all(source: PolicyValueSource) -> Self {
+        Self {
+            effect_policy: source,
+            workspace_confinement: source,
+            allow_edit: source,
+            allow_write: source,
+            allow_process: source,
+            allow_shell: source,
+            shell_path: source,
+            bash_timeout: source,
+            max_output_bytes: source,
+            allow_remote_read: source,
+        }
+    }
+}
+
+impl Default for ToolPolicyProvenance {
+    fn default() -> Self {
+        Self::all(PolicyValueSource::Default)
+    }
+}
+
+/// A value and its source label in an effective policy diagnostic.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EffectivePolicyValue<T> {
+    /// Resolved non-sensitive setting value.
+    pub value: T,
+    /// Configuration layer that supplied `value`.
+    pub source: PolicyValueSource,
+}
+
+/// Secret-safe identity of the shell selected for Bash execution.
+///
+/// This deliberately reports only the host-owned selection branch, never the
+/// executable path. In particular, it cannot be dictionary-tested to recover a
+/// configured path or used to correlate separate invocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellSelection {
+    /// The host supplied an explicit executable path.
+    Configured,
+    /// The executable `/bin/bash` was selected.
+    SystemBash,
+    /// An executable named `bash` was found on the host PATH.
+    PathBash,
+    /// Neither Bash candidate was available, so `sh` is used.
+    ShFallback,
+    /// Bash execution is unavailable on this platform.
+    Unavailable,
+}
+
+/// Secret-safe summary of the shell selected for command execution.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShellPathSummary {
+    /// The exact host-owned resolution branch that execution will use.
+    pub selection: ShellSelection,
+}
+
+/// Resolved capability gates and limits suitable for telemetry and diagnostics.
+///
+/// This type excludes the workspace path, shell path, retry values, and every
+/// other potentially sensitive configuration value not needed to explain an
+/// effective tool-policy decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct EffectiveToolPolicy {
+    /// The effect-broker mode used to admit tool effects and its source.
+    pub effect_policy: EffectivePolicyValue<EffectPolicy>,
+    /// True when explicit paths remain constrained to the workspace.
+    pub workspace_confinement: EffectivePolicyValue<bool>,
+    /// Whether the edit tool may mutate files.
+    pub allow_edit: EffectivePolicyValue<bool>,
+    /// Whether the write tool may create or replace files.
+    pub allow_write: EffectivePolicyValue<bool>,
+    /// Whether native process execution is allowed.
+    pub allow_process: EffectivePolicyValue<bool>,
+    /// Whether shell execution is allowed.
+    pub allow_shell: EffectivePolicyValue<bool>,
+    /// Which secret-safe shell resolution branch was selected.
+    pub shell_path: EffectivePolicyValue<ShellPathSummary>,
+    /// Rounded down to whole milliseconds, which is the execution boundary's
+    /// diagnostic precision.
+    pub bash_timeout_ms: EffectivePolicyValue<u64>,
+    /// Maximum bytes retained for one tool result.
+    pub max_output_bytes: EffectivePolicyValue<u64>,
+    /// Whether direct public HTTPS media reads are allowed.
+    pub allow_remote_read: EffectivePolicyValue<bool>,
+}
+
+#[cfg(unix)]
+pub(crate) struct ResolvedShell {
+    pub(crate) path: PathBuf,
+    pub(crate) selection: ShellSelection,
+}
+
+/// Resolve the exact shell selection shared by diagnostics and Bash execution.
+#[cfg(unix)]
+pub(crate) fn resolve_shell(configured: Option<&Path>) -> ResolvedShell {
+    if let Some(configured) = configured {
+        return ResolvedShell {
+            path: configured.to_path_buf(),
+            selection: ShellSelection::Configured,
+        };
+    }
+    let system_bash = PathBuf::from("/bin/bash");
+    if is_executable_file(&system_bash) {
+        return ResolvedShell {
+            path: system_bash,
+            selection: ShellSelection::SystemBash,
+        };
+    }
+    if let Some(path) = find_on_path("bash") {
+        return ResolvedShell {
+            path,
+            selection: ShellSelection::PathBash,
+        };
+    }
+    ResolvedShell {
+        path: PathBuf::from("sh"),
+        selection: ShellSelection::ShFallback,
+    }
+}
+
+fn selected_shell(configured: Option<&Path>) -> ShellSelection {
+    #[cfg(unix)]
+    {
+        resolve_shell(configured).selection
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = configured;
+        ShellSelection::Unavailable
+    }
+}
+
+#[cfg(unix)]
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(program))
+            .find(|candidate| is_executable_file(candidate))
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 /// Capability gates and resource limits enforced by the agent's tools.
 ///
 /// `workspace` is canonicalized once by [`Agent::new`](crate::Agent::new) and
@@ -118,6 +321,11 @@ pub struct SandboxConfig {
     pub bash_timeout: Duration,
     /// Maximum bytes of tool output before truncation.
     pub max_output_bytes: usize,
+    /// Provenance for fields included in [`Self::effective_tool_policy`].
+    ///
+    /// Direct library callers that mutate public fields may set this explicitly
+    /// when they want diagnostic provenance beyond the conservative defaults.
+    pub policy_provenance: ToolPolicyProvenance,
 }
 
 impl SandboxConfig {
@@ -139,6 +347,83 @@ impl SandboxConfig {
             shell_path: None,
             bash_timeout: Duration::from_secs(120),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            policy_provenance: ToolPolicyProvenance::default(),
+        }
+    }
+
+    /// Return the effective, secret-safe policy snapshot used by diagnostics.
+    pub fn effective_tool_policy(&self, effect_policy: EffectPolicy) -> EffectiveToolPolicy {
+        let provenance = self.policy_provenance;
+        EffectiveToolPolicy {
+            effect_policy: EffectivePolicyValue {
+                value: effect_policy,
+                source: provenance.effect_policy,
+            },
+            workspace_confinement: EffectivePolicyValue {
+                value: !self.allow_external_paths,
+                source: provenance.workspace_confinement,
+            },
+            allow_edit: EffectivePolicyValue {
+                value: self.allow_edit,
+                source: provenance.allow_edit,
+            },
+            allow_write: EffectivePolicyValue {
+                value: self.allow_write,
+                source: provenance.allow_write,
+            },
+            allow_process: EffectivePolicyValue {
+                value: self.allow_process,
+                source: provenance.allow_process,
+            },
+            allow_shell: EffectivePolicyValue {
+                value: self.allow_shell,
+                source: provenance.allow_shell,
+            },
+            shell_path: EffectivePolicyValue {
+                value: ShellPathSummary {
+                    selection: selected_shell(self.shell_path.as_deref()),
+                },
+                source: provenance.shell_path,
+            },
+            bash_timeout_ms: EffectivePolicyValue {
+                value: u64::try_from(self.bash_timeout.as_millis()).unwrap_or(u64::MAX),
+                source: provenance.bash_timeout,
+            },
+            max_output_bytes: EffectivePolicyValue {
+                value: u64::try_from(self.max_output_bytes).unwrap_or(u64::MAX),
+                source: provenance.max_output_bytes,
+            },
+            allow_remote_read: EffectivePolicyValue {
+                value: self.allow_remote_read,
+                source: provenance.allow_remote_read,
+            },
+        }
+    }
+}
+
+/// A path-resolution error whose confinement failures remain distinguishable
+/// from ordinary filesystem errors at the tool boundary.
+#[derive(Debug)]
+pub(crate) enum SandboxPathError {
+    /// The requested path shape or resolved target left workspace confinement.
+    WorkspaceConfinement(String),
+    /// The path could not be resolved for a non-policy reason.
+    Other(String),
+}
+
+impl SandboxPathError {
+    /// Whether this failure was caused by workspace-only confinement.
+    pub(crate) fn is_workspace_confinement(&self) -> bool {
+        matches!(self, Self::WorkspaceConfinement(_))
+    }
+}
+
+impl fmt::Display for SandboxPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WorkspaceConfinement(message) | Self::Other(message) => {
+                formatter.write_str(message)
+            }
         }
     }
 }
@@ -228,13 +513,21 @@ pub(crate) fn resolve_existing(
     workspace: &Path,
     path: &str,
     allow_external_paths: bool,
-) -> Result<PathBuf, String> {
-    let joined = candidate_path(workspace, path, allow_external_paths)?;
+) -> Result<PathBuf, SandboxPathError> {
+    let joined = candidate_path(workspace, path, allow_external_paths).map_err(|message| {
+        if allow_external_paths {
+            SandboxPathError::Other(message)
+        } else {
+            SandboxPathError::WorkspaceConfinement(message)
+        }
+    })?;
     let canonical = joined
         .canonicalize()
-        .map_err(|error| format!("{path}: {error}"))?;
+        .map_err(|error| SandboxPathError::Other(format!("{path}: {error}")))?;
     if !allow_external_paths && !canonical.starts_with(workspace) {
-        return Err(format!("{path}: path escapes the workspace"));
+        return Err(SandboxPathError::WorkspaceConfinement(format!(
+            "{path}: path escapes the workspace"
+        )));
     }
     Ok(canonical)
 }
@@ -247,8 +540,14 @@ pub(crate) fn resolve_create(
     workspace: &Path,
     path: &str,
     allow_external_paths: bool,
-) -> Result<PathBuf, String> {
-    let joined = candidate_path(workspace, path, allow_external_paths)?;
+) -> Result<PathBuf, SandboxPathError> {
+    let joined = candidate_path(workspace, path, allow_external_paths).map_err(|message| {
+        if allow_external_paths {
+            SandboxPathError::Other(message)
+        } else {
+            SandboxPathError::WorkspaceConfinement(message)
+        }
+    })?;
 
     if joined.symlink_metadata().is_ok() {
         return resolve_existing(workspace, path, allow_external_paths);
@@ -258,16 +557,18 @@ pub(crate) fn resolve_create(
     loop {
         ancestor = ancestor
             .parent()
-            .ok_or_else(|| format!("{path}: path has no valid parent"))?;
+            .ok_or_else(|| SandboxPathError::Other(format!("{path}: path has no valid parent")))?;
         if ancestor.symlink_metadata().is_ok() {
             break;
         }
     }
     let canonical_ancestor = ancestor
         .canonicalize()
-        .map_err(|error| format!("{path}: {error}"))?;
+        .map_err(|error| SandboxPathError::Other(format!("{path}: {error}")))?;
     if !allow_external_paths && !canonical_ancestor.starts_with(workspace) {
-        return Err(format!("{path}: path escapes the workspace"));
+        return Err(SandboxPathError::WorkspaceConfinement(format!(
+            "{path}: path escapes the workspace"
+        )));
     }
     let remainder = joined
         .strip_prefix(ancestor)
@@ -341,6 +642,74 @@ mod tests {
     }
 
     #[test]
+    fn effective_tool_policy_serializes_only_safe_values_and_sources() {
+        let (_dir, workspace) = workspace();
+        let raw_shell_path = PathBuf::from("/private/users/alice/.secrets/ygg-shell");
+        let mut sandbox = SandboxConfig::new(&workspace);
+        sandbox.allow_process = true;
+        sandbox.allow_shell = true;
+        sandbox.allow_remote_read = true;
+        sandbox.shell_path = Some(raw_shell_path.clone());
+        sandbox.bash_timeout = Duration::from_millis(12_345);
+        sandbox.max_output_bytes = 98_765;
+        sandbox.policy_provenance = ToolPolicyProvenance {
+            effect_policy: PolicyValueSource::Cli,
+            workspace_confinement: PolicyValueSource::Config,
+            allow_edit: PolicyValueSource::Default,
+            allow_write: PolicyValueSource::Config,
+            allow_process: PolicyValueSource::Environment,
+            allow_shell: PolicyValueSource::Cli,
+            shell_path: PolicyValueSource::HostRequest,
+            bash_timeout: PolicyValueSource::Default,
+            max_output_bytes: PolicyValueSource::Config,
+            allow_remote_read: PolicyValueSource::Environment,
+        };
+
+        let encoded = serde_json::to_value(
+            sandbox.effective_tool_policy(EffectPolicy::ControlledBashApproval),
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&encoded).unwrap();
+
+        assert_eq!(
+            encoded["effect_policy"]["value"],
+            "controlled_bash_approval"
+        );
+        assert_eq!(encoded["effect_policy"]["source"], "cli");
+        assert_eq!(encoded["workspace_confinement"]["value"], true);
+        assert_eq!(encoded["workspace_confinement"]["source"], "config");
+        assert_eq!(encoded["allow_edit"]["source"], "default");
+        assert_eq!(encoded["allow_write"]["source"], "config");
+        assert_eq!(encoded["allow_process"]["source"], "environment");
+        assert_eq!(encoded["allow_shell"]["source"], "cli");
+        assert_eq!(encoded["shell_path"]["source"], "host_request");
+        assert_eq!(encoded["bash_timeout_ms"]["value"], 12_345);
+        assert_eq!(encoded["bash_timeout_ms"]["source"], "default");
+        assert_eq!(encoded["max_output_bytes"]["value"], 98_765);
+        assert_eq!(encoded["allow_remote_read"]["source"], "environment");
+        assert_eq!(encoded["shell_path"]["value"]["selection"], "configured");
+        assert!(encoded["shell_path"]["value"].get("sha256").is_none());
+        assert!(!serialized.contains(raw_shell_path.to_str().unwrap()));
+        assert!(!serialized.contains(workspace.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn effective_policy_reports_the_same_default_shell_selection_as_execution() {
+        let (_dir, workspace) = workspace();
+        let sandbox = SandboxConfig::new(&workspace);
+        let resolved = resolve_shell(None);
+        let policy = sandbox.effective_tool_policy(EffectPolicy::Controlled);
+
+        assert_eq!(policy.shell_path.value.selection, resolved.selection);
+        assert!(matches!(
+            resolved.selection,
+            ShellSelection::SystemBash | ShellSelection::PathBash | ShellSelection::ShFallback
+        ));
+        assert_eq!(policy.shell_path.source, PolicyValueSource::Default);
+    }
+
+    #[test]
     fn normal_relative_access_resolves() {
         let (_dir, ws) = workspace();
         fs::create_dir(ws.join("src")).unwrap();
@@ -353,7 +722,7 @@ mod tests {
     fn parent_dir_components_rejected_in_workspace_only_mode() {
         let (_dir, ws) = workspace();
         let err = resolve_existing(&ws, "../etc/passwd", false).unwrap_err();
-        assert!(err.contains(".."), "{err}");
+        assert!(err.to_string().contains(".."), "{err}");
         // `..` is rejected even when it would stay inside the workspace.
         fs::create_dir(ws.join("src")).unwrap();
         fs::write(ws.join("ok.txt"), "x").unwrap();
@@ -364,7 +733,7 @@ mod tests {
     fn absolute_paths_rejected_in_workspace_only_mode() {
         let (_dir, ws) = workspace();
         let err = resolve_existing(&ws, "/etc/passwd", false).unwrap_err();
-        assert!(err.contains("absolute"), "{err}");
+        assert!(err.to_string().contains("absolute"), "{err}");
         assert!(resolve_create(&ws, "/tmp/new.txt", false).is_err());
     }
 
@@ -384,7 +753,8 @@ mod tests {
         std::os::unix::fs::symlink(&secret, ws.join("link.txt")).unwrap();
 
         let err = resolve_existing(&ws, "link.txt", false).unwrap_err();
-        assert!(err.contains("escapes"), "{err}");
+        assert!(err.is_workspace_confinement());
+        assert!(err.to_string().contains("escapes"), "{err}");
         // Creation through the same link is equally rejected.
         assert!(resolve_create(&ws, "link.txt", false).is_err());
     }
@@ -398,11 +768,11 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), ws.join("subdir")).unwrap();
 
         let err = resolve_existing(&ws, "subdir/data.txt", false).unwrap_err();
-        assert!(err.contains("escapes"), "{err}");
+        assert!(err.to_string().contains("escapes"), "{err}");
         // A create through a symlinked-out ancestor is rejected too, even for
         // a target that does not exist yet.
         let err = resolve_create(&ws, "subdir/new/file.txt", false).unwrap_err();
-        assert!(err.contains("escapes"), "{err}");
+        assert!(err.to_string().contains("escapes"), "{err}");
     }
 
     #[cfg(unix)]

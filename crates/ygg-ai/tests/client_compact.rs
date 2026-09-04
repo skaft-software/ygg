@@ -47,6 +47,7 @@ fn model(base_url: &str, protocol: Protocol) -> Model {
             auth: Auth::bearer("compact-secret"),
             default_headers: http::HeaderMap::new(),
             transport: ygg_ai::EndpointTransport::Http,
+            runtime: ygg_ai::RequestRuntime::default(),
             timeout: Duration::from_secs(2),
         }),
     }
@@ -54,13 +55,10 @@ fn model(base_url: &str, protocol: Protocol) -> Model {
 
 fn codex_model(base_url: &str) -> Model {
     let mut model = model(base_url, Protocol::OpenAiResponses);
-    let mut spec = (*model.spec).clone();
-    spec.endpoint = EndpointId("openai-codex".into());
+    let spec = Arc::make_mut(&mut model.spec);
     spec.cache.session_affinity_format = Some(ygg_ai::SessionAffinityFormat::Codex);
-    model.spec = Arc::new(spec);
-    let mut endpoint = (*model.endpoint).clone();
-    endpoint.id = EndpointId("openai-codex".into());
-    model.endpoint = Arc::new(endpoint);
+    Arc::make_mut(&mut model.endpoint).runtime.responses_profile =
+        ygg_ai::ResponsesRuntimeProfile::Codex;
     model
 }
 

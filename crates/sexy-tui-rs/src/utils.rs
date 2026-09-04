@@ -35,7 +35,7 @@ pub fn extract_ansi_code(text: &str, position: usize) -> Option<AnsiCode<'_>> {
                 length: end - position,
             })
         }
-        b']' | b'_' => {
+        b']' | b'_' | b'P' | b'^' => {
             let mut cursor = position + 2;
             while cursor < text.len() {
                 if text.as_bytes()[cursor] == 0x07 {

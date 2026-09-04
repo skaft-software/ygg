@@ -1,5 +1,6 @@
 #![allow(missing_docs)]
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Stdout, Write};
 #[cfg(unix)]
@@ -12,12 +13,50 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::{cursor, event, execute, queue, terminal};
 use sexy_tui_rs::{
-    ColorDepth as SexyColorDepth, SupportLevel as SexySupportLevel,
-    TerminalCapabilities as SexyTerminalCapabilities, TerminalSize as SexyTerminalSize,
+    ColorDepth as SexyColorDepth, ImageAnchor, ImageCapabilities, ImageCapabilityOverrides,
+    ImageId, ImageLimits, ImageProtocol, ImageProtocolEncoder, SupportLevel as SexySupportLevel,
+    TerminalCapabilities as SexyTerminalCapabilities, TerminalImage,
+    TerminalSize as SexyTerminalSize,
 };
 
 /// Shared dimensions reachable by both the boxed terminal and the shell.
 pub type TerminalSize = Arc<Mutex<(u16, u16)>>;
+
+/// Owned, validated image payloads addressable from semantic image anchors.
+///
+/// This store is intentionally internal to the interactive renderer. It has no
+/// path, URL, or byte-exposure API: only the terminal adapter can resolve an
+/// already allocated ID into an opaque `TerminalImage` for protocol encoding.
+#[derive(Clone, Default)]
+pub(crate) struct TerminalImageStore {
+    images: Arc<Mutex<HashMap<u32, Arc<TerminalImage>>>>,
+}
+
+impl TerminalImageStore {
+    /// Retain one image under an ID allocated by `ImageRegistry`.
+    pub(crate) fn register(&self, id: ImageId, image: Arc<TerminalImage>) {
+        self.images
+            .lock()
+            .expect("terminal image store mutex poisoned")
+            .insert(id.get(), image);
+    }
+
+    fn get(&self, id: ImageId) -> Option<Arc<TerminalImage>> {
+        self.images
+            .lock()
+            .expect("terminal image store mutex poisoned")
+            .get(&id.get())
+            .cloned()
+    }
+
+    /// Drop all payload references when a transcript is replaced.
+    pub(crate) fn clear(&self) {
+        self.images
+            .lock()
+            .expect("terminal image store mutex poisoned")
+            .clear();
+    }
+}
 
 /// ANSI colour policy. Structural glyph and cursor capabilities are detected
 /// separately, so forcing colour never forces an alternate-screen TUI.
@@ -261,6 +300,13 @@ fn sexy_terminal_capabilities(
         columns: dimensions.0,
         rows: dimensions.1,
     });
+    // Reuse the foundation's conservative environment hints only for image
+    // protocols. Ygg's own interactive/plain decision above remains the
+    // authority for every other frontend capability.
+    let image_hints = SexyTerminalCapabilities::detect();
+    rendered.kitty_graphics = image_hints.kitty_graphics;
+    rendered.iterm2_images = image_hints.iterm2_images;
+    rendered.cell_pixel_size = image_hints.cell_pixel_size;
 
     // This is both a progressive terminal feature and Ygg's render-frame
     // delimiter. The TUI otherwise calls `Terminal::write` once per row and
@@ -583,6 +629,10 @@ pub struct YggTerminal<W: Write = Stdout> {
     size: TerminalSize,
     last_was_cr: bool,
     pending: Vec<u8>,
+    /// Backend diagnostics mirror terminal control bytes but replace opaque
+    /// image protocol payloads with a fixed marker.
+    pending_log: Vec<u8>,
+    image_store: TerminalImageStore,
     write_log: Option<File>,
     in_synchronized_frame_depth: usize,
 }
@@ -606,23 +656,43 @@ impl YggTerminal<Stdout> {
     /// is enabled Ygg owns semantic scrolling and selection; without capture,
     /// native terminal selection and history remain available.
     pub fn enter_with_mouse(size: TerminalSize, capture_mouse: bool) -> Result<Self> {
+        Self::enter_with_mouse_and_images(size, capture_mouse, TerminalImageStore::default())
+    }
+
+    /// Enter with the image store shared by the retained shell and this output
+    /// adapter. The store contains only already validated owned payloads.
+    pub(crate) fn enter_with_mouse_and_images(
+        size: TerminalSize,
+        capture_mouse: bool,
+        image_store: TerminalImageStore,
+    ) -> Result<Self> {
         terminal::enable_raw_mode()?;
         RAW_ACTIVE.store(true, Ordering::SeqCst);
 
-        let result = Self::enter_inner(size, capture_mouse);
+        let result = Self::enter_inner(size, capture_mouse, image_store);
         if result.is_err() {
             force_restore();
         }
         result
     }
 
-    fn enter_inner(size: TerminalSize, capture_mouse: bool) -> Result<Self> {
+    fn enter_inner(
+        size: TerminalSize,
+        capture_mouse: bool,
+        image_store: TerminalImageStore,
+    ) -> Result<Self> {
         let mut out = std::io::stdout();
         execute!(
             out,
             event::EnableBracketedPaste,
             cursor::SetCursorStyle::SteadyBlock,
-            cursor::Hide
+            cursor::Hide,
+            // Pi's first primary-screen frame deliberately preserves saved
+            // lines and therefore does not erase physical rows left by the
+            // shell. Clear only the visible viewport before that frame; ED 3
+            // is intentionally omitted so ordinary terminal history survives.
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0),
         )?;
         if capture_mouse {
             execute!(out, event::EnableMouseCapture)?;
@@ -650,6 +720,8 @@ impl YggTerminal<Stdout> {
             size,
             last_was_cr: false,
             pending: Vec::with_capacity(16 * 1024),
+            pending_log: Vec::with_capacity(16 * 1024),
+            image_store,
             write_log: open_tui_write_log(std::env::var_os("YGG_TUI_WRITE_LOG")),
             in_synchronized_frame_depth: 0,
         })
@@ -657,13 +729,89 @@ impl YggTerminal<Stdout> {
 }
 
 impl<W: Write> YggTerminal<W> {
+    /// Conservative product policy: only Kitty gets live image placement.
+    /// iTerm2 has no targetable delete, so replay/destructive replacement would
+    /// leave stale pixels behind; the transcript uses semantic fallback instead.
+    pub(crate) fn image_capabilities(&self) -> ImageCapabilities {
+        let dimensions = *self.size.lock().expect("terminal size mutex poisoned");
+        let detected = ImageCapabilities::detect(
+            &sexy_terminal_capabilities(
+                TerminalCapabilities::detect(ColorMode::Auto, false),
+                dimensions,
+            ),
+            &ImageCapabilityOverrides::default(),
+        );
+        match detected.protocol() {
+            Some(ImageProtocol::Kitty) => detected,
+            _ => ImageCapabilities::forced(None, detected.cell_pixel_size()),
+        }
+    }
+
+    fn append_backend_bytes(&mut self, bytes: &[u8]) {
+        self.pending.extend_from_slice(bytes);
+        self.pending_log.extend_from_slice(bytes);
+    }
+
+    fn append_text(&mut self, text: &str) {
+        let normalized = normalize_line_endings(text, &mut self.last_was_cr);
+        self.append_backend_bytes(normalized.as_bytes());
+    }
+
+    fn append_image_anchor(&mut self, anchor: ImageAnchor) {
+        let Some(image) = self.image_store.get(anchor.id()) else {
+            return;
+        };
+        let Ok(command) = ImageProtocolEncoder::new(anchor.protocol(), ImageLimits::default())
+            .encode_place(anchor.id(), &image, anchor.layout())
+        else {
+            return;
+        };
+        // Reserve the complete opaque command and its fixed diagnostic marker
+        // before emitting either. An allocation failure therefore cannot leave
+        // a partial graphics sequence in a synchronized frame or an image
+        // write without its payload-free log replacement.
+        const LOG_MARKER: &[u8] = b"[terminal image omitted]";
+        if self.pending.try_reserve(command.encoded_len()).is_err()
+            || self.pending_log.try_reserve(LOG_MARKER.len()).is_err()
+        {
+            return;
+        }
+        if command.write_to(&mut self.pending).is_ok() {
+            self.pending_log.extend_from_slice(LOG_MARKER);
+        }
+    }
+
+    /// Replace only complete internal DCS anchors. Unknown or malformed DCS
+    /// controls are suppressed rather than forwarded; ordinary text before and
+    /// after them remains in the normal terminal text path.
+    fn append_render_data(&mut self, data: &str) {
+        let mut cursor = 0;
+        while let Some(relative_start) = data[cursor..].find("\x1bP") {
+            let start = cursor.saturating_add(relative_start);
+            self.append_text(&data[cursor..start]);
+            let body_start = start.saturating_add(2);
+            let Some(relative_end) = data[body_start..].find("\x1b\\") else {
+                // Never forward an unterminated DCS control from a semantic row.
+                return;
+            };
+            let end = body_start
+                .saturating_add(relative_end)
+                .saturating_add("\x1b\\".len());
+            if let Some(anchor) = ImageAnchor::parse(&data[start..end]) {
+                self.append_image_anchor(anchor);
+            }
+            cursor = end;
+        }
+        self.append_text(&data[cursor..]);
+    }
+
     fn flush_pending(&mut self) {
         if self.pending.is_empty() {
             return;
         }
         let _ = self.out.write_all(&self.pending);
         let log_failed = self.write_log.as_mut().is_some_and(|log| {
-            log.write_all(&self.pending)
+            log.write_all(&self.pending_log)
                 .and_then(|()| log.flush())
                 .is_err()
         });
@@ -671,6 +819,7 @@ impl<W: Write> YggTerminal<W> {
             self.write_log = None;
         }
         self.pending.clear();
+        self.pending_log.clear();
         let _ = self.out.flush();
     }
 
@@ -684,7 +833,7 @@ impl<W: Write> YggTerminal<W> {
     /// first: a stale background attribute must not turn an erased
     /// differential-render tail into a colored band.
     fn reset_rendition_before_clear(&mut self) {
-        self.pending.extend_from_slice(b"\x1b[0m");
+        self.append_backend_bytes(b"\x1b[0m");
     }
 }
 
@@ -716,8 +865,7 @@ impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
         // opt-in legacy inline extension can still write bare LF; raw mode
         // disables output post-processing, so normalize those at the backend
         // while preserving Pi's existing CRLF sequences.
-        let normalized = normalize_line_endings(data, &mut self.last_was_cr);
-        self.pending.extend_from_slice(normalized.as_bytes());
+        self.append_render_data(data);
 
         let begin_count = data.matches(SYNC_OUTPUT_BEGIN).count();
         let end_count = data.matches(SYNC_OUTPUT_END).count();
@@ -740,46 +888,58 @@ impl<W: Write> sexy_tui_rs::Terminal for YggTerminal<W> {
     }
 
     fn move_by(&mut self, lines: i16) {
+        let mut bytes = Vec::new();
         let result = match lines.cmp(&0) {
-            std::cmp::Ordering::Greater => queue!(self.pending, cursor::MoveDown(lines as u16)),
-            std::cmp::Ordering::Less => queue!(self.pending, cursor::MoveUp((-lines) as u16)),
+            std::cmp::Ordering::Greater => queue!(bytes, cursor::MoveDown(lines as u16)),
+            std::cmp::Ordering::Less => queue!(bytes, cursor::MoveUp((-lines) as u16)),
             std::cmp::Ordering::Equal => Ok(()),
         };
-        let _ = result;
+        if result.is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
     fn hide_cursor(&mut self) {
-        let _ = queue!(self.pending, cursor::Hide);
+        let mut bytes = Vec::new();
+        if queue!(bytes, cursor::Hide).is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
     fn show_cursor(&mut self) {
-        let _ = queue!(self.pending, cursor::Show);
+        let mut bytes = Vec::new();
+        if queue!(bytes, cursor::Show).is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
     fn clear_line(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = queue!(
-            self.pending,
-            terminal::Clear(terminal::ClearType::CurrentLine)
-        );
+        let mut bytes = Vec::new();
+        if queue!(bytes, terminal::Clear(terminal::ClearType::CurrentLine)).is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
     fn clear_from_cursor(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = queue!(
-            self.pending,
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        );
+        let mut bytes = Vec::new();
+        if queue!(bytes, terminal::Clear(terminal::ClearType::FromCursorDown)).is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
     fn clear_screen(&mut self) {
         self.reset_rendition_before_clear();
-        let _ = queue!(self.pending, terminal::Clear(terminal::ClearType::All));
+        let mut bytes = Vec::new();
+        if queue!(bytes, terminal::Clear(terminal::ClearType::All)).is_ok() {
+            self.append_backend_bytes(&bytes);
+        }
         self.flush_if_outside_frame();
     }
 
@@ -948,6 +1108,8 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
+            pending_log: Vec::new(),
+            image_store: TerminalImageStore::default(),
             write_log: open_tui_write_log(Some(path.clone().into_os_string())),
             in_synchronized_frame_depth: 0,
         };
@@ -958,6 +1120,50 @@ mod tests {
     }
 
     #[test]
+    fn image_anchors_emit_graphics_but_redact_the_write_log() {
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x01, 0x49, 0x44, 0x41, 0x54, 0x00,
+            0x28, 0x38, 0x7d, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+            0x60, 0x82,
+        ];
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ansi.log");
+        let writer = RecordingWriter::default();
+        let writes = writer.writes.clone();
+        let store = TerminalImageStore::default();
+        let id = ImageId::new(17).unwrap();
+        store.register(id, Arc::new(TerminalImage::from_slice(PNG).unwrap()));
+        let mut terminal = YggTerminal {
+            out: writer,
+            size: Arc::new(Mutex::new((80, 24))),
+            last_was_cr: false,
+            pending: Vec::new(),
+            pending_log: Vec::new(),
+            image_store: store,
+            write_log: open_tui_write_log(Some(path.clone().into_os_string())),
+            in_synchronized_frame_depth: 0,
+        };
+        let anchor = ImageAnchor::new(
+            ImageProtocol::Kitty,
+            id,
+            sexy_tui_rs::ImageLayout::new(1, 1).unwrap(),
+        )
+        .marker();
+
+        sexy_tui_rs::Terminal::write(&mut terminal, &format!("before{anchor}after"));
+
+        let output = String::from_utf8(writes.lock().unwrap().concat()).unwrap();
+        assert!(output.contains("\x1b_Ga=T"), "{output:?}");
+        assert!(!output.contains(&anchor), "{output:?}");
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"before[terminal image omitted]after"
+        );
+    }
+    #[test]
     fn synchronized_frame_is_one_atomic_backend_write_even_without_csi_2026_support() {
         let writer = RecordingWriter::default();
         let writes = writer.writes.clone();
@@ -967,6 +1173,8 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
+            pending_log: Vec::new(),
+            image_store: TerminalImageStore::default(),
             write_log: None,
             in_synchronized_frame_depth: 0,
         };
@@ -1003,6 +1211,8 @@ mod tests {
             size: Arc::new(Mutex::new((80, 24))),
             last_was_cr: false,
             pending: Vec::new(),
+            pending_log: Vec::new(),
+            image_store: TerminalImageStore::default(),
             write_log: None,
             in_synchronized_frame_depth: 0,
         };

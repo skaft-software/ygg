@@ -3065,7 +3065,7 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "ygg-agent"
-version = "0.6.7"
+version = "0.7.0-dev"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3100,7 +3100,7 @@ dependencies = [
 
 [[package]]
 name = "ygg-ai"
-version = "0.6.7"
+version = "0.7.0-dev"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3114,6 +3114,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite",
@@ -3124,7 +3125,7 @@ dependencies = [
 
 [[package]]
 name = "ygg-coding-agent"
-version = "0.6.7"
+version = "0.7.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3145,6 +3146,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "schemars",
  "semver",
@@ -3172,7 +3174,16 @@ dependencies = [
  "wiremock",
  "ygg-agent",
  "ygg-ai",
+ "ygg-migrate-types",
  "ygg-serve-backend",
+]
+
+[[package]]
+name = "ygg-migrate-types"
+version = "0.7.0-dev"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

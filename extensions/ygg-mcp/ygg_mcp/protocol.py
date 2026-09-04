@@ -133,12 +133,14 @@ class McpError(RuntimeError):
         *,
         permanent: bool = False,
         ambiguous: bool = False,
+        retry_after_ms: Optional[int] = None,
     ) -> None:
         super().__init__(safe_summary)
         self.code = code
         self.safe_summary = safe_summary
         self.permanent = permanent
         self.ambiguous = ambiguous
+        self.retry_after_ms = retry_after_ms
 
 
 class McpLaunchError(McpError):

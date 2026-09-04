@@ -66,7 +66,7 @@ Request:
 Response:
 
 ```json
-{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.6.7","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
+{"protocol_version":1,"request_id":"probe-1","seq":1,"type":"hello","data":{"sdk_version":"0.7.0-dev","protocol_version":1,"max_frame_bytes":1048576,"max_concurrent_runs":1,"commands":["hello","models","run","shutdown"],"features":{"streaming":true,"persistent_sessions":true,"seed_history":true,"typed_media_input":true,"typed_image_input":true,"typed_audio_input":true,"prompt_display_text":true,"inline_models":true,"tools":true,"skills":true,"extensions":true,"process_group_abort":true,"in_band_abort":false}}}
 ```
 
 Consumers must reject a protocol mismatch, unknown request ID, run/session ID
@@ -86,6 +86,40 @@ Each model reports `input_modalities` (including implied `text`) plus legacy
 is advertised only when both the model and selected wire protocol support native
 audio input. It is not an operating-system network sandbox and does not prevent
 a later run from calling its selected provider.
+
+### Host-owned GitHub Copilot
+
+GitHub Copilot is an embedding-only Rust integration. It is deliberately absent
+from `ygg --login`, environment/configuration provider setup, and the NDJSON
+`ygg-host` protocol: those surfaces cannot safely own the host's GitHub OAuth
+state. A standalone Ygg catalog therefore never advertises Copilot models.
+
+A Rust embedding application implements `ygg_sdk::provider::CopilotHost`, owns
+all device-flow/OAuth state and durable credential storage itself, and constructs
+`CopilotProvider` with an explicit `CopilotEndpoint`. The host can display the
+bounded `CopilotDeviceLogin` data returned by `begin_device_login`, poll until
+it reports `Authorized`, then call `register_models`. Registration checks host
+availability, exchanges a short-lived inference session, obtains the
+credential-free authenticated inventory, validates every model, and adds all
+routes atomically. Any login, exchange, discovery, validation, or catalog
+collision failure leaves Copilot models out of the picker.
+
+The host must provide a vetted HTTPS inference origin root (literal loopback
+HTTP is allowed only for deterministic tests; path/query/userinfo are rejected),
+short-lived `CopilotSession` values, and explicit `Protocol` metadata for every
+discovered model. `OpenAiChat` uses the Chat Completions route and
+`OpenAiResponses` uses the Responses route; other protocols are rejected and
+model names never select a codec. The request resolver exchanges when no
+session is installed and refreshes a session within its safety skew. Session
+credentials and dynamic headers remain in memory behind `Auth::Dynamic`, are
+marked sensitive on requests, redact from diagnostics, and are not part of
+provider definitions, catalog metadata, or persistence. Hosts must likewise
+keep credential values out of model IDs and display labels.
+
+This seam does not implement GitHub's live OAuth endpoints, GitHub Enterprise
+endpoint policy, or an interactive CLI flow. Those are intentionally
+host-owned; use the Rust SDK integration when a host can implement and test
+that policy.
 
 ## Run requests
 
@@ -174,7 +208,9 @@ or deleted.
 
 A successful run normally emits:
 
-1. `accepted` with the resolved model, native session path, and registered tools;
+1. `accepted` with the resolved model, native session path, registered tools, and
+   a secret-safe `effective_tool_policy` snapshot. Its values include capability
+   limits and source layers; it excludes raw workspace and shell paths.
 2. `started`;
 3. zero or more streaming events;
 4. `settled`; and
@@ -183,12 +219,32 @@ A successful run normally emits:
 Streaming events currently include:
 
 - `model_delta` and `output_media`;
+- opt-in `provider_lifecycle` readiness telemetry;
 - `provider_retry` and `candidate_rejected`;
-- `tool_start`, `tool_progress`, and `tool_finish`;
+- `tool_start`, `tool_policy`, `tool_progress`, and `tool_finish`; `tool_policy`
+  carries secret-safe allowed/denied admission metadata and stable denial codes,
+  never command contents or raw shell paths;
 - `model_step` usage/cost accounting;
 - `steering_delivered` and `follow_up_delivered`;
 - `compaction_start` and `compaction_finish`; and
 - `extension_notification`.
+
+`accepted.data.effective_tool_policy` and `tool_policy.data.decision.policy`
+share the same schema. `effect_policy`, `workspace_confinement`, `allow_edit`,
+`allow_write`, `allow_process`, `allow_shell`, `shell_path`, `bash_timeout_ms`,
+`max_output_bytes`, and `allow_remote_read` are each
+`{ "value": ..., "source": ... }`, with a source of `default`, `config`,
+`environment`, `cli`, or `host_request`. `shell_path.value` reports only
+`{ "selection": "configured" | "system_bash" | "path_bash" | "sh_fallback" |
+"unavailable" }`; it contains no shell path, digest, or cross-run identifier.
+A decision contains an optional effect, `allowed`, `authorization` when allowed,
+and a stable `denial_code` when denied. Allowed evidence is emitted only after
+all host hooks and reservation commit gates complete.
+
+`provider_lifecycle.data` has a `state` of `queued`, `loading`, or `ready` and
+nullable bounded `detail`. It is emitted only when the selected configured
+endpoint explicitly opted in; it is advisory endpoint telemetry, never model
+output or durable session content.
 
 `final_result.data` contains `status`, `output`, `error`, `filesChanged`,
 `toolCalls`, `steps`, and `sessionFile`. Status is `completed`, `blocked`, or

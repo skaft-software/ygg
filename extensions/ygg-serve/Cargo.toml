@@ -27,7 +27,7 @@ portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-ygg-agent = { version = "=0.6.7", path = "../../crates/ygg-agent" }
+ygg-agent = { version = "=0.7.0-dev", path = "../../crates/ygg-agent" }
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
@@ -38,6 +38,20 @@ tokio-tungstenite = "0.29"
 
 [lints.rust]
 missing_docs = "warn"
+
+[profile.ci-test]
+# This independent Cargo workspace uses the same bounded CI artifact policy as
+# the root workspace.
+inherits = "test"
+debug = "limited"
+incremental = false
+
+[profile.profiling]
+# Preserve release-like optimization while keeping full profiler symbols.
+inherits = "release"
+debug = "full"
+lto = "off"
+strip = "none"
 
 # Keep the audited lopdf 0.42.0 parser compatible with the Rust 1.86 MSRV;
 # see the vendored patch's source note for the one syntax-only change.

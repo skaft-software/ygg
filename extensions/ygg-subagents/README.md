@@ -2,7 +2,7 @@
 
 `ygg-subagents` is a small API `0.2` executable extension for Claude Code-like background workers. It launches named, single-purpose child conversations through Ygg's **host-owned `agent_sessions` service**. It is not an agent team, graph/recipe runtime, swarm, hosted-agent scheduler, or second Agent loop.
 
-Version `0.2.0` targets exactly Ygg `0.6.7`.
+Version `0.2.0` targets exactly Ygg `0.7.0-dev`.
 
 ## Safety model
 

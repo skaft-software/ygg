@@ -18,6 +18,9 @@ use sexy_tui_rs::{Color as TuiColor, TextStyle as TuiTextStyle};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
 use tokio::sync::{mpsc, oneshot};
+use ygg_agent::extension_runtime::{
+    ExtensionRuntimeDomain, ExtensionRuntimeManager, ExtensionTrustDomain,
+};
 use ygg_agent::{
     AgentEvent, CompactionReason, ContextBreakdown as AgentContextBreakdown,
     ContextSnapshot as AgentContextSnapshot, Entry, EntryId, EntryValue, GoalDecision, GoalDriver,
@@ -67,7 +70,9 @@ use ygg_serve_backend::{
     PROTOCOL_VERSION,
 };
 
-use crate::app::bootstrap::{build_app, rebuild_app, LaunchSelection, SessionSelection};
+use crate::app::bootstrap::{
+    build_app_with_runtime_manager, rebuild_app, LaunchSelection, SessionSelection,
+};
 use crate::app::{reasoning_label, supported_levels_with_subagents, App, Reconfig};
 use crate::commands;
 use crate::compaction::attempt_compaction;
@@ -6287,6 +6292,30 @@ async fn shutdown_worker_app(app: &mut Option<App>) {
     }
 }
 
+fn serve_runtime_manager(plan: &WorkerPlan) -> anyhow::Result<ExtensionRuntimeManager> {
+    // Serve never reuses the ordinary-host partition. Hashing both stable
+    // project identity and the finite authority profile provides an explicit,
+    // path-free trust partition while the runtime domain independently binds
+    // the canonical workspace.
+    let project = plan
+        .project_id
+        .as_ref()
+        .map(|project| project.as_str())
+        .unwrap_or("unbound");
+    let project_digest = format!("{:x}", Sha256::digest(project.as_bytes()));
+    let authority = format!("{:?}", plan.authority);
+    let authority_digest = format!("{:x}", Sha256::digest(authority.as_bytes()));
+    let trust = ExtensionTrustDomain::new(format!(
+        "serve-{}-{}",
+        &project_digest[..32],
+        &authority_digest[..32]
+    ))
+    .map_err(anyhow::Error::msg)?;
+    let domain =
+        ExtensionRuntimeDomain::serve(&plan.config.workspace, trust).map_err(anyhow::Error::msg)?;
+    Ok(ExtensionRuntimeManager::new(domain))
+}
+
 fn build_worker_app(plan: &mut WorkerPlan) -> anyhow::Result<App> {
     let mut config = plan.config.clone();
     config.resume = match &plan.launch.session {
@@ -6307,7 +6336,12 @@ fn build_worker_app(plan: &mut WorkerPlan) -> anyhow::Result<App> {
     {
         boot.set_prepared_session(session);
     }
-    build_app(boot, plan.launch.clone(), system)
+    build_app_with_runtime_manager(
+        boot,
+        plan.launch.clone(),
+        system,
+        Some(serve_runtime_manager(plan)?),
+    )
 }
 
 fn command_name_is_claimed_by_builtin(name: &str) -> bool {
@@ -8343,6 +8377,10 @@ async fn project_agent_event(
 ) -> Result<Option<HostRunOutcome>, ServiceError> {
     match agent_event {
         AgentEvent::TurnStarted => {}
+        AgentEvent::ProviderLifecycle { .. } => {
+            // Serve's durable item protocol intentionally has no endpoint-status
+            // item. Keep transport readiness out of session projections.
+        }
         AgentEvent::OutputDelta { channel, text } => {
             let text = bounded_text(&text, MAX_ITEM_TEXT_BYTES);
             let turn_id = projection.turn_id(run_id)?;
@@ -8452,6 +8490,12 @@ async fn project_agent_event(
                 }))
                 .await
                 .map_err(|_| ServiceError::Unavailable)?;
+        }
+        AgentEvent::ToolPolicyDecision { .. } => {
+            // The Serve protocol currently has no policy-decision item or
+            // delta. ToolFinished still projects the corresponding denial;
+            // keep this explicit so adding agent-side policy provenance does
+            // not silently change the graphical projection contract.
         }
         AgentEvent::ToolProgress { id, progress } => {
             project_tool_progress(id, progress, run_id, projection, events).await?;
@@ -9670,7 +9714,7 @@ async fn project_tool_progress(
                 .saturating_add(bytes.len() as u64);
             publish_tool_progress(&id.0, projection, events).await?;
         }
-        ToolProgress::Status(_) => {}
+        ToolProgress::Status(_) | ToolProgress::Decoration(_) => {}
         ToolProgress::Dropped { bytes, .. } => {
             let entry = projection.tool_progress.entry(id.0.clone()).or_default();
             entry.dropped_output_bytes = entry.dropped_output_bytes.saturating_add(bytes);
@@ -11719,6 +11763,7 @@ mod tests {
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,
             plain: false,
+            show_images: false,
             session_dir: directory.join("sessions"),
             compaction: crate::config::CompactionPolicy::default(),
             max_cost_microdollars: None,
@@ -11739,6 +11784,8 @@ mod tests {
             extension_activation_overridden: false,
             trusted_extensions: Vec::new(),
             invocation_trusted_extensions: Vec::new(),
+            experimental_streamable_http_mcp: false,
+            extension_flag_values: Default::default(),
             tools: crate::config::ToolPolicy::default(),
             telemetry: None,
             context_files: false,
@@ -14934,6 +14981,7 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                     id: ToolCallId(call_id.to_owned()),
                     name: name.to_owned(),
                     arguments_json: serde_json::to_string(&arguments).unwrap(),
+                    argument_error: None,
                 })],
                 model: ModelId("test-model".into()),
                 protocol: Protocol::AnthropicMessages,
@@ -15392,6 +15440,7 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                     id: ToolCallId("call-write-replaced".into()),
                     name: "write".into(),
                     arguments_json: serde_json::to_string(&replaced.arguments).unwrap(),
+                    argument_error: None,
                 })],
                 model: ModelId("test-model".into()),
                 protocol: Protocol::AnthropicMessages,
@@ -16567,6 +16616,7 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                         "command": hostile_command,
                     }))
                     .unwrap(),
+                    argument_error: None,
                 })],
                 model: ModelId("test-model".into()),
                 protocol: Protocol::AnthropicMessages,
@@ -16981,6 +17031,7 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                     id: ToolCallId("call-legacy-semantic".into()),
                     name: "bash".into(),
                     arguments_json: serde_json::to_string(&arguments).unwrap(),
+                    argument_error: None,
                 })],
                 model: ModelId("test-model".into()),
                 protocol: Protocol::AnthropicMessages,
@@ -17057,6 +17108,7 @@ printf '%s' '{"number":124,"url":"https://github.com/skaft-software/ygg/pull/124
                     id: ToolCallId("call-semantic-replay".into()),
                     name: "bash".into(),
                     arguments_json: serde_json::to_string(&arguments).unwrap(),
+                    argument_error: None,
                 })],
                 model: ModelId("test-model".into()),
                 protocol: Protocol::AnthropicMessages,

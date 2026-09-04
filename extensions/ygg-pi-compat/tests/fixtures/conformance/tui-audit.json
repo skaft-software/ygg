@@ -1,0 +1,274 @@
+{
+  "schema_version": 1,
+  "profile": "pi-0.84.4",
+  "fixtures": [
+    {
+      "id": "tui:test-autocomplete-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/autocomplete.test.ts",
+      "area": "autocomplete",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-bug-regression-isimageline-startswith-bug-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/bug-regression-isimageline-startswith-bug.test.ts",
+      "area": "terminal-image",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-editor-history-keybindings-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/editor-history-keybindings.test.ts",
+      "area": "editor",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-editor-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/editor.test.ts",
+      "area": "editor",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-fuzzy-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/fuzzy.test.ts",
+      "area": "autocomplete",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-input-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/input.test.ts",
+      "area": "input",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-keybindings-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/keybindings.test.ts",
+      "area": "keybindings",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-keys-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/keys.test.ts",
+      "area": "keys",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-latex-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/latex.test.ts",
+      "area": "markdown",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-layout-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/layout.test.ts",
+      "area": "layout",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-markdown-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/markdown.test.ts",
+      "area": "markdown",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-native-module-path-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/native-module-path.test.ts",
+      "area": "native-module",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-overlay-non-capturing-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/overlay-non-capturing.test.ts",
+      "area": "overlay",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-overlay-options-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/overlay-options.test.ts",
+      "area": "overlay",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-overlay-short-content-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/overlay-short-content.test.ts",
+      "area": "overlay",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-regression-overlay-cjk-boundary-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/regression-overlay-cjk-boundary.test.ts",
+      "area": "overlay",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-regression-regional-indicator-width-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/regression-regional-indicator-width.test.ts",
+      "area": "width",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-select-list-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/select-list.test.ts",
+      "area": "widgets",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-settings-list-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/settings-list.test.ts",
+      "area": "widgets",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-stdin-buffer-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/stdin-buffer.test.ts",
+      "area": "stdin-buffer",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tab-width-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tab-width.test.ts",
+      "area": "width",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-terminal-colors-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/terminal-colors.test.ts",
+      "area": "terminal",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-terminal-image-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/terminal-image.test.ts",
+      "area": "terminal-image",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-terminal-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/terminal.test.ts",
+      "area": "terminal",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-truncate-to-width-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/truncate-to-width.test.ts",
+      "area": "width",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-truncated-text-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/truncated-text.test.ts",
+      "area": "widgets",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tui-alt-screen-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tui-alt-screen.test.ts",
+      "area": "tui",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tui-cell-size-input-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tui-cell-size-input.test.ts",
+      "area": "tui",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tui-overlay-style-leak-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tui-overlay-style-leak.test.ts",
+      "area": "overlay",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tui-render-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tui-render.test.ts",
+      "area": "tui",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-tui-shrink-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/tui-shrink.test.ts",
+      "area": "tui",
+      "rust_equivalents": [
+        "tests/pi_tui_render.rs"
+      ],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-word-navigation-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/word-navigation.test.ts",
+      "area": "editor",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    },
+    {
+      "id": "tui:test-wrap-ansi-test-ts",
+      "kind": "tui_audit",
+      "upstream": "test/wrap-ansi.test.ts",
+      "area": "width",
+      "rust_equivalents": [],
+      "assertion": "The row is explicitly audited as a semantic-boundary divergence, not silently claimed as a Pi component port."
+    }
+  ]
+}

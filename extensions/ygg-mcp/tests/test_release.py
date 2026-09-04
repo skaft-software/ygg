@@ -24,10 +24,10 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-mcp")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.7")
+        self.assertEqual(manifest["requires_ygg"], "=0.7.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-mcp")
         self.assertTrue(manifest["capabilities"]["process"])
-        self.assertFalse(manifest["capabilities"]["network"])
+        self.assertTrue(manifest["capabilities"]["network"])
         self.assertTrue(manifest["contributes"]["presentation"])
         self.assertEqual(manifest["contributes"]["commands"], ["mcp"])
 
@@ -41,6 +41,7 @@ class ReleaseSmokeTests(unittest.TestCase):
             "vendor/ygg_extension/extension.py",
             "vendor/ygg_extension/protocol.py",
             "ygg_mcp/runtime.py",
+            "ygg_mcp/streamable_http.py",
             "config.schema.json",
             "config.example.json",
             "fixtures/configs/real-local.json",
@@ -86,6 +87,88 @@ class ReleaseSmokeTests(unittest.TestCase):
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertIn("valid MCP configuration", completed.stdout)
+
+    def test_remote_check_config_requires_the_owner_switch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "remote.json"
+            config.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "servers": {
+                            "remote": {
+                                "transport": "streamable-http",
+                                "url": "https://mcp.example.invalid/mcp",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config.chmod(0o600)
+            staged_entrypoint = root / "ygg-mcp"
+            staged_entrypoint.write_bytes((ROOT / "ygg-mcp").read_bytes())
+            staged_entrypoint.chmod(0o755)
+            environment = os.environ.copy()
+            environment["YGG_EXTENSION_DIR"] = str(ROOT)
+            command = [
+                str(staged_entrypoint),
+                "--config",
+                str(config),
+                "--check-config",
+            ]
+            denied = subprocess.run(
+                command,
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            abbreviated = subprocess.run(
+                [
+                    str(staged_entrypoint),
+                    "--experimental-streamable-http-m",
+                    "--config",
+                    str(config),
+                    "--check-config",
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            allowed = subprocess.run(
+                [
+                    str(staged_entrypoint),
+                    "--experimental-streamable-http-mcp",
+                    "--config",
+                    str(config),
+                    "--check-config",
+                ],
+                cwd=root,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        self.assertNotEqual(denied.returncode, 0)
+        self.assertIn("process owner", denied.stderr)
+        self.assertNotEqual(abbreviated.returncode, 0)
+        self.assertIn("unrecognized arguments", abbreviated.stderr)
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertIn("valid MCP configuration", allowed.stdout)
 
     def test_json_schemas_and_every_fixture_are_strict_json(self):
         json.loads((ROOT / "config.schema.json").read_text(encoding="utf-8"))

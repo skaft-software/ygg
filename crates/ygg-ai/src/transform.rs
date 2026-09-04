@@ -347,6 +347,14 @@ fn transform_assistant_part(
 ) -> Option<AssistantPart> {
     match part {
         AssistantPart::Text(text) => Some(AssistantPart::Text(text.clone())),
+        AssistantPart::ProviderMetadata(metadata)
+            if source.model == target.spec.id
+                && source.protocol == crate::types::Protocol::GoogleGenerativeAi
+                && target.spec.protocol == crate::types::Protocol::GoogleGenerativeAi =>
+        {
+            Some(AssistantPart::ProviderMetadata(metadata.clone()))
+        }
+        AssistantPart::ProviderMetadata(_) => None,
         AssistantPart::ToolCall(call) => {
             let mut call = call.clone();
             call.id = normalize_id(&call.id);
@@ -398,6 +406,12 @@ fn transform_assistant_part_owned(
 ) -> Option<AssistantPart> {
     match part {
         AssistantPart::Text(_) => Some(part),
+        AssistantPart::ProviderMetadata(metadata)
+            if same_model && target.spec.protocol == crate::types::Protocol::GoogleGenerativeAi =>
+        {
+            Some(AssistantPart::ProviderMetadata(metadata))
+        }
+        AssistantPart::ProviderMetadata(_) => None,
         AssistantPart::ToolCall(mut call) => {
             call.id = normalize_id_owned(call.id);
             Some(AssistantPart::ToolCall(call))
@@ -572,6 +586,7 @@ mod tests {
                 auth: crate::Auth::none(),
                 default_headers: http::HeaderMap::new(),
                 transport: crate::types::EndpointTransport::Http,
+                runtime: crate::types::RequestRuntime::default(),
                 timeout: std::time::Duration::from_secs(1),
             }),
         }
@@ -582,6 +597,7 @@ mod tests {
             id: ToolCallId(id.to_string()),
             name: "read".to_string(),
             arguments_json: "{}".to_string(),
+            argument_error: None,
         })
     }
 

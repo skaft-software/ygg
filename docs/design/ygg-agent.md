@@ -6,17 +6,18 @@
 
 ## Commit and cancellation invariants
 
-1. Streaming deltas are provisional and never enter the session.
+1. Streaming deltas are provisional and never enter the session. Opt-in provider lifecycle feedback is likewise forwarded only as transient `AgentEvent` telemetry; it does not mutate context, assembled assistant content, durable telemetry, or session records.
 2. A complete assistant message is persisted before any emitted tool is executed.
 3. Each tool result is persisted immediately after its execution outcome is committed.
-4. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
-5. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
-6. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
-7. Optional telemetry is an observer outside the session ledger. When installed,
+4. A completed call marked schema-invalid by `ygg-ai`'s request snapshot receives a static bounded paired error; it never reaches speculative execution, effect classification, hooks, or the tool implementation.
+5. Crash replay requires both `ReplaySafety::Safe` and an exact host classification of `Pure` or `WorkspaceRead`. Every other unresolved call becomes an indeterminate error and is not executed.
+6. One level-triggered abort signal is selected against provider open/body consumption, retries, tools, and autonomous compaction. Cancellation wins same-poll races. A cancelled compaction persists neither usage nor summary.
+7. Every driven run emits exactly one `RunFinished` and one durable checkpoint.
+8. Optional telemetry is an observer outside the session ledger. When installed,
    it receives an opaque run-start hook and coarse request/tool/compaction
    boundaries; it records hashes and bounded measurements, never raw prompts,
    arguments, results, or provider payloads.
-8. `Agent::prompt_without_tools` starts with a sticky tool-free policy.
+9. `Agent::prompt_without_tools` starts with a sticky tool-free policy.
    `RunControl::finish_now` persists its input at the next safe turn boundary and
    makes that policy sticky for the remainder of the run. Subsequent provider
    requests contain no tool schemas and set `ToolChoice::None`; calls emitted by
@@ -36,9 +37,25 @@ already-running executable.
 
 Workspace-mutation approval creates a random, short-lived capability bound to the canonical intent digest. Tokens are atomically single-use, stored by one-way verifier, redacted in debug output, and never supplied to tools. Dispatch reserves admission before `before_tool_call`, then commits and consumes the exact grant only after all hooks pass and immediately before calling `Tool::execute`. Hook denial or cancellation drops and revokes an uncommitted reservation; cancellation after commit cannot restore it. `after_tool_call` runs only for a committed effect.
 
-Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A denied call is returned to the provider as a paired tool error without invoking hooks or executable code.
+Sequential, parallel, and crash-recovery dispatch all use this boundary. Static `ToolConcurrency::Parallel` and `ReplaySafety::Safe` declarations are intersected with the exact host classification: only `Pure` and `WorkspaceRead` calls may run in a parallel batch or be replayed after a crash. A broker or argument denial is returned to the provider as a paired tool error before hooks or executable code; a trusted hook may veto an otherwise admitted call before dispatch.
 
 The broker is a deterministic admission reference monitor, not an OS sandbox. Controlled intentionally denies effect classes that still lack isolation or dedicated brokers, while allowing safe read-only `bash` commands through the `Controlled` process channel; `ControlledBashApproval` (selected by `--safe-mode`) confirms every `bash` call. The default `UnsafeHost` policy lets classified command and process effects use ambient host authority.
+
+`ToolPolicyDecision` is secret-safe host evidence emitted after `ToolStarted` and
+before its matching `ToolFinished`. An allowed decision is finalized only after
+trusted hooks and reservation commit succeed, not when a reservation is first
+created. Stable denials distinguish `secondary_hook_denied`,
+`effect_reservation_commit_denied`, and `invalid_tool_arguments`; their
+model-visible messages never include hook, parser, broker, argument, or approval
+details.
+
+Each decision carries an `EffectiveToolPolicy` snapshot. `effect_policy`,
+`workspace_confinement`, `allow_edit`, `allow_write`, `allow_process`,
+`allow_shell`, `shell_path`, `bash_timeout_ms`, `max_output_bytes`, and
+`allow_remote_read` are `{ value, source }` values. `shell_path.value.selection`
+is only one of `configured`, `system_bash`, `path_bash`, `sh_fallback`, or
+`unavailable`, derived by the same resolver used for Bash execution; it contains
+neither a path nor a digest.
 
 ## Sessions
 
@@ -79,6 +96,16 @@ compatibility mode. Children
 can message peers, steer active work, queue messages for an idle worker, receive
 follow-up runs, wait without lost notifications, and spawn within the remaining
 depth and concurrency bounds.
+
+Each child snapshot, `agent_sessions` spawn/list result, and durable spawn record
+also includes its `effective_tool_policy` and bounded
+`orchestration_provenance`. The latter records only `parent_inherited` or
+`child_override` for sandbox, effect policy, approval authority, environment,
+working directory, extension trust, tool scope, and execution limits. An
+extension-requested child scope or limit is a host-validated `child_override`;
+it does not transfer sandbox, broker, approval, environment, cwd, or trust
+control to the extension. No paths, environment values, approval tokens,
+extension identifiers, or model arguments are included.
 
 The default team limit is ten concurrent agents including the root, depth two,
 and thirty-two total agents during each owning run. Host

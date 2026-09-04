@@ -480,6 +480,22 @@ pub struct App {
     pub goal_session_id: String,
 }
 
+fn catalog_route_matches_active_model(catalog: &ModelCatalog, active: &Model) -> bool {
+    let Ok(current) = catalog.resolve(&active.spec.id) else {
+        return false;
+    };
+    current.endpoint.id == active.endpoint.id
+        && current.spec.id == active.spec.id
+        && current.spec.endpoint == active.spec.endpoint
+        && current.spec.api_name == active.spec.api_name
+        && current.spec.display_name == active.spec.display_name
+        && current.spec.protocol == active.spec.protocol
+        && current.spec.capabilities == active.spec.capabilities
+        && current.spec.limits == active.spec.limits
+        && current.spec.pricing == active.spec.pricing
+        && current.spec.cache == active.spec.cache
+}
+
 impl App {
     /// Whether this application has the owner-bound subagent observer needed
     /// before Ultra may be selected or submitted.
@@ -498,10 +514,44 @@ impl App {
     pub fn current_tool_schema_tokens(&self) -> u64 {
         crate::app::bootstrap::tool_schema_reserve(&self.agent.registered_tool_definitions())
     }
+
+    /// Synchronizes secret-free API 0.3 provider declarations at a product
+    /// catalog boundary after extension activity has been observed.
+    pub fn synchronize_extension_provider_catalog(&mut self) -> Vec<String> {
+        self.executable_extensions
+            .synchronize_provider_catalog(&mut self.catalog, &self.client)
+    }
+
+    /// Reconciles provider declarations at the request boundary and rejects a
+    /// model whose catalog route was withdrawn or replaced.
+    ///
+    /// Projection cleanup removes the old host-stream transport. Without this
+    /// fence, an `Agent` retaining that inert local endpoint could fall through
+    /// to its placeholder localhost HTTP URL after an extension mutation.
+    pub fn synchronize_extension_provider_catalog_for_request(
+        &mut self,
+    ) -> anyhow::Result<Vec<String>> {
+        let diagnostics = self.synchronize_extension_provider_catalog();
+        let _ = self.catalog.resolve(&self.model.spec.id).map_err(|_| {
+            anyhow::anyhow!(
+                "the active model {} is no longer available after an extension provider update; select a model before prompting",
+                self.model.spec.id.0
+            )
+        })?;
+        if !catalog_route_matches_active_model(&self.catalog, &self.model) {
+            anyhow::bail!(
+                "the active model {} route changed after an extension provider update; select it again before prompting",
+                self.model.spec.id.0
+            );
+        }
+        Ok(diagnostics)
+    }
 }
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.executable_extensions
+            .clear_provider_catalog(&mut self.catalog, &self.client);
         // The catalog is disposable: shutdown must never fail because this
         // best-effort projection could not be refreshed.
         let _ = self
@@ -515,7 +565,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use ygg_ai::{ReasoningCapability, ReasoningEffort, ReasoningEffortBudgets};
+    use ygg_ai::{EndpointId, ReasoningCapability, ReasoningEffort, ReasoningEffortBudgets};
 
     fn model_with(capability: Option<ReasoningCapability>) -> Model {
         let catalog = ModelCatalog::builtin().unwrap();
@@ -528,6 +578,26 @@ mod tests {
             spec: Arc::new(spec),
             endpoint: base.endpoint,
         }
+    }
+
+    #[test]
+    fn active_model_route_fails_closed_when_catalog_withdraws_or_replaces_it() {
+        let mut catalog = ModelCatalog::builtin().unwrap();
+        let model = catalog
+            .resolve(&ModelId("gpt-5.4-mini-responses".into()))
+            .unwrap();
+        assert!(catalog_route_matches_active_model(&catalog, &model));
+
+        assert!(catalog.remove_model_if_endpoint(&model.spec.id, &model.endpoint.id));
+        assert!(!catalog_route_matches_active_model(&catalog, &model));
+
+        let mut endpoint = (*model.endpoint).clone();
+        endpoint.id = EndpointId("active-route-replacement".into());
+        catalog.register_endpoint(endpoint.clone()).unwrap();
+        let mut specification = (*model.spec).clone();
+        specification.endpoint = endpoint.id.clone();
+        catalog.register_model(specification).unwrap();
+        assert!(!catalog_route_matches_active_model(&catalog, &model));
     }
 
     #[test]
