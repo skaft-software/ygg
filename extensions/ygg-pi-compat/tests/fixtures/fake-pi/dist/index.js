@@ -13,6 +13,15 @@ const fixtureEvents = (process.env.YGG_PI_FIXTURE_EVENTS ?? "")
   .split(",")
   .map((event) => event.trim())
   .filter(Boolean);
+const fixtureProviderRegistrationDelay = Number.parseInt(
+  process.env.YGG_PI_FIXTURE_PROVIDER_REGISTER_DELAY_MS ?? "0",
+  10,
+);
+const providerRegistrationDelay = Number.isSafeInteger(fixtureProviderRegistrationDelay)
+  && fixtureProviderRegistrationDelay >= 0
+  ? fixtureProviderRegistrationDelay
+  : 0;
+const fixtureProviderAuth = process.env.YGG_PI_FIXTURE_PROVIDER_AUTH ?? "host_credential";
 let fixtureCancellationObserved = false;
 
 function fixtureModeForPath(path) {
@@ -71,7 +80,9 @@ function fixtureProviderConfig(revision = 1) {
   return {
     name: revision === 1 ? "Fixture provider" : "Fixture provider refreshed",
     api: "openai-completions",
-    yggAuth: { kind: "host_credential", subject: "fixture-credential" },
+    yggAuth: fixtureProviderAuth === "none"
+      ? { kind: "none" }
+      : { kind: "host_credential", subject: "fixture-credential" },
     models: [
       {
         id: "fixture-model",
@@ -258,13 +269,20 @@ export class ExtensionRunner {
     // Retain the historical name for API 0.2 public-surface probes.
     this.providerBindings = providerActions;
     this.providerActions = providerActions;
-    if (this.fixtureMode === "provider") {
-      providerActions.registerProvider("fixture-provider", fixtureProviderConfig(1));
-    } else if (this.fixtureMode === "unsafe-provider") {
-      providerActions.registerProvider("unsafe-provider", {
-        ...fixtureProviderConfig(1),
-        apiKey: "must-not-cross-the-host-boundary",
-      });
+    const registerInitialProvider = () => {
+      if (this.fixtureMode === "provider") {
+        providerActions.registerProvider("fixture-provider", fixtureProviderConfig(1));
+      } else if (this.fixtureMode === "unsafe-provider") {
+        providerActions.registerProvider("unsafe-provider", {
+          ...fixtureProviderConfig(1),
+          apiKey: "must-not-cross-the-host-boundary",
+        });
+      }
+    };
+    if (providerRegistrationDelay > 0 && this.fixtureMode === "provider") {
+      setTimeout(registerInitialProvider, providerRegistrationDelay);
+    } else {
+      registerInitialProvider();
     }
   }
 

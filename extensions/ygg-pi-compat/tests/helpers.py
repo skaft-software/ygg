@@ -174,6 +174,7 @@ class BridgeProcess:
         source_fingerprint: str | None = None,
         fixture_mode: str | None = None,
         fixture_events: list[str] | None = None,
+        fixture_environment: dict[str, str] | None = None,
         strict_identity: bool = False,
         aggregate_digest: str = "a" * 64,
         command_name: str = "pi",
@@ -195,6 +196,8 @@ class BridgeProcess:
             environment["YGG_PI_FIXTURE_MODE"] = fixture_mode
         if fixture_events is not None:
             environment["YGG_PI_FIXTURE_EVENTS"] = ",".join(fixture_events)
+        if fixture_environment is not None:
+            environment.update(fixture_environment)
         selected_extensions = [Path(item).resolve() for item in (extensions or [extension])]
         selected_agent_dir = Path(agent_dir or (ROOT / ".test-pi-agent")).absolute()
         selected_manifest = Path(manifest_path or (FIXTURES / "extension.toml")).absolute()

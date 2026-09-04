@@ -5516,6 +5516,23 @@ pub async fn run_interactive(mut boot: Bootstrap) -> anyhow::Result<()> {
                     estimate_next_request_tokens(&app, &composed.parts),
                     context_window(&app.model),
                 );
+                // Do this directly at the request boundary. A provider update
+                // can remove the old host-stream transport; never let an Agent
+                // retaining its inert endpoint fall through to localhost.
+                let provider_diagnostics =
+                    match app.synchronize_extension_provider_catalog_for_request() {
+                        Ok(diagnostics) => diagnostics,
+                        Err(error) => {
+                            app.agent.set_system_prompt(app.system.clone());
+                            shell.restore_composed(retry_composed);
+                            shell.error(format!("prompt was not saved: {error}"));
+                            shell.render();
+                            continue;
+                        }
+                    };
+                for diagnostic in provider_diagnostics {
+                    shell.notice(diagnostic);
+                }
 
                 let mut run = {
                     let user_input = composed.into_user_input();

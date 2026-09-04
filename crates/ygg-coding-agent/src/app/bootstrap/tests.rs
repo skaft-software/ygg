@@ -2491,6 +2491,110 @@ fn initial_build_records_configuration_provenance() {
     ));
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn unknown_api_03_provider_model_preflights_restarts_and_reloads_with_fresh_routes() {
+    let node = std::process::Command::new("node")
+        .arg("--version")
+        .status()
+        .expect("node is required for the checked-in Pi bridge fixture");
+    assert!(
+        node.success(),
+        "node must be usable for the Pi bridge fixture"
+    );
+
+    let directory = tempfile::tempdir().unwrap();
+    let extension_root = directory.path().join("extensions");
+    let provider = extension_root.join("pi-provider");
+    std::fs::create_dir_all(&provider).unwrap();
+    let launcher = provider.join("launch-bridge.sh");
+    std::fs::write(&launcher, "#!/bin/sh\nexec node \"$@\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&launcher, permissions).unwrap();
+    let repository = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("coding-agent crate has a repository root")
+        .to_owned();
+    let bridge = repository
+        .join("extensions/ygg-pi-compat/bridge.mjs")
+        .to_string_lossy()
+        .into_owned();
+    let provider_extension = repository
+        .join("extensions/ygg-pi-compat/tests/fixtures/provider-extension.mjs")
+        .to_string_lossy()
+        .into_owned();
+    let fake_pi = repository
+        .join("extensions/ygg-pi-compat/tests/fixtures/fake-pi")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(
+        provider.join("extension.toml"),
+        format!(
+            r#"name = "pi-provider"
+version = "0.3.0"
+api_version = "0.3"
+
+[entrypoint]
+command = "launch-bridge.sh"
+args = [{bridge:?}, "--extension", {provider_extension:?}, "--pi-package", {fake_pi:?}, "--api-version", "0.3"]
+env = {{ YGG_PI_FIXTURE_API_VERSION = "0.3", YGG_PI_FIXTURE_PROVIDER_AUTH = "none", YGG_PI_FIXTURE_PROVIDER_REGISTER_DELAY_MS = "75" }}
+
+[contributes]
+tools = ["pi"]
+providers = true
+"#
+        ),
+    )
+    .unwrap();
+
+    let model_id = "fixture-provider/fixture-model";
+    let mut config = config(directory.path(), Some(model_id));
+    config.effect_policy = ygg_agent::EffectPolicy::UnsafeHost;
+    config.extension_paths = vec![extension_root];
+    config.enabled_extensions = vec!["pi-provider".into()];
+    config.invocation_trusted_extensions = vec!["pi-provider".into()];
+
+    let boot = bootstrap(config).unwrap();
+    boot.preflight_extension_providers().unwrap();
+    let preflight_catalog = boot.catalog_with_extension_providers();
+    let preflight_status = boot
+        .prestarted_extensions
+        .borrow()
+        .as_ref()
+        .map(|(_, extensions)| (extensions.status_summary(), extensions.summaries()));
+    assert!(
+        preflight_catalog.resolve(&ModelId(model_id.into())).is_ok(),
+        "preflight did not project {model_id}; startup: {preflight_status:#?}"
+    );
+    let launch = resolve_launch_print(&boot, "delayed-provider-model").unwrap();
+    assert_eq!(launch.model.0, model_id);
+
+    let mut app = build_app(boot, launch, "system".into()).unwrap();
+    assert_eq!(app.model.spec.id.0, model_id);
+    assert!(app.catalog.resolve(&ModelId(model_id.into())).is_ok());
+
+    let old_endpoint = app.model.endpoint.id.clone();
+    let reloads = app.executable_extensions.reload().await;
+    assert!(
+        reloads
+            .iter()
+            .any(|message| message.starts_with("reloaded pi-provider (generation ")),
+        "provider reload failed: {reloads:?}"
+    );
+    app.synchronize_extension_provider_catalog();
+    let refreshed = app.catalog.resolve(&ModelId(model_id.into())).unwrap();
+    assert_ne!(refreshed.endpoint.id, old_endpoint);
+    let error = app
+        .synchronize_extension_provider_catalog_for_request()
+        .unwrap_err();
+    assert!(error.to_string().contains("route changed"), "{error}");
+
+    app.executable_extensions.shutdown().await;
+}
+
 #[test]
 fn tool_schema_reserve_is_positive_and_deterministic() {
     let directory = tempfile::tempdir().unwrap();

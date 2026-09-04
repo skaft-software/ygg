@@ -6,7 +6,8 @@
 //! atomically so a stale extension cannot keep a model callable.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::extension_api_v03 as api_v03;
 
@@ -137,6 +138,7 @@ struct RegistryState {
 #[derive(Clone)]
 pub struct ExtensionProviderRegistry {
     state: Arc<Mutex<RegistryState>>,
+    changed: Arc<Condvar>,
     authorization_policy: Option<Arc<dyn ExtensionProviderAuthorizationPolicy>>,
 }
 
@@ -168,6 +170,7 @@ impl ExtensionProviderRegistry {
     pub fn new() -> Self {
         Self {
             state: Arc::new(Mutex::new(RegistryState::default())),
+            changed: Arc::new(Condvar::new()),
             authorization_policy: None,
         }
     }
@@ -178,6 +181,7 @@ impl ExtensionProviderRegistry {
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(RegistryState::default())),
+            changed: Arc::new(Condvar::new()),
             authorization_policy: Some(authorization_policy),
         }
     }
@@ -216,7 +220,10 @@ impl ExtensionProviderRegistry {
         }
         state.providers.remove(provider_id);
         state.revision = state.revision.saturating_add(1);
-        Ok(catalog_result(state.revision, Vec::new(), Vec::new()))
+        let result = catalog_result(state.revision, Vec::new(), Vec::new());
+        drop(state);
+        self.changed.notify_all();
+        Ok(result)
     }
 
     /// Removes every declaration still owned by one exact process generation.
@@ -230,11 +237,16 @@ impl ExtensionProviderRegistry {
             .iter()
             .filter_map(|(id, record)| (&record.owner == owner).then_some(id.clone()))
             .collect::<Vec<_>>();
-        if !removed.is_empty() {
+        let changed = !removed.is_empty();
+        if changed {
             for id in removed {
                 state.providers.remove(&id);
             }
             state.revision = state.revision.saturating_add(1);
+        }
+        drop(state);
+        if changed {
+            self.changed.notify_all();
         }
     }
 
@@ -252,6 +264,43 @@ impl ExtensionProviderRegistry {
             })
             .collect();
         (state.revision, entries)
+    }
+
+    /// Waits for every supplied process owner to publish at least one provider.
+    ///
+    /// API 0.3 extensions can issue their first reverse registration only after
+    /// their initialize response is written. Hosts that need provider models at
+    /// startup use this bounded barrier rather than assuming initialization
+    /// itself implies a non-empty catalog. `false` means the deadline elapsed;
+    /// a provider-capable extension is allowed to publish zero declarations.
+    pub fn wait_for_owners(&self, owners: &[ExtensionProviderOwner], timeout: Duration) -> bool {
+        let owners = owners
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if owners.is_empty() {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        let mut state = lock_registry(&self.state);
+        loop {
+            if owners.iter().all(|owner| {
+                state
+                    .providers
+                    .values()
+                    .any(|record| record.owner == *owner)
+            }) {
+                return true;
+            }
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            let (next, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
     }
 
     /// Resolves a callable route by provider and local model identifier.
@@ -305,9 +354,14 @@ impl ExtensionProviderRegistry {
         if &record.owner != owner {
             return Err(ExtensionProviderRegistryError::StaleOwner);
         }
-        if record.authorization != status {
+        let changed = record.authorization != status;
+        if changed {
             record.authorization = status;
             state.revision = state.revision.saturating_add(1);
+        }
+        drop(state);
+        if changed {
+            self.changed.notify_all();
         }
         Ok(())
     }
@@ -441,7 +495,10 @@ impl ExtensionProviderRegistry {
             },
         );
         state.revision = state.revision.saturating_add(1);
-        Ok(catalog_result(state.revision, vec![provider_id], model_ids))
+        let result = catalog_result(state.revision, vec![provider_id], model_ids);
+        drop(state);
+        self.changed.notify_all();
+        Ok(result)
     }
 }
 
@@ -768,6 +825,30 @@ mod tests {
             ),
             Err(ExtensionProviderRegistryError::StaleOwner)
         ));
+    }
+
+    #[test]
+    fn startup_wait_observes_post_initialize_registration_and_bounds_empty_catalogs() {
+        let registry = Arc::new(ExtensionProviderRegistry::new());
+        let delayed = Arc::clone(&registry);
+        let registration = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            delayed
+                .register(
+                    owner(1),
+                    api_v03::ProviderRegisterParams {
+                        provider: provider(),
+                        models: vec![model()],
+                    },
+                )
+                .expect("delayed registration");
+        });
+        assert!(registry.wait_for_owners(&[owner(1)], Duration::from_secs(1)));
+        registration.join().expect("registration thread");
+
+        let started = Instant::now();
+        assert!(!registry.wait_for_owners(&[owner(2)], Duration::from_millis(10)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

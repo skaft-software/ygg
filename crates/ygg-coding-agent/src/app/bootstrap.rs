@@ -28,7 +28,10 @@ use crate::app::{
     normalize_reasoning_selection_for_model_with_subagents, thinking_to_reasoning, App,
 };
 use crate::config::{CompactionMode, Config, ResumeSelector};
-use crate::extensions::{ExecutableExtensions, ExtensionProviderRuntime, SUBAGENTS_EXTENSION_NAME};
+use crate::extensions::{
+    provider_preflight_config, ExecutableExtensions, ExtensionProviderRuntime,
+    SUBAGENTS_EXTENSION_NAME,
+};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
@@ -59,14 +62,19 @@ pub struct Bootstrap {
 }
 
 impl Bootstrap {
-    /// Starts enabled extensions once when their API 0.3 declarations are
-    /// required to resolve an otherwise unknown initial model.
+    /// Starts only provider-capable API 0.3 extensions when their declarations
+    /// are required to resolve an otherwise unknown initial model.
     ///
     /// The temporary session is deliberately not a user session: provider
     /// discovery must not create or mutate a session before launch validation
-    /// succeeds. The started host is retained and rebound by `build_app`.
+    /// succeeds. The temporary process set is shut down before final startup so
+    /// every final App extension initializes against the selected real state.
     fn preflight_extension_providers(&self) -> anyhow::Result<()> {
         if self.prestarted_extensions.borrow().is_some() {
+            return Ok(());
+        }
+        let config = provider_preflight_config(&self.config);
+        if config.enabled_extensions.is_empty() {
             return Ok(());
         }
 
@@ -76,7 +84,7 @@ impl Bootstrap {
             .context("could not create temporary extension-provider bootstrap session")?;
         let model = extension_provider_bootstrap_model(&self.catalog);
         let (host, mut extensions) = configured_extensions_with_runtime_manager(
-            &self.config,
+            &config,
             &session,
             &model,
             &self.config.reasoning,
@@ -4170,9 +4178,13 @@ pub async fn resolve_launch_interactive(
         })
         .await?;
     *boot.prepared_session.borrow_mut() = prepared;
-    // Provider declarations are only available after API 0.3 extension
-    // activation; perform that boundary before presenting a model picker.
-    if !boot.config.enabled_extensions.is_empty() {
+    // Provider declarations are only needed before launch when no static model
+    // can satisfy the restored/explicit selection. Do not start ordinary
+    // extensions on a temporary session just to confirm an already-known route.
+    let needs_extension_provider_catalog = model
+        .as_ref()
+        .is_none_or(|model| boot.catalog.resolve(model).is_err());
+    if needs_extension_provider_catalog {
         boot.preflight_extension_providers()?;
     }
     let catalog = boot.catalog_with_extension_providers();
@@ -4549,21 +4561,20 @@ pub(crate) fn build_app_with_runtime_manager(
     if let Some((_, extensions)) = prestarted_extensions.as_mut() {
         extensions.synchronize_provider_catalog(&mut catalog, &client);
     }
-    let model = catalog.resolve(&launch.model)?;
-    let compact_model = config
-        .compaction
-        .compact_model
-        .as_ref()
-        .map(|id| catalog.resolve(id))
-        .transpose()
-        .with_context(|| "configured compaction model could not be resolved")?;
-    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
+    // A temporary provider preflight has just enough catalog state to identify
+    // the requested model. Keep that snapshot only as an initialization input;
+    // the final extension fleet starts after it is torn down and sees the real
+    // selected session/model state.
+    let bootstrap_model = catalog.resolve(&launch.model)?;
+    let bootstrap_reasoning = normalize_reasoning_for_model(&launch.reasoning, &bootstrap_model)?;
+    let requested_reasoning_mode = launch.reasoning_mode;
     let mut prepared_session = prepared_session.into_inner();
     let mut session = open_launch_session(&mut prepared_session, launch.session)?;
 
-    let requested_reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
-    let requested_reasoning_mode = launch.reasoning_mode;
-    validate_native_compaction_replay(config.compaction.mode, &session, &model)?;
+    if let Some((_, mut extensions)) = prestarted_extensions.take() {
+        extensions.clear_provider_catalog(&mut catalog, &client);
+        extensions.shutdown_blocking();
+    }
 
     let skills: Arc<dyn SkillRegistry> = Arc::new(FileSystemSkillRegistry::new_with_invocation(
         config.workspace.clone(),
@@ -4577,32 +4588,32 @@ pub(crate) fn build_app_with_runtime_manager(
         &config.prompt_paths,
         config.workspace_trusted,
     ));
-    let (extensions, mut executable_extensions) =
-        if let Some((mut extensions, mut executable_extensions)) = prestarted_extensions.take() {
-            apply_extension_tool_policy(&mut extensions, &config, &model);
-            executable_extensions.transition_active_session(
-                &session,
-                &model,
-                &requested_reasoning,
-                &sessions,
-            );
-            // Preflight must not activate interactive lifecycle work before the
-            // final App owns the session driver.
-            executable_extensions.deactivate_session_lifecycle_driver();
-            executable_extensions.synchronize_provider_catalog(&mut catalog, &client);
-            (extensions, executable_extensions)
-        } else {
-            configured_extensions_with_runtime_manager(
-                &config,
-                &session,
-                &model,
-                &requested_reasoning,
-                &sessions,
-                runtime_manager,
-                provider_runtime,
-            )?
-        };
+    let (mut extensions, mut executable_extensions) = configured_extensions_with_runtime_manager(
+        &config,
+        &session,
+        &bootstrap_model,
+        &bootstrap_reasoning,
+        &sessions,
+        runtime_manager,
+        provider_runtime,
+    )?;
     executable_extensions.synchronize_provider_catalog(&mut catalog, &client);
+    let model = catalog.resolve(&launch.model)?;
+    let requested_reasoning = normalize_reasoning_for_model(&launch.reasoning, &model)?;
+    // `bootstrap_model` can be an old provider generation. The extension host
+    // state exposes only the selected model identity, but refresh both the
+    // policy surface and snapshots from the final catalog before any App work.
+    apply_extension_tool_policy(&mut extensions, &config, &model);
+    executable_extensions.refresh_host_state(&session, &model, &requested_reasoning, &sessions);
+    let compact_model = config
+        .compaction
+        .compact_model
+        .as_ref()
+        .map(|id| catalog.resolve(id))
+        .transpose()
+        .with_context(|| "configured compaction model could not be resolved")?;
+    validate_compaction_route(config.compaction.mode, &model, compact_model.as_ref())?;
+    validate_native_compaction_replay(config.compaction.mode, &session, &model)?;
     let service_available = executable_extensions.has_agent_session_service();
     let subagents_available = service_available
         && subagents_surface_available(&executable_extensions, &extensions, &model);

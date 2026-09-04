@@ -113,6 +113,10 @@ const PROMPT_RPC_DEADLINE: Duration = Duration::from_secs(5);
 const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
+/// API 0.3 reverse provider registration starts only after initialize is
+/// acknowledged. This bounded window lets startup observe that post-initialize
+/// work without making a zero-provider extension block launch indefinitely.
+const PROVIDER_REGISTRATION_BARRIER: Duration = Duration::from_millis(500);
 /// Total per-extension deadline for the typed post-mutation hook. A timeout
 /// drops only that extension's rescan request after the host mutation settled.
 const POST_MUTATION_RPC_DEADLINE: Duration = Duration::from_millis(250);
@@ -240,6 +244,45 @@ fn extension_policy(
         policy.trust_for_invocation(name.clone());
     }
     (policy, grants)
+}
+
+/// Returns a copy of the product configuration narrowed to extensions that can
+/// statically negotiate API 0.3 provider catalogs.
+///
+/// Provider discovery is the only reason bootstrap may activate an extension
+/// before the final session/model exists. Keep that exceptional process set
+/// narrow: ordinary tools, hooks, and UI extensions must first observe the
+/// selected real launch state.
+pub(crate) fn provider_preflight_config(config: &Config) -> Config {
+    let resolver = ResourceResolver::new(config.workspace.clone(), config.workspace_trusted);
+    let snapshot = resolver.discover(ResourceKind::Extension, &config.extension_paths);
+    let mut diagnostics = Vec::new();
+    let (policy, _) = extension_policy(config, &mut diagnostics);
+    let mut descriptors = BTreeMap::<String, DiscoveredExtension>::new();
+    for resource in snapshot.resources() {
+        let Some(descriptor) =
+            load_extension_descriptor(&resolver, resource, &policy, &mut diagnostics)
+        else {
+            continue;
+        };
+        descriptors
+            .entry(descriptor.manifest.name.clone())
+            .or_insert(descriptor);
+    }
+    let provider_names = descriptors
+        .into_values()
+        .filter(|descriptor| {
+            descriptor.activation.enabled
+                && descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3
+                && descriptor.manifest.contributes.providers
+        })
+        .map(|descriptor| descriptor.manifest.name)
+        .collect::<BTreeSet<_>>();
+    let mut preflight = config.clone();
+    preflight
+        .enabled_extensions
+        .retain(|name| provider_names.contains(name));
+    preflight
 }
 
 fn normalize_trusted_manifest_path(path: &Path) -> anyhow::Result<PathBuf> {
@@ -1013,6 +1056,43 @@ impl Default for ExtensionProviderRuntime {
 impl ExtensionProviderRuntime {
     fn registry(&self) -> Arc<ExtensionProviderRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    fn initial_provider_owners(processes: &[ExtensionProcess]) -> Vec<ExtensionProviderOwner> {
+        processes
+            .iter()
+            .filter(|process| process.contributions().providers)
+            .map(|process| ExtensionProviderOwner {
+                extension_instance_id: process.extension_instance_id().to_owned(),
+                generation: process.health_snapshot().generation,
+            })
+            .collect()
+    }
+
+    fn await_initial_registrations(&self, processes: &[ExtensionProcess]) {
+        let owners = Self::initial_provider_owners(processes);
+        // There is no API 0.3 "initial provider catalog complete" frame: an
+        // extension is allowed to declare no providers. The registry condition
+        // variable therefore gives actual registrations a deterministic window
+        // while preserving a hard upper bound for zero-provider extensions.
+        let _ = self
+            .registry
+            .wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER);
+    }
+
+    async fn await_initial_registrations_async(&self, processes: &[ExtensionProcess]) {
+        let owners = Self::initial_provider_owners(processes);
+        if owners.is_empty() {
+            return;
+        }
+        let registry = Arc::clone(&self.registry);
+        // Reload runs from the Tokio runtime. Keep its Condvar wait off a core
+        // worker so a post-initialize reverse registration can make progress
+        // even when the runtime has only one configured worker thread.
+        let _ = tokio::task::spawn_blocking(move || {
+            registry.wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER)
+        })
+        .await;
     }
 
     /// Reconciles ready provider declarations into the local model catalog.
@@ -1937,6 +2017,11 @@ impl ExecutableExtensions {
                 }
             }
         }
+
+        // API 0.3 provider declarations are reverse RPCs intentionally sent
+        // after initialize. Observe their bounded startup barrier before the
+        // caller projects models from the registry.
+        provider_runtime.await_initial_registrations(&processes);
 
         // Register tool catalogs before observers/hooks so all live processes
         // have a host-owned dynamic group. A compatible shared process was
@@ -3757,22 +3842,27 @@ impl ExecutableExtensions {
             }))
             .await;
             let mut messages = Vec::new();
+            let mut reloaded = BTreeSet::new();
             for (name, results) in reloads {
                 for result in results {
                     match result {
-                        Ok(report) => messages.push(format!(
-                            "reloaded {name} (generation {}, previous shutdown {})",
-                            report.generation,
-                            if report.previous_shutdown_graceful {
-                                "clean"
-                            } else {
-                                "forced"
-                            }
-                        )),
+                        Ok(report) => {
+                            reloaded.insert(name.clone());
+                            messages.push(format!(
+                                "reloaded {name} (generation {}, previous shutdown {})",
+                                report.generation,
+                                if report.previous_shutdown_graceful {
+                                    "clean"
+                                } else {
+                                    "forced"
+                                }
+                            ));
+                        }
                         Err(error) => messages.push(format!("unable to reload {name}: {error}")),
                     }
                 }
             }
+            self.await_reloaded_provider_registrations(&reloaded).await;
             self.start_policy_supervisors();
             messages.extend(self.drain_events());
             return messages;
@@ -3786,10 +3876,12 @@ impl ExecutableExtensions {
         // extension and completion timing cannot reorder user-visible lines.
         let results = futures_util::future::join_all(reloads).await;
         let mut messages = Vec::with_capacity(results.len());
+        let mut reloaded = BTreeSet::new();
         let mut completed_mutations = Vec::new();
         for (name, result) in results {
             match result {
                 Ok(report) => {
+                    reloaded.insert(name.clone());
                     messages.push(format!(
                         "reloaded {name} (generation {}, previous shutdown {})",
                         report.generation,
@@ -3814,6 +3906,7 @@ impl ExecutableExtensions {
                 Err(error) => messages.push(format!("unable to reload {name}: {error}")),
             }
         }
+        self.await_reloaded_provider_registrations(&reloaded).await;
         for mutation in completed_mutations {
             let rescans = self.notify_post_mutation(mutation).await;
             messages.extend(rescans.into_iter().map(|request| {
@@ -3830,6 +3923,23 @@ impl ExecutableExtensions {
         messages.extend(diagnostics);
         messages.extend(self.drain_events());
         messages
+    }
+
+    /// Waits for post-initialize provider declarations from just-reloaded owners
+    /// before callers can reconcile their host-owned model routes.
+    async fn await_reloaded_provider_registrations(&self, reloaded: &BTreeSet<String>) {
+        if reloaded.is_empty() {
+            return;
+        }
+        let processes = self
+            .processes
+            .iter()
+            .filter(|process| reloaded.contains(&process.descriptor().manifest.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.provider_runtime
+            .await_initial_registrations_async(&processes)
+            .await;
     }
 
     fn schedule_confirmation_denials(&mut self) {
@@ -5437,6 +5547,39 @@ command = "does-not-exist"
             offline: true,
             workspace_trusted: false,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_preflight_config_excludes_non_provider_extensions() {
+        let temp = tempfile::tempdir().unwrap();
+        let extension_root = temp.path().join("extensions");
+        write_extension_manifest(
+            &extension_root.join("ordinary"),
+            "ordinary",
+            "ordinary tool",
+        );
+        let provider = extension_root.join("provider");
+        std::fs::create_dir_all(&provider).unwrap();
+        std::fs::write(
+            provider.join(EXTENSION_MANIFEST_FILENAME),
+            r#"name = "provider"
+version = "0.3.0"
+api_version = "0.3"
+
+[entrypoint]
+command = "must-not-run"
+
+[contributes]
+providers = true
+"#,
+        )
+        .unwrap();
+        let mut config = executable_extension_config(temp.path(), &extension_root, "ordinary");
+        config.enabled_extensions.push("provider".into());
+
+        let preflight = provider_preflight_config(&config);
+        assert_eq!(preflight.enabled_extensions, vec!["provider"]);
     }
 
     #[cfg(unix)]

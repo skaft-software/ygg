@@ -1167,7 +1167,10 @@ function registerPiProvider(name, config) {
       throw providerError(`provider catalog exceeds ${API_0_3_MAX_PROVIDER_MODELS} models`);
     }
     const hostMayBePublished = existing?.hostPublished === true;
-    if (existing) void cancelProviderStreamsForProvider(providerId);
+    // A declaration mutation must first fence every active stream using the
+    // old adapter. Marking them synchronously prevents the pump from queuing
+    // another nonterminal event while this callback returns to Pi.
+    const retiringStreams = existing ? markProviderStreamsForMutation(providerId) : [];
     const entry = {
       provider: normalized.provider,
       models: normalized.models,
@@ -1182,7 +1185,11 @@ function registerPiProvider(name, config) {
     };
     bridge.providers.set(providerId, entry);
     if (bridge.initialized) {
-      queueProviderMutation(hostMayBePublished ? "providers/update" : "providers/register", entry);
+      queueProviderMutation(
+        hostMayBePublished ? "providers/update" : "providers/register",
+        entry,
+        retiringStreams,
+      );
     }
   } catch (error) {
     bridge.providerRegistrationFailure = error;
@@ -1195,11 +1202,13 @@ function unregisterPiProvider(name) {
   const providerId = boundedProviderIdentifier(name, "provider name");
   const entry = bridge.providers.get(providerId);
   if (!entry) return;
+  // Fence the old adapter before the unregister reverse request can make the
+  // declaration unavailable to the host.
+  const retiringStreams = markProviderStreamsForMutation(providerId);
   bridge.providers.delete(providerId);
-  void cancelProviderStreamsForProvider(providerId);
   if (bridge.initialized && (entry.published || entry.hostPublished)) {
     bridge.retiredProviders.add(entry);
-    queueProviderUnregister(providerId, entry);
+    queueProviderUnregister(providerId, entry, retiringStreams);
   }
 }
 
@@ -1293,9 +1302,12 @@ async function publishProviderMutation(method, entry) {
   bridge.providerSyncError = null;
 }
 
-function queueProviderMutation(method, entry) {
+function queueProviderMutation(method, entry, retiringStreams = []) {
   bridge.providerSyncChain = bridge.providerSyncChain
-    .then(() => publishProviderMutation(method, entry))
+    .then(async () => {
+      await terminateProviderStreamsForMutation(retiringStreams);
+      await publishProviderMutation(method, entry);
+    })
     .catch((error) => {
       bridge.providerSyncError = error;
       diagnostic(`Pi provider catalog mutation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1328,9 +1340,10 @@ async function publishProviderUnregister(providerId, entry) {
   entry.authorization_status = "revoked";
 }
 
-function queueProviderUnregister(providerId, entry) {
+function queueProviderUnregister(providerId, entry, retiringStreams = []) {
   bridge.providerSyncChain = bridge.providerSyncChain
     .then(async () => {
+      await terminateProviderStreamsForMutation(retiringStreams);
       await publishProviderUnregister(providerId, entry);
       bridge.retiredProviders.delete(entry);
     })
@@ -1667,8 +1680,8 @@ function providerStreamIsTerminal(kind) {
   return kind === "finished" || kind === "error";
 }
 
-async function sendProviderStreamEvent(stream, event) {
-  if (stream.cancelled || stream.terminal) return false;
+async function writeProviderStreamEvent(stream, event, allowClosing) {
+  if (stream.cancelled || stream.terminal || (stream.closing && !allowClosing)) return false;
   if (stream.sequence >= API_0_3_MAX_PROVIDER_STREAM_EVENTS) {
     stream.exhausted = true;
     stream.terminal = true;
@@ -1704,24 +1717,37 @@ async function sendProviderStreamEvent(stream, event) {
   return true;
 }
 
+// Pi stream pumps and declaration mutations run in separate asynchronous
+// callbacks. Keep every write for one stream in a FIFO so a mutation terminal
+// cannot overtake an already admitted event or race with a later pump write.
+function sendProviderStreamEvent(stream, event, { allowClosing = false } = {}) {
+  const scheduled = stream.writeChain.then(() =>
+    writeProviderStreamEvent(stream, event, allowClosing),
+  );
+  // A failed write is still reported to its caller, but must not permanently
+  // prevent the terminal owner from observing/draining this stream state.
+  stream.writeChain = scheduled.catch(() => {});
+  return scheduled;
+}
+
 async function pumpProviderStream(stream) {
   const state = { toolCalls: new Map() };
   try {
-    while (!stream.cancelled) {
+    while (!stream.cancelled && !stream.closing) {
       const next = await stream.iterator.next();
       if (next.done) break;
       for (const candidate of normalizePiStreamEvent(next.value, state)) {
         const event = normalizeHostAdapterEvent(candidate.kind, candidate.payload);
         const sent = await sendProviderStreamEvent(stream, event);
-        if (!sent || stream.terminal || stream.cancelled) break;
+        if (!sent || stream.terminal || stream.cancelled || stream.closing) break;
       }
-      if (stream.terminal) break;
+      if (stream.terminal || stream.closing) break;
     }
-    if (!stream.cancelled && !stream.terminal) {
+    if (!stream.cancelled && !stream.closing && !stream.terminal) {
       await sendProviderStreamEvent(stream, { kind: "error", payload: {} });
     }
   } catch (error) {
-    if (!stream.cancelled) {
+    if (!stream.cancelled && !stream.closing) {
       diagnostic(`Pi provider stream failed: ${providerReason(error)}`);
       try {
         await sendProviderStreamEvent(stream, { kind: "error", payload: {} });
@@ -1730,7 +1756,9 @@ async function pumpProviderStream(stream) {
       }
     }
   } finally {
-    if (!stream.cancelled) {
+    // A declaration mutation owns iterator cancellation. It sends the stream's
+    // terminal event first, so the pump must not close the adapter early.
+    if (!stream.cancelled && !stream.closing) {
       if (stream.exhausted) stream.controller.abort("provider stream event limit reached");
       try {
         await stream.iterator.return?.();
@@ -1755,9 +1783,32 @@ async function cancelProviderStream(stream) {
   }
 }
 
-async function cancelProviderStreamsForProvider(providerId) {
-  const active = [...bridge.providerStreams.values()].filter((stream) => stream.providerId === providerId);
-  await Promise.all(active.map((stream) => cancelProviderStream(stream)));
+function markProviderStreamsForMutation(providerId) {
+  const active = [...bridge.providerStreams.values()].filter(
+    (stream) => stream.providerId === providerId && !stream.cancelled && !stream.terminal,
+  );
+  for (const stream of active) stream.closing = true;
+  return active;
+}
+
+async function terminateProviderStreamForMutation(stream) {
+  if (!stream || stream.cancelled) return;
+  stream.closing = true;
+  if (!stream.terminal) {
+    // Preserve the send failure for the catalog mutation owner. The host must
+    // never observe a changed declaration after a stream terminal failed.
+    try {
+      await sendProviderStreamEvent(stream, { kind: "error", payload: {} }, { allowClosing: true });
+    } finally {
+      await cancelProviderStream(stream);
+    }
+    return;
+  }
+  await cancelProviderStream(stream);
+}
+
+async function terminateProviderStreamsForMutation(streams) {
+  await Promise.all(streams.map((stream) => terminateProviderStreamForMutation(stream)));
 }
 
 async function cancelAllProviderStreams() {
@@ -1846,6 +1897,8 @@ async function handleProviderStream(message) {
     terminal: false,
     exhausted: false,
     cancelled: false,
+    closing: false,
+    writeChain: Promise.resolve(),
   };
   bridge.providerStreams.set(stream.id, stream);
   setImmediate(() => void pumpProviderStream(stream));

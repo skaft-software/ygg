@@ -833,6 +833,38 @@ class Api03ProviderBridgeTests(unittest.TestCase):
             self.assertFalse(authorization["params"]["interactive"])
             self.assertNotIn("lease", authorization["params"])
 
+    def test_api_03_delayed_initial_provider_registration_is_published_after_initialize(self) -> None:
+        bridge = BridgeProcess(
+            extension=PROVIDER_EXTENSION,
+            api_version="0.3",
+            fixture_environment={"YGG_PI_FIXTURE_PROVIDER_REGISTER_DELAY_MS": "75"},
+        )
+        catalog_requests: list[dict] = []
+        bridge.handlers["providers/register"] = lambda message: (
+            catalog_requests.append(message)
+            or {
+                "revision": 1,
+                "provider_ids": ["fixture-provider"],
+                "model_ids": ["fixture-provider/fixture-model"],
+            }
+        )
+        bridge.handlers["provider/auth/request"] = lambda _message: {"status": "ready"}
+        bridge.handlers["provider/auth/revoke"] = lambda _message: {"status": "revoked"}
+        bridge.handlers["providers/unregister"] = lambda _message: {
+            "revision": 2,
+            "provider_ids": [],
+            "model_ids": [],
+        }
+        with bridge:
+            initialized = bridge.initialize()
+            self.assertEqual("0.3", initialized["api_version"])
+            registration = bridge.wait_for(
+                lambda _messages: catalog_requests[0] if catalog_requests else None,
+                description="delayed initial API 0.3 provider registration",
+                timeout=1.0,
+            )
+            self.assertEqual("fixture-provider", registration["params"]["provider"]["id"])
+
     def test_api_03_tool_dispatcher_bounds_pi_content_parts(self) -> None:
         bridge, catalog_requests, auth_requests = self.provider_bridge()
         with bridge:
@@ -1185,6 +1217,43 @@ class Api03ProviderBridgeTests(unittest.TestCase):
                     )
                     mutation = self.v03_tool(bridge, mutation_tool)
                     self.assertNotIn("error", mutation)
+                    mutation_method = (
+                        "providers/update"
+                        if mutation_tool == "fixture_provider_update"
+                        else "providers/unregister"
+                    )
+                    mutation_request = bridge.wait_for(
+                        lambda messages: next(
+                            (
+                                message
+                                for message in messages
+                                if message.get("method") == mutation_method
+                            ),
+                            None,
+                        ),
+                        description=f"{mutation_method} after terminal stream event",
+                    )
+                    stream_events = [
+                        message
+                        for message in bridge.messages
+                        if message.get("method") == "provider/event"
+                        and message.get("params", {}).get("stream_id") == stream_id
+                    ]
+                    terminals = [
+                        message
+                        for message in stream_events
+                        if message["params"]["kind"] in {"finished", "error"}
+                    ]
+                    self.assertEqual(1, len(terminals))
+                    self.assertEqual("error", terminals[0]["params"]["kind"])
+                    self.assertEqual(
+                        list(range(len(stream_events))),
+                        [message["params"]["sequence"] for message in stream_events],
+                    )
+                    self.assertLess(
+                        bridge.messages.index(terminals[0]),
+                        bridge.messages.index(mutation_request),
+                    )
                     deadline = time.monotonic() + 2.0
                     cancellation_status: dict | None = None
                     while time.monotonic() < deadline:
@@ -1194,14 +1263,14 @@ class Api03ProviderBridgeTests(unittest.TestCase):
                         time.sleep(0.02)
                     self.assertIsNotNone(cancellation_status)
                     self.assertEqual("true", cancellation_status["result"]["content"][0]["text"])
-                    self.assertFalse(
-                        any(
-                            message.get("method") == "provider/event"
-                            and message.get("params", {}).get("stream_id") == stream_id
-                            and message.get("params", {}).get("kind") == "finished"
-                            for message in bridge.messages
-                        )
-                    )
+                    final_terminals = [
+                        message
+                        for message in bridge.messages
+                        if message.get("method") == "provider/event"
+                        and message.get("params", {}).get("stream_id") == stream_id
+                        and message["params"]["kind"] in {"finished", "error"}
+                    ]
+                    self.assertEqual([terminals[0]], final_terminals)
 
     def test_api_03_admission_limit_rejects_excess_and_cancels_queued_tools(self) -> None:
         with BridgeProcess(api_version="0.3") as bridge:
