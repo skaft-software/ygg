@@ -24,7 +24,15 @@ import {
   realpathSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join, relative as relativePath, resolve, sep } from "node:path";
+import {
+  delimiter,
+  dirname,
+  isAbsolute,
+  join,
+  relative as relativePath,
+  resolve,
+  sep,
+} from "node:path";
 import { createInterface } from "node:readline";
 import { pathToFileURL } from "node:url";
 
@@ -815,6 +823,18 @@ function piRuntimeIntegrity(root) {
   return hash.digest("hex");
 }
 
+function canonicalManifestPath(path) {
+  if (typeof path !== "string" || !isAbsolute(path)) {
+    throw new Error("Pi link manifest path must be absolute");
+  }
+  const canonical = realpathSync(path);
+  const metadata = lstatSync(canonical);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error("Pi link manifest path must resolve to a regular file");
+  }
+  return canonical;
+}
+
 function calculateLinkIdentity(piRuntime) {
   const hash = createHash("sha256");
   hash.update(Buffer.from("ygg-pi-aggregate-link-identity\0"));
@@ -824,7 +844,7 @@ function calculateLinkIdentity(piRuntime) {
     SUPPORTED_PI_VERSION,
     args.yggVersion,
     args.commandName,
-    resolve(args.linkManifest),
+    bridge.linkManifest,
     piRuntime.root,
     args.piRuntimeIntegrity,
     args.aggregateDigest,
@@ -876,9 +896,17 @@ function verifyRuntimeIdentity(piRuntime, params) {
   if (
     !extension
     || extension.name !== args.commandName
-    || resolve(extension.manifest_path ?? "") !== resolve(args.linkManifest)
     || params.ygg_version !== args.yggVersion
   ) {
+    throw new Error("Pi link identity does not match the selected trusted manifest; review trust/enablement and publish a replacement link");
+  }
+  let selectedManifest;
+  try {
+    selectedManifest = canonicalManifestPath(extension.manifest_path);
+  } catch {
+    throw new Error("Pi link identity does not match the selected trusted manifest; review trust/enablement and publish a replacement link");
+  }
+  if (selectedManifest !== bridge.linkManifest) {
     throw new Error("Pi link identity does not match the selected trusted manifest; review trust/enablement and publish a replacement link");
   }
   if (calculateLinkIdentity(piRuntime) !== args.linkIdentity) {
@@ -1218,11 +1246,13 @@ async function collectBeforePromptContext(prompt) {
 
 async function loadBridge(params) {
   validateNodeRuntime();
+  const linkManifest = args.strictIdentity ? canonicalManifestPath(args.linkManifest) : null;
   verifySourceFingerprints();
   bridge = {
     cwd: resolve(params.workspace ?? args.cwd ?? process.cwd()),
     agentDir: resolve(args.agentDir ?? process.env.YGG_PI_AGENT_DIR ?? join(homedir(), ".pi/agent")),
     extensionPaths: args.extensions.map((path) => resolve(path)),
+    linkManifest,
     commandName: args.commandName,
     hostState: params.host && typeof params.host === "object" ? { ...params.host } : {},
     agentActive: false,

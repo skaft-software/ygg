@@ -2863,7 +2863,12 @@ mod tests {
             b"ignored build output\n",
         )
         .unwrap();
-        let extension_root = temp.path().join("extensions");
+        let extension_store = temp.path().join("extension-store");
+        fs::create_dir_all(&extension_store).unwrap();
+        // Model macOS's /var -> /private/var alias with a deterministic Unix symlink.
+        let extension_root_alias = temp.path().join("extension-root-alias");
+        std::os::unix::fs::symlink(&extension_store, &extension_root_alias).unwrap();
+        let extension_root = extension_root_alias.join("extensions");
         install(
             &fixture_extension,
             Some("pi-host-integration"),
@@ -2874,6 +2879,7 @@ mod tests {
         )
         .unwrap();
         let manifest_path = extension_root.join("pi-host-integration/extension.toml");
+        assert_ne!(manifest_path, canonical(&manifest_path));
         let mut policy = ygg_agent::ExtensionPolicy::default();
         policy.enable("pi-host-integration");
         policy.trust_for_invocation("pi-host-integration");

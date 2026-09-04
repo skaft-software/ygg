@@ -109,7 +109,7 @@ def link_identity(
         "0.84.4",
         ygg_version,
         command_name,
-        os.path.abspath(manifest_path),
+        str(manifest_path.resolve(strict=True)),
         str(pi_package.resolve()),
         pi_runtime_integrity,
         aggregate_digest,
@@ -155,7 +155,7 @@ class BridgeProcess:
             environment["YGG_PI_FIXTURE_EVENTS"] = ",".join(fixture_events)
         selected_extensions = [Path(item).resolve() for item in (extensions or [extension])]
         selected_agent_dir = Path(agent_dir or (ROOT / ".test-pi-agent")).absolute()
-        selected_manifest = Path(manifest_path or (ROOT / ".test-link" / "extension.toml")).absolute()
+        selected_manifest = Path(manifest_path or (FIXTURES / "extension.toml")).absolute()
         command = [NODE, str(BRIDGE)]
         for selected in selected_extensions:
             command.extend(["--extension", str(selected)])

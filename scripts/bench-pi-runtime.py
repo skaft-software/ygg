@@ -394,6 +394,18 @@ def bridge_spec(
     fake_pi = root / "extensions/ygg-pi-compat/tests/fixtures/fake-pi"
     agent_dir = work / "agent"
     manifest = work / "manifest" / "extension.toml"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(
+        (
+            'name = "pi-fixture"\n'
+            'version = "0.0.0"\n'
+            'api_version = "0.2"\n\n'
+            '[entrypoint]\n'
+            'command = "node"\n'
+            'args = []\n'
+        ),
+        encoding="utf-8",
+    )
     source_hashes = [identity.compute_source_fingerprint(source) for source in sources]
     lock_hashes = [identity.source_lock_fingerprint(source) for source in sources]
     runtime_hash = identity.runtime_integrity(fake_pi)
