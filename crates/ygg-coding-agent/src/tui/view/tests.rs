@@ -2223,10 +2223,217 @@ fn terminal_native_prompt_stays_within_every_viewport() {
             line.chars()
                 .any(|character| matches!(character, '┏' | '┓' | '┗' | '┛'))
         }));
-        if width >= 4 {
-            assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
-        }
+        assert!(
+            rendered.iter().any(|line| line.contains(CURSOR_MARKER)),
+            "focused cursor missing at {width}x{height}: {rendered:?}"
+        );
     }
+}
+
+#[test]
+fn composer_geometry_keeps_full_rows_and_visual_edges_in_one_grid() {
+    for (chrome, width) in [("boxed", 12), ("framed", 12), ("shaded", 12), ("boxed", 8)] {
+        let mut shell = InteractiveShell::test_shell();
+        shell.set_size(width, 12);
+        let text_len = {
+            let mut state = shell.state.borrow_mut();
+            if chrome != "boxed" {
+                state.theme.override_token("composer", chrome);
+            }
+            let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, width);
+            state.editor.set_text("x".repeat(geometry.text_width()));
+            state.editor.text().len()
+        };
+
+        let rendered = render_shell(&shell.state.borrow(), width);
+        let cursor_line = rendered
+            .iter()
+            .find(|line| line.contains(CURSOR_MARKER))
+            .unwrap_or_else(|| panic!("{chrome} at {width} lost the cursor: {rendered:?}"));
+        let cursor_byte = cursor_line.find(CURSOR_MARKER).expect("cursor marker byte");
+        assert!(
+            visible_width(&cursor_line[..cursor_byte]) < usize::from(width),
+            "{chrome} at {width} placed the hardware cursor outside the viewport: {cursor_line:?}"
+        );
+        assert!(visible_width(cursor_line) <= usize::from(width));
+
+        // The action path uses this same cached projected layout rather than a
+        // raw-width approximation, so full rows still have a visual start/end.
+        shell.apply_edit(EditAction::Home);
+        assert_eq!(
+            shell.state.borrow().editor.cursor(),
+            0,
+            "{chrome} at {width}"
+        );
+        shell.apply_edit(EditAction::End);
+        assert_eq!(
+            shell.state.borrow().editor.cursor(),
+            text_len,
+            "{chrome} at {width}"
+        );
+    }
+}
+
+#[test]
+fn composer_visual_navigation_uses_the_same_safe_tab_and_control_projection_as_paint() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(8, 12);
+    let tabbed = "   \tabcdef";
+    shell.state.borrow_mut().editor.set_text(tabbed);
+    shell.apply_edit(EditAction::Home);
+    assert_eq!(
+        shell.state.borrow().editor.cursor(),
+        "   \ta".len(),
+        "Home must target the displayed second row after a positional tab"
+    );
+    shell.apply_edit(EditAction::End);
+    assert_eq!(shell.state.borrow().editor.cursor(), tabbed.len());
+
+    let control_plus_combining = "\x1b\u{0301}x";
+    {
+        let mut state = shell.state.borrow_mut();
+        state.editor.set_text(control_plus_combining);
+        state.editor.set_cursor("\x1b".len());
+    }
+    let rendered = render_shell(&shell.state.borrow(), 20);
+    let cursor_line = rendered
+        .iter()
+        .find(|line| line.contains(CURSOR_MARKER))
+        .expect("composer cursor row");
+    let safe_control = cursor_line.find("␛").expect("visualized ESC");
+    let cursor = cursor_line.find(CURSOR_MARKER).expect("cursor marker");
+    assert!(
+        safe_control < cursor,
+        "cursor split or preceded the joined visible control grapheme: {cursor_line:?}"
+    );
+
+    shell.apply_edit(EditAction::Home);
+    assert_eq!(shell.state.borrow().editor.cursor(), 0);
+    shell.apply_edit(EditAction::End);
+    assert_eq!(
+        shell.state.borrow().editor.cursor(),
+        control_plus_combining.len()
+    );
+}
+
+#[test]
+fn native_hardware_cursor_stays_inside_full_composer_rows() {
+    fn horizontal_positions(bytes: &[u8]) -> Vec<u16> {
+        let mut positions = Vec::new();
+        let mut start = 0;
+        while start + 3 <= bytes.len() {
+            if bytes[start..].starts_with(b"\x1b[") {
+                let mut end = start + 2;
+                while end < bytes.len() && bytes[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start + 2 && bytes.get(end) == Some(&b'G') {
+                    let column = std::str::from_utf8(&bytes[start + 2..end])
+                        .expect("CSI column is ASCII")
+                        .parse::<u16>()
+                        .expect("CSI column is numeric");
+                    positions.push(column);
+                }
+            }
+            start += 1;
+        }
+        positions
+    }
+
+    for (chrome, width) in [("boxed", 12), ("framed", 12), ("shaded", 12), ("boxed", 8)] {
+        let mut theme = crate::tui::theme::test_theme();
+        if chrome != "boxed" {
+            theme.override_token("composer", chrome);
+        }
+        let (mut shell, bytes) = emulated_shell(theme, width, 12);
+        shell
+            .tui
+            .as_mut()
+            .expect("emulated shell owns a TUI")
+            .set_show_hardware_cursor(true);
+        let text_width = {
+            let state = shell.state.borrow();
+            crate::tui::composer_surface::composer_editor_geometry(&state, width).text_width()
+        };
+        shell
+            .state
+            .borrow_mut()
+            .editor
+            .set_text("x".repeat(text_width));
+        shell.render();
+
+        let output = bytes
+            .lock()
+            .expect("emulated terminal output mutex poisoned")
+            .clone();
+        let positions = horizontal_positions(&output);
+        assert!(
+            positions.iter().any(|column| *column > 0),
+            "{chrome} at {width} did not position a hardware cursor: {output:?}"
+        );
+        assert!(
+            positions.iter().all(|column| *column <= width),
+            "{chrome} at {width} emitted an out-of-viewport cursor column: {positions:?}"
+        );
+    }
+}
+
+#[test]
+fn composer_projection_cache_reuses_an_unchanged_large_draft_and_refreshes_on_changes() {
+    let mut shell = InteractiveShell::test_shell();
+    shell.set_size(80, 24);
+    shell
+        .state
+        .borrow_mut()
+        .editor
+        .set_text("x".repeat(256 * 1024));
+
+    let first_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let projection = state.composer_editor_projection(geometry);
+        let expected_rows = (256_usize * 1024).div_ceil(geometry.text_width());
+        assert_eq!(projection.line_count(), expected_rows);
+        let _visible_row = projection.visible_row(projection.cursor_row(), CURSOR_MARKER);
+        let cache = state.composer_editor_cache.borrow();
+        let entry = cache.as_ref().expect("projection populated the cache");
+        assert_eq!(entry.text_width(), geometry.text_width());
+        entry.source()
+    };
+    let second_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let _projection = state.composer_editor_projection(geometry);
+        let cache_source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("projection retained the cache")
+            .source();
+        cache_source
+    };
+    assert_eq!(
+        first_cache, second_cache,
+        "unchanged draft rebuilt its layout"
+    );
+
+    shell.apply_edit(EditAction::Char('y'));
+    let refreshed_cache = {
+        let state = shell.state.borrow();
+        let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 80);
+        let _projection = state.composer_editor_projection(geometry);
+        let cache_source = state
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .expect("edit refreshed the cache")
+            .source();
+        cache_source
+    };
+    assert_ne!(
+        first_cache, refreshed_cache,
+        "edit did not refresh cached layout"
+    );
 }
 
 #[test]
@@ -2261,13 +2468,13 @@ fn vertical_editor_navigation_snaps_at_soft_wrapped_boundaries() {
 
     let editor_len = shell.state.borrow().editor.text().len();
     shell.state.borrow_mut().editor.set_cursor(editor_len - 2);
-    let (editor, cursor) = {
-        let state = shell.state.borrow();
-        (state.editor.text().to_owned(), state.editor.cursor())
-    };
     assert_eq!(
-        sexy_tui_rs::TextEditor::layout_for(&editor, cursor, composer_editor_wrap_width(8))
-            .cursor_row(),
+        {
+            let state = shell.state.borrow();
+            let geometry = crate::tui::composer_surface::composer_editor_geometry(&state, 8);
+            let cursor_row = state.composer_editor_projection(geometry).cursor_row();
+            cursor_row
+        },
         2,
         "fixture cursor must begin on the bottom soft-wrapped row"
     );

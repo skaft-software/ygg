@@ -66,7 +66,8 @@ pub use terminal_colors::{
     parse_terminal_color_scheme_report, RgbColor, TerminalColorScheme,
 };
 pub use text_editor::{
-    TextEditAction, TextEditor, TextEditorLayout, TextEditorProjection, TextEditorVisualLine,
+    TextEditAction, TextEditor, TextEditorCursor, TextEditorLayout, TextEditorProjection,
+    TextEditorVisualLine,
 };
 pub use theme::capability::CapabilityTier;
 pub use theme::Theme;

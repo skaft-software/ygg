@@ -1,4 +1,5 @@
-use sexy_tui_rs::strip_terminal_sequences;
+use sexy_tui_rs::{strip_terminal_sequences, WidthPolicy};
+use unicode_segmentation::UnicodeSegmentation;
 
 const MAX_LIVE_PANEL_BYTES: usize = 64 * 1024;
 const MAX_EXTENSION_RENDER_BYTES: usize = 64 * 1024;
@@ -285,18 +286,157 @@ pub(super) fn sanitize_extension_tool_render_segments(
     sanitized
 }
 
-fn visualize_editor_controls(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
-    while let Some(character) = chars.next() {
+/// A grapheme-safe mapping from the editable source buffer to a safe layout
+/// buffer. The layout buffer retains literal tabs so [`WidthPolicy`] can apply
+/// tab stops at the visual row where the tab is painted; [`Self::terminal_row`]
+/// expands those tabs only when materializing a visible terminal row.
+#[derive(Clone, Debug)]
+pub(crate) struct EditorDisplayMap {
+    layout_text: String,
+    boundaries: Vec<EditorDisplayBoundary>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EditorDisplayBoundary {
+    source: usize,
+    display: usize,
+}
+
+impl EditorDisplayMap {
+    /// Visualize controls without mutating the editable source buffer.
+    #[must_use]
+    pub(crate) fn from_source(source: &str) -> Self {
+        let mut layout_text = String::with_capacity(source.len());
+        let mut boundaries = Vec::with_capacity(source.graphemes(true).count().saturating_add(1));
+        boundaries.push(EditorDisplayBoundary {
+            source: 0,
+            display: 0,
+        });
+
+        for (start, grapheme) in source.grapheme_indices(true) {
+            append_visualized_editor_grapheme(&mut layout_text, grapheme);
+            boundaries.push(EditorDisplayBoundary {
+                source: start + grapheme.len(),
+                display: layout_text.len(),
+            });
+        }
+
+        // Replacing a control can make a following combining mark join the
+        // visible control-picture grapheme. Map every source boundary forward
+        // to a valid display boundary rather than placing a caret in that new
+        // grapheme's byte interior. Multiple source boundaries may safely map
+        // to one display boundary; reverse mapping chooses the latest source
+        // boundary for that visible location. Both lists are monotonic, so this
+        // normalization stays linear for large restored drafts.
+        let mut display_boundaries = layout_text
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(layout_text.len()));
+        let mut display_boundary = display_boundaries
+            .next()
+            .expect("a display buffer always has its zero boundary");
+        for boundary in &mut boundaries {
+            while display_boundary < boundary.display {
+                display_boundary = display_boundaries
+                    .next()
+                    .expect("source transformation cannot exceed display length");
+            }
+            boundary.display = display_boundary;
+        }
+
+        Self {
+            layout_text,
+            boundaries,
+        }
+    }
+
+    /// Safe text used for layout. It can contain literal tabs, so it must be
+    /// materialized through [`Self::terminal_row`] before terminal output.
+    #[must_use]
+    pub(crate) fn layout_text(&self) -> &str {
+        &self.layout_text
+    }
+
+    /// Map a source grapheme boundary to a display grapheme boundary.
+    #[must_use]
+    pub(crate) fn source_to_display(&self, source: usize) -> usize {
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.source <= source)
+            .saturating_sub(1);
+        self.boundaries[index].display
+    }
+
+    /// Map a display grapheme boundary back to a source grapheme boundary.
+    ///
+    /// Intermediate tab cells map to the preceding source boundary. Exact
+    /// display boundaries shared by transformed graphemes map to the latest
+    /// source boundary, avoiding a stale cursor inside a source sequence.
+    #[must_use]
+    pub(crate) fn display_to_source(&self, display: usize) -> usize {
+        let display = floor_to_grapheme_boundary(&self.layout_text, display);
+        let index = self
+            .boundaries
+            .partition_point(|boundary| boundary.display <= display)
+            .saturating_sub(1);
+        self.boundaries[index].source
+    }
+
+    /// Materialize one already-laid-out visible row for terminal output.
+    ///
+    /// `cursor` is an optional layout-text byte offset in `start..=end`. The
+    /// caller owns the trusted marker and focus policy; this method never
+    /// derives a cursor from source content.
+    #[must_use]
+    pub(crate) fn terminal_row(
+        &self,
+        start: usize,
+        end: usize,
+        cursor: Option<usize>,
+        cursor_marker: &str,
+    ) -> String {
+        let Some(row) = self.layout_text.get(start..end) else {
+            return String::new();
+        };
+        let cursor = cursor.filter(|offset| *offset >= start && *offset <= end);
+        let mut rendered = String::with_capacity(row.len().saturating_add(cursor_marker.len()));
+        let mut column = 0usize;
+        if cursor == Some(start) {
+            rendered.push_str(cursor_marker);
+        }
+        let policy = WidthPolicy::default();
+        for (relative, grapheme) in row.grapheme_indices(true) {
+            let offset = start + relative;
+            if grapheme == "\t" {
+                let width = policy.grapheme_width(grapheme, column);
+                rendered.push_str(&" ".repeat(width));
+                column = column.saturating_add(width);
+            } else {
+                rendered.push_str(grapheme);
+                column = column.saturating_add(policy.grapheme_width(grapheme, column));
+            }
+            if cursor == Some(offset + grapheme.len()) {
+                rendered.push_str(cursor_marker);
+            }
+        }
+        rendered
+    }
+}
+
+fn append_visualized_editor_grapheme(out: &mut String, grapheme: &str) {
+    if grapheme == "\r\n" {
+        out.push('\n');
+        return;
+    }
+    for character in grapheme.chars() {
         match character {
             '\n' => out.push('\n'),
-            '\r' if chars.peek() == Some(&'\n') => {
-                chars.next();
-                out.push('\n');
-            }
+            // A bare CR is visible source text in the composer. CRLF is
+            // handled above as one source grapheme and one hard line feed.
             '\r' => out.push('␍'),
-            '\t' => out.push_str("    "),
+            // Keep tabs for width-aware visual layout; expand them only in a
+            // row with a known starting column.
+            '\t' => out.push('\t'),
             '\x00' => out.push('␀'),
             '\x07' => out.push('␇'),
             '\x1b' => out.push('␛'),
@@ -304,21 +444,18 @@ fn visualize_editor_controls(raw: &str) -> String {
             visible => out.push(visible),
         }
     }
-    out
 }
 
-pub(crate) fn sanitized_editor(raw: &str, cursor: usize) -> (String, usize) {
-    let mut cursor = cursor.min(raw.len());
-    while cursor > 0 && !raw.is_char_boundary(cursor) {
-        cursor -= 1;
+fn floor_to_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() {
+        return offset;
     }
-    // Composer input remains authoritative and editable. Unlike command logs,
-    // controls are visualized rather than removed so cursor offsets can map to
-    // every source byte without executing it.
-    let before = visualize_editor_controls(&raw[..cursor]);
-    let safe_cursor = before.len();
-    let after = visualize_editor_controls(&raw[cursor..]);
-    (before + &after, safe_cursor)
+    text.grapheme_indices(true)
+        .take_while(|(index, _)| *index <= offset)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0)
 }
 
 /// Append ephemeral live display output while retaining only the newest 64 KiB.
@@ -466,14 +603,69 @@ mod tests {
     }
 
     #[test]
-    fn composer_sanitization_preserves_the_cursor_without_mutating_input() {
+    fn composer_display_map_preserves_the_cursor_without_mutating_input() {
         let raw = "before \x1b[31m after";
         let cursor = "before \x1b".len();
-        let (safe, safe_cursor) = sanitized_editor(raw, cursor);
+        let map = EditorDisplayMap::from_source(raw);
+        let safe = map.layout_text();
+        let safe_cursor = map.source_to_display(cursor);
         assert_eq!(raw, "before \x1b[31m after");
         assert_eq!(&safe[..safe_cursor], "before ␛");
         assert_eq!(safe, "before ␛[31m after");
-        assert!(safe.is_char_boundary(safe_cursor));
+        assert!(safe
+            .grapheme_indices(true)
+            .any(|(offset, _)| offset == safe_cursor));
+        assert_eq!(
+            map.terminal_row(0, safe.len(), Some(safe_cursor), "<cursor>"),
+            "before ␛<cursor>[31m after"
+        );
+    }
+
+    #[test]
+    fn composer_display_map_never_maps_a_cursor_into_joined_display_graphemes() {
+        // The source ESC and following combining mark are separate source
+        // boundaries, but visualizing ESC as U+241B makes them one displayed
+        // grapheme. Mapping must advance rather than split it.
+        let raw = "\x1b\u{0301}x";
+        let map = EditorDisplayMap::from_source(raw);
+        let display_cursor = map.source_to_display("\x1b".len());
+        assert_eq!(map.layout_text(), "␛\u{0301}x");
+        assert_eq!(display_cursor, "␛\u{0301}".len());
+        assert!(map
+            .layout_text()
+            .grapheme_indices(true)
+            .any(|(offset, _)| offset == display_cursor));
+        let source_cursor = map.display_to_source(display_cursor);
+        assert!(raw
+            .grapheme_indices(true)
+            .map(|(offset, _)| offset)
+            .chain(std::iter::once(raw.len()))
+            .any(|offset| offset == source_cursor));
+    }
+
+    #[test]
+    fn composer_display_map_expands_tabs_only_in_the_visible_row() {
+        let map = EditorDisplayMap::from_source("ab\tc");
+        assert_eq!(map.layout_text(), "ab\tc");
+        assert_eq!(map.terminal_row(0, 4, None, ""), "ab  c");
+
+        let map = EditorDisplayMap::from_source("x\t");
+        assert_eq!(map.terminal_row(0, 2, Some(2), "<cursor>"), "x   <cursor>");
+    }
+
+    #[test]
+    fn composer_display_map_cannot_confuse_source_with_the_trusted_cursor_token() {
+        let source = format!("source {} token", sexy_tui_rs::CURSOR_MARKER);
+        let map = EditorDisplayMap::from_source(&source);
+        assert!(!map.layout_text().contains(sexy_tui_rs::CURSOR_MARKER));
+        let row = map.terminal_row(
+            0,
+            map.layout_text().len(),
+            Some(map.layout_text().len()),
+            sexy_tui_rs::CURSOR_MARKER,
+        );
+        assert_eq!(row.matches(sexy_tui_rs::CURSOR_MARKER).count(), 1);
+        assert!(row.contains("source ␛_pi:c␇ token"));
     }
 
     #[test]

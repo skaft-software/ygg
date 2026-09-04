@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write as IoWrite};
 use std::path::PathBuf;
@@ -31,6 +31,10 @@ use crate::presentation::{
 };
 use crate::session_store::SessionMeta;
 use crate::tui::composer::{self, ComposedInput};
+use crate::tui::composer_surface::{
+    composer_editor_geometry, ComposerEditorCache, ComposerEditorGeometry,
+    ComposerEditorProjection, ComposerEditorSource,
+};
 use crate::tui::keymap::{EditAction, SlashMenuAction};
 use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
 #[cfg(test)]
@@ -75,7 +79,7 @@ use self::terminal_text::{
     normalize_carriage_return_progress, sanitize_extension_tool_render_segments,
 };
 pub(crate) use self::terminal_text::{
-    sanitize_for_terminal, sanitize_ordinary_surface_cell, sanitized_editor,
+    sanitize_for_terminal, sanitize_ordinary_surface_cell, EditorDisplayMap,
 };
 #[cfg(test)]
 use self::tool_render::looks_like_diff;
@@ -113,13 +117,6 @@ fn is_subagent_tool(name: &str) -> bool {
 
 /// Maximum physical rows retained in a collapsed command-output tail.
 const COMPACT_EXEC_OUTPUT_ROWS: usize = 5;
-
-/// Convert application-owned composer geometry into usable text cells. The
-/// prompt marker, its gap, and the hardware-cursor reservation stay shell
-/// policy; `TextEditor` receives only this final text width.
-pub(super) fn composer_editor_wrap_width(width: u16) -> usize {
-    usize::from(width).saturating_sub(3).max(1)
-}
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -686,6 +683,16 @@ pub(crate) struct ShellState {
     reasoning_renderer: RefCell<Option<RichRenderer>>,
     /// Reusable text model for the normal composer draft and cursor.
     pub(crate) editor: TextEditor,
+    /// Cached app-owned display mapping and generic visual layout for the
+    /// active composer source. It is invalidated by the editor revision, tool
+    /// prompt revision, or chrome-aware text width.
+    composer_editor_cache: RefCell<Option<ComposerEditorCache>>,
+    /// Sticky desired visual column while moving vertically through the
+    /// composer. Horizontal/edit actions clear it.
+    composer_preferred_column: Option<usize>,
+    /// Changes whenever the ephemeral tool prompt changes without mutating the
+    /// normal editor draft.
+    tool_input_revision: u64,
     /// Ephemeral tool-owned prompt rendered in place of the editor. Secret
     /// keystrokes never enter `editor` or any transcript/session structure.
     pub(crate) tool_input_prompt: Option<String>,
@@ -841,6 +848,44 @@ fn status_rainbow_strength_at(reasoning: Option<&str>, elapsed: Option<Duration>
 }
 
 impl ShellState {
+    /// Borrow the one app-owned safe display map and generic visual layout for
+    /// the current composer source and chrome-aware text cell width.
+    pub(crate) fn composer_editor_projection(
+        &self,
+        geometry: ComposerEditorGeometry,
+    ) -> Ref<'_, ComposerEditorProjection> {
+        let (source, text, cursor) = match &self.tool_input_prompt {
+            Some(prompt) => (
+                ComposerEditorSource::ToolPrompt(self.tool_input_revision),
+                prompt.as_str(),
+                prompt.len(),
+            ),
+            None => (
+                ComposerEditorSource::Draft(self.editor.revision()),
+                self.editor.text(),
+                self.editor.cursor(),
+            ),
+        };
+        let text_width = geometry.text_width();
+        let needs_refresh = self
+            .composer_editor_cache
+            .borrow()
+            .as_ref()
+            .is_none_or(|cache| !cache.matches(source, text_width));
+        if needs_refresh {
+            self.composer_editor_cache
+                .replace(Some(ComposerEditorCache::new(
+                    source, text, cursor, text_width,
+                )));
+        }
+        Ref::map(self.composer_editor_cache.borrow(), |cache| {
+            cache
+                .as_ref()
+                .expect("composer editor cache is initialized")
+                .projection()
+        })
+    }
+
     fn invalidate_transcript(&mut self) {
         self.transcript_cache.get_mut().dirty = true;
     }
@@ -2582,40 +2627,66 @@ impl InteractiveShell {
                 | EditAction::Newline
         );
         let mut state = self.state.borrow_mut();
-        let wrap_width = composer_editor_wrap_width(state.size.0);
-        match action {
-            EditAction::Paste(text) => {
-                // Attachment policy remains shell-owned, but the reusable
-                // editor is the sole authority for normalized text insertion
-                // and cursor movement.
-                let pasted = TextEditor::normalize_paste(&text);
-                let inserted = match composer::classify_paste(&pasted) {
-                    composer::PasteKind::Verbatim | composer::PasteKind::NonMediaFile(_) => pasted,
-                    composer::PasteKind::LargeText => state.ledger.attach_pasted_text(pasted),
-                    composer::PasteKind::MediaFile(path) => {
-                        let modalities = state.input_modalities;
-                        match state.ledger.attach_media(&path, modalities) {
-                            Ok(chip) => chip,
-                            Err(error) => {
-                                state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                pasted
-                            }
-                        }
-                    }
-                    composer::PasteKind::DocumentFile(path) => {
-                        match state.ledger.attach_file_reference(&path) {
-                            Ok(chip) => chip,
-                            Err(error) => {
-                                state.push_block(TranscriptBlock::Notice(error.to_string()));
-                                pasted
-                            }
-                        }
-                    }
-                };
-                state.editor.apply(EditAction::Paste(inserted), wrap_width);
+        let geometry = composer_editor_geometry(&state, state.size.0);
+        let visual_navigation = matches!(
+            &action,
+            EditAction::Up | EditAction::Down | EditAction::Home | EditAction::End
+        );
+
+        if visual_navigation && state.tool_input_prompt.is_none() {
+            // The display copy can differ from source when controls are
+            // visualized or tabs use a row-relative width. Ask the cached
+            // generic projection for visual movement, then map the trusted
+            // display boundary back into the source editor.
+            let mut preferred_column = state.composer_preferred_column;
+            let target = {
+                let projection = state.composer_editor_projection(geometry);
+                projection.visual_source_target(&action, &mut preferred_column)
+            };
+            state.composer_preferred_column = preferred_column;
+            if let Some(target) = target {
+                state.editor.set_cursor(target);
             }
-            action => {
-                state.editor.apply(action, wrap_width);
+        } else {
+            state.composer_preferred_column = None;
+            match action {
+                EditAction::Paste(text) => {
+                    // Attachment policy remains shell-owned, but the reusable
+                    // editor is the sole authority for normalized text insertion
+                    // and cursor movement.
+                    let pasted = TextEditor::normalize_paste(&text);
+                    let inserted = match composer::classify_paste(&pasted) {
+                        composer::PasteKind::Verbatim | composer::PasteKind::NonMediaFile(_) => {
+                            pasted
+                        }
+                        composer::PasteKind::LargeText => state.ledger.attach_pasted_text(pasted),
+                        composer::PasteKind::MediaFile(path) => {
+                            let modalities = state.input_modalities;
+                            match state.ledger.attach_media(&path, modalities) {
+                                Ok(chip) => chip,
+                                Err(error) => {
+                                    state.push_block(TranscriptBlock::Notice(error.to_string()));
+                                    pasted
+                                }
+                            }
+                        }
+                        composer::PasteKind::DocumentFile(path) => {
+                            match state.ledger.attach_file_reference(&path) {
+                                Ok(chip) => chip,
+                                Err(error) => {
+                                    state.push_block(TranscriptBlock::Notice(error.to_string()));
+                                    pasted
+                                }
+                            }
+                        }
+                    };
+                    state
+                        .editor
+                        .apply(EditAction::Paste(inserted), geometry.text_width());
+                }
+                action => {
+                    state.editor.apply(action, geometry.text_width());
+                }
             }
         }
 
@@ -3069,13 +3140,15 @@ impl InteractiveShell {
     }
 
     pub fn set_tool_input_prompt(&mut self, prompt: Option<String>) {
-        self.state.borrow_mut().tool_input_prompt = prompt.map(|prompt| {
+        let mut state = self.state.borrow_mut();
+        state.tool_input_prompt = prompt.map(|prompt| {
             sanitize_for_terminal(&prompt)
                 .lines()
                 .next()
                 .unwrap_or_default()
                 .to_owned()
         });
+        state.tool_input_revision = state.tool_input_revision.saturating_add(1);
     }
 
     pub fn set_input_modalities(&mut self, modalities: ModalitySet) {

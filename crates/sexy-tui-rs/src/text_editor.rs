@@ -80,6 +80,7 @@ impl TextEditorVisualLine {
 pub struct TextEditorLayout {
     lines: Vec<TextEditorVisualLine>,
     cursor_row: usize,
+    cursor: usize,
     wrap_width: usize,
 }
 
@@ -96,6 +97,12 @@ impl TextEditorLayout {
         self.cursor_row
     }
 
+    /// The cursor's grapheme-safe byte offset in the laid-out text.
+    #[must_use]
+    pub fn cursor_offset(&self) -> usize {
+        self.cursor
+    }
+
     /// Effective text-cell width used to create this layout.
     ///
     /// A requested width of zero is normalized to one so the model can always
@@ -106,35 +113,147 @@ impl TextEditorLayout {
     }
 }
 
-/// Plain visual rows prepared for an application's renderer.
+/// Structured cursor metadata for a [`TextEditorProjection`].
 ///
-/// The row at [`Self::cursor_row`] contains the supplied cursor marker exactly
-/// once when that marker is non-empty. The marker is treated as zero-width by
-/// callers such as the retained TUI; this type itself does not emit terminal
-/// escapes or impose focus policy.
+/// `offset` is a byte offset in the laid-out text and `column` is its
+/// display-cell position relative to the start of `row`. The cursor is always
+/// placed at a grapheme boundary, even when the source cursor sat in soft-wrap
+/// separator whitespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEditorCursor {
+    row: usize,
+    offset: usize,
+    column: usize,
+}
+
+impl TextEditorCursor {
+    /// Visual row containing the cursor.
+    #[must_use]
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Grapheme-safe byte offset in the text passed to the projection.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Display-cell column relative to the visual row's text start.
+    #[must_use]
+    pub fn column(&self) -> usize {
+        self.column
+    }
+}
+
+/// A lazily materialized, marker-free text projection.
+///
+/// The projection owns layout and structured cursor coordinates, not rendered
+/// strings. Call [`Self::line`] only for rows an application will paint and use
+/// [`Self::cursor`] or [`Self::cursor_parts`] to place application-owned cursor
+/// chrome. Keeping cursor metadata separate prevents an arbitrary source value
+/// from being confused with a cursor marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEditorProjection {
-    lines: Vec<String>,
-    cursor_row: usize,
+    layout: TextEditorLayout,
+    cursor: TextEditorCursor,
 }
 
 impl TextEditorProjection {
-    /// Projected visual rows in source order.
+    /// Borrow the visual layout used by this projection.
     #[must_use]
-    pub fn lines(&self) -> &[String] {
-        &self.lines
+    pub fn layout(&self) -> &TextEditorLayout {
+        &self.layout
     }
 
-    /// Index of the row containing the inserted cursor marker.
+    /// Visual rows in source order.
+    #[must_use]
+    pub fn lines(&self) -> &[TextEditorVisualLine] {
+        self.layout.lines()
+    }
+
+    /// Structured location of the cursor.
+    #[must_use]
+    pub fn cursor(&self) -> TextEditorCursor {
+        self.cursor
+    }
+
+    /// Index of the row containing the cursor.
     #[must_use]
     pub fn cursor_row(&self) -> usize {
-        self.cursor_row
+        self.cursor.row
     }
 
-    /// Consume the projection and return its rendered rows.
+    /// Borrow one visible row without allocating a rendered string.
+    ///
+    /// `text` must be the text used to create this projection. A mismatched
+    /// value returns `None` rather than slicing at an invalid UTF-8 boundary.
     #[must_use]
-    pub fn into_lines(self) -> Vec<String> {
-        self.lines
+    pub fn line<'a>(&self, text: &'a str, row: usize) -> Option<&'a str> {
+        let line = self.layout.lines.get(row)?;
+        text.get(line.start..line.visible_end)
+    }
+
+    /// Split the cursor row at the structured cursor location.
+    ///
+    /// Applications can insert their own trusted cursor token between the two
+    /// slices. The source text is never searched for that token.
+    #[must_use]
+    pub fn cursor_parts<'a>(&self, text: &'a str) -> Option<(&'a str, &'a str)> {
+        let line = self.layout.lines.get(self.cursor.row)?;
+        Some((
+            text.get(line.start..self.cursor.offset)?,
+            text.get(self.cursor.offset..line.visible_end)?,
+        ))
+    }
+
+    /// Return a display-text offset for a visual navigation action.
+    ///
+    /// This is useful when an embedding application lays out a transformed safe
+    /// display copy and maps the resulting offset back to its source model. The
+    /// generic editor still owns the visual-row algorithm; the application owns
+    /// any source/display transformation and mapping policy. `preferred_column`
+    /// survives consecutive Up/Down moves and should be reset after another
+    /// action.
+    #[must_use]
+    pub fn visual_target(
+        &self,
+        text: &str,
+        action: &TextEditAction,
+        preferred_column: &mut Option<usize>,
+    ) -> Option<usize> {
+        let current = self.layout.lines.get(self.cursor.row)?;
+        match action {
+            TextEditAction::Up | TextEditAction::Down => {
+                let target_column = preferred_column.unwrap_or(self.cursor.column);
+                *preferred_column = Some(target_column);
+                let last_row = self.layout.lines.len().saturating_sub(1);
+                match action {
+                    TextEditAction::Up if self.cursor.row == 0 => Some(0),
+                    TextEditAction::Down if self.cursor.row == last_row => Some(text.len()),
+                    TextEditAction::Up => Some(offset_at_column(
+                        text,
+                        &self.layout.lines[self.cursor.row - 1],
+                        target_column,
+                    )),
+                    TextEditAction::Down => Some(offset_at_column(
+                        text,
+                        &self.layout.lines[self.cursor.row + 1],
+                        target_column,
+                    )),
+                    _ => unreachable!("matched visual vertical action"),
+                }
+            }
+            TextEditAction::Home => {
+                *preferred_column = None;
+                Some(current.start)
+            }
+            TextEditAction::End => {
+                *preferred_column = None;
+                Some(current.visible_end)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -169,6 +288,9 @@ pub struct TextEditor {
     /// The column selected before a vertical move into a shorter row. It stays
     /// sticky for repeated vertical moves and is reset by non-vertical edits.
     preferred_column: Option<usize>,
+    /// Monotonic local identity for applications that cache a transformed
+    /// display projection without scanning the complete draft every frame.
+    revision: u64,
     cached_layout: RefCell<Option<LayoutCache>>,
 }
 
@@ -178,6 +300,7 @@ impl Default for TextEditor {
             text: String::new(),
             cursor: 0,
             preferred_column: None,
+            revision: 0,
             cached_layout: RefCell::new(None),
         }
     }
@@ -199,6 +322,7 @@ impl TextEditor {
             text,
             cursor,
             preferred_column: None,
+            revision: 0,
             cached_layout: RefCell::new(None),
         }
     }
@@ -218,6 +342,15 @@ impl TextEditor {
         self.cursor
     }
 
+    /// Monotonic local revision changed by a text or cursor mutation.
+    ///
+    /// It is intended only as a cache key within one editor instance; it is not
+    /// a durable revision or a cross-instance ordering value.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Return whether the buffer has no text.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -232,20 +365,33 @@ impl TextEditor {
 
     /// Replace the complete buffer and place the cursor at its end.
     pub fn set_text(&mut self, text: impl Into<String>) {
-        self.text = text.into();
-        self.cursor = self.text.len();
+        let text = text.into();
+        let cursor = text.len();
+        let changed = self.text != text || self.cursor != cursor;
+        self.text = text;
+        self.cursor = cursor;
         self.preferred_column = None;
-        self.invalidate_layout();
+        if changed {
+            self.invalidate_layout();
+            self.touch();
+        }
     }
 
     /// Clamp `cursor` to the preceding grapheme boundary and select it.
     ///
     /// Supplying an offset in the middle of a UTF-8 scalar or extended
-    /// grapheme never creates an invalid editor state.
+    /// grapheme never creates an invalid editor state. This setter deliberately
+    /// floors its input; edits use a separate ceiling rule so newly inserted
+    /// text is not reordered when it joins a suffix grapheme.
     pub fn set_cursor(&mut self, cursor: usize) {
-        self.cursor = clamp_to_grapheme_boundary(&self.text, cursor);
+        let cursor = clamp_to_grapheme_boundary(&self.text, cursor);
+        let changed = self.cursor != cursor;
+        self.cursor = cursor;
         self.preferred_column = None;
-        self.invalidate_layout();
+        if changed {
+            self.invalidate_layout();
+            self.touch();
+        }
     }
 
     /// Move the cursor to the end of the buffer.
@@ -255,26 +401,30 @@ impl TextEditor {
 
     /// Clear the buffer and reset its cursor.
     pub fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-        self.preferred_column = None;
-        self.invalidate_layout();
+        self.set_text(String::new());
     }
 
     /// Take the owned buffer, leaving an empty editor with cursor zero.
     #[must_use]
     pub fn take_text(&mut self) -> String {
+        let had_state = !self.text.is_empty() || self.cursor != 0;
         self.cursor = 0;
         self.preferred_column = None;
-        self.invalidate_layout();
-        std::mem::take(&mut self.text)
+        let text = std::mem::take(&mut self.text);
+        if had_state {
+            self.invalidate_layout();
+            self.touch();
+        }
+        text
     }
 
     /// Replace a complete-grapheme byte range without exposing mutable text.
     ///
     /// Returns `false` and leaves the model unchanged when either range endpoint
-    /// is not a grapheme boundary. The cursor follows text after the range and
-    /// moves to the replacement's end when it was inside the range.
+    /// is not a grapheme boundary. A cursor before a non-empty range stays
+    /// before it; a cursor after it follows the replacement; a cursor within it
+    /// moves to the replacement's end. Inserting through an empty range at the
+    /// cursor moves after the inserted text.
     pub fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> bool {
         if range.start > range.end
             || !is_grapheme_boundary(&self.text, range.start)
@@ -285,7 +435,11 @@ impl TextEditor {
 
         let removed = range.end - range.start;
         let inserted = replacement.len();
-        let next_cursor = if self.cursor <= range.start {
+        let next_cursor = if self.cursor < range.start {
+            self.cursor
+        } else if range.start == range.end && self.cursor == range.start {
+            range.start + inserted
+        } else if self.cursor == range.start {
             self.cursor
         } else if self.cursor >= range.end {
             self.cursor - removed + inserted
@@ -293,7 +447,7 @@ impl TextEditor {
             range.start + inserted
         };
         self.text.replace_range(range, replacement);
-        self.finish_non_vertical_change(next_cursor);
+        self.finish_after_edit(next_cursor);
         true
     }
 
@@ -344,6 +498,12 @@ impl TextEditor {
         layout
     }
 
+    /// Return a marker-free structured projection for the current text.
+    #[must_use]
+    pub fn projection(&self, wrap_width: usize) -> TextEditorProjection {
+        projection_for_layout(&self.text, self.layout(wrap_width))
+    }
+
     /// Layout arbitrary safe display text with the same editor rules.
     ///
     /// This exists for applications that retain raw editable text but render a
@@ -358,35 +518,21 @@ impl TextEditor {
         TextEditorLayout {
             lines,
             cursor_row,
+            cursor,
             wrap_width,
         }
     }
 
-    /// Build plain visual rows with `cursor_marker` inserted at the cursor.
-    #[must_use]
-    pub fn render_projection(
-        &self,
-        wrap_width: usize,
-        cursor_marker: &str,
-    ) -> TextEditorProjection {
-        let layout = self.layout(wrap_width);
-        projection_for(&self.text, self.cursor, &layout, cursor_marker)
-    }
-
-    /// Build a cursor-marker projection for arbitrary safe display text.
+    /// Build a marker-free structured projection for arbitrary safe display
+    /// text.
     ///
     /// Like [`Self::layout_for`], this is useful when an application transforms
-    /// untrusted source text only at its render boundary.
+    /// untrusted source text only at its render boundary. The returned cursor
+    /// coordinates are authoritative; applications add any trusted terminal
+    /// marker themselves rather than searching rendered source strings.
     #[must_use]
-    pub fn render_projection_for(
-        text: &str,
-        cursor: usize,
-        wrap_width: usize,
-        cursor_marker: &str,
-    ) -> TextEditorProjection {
-        let cursor = clamp_to_grapheme_boundary(text, cursor);
-        let layout = Self::layout_for(text, cursor, wrap_width);
-        projection_for(text, cursor, &layout, cursor_marker)
+    pub fn projection_for(text: &str, cursor: usize, wrap_width: usize) -> TextEditorProjection {
+        projection_for_layout(text, Self::layout_for(text, cursor, wrap_width))
     }
 
     fn insert_text(&mut self, text: &str) -> bool {
@@ -394,7 +540,7 @@ impl TextEditor {
             return false;
         }
         self.text.insert_str(self.cursor, text);
-        self.finish_non_vertical_change(self.cursor + text.len());
+        self.finish_after_edit(self.cursor + text.len());
         true
     }
 
@@ -404,7 +550,7 @@ impl TextEditor {
         }
         let previous = previous_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(previous..self.cursor, "");
-        self.finish_non_vertical_change(previous);
+        self.finish_after_edit(previous);
         true
     }
 
@@ -414,7 +560,7 @@ impl TextEditor {
         }
         let next = next_grapheme_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..next, "");
-        self.finish_non_vertical_change(self.cursor);
+        self.finish_after_edit(self.cursor);
         true
     }
 
@@ -423,7 +569,7 @@ impl TextEditor {
             return false;
         }
         let cursor = previous_grapheme_boundary(&self.text, self.cursor);
-        self.finish_non_vertical_change(cursor);
+        self.finish_after_motion(cursor);
         true
     }
 
@@ -432,7 +578,7 @@ impl TextEditor {
             return false;
         }
         let cursor = next_grapheme_boundary(&self.text, self.cursor);
-        self.finish_non_vertical_change(cursor);
+        self.finish_after_motion(cursor);
         true
     }
 
@@ -464,6 +610,7 @@ impl TextEditor {
         }
         self.cursor = cursor;
         self.invalidate_layout();
+        self.touch();
         true
     }
 
@@ -472,14 +619,30 @@ impl TextEditor {
         let line = &layout.lines[layout.cursor_row];
         let cursor = if end { line.visible_end } else { line.start };
         let changed = cursor != self.cursor;
-        self.finish_non_vertical_change(cursor);
+        self.finish_after_motion(cursor);
         changed
     }
 
-    fn finish_non_vertical_change(&mut self, cursor: usize) {
-        self.cursor = clamp_to_grapheme_boundary(&self.text, cursor);
+    fn finish_after_edit(&mut self, intended_cursor: usize) {
+        self.cursor = ceil_to_grapheme_boundary(&self.text, intended_cursor);
         self.preferred_column = None;
         self.invalidate_layout();
+        self.touch();
+    }
+
+    fn finish_after_motion(&mut self, cursor: usize) {
+        let cursor = clamp_to_grapheme_boundary(&self.text, cursor);
+        let changed = self.cursor != cursor;
+        self.cursor = cursor;
+        self.preferred_column = None;
+        if changed {
+            self.invalidate_layout();
+            self.touch();
+        }
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.saturating_add(1);
     }
 
     fn invalidate_layout(&mut self) {
@@ -652,28 +815,18 @@ fn offset_at_column(text: &str, line: &TextEditorVisualLine, target: usize) -> u
     offset
 }
 
-fn projection_for(
-    text: &str,
-    cursor: usize,
-    layout: &TextEditorLayout,
-    cursor_marker: &str,
-) -> TextEditorProjection {
-    let mut lines = Vec::with_capacity(layout.lines.len());
-    for (index, line) in layout.lines.iter().enumerate() {
-        if index == layout.cursor_row {
-            let cursor = cursor.clamp(line.start, line.visible_end);
-            lines.push(format!(
-                "{}{cursor_marker}{}",
-                &text[line.start..cursor],
-                &text[cursor..line.visible_end]
-            ));
-        } else {
-            lines.push(text[line.start..line.visible_end].to_owned());
-        }
-    }
+fn projection_for_layout(text: &str, layout: TextEditorLayout) -> TextEditorProjection {
+    let row = layout.cursor_row.min(layout.lines.len().saturating_sub(1));
+    let line = &layout.lines[row];
+    let offset =
+        clamp_to_grapheme_boundary(text, layout.cursor).clamp(line.start, line.visible_end);
     TextEditorProjection {
-        lines,
-        cursor_row: layout.cursor_row,
+        cursor: TextEditorCursor {
+            row,
+            offset,
+            column: column_at(text, line, offset),
+        },
+        layout,
     }
 }
 
@@ -697,6 +850,17 @@ fn clamp_to_grapheme_boundary(text: &str, offset: usize) -> usize {
         .unwrap_or(0)
 }
 
+fn ceil_to_grapheme_boundary(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    if offset == text.len() || is_grapheme_boundary(text, offset) {
+        return offset;
+    }
+    text.grapheme_indices(true)
+        .map(|(index, _)| index)
+        .find(|index| *index > offset)
+        .unwrap_or(text.len())
+}
+
 fn previous_grapheme_boundary(text: &str, cursor: usize) -> usize {
     text[..cursor]
         .grapheme_indices(true)
@@ -718,6 +882,7 @@ mod tests {
     fn assert_layout_invariants(text: &str, layout: &TextEditorLayout) {
         assert!(!layout.lines().is_empty());
         assert!(layout.cursor_row() < layout.lines().len());
+        assert!(is_grapheme_boundary(text, layout.cursor_offset()));
         for line in layout.lines() {
             assert!(line.start() <= line.visible_end());
             assert!(line.visible_end() <= line.end());
@@ -729,6 +894,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn projection_rows(text: &str, projection: &TextEditorProjection, marker: &str) -> Vec<String> {
+        projection
+            .lines()
+            .iter()
+            .enumerate()
+            .map(|(row, _)| {
+                let line = projection.line(text, row).unwrap();
+                if row == projection.cursor().row() {
+                    let offset = projection.cursor().offset();
+                    let visual = &projection.lines()[row];
+                    format!(
+                        "{}{}{}",
+                        &text[visual.start()..offset],
+                        marker,
+                        &text[offset..visual.visible_end()]
+                    )
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect()
     }
 
     #[test]
@@ -748,9 +936,10 @@ mod tests {
             assert!(editor.cursor_is_valid());
             assert_eq!(editor.cursor(), 0);
         }
-        let projection = editor.render_projection(0, "<cursor>");
-        assert_eq!(projection.lines(), ["<cursor>"]);
-        assert_eq!(projection.cursor_row(), 0);
+        let projection = editor.projection(0);
+        assert_eq!(projection.line(editor.text(), 0), Some(""));
+        assert_eq!(projection.cursor().row(), 0);
+        assert_eq!(projection.cursor().column(), 0);
     }
 
     #[test]
@@ -796,6 +985,41 @@ mod tests {
     }
 
     #[test]
+    fn suffix_joining_edits_ceil_the_cursor_without_changing_set_cursor_flooring() {
+        let cases = [
+            ("\u{301}x", "a\u{301}bx"),
+            ("\u{fe0f}x", "❤\u{fe0f}bx"),
+            ("🇧x", "🇦🇧bx"),
+            ("\u{200d}💻x", "👩\u{200d}💻bx"),
+        ];
+        for (suffix, expected) in cases {
+            let mut editor = TextEditor::with_text(suffix);
+            editor.apply(TextEditAction::Home, 80);
+            let first = match suffix {
+                "🇧x" => TextEditAction::Paste("🇦".into()),
+                "\u{200d}💻x" => TextEditAction::Paste("👩".into()),
+                "\u{fe0f}x" => TextEditAction::Char('❤'),
+                _ => TextEditAction::Char('a'),
+            };
+            assert!(editor.apply(first, 80), "{suffix:?}");
+            assert!(editor.cursor_is_valid(), "{suffix:?}");
+            assert!(editor.apply(TextEditAction::Char('b'), 80), "{suffix:?}");
+            assert_eq!(editor.text(), expected, "{suffix:?}");
+            assert!(editor.cursor_is_valid(), "{suffix:?}");
+        }
+
+        let mut replacement = TextEditor::with_text("\u{301}x");
+        replacement.set_cursor(0);
+        assert!(replacement.replace_range(0..0, "a"));
+        assert!(replacement.apply(TextEditAction::Char('b'), 80));
+        assert_eq!(replacement.text(), "a\u{301}bx");
+
+        let mut floor = TextEditor::with_text("e\u{301}");
+        floor.set_cursor(1);
+        assert_eq!(floor.cursor(), 0, "set_cursor remains a floor operation");
+    }
+
+    #[test]
     fn visual_layout_wraps_words_without_losing_source_ranges() {
         let editor = TextEditor::with_text("alpha beta gamma");
         let layout = editor.layout(10);
@@ -817,23 +1041,51 @@ mod tests {
     }
 
     #[test]
-    fn layout_and_projection_handle_zeroish_widths_wide_cells_and_unique_cursor_markers() {
+    fn structured_projection_never_confuses_source_with_a_cursor_marker() {
+        let editor = TextEditor::with_text("source <cursor> token");
+        let projection = editor.projection(80);
+        assert_eq!(
+            projection.line(editor.text(), 0),
+            Some("source <cursor> token")
+        );
+        assert_eq!(projection.cursor().offset(), editor.text().len());
+        let rows = projection_rows(editor.text(), &projection, "<cursor>");
+        assert_eq!(rows, ["source <cursor> token<cursor>"]);
+        assert_eq!(
+            projection.cursor_parts(editor.text()),
+            Some(("source <cursor> token", ""))
+        );
+
+        let marker_source = format!("source {} token", crate::CURSOR_MARKER);
+        let editor = TextEditor::with_text(marker_source.clone());
+        let projection = editor.projection(80);
+        assert_eq!(
+            projection.line(editor.text(), 0),
+            Some(marker_source.as_str())
+        );
+        assert_eq!(
+            projection.cursor_parts(editor.text()),
+            Some((marker_source.as_str(), ""))
+        );
+    }
+
+    #[test]
+    fn layout_and_projection_handle_zeroish_widths_wide_cells_and_cursor_coordinates() {
         let mut editor = TextEditor::with_text("e\u{301}界👩‍💻 alpha");
         editor.set_cursor("e\u{301}界".len());
         for width in 0..=4 {
             let layout = editor.layout(width);
             assert_layout_invariants(editor.text(), &layout);
-            let projection = editor.render_projection(width, "<cursor>");
-            assert_eq!(
-                projection
-                    .lines()
-                    .iter()
-                    .map(|line| line.matches("<cursor>").count())
-                    .sum::<usize>(),
-                1,
-                "width {width}: {projection:?}"
-            );
-            assert_eq!(projection.cursor_row(), layout.cursor_row());
+            let projection = editor.projection(width);
+            assert_eq!(projection.cursor().row(), layout.cursor_row());
+            assert!(projection.cursor().offset() <= editor.text().len());
+            assert!(is_grapheme_boundary(
+                editor.text(),
+                projection.cursor().offset()
+            ));
+            assert!(projection
+                .line(editor.text(), projection.cursor().row())
+                .is_some());
         }
     }
 
@@ -855,14 +1107,34 @@ mod tests {
     }
 
     #[test]
+    fn static_projection_visual_targets_share_one_layout() {
+        let text = "abcdef\nxy\nabcdefgh";
+        let projection = TextEditor::projection_for(text, 5, 80);
+        let mut preferred = None;
+        let target = projection
+            .visual_target(text, &TextEditAction::Down, &mut preferred)
+            .unwrap();
+        assert_eq!(target, "abcdef\nxy".len());
+        let projection = TextEditor::projection_for(text, target, 80);
+        let target = projection
+            .visual_target(text, &TextEditAction::Down, &mut preferred)
+            .unwrap();
+        assert_eq!(target, "abcdef\nxy\nabcde".len());
+        let projection = TextEditor::projection_for(text, target, 80);
+        let home = projection
+            .visual_target(text, &TextEditAction::Home, &mut preferred)
+            .unwrap();
+        assert_eq!(home, "abcdef\nxy\n".len());
+        assert_eq!(preferred, None);
+    }
+
+    #[test]
     fn soft_wraps_and_resize_keep_the_same_source_cursor_affinity() {
         let mut editor = TextEditor::with_text("abcdefghij");
         editor.set_cursor(7);
         assert_eq!(editor.layout(3).cursor_row(), 2);
         assert_eq!(editor.layout(5).cursor_row(), 1);
 
-        // A vertical motion establishes a preferred visual column. Reflowing
-        // before the next motion must preserve that column, not a stale row.
         editor.apply(TextEditAction::Up, 3);
         assert_eq!(editor.cursor(), 4);
         editor.apply(TextEditAction::Down, 5);
@@ -920,8 +1192,6 @@ mod tests {
         );
         assert_layout_invariants(editor.text(), &layout);
 
-        // CRLF is a single extended grapheme. It is not painted as source text,
-        // but motion can still cross it without creating a split cursor state.
         editor.set_cursor(1);
         editor.apply(TextEditAction::Right, 8);
         assert_eq!(editor.cursor(), 3);
@@ -933,18 +1203,10 @@ mod tests {
     #[test]
     fn static_projection_clamps_untrusted_offsets_without_mutating_source() {
         let text = "e\u{301}界";
-        let projection = TextEditor::render_projection_for(text, 1, 1, "<cursor>");
-        assert_eq!(
-            projection
-                .lines()
-                .iter()
-                .map(|line| line.matches("<cursor>").count())
-                .sum::<usize>(),
-            1
-        );
+        let projection = TextEditor::projection_for(text, 1, 1);
+        assert_eq!(projection.cursor().offset(), 0);
         assert_eq!(text, "e\u{301}界");
-        let layout = TextEditor::layout_for(text, 1, 1);
-        assert_layout_invariants(text, &layout);
+        assert_layout_invariants(text, projection.layout());
     }
 
     #[test]
@@ -959,6 +1221,7 @@ mod tests {
             "one\ntwo\n",
             "\r\n",
             "a\tb",
+            "\x1b\u{301}x",
         ];
         let widths = [0, 1, 2, 3, 7, 80];
         for source in sources {
@@ -979,20 +1242,53 @@ mod tests {
                 ] {
                     editor.apply(action, width);
                     assert!(editor.cursor_is_valid(), "{source:?} at width {width}");
-                    let layout = editor.layout(width);
-                    assert_layout_invariants(editor.text(), &layout);
-                    let projection = editor.render_projection(width, "<cursor>");
-                    assert_eq!(
-                        projection
-                            .lines()
-                            .iter()
-                            .map(|line| line.matches("<cursor>").count())
-                            .sum::<usize>(),
-                        1,
-                        "{source:?} at width {width}: {projection:?}"
-                    );
+                    let projection = editor.projection(width);
+                    assert_layout_invariants(editor.text(), projection.layout());
+                    assert!(projection
+                        .line(editor.text(), projection.cursor().row())
+                        .is_some());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn deterministic_randomized_unicode_edits_and_layouts_stay_safe() {
+        const FRAGMENTS: [&str; 12] = [
+            "a", "界", "e\u{301}", "\u{fe0f}", "🇦", "👩", "\u{200d}", "💻", "\t", "\x1b", "\r\n",
+            "\n",
+        ];
+        let mut seed = 0x5eed_cafe_u64;
+        let mut editor = TextEditor::new();
+        for _ in 0..4_000 {
+            if editor.text().len() > 128 {
+                editor.clear();
+            }
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let width = ((seed >> 8) as usize % 12).max(1);
+            let action = match seed % 11 {
+                0 => TextEditAction::Left,
+                1 => TextEditAction::Right,
+                2 => TextEditAction::Up,
+                3 => TextEditAction::Down,
+                4 => TextEditAction::Home,
+                5 => TextEditAction::End,
+                6 => TextEditAction::Backspace,
+                7 => TextEditAction::Delete,
+                8 => TextEditAction::Newline,
+                9 => TextEditAction::Char('界'),
+                _ => TextEditAction::Paste(
+                    FRAGMENTS[((seed >> 16) as usize) % FRAGMENTS.len()].to_owned(),
+                ),
+            };
+            editor.apply(action, width);
+            assert!(editor.text().is_char_boundary(editor.cursor()));
+            assert!(editor.cursor_is_valid());
+            let projection = editor.projection(width);
+            assert_layout_invariants(editor.text(), projection.layout());
+            let cursor = projection.cursor();
+            assert!(cursor.row() < projection.lines().len());
+            assert!(is_grapheme_boundary(editor.text(), cursor.offset()));
         }
     }
 }

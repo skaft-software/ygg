@@ -22,8 +22,8 @@ results; it must not learn what a run, tool call, provider, or model is.
 
 `TextEditor` owns only the reusable text mechanics: the UTF-8 buffer,
 grapheme-boundary cursor, semantic `TextEditAction`s, visual-wrap layout,
-vertical preferred-column movement, and plain cursor-marker projection. The
-coding agent keeps every product decision around it:
+vertical preferred-column movement, and marker-free structured cursor metadata.
+The coding agent keeps every product decision around it:
 
 - `tui/keymap.rs` translates crossterm events and exports its `EditAction` as the
   generic `TextEditAction`;
@@ -32,14 +32,17 @@ coding agent keeps every product decision around it:
 - composer paste classification, attachment chips, slash/path completion,
   submission, focus, and adaptive composer chrome remain in Ygg;
 - terminal-control visualization remains at Ygg's render boundary. When that
-  produces a safe display copy, render it with `TextEditor::layout_for` or
-  `TextEditor::render_projection_for`, not by mutating the source draft.
+  produces a safe display copy, Ygg owns a grapheme-safe source/display map,
+  uses `TextEditor::projection_for` for one mapped layout, maps visual movement
+  back to source, and expands tabs only in each materialized visual row.
 
 Ygg computes and passes the usable text-cell width after its prompt marker,
 chrome, and padding reservations. It must not expose mutable buffer access or
-reimplement grapheme movement around the generic model. A non-empty projection
-marker occurs exactly once; Ygg still decides whether a panel suppresses it and
-whether the retained TUI shows a hardware cursor.
+reimplement grapheme movement around the generic model. `TextEditorProjection`
+keeps cursor coordinates separate from source content; Ygg inserts its trusted
+hardware-cursor marker from those coordinates and may suppress it when a panel
+owns focus. Cache a transformed projection by `TextEditor::revision()` and that
+same chrome-aware text width, then materialize only visible rows.
 
 ## Replace generic duplicates
 
@@ -231,7 +234,8 @@ Terminal sanitization is not command, path, or network validation.
 - Tool output containing OSC 52, CSI erase/query, DCS/APC, BEL, invalid UTF-8,
   or bidi overrides cannot execute a terminal command.
 - Editor cursor cells remain correct around CJK, combining marks, emoji, CRLF paste,
-  soft wraps, and resize; a cursor-marker projection contains one marker.
+  soft wraps, resize, controls, and positional tabs; structured cursor metadata
+  remains unambiguous even when source text contains a marker-like value.
 - ANSI16/light and plain snapshots retain all status/diff/link meaning.
 - Panic, Ctrl-C, cancellation, and normal exit restore cursor/raw/paste/sync state.
 - Release benchmark data shows bounded streaming reparse bytes and syntax-cache
