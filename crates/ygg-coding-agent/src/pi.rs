@@ -9,11 +9,11 @@ use anyhow::Context;
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use ygg_agent::EXTENSION_API_VERSION_0_2;
 use ygg_agent::extension_process::{
     ExtensionCapabilities, ExtensionEntrypoint, ExtensionFilesystemAccess, ExtensionHook,
     ExtensionManifest, ExtensionUiSurface, ManifestContributions,
 };
+use ygg_agent::EXTENSION_API_VERSION_0_2;
 
 const BRIDGE_VERSION: &str = "0.3.0";
 const SUPPORTED_PI_VERSION: &str = "0.84.4";
@@ -2585,12 +2585,10 @@ mod tests {
         }
         assert_eq!(manifest.contributes.commands, ["pi-example"]);
         assert_eq!(manifest.contributes.hooks.len(), 3);
-        assert!(
-            !manifest
-                .contributes
-                .hooks
-                .contains(&ExtensionHook::BeforePrompt)
-        );
+        assert!(!manifest
+            .contributes
+            .hooks
+            .contains(&ExtensionHook::BeforePrompt));
         assert!(manifest.contributes.context);
 
         let evidence = runtime_evidence_text(
@@ -2746,15 +2744,13 @@ mod tests {
         );
         rollback("pi-rollback", Some(&extension_root), temp.path()).unwrap();
         assert!(!package.exists());
-        assert!(
-            fs::read_dir(&extension_root)
-                .unwrap()
-                .filter_map(Result::ok)
-                .any(|entry| entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".pi-rollback-pi-rollback-"))
-        );
+        assert!(fs::read_dir(&extension_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pi-rollback-pi-rollback-")));
     }
 
     #[test]
@@ -2873,18 +2869,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            process
-                .negotiated_features()
-                .contains(ygg_agent::EXTENSION_FEATURE_RUNTIME_COMMANDS)
-        );
+        assert!(process
+            .negotiated_features()
+            .contains(ygg_agent::EXTENSION_FEATURE_RUNTIME_COMMANDS));
         let commands = &process.contributions().commands;
         assert!(commands.iter().any(|command| command.name == "ui-methods"));
-        assert!(
-            !commands
-                .iter()
-                .any(|command| command.name == "pi-host-integration")
-        );
+        assert!(!commands
+            .iter()
+            .any(|command| command.name == "pi-host-integration"));
         let output = process
             .execute_command("ui-methods", Vec::new(), process.current_context())
             .await
@@ -2909,11 +2901,9 @@ mod tests {
             }
             Err(error) => error,
         };
-        assert!(
-            stale_error
-                .to_string()
-                .contains("changed after link publication")
-        );
+        assert!(stale_error
+            .to_string()
+            .contains("changed after link publication"));
     }
 
     #[cfg(unix)]
@@ -2964,13 +2954,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            process
-                .contributions()
-                .tools
-                .iter()
-                .any(|tool| tool.name == "hello")
-        );
+        assert!(process
+            .contributions()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "hello"));
         let output = process
             .call_tool(
                 "hello",
@@ -3033,13 +3021,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            process
-                .contributions()
-                .tools
-                .iter()
-                .any(|tool| tool.name == "hello")
-        );
+        assert!(process
+            .contributions()
+            .tools
+            .iter()
+            .any(|tool| tool.name == "hello"));
         let commands = process
             .contributions()
             .commands
