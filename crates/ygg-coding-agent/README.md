@@ -16,6 +16,14 @@ then inspect or reload them without rebuilding the binary. See the
 See the [workspace README](https://github.com/skaft-software/ygg#readme) for
 installation, provider setup, safety defaults, and release status.
 
+## Inline tool images
+
+Inline tool-result images are off by default. Opt in with `--show-images`,
+`YGG_SHOW_IMAGES=1`, or `show_images = true` in user configuration. Ygg only
+places validated inline payloads on Kitty terminals; unsupported terminals use
+text fallbacks. URLs and paths are never loaded for terminal display, and
+copy/plain/print output plus terminal-write logs remain payload-free.
+
 ## SDK and native host
 
 Rust consumers can embed the public `ygg-agent` and `ygg-ai` crates directly.

@@ -209,6 +209,9 @@ pub struct Cli {
     /// Use chronological ASCII output without cursor control.
     #[arg(long)]
     pub plain: bool,
+    /// Opt in to bounded inline tool-result images on compatible interactive terminals.
+    #[arg(long = "show-images")]
+    pub show_images: bool,
     /// Mouse ownership: auto/terminal/off preserve native gestures; app
     /// captures wheel scrolling and drag selection for the semantic viewport.
     #[arg(long, value_name = "MODE")]
@@ -346,6 +349,7 @@ struct ConfigLayer {
     color: Option<String>,
     mouse: Option<String>,
     plain: Option<bool>,
+    show_images: Option<bool>,
     allow_external_paths: Option<bool>,
     allow_edit: Option<bool>,
     allow_write: Option<bool>,
@@ -388,6 +392,7 @@ impl ConfigLayer {
         override_some!(color);
         override_some!(mouse);
         override_some!(plain);
+        override_some!(show_images);
         override_some!(allow_external_paths);
         override_some!(allow_edit);
         override_some!(allow_write);
@@ -486,6 +491,12 @@ impl ConfigLayer {
         tighten_bool(&mut self.allow_write, project.allow_write.take());
         tighten_bool(&mut self.allow_process, project.allow_process.take());
         tighten_bool(&mut self.allow_shell, project.allow_shell.take());
+        // Inline terminal images are opt-in at a user-controlled boundary. A
+        // trusted project may turn them off but cannot make retained payloads
+        // render in the user's terminal.
+        if project.show_images.take() == Some(false) {
+            self.show_images = Some(false);
+        }
         // Remote reads are opt-in. A project may revoke a user grant, but may
         // never create network authority when the user/global layer omitted it.
         if project.allow_remote_read.take() == Some(false) {
@@ -847,6 +858,7 @@ const CONFIG_KEYS: &[&str] = &[
     "color",
     "mouse",
     "plain",
+    "show_images",
     "allow_external_paths",
     "allow_edit",
     "allow_write",
@@ -1113,6 +1125,7 @@ fn environment_layer() -> anyhow::Result<ConfigLayer> {
         color: env_value("YGG_COLOR"),
         mouse: env_value("YGG_MOUSE"),
         plain: env_parse("YGG_PLAIN")?,
+        show_images: env_parse("YGG_SHOW_IMAGES")?,
         allow_external_paths: env_parse("YGG_ALLOW_EXTERNAL_PATHS")?,
         allow_edit: env_parse("YGG_ALLOW_EDIT")?,
         allow_write: env_parse("YGG_ALLOW_WRITE")?,
@@ -1519,6 +1532,7 @@ fn build_config_with_global_path(
         color,
         mouse,
         plain: cli.plain || values.plain.unwrap_or(false),
+        show_images: cli.show_images || values.show_images.unwrap_or(false),
         session_dir: cli
             .session_dir
             .or(values.session_dir)
@@ -1599,6 +1613,7 @@ mod tests {
             color: None,
             mouse: None,
             plain: false,
+            show_images: false,
             show_reasoning: false,
             max_turns: None,
             session_dir: None,

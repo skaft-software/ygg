@@ -443,6 +443,9 @@ pub struct Config {
     pub mouse: MouseMode,
     /// Force the chronological ASCII frontend even on a capable TTY.
     pub plain: bool,
+    /// Opt in to bounded inline image placement for interactive tool results.
+    /// Plain, print, and noninteractive frontends always remain payload-free.
+    pub show_images: bool,
     pub session_dir: PathBuf,
     pub compaction: CompactionPolicy,
     /// Optional cumulative session spend limit in microdollars.

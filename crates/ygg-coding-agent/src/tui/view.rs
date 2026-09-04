@@ -15,14 +15,17 @@ use anyhow::Result;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use sexy_tui_rs::{
-    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, RichRenderer,
-    TextEditor, TUI,
+    parse_markdown, strip_terminal_sequences, visible_width, wrap_text_with_ansi, ImageAnchor,
+    ImageCapabilities, ImagePlanner, ImageRegistry, ImageViewport, RichRenderer, TextEditor, TUI,
 };
 use ygg_agent::{AgentEvent, EntryValue, OutputChannel, Session, ToolProgress};
 use ygg_ai::{ModalitySet, Model, ModelId, ToolCallId, Usage};
 
 use crate::config::Config;
-use crate::hydrate::{hydrate_transcript_at, hydrate_transcript_tail};
+use crate::hydrate::{
+    hydrate_transcript_at_with_image_budget, hydrate_transcript_tail_with_image_budget,
+    project_tool_images, tool_image_limits, ToolImageBudget, ToolImagePlaceholder, ToolResultImage,
+};
 #[cfg(test)]
 use crate::presentation::summarize_tool;
 use crate::presentation::{
@@ -36,7 +39,7 @@ use crate::tui::composer_surface::{
     ComposerEditorProjection, ComposerEditorSource,
 };
 use crate::tui::keymap::{EditAction, SlashMenuAction};
-use crate::tui::terminal::{force_restore, TerminalSize, YggTerminal};
+use crate::tui::terminal::{force_restore, TerminalImageStore, TerminalSize, YggTerminal};
 #[cfg(test)]
 use crate::tui::theme::ThemeSurfaceChrome;
 use crate::tui::theme::{ModelLab, ThemeDensity, YggTheme};
@@ -117,6 +120,8 @@ fn is_subagent_tool(name: &str) -> bool {
 
 /// Maximum physical rows retained in a collapsed command-output tail.
 const COMPACT_EXEC_OUTPUT_ROWS: usize = 5;
+/// Maximum physical rows one inline tool image can reserve inside its tool card.
+const MAX_TOOL_IMAGE_RENDER_ROWS: u16 = 16;
 
 /// Output from an interactive `!` shell command, stored as a collapsible
 /// block so the transcript is not overwhelmed by long command output.
@@ -189,6 +194,23 @@ enum TranscriptBlock {
     Compaction(Box<CompactionBlock>),
 }
 
+/// Current opt-in image display mode copied into each retained tool panel.
+/// It contains capability metadata only; image bytes stay in `ToolResultImage`.
+#[derive(Clone, Copy, Debug)]
+struct ToolImageRendering {
+    enabled: bool,
+    capabilities: ImageCapabilities,
+}
+
+impl Default for ToolImageRendering {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            capabilities: ImageCapabilities::forced(None, None),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ToolPanel {
     id: ToolCallId,
@@ -196,6 +218,9 @@ struct ToolPanel {
     args: String,
     display: ToolDisplay,
     output: String,
+    /// Validated opaque image media, kept separate from text/copy output.
+    images: Vec<ToolResultImage>,
+    image_rendering: ToolImageRendering,
     finished: bool,
     is_error: bool,
     /// Wall time the call took, known once the outcome is final.
@@ -244,6 +269,8 @@ impl ToolPanel {
             args,
             display,
             output,
+            images: Vec::new(),
+            image_rendering: ToolImageRendering::default(),
             finished,
             is_error,
             duration: None,
@@ -279,6 +306,51 @@ impl ToolPanel {
         self.failure_reason = subagent_activity_failure_reason(view);
         self.output = subagent_activity_copy_text(view);
         self.cached_disclosure_sensitive.replace(None);
+    }
+
+    /// Produce visual image reservations only. The returned DCS anchor contains
+    /// stable IDs/layout metadata but never protocol payload bytes; the terminal
+    /// adapter resolves it through its private image store.
+    fn image_rows(&self, width: u16) -> Vec<String> {
+        self.images
+            .iter()
+            .flat_map(|image| {
+                if !self.image_rendering.enabled {
+                    return vec![image.fallback_text(true)];
+                }
+                let Some(id) = image.id() else {
+                    return vec![image.fallback_text(false)];
+                };
+                let Some(terminal_image) = image.terminal_image() else {
+                    return vec![image.fallback_text(false)];
+                };
+                let viewport = ImageViewport::with_capabilities(
+                    width.max(1),
+                    MAX_TOOL_IMAGE_RENDER_ROWS,
+                    self.image_rendering.capabilities,
+                )
+                .expect("fixed nonzero tool image viewport is valid");
+                let plan =
+                    ImagePlanner::new(self.image_rendering.capabilities, tool_image_limits())
+                        .plan_place(id, &terminal_image, viewport);
+                match plan {
+                    Ok(plan) => match (plan.terminal_command(), plan.layout()) {
+                        (Some(command), Some(layout)) => {
+                            let mut rows = plan.semantic_rows();
+                            if let Some(first) = rows.first_mut() {
+                                first.insert_str(
+                                    0,
+                                    &ImageAnchor::new(command.protocol(), id, layout).marker(),
+                                );
+                            }
+                            rows
+                        }
+                        _ => plan.semantic_rows(),
+                    },
+                    Err(_) => vec![image.fallback_text(false)],
+                }
+            })
+            .collect()
     }
 }
 
@@ -665,6 +737,14 @@ pub(crate) struct ShellState {
     pub(crate) theme: YggTheme,
     /// Whether this session uses explicit approval gates instead of full host access.
     pub(crate) safe_mode: bool,
+    /// Opt-in terminal-image mode and conservative terminal capability state.
+    image_rendering: ToolImageRendering,
+    /// Monotonic image IDs and the private backend payload map stay separate
+    /// from semantic transcript text.
+    image_registry: ImageRegistry,
+    terminal_images: TerminalImageStore,
+    /// Session-wide retained image accounting shared by live and resumed tools.
+    tool_image_budget: ToolImageBudget,
     /// Theme swap revision. The retained terminal renderer uses this
     /// to repaint the complete visible viewport even when some logical rows
     /// (notably blank separators) are byte-identical across themes.
@@ -982,7 +1062,111 @@ impl ShellState {
         self.invalidate_transcript_layout();
     }
 
-    fn push_block(&mut self, block: TranscriptBlock) {
+    fn update_image_rendering(&mut self, enabled: bool, capabilities: ImageCapabilities) {
+        self.image_rendering = ToolImageRendering {
+            enabled,
+            capabilities,
+        };
+        for block in &mut self.transcript {
+            if let TranscriptBlock::Tool(panel) = block {
+                panel.image_rendering = self.image_rendering;
+            }
+        }
+        self.invalidate_transcript_layout();
+    }
+
+    /// Assign stable IDs and register only the opaque validated payloads for
+    /// terminal placement. Registry exhaustion becomes a bounded text fallback.
+    fn register_tool_images(&mut self, mut images: Vec<ToolResultImage>) -> Vec<ToolResultImage> {
+        for image in &mut images {
+            let Some(terminal_image) = image.terminal_image() else {
+                continue;
+            };
+            match self.image_registry.place() {
+                Ok(action) => {
+                    let id = action.id();
+                    image.set_id(id);
+                    self.terminal_images.register(id, terminal_image);
+                }
+                Err(_) => {
+                    image.replace_with_placeholder(ToolImagePlaceholder::TerminalRegistryLimit)
+                }
+            }
+        }
+        images
+    }
+
+    /// Retire IDs before their semantic anchors are replaced. `ImageRegistry`
+    /// never reuses a retired value, so a replay cannot mistake stale terminal
+    /// pixels for a newly hydrated image with the same logical position.
+    fn retire_tool_image_ids(&mut self) {
+        let registry = &mut self.image_registry;
+        for block in &mut self.transcript {
+            let TranscriptBlock::Tool(panel) = block else {
+                continue;
+            };
+            for image in &mut panel.images {
+                if let Some(id) = image.id() {
+                    let _ = registry.delete(id);
+                    image.clear_id();
+                }
+            }
+        }
+    }
+
+    /// Discard terminal-owned payload references before replacing the logical
+    /// transcript. The TUI still sees old Kitty anchors and performs its normal
+    /// targeted/destructive cleanup during the next replay.
+    fn reset_terminal_images(&mut self) {
+        self.retire_tool_image_ids();
+        self.terminal_images.clear();
+        self.tool_image_budget = ToolImageBudget::default();
+    }
+
+    /// Rebuild IDs/store after deferred history materialization. The walk is
+    /// chronological, so an active local tail consumes whatever remains after
+    /// the durable snapshot and cannot exceed the same session budget.
+    fn rebuild_terminal_images(&mut self) {
+        self.retire_tool_image_ids();
+        self.terminal_images.clear();
+        let store = self.terminal_images.clone();
+        let registry = &mut self.image_registry;
+        let mut budget = ToolImageBudget::default();
+        for block in &mut self.transcript {
+            let TranscriptBlock::Tool(panel) = block else {
+                continue;
+            };
+            for image in &mut panel.images {
+                image.clear_id();
+                let Some(bytes) = image.byte_len() else {
+                    continue;
+                };
+                if let Err(reason) = budget.retain_existing(bytes) {
+                    image.replace_with_placeholder(reason);
+                    continue;
+                }
+                let Some(terminal_image) = image.terminal_image() else {
+                    continue;
+                };
+                match registry.place() {
+                    Ok(action) => {
+                        let id = action.id();
+                        image.set_id(id);
+                        store.register(id, terminal_image);
+                    }
+                    Err(_) => {
+                        image.replace_with_placeholder(ToolImagePlaceholder::TerminalRegistryLimit)
+                    }
+                }
+            }
+        }
+        self.tool_image_budget = budget;
+    }
+
+    fn push_block(&mut self, mut block: TranscriptBlock) {
+        if let TranscriptBlock::Tool(panel) = &mut block {
+            panel.image_rendering = self.image_rendering;
+        }
         let commit_id = self.next_transcript_commit_id.0;
         self.next_transcript_commit_id.0 = commit_id
             .checked_add(1)
@@ -999,7 +1183,10 @@ impl ShellState {
         self.invalidate_transcript();
     }
 
-    fn insert_block(&mut self, index: usize, block: TranscriptBlock) {
+    fn insert_block(&mut self, index: usize, mut block: TranscriptBlock) {
+        if let TranscriptBlock::Tool(panel) = &mut block {
+            panel.image_rendering = self.image_rendering;
+        }
         let index = index.min(self.transcript.len());
         let commit_id = self.next_transcript_commit_id.0;
         self.next_transcript_commit_id.0 = commit_id
@@ -1966,7 +2153,13 @@ impl InteractiveShell {
         if !theme.capabilities().interactive {
             anyhow::bail!("interactive terminal capabilities are unavailable");
         }
-        let terminal = YggTerminal::enter_with_mouse(size.clone(), capture_mouse)?;
+        let image_store = TerminalImageStore::default();
+        let terminal = YggTerminal::enter_with_mouse_and_images(
+            size.clone(),
+            capture_mouse,
+            image_store.clone(),
+        )?;
+        let image_capabilities = terminal.image_capabilities();
         let initial_size = *size.lock().expect("terminal size mutex poisoned");
         let state = SharedState::new(ShellState {
             theme,
@@ -1974,6 +2167,11 @@ impl InteractiveShell {
             follow_tail: true,
             application_viewport_requested: capture_mouse,
             startup_card_started_at: Some(Instant::now()),
+            image_rendering: ToolImageRendering {
+                enabled: false,
+                capabilities: image_capabilities,
+            },
+            terminal_images: image_store,
             ..ShellState::default()
         });
         let (render_tx, render_rx) = mpsc::sync_channel(1);
@@ -2055,7 +2253,18 @@ impl InteractiveShell {
         if self.render_thread.is_some() || self.tui.is_some() {
             return Ok(());
         }
-        let terminal = YggTerminal::enter_with_mouse(self.size.clone(), self.capture_mouse)?;
+        let image_store = self.state.borrow().terminal_images.clone();
+        let terminal = YggTerminal::enter_with_mouse_and_images(
+            self.size.clone(),
+            self.capture_mouse,
+            image_store,
+        )?;
+        let image_capabilities = terminal.image_capabilities();
+        {
+            let mut state = self.state.borrow_mut();
+            let enabled = state.image_rendering.enabled;
+            state.update_image_rendering(enabled, image_capabilities);
+        }
         let current_size = *self.size.lock().expect("terminal size mutex poisoned");
         self.set_size(current_size.0, current_size.1);
         let (render_tx, render_rx) = mpsc::sync_channel(1);
@@ -2403,6 +2612,21 @@ impl InteractiveShell {
                 result,
                 duration,
             } => {
+                let index = state.tool_panels.get(id).copied();
+                let completed_images = index
+                    .is_some()
+                    .then(|| match result {
+                        Ok(output) => project_tool_images(
+                            output.content_parts().iter().filter_map(|part| match part {
+                                ygg_agent::ToolOutputContentPart::Media(media) => Some(media),
+                                ygg_agent::ToolOutputContentPart::Text(_) => None,
+                            }),
+                            &mut state.tool_image_budget,
+                        ),
+                        Err(_) => Vec::new(),
+                    })
+                    .unwrap_or_default();
+                let completed_images = state.register_tool_images(completed_images);
                 let estimated_result_tokens = match result {
                     Ok(output) => output.media().iter().fold(
                         crate::compaction::estimate_text_tokens(&output.text),
@@ -2413,7 +2637,6 @@ impl InteractiveShell {
                     Err(error) => crate::compaction::estimate_text_tokens(&error.message),
                 }
                 .saturating_add(8);
-                let index = state.tool_panels.get(id).copied();
                 let mut completed_name = String::new();
                 if let Some(panel) = state.tool_output_mut(id) {
                     completed_name = panel.name.clone();
@@ -2421,6 +2644,7 @@ impl InteractiveShell {
                     panel.duration = Some(*duration);
                     panel.is_error = tool_result_is_failure(&panel.name, result);
                     panel.failure_reason = tool_failure_reason(&panel.name, result);
+                    panel.images = completed_images;
                     match result {
                         Ok(output) => {
                             panel.display.mark_media_read(output.media_kinds());
@@ -3173,9 +3397,21 @@ impl InteractiveShell {
     }
 
     pub fn set_runtime_config(&mut self, config: Config) {
+        let show_images = config.show_images;
         let mut state = self.state.borrow_mut();
         state.safe_mode = config.effect_policy != ygg_agent::EffectPolicy::UnsafeHost;
         state.max_session_cost_microdollars = config.max_cost_microdollars;
+        drop(state);
+        self.set_show_images(show_images);
+    }
+
+    /// Toggle opt-in inline image placement for the current interactive shell.
+    /// The setting affects only visual reservations; transcript text, copy,
+    /// plain/print output, and durable payload handling remain unchanged.
+    pub fn set_show_images(&mut self, enabled: bool) {
+        let mut state = self.state.borrow_mut();
+        let capabilities = state.image_rendering.capabilities;
+        state.update_image_rendering(enabled, capabilities);
     }
 
     pub fn pending_is_empty(&self) -> bool {
@@ -4701,19 +4937,21 @@ impl InteractiveShell {
         let entry_budget = usize::from(self.state.borrow().size.1)
             .saturating_mul(4)
             .clamp(64, 256);
-        let (items, history_deferred) = if self.capture_mouse {
+        let (items, history_deferred, image_budget) = if self.capture_mouse {
             // Explicit application-owned mode can hydrate older rows when its
             // semantic viewport reaches the bounded first-paint tail.
-            hydrate_transcript_tail(session, entry_budget)?
+            hydrate_transcript_tail_with_image_budget(session, entry_budget)?
         } else {
             // Pi's primary-screen renderer writes the complete logical frame.
             // Native terminal scrollback cannot prepend deferred rows later, so
             // materialize the active branch before rendering it.
-            let items = match session.head() {
-                Some(head) => hydrate_transcript_at(session, &head)?,
-                None => Vec::new(),
-            };
-            (items, false)
+            match session.head() {
+                Some(head) => {
+                    let (items, budget) = hydrate_transcript_at_with_image_budget(session, &head)?;
+                    (items, false, budget)
+                }
+                None => (Vec::new(), false, ToolImageBudget::default()),
+            }
         };
         let deferred_snapshot = history_deferred.then(|| DeferredSessionHistory {
             path: session.path().to_owned(),
@@ -4747,6 +4985,8 @@ impl InteractiveShell {
                 });
         state.transcript_epoch = state.transcript_epoch.wrapping_add(1);
         state.next_transcript_commit_id = NextTranscriptCommitId::default();
+        state.reset_terminal_images();
+        state.tool_image_budget = image_budget;
         state.transcript.clear();
         state.active_event_blocks.clear();
         state.transcript_commit_ids.clear();

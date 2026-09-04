@@ -1449,6 +1449,120 @@ impl ImageProtocolEncoder {
     }
 }
 
+/// A private zero-width marker that connects a semantic reservation to an
+/// opaque terminal-image command at the terminal-adapter boundary.
+///
+/// The marker is deliberately a DCS control string rather than a graphics
+/// protocol command. Retained renderers may keep it alongside blank semantic
+/// rows, while an adapter that owns the corresponding image bytes replaces it
+/// with a bounded protocol command. It contains no image payload, filename, or
+/// source location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageAnchor {
+    protocol: ImageProtocol,
+    id: ImageId,
+    layout: ImageLayout,
+}
+
+const IMAGE_ANCHOR_PREFIX: &str = "\x1bP+ygg-image;";
+const IMAGE_ANCHOR_SUFFIX: &str = "\x1b\\";
+
+impl ImageAnchor {
+    /// Build an anchor for one already-planned placement.
+    pub const fn new(protocol: ImageProtocol, id: ImageId, layout: ImageLayout) -> Self {
+        Self {
+            protocol,
+            id,
+            layout,
+        }
+    }
+
+    /// Protocol selected for this placement.
+    pub const fn protocol(self) -> ImageProtocol {
+        self.protocol
+    }
+
+    /// Stable logical image ID.
+    pub const fn id(self) -> ImageId {
+        self.id
+    }
+
+    /// Bounded terminal-cell placement.
+    pub const fn layout(self) -> ImageLayout {
+        self.layout
+    }
+
+    /// Render the zero-width adapter marker. This is not a terminal graphics
+    /// command and must not be emitted without an adapter that resolves it.
+    pub fn marker(self) -> String {
+        let protocol = match self.protocol {
+            ImageProtocol::Kitty => "kitty",
+            ImageProtocol::Iterm2 => "iterm2",
+        };
+        format!(
+            "{IMAGE_ANCHOR_PREFIX}v=1,p={protocol},i={},c={},r={}{}",
+            self.id.get(),
+            self.layout.columns(),
+            self.layout.rows(),
+            IMAGE_ANCHOR_SUFFIX,
+        )
+    }
+
+    /// Strictly parse one complete anchor marker. Unknown versions, fields,
+    /// protocols, invalid IDs, and invalid layouts are rejected.
+    pub fn parse(marker: &str) -> Option<Self> {
+        let body = marker
+            .strip_prefix(IMAGE_ANCHOR_PREFIX)?
+            .strip_suffix(IMAGE_ANCHOR_SUFFIX)?;
+        let mut fields = body.split(',');
+        if fields.next()? != "v=1" {
+            return None;
+        }
+        let protocol = match fields.next()?.strip_prefix("p=")? {
+            "kitty" => ImageProtocol::Kitty,
+            "iterm2" => ImageProtocol::Iterm2,
+            _ => return None,
+        };
+        let id = ImageId::new(fields.next()?.strip_prefix("i=")?.parse().ok()?).ok()?;
+        let columns = fields.next()?.strip_prefix("c=")?.parse().ok()?;
+        let rows = fields.next()?.strip_prefix("r=")?.parse().ok()?;
+        if fields.next().is_some() {
+            return None;
+        }
+        Some(Self::new(
+            protocol,
+            id,
+            ImageLayout::new(columns, rows).ok()?,
+        ))
+    }
+
+    /// Find every complete, bounded anchor in a rendered line. At most the
+    /// global live-image limit is returned, so hostile text cannot create an
+    /// unbounded parse result.
+    pub fn parse_all(line: &str) -> Vec<Self> {
+        let mut anchors = Vec::new();
+        let mut search_from = 0;
+        while anchors.len() < HARD_MAX_LIVE_IMAGES {
+            let Some(relative_start) = line[search_from..].find(IMAGE_ANCHOR_PREFIX) else {
+                break;
+            };
+            let start = search_from.saturating_add(relative_start);
+            let body_start = start.saturating_add(IMAGE_ANCHOR_PREFIX.len());
+            let Some(relative_end) = line[body_start..].find(IMAGE_ANCHOR_SUFFIX) else {
+                break;
+            };
+            let end = body_start
+                .saturating_add(relative_end)
+                .saturating_add(IMAGE_ANCHOR_SUFFIX.len());
+            if let Some(anchor) = Self::parse(&line[start..end]) {
+                anchors.push(anchor);
+            }
+            search_from = end;
+        }
+        anchors
+    }
+}
+
 /// A semantic reservation plus optional, out-of-band protocol command.
 ///
 /// This is the intended handoff to a future renderer integration: use semantic
@@ -1458,6 +1572,7 @@ impl ImageProtocolEncoder {
 pub struct ImageRenderPlan<'a> {
     reservation: ImageReservation,
     command: Option<ImageTerminalCommand<'a>>,
+    layout: Option<ImageLayout>,
     fallback_reason: Option<ImageFallbackReason>,
 }
 
@@ -1466,6 +1581,7 @@ impl fmt::Debug for ImageRenderPlan<'_> {
         f.debug_struct("ImageRenderPlan")
             .field("reservation", &self.reservation)
             .field("has_terminal_command", &self.command.is_some())
+            .field("layout", &self.layout)
             .field("fallback_reason", &self.fallback_reason)
             .finish()
     }
@@ -1490,6 +1606,13 @@ impl<'a> ImageRenderPlan<'a> {
     /// Optional opaque protocol output to write separately from semantic text.
     pub const fn terminal_command(&self) -> Option<&ImageTerminalCommand<'a>> {
         self.command.as_ref()
+    }
+
+    /// Placement geometry when a terminal command is available. This lets a
+    /// retained renderer create a zero-width [`ImageAnchor`] without exposing
+    /// protocol bytes in its semantic frame.
+    pub const fn layout(&self) -> Option<ImageLayout> {
+        self.layout
     }
 
     /// Why this plan has no terminal command.
@@ -1600,6 +1723,7 @@ impl ImagePlanner {
             Ok(command) => Ok(ImageRenderPlan {
                 reservation: ImageReservation::blank(layout),
                 command: Some(command),
+                layout: Some(layout),
                 fallback_reason: None,
             }),
             Err(ImageError::UnsupportedOperation) => Ok(fallback_plan(
@@ -1615,6 +1739,7 @@ fn fallback_plan<'a>(image: &'a TerminalImage, reason: ImageFallbackReason) -> I
     ImageRenderPlan {
         reservation: ImageReservation::fallback(image, reason),
         command: None,
+        layout: None,
         fallback_reason: Some(reason),
     }
 }
@@ -2970,6 +3095,24 @@ mod tests {
         assert_eq!(registry.place(), Err(ImageError::TooManyLiveImages));
         registry.delete(image_id(1)).unwrap();
         assert_eq!(registry.place().unwrap().id().get(), 4_097);
+    }
+
+    #[test]
+    fn image_anchor_round_trips_without_graphics_payload() {
+        let anchor = ImageAnchor::new(
+            ImageProtocol::Kitty,
+            image_id(41),
+            ImageLayout::new(7, 3).unwrap(),
+        );
+        let marker = anchor.marker();
+        assert_eq!(ImageAnchor::parse(&marker), Some(anchor));
+        assert_eq!(
+            ImageAnchor::parse_all(&format!("before{marker}after")),
+            vec![anchor]
+        );
+        assert!(!marker.contains("IDAT"));
+        assert!(!marker.contains("_G"));
+        assert!(ImageAnchor::parse("\x1bP+ygg-image;v=2,p=kitty,i=41,c=7,r=3\x1b\\").is_none());
     }
 
     #[test]

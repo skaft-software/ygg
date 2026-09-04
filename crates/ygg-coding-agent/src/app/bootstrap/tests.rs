@@ -162,6 +162,7 @@ fn config(directory: &std::path::Path, model: Option<&str>) -> Config {
         theme_paths: vec![],
         color: crate::config::ColorMode::Auto,
         plain: false,
+        show_images: false,
         session_dir: directory.join("sessions"),
         compaction: CompactionPolicy::default(),
         max_cost_microdollars: None,

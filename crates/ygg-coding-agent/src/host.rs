@@ -1318,6 +1318,7 @@ fn host_config(request: &RunRequest) -> anyhow::Result<Config> {
         color: ColorMode::Never,
         mouse: MouseMode::Off,
         plain: true,
+        show_images: false,
         session_dir,
         compaction: CompactionPolicy::default(),
         max_cost_microdollars: request.max_cost_microdollars,

@@ -406,6 +406,9 @@ pub(super) fn render_block_planned_with_rainbow(
                     )),
                 _ => {}
             }
+            // Image reservations are visual-only and deliberately remain out
+            // of `panel.output`, selection, and plain/print projections.
+            output_lines.extend(panel.image_rows(nested_width));
             append_nested_tool_output(&mut lines, output_lines, theme, width);
             finish_transcript_block(lines)
         }

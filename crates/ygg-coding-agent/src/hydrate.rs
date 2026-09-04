@@ -1,11 +1,268 @@
 #![allow(missing_docs)]
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
+use std::sync::Arc;
 
+use sexy_tui_rs::{ImageId, ImageLimits, TerminalImage};
 use ygg_agent::{Entry, EntryMetadata, EntryValue, Session};
-use ygg_ai::{AssistantPart, Message, ToolCallId, ToolResultPart, UserPart};
+use ygg_ai::{AssistantPart, ImageSource, Media, Message, ToolCallId, ToolResultPart, UserPart};
 
 use crate::tui::theme::ModelLab;
+
+/// Maximum owned image bytes accepted from one tool-result image. This sits
+/// below the terminal foundation's hard cap so the product projection remains
+/// bounded even when a session contains larger provider payloads.
+pub(crate) const MAX_TOOL_RESULT_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum inline image payload bytes retained for one tool result.
+pub(crate) const MAX_TOOL_RESULT_IMAGE_BYTES_PER_ITEM: usize = 4 * 1024 * 1024;
+/// Maximum validated images retained for one tool result.
+pub(crate) const MAX_TOOL_RESULT_IMAGES_PER_ITEM: usize = 4;
+/// Maximum validated tool-result images retained in one interactive session.
+pub(crate) const MAX_SESSION_TOOL_RESULT_IMAGES: usize = 32;
+/// Maximum inline image payload bytes retained in one interactive session.
+pub(crate) const MAX_SESSION_TOOL_RESULT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// A bounded, opaque image projection for one tool result.
+///
+/// Raw bytes remain private inside [`TerminalImage`]. The only public
+/// projection methods expose display-safe format, dimensions, and byte-count
+/// summaries, never base64, source locations, or payload slices.
+#[derive(Clone)]
+pub(crate) enum ToolResultImage {
+    Ready {
+        image: Arc<TerminalImage>,
+        id: Option<ImageId>,
+    },
+    Placeholder(ToolImagePlaceholder),
+}
+
+impl fmt::Debug for ToolResultImage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ready { image, id } => f
+                .debug_struct("ToolResultImage")
+                .field("format", &image.format())
+                .field("dimensions", &image.dimensions())
+                .field("byte_len", &image.byte_len())
+                .field("id", id)
+                .finish(),
+            Self::Placeholder(reason) => f
+                .debug_tuple("ToolResultImage::Placeholder")
+                .field(reason)
+                .finish(),
+        }
+    }
+}
+
+impl PartialEq for ToolResultImage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Ready { image: left, .. }, Self::Ready { image: right, .. }) => {
+                left.format() == right.format()
+                    && left.dimensions() == right.dimensions()
+                    && left.byte_len() == right.byte_len()
+            }
+            (Self::Placeholder(left), Self::Placeholder(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl ToolResultImage {
+    fn ready(image: TerminalImage) -> Self {
+        Self::Ready {
+            image: Arc::new(image),
+            id: None,
+        }
+    }
+
+    /// Clone the validated opaque image for the terminal-owned store.
+    pub(crate) fn terminal_image(&self) -> Option<Arc<TerminalImage>> {
+        match self {
+            Self::Ready { image, .. } => Some(image.clone()),
+            Self::Placeholder(_) => None,
+        }
+    }
+
+    /// Stable logical image ID assigned by the interactive shell.
+    pub(crate) fn id(&self) -> Option<ImageId> {
+        match self {
+            Self::Ready { id, .. } => *id,
+            Self::Placeholder(_) => None,
+        }
+    }
+
+    /// Assign a newly allocated stable terminal image ID.
+    pub(crate) fn set_id(&mut self, id: ImageId) {
+        if let Self::Ready { id: current, .. } = self {
+            *current = Some(id);
+        }
+    }
+
+    /// Clear a previous terminal placement before rebuilding a transcript.
+    pub(crate) fn clear_id(&mut self) {
+        if let Self::Ready { id, .. } = self {
+            *id = None;
+        }
+    }
+
+    /// Replace a ready payload with a bounded non-payload fallback.
+    pub(crate) fn replace_with_placeholder(&mut self, reason: ToolImagePlaceholder) {
+        *self = Self::Placeholder(reason);
+    }
+
+    /// Owned payload bytes, used only for bounded internal accounting.
+    pub(crate) fn byte_len(&self) -> Option<usize> {
+        match self {
+            Self::Ready { image, .. } => Some(image.byte_len()),
+            Self::Placeholder(_) => None,
+        }
+    }
+
+    /// Deterministic text fallback that never includes payload data.
+    pub(crate) fn fallback_text(&self, hidden: bool) -> String {
+        match self {
+            Self::Ready { image, .. } => {
+                let dimensions = image.dimensions();
+                let state = if hidden {
+                    "hidden; enable terminal images"
+                } else {
+                    "unavailable"
+                };
+                format!(
+                    "[image: {} {}x{} ({state})]",
+                    image.format().name(),
+                    dimensions.width(),
+                    dimensions.height(),
+                )
+            }
+            Self::Placeholder(reason) => reason.text().to_owned(),
+        }
+    }
+}
+
+/// Why an image has a text placeholder instead of an owned payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolImagePlaceholder {
+    NotInline,
+    Invalid,
+    ImageByteLimit,
+    PerItemByteLimit,
+    PerItemImageLimit,
+    SessionImageLimit,
+    SessionByteLimit,
+    TerminalRegistryLimit,
+}
+
+impl ToolImagePlaceholder {
+    fn text(self) -> &'static str {
+        match self {
+            Self::NotInline => "[image unavailable: inline payload required]",
+            Self::Invalid => "[image unavailable: invalid inline payload]",
+            Self::ImageByteLimit => "[image unavailable: image byte limit]",
+            Self::PerItemByteLimit => "[image unavailable: tool-result byte limit]",
+            Self::PerItemImageLimit => "[image unavailable: tool-result image limit]",
+            Self::SessionImageLimit => "[image unavailable: session image limit]",
+            Self::SessionByteLimit => "[image unavailable: session byte limit]",
+            Self::TerminalRegistryLimit => "[image unavailable: terminal image limit]",
+        }
+    }
+}
+
+/// Accounting for validated images retained by one interactive session.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolImageBudget {
+    image_count: usize,
+    image_bytes: usize,
+}
+
+impl ToolImageBudget {
+    fn can_retain(&self, bytes: usize) -> Result<(), ToolImagePlaceholder> {
+        if self.image_count >= MAX_SESSION_TOOL_RESULT_IMAGES {
+            return Err(ToolImagePlaceholder::SessionImageLimit);
+        }
+        if self.image_bytes.saturating_add(bytes) > MAX_SESSION_TOOL_RESULT_IMAGE_BYTES {
+            return Err(ToolImagePlaceholder::SessionByteLimit);
+        }
+        Ok(())
+    }
+
+    fn retain(&mut self, bytes: usize) {
+        self.image_count = self.image_count.saturating_add(1);
+        self.image_bytes = self.image_bytes.saturating_add(bytes);
+    }
+
+    /// Re-account one already validated payload while rebuilding the visible
+    /// transcript, preserving the precise bounded fallback when it no longer
+    /// fits the session budget.
+    pub(crate) fn retain_existing(&mut self, bytes: usize) -> Result<(), ToolImagePlaceholder> {
+        self.can_retain(bytes)?;
+        self.retain(bytes);
+        Ok(())
+    }
+}
+
+/// Product-level limits used for every parse and placement revalidation.
+pub(crate) fn tool_image_limits() -> ImageLimits {
+    ImageLimits::default()
+        .with_max_payload_bytes(MAX_TOOL_RESULT_IMAGE_BYTES)
+        .expect("fixed tool image payload limit is valid")
+}
+
+/// Project ordered tool-result image media into bounded opaque storage.
+///
+/// Non-inline image sources are never resolved. Invalid and over-budget image
+/// parts become small deterministic placeholders, preserving result ordering
+/// without retaining a path, URL, provider reference, or raw payload.
+pub(crate) fn project_tool_images<'a>(
+    media: impl IntoIterator<Item = &'a Media>,
+    session_budget: &mut ToolImageBudget,
+) -> Vec<ToolResultImage> {
+    let mut images = Vec::new();
+    let mut item_count = 0usize;
+    let mut item_bytes = 0usize;
+    for media in media {
+        let Media::Image(image) = media else {
+            continue;
+        };
+        if item_count >= MAX_TOOL_RESULT_IMAGES_PER_ITEM {
+            images.push(ToolResultImage::Placeholder(
+                ToolImagePlaceholder::PerItemImageLimit,
+            ));
+            break;
+        }
+        item_count = item_count.saturating_add(1);
+        let ImageSource::Inline(data) = &image.source else {
+            images.push(ToolResultImage::Placeholder(
+                ToolImagePlaceholder::NotInline,
+            ));
+            continue;
+        };
+        let bytes = data.len();
+        let placeholder = if bytes > MAX_TOOL_RESULT_IMAGE_BYTES {
+            Some(ToolImagePlaceholder::ImageByteLimit)
+        } else if item_bytes.saturating_add(bytes) > MAX_TOOL_RESULT_IMAGE_BYTES_PER_ITEM {
+            Some(ToolImagePlaceholder::PerItemByteLimit)
+        } else {
+            session_budget.can_retain(bytes).err()
+        };
+        if let Some(placeholder) = placeholder {
+            images.push(ToolResultImage::Placeholder(placeholder));
+            continue;
+        }
+        let Ok(image) =
+            TerminalImage::from_slice_with_metadata(data, Default::default(), &tool_image_limits())
+        else {
+            images.push(ToolResultImage::Placeholder(ToolImagePlaceholder::Invalid));
+            continue;
+        };
+        item_bytes = item_bytes.saturating_add(bytes);
+        session_budget.retain(bytes);
+        images.push(ToolResultImage::ready(image));
+    }
+    images
+}
 
 /// One displayable item reconstructed from a session's active branch.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,6 +291,9 @@ pub enum TranscriptItem {
         /// interrupted calls, and for results whose timing window was not
         /// recorded.
         duration_ms: Option<u64>,
+        /// Opaque bounded image projection. Text/copy/plain surfaces ignore
+        /// this field and retain their existing payload-free semantics.
+        images: Vec<ToolResultImage>,
     },
     CompactionMarker {
         summary: String,
@@ -105,6 +365,7 @@ fn tool_result_duration_ms(metadata: Option<&EntryMetadata>) -> Option<u64> {
 
 fn push_message(
     items: &mut Vec<TranscriptItem>,
+    image_budget: &mut ToolImageBudget,
     message: &Message,
     model_lab: Option<ModelLab>,
     prompt_color: Option<String>,
@@ -150,6 +411,13 @@ fn push_message(
                             text: tool_result_text(&result.content),
                             is_error: result.is_error,
                             duration_ms: tool_result_duration_ms(metadata),
+                            images: project_tool_images(
+                                result.content.iter().filter_map(|part| match part {
+                                    ToolResultPart::Media(media) => Some(media),
+                                    ToolResultPart::Text(_) => None,
+                                }),
+                                image_budget,
+                            ),
                         })
                     }
                     UserPart::Media(media) => text.push_str(&media_marker(media)),
@@ -253,7 +521,9 @@ fn active_branch_tail_from<'a>(
     Ok((entries, truncated))
 }
 
-fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
+fn hydrate_entries_with_image_budget(
+    entries: Vec<&Entry>,
+) -> (Vec<TranscriptItem>, ToolImageBudget) {
     // Pair results only with the assistant turn they follow. Provider call IDs
     // are not guaranteed globally unique across a long session, so one later
     // turn reusing an ID must not make an older interrupted call look durable.
@@ -305,6 +575,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
     let mut active_lab: Option<ModelLab> = None;
     let mut active_model: Option<String> = None;
     let mut items = Vec::new();
+    let mut image_budget = ToolImageBudget::default();
     for entry in entries {
         match &entry.value {
             EntryValue::Message(message) => {
@@ -350,6 +621,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                     .and_then(|metadata| metadata.display_text.as_deref());
                 push_message(
                     &mut items,
+                    &mut image_budget,
                     message,
                     prompt_lab,
                     prompt_color,
@@ -374,6 +646,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
                                 text: "interrupted before a durable tool result was recorded; this call is not running and will be reconciled before the next prompt".into(),
                                 is_error: true,
                                 duration_ms: None,
+                                images: Vec::new(),
                             });
                         }
                     }
@@ -404,7 +677,7 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
             | EntryValue::SkillDeactivated { .. } => {}
         }
     }
-    items
+    (items, image_budget)
 }
 
 /// Rebuild the display transcript by walking head-to-root on the active branch
@@ -412,18 +685,17 @@ fn hydrate_entries(entries: Vec<&Entry>) -> Vec<TranscriptItem> {
 #[cfg(test)]
 pub fn hydrate_transcript(session: &Session) -> anyhow::Result<Vec<TranscriptItem>> {
     let (entries, _) = active_branch_tail_from(session, session.head_ref(), None)?;
-    Ok(hydrate_entries(entries))
+    Ok(hydrate_entries_with_image_budget(entries).0)
 }
 
-/// Rebuild the active branch as it existed at a retained immutable head. This
-/// lets a deferred TUI snapshot materialize safely even if the live session has
-/// appended newer entries in the meantime.
-pub fn hydrate_transcript_at(
+/// Rebuild an immutable session head and return the exact image budget consumed
+/// by the retained opaque projection.
+pub(crate) fn hydrate_transcript_at_with_image_budget(
     session: &Session,
     head: &ygg_agent::EntryId,
-) -> anyhow::Result<Vec<TranscriptItem>> {
+) -> anyhow::Result<(Vec<TranscriptItem>, ToolImageBudget)> {
     let (entries, _) = active_branch_tail_from(session, Some(head), None)?;
-    Ok(hydrate_entries(entries))
+    Ok(hydrate_entries_with_image_budget(entries))
 }
 
 /// Rebuild only the newest active-branch entries for latency-sensitive first
@@ -433,9 +705,20 @@ pub fn hydrate_transcript_tail(
     session: &Session,
     max_entries: usize,
 ) -> anyhow::Result<(Vec<TranscriptItem>, bool)> {
+    let (items, truncated, _) = hydrate_transcript_tail_with_image_budget(session, max_entries)?;
+    Ok((items, truncated))
+}
+
+/// Tail hydration plus the retained image budget used by the interactive
+/// shell's subsequent live tool-result projection.
+pub(crate) fn hydrate_transcript_tail_with_image_budget(
+    session: &Session,
+    max_entries: usize,
+) -> anyhow::Result<(Vec<TranscriptItem>, bool, ToolImageBudget)> {
     let (entries, truncated) =
         active_branch_tail_from(session, session.head_ref(), Some(max_entries.max(1)))?;
-    Ok((hydrate_entries(entries), truncated))
+    let (items, budget) = hydrate_entries_with_image_budget(entries);
+    Ok((items, truncated, budget))
 }
 
 #[cfg(test)]
@@ -458,6 +741,18 @@ mod tests {
             model: ModelId("test".into()),
             protocol: Protocol::OpenAiChat,
         }))
+    }
+
+    #[test]
+    fn tool_image_budget_rejects_the_next_session_image() {
+        let mut budget = ToolImageBudget::default();
+        for _ in 0..MAX_SESSION_TOOL_RESULT_IMAGES {
+            assert!(budget.retain_existing(1).is_ok());
+        }
+        assert_eq!(
+            budget.retain_existing(1),
+            Err(ToolImagePlaceholder::SessionImageLimit)
+        );
     }
 
     #[test]
@@ -626,6 +921,7 @@ mod tests {
                     text: "ok".into(),
                     is_error: false,
                     duration_ms: None,
+                    images: Vec::new(),
                 },
                 TranscriptItem::User {
                     text: "after".into(),

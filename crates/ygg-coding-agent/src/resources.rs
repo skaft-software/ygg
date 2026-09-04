@@ -1478,6 +1478,7 @@ mod tests {
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,
             plain: false,
+            show_images: false,
             session_dir: PathBuf::from("sessions"),
             compaction: CompactionPolicy::default(),
             max_cost_microdollars: None,

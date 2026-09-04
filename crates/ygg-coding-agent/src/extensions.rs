@@ -3200,6 +3200,7 @@ command = "does-not-exist"
             color: crate::config::ColorMode::Auto,
             mouse: crate::config::MouseMode::Auto,
             plain: false,
+            show_images: false,
             session_dir: workspace.join("sessions"),
             compaction: crate::config::CompactionPolicy::default(),
             max_cost_microdollars: None,

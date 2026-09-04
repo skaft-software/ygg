@@ -27,7 +27,7 @@ pub use capabilities::{
 };
 pub use glyphs::GlyphSet;
 pub use images::{
-    cell_rows_for_pixels, parse_terminal_image_reply, ImageAction, ImageCapabilities,
+    cell_rows_for_pixels, parse_terminal_image_reply, ImageAction, ImageAnchor, ImageCapabilities,
     ImageCapabilityOverrides, ImageCapabilityQuery, ImageDimensions, ImageError,
     ImageFallbackReason, ImageFilename, ImageFormat, ImageId, ImageLayout, ImageLimits,
     ImagePlanner, ImageProtocol, ImageProtocolEncoder, ImageRegistry, ImageRenderPlan,
