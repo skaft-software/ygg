@@ -160,7 +160,7 @@ fn render_fixture(fixture: ContractFixture) -> RenderedFixture {
     let picker_raw = super::panel_render::render_panel(&shell.state.borrow(), fixture.width);
     shell.close_panel();
 
-    shell.state.borrow_mut().editor = "/m".into();
+    shell.state.borrow_mut().editor.set_text("/m");
     let commands_raw = {
         let state = shell.state.borrow();
         super::input_overlays::render_slash_suggestions(&state, fixture.width, 4)
@@ -198,8 +198,7 @@ const HOSTILE_METADATA: &str =
 
 fn set_editor(shell: &mut InteractiveShell, editor: &str) {
     let mut state = shell.state.borrow_mut();
-    state.editor = editor.to_owned();
-    state.editor_cursor = state.editor.len();
+    state.editor.set_text(editor);
     state.slash_popup_dismissed = false;
 }
 
