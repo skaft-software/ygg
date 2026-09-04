@@ -1853,7 +1853,9 @@ impl ExtensionSessionBinding {
                     });
                 }
                 if let Some(wait) = state.starting.get(&key) {
-                    (Some(Arc::clone(&wait.notify)), None)
+                    // Create the waiter before releasing the state lock: a
+                    // completed startup's notify_waiters stores no later permit.
+                    (Some(Arc::clone(&wait.notify).notified_owned()), None)
                 } else {
                     let usage = ExtensionRuntimeManager::estimated_usage(&config);
                     match self.manager.reserve(&mut state, usage, &provenance) {
@@ -1903,7 +1905,7 @@ impl ExtensionSessionBinding {
                     .await;
             }
             let wait = wait.expect("a non-starting activation waits for its owner");
-            wait.notified().await;
+            wait.await;
             if self.released.load(Ordering::Acquire) {
                 return Err(ExtensionRuntimeManagerError::BindingClosed);
             }
@@ -2306,7 +2308,7 @@ done
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_wakes_startup_waiters_without_launching_a_child() {
         let temporary = tempfile::tempdir().unwrap();
         let descriptor = descriptor(
@@ -2338,38 +2340,43 @@ done
             .unwrap();
         let binding = manager.bind_session("session-a").unwrap();
         let workspace = temporary.path().to_owned();
-        let pending = tokio::spawn({
+        let mut pending = tokio::task::JoinSet::new();
+        for _ in 0..8 {
             let binding = binding.clone();
-            async move {
+            let workspace = workspace.clone();
+            pending.spawn(async move {
                 binding
                     .activate("lazy-runtime", ExtensionRuntimeConfig::new(workspace))
                     .await
-            }
-        });
-        for _ in 0..16 {
-            if manager
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !manager
                 .statuses()
                 .iter()
                 .any(|status| status.state == ExtensionManagedRuntimeState::Starting)
             {
-                break;
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
+        })
+        .await
+        .expect("one activation must own the pending startup");
         assert!(manager
             .statuses()
             .iter()
             .any(|status| status.state == ExtensionManagedRuntimeState::Starting));
 
         manager.shutdown().await;
-        let result = tokio::time::timeout(Duration::from_secs(1), pending)
-            .await
-            .expect("shutdown must wake an activation waiting for a startup slot")
-            .unwrap();
-        assert!(matches!(
-            result,
-            Err(ExtensionRuntimeManagerError::ManagerClosed)
-        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while let Some(result) = pending.join_next().await {
+                assert!(matches!(
+                    result.unwrap(),
+                    Err(ExtensionRuntimeManagerError::ManagerClosed)
+                ));
+            }
+        })
+        .await
+        .expect("shutdown must wake both the startup owner and coalesced activations");
         drop(permit);
         assert!(!temporary.path().join("starts").exists());
     }
