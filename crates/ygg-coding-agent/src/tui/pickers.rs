@@ -359,7 +359,7 @@ where
     pick_list(
         shell,
         input,
-        title,
+        OrdinarySurfaceMetadata::new(title),
         items,
         descriptions,
         initial_selected,
