@@ -1297,7 +1297,7 @@ impl fmt::Debug for ImageTerminalCommand<'_> {
     }
 }
 
-impl<'a> ImageTerminalCommand<'a> {
+impl ImageTerminalCommand<'_> {
     /// Protocol selected for this command.
     pub const fn protocol(&self) -> ImageProtocol {
         self.protocol
@@ -1735,7 +1735,7 @@ impl ImagePlanner {
     }
 }
 
-fn fallback_plan<'a>(image: &'a TerminalImage, reason: ImageFallbackReason) -> ImageRenderPlan<'a> {
+fn fallback_plan(image: &TerminalImage, reason: ImageFallbackReason) -> ImageRenderPlan<'_> {
     ImageRenderPlan {
         reservation: ImageReservation::fallback(image, reason),
         command: None,
