@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use crate::events::AgentEvent;
 use crate::extension::{
     DynamicToolRegistration, EventObserver, Extension, ExtensionHost, ToolCallHook,
 };
+use crate::extension_api_v03 as api_v03;
 use crate::extension_policy::{
     ExtensionActionIntent, ExtensionApprovalStore, ExtensionApprovalToken, ExtensionPolicyDecision,
 };
@@ -45,13 +46,16 @@ use crate::tool::{
 };
 
 /// The newest executable-extension API implemented by this Ygg release.
-pub const EXTENSION_API_VERSION: &str = EXTENSION_API_VERSION_0_2;
+pub const EXTENSION_API_VERSION: &str = EXTENSION_API_VERSION_0_3;
 
 /// Frozen compatibility version for simple, trusted text extensions.
 pub const EXTENSION_API_VERSION_0_1: &str = "0.1";
 
 /// Stateful extension protocol with cancellation, progress, and lifecycle.
 pub const EXTENSION_API_VERSION_0_2: &str = "0.2";
+
+/// Schema-generated canonical extension protocol foundation.
+pub const EXTENSION_API_VERSION_0_3: &str = api_v03::API_VERSION;
 
 /// API `0.2` cooperative request cancellation feature.
 pub const EXTENSION_FEATURE_REQUEST_CANCELLATION: &str = "request_cancellation";
@@ -1202,13 +1206,10 @@ impl ExtensionManifest {
                 self.version
             ))
         })?;
-        if !matches!(
-            self.api_version.as_str(),
-            EXTENSION_API_VERSION_0_1 | EXTENSION_API_VERSION_0_2
-        ) {
+        if !api_v03::runtime_supports_api_version(&self.api_version) {
             return Err(ExtensionRuntimeError::UnsupportedApiVersion {
                 extension: self.api_version.clone(),
-                host: format!("{EXTENSION_API_VERSION_0_1} or {EXTENSION_API_VERSION_0_2}"),
+                host: "0.1, 0.2, or 0.3".into(),
             });
         }
         if let Some(requires_ygg) = &self.requires_ygg {
@@ -1231,6 +1232,21 @@ impl ExtensionManifest {
         if self.api_version == EXTENSION_API_VERSION_0_1 && self.contributes.presentation {
             return Err(ExtensionRuntimeError::InvalidManifest(
                 "semantic presentation requires extension API 0.2".into(),
+            ));
+        }
+        if self.api_version == EXTENSION_API_VERSION_0_3
+            && (!self.contributes.commands.is_empty()
+                || !self.contributes.hooks.is_empty()
+                || !self.contributes.ui.is_empty()
+                || self.contributes.context
+                || !self.contributes.tool_renderers.is_empty()
+                || self.contributes.notifications
+                || self.contributes.confirmations
+                || self.contributes.presentation)
+        {
+            return Err(ExtensionRuntimeError::InvalidManifest(
+                "API 0.3 currently implements only its negotiated initial tool catalog; commands, hooks, context, UI, renderers, notifications, confirmations, and presentation are deferred"
+                    .into(),
             ));
         }
         if self.entrypoint.command.trim().is_empty()
@@ -3374,6 +3390,13 @@ impl ExtensionProcess {
                     .into(),
             ));
         }
+        if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3
+            && config.max_message_bytes <= 1
+        {
+            return Err(ExtensionRuntimeError::Protocol(
+                "API 0.3 message limit must leave room for a non-empty frame and newline".into(),
+            ));
+        }
         if !config.workspace.is_dir() {
             return Err(ExtensionRuntimeError::Spawn {
                 extension: descriptor.manifest.name.clone(),
@@ -3559,7 +3582,7 @@ impl ExtensionProcess {
         self.execution_context()
     }
 
-    /// Builds a session-owned API `0.2` context for product boundaries such as
+    /// Builds a session-owned API `0.2`/`0.3` context for product boundaries such as
     /// commands, prompt hooks, and context collection. The host supplies only
     /// the durable owner key; this method attaches the unforgeable instance and
     /// active process-generation fences. Frozen API `0.1` remains ownerless.
@@ -3568,7 +3591,10 @@ impl ExtensionProcess {
         session_id: impl Into<String>,
     ) -> ExtensionExecutionContext {
         let mut context = self.execution_context();
-        if self.api_version() == EXTENSION_API_VERSION_0_2 {
+        if matches!(
+            self.api_version(),
+            EXTENSION_API_VERSION_0_2 | EXTENSION_API_VERSION_0_3
+        ) {
             let generation = read_std_lock(&self.inner.connection).generation;
             context.resource_owner = Some(ExtensionResourceOwner {
                 session_id: session_id.into(),
@@ -3588,6 +3614,7 @@ impl ExtensionProcess {
     ) -> Result<ToolCallOutput, ExtensionRuntimeError> {
         let name = name.into();
         let connection = read_std_lock(&self.inner.connection).clone();
+        connection.require_api_v03_host_method(methods::TOOL_CALL)?;
         let _catalog = read_std_lock(&connection.catalog_guard);
         let definition = self.require_tool(&connection, &name)?;
         let catalog_revision = read_std_lock(&connection.protocol)
@@ -3602,12 +3629,23 @@ impl ExtensionProcess {
         let artifact_owner = resource_owner
             .as_ref()
             .map(|owner| owner.session_id.clone());
-        let params = serde_json::to_value(ToolCallRequest {
-            name,
-            arguments,
-            catalog_revision,
-            context,
-        })
+        let params = if read_std_lock(&connection.protocol).version == EXTENSION_API_VERSION_0_3 {
+            let params = api_v03::ToolCallParams {
+                name,
+                arguments,
+                context: serde_json::to_value(context)
+                    .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            };
+            api_v03::validate_tool_call_params(&params).map_err(api_v03_protocol_error)?;
+            serde_json::to_value(params)
+        } else {
+            serde_json::to_value(ToolCallRequest {
+                name,
+                arguments,
+                catalog_revision,
+                context,
+            })
+        }
         .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
         drop(_catalog);
         let _artifact_lease = connection.acquire_artifact_lease();
@@ -3634,6 +3672,7 @@ impl ExtensionProcess {
         progress: ToolProgressSink,
         request_started: oneshot::Sender<ExtensionOperationToken>,
     ) -> Result<ToolCallOutput, ExtensionRuntimeError> {
+        connection.require_api_v03_host_method(methods::TOOL_CALL)?;
         let catalog_revision = read_std_lock(&connection.protocol)
             .supports(EXTENSION_FEATURE_DYNAMIC_TOOLS)
             .then_some(catalog_revision);
@@ -3646,12 +3685,23 @@ impl ExtensionProcess {
         let artifact_owner = resource_owner
             .as_ref()
             .map(|owner| owner.session_id.clone());
-        let params = serde_json::to_value(ToolCallRequest {
-            name: definition.name.clone(),
-            arguments,
-            catalog_revision,
-            context,
-        })
+        let params = if read_std_lock(&connection.protocol).version == EXTENSION_API_VERSION_0_3 {
+            let params = api_v03::ToolCallParams {
+                name: definition.name.clone(),
+                arguments,
+                context: serde_json::to_value(context)
+                    .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            };
+            api_v03::validate_tool_call_params(&params).map_err(api_v03_protocol_error)?;
+            serde_json::to_value(params)
+        } else {
+            serde_json::to_value(ToolCallRequest {
+                name: definition.name.clone(),
+                arguments,
+                catalog_revision,
+                context,
+            })
+        }
         .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
         let _artifact_lease = connection.acquire_artifact_lease();
         let result = connection
@@ -3709,6 +3759,7 @@ impl ExtensionProcess {
             return Err(self.undeclared("command", name));
         }
         let connection = read_std_lock(&self.inner.connection).clone();
+        connection.require_api_v03_host_method(methods::COMMAND_EXECUTE)?;
         let mut context = context;
         context.resource_owner = context.resource_owner.map(|owner| ExtensionResourceOwner {
             session_id: owner.session_id,
@@ -4656,6 +4707,7 @@ impl ExtensionProcess {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        connection.require_api_v03_host_method(method)?;
         let params = serde_json::to_value(params)
             .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
         let result = connection
@@ -5494,6 +5546,49 @@ const REQUEST_COMPLETED: u8 = 1;
 const REQUEST_CANCELLED: u8 = 2;
 const JSON_RPC_REQUEST_CANCELLED: i64 = -32800;
 
+/// Shared transport-size authority. API 0.3 stores the protocol-defined
+/// payload limit (without LF); legacy transports retain their historical full
+/// line limit. Initialization installs the selected API 0.3 payload bound once
+/// before buffered post-handshake frames are released.
+struct ProtocolFrameLimit {
+    api_v03: bool,
+    bytes: AtomicUsize,
+}
+
+impl ProtocolFrameLimit {
+    fn new(max_message_bytes: usize, api_v03: bool) -> Self {
+        Self {
+            api_v03,
+            bytes: AtomicUsize::new(if api_v03 {
+                max_message_bytes.saturating_sub(1)
+            } else {
+                max_message_bytes
+            }),
+        }
+    }
+
+    fn max_frame_bytes(&self) -> usize {
+        self.bytes.load(Ordering::Acquire)
+    }
+
+    fn max_message_bytes(&self) -> usize {
+        if self.api_v03 {
+            self.max_frame_bytes().saturating_add(1)
+        } else {
+            self.max_frame_bytes()
+        }
+    }
+
+    fn accepts_message_bytes(&self, bytes: usize) -> bool {
+        bytes <= self.max_message_bytes()
+    }
+
+    fn install_selected_api_v03(&self, max_frame_bytes: usize) {
+        debug_assert!(self.api_v03);
+        self.bytes.store(max_frame_bytes, Ordering::Release);
+    }
+}
+
 struct ProcessConnection {
     writer: mpsc::Sender<WriterFrame>,
     child: Arc<Mutex<Child>>,
@@ -5506,12 +5601,13 @@ struct ProcessConnection {
     draining: Arc<AtomicBool>,
     active_admissions: AtomicU64,
     slots: StdRwLock<Arc<Semaphore>>,
-    max_message_bytes: usize,
+    frame_limit: Arc<ProtocolFrameLimit>,
     shutdown_timeout: Duration,
     cancellation_grace: Duration,
     tombstone_ttl: Duration,
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
+    api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
     catalog_guard: StdRwLock<()>,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_revision: AtomicU64,
@@ -5590,7 +5686,7 @@ struct ChildResponseClaim {
     id: ExtensionRequestId,
     response_state: Arc<ChildResponseState>,
     admitted: bool,
-    abort_cancel: Option<(mpsc::Sender<WriterFrame>, usize)>,
+    abort_cancel: Option<(mpsc::Sender<WriterFrame>, Arc<ProtocolFrameLimit>)>,
 }
 
 impl ChildResponseClaim {
@@ -5641,12 +5737,12 @@ impl Drop for ChildResponseClaim {
             self.response_state.changed.notify_waiters();
             deferred_cancel
         };
-        if let (Some(reason), Some((writer, max_message_bytes))) =
+        if let (Some(reason), Some((writer, frame_limit))) =
             (deferred_cancel, self.abort_cancel.take())
         {
             let _ = queue_writer_value(
                 &writer,
-                max_message_bytes,
+                &frame_limit,
                 serde_json::json!({
                     "jsonrpc":"2.0",
                     "method":methods::CANCEL_REQUEST,
@@ -5820,6 +5916,7 @@ async fn run_protocol_writer(
     events: broadcast::Sender<ExtensionEvent>,
     child: Arc<Mutex<Child>>,
     termination: ProcessTerminationHandle,
+    frame_limit: Arc<ProtocolFrameLimit>,
 ) {
     while let Some(mut frame) = frames.recv().await {
         if frame
@@ -5838,6 +5935,29 @@ async fn run_protocol_writer(
                 )));
             }
             continue;
+        }
+
+        if !frame_limit.accepts_message_bytes(frame.line.len()) {
+            let message = format!(
+                "outbound message exceeded negotiated {} byte limit",
+                frame_limit.max_message_bytes()
+            );
+            closed.store(true, Ordering::Release);
+            update_health(
+                &health,
+                ExtensionHealthState::Crashed,
+                Some(message.clone()),
+            );
+            let error = PendingError::Protocol(message.clone());
+            if let Some(completion) = frame.completion.take() {
+                let _ = completion.send(Err(error.clone()));
+            }
+            fail_all_pending(&pending, &pending_changed, error);
+            let _ = events.send(ExtensionEvent::Diagnostic { message });
+            if !draining.load(Ordering::Acquire) {
+                reap_failed_extension(child, termination).await;
+            }
+            return;
         }
 
         let result = async {
@@ -5914,6 +6034,14 @@ async fn reap_failed_extension(child: Arc<Mutex<Child>>, termination: ProcessTer
 }
 
 impl ProcessConnection {
+    fn max_message_bytes(&self) -> usize {
+        self.frame_limit.max_message_bytes()
+    }
+
+    fn max_frame_bytes(&self) -> usize {
+        self.frame_limit.max_frame_bytes()
+    }
+
     fn acquire_artifact_lease(self: &Arc<Self>) -> ArtifactDecodeLease {
         self.artifact_leases.fetch_add(1, Ordering::AcqRel);
         ArtifactDecodeLease {
@@ -6161,22 +6289,52 @@ impl ProcessConnection {
         }
     }
 
+    fn require_api_v03_host_method(&self, method: &str) -> Result<(), ExtensionRuntimeError> {
+        if read_std_lock(&self.protocol).version != EXTENSION_API_VERSION_0_3 {
+            return Ok(());
+        }
+        let contract = read_std_lock(&self.api_v03_contract)
+            .clone()
+            .ok_or_else(|| {
+                ExtensionRuntimeError::Protocol(
+                    "API 0.3 contract is unavailable before initialization".into(),
+                )
+            })?;
+        api_v03::require_method(&contract, method, api_v03::MethodDirection::HostToExtension)
+            .map_err(api_v03_protocol_error)
+    }
+
     fn serialize_message(
         &self,
         message: &serde_json::Value,
     ) -> Result<Vec<u8>, ExtensionRuntimeError> {
-        let mut line = serde_json::to_vec(message)
-            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        let is_api_v03 = read_std_lock(&self.protocol).version == EXTENSION_API_VERSION_0_3;
+        let mut line = if is_api_v03 {
+            api_v03::parse_json_rpc_envelope(message.clone()).map_err(api_v03_protocol_error)?;
+            api_v03::canonical_frame(message, self.max_frame_bytes())
+                .map_err(api_v03_protocol_error)?
+                .into_bytes()
+        } else {
+            serde_json::to_vec(message)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
+        };
         line.push(b'\n');
-        if line.len() > self.max_message_bytes {
+        let max_message_bytes = self.max_message_bytes();
+        if line.len() > max_message_bytes {
             return Err(ExtensionRuntimeError::MessageTooLarge {
-                limit: self.max_message_bytes,
+                limit: max_message_bytes,
             });
         }
         Ok(line)
     }
 
     fn queue_notification(&self, method: &str, params: serde_json::Value) -> bool {
+        if read_std_lock(&self.protocol).version == EXTENSION_API_VERSION_0_3
+            && method == methods::CANCEL_REQUEST
+            && api_v03::parse_cancel_request_params(params.clone()).is_err()
+        {
+            return false;
+        }
         let message = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -6314,17 +6472,28 @@ impl ProcessConnection {
         id: ExtensionRequestId,
         result: &T,
     ) -> Result<ChildResponseAdmission, ExtensionRuntimeError> {
-        let mut line = serde_json::to_vec(&ChildSuccessResponse {
+        let response = ChildSuccessResponse {
             jsonrpc: "2.0",
             id: &id,
             result,
-        })
-        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        };
+        let mut line = if read_std_lock(&self.protocol).version == EXTENSION_API_VERSION_0_3 {
+            let response = serde_json::to_value(response)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+            api_v03::parse_json_rpc_envelope(response.clone()).map_err(api_v03_protocol_error)?;
+            api_v03::canonical_json(&response)
+                .map_err(api_v03_protocol_error)?
+                .into_bytes()
+        } else {
+            serde_json::to_vec(&response)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
+        };
         line.push(b'\n');
-        if line.len() > self.max_message_bytes {
+        let max_message_bytes = self.max_message_bytes();
+        if line.len() > max_message_bytes {
             line.fill(0);
             return Err(ExtensionRuntimeError::MessageTooLarge {
-                limit: self.max_message_bytes,
+                limit: max_message_bytes,
             });
         }
         let line = ZeroizingBytes(line);
@@ -6348,7 +6517,7 @@ impl ProcessConnection {
                         id: id.clone(),
                         response_state,
                         admitted: false,
-                        abort_cancel: Some((self.writer.clone(), self.max_message_bytes)),
+                        abort_cancel: Some((self.writer.clone(), Arc::clone(&self.frame_limit))),
                     };
                     let (completed, completion) = oneshot::channel();
                     let admission = self.writer.send(WriterFrame {
@@ -6498,13 +6667,32 @@ impl ProcessConnection {
         let acknowledged = if self.closed.load(Ordering::Acquire) {
             false
         } else {
-            self.request_during_shutdown(
-                methods::SHUTDOWN,
-                serde_json::json!({}),
-                self.shutdown_timeout,
-            )
-            .await
-            .is_ok()
+            let is_api_v03 = read_std_lock(&self.protocol).version == EXTENSION_API_VERSION_0_3;
+            let params = if is_api_v03 {
+                let params = api_v03::ShutdownParams {};
+                if api_v03::validate_shutdown_params(&params).is_err() {
+                    return false;
+                }
+                match serde_json::to_value(params) {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            } else {
+                serde_json::json!({})
+            };
+            match self
+                .request_during_shutdown(methods::SHUTDOWN, params, self.shutdown_timeout)
+                .await
+            {
+                Ok(value) if is_api_v03 => api_v03::parse_shutdown_result(value)
+                    .and_then(|result| {
+                        api_v03::validate_shutdown_result(&result)?;
+                        Ok(())
+                    })
+                    .is_ok(),
+                Ok(_) => true,
+                Err(_) => false,
+            }
         };
 
         let exited = {
@@ -6714,6 +6902,21 @@ async fn spawn_connection(
     let closed = Arc::new(AtomicBool::new(false));
     let draining = Arc::new(AtomicBool::new(false));
     let tombstones = Arc::new(StdMutex::new(RequestTombstones::default()));
+    let api_v03_contract = Arc::new(StdRwLock::new(None));
+    let (protocol_max_message_bytes, api_v03_max_frame_bytes) =
+        if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3 {
+            let max_frame_bytes = config
+                .max_message_bytes
+                .saturating_sub(1)
+                .min(api_v03::MAX_FRAME_BYTES);
+            (max_frame_bytes.saturating_add(1), max_frame_bytes)
+        } else {
+            (config.max_message_bytes, 0)
+        };
+    let frame_limit = Arc::new(ProtocolFrameLimit::new(
+        protocol_max_message_bytes,
+        descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3,
+    ));
     let protocol = Arc::new(StdRwLock::new(ExtensionNegotiatedProtocol {
         version: descriptor.manifest.api_version.clone(),
         features: BTreeSet::new(),
@@ -6739,6 +6942,7 @@ async fn spawn_connection(
         events.clone(),
         Arc::clone(&child),
         termination,
+        Arc::clone(&frame_limit),
     ));
     let (presentation_updates, presentation_update_rx) = watch::channel(None);
     tokio::spawn(dispatch_presentation_updates(
@@ -6757,13 +6961,14 @@ async fn spawn_connection(
         presentation_updates,
         generation,
         instance_id.to_owned(),
-        config.max_message_bytes,
+        Arc::clone(&frame_limit),
         descriptor.manifest.contributes.clone(),
         writer.clone(),
         Arc::clone(&child_requests),
         child_work_slots,
         Arc::clone(&tombstones),
         Arc::clone(&protocol),
+        Arc::clone(&api_v03_contract),
         Arc::clone(&tool_catalog),
         catalog_updates,
         delegation_service,
@@ -6809,12 +7014,13 @@ async fn spawn_connection(
         draining,
         active_admissions: AtomicU64::new(0),
         slots: StdRwLock::new(Arc::new(Semaphore::new(config.max_pending_requests))),
-        max_message_bytes: config.max_message_bytes,
+        frame_limit,
         shutdown_timeout: config.shutdown_timeout,
         cancellation_grace: config.cancellation_grace,
         tombstone_ttl: config.tombstone_ttl,
         tombstones,
         protocol,
+        api_v03_contract,
         catalog_guard: StdRwLock::new(()),
         tool_catalog,
         catalog_revision: AtomicU64::new(0),
@@ -6856,60 +7062,88 @@ async fn spawn_connection(
     if offered_host_services.secrets {
         optional_features.push(EXTENSION_FEATURE_SECRETS.to_owned());
     }
-    let initialize = InitializeRequest {
-        api_version: descriptor.manifest.api_version.clone(),
-        ygg_version: env!("CARGO_PKG_VERSION").to_owned(),
-        extension: ExtensionIdentity {
-            name: descriptor.manifest.name.clone(),
-            version: descriptor.manifest.version.clone(),
-            manifest_path: descriptor.manifest_path.clone(),
-            source: descriptor.source,
-        },
-        workspace: config.workspace.clone(),
-        capabilities: descriptor.manifest.capabilities.clone(),
-        contributes: descriptor.manifest.contributes.clone(),
-        host: host_state,
-        protocol: (descriptor.manifest.api_version == EXTENSION_API_VERSION_0_2).then(|| {
-            ExtensionProtocolRequest {
-                version: EXTENSION_API_VERSION_0_2.to_owned(),
-                required_features,
-                optional_features,
-                limits: ExtensionProtocolLimits {
-                    max_concurrent_requests: config.max_pending_requests,
-                },
-            }
-        }),
+
+    let api_v03_offer = (descriptor.manifest.api_version == EXTENSION_API_VERSION_0_3)
+        .then(|| api_v03::host_offer(api_v03_max_frame_bytes, config.max_pending_requests))
+        .transpose()
+        .map_err(api_v03_protocol_error)?;
+    let extension_identity = ExtensionIdentity {
+        name: descriptor.manifest.name.clone(),
+        version: descriptor.manifest.version.clone(),
+        manifest_path: descriptor.manifest_path.clone(),
+        source: descriptor.source,
     };
-    let initialize_value = serde_json::to_value(initialize)
-        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
-    let response = match connection
+    let initialize_value = if let Some(contract) = &api_v03_offer {
+        let initialize = api_v03::InitializeRequest {
+            api_version: EXTENSION_API_VERSION_0_3.to_owned(),
+            ygg_version: env!("CARGO_PKG_VERSION").to_owned(),
+            extension: serde_json::to_value(&extension_identity)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            workspace: config.workspace.to_string_lossy().into_owned(),
+            capabilities: serde_json::to_value(&descriptor.manifest.capabilities)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            contributes: serde_json::to_value(&descriptor.manifest.contributes)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            host: serde_json::to_value(&host_state)
+                .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?,
+            contract: contract.clone(),
+        };
+        api_v03::validate_initialize_request(&initialize).map_err(api_v03_protocol_error)?;
+        serde_json::to_value(initialize)
+            .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
+    } else {
+        serde_json::to_value(InitializeRequest {
+            api_version: descriptor.manifest.api_version.clone(),
+            ygg_version: env!("CARGO_PKG_VERSION").to_owned(),
+            extension: extension_identity,
+            workspace: config.workspace.clone(),
+            capabilities: descriptor.manifest.capabilities.clone(),
+            contributes: descriptor.manifest.contributes.clone(),
+            host: host_state,
+            protocol: (descriptor.manifest.api_version == EXTENSION_API_VERSION_0_2).then(|| {
+                ExtensionProtocolRequest {
+                    version: EXTENSION_API_VERSION_0_2.to_owned(),
+                    required_features,
+                    optional_features,
+                    limits: ExtensionProtocolLimits {
+                        max_concurrent_requests: config.max_pending_requests,
+                    },
+                }
+            }),
+        })
+        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
+    };
+    let response = connection
         .request(
             methods::INITIALIZE,
             initialize_value,
             config.request_timeout,
         )
-        .await
-    {
-        Ok(value) => serde_json::from_value::<InitializeResponse>(value).map_err(|error| {
-            ExtensionRuntimeError::Protocol(format!("invalid initialize response: {error}"))
-        }),
-        Err(error) => Err(error),
-    };
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            initialization_complete.store(true, Ordering::Release);
-            initialization_changed.notify_waiters();
-            connection.terminate().await;
-            return Err(error);
+        .await;
+    let negotiated = match response.and_then(|response| {
+        if let Some(offer) = &api_v03_offer {
+            let response = api_v03::parse_initialize_response(response).map_err(|error| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "invalid API 0.3 initialize response: {error}"
+                ))
+            })?;
+            negotiate_api_v03_contributions(&descriptor.manifest, offer, response).map(
+                |(contributions, protocol, contract)| (contributions, protocol, Some(contract)),
+            )
+        } else {
+            let response: InitializeResponse =
+                serde_json::from_value(response).map_err(|error| {
+                    ExtensionRuntimeError::Protocol(format!("invalid initialize response: {error}"))
+                })?;
+            negotiate_contributions_with_host_services(
+                &descriptor.manifest,
+                response,
+                config.max_pending_requests,
+                offered_host_services,
+            )
+            .map(|(contributions, protocol)| (contributions, protocol, None))
         }
-    };
-    let (contributions, negotiated) = match negotiate_contributions_with_host_services(
-        &descriptor.manifest,
-        response,
-        config.max_pending_requests,
-        offered_host_services,
-    ) {
+    }) {
         Ok(negotiated) => negotiated,
         Err(error) => {
             initialization_complete.store(true, Ordering::Release);
@@ -6918,9 +7152,18 @@ async fn spawn_connection(
             return Err(error);
         }
     };
-    *write_std_lock(&connection.slots) =
-        Arc::new(Semaphore::new(negotiated.max_concurrent_requests));
-    *write_std_lock(&connection.protocol) = negotiated;
+    let (contributions, protocol, api_v03_contract) = negotiated;
+    if let Some(contract) = &api_v03_contract {
+        // The reader waits after the initialize response, so this single atomic
+        // install becomes visible to both outbound serialization and the next
+        // buffered stdout byte before protocol traffic resumes.
+        connection
+            .frame_limit
+            .install_selected_api_v03(contract.limits.max_frame_bytes);
+    }
+    *write_std_lock(&connection.slots) = Arc::new(Semaphore::new(protocol.max_concurrent_requests));
+    *write_std_lock(&connection.protocol) = protocol;
+    *write_std_lock(&connection.api_v03_contract) = api_v03_contract;
     *write_std_lock(&connection.tool_catalog) = contributions.tools.clone();
     initialization_complete.store(true, Ordering::Release);
     initialization_changed.notify_waiters();
@@ -7033,6 +7276,80 @@ fn resolve_entrypoint_command(
         command: configured,
         _staging: None,
     })
+}
+
+fn api_v03_protocol_error(error: api_v03::ContractError) -> ExtensionRuntimeError {
+    ExtensionRuntimeError::Protocol(format!(
+        "API 0.3 contract error {}: {}",
+        error.code, error.message
+    ))
+}
+
+fn negotiate_api_v03_contributions(
+    manifest: &ExtensionManifest,
+    offer: &api_v03::ContractOffer,
+    response: api_v03::InitializeResponse,
+) -> Result<
+    (
+        ExtensionContributions,
+        ExtensionNegotiatedProtocol,
+        api_v03::NegotiatedContract,
+    ),
+    ExtensionRuntimeError,
+> {
+    if manifest.api_version != EXTENSION_API_VERSION_0_3 {
+        return Err(ExtensionRuntimeError::UnsupportedApiVersion {
+            extension: response.api_version,
+            host: manifest.api_version.clone(),
+        });
+    }
+    api_v03::validate_initialize_response(&response).map_err(api_v03_protocol_error)?;
+    let contract = api_v03::negotiate(offer, &response.contract).map_err(api_v03_protocol_error)?;
+    if !manifest.contributes.commands.is_empty()
+        || !manifest.contributes.hooks.is_empty()
+        || !manifest.contributes.ui.is_empty()
+        || manifest.contributes.context
+        || !manifest.contributes.tool_renderers.is_empty()
+        || manifest.contributes.notifications
+        || manifest.contributes.confirmations
+        || manifest.contributes.presentation
+    {
+        return Err(ExtensionRuntimeError::Protocol(
+            "API 0.3 received deferred manifest contributions after validation".into(),
+        ));
+    }
+    let tools = response
+        .tools
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+            output_schema: tool.output_schema,
+        })
+        .collect::<Vec<_>>();
+    let protocol = ExtensionNegotiatedProtocol {
+        version: EXTENSION_API_VERSION_0_3.to_owned(),
+        features: contract.capabilities.clone(),
+        max_concurrent_requests: contract.limits.max_concurrent_requests,
+        lifecycle_events: BTreeSet::new(),
+    };
+
+    let tool_names = tools
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect::<Vec<_>>();
+    ensure_same_contributions("tools", &manifest.contributes.tools, &tool_names)?;
+    validate_tool_definitions(&tools, &manifest.api_version)?;
+
+    Ok((
+        ExtensionContributions {
+            tools,
+            ..ExtensionContributions::default()
+        },
+        protocol,
+        contract,
+    ))
 }
 
 fn negotiate_contributions_with_host_services(
@@ -7274,7 +7591,10 @@ fn validate_tool_definitions(
             )));
         }
         if let Some(schema) = &tool.output_schema {
-            if api_version != EXTENSION_API_VERSION_0_2 {
+            if !matches!(
+                api_version,
+                EXTENSION_API_VERSION_0_2 | EXTENSION_API_VERSION_0_3
+            ) {
                 return Err(ExtensionRuntimeError::Protocol(format!(
                     "API 0.1 tool `{}` cannot declare output_schema",
                     tool.name
@@ -7724,6 +8044,43 @@ fn decode_tool_call_output(
     artifact_owner: Option<&str>,
     value: serde_json::Value,
 ) -> Result<ToolCallOutput, ExtensionRuntimeError> {
+    if read_std_lock(&connection.protocol).version == EXTENSION_API_VERSION_0_3 {
+        let result = api_v03::parse_tool_call_result(value).map_err(api_v03_protocol_error)?;
+        api_v03::validate_tool_call_result(&result).map_err(api_v03_protocol_error)?;
+        let parts = result
+            .content
+            .into_iter()
+            .map(|part| match part {
+                api_v03::ContentPart::Text { text } => Ok(ToolOutputContentPart::Text(text)),
+                api_v03::ContentPart::Image { .. } | api_v03::ContentPart::Audio { .. } => {
+                    Err(ExtensionRuntimeError::Protocol(
+                        "API 0.3 image and audio content parts are deferred".into(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let structured_content = match result.structured_content {
+            api_v03::Presence::Absent => None,
+            api_v03::Presence::Null => Some(serde_json::Value::Null),
+            api_v03::Presence::Value(value) => Some(value),
+        };
+        let metadata = result.metadata;
+        let native = ToolOutput::from_content_parts(parts)
+            .try_with_details(structured_content.clone(), metadata.clone())
+            .map_err(|error| {
+                ExtensionRuntimeError::Protocol(format!(
+                    "tool `{}` returned invalid API 0.3 output details: {error}",
+                    definition.name
+                ))
+            })?;
+        return Ok(ToolCallOutput {
+            content: native.text.clone(),
+            is_error: result.is_error,
+            metadata: metadata.unwrap_or(serde_json::Value::Null),
+            structured_content,
+            native_output: Some(native),
+        });
+    }
     let wire: ToolCallOutputWire = serde_json::from_value(value).map_err(|error| {
         ExtensionRuntimeError::Protocol(format!(
             "invalid `{}` response for tool `{}`: {error}",
@@ -8095,7 +8452,7 @@ struct ProtocolReadState {
     presentation_sequence: AtomicU64,
     generation: u64,
     instance_id: String,
-    max_message_bytes: usize,
+    frame_limit: Arc<ProtocolFrameLimit>,
     declared: ManifestContributions,
     writer: mpsc::Sender<WriterFrame>,
     child_requests: ChildRequests,
@@ -8103,6 +8460,7 @@ struct ProtocolReadState {
     child_work_slots: Arc<Semaphore>,
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
+    api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
@@ -8114,6 +8472,12 @@ struct ProtocolReadState {
     artifact_store: ArtifactStore,
     child: Option<Arc<Mutex<Child>>>,
     termination: Option<ProcessTerminationHandle>,
+}
+
+impl ProtocolReadState {
+    fn max_message_bytes(&self) -> usize {
+        self.frame_limit.max_message_bytes()
+    }
 }
 
 enum AgentSessionOperation {
@@ -8207,7 +8571,7 @@ fn queue_agent_session_operation(
                 &state.child_requests,
                 &request_id,
                 &state.writer,
-                state.max_message_bytes,
+                state.max_message_bytes(),
                 serde_json::json!({
                     "jsonrpc":"2.0",
                     "id":request_id,
@@ -8227,7 +8591,7 @@ fn queue_agent_session_operation(
     let child_requests = Arc::clone(&state.child_requests);
     let health = Arc::clone(&state.health);
     let events = state.events.clone();
-    let max_message_bytes = state.max_message_bytes;
+    let max_message_bytes = state.max_message_bytes();
     tokio::spawn(async move {
         let cancellation = CancellationToken::default();
         let result = if let (Some(service), Some(resource_owner)) = (service, resource_owner) {
@@ -8306,7 +8670,7 @@ fn queue_secret_lookup(
             &state.child_requests,
             &request_id,
             &state.writer,
-            state.max_message_bytes,
+            state.max_message_bytes(),
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":request_id,
@@ -8320,7 +8684,7 @@ fn queue_secret_lookup(
             &state.child_requests,
             &request_id,
             &state.writer,
-            state.max_message_bytes,
+            state.max_message_bytes(),
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":request_id,
@@ -8337,7 +8701,7 @@ fn queue_secret_lookup(
             &state.child_requests,
             &request_id,
             &state.writer,
-            state.max_message_bytes,
+            state.max_message_bytes(),
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":request_id,
@@ -8353,7 +8717,7 @@ fn queue_secret_lookup(
                 &state.child_requests,
                 &request_id,
                 &state.writer,
-                state.max_message_bytes,
+                state.max_message_bytes(),
                 serde_json::json!({
                     "jsonrpc":"2.0",
                     "id":request_id,
@@ -8377,7 +8741,7 @@ fn queue_secret_lookup(
     let writer = state.writer.clone();
     let health = Arc::clone(&state.health);
     let events = state.events.clone();
-    let max_message_bytes = state.max_message_bytes;
+    let max_message_bytes = state.max_message_bytes();
     tokio::spawn(async move {
         let result = tokio::select! {
             result = broker.get_secret(lookup) => Some(result),
@@ -8463,13 +8827,14 @@ async fn read_protocol_stdout<R>(
     presentation_updates: watch::Sender<Option<PresentationDispatch>>,
     generation: u64,
     instance_id: String,
-    max_message_bytes: usize,
+    frame_limit: Arc<ProtocolFrameLimit>,
     declared: ManifestContributions,
     writer: mpsc::Sender<WriterFrame>,
     child_requests: ChildRequests,
     child_work_slots: Arc<Semaphore>,
     tombstones: Arc<StdMutex<RequestTombstones>>,
     protocol: Arc<StdRwLock<ExtensionNegotiatedProtocol>>,
+    api_v03_contract: Arc<StdRwLock<Option<api_v03::NegotiatedContract>>>,
     tool_catalog: Arc<StdRwLock<Vec<ToolDefinition>>>,
     catalog_updates: mpsc::Sender<CatalogUpdateRequest>,
     delegation_service: Arc<StdRwLock<Option<ExtensionDelegationService>>>,
@@ -8498,7 +8863,7 @@ async fn read_protocol_stdout<R>(
         presentation_sequence: AtomicU64::new(0),
         generation,
         instance_id,
-        max_message_bytes,
+        frame_limit,
         declared,
         writer,
         child_requests,
@@ -8506,6 +8871,7 @@ async fn read_protocol_stdout<R>(
         child_work_slots,
         tombstones,
         protocol,
+        api_v03_contract,
         tool_catalog,
         catalog_updates,
         delegation_service,
@@ -8533,10 +8899,21 @@ async fn read_protocol_stdout<R>(
         };
         for byte in &read_buffer[..count] {
             if *byte == b'\n' {
+                let is_api_v03 =
+                    read_std_lock(&state.protocol).version == EXTENSION_API_VERSION_0_3;
                 if line.last() == Some(&b'\r') {
+                    if is_api_v03 {
+                        break 'stream Err("API 0.3 frames must end with exactly one LF".into());
+                    }
                     line.pop();
                 }
                 if line.is_empty() {
+                    if is_api_v03 {
+                        break 'stream Err(
+                            "API 0.3 frames must contain one canonical JSON value per LF delimiter"
+                                .into(),
+                        );
+                    }
                     continue;
                 }
                 if let Err(error) = handle_protocol_line(&line, &state) {
@@ -8555,10 +8932,10 @@ async fn read_protocol_stdout<R>(
                 }
             } else {
                 line.push(*byte);
-                if line.len() >= state.max_message_bytes {
+                if line.len() >= state.max_message_bytes() {
                     break 'stream Err(format!(
                         "stdout message exceeded {} bytes",
-                        state.max_message_bytes
+                        state.max_message_bytes()
                     ));
                 }
             }
@@ -8632,9 +9009,150 @@ fn presentation_update_owner(
     }
 }
 
+fn queue_api_v03_unknown_method(
+    state: &ProtocolReadState,
+    id: serde_json::Value,
+    method: &str,
+) -> Result<(), String> {
+    let error = api_v03::error_object(
+        "unknown_method",
+        Some(serde_json::json!({"method": method})),
+    )
+    .map_err(|error| error.to_string())?;
+    let response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": error,
+    });
+    queue_writer_value(&state.writer, &state.frame_limit, response)
+}
+
+fn reject_duplicate_json_keys(line: &[u8]) -> Result<(), serde_json::Error> {
+    struct JsonValue;
+    struct JsonValueVisitor;
+
+    impl<'de> Deserialize<'de> for JsonValue {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserializer.deserialize_any(JsonValueVisitor)
+        }
+    }
+
+    impl<'de> serde::de::Visitor<'de> for JsonValueVisitor {
+        type Value = JsonValue;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON value without duplicate object keys")
+        }
+
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_str<E>(self, _: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_borrowed_str<E>(self, _: &'de str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_string<E>(self, _: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(JsonValue)
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            while sequence.next_element::<JsonValue>()?.is_some() {}
+            Ok(JsonValue)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut keys = HashSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate JSON object key {key:?}"
+                    )));
+                }
+                map.next_value::<JsonValue>()?;
+            }
+            Ok(JsonValue)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(line);
+    JsonValue::deserialize(&mut deserializer)?;
+    deserializer.end()
+}
+
 fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), String> {
+    let is_api_v03 = read_std_lock(&state.protocol).version == EXTENSION_API_VERSION_0_3;
+    if is_api_v03 {
+        // Deserialize once with a streaming visitor before `Value` normalizes
+        // duplicate object keys. Canonical reserialization alone would reject
+        // them eventually, but cannot identify the hostile raw wire shape.
+        reject_duplicate_json_keys(line)
+            .map_err(|error| format!("invalid API 0.3 raw JSON: {error}"))?;
+    }
     let value: serde_json::Value =
         serde_json::from_slice(line).map_err(|error| format!("invalid JSON on stdout: {error}"))?;
+    if is_api_v03 {
+        let canonical = api_v03::canonical_json(&value)
+            .map_err(|error| format!("invalid API 0.3 canonical frame: {error}"))?;
+        if canonical.as_bytes() != line {
+            return Err("API 0.3 frame is not canonical JSON".into());
+        }
+        api_v03::parse_json_rpc_envelope(value.clone())
+            .map_err(|error| format!("invalid API 0.3 JSON-RPC envelope: {error}"))?;
+    }
     let object = value
         .as_object()
         .ok_or_else(|| "protocol message must be a JSON object".to_owned())?;
@@ -8643,6 +9161,24 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
     }
 
     if let Some(method) = object.get("method").and_then(serde_json::Value::as_str) {
+        if read_std_lock(&state.protocol).version == EXTENSION_API_VERSION_0_3 {
+            let contract = read_std_lock(&state.api_v03_contract)
+                .clone()
+                .ok_or_else(|| {
+                    "API 0.3 extension sent a method before contract initialization".to_owned()
+                })?;
+            if let Err(error) = api_v03::require_method(
+                &contract,
+                method,
+                api_v03::MethodDirection::ExtensionToHost,
+            ) {
+                if let Some(id) = object.get("id") {
+                    queue_api_v03_unknown_method(state, id.clone(), method)?;
+                    return Ok(());
+                }
+                return Err(format!("API 0.3 method `{method}` rejected: {error}"));
+            }
+        }
         let params = object
             .get("params")
             .cloned()
@@ -8702,7 +9238,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     let child_requests = Arc::clone(&state.child_requests);
                     let health = Arc::clone(&state.health);
                     let events = state.events.clone();
-                    let max_message_bytes = state.max_message_bytes;
+                    let max_message_bytes = state.max_message_bytes();
                     let response_id = request_id;
                     tokio::spawn(async move {
                         let confirmation = progress.confirmation(
@@ -8811,6 +9347,10 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 dispatch_progress(state, progress)?;
             }
             methods::CANCEL_REQUEST => {
+                if read_std_lock(&state.protocol).version == EXTENSION_API_VERSION_0_3 {
+                    api_v03::parse_cancel_request_params(params.clone())
+                        .map_err(|error| format!("invalid API 0.3 cancellation: {error}"))?;
+                }
                 let id = params
                     .get("id")
                     .cloned()
@@ -8846,7 +9386,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                             &state.child_requests,
                             &id,
                             &state.writer,
-                            state.max_message_bytes,
+                            state.max_message_bytes(),
                             serde_json::json!({
                                 "jsonrpc":"2.0",
                                 "id":id,
@@ -8871,7 +9411,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         &state.child_requests,
                         &id,
                         &state.writer,
-                        state.max_message_bytes,
+                        state.max_message_bytes(),
                         serde_json::json!({
                             "jsonrpc":"2.0",
                             "id":id,
@@ -8948,7 +9488,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                     let child_requests = Arc::clone(&state.child_requests);
                     let health = Arc::clone(&state.health);
                     let events = state.events.clone();
-                    let max_message_bytes = state.max_message_bytes;
+                    let max_message_bytes = state.max_message_bytes();
                     let response_id = id;
                     tokio::spawn(async move {
                         let input = progress.input(request.prompt, request.secret);
@@ -8998,7 +9538,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         &state.child_requests,
                         &id,
                         &state.writer,
-                        state.max_message_bytes,
+                        state.max_message_bytes(),
                         serde_json::json!({
                             "jsonrpc": "2.0",
                             "id": id,
@@ -9257,7 +9797,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                                 &state.child_requests,
                                 &id,
                                 &state.writer,
-                                state.max_message_bytes,
+                                state.max_message_bytes(),
                                 serde_json::json!({
                                     "jsonrpc":"2.0",
                                     "id":id,
@@ -9277,7 +9817,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         let health = Arc::clone(&state.health);
                         let events = state.events.clone();
                         let response_id = id;
-                        let max_message_bytes = state.max_message_bytes;
+                        let max_message_bytes = state.max_message_bytes();
                         let generation = state.generation;
                         tokio::spawn(async move {
                             let publication = store
@@ -9341,7 +9881,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                             &state.child_requests,
                             &id,
                             &state.writer,
-                            state.max_message_bytes,
+                            state.max_message_bytes(),
                             serde_json::json!({
                                 "jsonrpc":"2.0",
                                 "id":id,
@@ -9357,7 +9897,7 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                         .map_err(|error| format!("invalid unknown-method request id: {error}"))?;
                     queue_writer_value(
                         &state.writer,
-                        state.max_message_bytes,
+                        &state.frame_limit,
                         serde_json::json!({
                             "jsonrpc":"2.0",
                             "id":id,
@@ -9382,6 +9922,12 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| "response requires a numeric id".to_owned())?;
     let reply = if let Some(error) = object.get("error") {
+        if read_std_lock(&state.protocol).version == EXTENSION_API_VERSION_0_3 {
+            let error: api_v03::ErrorObject = serde_json::from_value(error.clone())
+                .map_err(|decode| format!("invalid API 0.3 JSON-RPC error: {decode}"))?;
+            api_v03::validate_error_object(&error)
+                .map_err(|error| format!("invalid API 0.3 JSON-RPC error: {error}"))?;
+        }
         let error: RpcErrorObject = serde_json::from_value(error.clone())
             .map_err(|decode| format!("invalid JSON-RPC error: {decode}"))?;
         Err(PendingError::Remote {
@@ -9467,13 +10013,13 @@ fn queue_catalog_update(
         catalog: Arc::clone(&state.tool_catalog),
         writer: state.writer.clone(),
         child_requests: Arc::clone(&state.child_requests),
-        max_message_bytes: state.max_message_bytes,
+        max_message_bytes: state.max_message_bytes(),
     };
     if state.catalog_updates.try_send(request).is_err() {
         settle_child_request(&state.child_requests, &request_id);
         queue_writer_value(
             &state.writer,
-            state.max_message_bytes,
+            &state.frame_limit,
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":request_id,
@@ -9498,7 +10044,7 @@ fn reject_unparented_child_request(
         &state.child_requests,
         &request_id,
         &state.writer,
-        state.max_message_bytes,
+        state.max_message_bytes(),
         serde_json::json!({
             "jsonrpc":"2.0",
             "id":request_id,
@@ -9535,7 +10081,7 @@ fn register_child_request(
         // framing or protocol violation.
         let _ = queue_writer_value(
             &state.writer,
-            state.max_message_bytes,
+            &state.frame_limit,
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":id,
@@ -9656,6 +10202,8 @@ fn rollback_undelivered_artifact(
     }
 }
 
+// API 0.3 rejects deferred extension-originated requests before this legacy
+// response path.
 fn try_queue_child_response(
     child_requests: &ChildRequests,
     id: &ExtensionRequestId,
@@ -9722,7 +10270,7 @@ fn cancel_children_from_reader(state: &ProtocolReadState, parent_request_id: u64
     for id in child_ids {
         let _ = queue_writer_value(
             &state.writer,
-            state.max_message_bytes,
+            &state.frame_limit,
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "method":methods::CANCEL_REQUEST,
@@ -9889,11 +10437,18 @@ fn artifact_publication(request: ArtifactPublishRequest) -> Result<ArtifactPubli
 
 fn queue_writer_value(
     writer: &mpsc::Sender<WriterFrame>,
-    max_message_bytes: usize,
+    frame_limit: &ProtocolFrameLimit,
     value: serde_json::Value,
 ) -> Result<(), String> {
-    let line = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
-    queue_writer_line(writer, max_message_bytes, line)
+    let line = if frame_limit.api_v03 {
+        api_v03::parse_json_rpc_envelope(value.clone()).map_err(|error| error.to_string())?;
+        api_v03::canonical_frame(&value, frame_limit.max_frame_bytes())
+            .map_err(|error| error.to_string())?
+            .into_bytes()
+    } else {
+        serde_json::to_vec(&value).map_err(|error| error.to_string())?
+    };
+    queue_writer_line(writer, frame_limit.max_message_bytes(), line)
 }
 
 fn queue_writer_line(
@@ -10149,7 +10704,10 @@ confirmations = true
                 presentation_sequence: AtomicU64::new(0),
                 generation: 1,
                 instance_id: "instance-test".into(),
-                max_message_bytes: DEFAULT_EXTENSION_MESSAGE_BYTES,
+                frame_limit: Arc::new(ProtocolFrameLimit::new(
+                    DEFAULT_EXTENSION_MESSAGE_BYTES,
+                    false,
+                )),
                 declared,
                 writer,
                 child_requests: Arc::new(StdMutex::new(HashMap::new())),
@@ -10159,6 +10717,7 @@ confirmations = true
                 protocol: Arc::new(StdRwLock::new(ExtensionNegotiatedProtocol::api_0_1(
                     DEFAULT_PENDING_REQUESTS,
                 ))),
+                api_v03_contract: Arc::new(StdRwLock::new(None)),
                 tool_catalog: Arc::new(StdRwLock::new(Vec::new())),
                 catalog_updates,
                 delegation_service: Arc::new(StdRwLock::new(None)),
@@ -10590,7 +11149,13 @@ confirmations = true
             id: id.clone(),
             response_state: Arc::clone(&response_state),
             admitted: false,
-            abort_cancel: Some((writer, DEFAULT_EXTENSION_MESSAGE_BYTES)),
+            abort_cancel: Some((
+                writer,
+                Arc::new(ProtocolFrameLimit::new(
+                    DEFAULT_EXTENSION_MESSAGE_BYTES,
+                    false,
+                )),
+            )),
         };
 
         assert!(cancel_active_children(&children, 7, "parent settled").is_empty());
@@ -10637,7 +11202,7 @@ confirmations = true
             &state.child_requests,
             &id,
             &state.writer,
-            state.max_message_bytes,
+            state.max_message_bytes(),
             serde_json::json!({
                 "jsonrpc":"2.0",
                 "id":id,
@@ -11446,6 +12011,506 @@ confirmations = true
             ),
             Err(ExtensionRuntimeError::Protocol(message)) if message.contains("do not match")
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_process_uses_canonical_contracts_and_unknown_method_errors() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("api-v03.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip("\n") == canonical(value), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+initialize = receive()
+assert initialize["method"] == "initialize", initialize
+contract = initialize["params"]["contract"]
+assert contract["schema"] == "ygg.extension.api/0.3", contract
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": contract["required_capabilities"],
+    "methods": contract["required_methods"],
+    "limits": contract["limits"],
+}
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "api_version": "0.3",
+        "tools": [{
+            "name": "echo",
+            "description": "Canonical echo",
+            "parameters": {"type": "object"},
+        }],
+        "contract": selection,
+    },
+})
+
+send({
+    "jsonrpc": "2.0",
+    "id": "unavailable-method",
+    "method": "tools/register",
+    "params": {},
+})
+saw_unknown_method_error = False
+saw_tool_call = False
+while not (saw_unknown_method_error and saw_tool_call):
+    message = receive()
+    if message.get("id") == "unavailable-method":
+        assert message["error"]["code"] == -32601, message
+        assert message["error"]["message"] == "unknown or unnegotiated method", message
+        saw_unknown_method_error = True
+    else:
+        assert message["method"] == "tool/call", message
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {
+                "content": [{"type": "text", "text": "canonical API 0.3"}],
+                "is_error": False,
+                "metadata": {},
+            },
+        })
+        saw_tool_call = True
+
+shutdown = receive()
+assert shutdown["method"] == "shutdown", shutdown
+send({"jsonrpc": "2.0", "id": shutdown["id"], "result": {"terminal": "shutdown"}})
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "api-v03.py"
+[contributes]
+tools = ["echo"]
+"#,
+        )
+        .expect("API 0.3 manifest");
+        let process = ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        .expect("start API 0.3 process");
+        assert_eq!(process.api_version(), EXTENSION_API_VERSION_0_3);
+        let protocol = process.negotiated_protocol();
+        assert_eq!(protocol.version, EXTENSION_API_VERSION_0_3);
+        assert!(protocol.supports(EXTENSION_FEATURE_REQUEST_CANCELLATION));
+        assert!(protocol.supports(EXTENSION_FEATURE_CONTENT_PARTS));
+        let connection = read_std_lock(&process.inner.connection).clone();
+        match connection.require_api_v03_host_method(methods::COMMAND_EXECUTE) {
+            Err(ExtensionRuntimeError::Protocol(message)) => {
+                assert_eq!(
+                    message,
+                    concat!(
+                        "API 0.3 contract error -32601: unknown or unnegotiated method: ",
+                        "unknown method \"command/execute\""
+                    )
+                );
+            }
+            other => panic!("expected unavailable API 0.3 command rejection, got {other:?}"),
+        }
+        let mut events = process.subscribe();
+        let output = process
+            .call_tool("echo", serde_json::json!({}), process.current_context())
+            .await;
+        if let Err(ref error) = output {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let diagnostics = std::iter::from_fn(|| events.try_recv().ok())
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>();
+            panic!(
+                "canonical API 0.3 tool response failed: {error}; health={:?}; events={diagnostics:?}",
+                process.health_snapshot()
+            );
+        }
+        assert_eq!(output.expect("checked above").content, "canonical API 0.3");
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_runtime_frame_limit_accepts_exact_payload_and_rejects_oversized_queue() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("frame-limit.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.buffer.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip(b"\n") == canonical(value).encode(), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+initialize = receive()
+contract = initialize["params"]["contract"]
+limits = dict(contract["limits"])
+limits["max_frame_bytes"] = 512
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": contract["required_capabilities"],
+    "methods": contract["required_methods"],
+    "limits": limits,
+}
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {"api_version": "0.3", "tools": [], "contract": selection},
+})
+message = receive()
+assert len(canonical(message).encode()) == 512, len(canonical(message).encode())
+send({"jsonrpc": "2.0", "id": message["id"], "result": {"terminal": "shutdown"}})
+sys.stdin.buffer.readline()
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03-frame-limit"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "frame-limit.py"
+"#,
+        )
+        .expect("API 0.3 manifest");
+        let mut config = ExtensionRuntimeConfig::new(temp.path());
+        config.max_message_bytes = 2048;
+        let process = ExtensionProcess::start(trusted_descriptor(temp.path(), manifest), config)
+            .await
+            .expect("start API 0.3 process");
+        let connection = read_std_lock(&process.inner.connection).clone();
+        assert_eq!(connection.max_frame_bytes(), 512);
+        assert_eq!(connection.max_message_bytes(), 513);
+
+        let id = connection.next_id.load(Ordering::Acquire);
+        let empty_params = serde_json::json!({"padding": ""});
+        let empty_message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "shutdown",
+            "params": empty_params,
+        });
+        let empty_line = connection
+            .serialize_message(&empty_message)
+            .expect("empty frame fits");
+        let padding = 512 - (empty_line.len() - 1);
+        let params = serde_json::json!({"padding": "x".repeat(padding)});
+        let exact_message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "shutdown",
+            "params": params,
+        });
+        assert_eq!(
+            connection
+                .serialize_message(&exact_message)
+                .expect("exact frame fits")
+                .len(),
+            513
+        );
+        assert_eq!(
+            connection
+                .request(
+                    "shutdown",
+                    exact_message["params"].clone(),
+                    Duration::from_secs(5)
+                )
+                .await
+                .expect("exactly bounded request")["terminal"],
+            "shutdown"
+        );
+
+        // A pre-serialized line has to be checked again by the writer after
+        // negotiation; it cannot bypass the selected payload limit in its queue.
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let mut oversized = vec![b' '; 513];
+        oversized.push(b'\n');
+        connection
+            .writer
+            .send(WriterFrame {
+                line: oversized,
+                state: Arc::new(AtomicU8::new(FRAME_QUEUED)),
+                completion: Some(completion_tx),
+            })
+            .await
+            .expect("queue oversized buffered frame");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), completion_rx)
+                .await
+                .expect("writer completion")
+                .expect("writer retained completion"),
+            Err(PendingError::Protocol(message))
+                if message == "outbound message exceeded negotiated 513 byte limit"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_process_rejects_crlf_at_stdout_boundary() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("crlf.sh");
+        write_executable_script(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '{"id":1,"jsonrpc":"2.0","result":{}}\r\n'
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "crlf-api-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "crlf.sh"
+"#,
+        )
+        .expect("API 0.3 manifest");
+        match ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        {
+            Err(ExtensionRuntimeError::Closed(message)) => {
+                assert_eq!(message, "API 0.3 frames must end with exactly one LF");
+            }
+            Err(error) => panic!("expected CRLF rejection, got {error}"),
+            Ok(_) => panic!("CRLF API 0.3 frame initialized successfully"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_process_rejects_empty_lf_frame_at_stdout_boundary() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("empty-frame.sh");
+        write_executable_script(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf '\n'
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "empty-frame-api-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "empty-frame.sh"
+"#,
+        )
+        .expect("API 0.3 manifest");
+        match ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        {
+            Err(ExtensionRuntimeError::Closed(message)) => assert_eq!(
+                message,
+                "API 0.3 frames must contain one canonical JSON value per LF delimiter"
+            ),
+            Err(error) => panic!("expected empty-frame rejection, got {error}"),
+            Ok(_) => panic!("empty API 0.3 frame initialized successfully"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn api_v03_process_rejects_noncanonical_wire_frames() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("noncanonical.sh");
+        write_executable_script(
+            &script_path,
+            r#"#!/bin/sh
+IFS= read -r initialize
+printf ' {"jsonrpc":"2.0","id":1,"result":{}}\n'
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "noncanonical-api-v03"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "noncanonical.sh"
+"#,
+        )
+        .expect("API 0.3 manifest");
+        match ExtensionProcess::start(
+            trusted_descriptor(temp.path(), manifest),
+            ExtensionRuntimeConfig::new(temp.path()),
+        )
+        .await
+        {
+            Err(ExtensionRuntimeError::Closed(message)) => {
+                assert_eq!(message, "API 0.3 frame is not canonical JSON");
+            }
+            Err(error) => panic!("expected canonical-wire rejection, got {error}"),
+            Ok(_) => panic!("noncanonical API 0.3 frame initialized successfully"),
+        }
+    }
+
+    #[test]
+    fn api_v03_frame_limit_excludes_the_delimiter_and_rechecks_buffered_frames() {
+        let limit = Arc::new(ProtocolFrameLimit::new(257, true));
+        assert_eq!(limit.max_frame_bytes(), 256);
+        assert_eq!(limit.max_message_bytes(), 257);
+        assert!(
+            limit.accepts_message_bytes(257),
+            "a 256-byte payload plus LF fits"
+        );
+        assert!(!limit.accepts_message_bytes(258));
+
+        // A frame serialized before selection must be rechecked by the shared
+        // writer authority after the selected bound is atomically installed.
+        let buffered_line_bytes = 257;
+        limit.install_selected_api_v03(128);
+        assert_eq!(limit.max_message_bytes(), 129);
+        assert!(!limit.accepts_message_bytes(buffered_line_bytes));
+        assert!(limit.accepts_message_bytes(129));
+
+        let reader = Arc::clone(&limit);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                for _ in 0..1_000 {
+                    assert!(matches!(reader.max_message_bytes(), 129 | 65));
+                }
+            });
+            limit.install_selected_api_v03(64);
+        });
+        assert_eq!(limit.max_frame_bytes(), 64);
+        assert_eq!(limit.max_message_bytes(), 65);
+    }
+
+    #[test]
+    fn api_v03_raw_boundary_rejects_duplicate_keys_and_crlf() {
+        let (mut state, _frames) =
+            protocol_read_state_for_test(ManifestContributions::default(), broadcast::channel(8).0);
+        state.frame_limit = Arc::new(ProtocolFrameLimit::new(1025, true));
+        *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
+            version: EXTENSION_API_VERSION_0_3.to_owned(),
+            features: BTreeSet::new(),
+            max_concurrent_requests: 1,
+            lifecycle_events: BTreeSet::new(),
+        };
+
+        assert!(matches!(
+            handle_protocol_line(br#"{"jsonrpc":"2.0","id":1,"id":1,"result":{}}"#, &state),
+            Err(message) if message.contains("duplicate JSON object key \"id\"")
+        ));
+        assert!(matches!(
+            handle_protocol_line(br#"{"id":1,"jsonrpc":"2.0","result":{"x":1,"x":2}}"#, &state),
+            Err(message) if message.contains("duplicate JSON object key \"x\"")
+        ));
+        assert_eq!(
+            handle_protocol_line(b"{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{}}\r", &state),
+            Err("API 0.3 frame is not canonical JSON".into())
+        );
+    }
+
+    #[test]
+    fn api_v03_queue_writer_value_canonicalizes_and_validates_child_frames() {
+        let (mut state, mut frames) =
+            protocol_read_state_for_test(ManifestContributions::default(), broadcast::channel(8).0);
+        state.frame_limit = Arc::new(ProtocolFrameLimit::new(1025, true));
+        *write_std_lock(&state.protocol) = ExtensionNegotiatedProtocol {
+            version: EXTENSION_API_VERSION_0_3.to_owned(),
+            features: BTreeSet::new(),
+            max_concurrent_requests: 1,
+            lifecycle_events: BTreeSet::new(),
+        };
+
+        queue_writer_value(
+            &state.writer,
+            &state.frame_limit,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "child",
+                "error": {
+                    "code": -32601,
+                    "message": "unknown or unnegotiated method",
+                },
+            }),
+        )
+        .expect("canonical API 0.3 child response");
+        assert_eq!(
+            frames.try_recv().expect("queued response").line,
+            br#"{"error":{"code":-32601,"message":"unknown or unnegotiated method"},"id":"child","jsonrpc":"2.0"}
+"#
+        );
+        assert!(queue_writer_value(
+            &state.writer,
+            &state.frame_limit,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "child",
+                "error": {"code": -32601, "message": "method not found"},
+            }),
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn api_v03_message_limit_reserves_the_newline_delimiter() {
+        let temp = TempDir::new().expect("tempdir");
+        let manifest = ExtensionManifest::parse(
+            r#"name = "api-v03-small-frame"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "must-not-spawn"
+"#,
+        )
+        .expect("API 0.3 manifest");
+        let mut config = ExtensionRuntimeConfig::new(temp.path());
+        config.max_message_bytes = 1;
+        match ExtensionProcess::start(trusted_descriptor(temp.path(), manifest), config).await {
+            Err(ExtensionRuntimeError::Protocol(message)) => assert_eq!(
+                message,
+                "API 0.3 message limit must leave room for a non-empty frame and newline"
+            ),
+            Err(error) => panic!("expected API 0.3 frame-limit rejection, got {error}"),
+            Ok(_) => panic!("API 0.3 process initialized without a frame payload limit"),
+        }
     }
 
     #[test]

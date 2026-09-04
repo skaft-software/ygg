@@ -1,8 +1,9 @@
 # Executable extensions
 
 > **Protocol reference:** [`docs/extensions/PROTOCOL-REFERENCE.md`](extensions/PROTOCOL-REFERENCE.md)
-> contains the complete specification of every JSON-RPC method, request/response
-> shape, type reference, and lifecycle timing.
+> contains the complete API `0.1`/`0.2` JSON-RPC method, request/response,
+> type, and lifecycle reference. API `0.3` is separately generated from its
+> schema at [`docs/extensions/API-0.3-REFERENCE.md`](extensions/API-0.3-REFERENCE.md).
 
 Ygg supports trusted local extension processes alongside native Rust
 `Extension` implementations. Process extensions use JSON-RPC 2.0 messages,
@@ -49,23 +50,28 @@ The extra local hop is intentional. It preserves language neutrality,
 replaceability, failure isolation, and a kernel that does not grow a special
 manager for every external protocol.
 
-Two exact manifest-selected protocol versions are implemented:
+Three exact manifest-selected protocol versions are implemented:
 
 - API `0.1` is frozen for existing trusted, bounded, text-oriented
   extensions. Its initialization wire remains unchanged. It does not inherit
   API `0.2` cancellation, progress, structured/media retention, correlation,
   or terminal lifecycle guarantees; optional `metadata` is accepted but
   discarded by the native subprocess adapter.
-- API `0.2` is the current stateful foundation. It negotiates cooperative
-  cancellation and typed content as required features, plus scoped progress,
-  artifacts, lifecycle observations, policy intents, and live tool catalogs as
-  optional features. Bounded child model sessions, single-use approval
-  capabilities, and owner-scoped secret lookup are offered conditionally;
-  parent-correlated ephemeral input is part of the base `0.2` contract.
+- API `0.2` remains the supported stateful legacy foundation. It negotiates
+  cooperative cancellation and typed content as required features, plus scoped
+  progress, artifacts, lifecycle observations, policy intents, and live tool
+  catalogs as optional features. Bounded child model sessions, single-use
+  approval capabilities, and owner-scoped secret lookup are offered
+  conditionally; parent-correlated ephemeral input is part of the base `0.2`
+  contract.
+- API `0.3` is the current schema-generated canonical foundation. Its exact
+  capabilities, methods, bounds, errors, and availability are defined only by
+  the generated [API `0.3` reference](extensions/API-0.3-REFERENCE.md); it is
+  not an implicit upgrade of either legacy wire.
 
-API `0.2` supplies the stateful transport foundation for trusted daily use
-within those boundaries. It does not add an operating-system sandbox or move a
-domain capability into the host.
+API `0.2` remains the stateful transport foundation for existing trusted daily
+use within those boundaries. API `0.3` adds no operating-system sandbox or
+moves a domain capability into the host.
 
 Pi migration is capability-oriented rather than a promise to reproduce Pi's
 in-process ABI. `ygg migrate pi --dry-run` inventories package resources and
@@ -875,8 +881,12 @@ ygg-web-search/
         └── SKILL.md
 ```
 
-A packaged manifest must select current API `0.2` and add exact Ygg
-compatibility alongside its independent extension version:
+A packaged manifest must select a bundle-supported API version and add exact
+Ygg compatibility alongside its independent extension version. New API `0.3`
+packages must follow the generated
+[API `0.3` reference](extensions/API-0.3-REFERENCE.md); existing API `0.2`
+packages remain installable. API `0.1` remains supported only for unpackaged
+legacy runtime compatibility and cannot be installed as a bundle:
 
 ```toml
 name = "ygg-web-search"

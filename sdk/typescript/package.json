@@ -1,0 +1,27 @@
+{
+  "name": "@ygg/extension-api-v03",
+  "version": "0.3.0",
+  "description": "Schema-generated canonical wire contract for Ygg extension API 0.3",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/api_v03.d.ts",
+      "import": "./src/api_v03.mjs",
+      "default": "./src/api_v03.mjs"
+    }
+  },
+  "types": "./src/api_v03.d.ts",
+  "files": [
+    "src/api_v03.mjs",
+    "src/api_v03.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node tests/api_v03_conformance.mjs",
+    "test:package": "node tests/package_conformance.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

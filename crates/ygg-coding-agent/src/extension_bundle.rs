@@ -254,10 +254,9 @@ fn validate_bundle_manifest(
             archive_root
         );
     }
-    if manifest.api_version != ygg_agent::EXTENSION_API_VERSION {
+    if !ygg_agent::extension_api_v03::bundle_supports_api_version(&manifest.api_version) {
         anyhow::bail!(
-            "installable extension bundles require API {:?}; manifest declares {:?}",
-            ygg_agent::EXTENSION_API_VERSION,
+            "installable extension bundles require a bundle-supported API (0.2 or 0.3); manifest declares {:?}",
             manifest.api_version
         );
     }
@@ -639,9 +638,9 @@ fn validate_install_record(record: &InstallRecord, expected_id: &str) -> anyhow:
     }
     Version::parse(&record.version)
         .context("installed extension version is not semantic versioning")?;
-    if record.api_version != ygg_agent::EXTENSION_API_VERSION {
+    if !ygg_agent::extension_api_v03::bundle_supports_api_version(&record.api_version) {
         anyhow::bail!(
-            "installed extension has unsupported API {:?}",
+            "installed extension has unsupported bundle API {:?}",
             record.api_version
         );
     }
@@ -844,6 +843,15 @@ mod tests {
     }
 
     fn create_bundle(directory: &Path, id: &str, body: &[u8]) -> PathBuf {
+        create_bundle_with_api_version(directory, id, body, ygg_agent::EXTENSION_API_VERSION)
+    }
+
+    fn create_bundle_with_api_version(
+        directory: &Path,
+        id: &str,
+        body: &[u8],
+        api_version: &str,
+    ) -> PathBuf {
         let path = directory.join(format!("{id}.tar.gz"));
         let encoder = GzEncoder::new(File::create(&path).unwrap(), Compression::default());
         let mut archive = tar::Builder::new(encoder);
@@ -851,7 +859,12 @@ mod tests {
         append_file(
             &mut archive,
             &format!("{id}/{BUNDLE_MANIFEST}"),
-            manifest(id).as_bytes(),
+            manifest(id)
+                .replace(
+                    &format!("api_version = \"{}\"", ygg_agent::EXTENSION_API_VERSION),
+                    &format!("api_version = \"{api_version}\""),
+                )
+                .as_bytes(),
             0o644,
         );
         append_file(&mut archive, &format!("{id}/{id}"), body, 0o755);
@@ -1038,6 +1051,53 @@ mod tests {
         let encoder = archive.into_inner().unwrap();
         encoder.finish().unwrap();
         assert!(install_local(&directory.path().join("legacy-root"), &legacy, false).is_err());
+    }
+
+    #[test]
+    fn bundle_version_policy_keeps_api_v02_installable() {
+        let source = manifest("test-extension");
+        for version in ["0.2", "0.3"] {
+            let manifest = source.replace(
+                &format!("api_version = \"{}\"", ygg_agent::EXTENSION_API_VERSION),
+                &format!("api_version = \"{version}\""),
+            );
+            let parsed = ygg_agent::ExtensionManifest::parse(&manifest).unwrap();
+            assert_eq!(
+                validate_bundle_manifest(&parsed, "test-extension")
+                    .unwrap()
+                    .api_version,
+                version
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("extensions");
+        let archive = create_bundle_with_api_version(
+            directory.path(),
+            "api-v02-extension",
+            b"runtime",
+            "0.2",
+        );
+        let installed = install_local(&root, &archive, false).unwrap();
+        assert_eq!(installed.api_version, "0.2");
+        assert_eq!(
+            load_install_record(&root.join("api-v02-extension"), "api-v02-extension")
+                .unwrap()
+                .api_version,
+            "0.2"
+        );
+        assert_eq!(
+            list_installed(&root).unwrap()[0].api_version,
+            "0.2",
+            "API 0.2 records remain listable after installation"
+        );
+
+        let legacy = source.replace(
+            &format!("api_version = \"{}\"", ygg_agent::EXTENSION_API_VERSION),
+            "api_version = \"0.1\"",
+        );
+        let parsed = ygg_agent::ExtensionManifest::parse(&legacy).unwrap();
+        assert!(validate_bundle_manifest(&parsed, "test-extension").is_err());
     }
 
     #[test]
