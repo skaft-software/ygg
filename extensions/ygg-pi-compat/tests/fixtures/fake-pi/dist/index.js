@@ -7,6 +7,11 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+function fixtureDelay(name) {
+  const value = Number.parseInt(process.env[name] ?? "0", 10);
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
 const fixtureMode = process.env.YGG_PI_FIXTURE_MODE ?? "";
 const fixtureApiVersion = process.env.YGG_PI_FIXTURE_API_VERSION ?? "0.2";
 const fixtureEvents = (process.env.YGG_PI_FIXTURE_EVENTS ?? "")
@@ -21,6 +26,10 @@ const providerRegistrationDelay = Number.isSafeInteger(fixtureProviderRegistrati
   && fixtureProviderRegistrationDelay >= 0
   ? fixtureProviderRegistrationDelay
   : 0;
+const providerBeforeRequestDelay = fixtureDelay("YGG_PI_FIXTURE_PROVIDER_BEFORE_REQUEST_DELAY_MS");
+const providerAdapterDelay = fixtureDelay("YGG_PI_FIXTURE_PROVIDER_ADAPTER_DELAY_MS");
+const providerSetupMutation = process.env.YGG_PI_FIXTURE_PROVIDER_SETUP_MUTATION ?? "";
+const providerSetupMutationStage = process.env.YGG_PI_FIXTURE_PROVIDER_SETUP_MUTATION_STAGE ?? "";
 const fixtureProviderAuth = process.env.YGG_PI_FIXTURE_PROVIDER_AUTH ?? "host_credential";
 const fixtureInitialProviderCount = Number.parseInt(
   process.env.YGG_PI_FIXTURE_INITIAL_PROVIDER_COUNT ?? "1",
@@ -30,6 +39,11 @@ const initialProviderCount = Number.isSafeInteger(fixtureInitialProviderCount)
   ? Math.max(1, Math.min(fixtureInitialProviderCount, 2))
   : 1;
 let fixtureCancellationObserved = false;
+let fixtureProviderSetupStage = "idle";
+let fixtureProviderSetupAbortObserved = false;
+let fixtureProviderLateIteratorClosed = false;
+let fixtureProviderActions = null;
+let fixtureProviderSetupMutationTriggered = false;
 
 function fixtureModeForPath(path) {
   const value = String(path ?? "");
@@ -37,6 +51,20 @@ function fixtureModeForPath(path) {
   if (value.endsWith("provider-headers-hook-extension.mjs")) return "provider-headers-hook";
   if (value.endsWith("provider-extension.mjs")) return "provider";
   return fixtureMode || "default";
+}
+
+function mutateProviderDuringSetup(stage) {
+  if (
+    !fixtureProviderActions
+    || fixtureProviderSetupMutationTriggered
+    || providerSetupMutationStage !== stage
+  ) return;
+  fixtureProviderSetupMutationTriggered = true;
+  if (providerSetupMutation === "update") {
+    fixtureProviderActions.registerProvider("fixture-provider", fixtureProviderConfig(2));
+  } else if (providerSetupMutation === "unregister") {
+    fixtureProviderActions.unregisterProvider("fixture-provider");
+  }
 }
 
 async function* fixtureProviderStream({ request, signal }) {
@@ -83,6 +111,30 @@ async function* fixtureProviderStream({ request, signal }) {
   };
 }
 
+async function fixtureProviderAdapter(input) {
+  fixtureProviderSetupStage = "adapter";
+  console.error("fixture provider setup adapter");
+  mutateProviderDuringSetup("adapter");
+  if (input.signal) {
+    if (input.signal.aborted) fixtureProviderSetupAbortObserved = true;
+    else input.signal.addEventListener("abort", () => {
+      fixtureProviderSetupAbortObserved = true;
+    }, { once: true });
+  }
+  // Deliberately do not cooperate with the AbortSignal while acquiring. This
+  // fixture verifies that the bridge closes an adapter resource which appears
+  // after a provider mutation has already fenced setup.
+  if (providerAdapterDelay > 0) await sleep(providerAdapterDelay);
+  const iterator = fixtureProviderStream(input);
+  const close = iterator.return?.bind(iterator);
+  iterator.return = async (...args) => {
+    fixtureProviderLateIteratorClosed = true;
+    fixtureProviderSetupStage = "adapter_iterator_closed";
+    return close ? close(...args) : { done: true, value: undefined };
+  };
+  return iterator;
+}
+
 function fixtureProviderConfig(revision = 1, secondary = false) {
   const providerLabel = secondary ? "Fixture second provider" : "Fixture provider";
   const modelLabel = secondary ? "Fixture second model" : "Fixture model";
@@ -101,7 +153,7 @@ function fixtureProviderConfig(revision = 1, secondary = false) {
         reasoning: false,
       },
     ],
-    yggStream: fixtureProviderStream,
+    yggStream: fixtureProviderAdapter,
   };
 }
 
@@ -262,6 +314,16 @@ export class ExtensionRunner {
         makeTool("fixture_provider_cancel_status", async () => ({
           content: [{ type: "text", text: String(fixtureCancellationObserved) }],
         })),
+        makeTool("fixture_provider_setup_status", async () => ({
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              stage: fixtureProviderSetupStage,
+              abort_observed: fixtureProviderSetupAbortObserved,
+              late_iterator_closed: fixtureProviderLateIteratorClosed,
+            }),
+          }],
+        })),
         makeTool("fixture_provider_many_parts", async () => ({
           content: Array.from({ length: 257 }, (_unused, index) => ({
             type: "text",
@@ -278,6 +340,7 @@ export class ExtensionRunner {
     // Retain the historical name for API 0.2 public-surface probes.
     this.providerBindings = providerActions;
     this.providerActions = providerActions;
+    if (this.fixtureMode === "provider") fixtureProviderActions = providerActions;
     const registerInitialProvider = () => {
       if (this.fixtureMode === "provider") {
         providerActions.registerProvider("fixture-provider", fixtureProviderConfig(1));
@@ -312,6 +375,13 @@ export class ExtensionRunner {
 
   async emitBeforeProviderRequest(request) {
     if (this.fixtureMode !== "provider") return request;
+    fixtureProviderSetupStage = "before_request";
+    fixtureProviderSetupAbortObserved = false;
+    fixtureProviderLateIteratorClosed = false;
+    console.error("fixture provider setup before_request");
+    mutateProviderDuringSetup("before_request");
+    if (providerBeforeRequestDelay > 0) await sleep(providerBeforeRequestDelay);
+    fixtureProviderSetupStage = "before_request_complete";
     if (request.fixture_unsafe_mutation === true) {
       request.authorizationHeader = "must-not-reach-pi-adapter";
       return undefined;

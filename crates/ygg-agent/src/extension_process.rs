@@ -9511,6 +9511,15 @@ impl HostStreamTransport for ExtensionProviderStreamTransport {
             connection.settle_provider_stream(&stream_id);
             return Err(provider_unavailable_error());
         }
+        // The extension may have spent arbitrary time in setup before it
+        // accepted. Do not turn that stale acceptance into a response stream if
+        // its declaration, owner generation, authorization, or connection was
+        // replaced while the request was in flight.
+        if !connection_is_usable(&connection) || !registry.route_is_active(&route) {
+            connection
+                .cancel_provider_stream(&stream_id, "provider route changed before admission");
+            return Err(provider_unavailable_error());
+        }
 
         Ok(extension_provider_response_stream(
             connection,
@@ -16484,6 +16493,199 @@ flags = [
             );
         }
         assert_eq!(output.expect("checked above").content, "canonical API 0.3");
+        assert!(process.shutdown().await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn extension_provider_stream_revalidates_a_route_changed_during_acceptance() {
+        let temp = TempDir::new().expect("tempdir");
+        let script_path = temp.path().join("provider-route-race.py");
+        write_executable_script(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def receive():
+    line = sys.stdin.readline()
+    assert line, "host closed stdin"
+    value = json.loads(line)
+    assert line.rstrip("\n") == canonical(value), line
+    return value
+
+
+def send(value):
+    sys.stdout.write(canonical(value) + "\n")
+    sys.stdout.flush()
+
+
+def provider(max_output_tokens):
+    return {
+        "provider": {
+            "id": "fixture-provider",
+            "label": "Fixture provider",
+            "auth": {"kind": "none"},
+        },
+        "models": [{
+            "id": "fixture-model",
+            "api_name": "fixture-model",
+            "protocol": "openai_chat",
+            "context_window": 8192,
+            "max_output_tokens": max_output_tokens,
+            "capabilities": {
+                "tools": False,
+                "parallel_tool_calls": False,
+                "structured_output": False,
+                "reasoning": False,
+            },
+        }],
+    }
+
+
+def request(identifier, method, params):
+    send({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params})
+    response = receive()
+    assert response.get("id") == identifier and "result" in response, response
+    return response["result"]
+
+
+initialize = receive()
+assert initialize["method"] == "initialize", initialize
+contract = initialize["params"]["contract"]
+provider_capabilities = {"provider_catalog", "provider_stream", "provider_auth"}
+provider_methods = {
+    "providers/complete",
+    "providers/register",
+    "providers/update",
+    "providers/unregister",
+    "provider/stream",
+    "provider/event",
+    "provider/cancel",
+    "provider/auth/request",
+    "provider/auth/revoke",
+}
+selection = {
+    "schema": contract["schema"],
+    "encoding": contract["encoding"],
+    "capabilities": [
+        capability
+        for capability in contract["required_capabilities"] + contract["optional_capabilities"]
+        if capability in contract["required_capabilities"] or capability in provider_capabilities
+    ],
+    "methods": [
+        method
+        for method in contract["required_methods"] + contract["optional_methods"]
+        if method in contract["required_methods"] or method in provider_methods
+    ],
+    "limits": contract["limits"],
+}
+assert provider_capabilities.issubset(selection["capabilities"]), selection
+assert provider_methods.issubset(selection["methods"]), selection
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {"api_version": "0.3", "tools": [], "contract": selection},
+})
+request("register", "providers/register", provider(1024))
+send({"jsonrpc": "2.0", "method": "providers/complete", "params": {}})
+
+while True:
+    message = receive()
+    if message["method"] == "provider/stream":
+        params = message["params"]
+        # The update is accepted before this request's stale acceptance. This
+        # is the exact post-acceptance race the transport must fence.
+        request("replace-route", "providers/update", provider(2048))
+        send({
+            "jsonrpc": "2.0",
+            "id": message["id"],
+            "result": {"stream_id": params["stream_id"], "accepted": True},
+        })
+    elif message["method"] == "provider/cancel":
+        assert message["params"]["reason"] == "provider route changed before admission", message
+    elif message["method"] == "shutdown":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"terminal": "shutdown"}})
+        break
+    else:
+        raise AssertionError(message)
+"#,
+        );
+        let manifest = ExtensionManifest::parse(
+            r#"name = "provider-route-race"
+version = "0.3.0"
+api_version = "0.3"
+[entrypoint]
+command = "provider-route-race.py"
+[contributes]
+providers = true
+"#,
+        )
+        .expect("API 0.3 provider manifest");
+        let registry = Arc::new(ExtensionProviderRegistry::new());
+        let mut runtime = ExtensionRuntimeConfig::new(temp.path());
+        runtime.provider_registry = Some(Arc::clone(&registry));
+        let process = ExtensionProcess::start(trusted_descriptor(temp.path(), manifest), runtime)
+            .await
+            .expect("start API 0.3 provider process");
+        let route = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(route) = registry.resolve("fixture-provider", "fixture-model") {
+                    break route;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial provider route");
+        let transport = process.provider_stream_transport("fixture-provider", "fixture-model");
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            transport.stream(
+                HostStreamModel {
+                    id: ygg_ai::ModelId("fixture-provider/fixture-model".into()),
+                    protocol: Protocol::OpenAiChat,
+                    pricing: None,
+                },
+                ygg_ai::Request {
+                    system: None,
+                    messages: Vec::new(),
+                    tools: Vec::new(),
+                    tool_choice: Default::default(),
+                    max_output_tokens: None,
+                    temperature: None,
+                    stop: Vec::new(),
+                    reasoning: Default::default(),
+                    reasoning_mode: Default::default(),
+                    responses: None,
+                    output_format: Default::default(),
+                    output_modalities: Default::default(),
+                    compatibility: Default::default(),
+                    cache_retention: Default::default(),
+                    session_id: None,
+                },
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("provider acceptance response");
+        assert!(matches!(
+            result,
+            Err(AiError::Provider(ProviderError {
+                kind: Some(kind),
+                message,
+                ..
+            })) if kind == "extension_provider" && message == "extension provider is unavailable"
+        ));
+        assert!(
+            !registry.route_is_active(&route),
+            "the original route must be stale after the extension update"
+        );
         assert!(process.shutdown().await);
     }
 

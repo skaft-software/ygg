@@ -740,8 +740,14 @@ class BridgeProtocolTests(unittest.TestCase):
 
 @unittest.skipUnless(NODE, "node is required for the API 0.3 bridge subprocess tests")
 class Api03ProviderBridgeTests(unittest.TestCase):
-    def provider_bridge(self) -> tuple[BridgeProcess, list[dict], list[dict]]:
-        bridge = BridgeProcess(extension=PROVIDER_EXTENSION, api_version="0.3")
+    def provider_bridge(
+        self, *, fixture_environment: dict[str, str] | None = None
+    ) -> tuple[BridgeProcess, list[dict], list[dict]]:
+        bridge = BridgeProcess(
+            extension=PROVIDER_EXTENSION,
+            api_version="0.3",
+            fixture_environment=fixture_environment,
+        )
         catalog_requests: list[dict] = []
         auth_requests: list[dict] = []
 
@@ -795,6 +801,10 @@ class Api03ProviderBridgeTests(unittest.TestCase):
             lambda _messages: auth_requests[0] if auth_requests else None,
             description="initial provider authorization",
         )
+
+    def provider_setup_status(self, bridge: BridgeProcess) -> dict:
+        response = self.v03_tool(bridge, "fixture_provider_setup_status")
+        return json.loads(response["result"]["content"][0]["text"])
 
     def test_api_03_selects_host_owned_provider_catalog_and_auth(self) -> None:
         bridge, catalog_requests, auth_requests = self.provider_bridge()
@@ -1338,6 +1348,86 @@ class Api03ProviderBridgeTests(unittest.TestCase):
                         and message["params"]["kind"] in {"finished", "error"}
                     ]
                     self.assertEqual([terminals[0]], final_terminals)
+
+    def test_provider_mutation_fences_streams_still_in_async_setup(self) -> None:
+        # Exercise both asynchronous setup boundaries and both declaration
+        # mutations. The adapter deliberately ignores abort while acquiring so
+        # the mutation cannot publish until its late iterator has been closed.
+        setups = (
+            (
+                "before_request",
+                {"YGG_PI_FIXTURE_PROVIDER_BEFORE_REQUEST_DELAY_MS": "250"},
+                False,
+            ),
+            (
+                "adapter",
+                {"YGG_PI_FIXTURE_PROVIDER_ADAPTER_DELAY_MS": "250"},
+                True,
+            ),
+        )
+        for mutation in ("update", "unregister"):
+            for stage, delays, expects_late_cleanup in setups:
+                with self.subTest(mutation=mutation, stage=stage):
+                    fixture_environment = {
+                        **delays,
+                        "YGG_PI_FIXTURE_PROVIDER_SETUP_MUTATION": mutation,
+                        "YGG_PI_FIXTURE_PROVIDER_SETUP_MUTATION_STAGE": stage,
+                    }
+                    bridge, catalog_requests, auth_requests = self.provider_bridge(
+                        fixture_environment=fixture_environment
+                    )
+                    with bridge:
+                        bridge.initialize()
+                        self.wait_for_provider_ready(bridge, catalog_requests, auth_requests)
+                        stream_id = f"{mutation}-{stage}-setup"
+                        stream_request_id = bridge.send_request(
+                            "provider/stream",
+                            {
+                                "stream_id": stream_id,
+                                "provider_id": "fixture-provider",
+                                "model_id": "fixture-model",
+                                "request": {"prompt": "fence setup"},
+                            },
+                        )
+                        bridge.wait_for(
+                            lambda _messages: any(
+                                f"fixture provider setup {stage}" in line for line in bridge.stderr
+                            ),
+                            description=f"fixture {stage} setup boundary",
+                        )
+                        stream_response = bridge.wait_response(stream_request_id, timeout=1.0)
+                        self.assertEqual(
+                            {
+                                "stream_id": stream_id,
+                                "accepted": False,
+                                "reason": "provider or model is unavailable",
+                            },
+                            stream_response["result"],
+                        )
+                        mutation_method = "providers/update" if mutation == "update" else "providers/unregister"
+                        bridge.wait_for(
+                            lambda messages: next(
+                                (
+                                    message
+                                    for message in messages
+                                    if message.get("method") == mutation_method
+                                ),
+                                None,
+                            ),
+                            description=f"{mutation_method} after fenced {stage} setup",
+                        )
+                        self.assertFalse(
+                            any(
+                                message.get("method") == "provider/event"
+                                and message.get("params", {}).get("stream_id") == stream_id
+                                for message in bridge.messages
+                            )
+                        )
+                        final_status = self.provider_setup_status(bridge)
+                        if expects_late_cleanup:
+                            self.assertTrue(final_status["abort_observed"])
+                            self.assertTrue(final_status["late_iterator_closed"])
+                            self.assertEqual("adapter_iterator_closed", final_status["stage"])
 
     def test_api_03_admission_limit_rejects_excess_and_cancels_queued_tools(self) -> None:
         with BridgeProcess(api_version="0.3") as bridge:

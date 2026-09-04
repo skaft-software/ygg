@@ -1189,7 +1189,7 @@ function registerPiProvider(name, config) {
     // A declaration mutation must first fence every active stream using the
     // old adapter. Marking them synchronously prevents the pump from queuing
     // another nonterminal event while this callback returns to Pi.
-    const retiringStreams = existing ? markProviderStreamsForMutation(providerId) : [];
+    const retiringStreams = existing ? markProviderStreamsForMutation(providerId) : undefined;
     const entry = {
       provider: normalized.provider,
       models: normalized.models,
@@ -1321,7 +1321,7 @@ async function publishProviderMutation(method, entry) {
   bridge.providerSyncError = null;
 }
 
-function queueProviderMutation(method, entry, retiringStreams = [], { initial = false } = {}) {
+function queueProviderMutation(method, entry, retiringStreams, { initial = false } = {}) {
   bridge.providerSyncChain = bridge.providerSyncChain
     .then(async () => {
       await terminateProviderStreamsForMutation(retiringStreams);
@@ -1342,7 +1342,7 @@ function publishInitialProviderCatalog(includeCompletion) {
   if (bridge.initialProviderCatalogQueued) return;
   bridge.initialProviderCatalogQueued = true;
   for (const entry of bridge.providers.values()) {
-    if (!entry.published) queueProviderMutation("providers/register", entry, [], { initial: true });
+    if (!entry.published) queueProviderMutation("providers/register", entry, undefined, { initial: true });
   }
   if (!includeCompletion) return;
   // The bridge serializes reverse registrations. Queue completion behind every
@@ -1398,7 +1398,7 @@ async function publishProviderUnregister(providerId, entry) {
   entry.authorization_status = "revoked";
 }
 
-function queueProviderUnregister(providerId, entry, retiringStreams = []) {
+function queueProviderUnregister(providerId, entry, retiringStreams) {
   bridge.providerSyncChain = bridge.providerSyncChain
     .then(async () => {
       await terminateProviderStreamsForMutation(retiringStreams);
@@ -1841,12 +1841,89 @@ async function cancelProviderStream(stream) {
   }
 }
 
+function createProviderStreamSetup(request, entry, controller) {
+  let resolveSettled;
+  const setup = {
+    id: request.streamId,
+    providerId: request.providerId,
+    modelId: request.modelId,
+    entry,
+    controller,
+    iterator: null,
+    iteratorCleanup: null,
+    lateAdapterCleanup: null,
+    closing: false,
+    cancelled: false,
+    admitted: false,
+    settled: new Promise((resolve) => {
+      resolveSettled = resolve;
+    }),
+    resolveSettled,
+  };
+  return setup;
+}
+
+function providerStreamSetupIsCurrent(setup) {
+  const entry = bridge.providers.get(setup.providerId);
+  return !setup.closing
+    && !setup.cancelled
+    && entry === setup.entry
+    && entry.published
+    && entry.authorization_status === "ready"
+    && entry.models.some((model) => model.id === setup.modelId);
+}
+
+async function closeProviderStreamSetupIterator(setup) {
+  if (!setup.iterator || setup.iteratorCleanup) return setup.iteratorCleanup;
+  setup.iteratorCleanup = Promise.resolve()
+    .then(() => setup.iterator.return?.())
+    .catch((error) => {
+      diagnostic(`Pi provider stream setup cleanup failed: ${providerReason(error)}`);
+    });
+  await setup.iteratorCleanup;
+}
+
+async function closeProviderStreamSetup(setup, reason) {
+  setup.controller.abort(reason);
+  await closeProviderStreamSetupIterator(setup);
+}
+
+function settleProviderStreamSetup(setup) {
+  if (bridge.providerStreamSetups.get(setup.id) === setup) {
+    bridge.providerStreamSetups.delete(setup.id);
+  }
+  if (setup.resolveSettled) {
+    setup.resolveSettled();
+    setup.resolveSettled = null;
+  }
+}
+
+async function cancelProviderStreamSetup(setup) {
+  if (!setup || setup.cancelled) return;
+  setup.cancelled = true;
+  setup.closing = true;
+  await closeProviderStreamSetup(setup, "provider stream cancelled");
+}
+
+async function waitForProviderStreamSetup(setup) {
+  if (!setup) return;
+  await setup.settled;
+  await setup.lateAdapterCleanup;
+}
+
 function markProviderStreamsForMutation(providerId) {
-  const active = [...bridge.providerStreams.values()].filter(
+  const streams = [...bridge.providerStreams.values()].filter(
     (stream) => stream.providerId === providerId && !stream.cancelled && !stream.terminal,
   );
-  for (const stream of active) stream.closing = true;
-  return active;
+  const setups = [...bridge.providerStreamSetups.values()].filter(
+    (setup) => setup.providerId === providerId,
+  );
+  for (const stream of streams) stream.closing = true;
+  for (const setup of setups) {
+    setup.closing = true;
+    setup.controller.abort("provider declaration changed");
+  }
+  return { streams, setups };
 }
 
 async function terminateProviderStreamForMutation(stream) {
@@ -1865,12 +1942,60 @@ async function terminateProviderStreamForMutation(stream) {
   await cancelProviderStream(stream);
 }
 
-async function terminateProviderStreamsForMutation(streams) {
-  await Promise.all(streams.map((stream) => terminateProviderStreamForMutation(stream)));
+async function terminateProviderStreamSetupForMutation(setup) {
+  if (!setup) return;
+  setup.closing = true;
+  await closeProviderStreamSetup(setup, "provider declaration changed");
+  await setup.settled;
+  await setup.lateAdapterCleanup;
+}
+
+async function terminateProviderStreamsForMutation(retiring) {
+  if (!retiring) return;
+  await Promise.all([
+    ...retiring.streams.map((stream) => terminateProviderStreamForMutation(stream)),
+    ...retiring.setups.map((setup) => terminateProviderStreamSetupForMutation(setup)),
+  ]);
 }
 
 async function cancelAllProviderStreams() {
-  await Promise.all([...bridge.providerStreams.values()].map((stream) => cancelProviderStream(stream)));
+  const setups = [...bridge.providerStreamSetups.values()];
+  await Promise.all([
+    ...[...bridge.providerStreams.values()].map((stream) => cancelProviderStream(stream)),
+    ...setups.map((setup) => cancelProviderStreamSetup(setup)),
+  ]);
+  await Promise.all(setups.map((setup) => waitForProviderStreamSetup(setup)));
+}
+
+async function acquireProviderStreamIterator(setup, adapterInput) {
+  const pending = Promise.resolve().then(() => setup.entry.adapter({
+    ...adapterInput,
+    signal: setup.controller.signal,
+  }));
+  try {
+    const source = await awaitWithCancellation(pending, setup.controller.signal);
+    const iterator = asyncIteratorForProvider(source);
+    setup.iterator = iterator;
+    return iterator;
+  } catch (error) {
+    // A mutation/cancellation can win the race while a non-cooperative adapter
+    // is still acquiring its iterator. Consume and close that late resource
+    // before a fenced catalog mutation is allowed to publish.
+    if (setup.controller.signal.aborted) {
+      setup.lateAdapterCleanup = pending.then(
+        async (source) => {
+          try {
+            setup.iterator = asyncIteratorForProvider(source);
+            await closeProviderStreamSetupIterator(setup);
+          } catch (lateError) {
+            diagnostic(`Pi provider stream late setup cleanup failed: ${providerReason(lateError)}`);
+          }
+        },
+        () => {},
+      );
+    }
+    throw error;
+  }
 }
 
 async function handleProviderStream(message) {
@@ -1902,7 +2027,7 @@ async function handleProviderStream(message) {
       reason: "provider has no secret-free host stream adapter",
     };
   }
-  if (bridge.providerStreams.has(request.streamId)) {
+  if (bridge.providerStreams.has(request.streamId) || bridge.providerStreamSetups.has(request.streamId)) {
     return { stream_id: request.streamId, accepted: false, reason: "stream identifier is already active" };
   }
   const controller = new AbortController();
@@ -1910,57 +2035,77 @@ async function handleProviderStream(message) {
   const abortForParent = () => controller.abort("provider request cancelled");
   parentSignal.addEventListener("abort", abortForParent, { once: true });
   if (parentSignal.aborted) abortForParent();
-  let iterator;
+  const setup = createProviderStreamSetup(request, entry, controller);
+  bridge.providerStreamSetups.set(setup.id, setup);
   try {
-    if (parentSignal.aborted) throw new CancellationError();
     const transformedRequest = await awaitWithCancellation(
       emitBeforeProviderRequest(request.request),
-      parentSignal,
+      controller.signal,
     );
+    if (!providerStreamSetupIsCurrent(setup)) {
+      return { stream_id: request.streamId, accepted: false, reason: "provider or model is unavailable" };
+    }
     // The adapter receives only secret-free declarations and the canonical
     // request. Host leases, endpoints, headers, and credential material do not
     // cross this compatibility boundary.
     const adapterInput = canonicalClone({
-      provider: entry.provider,
-      model: entry.models.find((model) => model.id === request.modelId),
+      provider: setup.entry.provider,
+      model: setup.entry.models.find((model) => model.id === request.modelId),
       request: transformedRequest,
     });
-    const source = await awaitWithCancellation(
-      entry.adapter({
-        ...adapterInput,
-        signal: controller.signal,
-      }),
-      parentSignal,
-    );
-    iterator = asyncIteratorForProvider(source);
+    const iterator = await acquireProviderStreamIterator(setup, adapterInput);
+    if (!providerStreamSetupIsCurrent(setup)) {
+      return { stream_id: request.streamId, accepted: false, reason: "provider or model is unavailable" };
+    }
     // Pi defines this hook at response acquisition, before an assistant stream
     // is consumed. The host deliberately supplies no response headers.
-    await awaitWithCancellation(emitAfterProviderResponse(200), parentSignal);
-    if (parentSignal.aborted) throw new CancellationError();
+    await awaitWithCancellation(emitAfterProviderResponse(200), controller.signal);
+    // Revalidate after every asynchronous setup boundary and immediately before
+    // admission. A replacement/unregister may have fenced the captured adapter
+    // while a hook or acquisition promise was pending.
+    if (!providerStreamSetupIsCurrent(setup)) {
+      return { stream_id: request.streamId, accepted: false, reason: "provider or model is unavailable" };
+    }
+    if (bridge.providerStreams.has(request.streamId)) {
+      return { stream_id: request.streamId, accepted: false, reason: "stream identifier is already active" };
+    }
+    const stream = {
+      id: request.streamId,
+      providerId: request.providerId,
+      controller,
+      iterator,
+      sequence: 0,
+      terminal: false,
+      exhausted: false,
+      cancelled: false,
+      closing: false,
+      writeChain: Promise.resolve(),
+    };
+    bridge.providerStreams.set(stream.id, stream);
+    setup.admitted = true;
+    setImmediate(() => void pumpProviderStream(stream));
+    return { stream_id: request.streamId, accepted: true };
   } catch (error) {
-    parentSignal.removeEventListener("abort", abortForParent);
-    controller.abort();
-    if (error instanceof CancellationError || parentSignal.aborted) throw new CancellationError();
+    await closeProviderStreamSetup(setup, "provider stream setup stopped");
+    if (error instanceof CancellationError || parentSignal.aborted) {
+      if (!parentSignal.aborted && (setup.closing || setup.cancelled)) {
+        return { stream_id: request.streamId, accepted: false, reason: "provider or model is unavailable" };
+      }
+      throw new CancellationError();
+    }
+    if (setup.closing || setup.cancelled) {
+      return { stream_id: request.streamId, accepted: false, reason: "provider or model is unavailable" };
+    }
     if (error?.code === API_0_3_ERROR.invalid_params.code) throw error;
     diagnostic(`Pi provider stream setup failed: ${providerReason(error)}`);
     return { stream_id: request.streamId, accepted: false, reason: publicProviderReason() };
+  } finally {
+    parentSignal.removeEventListener("abort", abortForParent);
+    if (!setup.admitted) {
+      await closeProviderStreamSetup(setup, "provider stream setup closed");
+    }
+    settleProviderStreamSetup(setup);
   }
-  parentSignal.removeEventListener("abort", abortForParent);
-  const stream = {
-    id: request.streamId,
-    providerId: request.providerId,
-    controller,
-    iterator,
-    sequence: 0,
-    terminal: false,
-    exhausted: false,
-    cancelled: false,
-    closing: false,
-    writeChain: Promise.resolve(),
-  };
-  bridge.providerStreams.set(stream.id, stream);
-  setImmediate(() => void pumpProviderStream(stream));
-  return { stream_id: request.streamId, accepted: true };
 }
 
 async function handleProviderCancel(params) {
@@ -1978,7 +2123,10 @@ async function handleProviderCancel(params) {
   ) {
     throw providerError("provider stream cancellation.reason must be a bounded string");
   }
-  await cancelProviderStream(bridge.providerStreams.get(streamId));
+  await Promise.all([
+    cancelProviderStream(bridge.providerStreams.get(streamId)),
+    cancelProviderStreamSetup(bridge.providerStreamSetups.get(streamId)),
+  ]);
 }
 
 function assertV03ToolCallParams(params) {
@@ -2997,6 +3145,9 @@ async function loadBridge(params, v03Selection = undefined) {
     providers: new Map(),
     retiredProviders: new Set(),
     providerStreams: new Map(),
+    // Setup records fence an inbound stream before its asynchronous hooks and
+    // adapter acquisition have produced an admitted stream.
+    providerStreamSetups: new Map(),
     providerSyncChain: Promise.resolve(),
     providerSyncError: null,
     initialProviderCatalogCollecting: false,

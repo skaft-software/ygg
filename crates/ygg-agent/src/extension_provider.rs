@@ -859,6 +859,46 @@ mod tests {
     }
 
     #[test]
+    fn resolved_routes_are_inactive_after_their_declaration_changes() {
+        let registry = ExtensionProviderRegistry::new();
+        registry
+            .register(
+                owner(1),
+                api_v03::ProviderRegisterParams {
+                    provider: provider(),
+                    models: vec![model()],
+                },
+            )
+            .expect("registration");
+        registry.complete_initial_catalog(&owner(1));
+        let route = registry
+            .resolve("fixture", "model")
+            .expect("callable route");
+        assert!(registry.route_is_active(&route));
+
+        let mut replacement = model();
+        replacement.max_output_tokens = 2_048;
+        registry
+            .update(
+                owner(1),
+                api_v03::ProviderUpdateParams {
+                    provider: provider(),
+                    models: vec![replacement],
+                },
+            )
+            .expect("replacement");
+        assert!(!registry.route_is_active(&route));
+
+        let current = registry
+            .resolve("fixture", "model")
+            .expect("replacement route");
+        registry
+            .unregister(&owner(1), "fixture")
+            .expect("unregister");
+        assert!(!registry.route_is_active(&current));
+    }
+
+    #[test]
     fn startup_wait_requires_complete_initial_batch_and_hides_incomplete_owners() {
         let registry = Arc::new(ExtensionProviderRegistry::new());
         let delayed = Arc::clone(&registry);
