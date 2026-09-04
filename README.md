@@ -302,6 +302,14 @@ text/image input, a 1.05M-token context window, 128K output, and `low` through
 `max` reasoning effort. Inputs above 272K use its long-context price tier.
 Select it through the same generic path: `ygg --model gpt-6-astra`.
 
+This `0.7.0-dev` dogfood build provides baseline Astra model selection,
+text/image requests, reasoning, and ordinary/parallel tool calls. It does not
+yet implement native async tools (`async: true` with a pending-call lifecycle),
+steering an active Responses WebSocket response, or coding-loop reasoning
+changes through `configuration_update` with verified cache preservation.
+Input received during execution is queued for a later model-turn boundary;
+`parallel_tool_calls` does not imply native async tool support.
+
 ```sh
 export OPENROUTER_API_KEY='...'
 ygg --model openrouter/anthropic/claude-sonnet-4.6
@@ -412,6 +420,10 @@ is authoritative: if it omits Astra, Ygg does not inject a Codex Astra route.
 When it includes Astra, the subscription route is always selectable as
 `codex/gpt-6-astra`, independently of whether a direct OpenAI preset is
 configured.
+
+The baseline dogfood limits above also apply to Codex Astra. Public API support
+does not establish OAuth feature support: additional Codex capabilities require
+fresh, account-scoped live metadata or verified behavior of that endpoint.
 
 GitHub Copilot is intentionally **not** a `ygg --login` or configuration preset.
 An embedding Rust application can own GitHub device login, OAuth storage,
