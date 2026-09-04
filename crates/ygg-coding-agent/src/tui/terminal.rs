@@ -622,7 +622,13 @@ impl YggTerminal<Stdout> {
             out,
             event::EnableBracketedPaste,
             cursor::SetCursorStyle::SteadyBlock,
-            cursor::Hide
+            cursor::Hide,
+            // Pi's first primary-screen frame deliberately preserves saved
+            // lines and therefore does not erase physical rows left by the
+            // shell. Clear only the visible viewport before that frame; ED 3
+            // is intentionally omitted so ordinary terminal history survives.
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0),
         )?;
         if capture_mouse {
             execute!(out, event::EnableMouseCapture)?;

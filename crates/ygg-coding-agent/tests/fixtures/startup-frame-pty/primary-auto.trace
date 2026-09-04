@@ -1,0 +1,17 @@
+mode=auto
+startup.clear_screen=true
+startup.first_full_frame.synchronized=true
+startup.first_full_frame.stale_rows=false
+startup.ready_frame.stale_rows=false
+resize.redraw.synchronized=true
+resize.clear_screen=true
+resize.clear_saved_lines=true
+resize.stale_rows=false
+shutdown.cursor_visible=true
+shutdown.bracketed_paste_disabled=true
+shutdown.termios_restored=true
+shutdown.cursor_position_valid=true
+shutdown.mouse_restored=true
+alternate_screen.used=false
+frames.balanced=true
+mouse.capture=false
