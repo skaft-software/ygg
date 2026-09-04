@@ -9900,7 +9900,7 @@ async fn spawn_connection(
         serde_json::to_value(initialize)
             .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
     } else {
-        serde_json::to_value(InitializeRequest {
+        let mut initialize_value = serde_json::to_value(InitializeRequest {
             api_version: descriptor.manifest.api_version.clone(),
             ygg_version: env!("CARGO_PKG_VERSION").to_owned(),
             extension: extension_identity,
@@ -9919,7 +9919,17 @@ async fn spawn_connection(
                 }
             }),
         })
-        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?
+        .map_err(|error| ExtensionRuntimeError::Protocol(error.to_string()))?;
+        if descriptor.manifest.api_version == EXTENSION_API_VERSION_0_1 {
+            // API 0.1's frozen initialize payload predates shortcuts. Keep the
+            // absent field distinct from an API 0.2 empty shortcut catalog.
+            initialize_value
+                .get_mut("contributes")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("InitializeRequest contributions serialize as an object")
+                .remove("shortcuts");
+        }
+        initialize_value
     };
     let response = connection
         .request(
