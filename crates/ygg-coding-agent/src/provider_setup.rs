@@ -913,6 +913,9 @@ fn registry_for_prepared(
         api_key_env: None,
         cache: None,
         startup_timeout_secs: None,
+        // Lifecycle feedback remains an explicit endpoint opt-in; provider
+        // onboarding must not activate it merely by creating a registry entry.
+        lifecycle_feedback: false,
     };
     let mut registry = snapshot.registry().cloned().unwrap_or(CustomRegistry {
         version: 1,
@@ -1208,7 +1211,8 @@ mod tests {
         assert!(!preview.contains("secret-value"));
         let completed = service.commit_and_rebuild(prepared).unwrap();
         assert_eq!(completed.model.0, "custom/local/beta");
-        assert!(completed.catalog.resolve(&completed.model).is_ok());
+        let model = completed.catalog.resolve(&completed.model).unwrap();
+        assert!(!model.endpoint.runtime.lifecycle_feedback);
         assert!(completed.receipt.render(None).contains("Fixture Local"));
     }
 
@@ -1297,6 +1301,7 @@ mod tests {
                     api_key_env: None,
                     cache: None,
                     startup_timeout_secs: None,
+                    lifecycle_feedback: false,
                 },
             ))
             .unwrap();
