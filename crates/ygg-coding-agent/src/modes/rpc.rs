@@ -394,6 +394,7 @@ fn protocol_name(protocol: &Protocol) -> &'static str {
         Protocol::OpenAiChat => "openai-completions",
         Protocol::AnthropicMessages => "anthropic-messages",
         Protocol::BedrockConverse => "bedrock-converse",
+        Protocol::GoogleGenerativeAi => "google-generative-ai",
     }
 }
 
@@ -520,18 +521,21 @@ fn assistant_content(message: &AssistantMessage) -> Vec<Value> {
     message
         .content
         .iter()
-        .map(|part| match part {
-            AssistantPart::Text(text) => json!({"type": "text", "text": text}),
-            AssistantPart::Reasoning(reasoning) => {
-                json!({"type": "thinking", "thinking": reasoning.text.as_deref().unwrap_or_default()})
-            }
-            AssistantPart::ToolCall(call) => json!({
+        .filter_map(|part| match part {
+            AssistantPart::Text(text) => Some(json!({"type": "text", "text": text})),
+            AssistantPart::Reasoning(reasoning) => Some(
+                json!({"type": "thinking", "thinking": reasoning.text.as_deref().unwrap_or_default()}),
+            ),
+            AssistantPart::ToolCall(call) => Some(json!({
                 "type": "toolCall",
                 "id": call.id.0,
                 "name": call.name,
                 "arguments": serde_json::from_str::<Value>(&call.arguments_json).unwrap_or(Value::Null)
-            }),
-            AssistantPart::Media(media) => media_content(media),
+            })),
+            AssistantPart::Media(media) => Some(media_content(media)),
+            // Thought signatures are opaque continuation credentials. They stay
+            // in the persisted canonical message but never cross the RPC view.
+            AssistantPart::ProviderMetadata(_) => None,
         })
         .collect()
 }

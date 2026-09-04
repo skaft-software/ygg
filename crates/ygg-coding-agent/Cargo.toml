@@ -79,6 +79,7 @@ async-trait = "0.1"
 tempfile = "3"
 signal-hook = "0.3"
 sha2 = "0.10"
+ring = "0.17"
 libc = "0.2"
 getrandom = { version = "0.3", optional = true }
 globset = "0.4"

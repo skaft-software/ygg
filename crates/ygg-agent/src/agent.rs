@@ -1554,7 +1554,9 @@ fn message_visible_text(message: &Message) -> Option<String> {
                     .filter(|transcript| !transcript.trim().is_empty())
                     .or(Some("[generated audio]")),
                 AssistantPart::Media(Media::Image(_)) => Some("[generated image]"),
-                AssistantPart::Reasoning(_) | AssistantPart::ToolCall(_) => None,
+                AssistantPart::Reasoning(_)
+                | AssistantPart::ProviderMetadata(_)
+                | AssistantPart::ToolCall(_) => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -1865,7 +1867,7 @@ fn assistant_has_terminal_content(assistant: &AssistantMessage) -> bool {
     assistant.content.iter().any(|part| match part {
         AssistantPart::Text(text) => !text.trim().is_empty(),
         AssistantPart::ToolCall(_) | AssistantPart::Media(_) => true,
-        AssistantPart::Reasoning(_) => false,
+        AssistantPart::Reasoning(_) | AssistantPart::ProviderMetadata(_) => false,
     })
 }
 

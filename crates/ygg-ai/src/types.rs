@@ -111,6 +111,8 @@ pub enum Protocol {
     AnthropicMessages,
     /// Amazon Bedrock Converse/ConverseStream protocol.
     BedrockConverse,
+    /// Google Generative AI / Vertex `generateContent` protocol.
+    GoogleGenerativeAi,
 }
 
 /// Preferred transport for streaming provider responses.
@@ -766,10 +768,31 @@ pub enum AssistantPart {
     Text(String),
     /// Intermediate reasoning text and state.
     Reasoning(ReasoningPart),
+    /// Opaque metadata for the immediately following assistant part.
+    ///
+    /// This is retained only by a matching provider/model codec. It has no
+    /// visible content and must not be moved across assistant parts during
+    /// replay.
+    ProviderMetadata(ProviderPartMetadata),
     /// Request to execute a tool.
     ToolCall(ToolCall),
     /// Generated output media (e.g. spoken audio).
     Media(Media),
+}
+
+/// Opaque provider metadata associated with the next assistant part.
+///
+/// The metadata marker is intentionally a distinct canonical part rather than
+/// a property of text or tool calls: providers can attach continuation data to
+/// several unrelated wire part kinds, and preserving its position is required
+/// for replay.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ProviderPartMetadata {
+    /// Google Gemini/Vertex opaque thought signature for the following part.
+    GoogleThoughtSignature {
+        /// Base64-encoded provider continuation value.
+        signature: String,
+    },
 }
 
 /// Execution outcome of a tool call.

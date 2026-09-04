@@ -3,9 +3,9 @@
 use crate::error::{AiError, DecodeError, Diagnostic, StreamProtocolError};
 use crate::pricing::Pricing;
 use crate::types::{
-    AssistantMessage, AssistantPart, Media, ModelId, Protocol, ReasoningPart, ReasoningState,
-    Response, StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId,
-    ToolDef, Usage,
+    AssistantMessage, AssistantPart, Media, ModelId, Protocol, ProviderPartMetadata, ReasoningPart,
+    ReasoningState, Response, StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError,
+    ToolCallId, ToolDef, Usage,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -224,6 +224,8 @@ pub(crate) struct ResponseBuilder {
     pub(crate) text_buffers: HashMap<usize, String>,
     pub(crate) reasoning_text_buffers: HashMap<usize, String>,
     pub(crate) reasoning_states: HashMap<usize, ReasoningState>,
+    /// Opaque provider metadata retained immediately before its target part.
+    pub(crate) part_metadata: HashMap<usize, ProviderPartMetadata>,
     pub(crate) tool_call_builders: HashMap<usize, ToolCallBuilder>,
     pub(crate) media_parts: HashMap<usize, Media>,
     pub(crate) usage: Option<Usage>,
@@ -291,6 +293,7 @@ impl ResponseBuilder {
             text_buffers: HashMap::with_capacity(4),
             reasoning_text_buffers: HashMap::with_capacity(2),
             reasoning_states: HashMap::with_capacity(2),
+            part_metadata: HashMap::with_capacity(2),
             tool_call_builders: HashMap::with_capacity(4),
             media_parts: HashMap::with_capacity(2),
             usage: None,
@@ -641,6 +644,36 @@ impl ResponseBuilder {
             .and_then(|builder| builder.argument_error)
     }
 
+    /// Attaches opaque provider metadata to an already-started canonical part.
+    ///
+    /// The metadata is retained immediately before that part during assembly so
+    /// a later request can replay provider continuation context without
+    /// reclassifying the content as reasoning.
+    pub(crate) fn set_provider_metadata(
+        &mut self,
+        index: usize,
+        metadata: ProviderPartMetadata,
+    ) -> Result<(), AiError> {
+        if self.part_metadata.contains_key(&index) {
+            return Ok(());
+        }
+        if !self.observed_indices.contains(&index)
+            || self
+                .observed_indices
+                .len()
+                .checked_add(self.part_metadata.len())
+                .is_none_or(|parts| parts >= MAX_RESPONSE_PARTS)
+        {
+            return Err(AiError::Decode(DecodeError::TooManyResponseParts));
+        }
+        let bytes = match &metadata {
+            ProviderPartMetadata::GoogleThoughtSignature { signature } => signature.len(),
+        };
+        self.add_content_bytes(bytes)?;
+        self.part_metadata.insert(index, metadata);
+        Ok(())
+    }
+
     /// Normalizes unprocessed provider-generated tool arguments before consuming
     /// the builder.
     ///
@@ -710,6 +743,9 @@ impl ResponseBuilder {
         indices.sort_unstable();
 
         for index in indices {
+            if let Some(metadata) = self.part_metadata.remove(&index) {
+                content.push(AssistantPart::ProviderMetadata(metadata));
+            }
             if let Some(text) = self.text_buffers.remove(&index) {
                 content.push(AssistantPart::Text(text));
             } else if let Some(reasoning_text) = self.reasoning_text_buffers.remove(&index) {

@@ -100,6 +100,24 @@ fn opencode_openai_pricing(model_id: &str) -> Option<Pricing> {
     Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
 }
 
+fn google_pricing(model_id: &str) -> Option<Pricing> {
+    let rates = match model_id {
+        "gemini-2.5-flash" => (300_000, 2_500_000, 30_000, 0),
+        "gemini-2.5-flash-lite" => (100_000, 400_000, 10_000, 0),
+        "gemini-2.5-pro" => (1_250_000, 10_000_000, 125_000, 0),
+        "gemini-3-flash" | "gemini-3-flash-preview" => (500_000, 3_000_000, 50_000, 0),
+        "gemini-3.1-flash-lite" | "gemini-3.1-flash-lite-preview" | "gemini-flash-lite-latest" => {
+            (250_000, 1_500_000, 25_000, 0)
+        }
+        "gemini-3.1-pro-preview" | "gemini-3.1-pro-preview-customtools" | "gemini-3.1-pro" => {
+            (2_000_000, 12_000_000, 200_000, 0)
+        }
+        "gemini-3.5-flash" | "gemini-flash-latest" => (1_500_000, 9_000_000, 150_000, 0),
+        _ => return None,
+    };
+    Some(flat_pricing(rates.0, rates.1, rates.2, rates.3))
+}
+
 fn anthropic_pricing(model_id: &str) -> Option<Pricing> {
     let rates = if model_id.starts_with("claude-fable-5") {
         (10_000_000, 50_000_000, 1_000_000, 12_500_000)
@@ -179,6 +197,7 @@ fn legacy_model_pricing(profile: PricingProfile, model_id: &str) -> Option<Prici
     let rates = match profile {
         PricingProfile::OpenAi => return openai_pricing(model_id),
         PricingProfile::Anthropic => return anthropic_pricing(model_id),
+        PricingProfile::Google => return google_pricing(model_id),
         PricingProfile::DeepSeek => match model_id {
             "deepseek-v4-flash" => (140_000, 280_000, 2_800, 0),
             "deepseek-v4-pro" => (435_000, 870_000, 3_625, 0),
@@ -191,8 +210,9 @@ fn legacy_model_pricing(profile: PricingProfile, model_id: &str) -> Option<Prici
             _ => return None,
         },
         PricingProfile::OpenCode => {
-            if let Some(pricing) =
-                opencode_openai_pricing(model_id).or_else(|| anthropic_pricing(model_id))
+            if let Some(pricing) = opencode_openai_pricing(model_id)
+                .or_else(|| anthropic_pricing(model_id))
+                .or_else(|| google_pricing(model_id))
             {
                 return Some(pricing);
             }

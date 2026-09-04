@@ -29,6 +29,8 @@ pub enum ProviderAuthentication {
         /// The private resolver also supports profiles and task/instance metadata.
         variables: &'static [&'static str],
     },
+    /// Application Default Credentials resolved by the private auth lifecycle.
+    ApplicationDefaultCredentials,
     /// A product-owned subscription login supplies the dynamic credential.
     Subscription {
         /// Stable login selector shown in setup diagnostics.
@@ -40,7 +42,9 @@ impl ProviderAuthentication {
     pub(crate) fn environment_variables(self) -> Option<&'static [&'static str]> {
         match self {
             Self::Environment { variables } => Some(variables),
-            Self::Aws { .. } | Self::Subscription { .. } => None,
+            Self::Aws { .. } | Self::ApplicationDefaultCredentials | Self::Subscription { .. } => {
+                None
+            }
         }
     }
 }
@@ -124,6 +128,8 @@ pub enum StaticModelSet {
     CloudflareAiGateway,
     /// Amazon Bedrock Converse models with published conservative limits.
     Bedrock,
+    /// Google Gemini and Vertex models using the native generateContent API.
+    Google,
 }
 
 /// Whether a discovery cache is required before a provider can expose models or
@@ -151,6 +157,8 @@ pub enum CompatibilityProfile {
     Fireworks,
     /// OpenCode's route-specific cache compatibility behavior.
     OpenCode,
+    /// Google generateContent routes do not support Ygg cache-affinity headers.
+    Google,
     /// User-configured endpoint metadata.
     Custom,
     /// Codex subscription cache affinity.
@@ -180,6 +188,8 @@ pub enum PricingProfile {
     MiniMax,
     /// OpenCode rate overrides plus checked-in reference pricing.
     OpenCode,
+    /// Google model-rate overrides for Generative AI and Vertex routes.
+    Google,
     /// Discovery-provided OpenRouter pricing plus checked-in fallback pricing.
     OpenRouter,
     /// User-configured pricing, defaulting to zero for local/self-hosted routes.
@@ -208,6 +218,8 @@ pub enum EndpointAuthPresentation {
     Header(&'static str),
     /// Sign the exact request with a private AWS SigV4 credential chain.
     AwsSigV4,
+    /// Send the private environment credential in `x-goog-api-key`.
+    GoogleApiKeyHeader,
     /// Bind a private dynamic resolver owned by the authentication lifecycle.
     Dynamic,
 }
@@ -374,6 +386,9 @@ impl ProviderDeclaration {
                 | ProviderAuthentication::Aws { variables } => ProviderAccess::Environment {
                     variables: variables.iter().map(|value| (*value).to_owned()).collect(),
                 },
+                ProviderAuthentication::ApplicationDefaultCredentials => {
+                    ProviderAccess::ApplicationDefaultCredentials
+                }
                 ProviderAuthentication::Subscription { login } => ProviderAccess::Subscription {
                     login: login.to_owned(),
                 },
@@ -464,6 +479,7 @@ impl ProviderDeclaration {
                     ));
                 }
             }
+            ProviderAuthentication::ApplicationDefaultCredentials => {}
             ProviderAuthentication::Subscription { login } if !valid_provider_identifier(login) => {
                 return Err(ProviderDefinitionError::new(
                     "provider subscription login declaration is invalid",
@@ -517,11 +533,13 @@ impl ProviderDeclaration {
                         | EndpointAuthPresentation::ApiKeyHeader
                         | EndpointAuthPresentation::CloudflareAiGateway
                         | EndpointAuthPresentation::Header(_)
+                        | EndpointAuthPresentation::GoogleApiKeyHeader
                 ) | (
                     ProviderAuthentication::Aws { .. },
                     EndpointAuthPresentation::AwsSigV4
                 ) | (
-                    ProviderAuthentication::Subscription { .. },
+                    ProviderAuthentication::ApplicationDefaultCredentials
+                        | ProviderAuthentication::Subscription { .. },
                     EndpointAuthPresentation::Dynamic
                 )
             );
@@ -724,6 +742,8 @@ pub enum ProviderAccess {
         /// Variables checked by the product-owned auth lifecycle.
         variables: Vec<String>,
     },
+    /// Application Default Credentials are resolved from trusted local files.
+    ApplicationDefaultCredentials,
     /// The provider is available after the named login is complete.
     Subscription {
         /// Login selector.
@@ -1207,6 +1227,25 @@ mod tests {
                 .protocol,
             Protocol::AnthropicMessages
         );
+        let gemini = GEMINI
+            .route_for_model("gemini-2.5-flash")
+            .expect("Gemini native route");
+        assert_eq!(gemini.protocol, Protocol::GoogleGenerativeAi);
+        assert_eq!(
+            gemini.auth_presentation,
+            EndpointAuthPresentation::GoogleApiKeyHeader
+        );
+        assert_eq!(
+            VERTEX
+                .route_for_model("gemini-2.5-flash")
+                .expect("Vertex native route")
+                .protocol,
+            Protocol::GoogleGenerativeAi
+        );
+        assert!(matches!(
+            VERTEX.definition().authentication(),
+            ProviderAccess::ApplicationDefaultCredentials
+        ));
     }
 
     #[test]

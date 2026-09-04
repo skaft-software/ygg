@@ -487,6 +487,7 @@ pub(crate) fn build_request(
                             }
                         }
                         AssistantPart::Media(_) => {}
+                        AssistantPart::ProviderMetadata(_) => {}
                     }
                 }
 

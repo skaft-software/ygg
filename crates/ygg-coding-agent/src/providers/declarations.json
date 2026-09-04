@@ -589,6 +589,77 @@
       "discovery_capabilities": "default"
     },
     {
+      "const_name": "GEMINI",
+      "id": "gemini",
+      "name": "Google Gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "GEMINI_API_KEY"
+        ]
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "google",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "gemini",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "google_api_key_header",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "google",
+      "pricing": "google",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
+      "const_name": "VERTEX",
+      "id": "vertex",
+      "name": "Google Vertex AI",
+      "base_url": "https://us-central1-aiplatform.googleapis.com/v1/projects/placeholder/locations/us-central1/publishers/google/",
+      "authentication": {
+        "kind": "application_default_credentials"
+      },
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "google",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "vertex",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "dynamic",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "google",
+      "pricing": "google",
+      "discovery_capabilities": "assume_image_input"
+    },
+    {
       "const_name": "OPENCODE",
       "id": "opencode",
       "name": "OpenCode Zen",
@@ -631,12 +702,21 @@
           "body_encoding": "identity",
           "auth_presentation": "bearer",
           "responses_profile": "default"
+        },
+        {
+          "endpoint_id": "opencode-google",
+          "protocol": "google_generative_ai",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "bearer",
+          "responses_profile": "default"
         }
       ],
       "route_rules": [
         {
-          "kind": "exclude_prefix",
-          "value": "gemini-"
+          "kind": "select_prefix",
+          "prefix": "gemini-",
+          "route": 3
         },
         {
           "kind": "select_prefix",

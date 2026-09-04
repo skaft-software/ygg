@@ -837,6 +837,7 @@ fn protocol_label(protocol: Protocol) -> &'static str {
         Protocol::OpenAiChat => "openai_chat",
         Protocol::AnthropicMessages => "anthropic_messages",
         Protocol::BedrockConverse => "bedrock_converse",
+        Protocol::GoogleGenerativeAi => "google_generative_ai",
     }
 }
 

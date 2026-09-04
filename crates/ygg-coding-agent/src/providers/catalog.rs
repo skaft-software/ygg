@@ -79,6 +79,33 @@ pub(crate) fn register_private_endpoints_at_base_url(
     Ok(())
 }
 
+/// Register every unique route endpoint with declaration-owned dynamic auth.
+/// The dynamic resolver itself is private to the product authentication
+/// lifecycle; this catalog layer only receives its opaque [`Auth`] handle.
+pub(crate) fn register_dynamic_endpoints_at_base_url(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+    auth: Auth,
+    base_url: &url::Url,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    for route in declaration.routes {
+        if route.auth_presentation != super::contract::EndpointAuthPresentation::Dynamic {
+            anyhow::bail!("dynamic credential declaration has a non-dynamic route");
+        }
+        let route_base_url = base_url.join(route.base_path)?;
+        register_endpoint(
+            catalog,
+            declaration,
+            route,
+            auth.clone(),
+            route_base_url,
+            timeout,
+        )?;
+    }
+    Ok(())
+}
+
 /// Register a declared endpoint with a privately owned authentication strategy.
 fn register_endpoint(
     catalog: &mut ModelCatalog,

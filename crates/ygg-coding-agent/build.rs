@@ -155,6 +155,7 @@ struct ProviderSpec {
 enum AuthenticationSpec {
     Environment { variables: Vec<String> },
     Aws { variables: Vec<String> },
+    ApplicationDefaultCredentials,
     Subscription { login: String },
 }
 
@@ -349,6 +350,7 @@ fn protocol_expression(value: &str) -> Option<&'static str> {
         "openai_chat" => Some("Protocol::OpenAiChat"),
         "anthropic_messages" => Some("Protocol::AnthropicMessages"),
         "bedrock_converse" => Some("Protocol::BedrockConverse"),
+        "google_generative_ai" => Some("Protocol::GoogleGenerativeAi"),
         _ => None,
     }
 }
@@ -404,9 +406,13 @@ fn auth_presentation_expression(route: &RouteSpec) -> Option<String> {
         "aws_sigv4" if route.auth_header.is_none() => {
             Some("EndpointAuthPresentation::AwsSigV4".to_owned())
         }
+        "google_api_key_header" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::GoogleApiKeyHeader".to_owned())
+        }
         "dynamic" if route.auth_header.is_none() => {
             Some("EndpointAuthPresentation::Dynamic".to_owned())
         }
+
         _ => None,
     }
 }
@@ -429,6 +435,7 @@ fn static_models_expression(value: &str) -> Option<&'static str> {
         "cloudflare_workers_ai" => Some("StaticModelSet::CloudflareWorkersAi"),
         "cloudflare_ai_gateway" => Some("StaticModelSet::CloudflareAiGateway"),
         "bedrock" => Some("StaticModelSet::Bedrock"),
+        "google" => Some("StaticModelSet::Google"),
         _ => None,
     }
 }
@@ -458,6 +465,7 @@ fn compatibility_expression(value: &str) -> Option<&'static str> {
         "short_retention" => Some("CompatibilityProfile::ShortRetention"),
         "fireworks" => Some("CompatibilityProfile::Fireworks"),
         "opencode" => Some("CompatibilityProfile::OpenCode"),
+        "google" => Some("CompatibilityProfile::Google"),
         "custom" => Some("CompatibilityProfile::Custom"),
         "codex" => Some("CompatibilityProfile::Codex"),
         "mistral" => Some("CompatibilityProfile::Mistral"),
@@ -474,6 +482,7 @@ fn pricing_expression(value: &str) -> Option<&'static str> {
         "deepseek" => Some("PricingProfile::DeepSeek"),
         "minimax" => Some("PricingProfile::MiniMax"),
         "opencode" => Some("PricingProfile::OpenCode"),
+        "google" => Some("PricingProfile::Google"),
         "openrouter" => Some("PricingProfile::OpenRouter"),
         "custom" => Some("PricingProfile::Custom"),
         "subscription" => Some("PricingProfile::Subscription"),
@@ -733,6 +742,7 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
                 "provider declaration has an invalid credential environment",
             ));
         }
+        AuthenticationSpec::ApplicationDefaultCredentials => {}
         AuthenticationSpec::Subscription { login } if valid_provider_identifier(login) => {}
         AuthenticationSpec::Subscription { .. } => {
             return Err(provider_manifest_error(
@@ -780,9 +790,17 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
             (&spec.authentication, route.auth_presentation.as_str()),
             (
                 AuthenticationSpec::Environment { .. },
-                "bearer" | "api_key_header" | "cloudflare_ai_gateway" | "header"
+                "bearer"
+                    | "api_key_header"
+                    | "cloudflare_ai_gateway"
+                    | "header"
+                    | "google_api_key_header"
             ) | (AuthenticationSpec::Aws { .. }, "aws_sigv4")
-                | (AuthenticationSpec::Subscription { .. }, "dynamic")
+                | (
+                    AuthenticationSpec::ApplicationDefaultCredentials
+                        | AuthenticationSpec::Subscription { .. },
+                    "dynamic"
+                )
         );
         if !valid_presentation {
             return Err(provider_manifest_error(
@@ -872,6 +890,9 @@ fn authentication_expression(spec: &AuthenticationSpec) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("ProviderAuthentication::Aws {{ variables: &[{variables}] }}")
+        }
+        AuthenticationSpec::ApplicationDefaultCredentials => {
+            "ProviderAuthentication::ApplicationDefaultCredentials".to_owned()
         }
         AuthenticationSpec::Subscription { login } => format!(
             "ProviderAuthentication::Subscription {{ login: {} }}",
@@ -1036,13 +1057,15 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
     }
     generated.push_str("];\n\n");
     generated.push_str(
-        "/// API-key built-ins; subscription routes are kept separately by auth ownership.\n",
+        "/// Environment-credential and ADC built-ins; subscription routes are kept separately by auth ownership.\n",
     );
     generated.push_str("pub const BUILTIN_PROVIDER_DECLARATIONS: &[ProviderDeclaration] = &[\n");
     for provider in &manifest.providers {
         if matches!(
             provider.authentication,
-            AuthenticationSpec::Environment { .. } | AuthenticationSpec::Aws { .. }
+            AuthenticationSpec::Environment { .. }
+                | AuthenticationSpec::Aws { .. }
+                | AuthenticationSpec::ApplicationDefaultCredentials
         ) {
             writeln!(generated, "    {},", provider.const_name)
                 .expect("writing to String cannot fail");

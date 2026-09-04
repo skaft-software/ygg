@@ -74,12 +74,12 @@ pub use types::{
     CacheControlFormat, CacheRetention, Capabilities, Endpoint, EndpointId, EndpointTransport,
     ImageDetail, ImageMedia, ImageSource, JsonSchemaFormat, Media, Message, Modality, ModalitySet,
     ModelId, ModelLimits, ModelSpec, OpenAiChatReasoningMode, OpenAiChatRuntimeProfile,
-    OutputFormat, OutputModalities, Protocol, ProviderMediaRef, ReasoningCapability,
-    ReasoningConfig, ReasoningControl, ReasoningEffort, ReasoningEffortBudgets, ReasoningMode,
-    ReasoningPart, ReasoningState, ReasoningStateKind, Request, RequestBodyEncoding,
-    RequestRuntime, Response, ResponsesRuntimeProfile, SessionAffinityFormat, StopReason,
-    ToolArgumentValidation, ToolCall, ToolCallArgumentError, ToolCallId, ToolChoice, ToolDef,
-    ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
+    OutputFormat, OutputModalities, Protocol, ProviderMediaRef, ProviderPartMetadata,
+    ReasoningCapability, ReasoningConfig, ReasoningControl, ReasoningEffort,
+    ReasoningEffortBudgets, ReasoningMode, ReasoningPart, ReasoningState, ReasoningStateKind,
+    Request, RequestBodyEncoding, RequestRuntime, Response, ResponsesRuntimeProfile,
+    SessionAffinityFormat, StopReason, ToolArgumentValidation, ToolCall, ToolCallArgumentError,
+    ToolCallId, ToolChoice, ToolDef, ToolResult, ToolResultPart, Usage, UserMessage, UserPart,
 };
 
 /// Validates normalized arguments against the exact tool-definition snapshot.

@@ -31,8 +31,8 @@ use crate::extensions::{ExecutableExtensions, SUBAGENTS_EXTENSION_NAME};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
-    ModelDiscovery, ModelFilter, ProviderDeclaration, ProviderRoute, ProviderRuntimeConfiguration,
-    BUILTIN_PROVIDER_DECLARATIONS,
+    ModelDiscovery, ModelFilter, ProviderAuthentication, ProviderDeclaration, ProviderRoute,
+    ProviderRuntimeConfiguration, BUILTIN_PROVIDER_DECLARATIONS,
 };
 use crate::resources::{format_skills_for_prompt, FileSystemSkillRegistry};
 use crate::session_store::SessionStore;
@@ -955,7 +955,9 @@ fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
                 || id.contains("reason")
                 || id.contains("r1")
         }
-        Protocol::AnthropicMessages | Protocol::BedrockConverse => false,
+        Protocol::AnthropicMessages | Protocol::BedrockConverse | Protocol::GoogleGenerativeAi => {
+            false
+        }
     }
 }
 
@@ -1703,6 +1705,45 @@ fn try_register_declaration(
         }
         ProviderRuntimeConfiguration::Default => {}
     }
+
+    match declaration.authentication {
+        ProviderAuthentication::Environment { .. } => {
+            try_register_environment_declaration(catalog, declaration)
+        }
+        ProviderAuthentication::ApplicationDefaultCredentials => {
+            let Some(configuration) = crate::providers::resolve_application_default_credentials()?
+            else {
+                return Ok(());
+            };
+            match declaration.model_discovery {
+                ModelDiscovery::Static | ModelDiscovery::None => {}
+                _ => anyhow::bail!(
+                    "dynamic-credential provider {} must use static model discovery",
+                    declaration.id
+                ),
+            }
+            crate::providers::register_dynamic_endpoints_at_base_url(
+                catalog,
+                declaration,
+                configuration.auth,
+                &configuration.base_url,
+                PROVIDER_RESPONSE_HEADER_TIMEOUT,
+            )?;
+            crate::providers::register_static_models(catalog, declaration)
+        }
+        // Built-in AWS declarations are handled by their runtime configuration
+        // above; no generic endpoint construction can safely invent a signer.
+        ProviderAuthentication::Aws { .. } => {
+            unreachable!("AWS provider declarations require a runtime configuration")
+        }
+        ProviderAuthentication::Subscription { .. } => Ok(()),
+    }
+}
+
+fn try_register_environment_declaration(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+) -> anyhow::Result<()> {
     let Some(credential) = crate::providers::resolve_environment(declaration)? else {
         return Ok(());
     };
@@ -1765,9 +1806,6 @@ fn merge_provider_catalog(target: &mut ModelCatalog, source: ModelCatalog) -> an
 
 fn declaration_is_configured(declaration: &ProviderDeclaration) -> anyhow::Result<bool> {
     match declaration.runtime_configuration {
-        ProviderRuntimeConfiguration::Default => {
-            Ok(crate::providers::resolve_environment(declaration)?.is_some())
-        }
         // The AWS chain includes EC2 instance metadata, which has no local
         // configuration marker. Schedule one bounded private registration job;
         // it decides whether a credential exists and avoids probing the chain
@@ -1779,6 +1817,18 @@ fn declaration_is_configured(declaration: &ProviderDeclaration) -> anyhow::Resul
             }
             Ok(azure_openai_configuration(declaration)?.is_some())
         }
+        ProviderRuntimeConfiguration::Default => match declaration.authentication {
+            ProviderAuthentication::Environment { .. } => {
+                Ok(crate::providers::resolve_environment(declaration)?.is_some())
+            }
+            ProviderAuthentication::ApplicationDefaultCredentials => {
+                Ok(crate::providers::resolve_application_default_credentials()?.is_some())
+            }
+            ProviderAuthentication::Subscription { .. } => Ok(false),
+            ProviderAuthentication::Aws { .. } => {
+                unreachable!("AWS provider declarations require a runtime configuration")
+            }
+        },
     }
 }
 

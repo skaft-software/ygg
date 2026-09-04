@@ -2,7 +2,7 @@
 
 ## Canonical model
 
-`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Amazon Bedrock Converse. Provider DTOs do not cross the crate boundary.
+`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Amazon Bedrock Converse, and Google `generateContent`. Provider DTOs do not cross the crate boundary.
 
 ## Capability and reasoning model
 
@@ -20,6 +20,23 @@ sessions. Protocol validation rejects it in strict mode (or reports
 `ignored_reasoning_mode` in lossy mode), and no codec serializes a
 `reasoning.mode` field. The product layer must migrate legacy Pro state only
 after it has both model metadata and a live, trusted `ygg-subagents` observer.
+
+## Google generateContent
+
+Gemini Developer API, Vertex AI, and declared Google-compatible routes select the
+same native codec. It constructs the fixed `models/<safe-api-name>:streamGenerateContent`
+path under a trusted endpoint, uses Google content/function declarations and native
+JSON-schema fields, and decodes SSE candidate snapshots into canonical deltas.
+Google's opaque `thoughtSignature` is retained as position-bound
+`ProviderMetadata` immediately before its text, reasoning, or function-call part.
+It is replayed only to the same Google model; transformations to any other model
+or protocol drop it.
+
+The codec accepts only inline image bytes, never fetches a user-provided image
+URL, and rejects unsupported tool-result media. Cumulative function-call argument
+snapshots are merged before terminal assembly rather than concatenated as invalid
+JSON. Google thought text is canonical reasoning; a thought signature alone does
+not make visible content reasoning.
 
 ## Responses Lite
 

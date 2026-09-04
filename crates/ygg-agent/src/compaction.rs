@@ -443,6 +443,7 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                                 thinking.push(value.clone());
                             }
                         }
+                        AssistantPart::ProviderMetadata(_) => {}
                         AssistantPart::ToolCall(call) => calls.push(tool_call_text(call)),
                         AssistantPart::Media(media) => text.push(media_summary(media)),
                     }

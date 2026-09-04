@@ -102,8 +102,112 @@ pub const MINIMAX_MODELS: &[StaticModelPreset] = &[
     ),
 ];
 
-// Ported from @earendil-works/pi-ai 0.80.10. Models using Google's protocol
-// are intentionally omitted until Ygg implements google-generative-ai.
+// Google models available from both Gemini Developer API and Vertex AI. Their
+// native protocol preserves function-call and thought-signature state.
+pub const GOOGLE_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "gemini-2.5-flash",
+        "Gemini 2.5 Flash",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-2.5-flash-lite",
+        "Gemini 2.5 Flash-Lite",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-2.5-pro",
+        "Gemini 2.5 Pro",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3-flash-preview",
+        "Gemini 3 Flash Preview",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.1-flash-lite",
+        "Gemini 3.1 Flash Lite",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.1-pro-preview",
+        "Gemini 3.1 Pro Preview",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.1-pro-preview-customtools",
+        "Gemini 3.1 Pro Preview Custom Tools",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.5-flash",
+        "Gemini 3.5 Flash",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-flash-latest",
+        "Gemini Flash Latest",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-flash-lite-latest",
+        "Gemini Flash-Lite Latest",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+];
+
+// Ported from @earendil-works/pi-ai 0.80.10.
 pub const OPENCODE_MODELS: &[StaticModelPreset] = &[
     StaticModelPreset::new(
         "big-pickle",
@@ -258,6 +362,36 @@ pub const OPENCODE_MODELS: &[StaticModelPreset] = &[
         ReasoningEffort::Max,
     )
     .with_deepseek_thinking(),
+    StaticModelPreset::new(
+        "gemini-3-flash",
+        "Gemini 3 Flash",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.1-pro",
+        "Gemini 3.1 Pro Preview",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "gemini-3.5-flash",
+        "Gemini 3.5 Flash",
+        Protocol::GoogleGenerativeAi,
+        1_048_576,
+        65_536,
+        true,
+        true,
+        ReasoningEffort::High,
+    ),
     StaticModelPreset::new(
         "glm-5",
         "GLM-5",
@@ -891,5 +1025,6 @@ pub(crate) fn static_models(set: StaticModelSet) -> &'static [StaticModelPreset]
         StaticModelSet::Mistral => MISTRAL_MODELS,
         StaticModelSet::CloudflareWorkersAi => CLOUDFLARE_WORKERS_AI_MODELS,
         StaticModelSet::CloudflareAiGateway => CLOUDFLARE_AI_GATEWAY_MODELS,
+        StaticModelSet::Google => GOOGLE_MODELS,
     }
 }

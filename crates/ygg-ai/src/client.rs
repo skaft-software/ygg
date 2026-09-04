@@ -990,6 +990,7 @@ async fn stream_http(
                                 Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
+                                Protocol::GoogleGenerativeAi => crate::protocol::google::decode_stream_event(&model_clone, &sse, &mut builder),
                             }
                             .map_err(|error| {
                                 annotate_stream_failure(
@@ -1084,6 +1085,7 @@ async fn stream_http(
                                 Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
+                                Protocol::GoogleGenerativeAi => crate::protocol::google::decode_stream_event(&model_clone, &sse, &mut builder),
                             }
                             .map_err(|error| {
                                 annotate_stream_failure(
@@ -1185,6 +1187,7 @@ async fn stream_http(
             let mut index_counter = 0;
             for part in &message.content {
                 match part {
+                    crate::types::AssistantPart::ProviderMetadata(_) => {}
                     crate::types::AssistantPart::Text(text) => {
                         let idx = index_counter;
                         index_counter += 1;
@@ -1587,6 +1590,7 @@ impl AiClient {
                 crate::protocol::openai_responses::build_request(model, &req)?
             }
             Protocol::BedrockConverse => crate::protocol::bedrock::build_request(model, &req)?,
+            Protocol::GoogleGenerativeAi => crate::protocol::google::build_request(model, &req)?,
         };
 
         // Pre-send Lossy diagnostics (capability drops computed in `build_request`)

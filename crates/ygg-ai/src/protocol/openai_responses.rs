@@ -650,6 +650,7 @@ fn map_assistant_input(
                 }
             }
             AssistantPart::Media(_) => {}
+            AssistantPart::ProviderMetadata(_) => {}
         }
     }
     flush_assistant_text(&mut input, &mut text_parts);

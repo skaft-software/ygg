@@ -377,6 +377,17 @@ and sync the directory on Unix. Token-bearing types redact both tokens from
 `Debug`; token endpoint failures expose only status and a constrained OAuth
 error code, never the raw response body.
 
+Gemini Developer API presets are registered only while bounded `GEMINI_API_KEY`
+is nonempty and use `x-goog-api-key` at request time. Vertex presets are
+registered only after an owner-private, bounded Application Default Credentials
+file and validated `GOOGLE_CLOUD_PROJECT` plus `GOOGLE_CLOUD_LOCATION` (or
+`GOOGLE_CLOUD_REGION`) are present. The product accepts `authorized_user` and
+PKCS#8 service-account ADC files, builds the regional Google authority from
+single safe path segments, ignores credential-controlled token URLs, refreshes
+into memory under a mutex, and sends refreshes only to the fixed Google OAuth
+token endpoint with redirects disabled. It neither runs `gcloud` nor persists
+ADC credentials or access tokens.
+
 ## Frontends
 
 Interactive, plain, and print modes share `App`, `Agent`, session persistence,

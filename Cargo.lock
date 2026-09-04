@@ -3146,6 +3146,7 @@ dependencies = [
  "percent-encoding",
  "regex",
  "reqwest",
+ "ring",
  "rusqlite",
  "schemars",
  "semver",

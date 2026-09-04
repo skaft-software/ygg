@@ -275,6 +275,17 @@ impl ModelCatalog {
     }
 }
 
+/// Google request URLs interpolate `api_name` into one fixed path segment.
+/// Restrict it at catalog ingress so discovery/configuration cannot escape the
+/// configured Gemini or Vertex endpoint scope.
+fn google_api_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
 pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
     if spec.api_name.is_empty()
         || !spec.capabilities.input_modalities.is_valid()
@@ -282,6 +293,8 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
         || spec.limits.context_window == 0
         || spec.limits.max_output_tokens == 0
         || spec.limits.max_output_tokens > spec.limits.context_window
+        || (spec.protocol == Protocol::GoogleGenerativeAi
+            && !google_api_name_is_safe(&spec.api_name))
         || (spec.protocol != Protocol::OpenAiChat
             && (spec.capabilities.input_modalities.contains(Modality::Audio)
                 || spec
@@ -317,7 +330,9 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
                 reasoning.control,
                 ReasoningControl::Effort | ReasoningControl::AlwaysOn | ReasoningControl::Toggle
             ),
-            Protocol::OpenAiResponses => reasoning.control == ReasoningControl::Effort,
+            Protocol::OpenAiResponses | Protocol::GoogleGenerativeAi => {
+                reasoning.control == ReasoningControl::Effort
+            }
             // Converse has no portable reasoning control in this codec.
             Protocol::BedrockConverse => false,
         };

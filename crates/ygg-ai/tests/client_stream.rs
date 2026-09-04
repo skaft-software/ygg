@@ -463,6 +463,56 @@ async fn test_client_stream_anthropic() {
     assert_eq!(response.response_id.as_deref(), Some("msg_1"));
 }
 
+#[tokio::test]
+async fn test_client_stream_google_generate_content() {
+    let mock_server = MockServer::start().await;
+    let body = concat!(
+        "data: {\"responseId\":\"gemini-response-1\",\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":2,\"candidatesTokenCount\":1,\"totalTokenCount\":3}}\n\n"
+    );
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ))
+        .and(wiremock::matchers::header(
+            "x-goog-api-key",
+            "test-google-key",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("content-type", "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let mut model = make_test_model(
+        &format!("{}/v1beta/", mock_server.uri()),
+        Protocol::GoogleGenerativeAi,
+        false,
+    );
+    let mut spec = (*model.spec).clone();
+    spec.api_name = "gemini-2.5-flash".to_owned();
+    model.spec = Arc::new(spec);
+    let mut endpoint = (*model.endpoint).clone();
+    endpoint.auth = Auth::header(
+        http::HeaderName::from_static("x-goog-api-key"),
+        "test-google-key",
+    );
+    model.endpoint = Arc::new(endpoint);
+
+    let response = AiClient::new()
+        .complete(&model, text_request())
+        .await
+        .expect("Google fixture response");
+    assert_eq!(response.response_id.as_deref(), Some("gemini-response-1"));
+    assert_eq!(response.usage.input_tokens, 2);
+    assert_eq!(response.usage.output_tokens, 1);
+    assert!(matches!(
+        response.message.content.as_slice(),
+        [ygg_ai::AssistantPart::Text(text)] if text == "hello"
+    ));
+}
+
 fn text_request() -> Request {
     Request {
         system: None,

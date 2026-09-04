@@ -347,6 +347,29 @@ export AZURE_OPENAI_DEPLOYMENT='my-gpt-deployment'
 ygg --model azure-openai/my-gpt-deployment
 ```
 
+Gemini uses Google's native `generateContent` API rather than an OpenAI-compatible
+translation. Set a Gemini Developer API key to expose the checked-in Gemini
+presets (including tools, structured JSON output, and supported images):
+
+```sh
+export GEMINI_API_KEY='...'
+ygg --model gemini/gemini-2.5-flash
+```
+
+Vertex AI uses Application Default Credentials and requires an explicit project
+and location. `GOOGLE_APPLICATION_CREDENTIALS`, when set, must name an absolute
+owner-private ADC file; otherwise Ygg checks the owner-private default ADC file.
+Ygg supports `authorized_user` and PKCS#8 `service_account` ADC files, refreshes
+short-lived access tokens in memory, and never invokes `gcloud` or persists
+credential values.
+
+```sh
+export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/adc.json
+export GOOGLE_CLOUD_PROJECT=my-project
+export GOOGLE_CLOUD_LOCATION=us-central1
+ygg --model vertex/gemini-2.5-flash
+```
+
 ChatGPT subscription users can use the hosted device flow instead of manually managing an API key:
 
 ```sh

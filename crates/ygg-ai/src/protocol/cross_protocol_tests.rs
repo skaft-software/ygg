@@ -208,7 +208,11 @@ fn test_cross_protocol_anthropic_message_merging() {
 
 #[test]
 fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
-    for protocol in [Protocol::OpenAiResponses, Protocol::AnthropicMessages] {
+    for protocol in [
+        Protocol::OpenAiResponses,
+        Protocol::AnthropicMessages,
+        Protocol::GoogleGenerativeAi,
+    ] {
         let model = make_model(protocol, false, false, false, false);
         let req = Request {
             system: None,
@@ -252,6 +256,12 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
             .unwrap(),
             Protocol::AnthropicMessages => serde_json::from_slice(
                 &crate::protocol::anthropic::build_request(&model, &req)
+                    .unwrap()
+                    .body,
+            )
+            .unwrap(),
+            Protocol::GoogleGenerativeAi => serde_json::from_slice(
+                &crate::protocol::google::build_request(&model, &req)
                     .unwrap()
                     .body,
             )

@@ -137,11 +137,12 @@ pub(crate) fn validate_request(
     for msg in &req.messages {
         match msg {
             Message::Assistant(ref assistant) => {
-                // If the protocol requires pairing (Anthropic, OpenAI Responses),
-                // check if there were any unresolved tool calls from the previous assistant turn.
+                // Google, Anthropic, and OpenAI Responses require function/tool
+                // responses before another assistant turn.
                 if (protocol == Protocol::AnthropicMessages
                     || protocol == Protocol::OpenAiResponses
-                    || protocol == Protocol::BedrockConverse)
+                    || protocol == Protocol::BedrockConverse
+                    || protocol == Protocol::GoogleGenerativeAi)
                     && !pending_calls.is_empty()
                 {
                     // In Strict mode, this is a ValidationError.
@@ -192,7 +193,8 @@ pub(crate) fn validate_request(
 
     if (protocol == Protocol::AnthropicMessages
         || protocol == Protocol::OpenAiResponses
-        || protocol == Protocol::BedrockConverse)
+        || protocol == Protocol::BedrockConverse
+        || protocol == Protocol::GoogleGenerativeAi)
         && !pending_calls.is_empty()
     {
         for call_id in &pending_calls {
@@ -265,17 +267,26 @@ pub(crate) fn validate_request(
                                 }
                             }
 
-                            // Bedrock Converse accepts image bytes, not remote URLs.
-                            if protocol == Protocol::BedrockConverse
-                                && matches!(&image.source, ImageSource::Url(_))
+                            // Bedrock and Gemini accept inline image bytes, not arbitrary remote URLs.
+                            // In particular, Google `fileData` references have a distinct trust
+                            // contract and must not expand the provider's network authority.
+                            if matches!(
+                                protocol,
+                                Protocol::BedrockConverse | Protocol::GoogleGenerativeAi
+                            ) && matches!(&image.source, ImageSource::Url(_))
                             {
                                 if mode == CompatibilityMode::Strict {
                                     return Err(AiError::Unsupported(UnsupportedError::Image));
                                 }
                                 diagnostics.push(Diagnostic {
                                     code: "dropped_image_url".to_string(),
-                                    message: "Bedrock Converse requires inline image bytes"
-                                        .to_string(),
+                                    message: match protocol {
+                                        Protocol::BedrockConverse => {
+                                            "Bedrock Converse requires inline image bytes".to_string()
+                                        }
+                                        Protocol::GoogleGenerativeAi => "Google Generative AI supports inline image input; arbitrary image URLs are not forwarded".to_string(),
+                                        _ => unreachable!("only inline-image protocols reach this branch"),
+                                    },
                                 });
                             }
 
@@ -446,7 +457,10 @@ pub(crate) fn validate_request(
                                                 ImageSource::Inline(_) | ImageSource::Url(_)
                                             )
                                         }
-                                        Protocol::BedrockConverse => false,
+                                        // Bedrock Converse and Gemini functionResponse have no
+                                        // documented tool-result media mapping.
+                                        Protocol::BedrockConverse
+                                        | Protocol::GoogleGenerativeAi => false,
                                     },
                                     ToolResultPart::Media(Media::Audio(_)) => false,
                                 };
@@ -486,7 +500,10 @@ pub(crate) fn validate_request(
                 for part in &assistant.content {
                     match part {
                         AssistantPart::Reasoning(rp) => {
-                            if protocol != Protocol::OpenAiChat && rp.state.is_none() {
+                            if protocol != Protocol::OpenAiChat
+                                && protocol != Protocol::GoogleGenerativeAi
+                                && rp.state.is_none()
+                            {
                                 if mode == CompatibilityMode::Strict {
                                     return Err(AiError::Unsupported(
                                         UnsupportedError::ReasoningStateMismatch {

@@ -450,7 +450,7 @@ fn push_message(
                             args,
                         });
                     }
-                    AssistantPart::Media(_) => {}
+                    AssistantPart::Media(_) | AssistantPart::ProviderMetadata(_) => {}
                 }
             }
         }

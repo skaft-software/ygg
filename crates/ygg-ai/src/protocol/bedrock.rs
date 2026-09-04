@@ -213,7 +213,9 @@ pub(crate) fn build_request(
                                 }
                             }));
                         }
-                        AssistantPart::Reasoning(_) | AssistantPart::Media(_) => {}
+                        AssistantPart::Reasoning(_)
+                        | AssistantPart::Media(_)
+                        | AssistantPart::ProviderMetadata(_) => {}
                     }
                 }
                 push_message(&mut messages, "assistant", content);

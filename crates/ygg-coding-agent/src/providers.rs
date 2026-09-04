@@ -11,6 +11,7 @@ mod compatibility;
 mod contract;
 mod models;
 mod pricing;
+mod vertex;
 
 pub use contract::{
     CompatibilityProfile, PricingProfile, ProviderAccess, ProviderAvailability,
@@ -32,15 +33,16 @@ pub(crate) use auth::{
     resolve_environment, EnvironmentCredential,
 };
 pub(crate) use catalog::{
-    public_headers, register_discovered_model, register_environment_endpoints,
-    register_environment_endpoints_at_base_url, register_private_endpoints_at_base_url,
-    register_static_models,
+    public_headers, register_discovered_model, register_dynamic_endpoints_at_base_url,
+    register_environment_endpoints, register_environment_endpoints_at_base_url,
+    register_private_endpoints_at_base_url, register_static_models,
 };
 pub(crate) use compatibility::cache_compatibility;
 pub(crate) use contract::{
-    InventoryCacheMode, ModelDiscovery, ModelFilter, ProviderDeclaration, ProviderRoute,
-    ProviderRuntimeConfiguration, BUILTIN_PROVIDER_DECLARATIONS, CODEX, DEEPSEEK,
+    InventoryCacheMode, ModelDiscovery, ModelFilter, ProviderAuthentication, ProviderDeclaration,
+    ProviderRoute, ProviderRuntimeConfiguration, BUILTIN_PROVIDER_DECLARATIONS, CODEX, DEEPSEEK,
 };
 #[cfg(test)]
 pub(crate) use contract::{OPENAI, OPENCODE, OPENROUTER};
 pub(crate) use pricing::pricing_for;
+pub(crate) use vertex::resolve_application_default_credentials;

@@ -58,6 +58,7 @@ pub(crate) fn cache_control(
 
 pub(crate) mod anthropic;
 pub(crate) mod bedrock;
+pub(crate) mod google;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_responses;
 

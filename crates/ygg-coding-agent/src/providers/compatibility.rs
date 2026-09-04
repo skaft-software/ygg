@@ -66,6 +66,11 @@ pub(crate) fn cache_compatibility(
             cache.send_session_affinity_headers = true;
             cache.session_affinity_format = Some(SessionAffinityFormat::Mistral);
         }
+        CompatibilityProfile::Google => {
+            cache.supports_long_retention = false;
+            cache.send_session_id_header = false;
+            cache.supports_cache_control_on_tools = false;
+        }
         CompatibilityProfile::Default
         | CompatibilityProfile::Cloudflare
         | CompatibilityProfile::Fireworks

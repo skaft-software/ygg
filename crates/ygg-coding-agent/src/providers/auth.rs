@@ -90,6 +90,10 @@ pub(crate) fn environment_auth(
             http::HeaderName::from_bytes(name.as_bytes())?,
             credential.variable(),
         )),
+        EndpointAuthPresentation::GoogleApiKeyHeader => Ok(Auth::header_env(
+            http::HeaderName::from_static("x-goog-api-key"),
+            credential.variable(),
+        )),
         EndpointAuthPresentation::AwsSigV4 | EndpointAuthPresentation::Dynamic => {
             anyhow::bail!("environment provider declaration has an invalid credential presentation")
         }
@@ -120,6 +124,10 @@ pub(crate) fn environment_discovery_headers(
         ),
         EndpointAuthPresentation::Header(name) => (
             http::HeaderName::from_bytes(name.as_bytes())?,
+            credential.value().to_owned(),
+        ),
+        EndpointAuthPresentation::GoogleApiKeyHeader => (
+            http::HeaderName::from_static("x-goog-api-key"),
             credential.value().to_owned(),
         ),
         EndpointAuthPresentation::AwsSigV4 | EndpointAuthPresentation::Dynamic => {
@@ -575,7 +583,7 @@ pub(crate) fn missing_environment_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::contract::{ANTHROPIC, CLOUDFLARE_AI_GATEWAY, OPENAI};
+    use crate::providers::contract::{ANTHROPIC, CLOUDFLARE_AI_GATEWAY, GEMINI, OPENAI};
 
     #[test]
     fn aws_profile_parser_selects_only_the_requested_bounded_section() {
@@ -678,5 +686,8 @@ ignored key = ignored
         let gateway_header = &gateway[http::HeaderName::from_static("cf-aig-authorization")];
         assert_eq!(gateway_header.to_str().unwrap(), "Bearer not-formatted");
         assert!(gateway_header.is_sensitive());
+
+        let google = environment_discovery_headers(&GEMINI.routes[0], &credential).unwrap();
+        assert!(google[http::HeaderName::from_static("x-goog-api-key")].is_sensitive());
     }
 }
