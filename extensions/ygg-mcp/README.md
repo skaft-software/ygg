@@ -44,7 +44,7 @@ An explicitly read-only tool may run without an additional prompt. Every
 `unknown` or `destructive` call goes through the negotiated host
 `policy/evaluate` service. If policy intents are unavailable, evaluation fails,
 or the host denies the intent, the bridge fails closed. It uses a one-use
-approval retry only when the host actually negotiates `approvals`; Ygg `0.6.7`'s
+approval retry only when the host actually negotiates `approvals`; Ygg `0.7.0-dev`'s
 coding product does not currently enable approval issuance, so those calls are
 denied with an explanatory tool error. An MCP tool call is never automatically
 replayed after timeout, cancellation, crash, or an ambiguous disconnect.
@@ -132,7 +132,7 @@ made generally available.
 
 ## Requirements and installation
 
-- Ygg exactly `0.6.7` (`requires_ygg = "=0.6.7"`)
+- Ygg exactly `0.7.0-dev` (`requires_ygg = "=0.7.0-dev"`)
 - Python 3.9 or newer on `PATH`
 - separately installed MCP server executables
 

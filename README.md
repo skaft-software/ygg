@@ -50,6 +50,8 @@ ygg --version   # ygg 0.6.7
 ygg --help
 ```
 
+> Development builds from this checkout identify as `ygg 0.7.0-dev`; this is not a released `v0.7.0` tag.
+
 No Rust toolchain is needed. Prebuilt binaries cover GNU/Linux x86-64, macOS
 x86-64, and macOS Apple silicon; Linux musl is not included. Use the same binary
 with [cloud providers](#use-a-cloud-model) or [your own local endpoint](#use-custom-openai-compatible-providers).

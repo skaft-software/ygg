@@ -174,7 +174,7 @@ name = "git-tools"
 version = "0.2.0"
 api_version = "0.2"
 # Required for an installable bundle; optional for an unpackaged local copy.
-requires_ygg = "=0.6.7"
+requires_ygg = "=0.7.0-dev"
 description = "Small local git helpers"
 
 [entrypoint]
@@ -1030,7 +1030,7 @@ legacy runtime compatibility and cannot be installed as a bundle:
 name = "ygg-web-search"
 version = "0.2.0"
 api_version = "0.2"
-requires_ygg = "=0.6.7"
+requires_ygg = "=0.7.0-dev"
 ```
 
 `requires_ygg` is optional for an unpackaged local extension, but when present

@@ -33,9 +33,9 @@ name = "ygg-host"
 path = "src/bin/ygg-host.rs"
 
 [dependencies]
-ygg-ai = { version = "=0.6.7", path = "../ygg-ai" }
-ygg-agent = { version = "=0.6.7", path = "../ygg-agent" }
-ygg-migrate-types = { version = "=0.6.7", path = "../ygg-migrate-types" }
+ygg-ai = { version = "=0.7.0-dev", path = "../ygg-ai" }
+ygg-agent = { version = "=0.7.0-dev", path = "../ygg-agent" }
+ygg-migrate-types = { version = "=0.7.0-dev", path = "../ygg-migrate-types" }
 # Vendored semantic rich-rendering integration. Keeping it in this workspace
 # makes fresh clones build the exact implementation reviewed with Ygg.
 sexy-tui-rs = { version = "=0.3.1", path = "../sexy-tui-rs" }

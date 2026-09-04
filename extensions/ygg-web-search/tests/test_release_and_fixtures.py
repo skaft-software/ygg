@@ -49,7 +49,7 @@ class ReleaseAndFixtureTests(unittest.TestCase):
             'name = "ygg-web-search"',
             'version = "0.3.0"',
             'api_version = "0.2"',
-            'requires_ygg = "=0.6.7"',
+            'requires_ygg = "=0.7.0-dev"',
             'command = "extension.py"',
             'tools = ["web_search", "web_fetch", "web_find"]',
             'commands = ["web-search"]',

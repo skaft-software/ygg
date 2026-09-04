@@ -2017,7 +2017,7 @@
       "name": "initialize-request",
       "value": {
         "api_version": "0.3",
-        "ygg_version": "0.7.0",
+        "ygg_version": "0.7.0-dev",
         "extension": {
           "name": "fixture",
           "source": "explicit",

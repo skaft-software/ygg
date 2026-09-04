@@ -24,7 +24,7 @@ class ReleaseSmokeTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-mcp")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.7")
+        self.assertEqual(manifest["requires_ygg"], "=0.7.0-dev")
         self.assertEqual(manifest["entrypoint"]["command"], "ygg-mcp")
         self.assertTrue(manifest["capabilities"]["process"])
         self.assertTrue(manifest["capabilities"]["network"])

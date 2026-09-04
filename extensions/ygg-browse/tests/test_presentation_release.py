@@ -206,7 +206,7 @@ class PackageTests(unittest.TestCase):
         self.assertEqual(manifest["name"], "ygg-browse")
         self.assertEqual(manifest["version"], "0.1.0")
         self.assertEqual(manifest["api_version"], "0.2")
-        self.assertEqual(manifest["requires_ygg"], "=0.6.7")
+        self.assertEqual(manifest["requires_ygg"], "=0.7.0-dev")
         self.assertEqual(set(manifest["contributes"]["tools"]), TOOLS)
         self.assertEqual(manifest["contributes"]["commands"], ["browse"])
         self.assertTrue(manifest["contributes"]["confirmations"])
@@ -285,7 +285,7 @@ class PackageTests(unittest.TestCase):
                 "method": "initialize",
                 "params": {
                     "api_version": "0.2",
-                    "ygg_version": "0.6.7",
+                    "ygg_version": "0.7.0-dev",
                     "extension": {
                         "name": "ygg-browse",
                         "version": "0.1.0",
