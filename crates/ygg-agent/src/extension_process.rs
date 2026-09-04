@@ -4281,6 +4281,8 @@ pub mod methods {
     pub const TOOLS_REGISTER: &str = "tools/register";
     /// Extension-to-host live tool removal request.
     pub const TOOLS_UNREGISTER: &str = "tools/unregister";
+    /// Extension-to-host completion of an initial provider catalog batch.
+    pub const PROVIDERS_COMPLETE: &str = "providers/complete";
     /// Extension-to-host atomic provider catalog registration.
     pub const PROVIDERS_REGISTER: &str = "providers/register";
     /// Extension-to-host atomic provider catalog replacement.
@@ -10225,6 +10227,7 @@ fn negotiate_api_v03_contributions(
     let contract = api_v03::negotiate(offer, &response.contract).map_err(api_v03_protocol_error)?;
     let provider_capabilities = ["provider_catalog", "provider_stream", "provider_auth"];
     let provider_methods = [
+        methods::PROVIDERS_COMPLETE,
         methods::PROVIDERS_REGISTER,
         methods::PROVIDERS_UPDATE,
         methods::PROVIDERS_UNREGISTER,
@@ -12757,6 +12760,14 @@ fn handle_protocol_line(line: &[u8], state: &ProtocolReadState) -> Result<(), St
                 let request_id: ExtensionRequestId = serde_json::from_value(id)
                     .map_err(|error| format!("invalid cancel request id: {error}"))?;
                 settle_child_request(&state.child_requests, &request_id);
+            }
+            methods::PROVIDERS_COMPLETE => {
+                require_declared(state.declared.providers, "provider catalogs")?;
+                api_v03::parse_provider_catalog_complete_params(params)
+                    .map_err(|error| format!("invalid provider catalog completion: {error}"))?;
+                let registry = provider_registry_for_request(state)
+                    .map_err(|_| "provider registry is unavailable".to_owned())?;
+                registry.complete_initial_catalog(&state.provider_owner);
             }
             methods::PROVIDERS_REGISTER => {
                 require_declared(state.declared.providers, "provider catalogs")?;

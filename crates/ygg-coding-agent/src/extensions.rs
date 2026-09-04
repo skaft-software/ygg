@@ -114,8 +114,9 @@ const AFTER_RESPONSE_RPC_DEADLINE: Duration = Duration::from_secs(2);
 const RENDERER_RPC_DEADLINE: Duration = Duration::from_millis(500);
 const LIFECYCLE_NOTIFY_DEADLINE: Duration = Duration::from_millis(250);
 /// API 0.3 reverse provider registration starts only after initialize is
-/// acknowledged. This bounded window lets startup observe that post-initialize
-/// work without making a zero-provider extension block launch indefinitely.
+/// acknowledged. The provider completion notification settles the full initial
+/// batch (including zero providers); this remains a bounded fail-closed wait
+/// for older extensions that do not negotiate the additive notification.
 const PROVIDER_REGISTRATION_BARRIER: Duration = Duration::from_millis(500);
 /// Total per-extension deadline for the typed post-mutation hook. A timeout
 /// drops only that extension's rescan request after the host mutation settled.
@@ -1071,10 +1072,9 @@ impl ExtensionProviderRuntime {
 
     fn await_initial_registrations(&self, processes: &[ExtensionProcess]) {
         let owners = Self::initial_provider_owners(processes);
-        // There is no API 0.3 "initial provider catalog complete" frame: an
-        // extension is allowed to declare no providers. The registry condition
-        // variable therefore gives actual registrations a deterministic window
-        // while preserving a hard upper bound for zero-provider extensions.
+        // A completion notification follows every bridge-owned initial batch,
+        // including an empty one. Extensions predating that additive API surface
+        // time out here and their incomplete declarations remain unprojected.
         let _ = self
             .registry
             .wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER);
@@ -1086,8 +1086,8 @@ impl ExtensionProviderRuntime {
             return;
         }
         let registry = Arc::clone(&self.registry);
-        // Reload runs from the Tokio runtime. Keep its Condvar wait off a core
-        // worker so a post-initialize reverse registration can make progress
+        // Reload runs from the Tokio runtime. Keep its completion wait off a
+        // core worker so post-initialize reverse registration can make progress
         // even when the runtime has only one configured worker thread.
         let _ = tokio::task::spawn_blocking(move || {
             registry.wait_for_owners(&owners, PROVIDER_REGISTRATION_BARRIER)

@@ -2496,7 +2496,8 @@ fn initial_build_records_configuration_provenance() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn unknown_api_03_provider_model_preflights_restarts_and_reloads_with_fresh_routes() {
+async fn unknown_api_03_last_initial_provider_model_preflights_restarts_and_reloads_with_fresh_routes(
+) {
     let node = std::process::Command::new("node")
         .arg("--version")
         .status()
@@ -2543,7 +2544,7 @@ api_version = "0.3"
 [entrypoint]
 command = "launch-bridge.sh"
 args = [{bridge:?}, "--extension", {provider_extension:?}, "--pi-package", {fake_pi:?}, "--api-version", "0.3"]
-env = {{ YGG_PI_FIXTURE_API_VERSION = "0.3", YGG_PI_FIXTURE_PROVIDER_AUTH = "none", YGG_PI_FIXTURE_PROVIDER_REGISTER_DELAY_MS = "75" }}
+env = {{ YGG_PI_FIXTURE_API_VERSION = "0.3", YGG_PI_FIXTURE_PROVIDER_AUTH = "none", YGG_PI_FIXTURE_PROVIDER_REGISTER_DELAY_MS = "75", YGG_PI_FIXTURE_INITIAL_PROVIDER_COUNT = "2" }}
 
 [contributes]
 tools = ["pi"]
@@ -2553,7 +2554,10 @@ providers = true
     )
     .unwrap();
 
-    let model_id = "fixture-provider/fixture-model";
+    // The fake Pi fixture queues this declaration after the first provider.
+    // Selecting it proves preflight waits for the owner's complete batch rather
+    // than returning after the first reverse registration.
+    let model_id = "fixture-second-provider/fixture-second-model";
     let mut config = config(directory.path(), Some(model_id));
     config.effect_policy = ygg_agent::EffectPolicy::UnsafeHost;
     config.extension_paths = vec![extension_root];

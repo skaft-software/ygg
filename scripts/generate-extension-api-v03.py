@@ -347,7 +347,7 @@ def validate_schema(schema: dict[str, Any]) -> None:
             raise ValueError(f"method {method['name']} has invalid host_offer")
         if method.get("status") not in {"foundation", "deferred"}:
             raise ValueError(f"method {method['name']} has invalid status")
-        if method.get("terminal") not in {"initialized", "result_or_error", "shutdown", "original_request_cancelled", "stream_event", "deferred"}:
+        if method.get("terminal") not in {"initialized", "result_or_error", "shutdown", "original_request_cancelled", "stream_event", "catalog_complete", "deferred"}:
             raise ValueError(f"method {method['name']} has invalid terminal semantics")
         if not isinstance(method.get("notification"), bool):
             raise ValueError(f"method {method['name']} must declare notification semantics")

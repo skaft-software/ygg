@@ -864,6 +864,73 @@ class Api03ProviderBridgeTests(unittest.TestCase):
                 timeout=1.0,
             )
             self.assertEqual("fixture-provider", registration["params"]["provider"]["id"])
+            completion = bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "providers/complete"),
+                    None,
+                ),
+                description="delayed initial provider catalog completion",
+                timeout=1.0,
+            )
+            self.assertGreater(bridge.messages.index(completion), bridge.messages.index(registration))
+
+    def test_api_03_initial_provider_completion_follows_full_serial_batch(self) -> None:
+        bridge = BridgeProcess(
+            extension=PROVIDER_EXTENSION,
+            api_version="0.3",
+            fixture_environment={
+                "YGG_PI_FIXTURE_PROVIDER_AUTH": "none",
+                "YGG_PI_FIXTURE_INITIAL_PROVIDER_COUNT": "2",
+            },
+        )
+        registrations: list[dict] = []
+
+        def catalog(message: dict) -> dict:
+            registrations.append(message)
+            provider = message["params"]["provider"]
+            models = message["params"]["models"]
+            return {
+                "revision": len(registrations),
+                "provider_ids": [provider["id"]],
+                "model_ids": [f'{provider["id"]}/{model["id"]}' for model in models],
+            }
+
+        bridge.handlers["providers/register"] = catalog
+        with bridge:
+            bridge.initialize()
+            completion = bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "providers/complete"),
+                    None,
+                ),
+                description="initial provider catalog completion",
+            )
+            self.assertNotIn("id", completion)
+            self.assertEqual({}, completion["params"])
+            self.assertEqual(
+                ["fixture-provider", "fixture-second-provider"],
+                [message["params"]["provider"]["id"] for message in registrations],
+            )
+            completion_index = bridge.messages.index(completion)
+            self.assertTrue(
+                all(bridge.messages.index(message) < completion_index for message in registrations),
+                "completion must follow every serialized registration",
+            )
+
+    def test_api_03_empty_initial_provider_catalog_completes(self) -> None:
+        with BridgeProcess(api_version="0.3") as bridge:
+            bridge.initialize()
+            completion = bridge.wait_for(
+                lambda messages: next(
+                    (message for message in messages if message.get("method") == "providers/complete"),
+                    None,
+                ),
+                description="empty provider catalog completion",
+            )
+            self.assertEqual({}, completion["params"])
+            self.assertFalse(
+                any(message.get("method") == "providers/register" for message in bridge.messages)
+            )
 
     def test_api_03_tool_dispatcher_bounds_pi_content_parts(self) -> None:
         bridge, catalog_requests, auth_requests = self.provider_bridge()

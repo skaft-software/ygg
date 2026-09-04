@@ -22,6 +22,13 @@ const providerRegistrationDelay = Number.isSafeInteger(fixtureProviderRegistrati
   ? fixtureProviderRegistrationDelay
   : 0;
 const fixtureProviderAuth = process.env.YGG_PI_FIXTURE_PROVIDER_AUTH ?? "host_credential";
+const fixtureInitialProviderCount = Number.parseInt(
+  process.env.YGG_PI_FIXTURE_INITIAL_PROVIDER_COUNT ?? "1",
+  10,
+);
+const initialProviderCount = Number.isSafeInteger(fixtureInitialProviderCount)
+  ? Math.max(1, Math.min(fixtureInitialProviderCount, 2))
+  : 1;
 let fixtureCancellationObserved = false;
 
 function fixtureModeForPath(path) {
@@ -76,17 +83,19 @@ async function* fixtureProviderStream({ request, signal }) {
   };
 }
 
-function fixtureProviderConfig(revision = 1) {
+function fixtureProviderConfig(revision = 1, secondary = false) {
+  const providerLabel = secondary ? "Fixture second provider" : "Fixture provider";
+  const modelLabel = secondary ? "Fixture second model" : "Fixture model";
   return {
-    name: revision === 1 ? "Fixture provider" : "Fixture provider refreshed",
+    name: revision === 1 ? providerLabel : `${providerLabel} refreshed`,
     api: "openai-completions",
     yggAuth: fixtureProviderAuth === "none"
       ? { kind: "none" }
       : { kind: "host_credential", subject: "fixture-credential" },
     models: [
       {
-        id: "fixture-model",
-        name: revision === 1 ? "Fixture model" : "Fixture model refreshed",
+        id: secondary ? "fixture-second-model" : "fixture-model",
+        name: revision === 1 ? modelLabel : `${modelLabel} refreshed`,
         contextWindow: 8192,
         maxTokens: revision === 1 ? 1024 : 2048,
         reasoning: false,
@@ -272,6 +281,9 @@ export class ExtensionRunner {
     const registerInitialProvider = () => {
       if (this.fixtureMode === "provider") {
         providerActions.registerProvider("fixture-provider", fixtureProviderConfig(1));
+        if (initialProviderCount > 1) {
+          providerActions.registerProvider("fixture-second-provider", fixtureProviderConfig(1, true));
+        }
       } else if (this.fixtureMode === "unsafe-provider") {
         providerActions.registerProvider("unsafe-provider", {
           ...fixtureProviderConfig(1),

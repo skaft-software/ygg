@@ -46,6 +46,12 @@ const API_0_3_MAX_CONTENT_PARTS = 256;
 const API_0_3_MAX_PROVIDERS = 32;
 const API_0_3_MAX_PROVIDER_MODELS = 256;
 const API_0_3_MAX_PROVIDER_STREAM_EVENTS = 100_000;
+// Pi provider registration has no native "initial batch complete" callback.
+// Reserve one explicit, bounded collection window after initialize so deferred
+// registration callbacks join the initial API 0.3 catalog rather than racing an
+// empty completion notification. The host's startup barrier is intentionally
+// larger than this window and still fails closed on timeout.
+const API_0_3_INITIAL_PROVIDER_CATALOG_WINDOW_MS = 100;
 const API_0_3_MAX_EXTENSION_FLAGS = 64;
 const API_0_3_MAX_DEPTH = 32;
 const API_0_3_MAX_PORTABLE_INTEGER = Number.MAX_SAFE_INTEGER;
@@ -69,6 +75,7 @@ const API_0_3_OPTIONAL_METHODS = [
   "provider/cancel",
   "provider/event",
   "provider/stream",
+  "providers/complete",
   "providers/register",
   "providers/unregister",
   "providers/update",
@@ -86,6 +93,7 @@ const API_0_3_OPTIONAL_METHOD_CAPABILITIES = new Map([
   ["provider/cancel", "provider_stream"],
   ["provider/event", "provider_stream"],
   ["provider/stream", "provider_stream"],
+  ["providers/complete", "provider_catalog"],
   ["providers/register", "provider_catalog"],
   ["providers/unregister", "provider_catalog"],
   ["providers/update", "provider_catalog"],
@@ -94,6 +102,9 @@ const API_0_3_OPTIONAL_METHOD_CAPABILITIES = new Map([
   ["session/reload", "session_lifecycle"],
   ["session/switch", "session_lifecycle"],
 ]);
+// The original provider surface remains an all-or-nothing selection. Catalog
+// completion is additive so a newer bridge can still run against a host that
+// predates the notification; that host gets the previous bounded behavior.
 const API_0_3_PROVIDER_METHODS = [
   "provider/auth/request",
   "provider/auth/revoke",
@@ -104,6 +115,7 @@ const API_0_3_PROVIDER_METHODS = [
   "providers/unregister",
   "providers/update",
 ];
+const API_0_3_PROVIDER_CATALOG_COMPLETION = "providers/complete";
 const API_0_3_ERROR = {
   parse_error: { code: -32700, message: "parse error" },
   invalid_request: { code: -32600, message: "invalid request" },
@@ -492,6 +504,13 @@ function diagnostic(message) {
 function boundedDiagnostic(message, maxBytes = 4096) {
   const text = String(message).replaceAll("\n", " ");
   diagnostic(Buffer.byteLength(text) <= maxBytes ? text : `${Buffer.from(text).subarray(0, maxBytes).toString("utf8")}…`);
+}
+
+function notifyHost(method, params) {
+  if (isApiV03() && !bridge?.v03Contract?.methods?.includes(method)) {
+    throw providerCapabilityError(`${method} is not selected by the API 0.3 contract`);
+  }
+  return send({ jsonrpc: "2.0", method, params });
 }
 
 async function requestHost(method, params) {
@@ -1184,7 +1203,7 @@ function registerPiProvider(name, config) {
       authorization_status: undefined,
     };
     bridge.providers.set(providerId, entry);
-    if (bridge.initialized) {
+    if (bridge.initialized && !bridge.initialProviderCatalogCollecting) {
       queueProviderMutation(
         hostMayBePublished ? "providers/update" : "providers/register",
         entry,
@@ -1302,7 +1321,7 @@ async function publishProviderMutation(method, entry) {
   bridge.providerSyncError = null;
 }
 
-function queueProviderMutation(method, entry, retiringStreams = []) {
+function queueProviderMutation(method, entry, retiringStreams = [], { initial = false } = {}) {
   bridge.providerSyncChain = bridge.providerSyncChain
     .then(async () => {
       await terminateProviderStreamsForMutation(retiringStreams);
@@ -1310,15 +1329,54 @@ function queueProviderMutation(method, entry, retiringStreams = []) {
     })
     .catch((error) => {
       bridge.providerSyncError = error;
+      if (initial) bridge.initialProviderCatalogFailed = true;
       diagnostic(`Pi provider catalog mutation failed: ${error instanceof Error ? error.message : String(error)}`);
     });
 }
 
-function queueInitialProviders() {
-  if (!providerContractAvailable()) return;
+function providerCatalogCompletionSelected() {
+  return bridge.v03Contract?.methods?.includes(API_0_3_PROVIDER_CATALOG_COMPLETION) === true;
+}
+
+function publishInitialProviderCatalog(includeCompletion) {
+  if (bridge.initialProviderCatalogQueued) return;
+  bridge.initialProviderCatalogQueued = true;
   for (const entry of bridge.providers.values()) {
-    if (!entry.published) queueProviderMutation("providers/register", entry);
+    if (!entry.published) queueProviderMutation("providers/register", entry, [], { initial: true });
   }
+  if (!includeCompletion) return;
+  // The bridge serializes reverse registrations. Queue completion behind every
+  // initial registration so the host observes the full batch rather than the
+  // first declaration. This notification also settles an empty catalog.
+  bridge.providerSyncChain = bridge.providerSyncChain
+    .then(async () => {
+      if (bridge.initialProviderCatalogFailed) return;
+      await notifyHost(API_0_3_PROVIDER_CATALOG_COMPLETION, {});
+      bridge.initialProviderCatalogComplete = true;
+    })
+    .catch((error) => {
+      bridge.providerSyncError = error;
+      bridge.initialProviderCatalogFailed = true;
+      diagnostic(`Pi initial provider catalog completion failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+}
+
+function queueInitialProviders() {
+  if (!providerContractAvailable() || bridge.initialProviderCatalogQueued) return;
+  // An older API 0.3 host lacks the additive completion notification. Preserve
+  // its pre-completion behavior instead of delaying ordinary mutations.
+  if (!providerCatalogCompletionSelected()) {
+    bridge.initialProviderCatalogCollecting = false;
+    publishInitialProviderCatalog(false);
+    return;
+  }
+  if (!bridge.initialProviderCatalogCollecting) return;
+  if (bridge.initialProviderCatalogTimer !== null) return;
+  bridge.initialProviderCatalogTimer = setTimeout(() => {
+    bridge.initialProviderCatalogTimer = null;
+    bridge.initialProviderCatalogCollecting = false;
+    publishInitialProviderCatalog(true);
+  }, API_0_3_INITIAL_PROVIDER_CATALOG_WINDOW_MS);
 }
 
 async function publishProviderUnregister(providerId, entry) {
@@ -1960,6 +2018,11 @@ function assertV03PiToolDispatch(value) {
 
 async function cleanupProviderCatalog() {
   if (!isApiV03() || !bridge?.initialized) return;
+  if (bridge.initialProviderCatalogTimer !== null) {
+    clearTimeout(bridge.initialProviderCatalogTimer);
+    bridge.initialProviderCatalogTimer = null;
+  }
+  bridge.initialProviderCatalogCollecting = false;
   await cancelAllProviderStreams();
   await bridge.providerSyncChain;
   const entries = new Map();
@@ -2861,8 +2924,15 @@ function selectV03Contract(params) {
     API_0_3_PROVIDER_METHODS,
     "optional provider methods",
   );
+  const providerCatalogCompletionOffered = optionalMethods.has(API_0_3_PROVIDER_CATALOG_COMPLETION);
   if (providerCapabilitiesOffered !== providerMethodsOffered) {
     throw v03ProtocolError("capability_mismatch", "provider capabilities and methods must be selected together");
+  }
+  if (providerCatalogCompletionOffered && !providerCapabilitiesOffered) {
+    throw v03ProtocolError(
+      "capability_mismatch",
+      "provider catalog completion requires the provider capability set",
+    );
   }
   const providerContract = providerCapabilitiesOffered && providerMethodsOffered;
   const capabilities = [...API_0_3_REQUIRED_CAPABILITIES];
@@ -2870,6 +2940,7 @@ function selectV03Contract(params) {
   if (providerContract) {
     capabilities.push(...API_0_3_PROVIDER_CAPABILITIES);
     methods.push(...API_0_3_PROVIDER_METHODS);
+    if (providerCatalogCompletionOffered) methods.push(API_0_3_PROVIDER_CATALOG_COMPLETION);
   }
   return {
     providerContract,
@@ -2928,6 +2999,11 @@ async function loadBridge(params, v03Selection = undefined) {
     providerStreams: new Map(),
     providerSyncChain: Promise.resolve(),
     providerSyncError: null,
+    initialProviderCatalogCollecting: false,
+    initialProviderCatalogQueued: false,
+    initialProviderCatalogTimer: null,
+    initialProviderCatalogComplete: false,
+    initialProviderCatalogFailed: false,
     providerRegistrationFailure: null,
     providerCatalogRevision: 0,
     loadedExtensions: [],
@@ -3044,8 +3120,11 @@ async function handleInitialize(message) {
     if (tools.length > bridge.v03Contract.limits.max_tools) {
       throw v03ProtocolError("resource_exhausted", "Pi tool catalog exceeds negotiated max_tools");
     }
-    // Keep the offered bound through the initialize response. The negotiated
-    // bound becomes active only after that frame is written successfully.
+    // Begin collecting before the response write can yield to deferred Pi
+    // registration callbacks. Reverse RPCs remain deferred until that response
+    // has been written by queueInitialProviders below.
+    bridge.initialProviderCatalogCollecting = providerContractAvailable()
+      && providerCatalogCompletionSelected();
     bridge.initialized = true;
     diagnostic(`Pi compatibility profile ${bridge.piRuntimeVersion} initialized with API 0.3`);
     return {
@@ -3586,8 +3665,9 @@ async function onMessage(message) {
     if (isApiV03() && message.method === "initialize") {
       bridge.frameLimit = bridge.v03Contract.limits.max_frame_bytes;
       // Reverse provider registration must start only after the initialize
-      // response and negotiated writer bound are both established.
-      if (bridge.providers.size) queueInitialProviders();
+      // response and negotiated writer bound are both established. Completion
+      // is emitted even when this owner declares no providers.
+      queueInitialProviders();
     }
     if (message.method === "shutdown") setImmediate(() => process.exit(0));
   } catch (error) {

@@ -5,7 +5,7 @@
 //! generation owns each entry; teardown and replacement remove that ownership
 //! atomically so a stale extension cannot keep a model callable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -128,6 +128,7 @@ struct ProviderRecord {
 struct RegistryState {
     revision: usize,
     providers: BTreeMap<String, ProviderRecord>,
+    initial_catalog_complete: BTreeSet<ExtensionProviderOwner>,
 }
 
 /// Shared registry for all executable extension provider declarations.
@@ -148,6 +149,10 @@ impl std::fmt::Debug for ExtensionProviderRegistry {
         formatter
             .debug_struct("ExtensionProviderRegistry")
             .field("providers", &state.providers.len())
+            .field(
+                "initial_catalog_complete_owners",
+                &state.initial_catalog_complete.len(),
+            )
             .field("revision", &state.revision)
             .field(
                 "authorization_policy_configured",
@@ -226,7 +231,8 @@ impl ExtensionProviderRegistry {
         Ok(result)
     }
 
-    /// Removes every declaration still owned by one exact process generation.
+    /// Removes every declaration and completion state still owned by one exact
+    /// process generation.
     ///
     /// This is idempotent and intentionally ignores a newer replacement with
     /// the same instance identity.
@@ -237,7 +243,8 @@ impl ExtensionProviderRegistry {
             .iter()
             .filter_map(|(id, record)| (&record.owner == owner).then_some(id.clone()))
             .collect::<Vec<_>>();
-        let changed = !removed.is_empty();
+        let completion_removed = state.initial_catalog_complete.remove(owner);
+        let changed = !removed.is_empty() || completion_removed;
         if changed {
             for id in removed {
                 state.providers.remove(&id);
@@ -250,12 +257,35 @@ impl ExtensionProviderRegistry {
         }
     }
 
-    /// Returns the current non-secret registry revision and declarations.
+    /// Marks an owner's complete initial provider-registration batch as settled.
+    ///
+    /// The API 0.3 `providers/complete` notification is intentionally
+    /// idempotent so a retry cannot turn a completed catalog into a partial
+    /// one. Declarations remain non-callable until this signal arrives.
+    pub fn complete_initial_catalog(&self, owner: &ExtensionProviderOwner) {
+        let mut state = lock_registry(&self.state);
+        let changed = state.initial_catalog_complete.insert(owner.clone());
+        if changed {
+            state.revision = state.revision.saturating_add(1);
+        }
+        drop(state);
+        if changed {
+            self.changed.notify_all();
+        }
+    }
+
+    /// Returns the current non-secret registry revision and completed
+    /// declarations.
+    ///
+    /// Catalog entries belonging to an owner that has not completed its initial
+    /// registration batch are deliberately withheld. This keeps compatibility
+    /// timeout behavior fail-closed instead of publishing a partial catalog.
     pub fn snapshot(&self) -> (usize, Vec<ExtensionProviderCatalogEntry>) {
         let state = lock_registry(&self.state);
         let entries = state
             .providers
             .values()
+            .filter(|record| state.initial_catalog_complete.contains(&record.owner))
             .map(|record| ExtensionProviderCatalogEntry {
                 owner: record.owner.clone(),
                 provider: record.provider.clone(),
@@ -266,30 +296,26 @@ impl ExtensionProviderRegistry {
         (state.revision, entries)
     }
 
-    /// Waits for every supplied process owner to publish at least one provider.
+    /// Waits for every supplied process owner to complete its initial provider
+    /// registration batch.
     ///
-    /// API 0.3 extensions can issue their first reverse registration only after
-    /// their initialize response is written. Hosts that need provider models at
+    /// API 0.3 extensions can issue reverse registrations only after their
+    /// initialize response is written. Hosts that need provider models at
     /// startup use this bounded barrier rather than assuming initialization
-    /// itself implies a non-empty catalog. `false` means the deadline elapsed;
-    /// a provider-capable extension is allowed to publish zero declarations.
+    /// itself implies a complete catalog. `false` means the compatibility
+    /// deadline elapsed; any declarations of an incomplete owner stay hidden.
     pub fn wait_for_owners(&self, owners: &[ExtensionProviderOwner], timeout: Duration) -> bool {
-        let owners = owners
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
+        let owners = owners.iter().cloned().collect::<BTreeSet<_>>();
         if owners.is_empty() {
             return true;
         }
         let deadline = Instant::now() + timeout;
         let mut state = lock_registry(&self.state);
         loop {
-            if owners.iter().all(|owner| {
-                state
-                    .providers
-                    .values()
-                    .any(|record| record.owner == *owner)
-            }) {
+            if owners
+                .iter()
+                .all(|owner| state.initial_catalog_complete.contains(owner))
+            {
                 return true;
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
@@ -307,16 +333,18 @@ impl ExtensionProviderRegistry {
     pub fn resolve(&self, provider_id: &str, model_id: &str) -> Option<ExtensionProviderRoute> {
         let state = lock_registry(&self.state);
         let record = state.providers.get(provider_id)?;
-        (record.authorization == ExtensionProviderAuthorizationStatus::Ready).then(|| {
-            record
-                .models
-                .get(model_id)
-                .map(|model| ExtensionProviderRoute {
-                    owner: record.owner.clone(),
-                    provider: record.provider.clone(),
-                    model: model.clone(),
-                })
-        })?
+        (state.initial_catalog_complete.contains(&record.owner)
+            && record.authorization == ExtensionProviderAuthorizationStatus::Ready)
+            .then(|| {
+                record
+                    .models
+                    .get(model_id)
+                    .map(|model| ExtensionProviderRoute {
+                        owner: record.owner.clone(),
+                        provider: record.provider.clone(),
+                        model: model.clone(),
+                    })
+            })?
     }
 
     /// Returns whether this exact route is still current and callable.
@@ -330,7 +358,8 @@ impl ExtensionProviderRegistry {
         let Some(record) = state.providers.get(&route.provider.id) else {
             return false;
         };
-        record.owner == route.owner
+        state.initial_catalog_complete.contains(&route.owner)
+            && record.owner == route.owner
             && record.authorization == ExtensionProviderAuthorizationStatus::Ready
             && record.provider == route.provider
             && record.models.get(&route.model.id) == Some(&route.model)
@@ -801,6 +830,7 @@ mod tests {
                 },
             )
             .expect("initial registration");
+        registry.complete_initial_catalog(&owner(1));
         registry
             .update(
                 owner(2),
@@ -810,6 +840,7 @@ mod tests {
                 },
             )
             .expect("newer generation replaces old");
+        registry.complete_initial_catalog(&owner(2));
         registry.remove_owner(&owner(1));
         assert_eq!(
             registry.resolve("fixture", "model").unwrap().owner,
@@ -828,11 +859,10 @@ mod tests {
     }
 
     #[test]
-    fn startup_wait_observes_post_initialize_registration_and_bounds_empty_catalogs() {
+    fn startup_wait_requires_complete_initial_batch_and_hides_incomplete_owners() {
         let registry = Arc::new(ExtensionProviderRegistry::new());
         let delayed = Arc::clone(&registry);
         let registration = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
             delayed
                 .register(
                     owner(1),
@@ -841,14 +871,50 @@ mod tests {
                         models: vec![model()],
                     },
                 )
-                .expect("delayed registration");
+                .expect("first delayed registration");
+            std::thread::sleep(Duration::from_millis(20));
+            let mut second_provider = provider();
+            second_provider.id = "fixture-second".into();
+            delayed
+                .register(
+                    owner(1),
+                    api_v03::ProviderRegisterParams {
+                        provider: second_provider,
+                        models: vec![model()],
+                    },
+                )
+                .expect("second delayed registration");
+            delayed.complete_initial_catalog(&owner(1));
         });
         assert!(registry.wait_for_owners(&[owner(1)], Duration::from_secs(1)));
         registration.join().expect("registration thread");
+        let (_, entries) = registry.snapshot();
+        assert_eq!(
+            entries.len(),
+            2,
+            "completion exposes the full initial batch"
+        );
 
+        let incomplete = ExtensionProviderRegistry::new();
+        incomplete
+            .register(
+                owner(2),
+                api_v03::ProviderRegisterParams {
+                    provider: provider(),
+                    models: vec![model()],
+                },
+            )
+            .expect("incomplete registration");
         let started = Instant::now();
-        assert!(!registry.wait_for_owners(&[owner(2)], Duration::from_millis(10)));
+        assert!(!incomplete.wait_for_owners(&[owner(2)], Duration::from_millis(10)));
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(incomplete.snapshot().1.is_empty());
+        assert!(incomplete.resolve("fixture", "model").is_none());
+
+        let empty = ExtensionProviderRegistry::new();
+        empty.complete_initial_catalog(&owner(3));
+        assert!(empty.wait_for_owners(&[owner(3)], Duration::from_millis(10)));
+        assert!(empty.snapshot().1.is_empty());
     }
 
     #[test]
@@ -863,6 +929,7 @@ mod tests {
                 },
             )
             .expect("registration");
+        registry.complete_initial_catalog(&owner(1));
         assert!(registry.resolve("fixture", "model").is_some());
         let mut authenticated = provider();
         authenticated.auth.kind = "host_credential".into();

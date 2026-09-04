@@ -60,15 +60,22 @@ one fixed aggregate Pi-tool dispatcher; it omits the legacy command, UI,
 context, notification, confirmation, process, and network contributions.
 
 In this mode, bounded secret-free `registerProvider` and `unregisterProvider`
-declarations are synchronized to Ygg's API `0.3` catalog. Ygg performs host
-authorization and retains credentials and authorization leases. The bridge
-passes only canonical semantic request JSON, secret-free catalog metadata, and
-a generic cancellation signal to the extension's `yggStream` adapter. It
-rejects endpoint/base-URL, headers, API keys, transport, callback, and OAuth
-payload authority rather than forwarding it. Safe semantic
-`before_provider_request` transforms and reduced `after_provider_response`
-status hooks are supported; `before_provider_headers` is explicitly rejected
-because headers remain host-owned.
+declarations are synchronized to Ygg's API `0.3` catalog. After the bridge's
+bounded initial startup collection window closes and it has received every
+response for the serialized registration batch, it emits the additive
+`providers/complete` notification, including for an empty catalog. Ygg projects
+an owner's declarations only after that completion signal; an older API `0.3`
+extension that does not negotiate it reaches a bounded timeout with its
+incomplete declarations withheld rather than publishing a partial route.
+Ygg performs host authorization and retains credentials and authorization
+leases. The bridge passes only canonical semantic request JSON, secret-free
+catalog metadata, and a generic cancellation signal to the extension's
+`yggStream` adapter. It rejects endpoint/base-URL, headers, API keys,
+transport, callback, and OAuth payload authority rather than forwarding it.
+Safe semantic `before_provider_request` transforms and reduced
+`after_provider_response` status hooks are supported;
+`before_provider_headers` is explicitly rejected because headers remain
+host-owned.
 
 Outside that opt-in mode, provider registration and provider payload hooks fail
 explicitly. The bridge does not silently emulate session/tree mutation,

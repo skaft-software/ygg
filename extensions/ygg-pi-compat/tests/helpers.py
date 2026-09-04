@@ -45,6 +45,7 @@ def v03_contract(*, providers: bool = True, max_frame_bytes: int = 1_048_576) ->
             "provider/cancel",
             "provider/event",
             "provider/stream",
+            "providers/complete",
             "providers/register",
             "providers/unregister",
             "providers/update",
