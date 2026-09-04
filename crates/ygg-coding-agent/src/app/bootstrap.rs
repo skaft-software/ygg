@@ -31,7 +31,8 @@ use crate::extensions::{ExecutableExtensions, SUBAGENTS_EXTENSION_NAME};
 use crate::modes::interactive::run_blocking_lifecycle;
 use crate::prompts::PromptRegistry;
 use crate::providers::{
-    ModelDiscovery, ModelFilter, ProviderDeclaration, ProviderRoute, BUILTIN_PROVIDER_DECLARATIONS,
+    ModelDiscovery, ModelFilter, ProviderDeclaration, ProviderRoute, ProviderRuntimeConfiguration,
+    BUILTIN_PROVIDER_DECLARATIONS,
 };
 use crate::resources::{format_skills_for_prompt, FileSystemSkillRegistry};
 use crate::session_store::SessionStore;
@@ -954,7 +955,7 @@ fn discovered_model_supports_reasoning(protocol: Protocol, id: &str) -> bool {
                 || id.contains("reason")
                 || id.contains("r1")
         }
-        Protocol::AnthropicMessages => false,
+        Protocol::AnthropicMessages | Protocol::BedrockConverse => false,
     }
 }
 
@@ -1530,6 +1531,162 @@ fn openrouter_models_from_response(
     Ok(models)
 }
 
+fn azure_openai_configuration(
+    declaration: &ProviderDeclaration,
+) -> anyhow::Result<Option<(url::Url, String)>> {
+    let endpoint = optional_env("AZURE_OPENAI_ENDPOINT")?;
+    let resource = optional_env("AZURE_OPENAI_RESOURCE")?;
+    let version = optional_env("AZURE_OPENAI_API_VERSION")?;
+    let deployment = optional_env("AZURE_OPENAI_DEPLOYMENT")?;
+    azure_openai_configuration_from_values(
+        declaration,
+        endpoint.as_deref(),
+        resource.as_deref(),
+        version.as_deref(),
+        deployment.as_deref(),
+    )
+}
+
+fn azure_openai_configuration_from_values(
+    declaration: &ProviderDeclaration,
+    endpoint: Option<&str>,
+    resource: Option<&str>,
+    version: Option<&str>,
+    deployment: Option<&str>,
+) -> anyhow::Result<Option<(url::Url, String)>> {
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint.to_owned(),
+        None => {
+            let Some(resource) = resource else {
+                return Ok(None);
+            };
+            if resource.is_empty()
+                || resource.len() > 128
+                || !resource
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                anyhow::bail!("invalid AZURE_OPENAI_RESOURCE");
+            }
+            format!("https://{resource}.openai.azure.com/")
+        }
+    };
+    let mut endpoint =
+        url::Url::parse(&endpoint).map_err(|_| anyhow::anyhow!("invalid AZURE_OPENAI_ENDPOINT"))?;
+    if !matches!(endpoint.scheme(), "https" | "http")
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        anyhow::bail!("invalid AZURE_OPENAI_ENDPOINT");
+    }
+    if !endpoint.path().ends_with('/') {
+        endpoint.set_path(&format!("{}/", endpoint.path()));
+    }
+    let mut base_url = endpoint.join("openai/")?;
+    let version = version
+        .map(str::to_owned)
+        .or_else(|| {
+            url::Url::parse(declaration.base_url).ok().and_then(|url| {
+                url.query_pairs()
+                    .find(|(name, _)| name == "api-version")
+                    .map(|(_, value)| value.into_owned())
+            })
+        })
+        .ok_or_else(|| anyhow::anyhow!("AZURE_OPENAI_API_VERSION is required"))?;
+    if version.is_empty()
+        || version.len() > 96
+        || !version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+    {
+        anyhow::bail!("invalid AZURE_OPENAI_API_VERSION");
+    }
+    base_url.set_query(Some(&format!("api-version={version}")));
+    let deployment = deployment
+        .ok_or_else(|| anyhow::anyhow!("AZURE_OPENAI_DEPLOYMENT is required"))?
+        .to_owned();
+    if deployment.is_empty() || deployment.len() > 256 || deployment.chars().any(char::is_control) {
+        anyhow::bail!("invalid AZURE_OPENAI_DEPLOYMENT");
+    }
+    Ok(Some((base_url, deployment)))
+}
+
+fn register_azure_openai(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+) -> anyhow::Result<()> {
+    let Some(credential) = crate::providers::resolve_environment(declaration)? else {
+        return Ok(());
+    };
+    let Some((base_url, deployment)) = azure_openai_configuration(declaration)? else {
+        return Ok(());
+    };
+    crate::providers::register_environment_endpoints_at_base_url(
+        catalog,
+        declaration,
+        &credential,
+        &base_url,
+        PROVIDER_RESPONSE_HEADER_TIMEOUT,
+    )?;
+    let Some(route) = declaration.route_for_model(&deployment) else {
+        anyhow::bail!("Azure OpenAI declaration has no default route");
+    };
+    crate::providers::register_discovered_model(
+        catalog,
+        declaration,
+        &deployment,
+        Some(format!("Azure OpenAI: {deployment}")),
+        Capabilities {
+            input_modalities: ModalitySet::none().with(ygg_ai::Modality::Image),
+            output_modalities: ModalitySet::none(),
+            tools: true,
+            parallel_tool_calls: true,
+            reasoning: discovered_model_supports_reasoning(route.protocol, &deployment).then_some(
+                ReasoningCapability {
+                    control: ReasoningControl::Effort,
+                    exposes_text: true,
+                    preserves_state: true,
+                    effort_budgets: None,
+                    openai_chat_mode: OpenAiChatReasoningMode::Standard,
+                    min_effort: ygg_ai::ReasoningEffort::Minimal,
+                    max_effort: ygg_ai::ReasoningEffort::High,
+                },
+            ),
+            responses_lite: false,
+            agent_delegation: None,
+            structured_output: true,
+            deferred_tool_loading: false,
+        },
+        ModelLimits {
+            context_window: 128_000,
+            max_output_tokens: 16_384,
+        },
+        None,
+    )
+}
+
+fn register_aws_bedrock(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+) -> anyhow::Result<()> {
+    let region = crate::providers::aws_bedrock_region()?;
+    let Some(auth) = crate::providers::aws_bedrock_auth(&region)? else {
+        return Ok(());
+    };
+    let base_url = crate::providers::aws_bedrock_base_url(&region)?;
+    crate::providers::register_private_endpoints_at_base_url(
+        catalog,
+        declaration,
+        auth,
+        &base_url,
+        PROVIDER_RESPONSE_HEADER_TIMEOUT,
+    )?;
+    crate::providers::register_static_models(catalog, declaration)
+}
+
 fn try_register_declaration(
     catalog: &mut ModelCatalog,
     declaration: &ProviderDeclaration,
@@ -1537,6 +1694,15 @@ fn try_register_declaration(
     declaration.validate().map_err(|error| {
         anyhow::anyhow!("invalid {} provider declaration: {error}", declaration.id)
     })?;
+    match declaration.runtime_configuration {
+        ProviderRuntimeConfiguration::AwsBedrock => {
+            return register_aws_bedrock(catalog, declaration);
+        }
+        ProviderRuntimeConfiguration::AzureOpenAi => {
+            return register_azure_openai(catalog, declaration);
+        }
+        ProviderRuntimeConfiguration::Default => {}
+    }
     let Some(credential) = crate::providers::resolve_environment(declaration)? else {
         return Ok(());
     };
@@ -1597,15 +1763,34 @@ fn merge_provider_catalog(target: &mut ModelCatalog, source: ModelCatalog) -> an
     Ok(())
 }
 
+fn declaration_is_configured(declaration: &ProviderDeclaration) -> anyhow::Result<bool> {
+    match declaration.runtime_configuration {
+        ProviderRuntimeConfiguration::Default => {
+            Ok(crate::providers::resolve_environment(declaration)?.is_some())
+        }
+        // The AWS chain includes EC2 instance metadata, which has no local
+        // configuration marker. Schedule one bounded private registration job;
+        // it decides whether a credential exists and avoids probing the chain
+        // once here and again when constructing the endpoint.
+        ProviderRuntimeConfiguration::AwsBedrock => Ok(true),
+        ProviderRuntimeConfiguration::AzureOpenAi => {
+            if crate::providers::resolve_environment(declaration)?.is_none() {
+                return Ok(false);
+            }
+            Ok(azure_openai_configuration(declaration)?.is_some())
+        }
+    }
+}
+
 /// Discover configured provider catalogs concurrently, then merge them on the
 /// launch thread. A fleet outage therefore costs at most one bounded discovery
 /// interval instead of one interval per configured account.
 fn register_configured_presets_parallel(catalog: &mut ModelCatalog) {
     let mut jobs = Vec::new();
     for declaration in BUILTIN_PROVIDER_DECLARATIONS {
-        match crate::providers::resolve_environment(declaration) {
-            Ok(Some(_)) => {}
-            Ok(None) => continue,
+        match declaration_is_configured(declaration) {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(error) => {
                 // An invalid/oversized optional credential must not become a
                 // request, but one unusable provider must not block other

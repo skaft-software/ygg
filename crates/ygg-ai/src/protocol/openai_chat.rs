@@ -1027,11 +1027,7 @@ pub(crate) fn build_request(
     let body_bytes = serde_json::to_vec(&chat_req)
         .map_err(|e| AiError::Decode(DecodeError::Json(e.to_string())))?;
 
-    let url = model
-        .endpoint
-        .base_url
-        .join("chat/completions")
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let url = crate::protocol::endpoint_url(&model.endpoint.base_url, "chat/completions")?;
 
     let mut headers = http::HeaderMap::new();
     let affinity_format = model.spec.cache.send_session_affinity_headers.then_some(

@@ -620,6 +620,49 @@ pub const OPENCODE_MODELS: &[StaticModelPreset] = &[
     ),
 ];
 
+pub const BEDROCK_MODELS: &[StaticModelPreset] = &[
+    StaticModelPreset::new(
+        "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        "Claude 3.5 Sonnet (Bedrock)",
+        Protocol::BedrockConverse,
+        200_000,
+        8_192,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "Claude 3.7 Sonnet (Bedrock)",
+        Protocol::BedrockConverse,
+        200_000,
+        8_192,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+        "Claude Sonnet 4 (Bedrock)",
+        Protocol::BedrockConverse,
+        200_000,
+        64_000,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+    StaticModelPreset::new(
+        "amazon.nova-pro-v1:0",
+        "Amazon Nova Pro (Bedrock)",
+        Protocol::BedrockConverse,
+        300_000,
+        5_000,
+        true,
+        false,
+        ReasoningEffort::High,
+    ),
+];
+
 /// Checked-in Mistral Chat Completions models. These retain the Mistral
 /// transport profile while using the canonical OpenAI Chat model contract.
 pub const MISTRAL_MODELS: &[StaticModelPreset] = &[
@@ -844,6 +887,7 @@ pub(crate) fn static_models(set: StaticModelSet) -> &'static [StaticModelPreset]
         StaticModelSet::None => &[],
         StaticModelSet::MiniMax => MINIMAX_MODELS,
         StaticModelSet::OpenCode => OPENCODE_MODELS,
+        StaticModelSet::Bedrock => BEDROCK_MODELS,
         StaticModelSet::Mistral => MISTRAL_MODELS,
         StaticModelSet::CloudflareWorkersAi => CLOUDFLARE_WORKERS_AI_MODELS,
         StaticModelSet::CloudflareAiGateway => CLOUDFLARE_AI_GATEWAY_MODELS,

@@ -318,6 +318,8 @@ pub(crate) fn validate_model_spec(spec: &ModelSpec) -> Result<(), ConfigError> {
                 ReasoningControl::Effort | ReasoningControl::AlwaysOn | ReasoningControl::Toggle
             ),
             Protocol::OpenAiResponses => reasoning.control == ReasoningControl::Effort,
+            // Converse has no portable reasoning control in this codec.
+            Protocol::BedrockConverse => false,
         };
         let chat_mode_matches = reasoning.openai_chat_mode == OpenAiChatReasoningMode::Standard
             || (spec.protocol == Protocol::OpenAiChat
@@ -364,21 +366,31 @@ pub(crate) fn validate_endpoint(endpoint: &Endpoint) -> Result<(), ConfigError> 
 }
 
 fn validate_base_url(url: &url::Url) -> Result<(), ConfigError> {
+    let allowed_version_query = url.query_pairs().collect::<Vec<_>>();
+    let has_only_api_version = allowed_version_query.len() == 1
+        && allowed_version_query[0].0 == "api-version"
+        && !allowed_version_query[0].1.is_empty()
+        && allowed_version_query[0].1.len() <= 128
+        && allowed_version_query[0]
+            .1
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
     if !url.cannot_be_a_base()
         && (url.scheme() == "http" || url.scheme() == "https")
         && url.username().is_empty()
         && url.password().is_none()
-        && url.query().is_none()
+        && (url.query().is_none() || has_only_api_version)
         && url.fragment().is_none()
         && url.path().ends_with('/')
     {
         Ok(())
     } else {
-        // Invalid URLs may contain userinfo or query credentials. Return the
-        // contract, not attacker-controlled URL text, because catalog errors
-        // can be persisted or presented directly by downstream applications.
+        // Invalid URLs may contain userinfo or query credentials. The only
+        // query accepted on an endpoint base is Azure's non-secret
+        // `api-version`; return the contract, not attacker-controlled URL text,
+        // because catalog errors can be persisted or presented directly.
         Err(ConfigError::InvalidBaseUrl(
-            "expected an absolute HTTP(S) URL without userinfo, query, or fragment and with a trailing slash"
+            "expected an absolute HTTP(S) URL without userinfo or fragment, with a trailing slash and at most one non-secret api-version query"
                 .to_owned(),
         ))
     }

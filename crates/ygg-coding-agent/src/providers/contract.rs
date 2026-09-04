@@ -23,6 +23,12 @@ pub enum ProviderAuthentication {
         /// Variables checked in priority order by the private auth lifecycle.
         variables: &'static [&'static str],
     },
+    /// A product-owned AWS credential chain supplies a request signer.
+    Aws {
+        /// Environment variables that document the standard AWS setup surface.
+        /// The private resolver also supports profiles and task/instance metadata.
+        variables: &'static [&'static str],
+    },
     /// A product-owned subscription login supplies the dynamic credential.
     Subscription {
         /// Stable login selector shown in setup diagnostics.
@@ -34,7 +40,7 @@ impl ProviderAuthentication {
     pub(crate) fn environment_variables(self) -> Option<&'static [&'static str]> {
         match self {
             Self::Environment { variables } => Some(variables),
-            Self::Subscription { .. } => None,
+            Self::Aws { .. } | Self::Subscription { .. } => None,
         }
     }
 }
@@ -116,6 +122,8 @@ pub enum StaticModelSet {
     CloudflareWorkersAi,
     /// Cloudflare AI Gateway provider-routed models.
     CloudflareAiGateway,
+    /// Amazon Bedrock Converse models with published conservative limits.
+    Bedrock,
 }
 
 /// Whether a discovery cache is required before a provider can expose models or
@@ -196,6 +204,10 @@ pub enum EndpointAuthPresentation {
     /// Forward the private environment credential through Cloudflare AI
     /// Gateway's `cf-aig-authorization: Bearer <token>` header.
     CloudflareAiGateway,
+    /// Send the private environment credential in a declaration-selected header.
+    Header(&'static str),
+    /// Sign the exact request with a private AWS SigV4 credential chain.
+    AwsSigV4,
     /// Bind a private dynamic resolver owned by the authentication lifecycle.
     Dynamic,
 }
@@ -257,6 +269,20 @@ pub enum ModelRouteRule {
     },
 }
 
+/// Non-secret endpoint construction selected by a built-in declaration.
+///
+/// This remains internal setup metadata and is intentionally omitted from
+/// [`ProviderDefinition`], which never exposes endpoint URLs or credentials.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderRuntimeConfiguration {
+    /// Use the declaration's fixed base URL.
+    Default,
+    /// Build a regional Amazon Bedrock Runtime endpoint and use SigV4.
+    AwsBedrock,
+    /// Build an Azure OpenAI Responses endpoint from resource/deployment setup.
+    AzureOpenAi,
+}
+
 /// Data-only built-in provider declaration.
 ///
 /// It contains no credential material. The private auth lifecycle translates a
@@ -275,6 +301,8 @@ pub struct ProviderDeclaration {
     pub base_url_environment: &'static [&'static str],
     /// Setup and authentication lifecycle kind.
     pub authentication: ProviderAuthentication,
+    /// Non-secret endpoint construction selected by this declaration.
+    pub runtime_configuration: ProviderRuntimeConfiguration,
     /// Model inventory source.
     pub model_discovery: ModelDiscovery,
     /// Conservative capability behavior for sparse inventory responses.
@@ -342,7 +370,8 @@ impl ProviderDeclaration {
             id: self.id.to_owned(),
             label: self.name.to_owned(),
             authentication: match self.authentication {
-                ProviderAuthentication::Environment { variables } => ProviderAccess::Environment {
+                ProviderAuthentication::Environment { variables }
+                | ProviderAuthentication::Aws { variables } => ProviderAccess::Environment {
                     variables: variables.iter().map(|value| (*value).to_owned()).collect(),
                 },
                 ProviderAuthentication::Subscription { login } => ProviderAccess::Subscription {
@@ -427,7 +456,8 @@ impl ProviderDeclaration {
         }
         validate_base_url_template(self.base_url, self.base_url_environment)?;
         match self.authentication {
-            ProviderAuthentication::Environment { variables } => {
+            ProviderAuthentication::Environment { variables }
+            | ProviderAuthentication::Aws { variables } => {
                 if variables.is_empty() || variables.iter().any(|value| !valid_env_name(value)) {
                     return Err(ProviderDefinitionError::new(
                         "provider credential environment declaration is invalid",
@@ -458,6 +488,13 @@ impl ProviderDeclaration {
                     "provider OpenAI Chat runtime profile requires a Chat route",
                 ));
             }
+            if let EndpointAuthPresentation::Header(name) = route.auth_presentation {
+                if !name.bytes().all(is_http_token_byte) || name.is_empty() {
+                    return Err(ProviderDefinitionError::new(
+                        "provider credential header declaration is invalid",
+                    ));
+                }
+            }
             if route.runtime.responses_profile != ResponsesRuntimeProfile::Default
                 && route.protocol != Protocol::OpenAiResponses
             {
@@ -479,6 +516,10 @@ impl ProviderDeclaration {
                     EndpointAuthPresentation::Bearer
                         | EndpointAuthPresentation::ApiKeyHeader
                         | EndpointAuthPresentation::CloudflareAiGateway
+                        | EndpointAuthPresentation::Header(_)
+                ) | (
+                    ProviderAuthentication::Aws { .. },
+                    EndpointAuthPresentation::AwsSigV4
                 ) | (
                     ProviderAuthentication::Subscription { .. },
                     EndpointAuthPresentation::Dynamic
@@ -904,6 +945,22 @@ fn valid_provider_label(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 
+fn valid_version_query(url: &url::Url) -> bool {
+    let Some(query) = url.query() else {
+        return true;
+    };
+    query.len() <= 128
+        && url.query_pairs().next().is_some_and(|(name, value)| {
+            name == "api-version"
+                && !value.is_empty()
+                && value.len() <= 96
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        })
+        && url.query_pairs().nth(1).is_none()
+}
+
 fn valid_env_name(value: &str) -> bool {
     !value.is_empty()
         && value
@@ -915,7 +972,7 @@ fn valid_base_url(url: &url::Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
-        && url.query().is_none()
+        && valid_version_query(url)
         && url.fragment().is_none()
         && url.path().ends_with('/')
 }
@@ -1113,6 +1170,28 @@ mod tests {
                 ("openai-beta", "responses=experimental"),
                 ("originator", "ygg")
             ]
+        );
+        assert_eq!(
+            BEDROCK
+                .route_for_model("anthropic.claude-3-7-sonnet-20250219-v1:0")
+                .expect("Bedrock default route")
+                .protocol,
+            Protocol::BedrockConverse
+        );
+        assert!(matches!(
+            BEDROCK.authentication,
+            ProviderAuthentication::Aws { .. }
+        ));
+        assert_eq!(
+            AZURE_OPENAI
+                .route_for_model("configured-deployment")
+                .expect("Azure OpenAI default route")
+                .auth_presentation,
+            EndpointAuthPresentation::Header("api-key")
+        );
+        assert_eq!(
+            AZURE_OPENAI.runtime_configuration,
+            ProviderRuntimeConfiguration::AzureOpenAi
         );
         assert_eq!(
             FIREWORKS

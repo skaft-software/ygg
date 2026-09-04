@@ -654,11 +654,7 @@ pub(crate) fn build_request(
     let body_bytes = serde_json::to_vec(&anth_req)
         .map_err(|e| AiError::Decode(DecodeError::Json(e.to_string())))?;
 
-    let url = model
-        .endpoint
-        .base_url
-        .join("messages")
-        .map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let url = crate::protocol::endpoint_url(&model.endpoint.base_url, "messages")?;
 
     let mut headers = http::HeaderMap::new();
     headers.insert(

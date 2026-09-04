@@ -49,8 +49,9 @@ mod validate;
 pub(crate) mod protocol;
 
 pub use auth::{
-    Auth, CredentialResolver, CredentialResolverRegistry, CredentialScheme, ResolvedCredential,
-    Secret,
+    Auth, AwsCredentials, AwsSigV4Signer, CredentialResolver, CredentialResolverRegistry,
+    CredentialScheme, RequestSigner, ResolvedCredential, Secret, SignedRequestHeaders,
+    SigningRequest,
 };
 pub use catalog::{AuthConfig, CatalogConfig, EndpointConfig, Model, ModelCatalog, ModelConfig};
 pub use client::AiClient;

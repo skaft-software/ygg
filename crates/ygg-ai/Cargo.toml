@@ -30,6 +30,7 @@ thiserror = "1"
 url = { version = "2", features = ["serde"] }
 base64 = "0.22"
 mime = "0.3"
+sha2 = "0.10"
 zstd = "0.13"
 
 [build-dependencies]

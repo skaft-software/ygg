@@ -256,7 +256,7 @@ fn test_lossy_inserts_missing_tool_result_before_next_assistant() {
                     .body,
             )
             .unwrap(),
-            Protocol::OpenAiChat => unreachable!(),
+            Protocol::OpenAiChat | Protocol::BedrockConverse => unreachable!(),
         };
         let serialized = body.to_string();
         assert!(serialized.contains("call_missing"));

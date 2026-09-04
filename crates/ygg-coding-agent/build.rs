@@ -138,6 +138,7 @@ struct ProviderSpec {
     #[serde(default)]
     base_url_environment: Vec<String>,
     authentication: AuthenticationSpec,
+    runtime_configuration: Option<String>,
     model_discovery: DiscoverySpec,
     discovery_capabilities: String,
     static_models: String,
@@ -153,6 +154,7 @@ struct ProviderSpec {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum AuthenticationSpec {
     Environment { variables: Vec<String> },
+    Aws { variables: Vec<String> },
     Subscription { login: String },
 }
 
@@ -183,6 +185,7 @@ struct RouteSpec {
     #[serde(default = "default_openai_chat_profile")]
     openai_chat_profile: String,
     auth_presentation: String,
+    auth_header: Option<String>,
 }
 
 fn default_openai_chat_profile() -> String {
@@ -235,7 +238,7 @@ fn valid_base_url(url: &url::Url) -> bool {
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
-        && url.query().is_none()
+        && valid_version_query(url)
         && url.fragment().is_none()
         && url.path().ends_with('/')
 }
@@ -294,6 +297,22 @@ fn credential_like_header(name: &str) -> bool {
         || lower.contains("password")
 }
 
+fn valid_version_query(url: &url::Url) -> bool {
+    let Some(query) = url.query() else {
+        return true;
+    };
+    query.len() <= 128
+        && url.query_pairs().next().is_some_and(|(name, value)| {
+            name == "api-version"
+                && !value.is_empty()
+                && value.len() <= 96
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
+        })
+        && url.query_pairs().nth(1).is_none()
+}
+
 fn valid_public_header(name: &str, value: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(is_http_token_byte)
@@ -329,6 +348,7 @@ fn protocol_expression(value: &str) -> Option<&'static str> {
         "openai_responses" => Some("Protocol::OpenAiResponses"),
         "openai_chat" => Some("Protocol::OpenAiChat"),
         "anthropic_messages" => Some("Protocol::AnthropicMessages"),
+        "bedrock_converse" => Some("Protocol::BedrockConverse"),
         _ => None,
     }
 }
@@ -365,12 +385,28 @@ fn openai_chat_profile_expression(value: &str) -> Option<&'static str> {
     }
 }
 
-fn auth_presentation_expression(value: &str) -> Option<&'static str> {
-    match value {
-        "bearer" => Some("EndpointAuthPresentation::Bearer"),
-        "api_key_header" => Some("EndpointAuthPresentation::ApiKeyHeader"),
-        "cloudflare_ai_gateway" => Some("EndpointAuthPresentation::CloudflareAiGateway"),
-        "dynamic" => Some("EndpointAuthPresentation::Dynamic"),
+fn auth_presentation_expression(route: &RouteSpec) -> Option<String> {
+    match route.auth_presentation.as_str() {
+        "bearer" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::Bearer".to_owned())
+        }
+        "api_key_header" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::ApiKeyHeader".to_owned())
+        }
+        "cloudflare_ai_gateway" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::CloudflareAiGateway".to_owned())
+        }
+        "header" => route
+            .auth_header
+            .as_deref()
+            .filter(|header| !header.is_empty() && header.bytes().all(is_http_token_byte))
+            .map(|header| format!("EndpointAuthPresentation::Header({})", quote(header))),
+        "aws_sigv4" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::AwsSigV4".to_owned())
+        }
+        "dynamic" if route.auth_header.is_none() => {
+            Some("EndpointAuthPresentation::Dynamic".to_owned())
+        }
         _ => None,
     }
 }
@@ -392,6 +428,16 @@ fn static_models_expression(value: &str) -> Option<&'static str> {
         "mistral" => Some("StaticModelSet::Mistral"),
         "cloudflare_workers_ai" => Some("StaticModelSet::CloudflareWorkersAi"),
         "cloudflare_ai_gateway" => Some("StaticModelSet::CloudflareAiGateway"),
+        "bedrock" => Some("StaticModelSet::Bedrock"),
+        _ => None,
+    }
+}
+
+fn runtime_configuration_expression(value: Option<&str>) -> Option<&'static str> {
+    match value.unwrap_or("default") {
+        "default" => Some("ProviderRuntimeConfiguration::Default"),
+        "aws_bedrock" => Some("ProviderRuntimeConfiguration::AwsBedrock"),
+        "azure_openai" => Some("ProviderRuntimeConfiguration::AzureOpenAi"),
         _ => None,
     }
 }
@@ -679,10 +725,10 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
         ));
     }
     match &spec.authentication {
-        AuthenticationSpec::Environment { variables }
+        AuthenticationSpec::Environment { variables } | AuthenticationSpec::Aws { variables }
             if !variables.is_empty()
                 && variables.iter().all(|value| valid_environment_name(value)) => {}
-        AuthenticationSpec::Environment { .. } => {
+        AuthenticationSpec::Environment { .. } | AuthenticationSpec::Aws { .. } => {
             return Err(provider_manifest_error(
                 "provider declaration has an invalid credential environment",
             ));
@@ -707,7 +753,7 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
             || body_encoding_expression(&route.body_encoding).is_none()
             || responses_profile_expression(&route.responses_profile).is_none()
             || openai_chat_profile_expression(&route.openai_chat_profile).is_none()
-            || auth_presentation_expression(&route.auth_presentation).is_none()
+            || auth_presentation_expression(route).is_none()
         {
             return Err(provider_manifest_error(
                 "provider declaration has an invalid route",
@@ -734,8 +780,9 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
             (&spec.authentication, route.auth_presentation.as_str()),
             (
                 AuthenticationSpec::Environment { .. },
-                "bearer" | "api_key_header" | "cloudflare_ai_gateway"
-            ) | (AuthenticationSpec::Subscription { .. }, "dynamic")
+                "bearer" | "api_key_header" | "cloudflare_ai_gateway" | "header"
+            ) | (AuthenticationSpec::Aws { .. }, "aws_sigv4")
+                | (AuthenticationSpec::Subscription { .. }, "dynamic")
         );
         if !valid_presentation {
             return Err(provider_manifest_error(
@@ -786,6 +833,7 @@ fn validate_provider(spec: &ProviderSpec) -> Result<(), io::Error> {
     }
     if discovery_capabilities_expression(&spec.discovery_capabilities).is_none()
         || static_models_expression(&spec.static_models).is_none()
+        || runtime_configuration_expression(spec.runtime_configuration.as_deref()).is_none()
         || cache_mode_expression(&spec.inventory_cache).is_none()
         || compatibility_expression(&spec.compatibility).is_none()
         || pricing_expression(&spec.pricing).is_none()
@@ -817,6 +865,14 @@ fn authentication_expression(spec: &AuthenticationSpec) -> String {
                 .join(", ");
             format!("ProviderAuthentication::Environment {{ variables: &[{variables}] }}")
         }
+        AuthenticationSpec::Aws { variables } => {
+            let variables = variables
+                .iter()
+                .map(|value| quote(value))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("ProviderAuthentication::Aws {{ variables: &[{variables}] }}")
+        }
         AuthenticationSpec::Subscription { login } => format!(
             "ProviderAuthentication::Subscription {{ login: {} }}",
             quote(login)
@@ -828,8 +884,11 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
     let manifest_path = manifest_dir.join("src/providers/declarations.json");
     println!("cargo:rerun-if-changed={}", manifest_path.display());
     let source = fs::read_to_string(&manifest_path)?;
-    let manifest: ProviderManifest = serde_json::from_str(&source)
-        .map_err(|_| provider_manifest_error("provider declaration manifest is invalid JSON"))?;
+    let manifest: ProviderManifest = serde_json::from_str(&source).map_err(|error| {
+        provider_manifest_error(format!(
+            "provider declaration manifest is invalid JSON: {error}"
+        ))
+    })?;
     if manifest.schema_version != 2 || manifest.providers.is_empty() {
         return Err(provider_manifest_error(
             "provider declaration manifest has an unsupported schema version",
@@ -892,6 +951,13 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
         .expect("writing to String cannot fail");
         writeln!(
             generated,
+            "    runtime_configuration: {},",
+            runtime_configuration_expression(provider.runtime_configuration.as_deref())
+                .expect("validated runtime configuration")
+        )
+        .expect("writing to String cannot fail");
+        writeln!(
+            generated,
             "    model_discovery: {},",
             discovery_expression(&provider.model_discovery)?
         )
@@ -923,7 +989,7 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
                 quote(&route.endpoint_id),
                 quote(&route.base_path),
                 protocol_expression(&route.protocol).expect("validated protocol"),
-                auth_presentation_expression(&route.auth_presentation)
+                auth_presentation_expression(route)
                     .expect("validated auth presentation"),
                 transport_expression(&route.transport).expect("validated transport"),
                 body_encoding_expression(&route.body_encoding).expect("validated body encoding"),
@@ -976,7 +1042,7 @@ fn generate_provider_declarations(manifest_dir: &Path, out_dir: &Path) -> io::Re
     for provider in &manifest.providers {
         if matches!(
             provider.authentication,
-            AuthenticationSpec::Environment { .. }
+            AuthenticationSpec::Environment { .. } | AuthenticationSpec::Aws { .. }
         ) {
             writeln!(generated, "    {},", provider.const_name)
                 .expect("writing to String cannot fail");

@@ -21,6 +21,55 @@ fn discovered_reasoning_supports_chat_and_responses_models() {
 }
 
 #[test]
+fn azure_openai_configuration_routes_deployments_through_versioned_responses_base() {
+    let declaration = BUILTIN_PROVIDER_DECLARATIONS
+        .iter()
+        .find(|declaration| declaration.id == "azure-openai")
+        .expect("Azure OpenAI declaration");
+    let (base_url, deployment) = azure_openai_configuration_from_values(
+        declaration,
+        None,
+        Some("enterprise-resource"),
+        None,
+        Some("production-gpt"),
+    )
+    .unwrap()
+    .expect("Azure configuration");
+
+    assert_eq!(deployment, "production-gpt");
+    assert_eq!(
+        base_url.as_str(),
+        "https://enterprise-resource.openai.azure.com/openai/?api-version=2025-04-01-preview"
+    );
+}
+
+#[test]
+fn azure_openai_configuration_rejects_credential_bearing_endpoint_urls() {
+    let declaration = BUILTIN_PROVIDER_DECLARATIONS
+        .iter()
+        .find(|declaration| declaration.id == "azure-openai")
+        .expect("Azure OpenAI declaration");
+    let error = azure_openai_configuration_from_values(
+        declaration,
+        Some("https://example.invalid/?api-key=secret"),
+        None,
+        None,
+        Some("deployment"),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid AZURE_OPENAI_ENDPOINT"));
+}
+
+#[test]
+fn aws_runtime_registration_is_scheduled_without_a_static_environment_marker() {
+    let declaration = BUILTIN_PROVIDER_DECLARATIONS
+        .iter()
+        .find(|declaration| declaration.id == "bedrock")
+        .expect("Bedrock declaration");
+    assert!(declaration_is_configured(declaration).unwrap());
+}
+
+#[test]
 fn codex_compaction_respects_model_window_and_allows_smaller_caps() {
     let directory = tempfile::tempdir().unwrap();
     let mut config = config(directory.path(), None);

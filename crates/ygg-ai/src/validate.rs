@@ -140,7 +140,8 @@ pub(crate) fn validate_request(
                 // If the protocol requires pairing (Anthropic, OpenAI Responses),
                 // check if there were any unresolved tool calls from the previous assistant turn.
                 if (protocol == Protocol::AnthropicMessages
-                    || protocol == Protocol::OpenAiResponses)
+                    || protocol == Protocol::OpenAiResponses
+                    || protocol == Protocol::BedrockConverse)
                     && !pending_calls.is_empty()
                 {
                     // In Strict mode, this is a ValidationError.
@@ -189,7 +190,9 @@ pub(crate) fn validate_request(
         }
     }
 
-    if (protocol == Protocol::AnthropicMessages || protocol == Protocol::OpenAiResponses)
+    if (protocol == Protocol::AnthropicMessages
+        || protocol == Protocol::OpenAiResponses
+        || protocol == Protocol::BedrockConverse)
         && !pending_calls.is_empty()
     {
         for call_id in &pending_calls {
@@ -237,7 +240,8 @@ pub(crate) fn validate_request(
                                         "Inline images require an explicit media type".to_string(),
                                     ),
                                     Some(mime)
-                                        if protocol == Protocol::AnthropicMessages
+                                        if (protocol == Protocol::AnthropicMessages
+                                            || protocol == Protocol::BedrockConverse)
                                             && !matches!(
                                                 mime.as_ref(),
                                                 "image/jpeg"
@@ -246,7 +250,7 @@ pub(crate) fn validate_request(
                                                     | "image/webp"
                                             ) =>
                                     {
-                                        Some("Anthropic inline images require JPEG, PNG, GIF, or WebP media type".to_string())
+                                        Some("Anthropic and Bedrock inline images require JPEG, PNG, GIF, or WebP media type".to_string())
                                     }
                                     Some(_) => None,
                                 };
@@ -259,6 +263,20 @@ pub(crate) fn validate_request(
                                         message,
                                     });
                                 }
+                            }
+
+                            // Bedrock Converse accepts image bytes, not remote URLs.
+                            if protocol == Protocol::BedrockConverse
+                                && matches!(&image.source, ImageSource::Url(_))
+                            {
+                                if mode == CompatibilityMode::Strict {
+                                    return Err(AiError::Unsupported(UnsupportedError::Image));
+                                }
+                                diagnostics.push(Diagnostic {
+                                    code: "dropped_image_url".to_string(),
+                                    message: "Bedrock Converse requires inline image bytes"
+                                        .to_string(),
+                                });
                             }
 
                             // Provider-hosted image IDs are only documented for Responses.
@@ -428,6 +446,7 @@ pub(crate) fn validate_request(
                                                 ImageSource::Inline(_) | ImageSource::Url(_)
                                             )
                                         }
+                                        Protocol::BedrockConverse => false,
                                     },
                                     ToolResultPart::Media(Media::Audio(_)) => false,
                                 };
@@ -638,7 +657,12 @@ pub(crate) fn validate_request(
     // 8. Structured output format check
     match &req.output_format {
         OutputFormat::JsonObject => {
-            if !caps.structured_output || protocol == Protocol::AnthropicMessages {
+            if !caps.structured_output
+                || matches!(
+                    protocol,
+                    Protocol::AnthropicMessages | Protocol::BedrockConverse
+                )
+            {
                 if mode == CompatibilityMode::Strict {
                     return Err(AiError::Unsupported(UnsupportedError::StructuredOutput));
                 }
@@ -650,7 +674,7 @@ pub(crate) fn validate_request(
             }
         }
         OutputFormat::JsonSchema(ref s) => {
-            if !caps.structured_output {
+            if !caps.structured_output || protocol == Protocol::BedrockConverse {
                 if mode == CompatibilityMode::Strict {
                     return Err(AiError::Unsupported(UnsupportedError::StructuredOutput));
                 } else {
@@ -1476,6 +1500,46 @@ mod matrix_tests {
                 &req,
                 &caps(false, false, false, false, false, true),
                 Protocol::AnthropicMessages
+            ),
+            Err(AiError::Unsupported(UnsupportedError::StructuredOutput))
+        ));
+    }
+
+    #[test]
+    fn structured_output_is_unsupported_on_bedrock_even_if_misadvertised() {
+        let mut req = base();
+        req.output_format = OutputFormat::JsonObject;
+        assert!(matches!(
+            run(
+                &req,
+                &caps(false, false, false, false, false, true),
+                Protocol::BedrockConverse
+            ),
+            Err(AiError::Unsupported(UnsupportedError::StructuredOutput))
+        ));
+        req.compatibility = Lossy;
+        assert!(has_code(
+            &run(
+                &req,
+                &caps(false, false, false, false, false, true),
+                Protocol::BedrockConverse
+            )
+            .unwrap(),
+            "downgraded_output_format"
+        ));
+
+        req.compatibility = Strict;
+        req.output_format = OutputFormat::JsonSchema(JsonSchemaFormat {
+            name: "output".into(),
+            description: None,
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        assert!(matches!(
+            run(
+                &req,
+                &caps(false, false, false, false, false, true),
+                Protocol::BedrockConverse
             ),
             Err(AiError::Unsupported(UnsupportedError::StructuredOutput))
         ));

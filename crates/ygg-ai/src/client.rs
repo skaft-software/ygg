@@ -460,6 +460,184 @@ fn websocket_open_failure_is_replay_safe(error: &AiError) -> bool {
     )
 }
 
+fn bedrock_response_stream(
+    response: reqwest::Response,
+    model: Model,
+    tool_definitions: Vec<ToolDef>,
+    pre_send_diagnostics: Vec<crate::error::Diagnostic>,
+    buffer_ambiguous_compatibility_content: bool,
+    diagnostic_redactor: CredentialRedactor,
+    stream_initial_timeout: Duration,
+    stream_idle_timeout: Duration,
+    stream_deadline: Duration,
+) -> ResponseStream {
+    let raw_event_stream = try_stream! {
+        let mut decoder = crate::protocol::bedrock::BedrockEventStreamDecoder::new();
+        let mut state = crate::protocol::bedrock::BedrockStreamState::default();
+        let mut builder = ResponseBuilder::new(
+            model.spec.id.clone(),
+            model.spec.protocol,
+            model.spec.pricing.clone(),
+        );
+        builder.set_tool_definitions(&tool_definitions)?;
+        builder.set_buffer_ambiguous_compatibility_content(
+            buffer_ambiguous_compatibility_content,
+        );
+        for diagnostic in &pre_send_diagnostics {
+            builder.add_diagnostic(diagnostic.clone());
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut terminal_seen = false;
+        let mut provider_event_seen = false;
+        let mut successful_body_prefix = Vec::new();
+        let mut first_body_chunk = true;
+        let started_at = Instant::now();
+        let mut last_event_at = None;
+        'read: loop {
+            let remaining = stream_deadline.saturating_sub(started_at.elapsed());
+            if remaining.is_zero() {
+                Err(annotate_stream_failure(
+                    AiError::Transport(TransportError {
+                        phase: TransportPhase::Body,
+                        timeout: true,
+                        message: "stream exceeded its overall deadline".to_owned(),
+                    }),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                ))?;
+            }
+            let quiet_timeout = if first_body_chunk {
+                stream_initial_timeout
+            } else {
+                stream_idle_timeout
+            };
+            let wait_for = remaining.min(quiet_timeout);
+            let chunk_result = tokio::time::timeout(wait_for, stream.next())
+                .await
+                .map_err(|_| {
+                    annotate_stream_failure(
+                        AiError::Transport(TransportError {
+                            phase: TransportPhase::Body,
+                            timeout: true,
+                            message: if remaining <= quiet_timeout {
+                                "stream exceeded its overall deadline".to_owned()
+                            } else if first_body_chunk {
+                                "stream was idle beyond its initial timeout".to_owned()
+                            } else {
+                                "stream was idle beyond its timeout".to_owned()
+                            },
+                        }),
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+            let Some(chunk_result) = chunk_result else {
+                break;
+            };
+            let chunk = chunk_result.map_err(|error| {
+                annotate_stream_failure(
+                    reqwest_transport_error(error, TransportPhase::Body, "Bedrock response body"),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            first_body_chunk = false;
+            if !provider_event_seen && successful_body_prefix.len() < MAX_SUCCESS_ERROR_BODY_BYTES {
+                let remaining = MAX_SUCCESS_ERROR_BODY_BYTES - successful_body_prefix.len();
+                successful_body_prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            let messages = decoder.push(&chunk).map_err(|error| {
+                annotate_stream_failure(
+                    AiError::Decode(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            if !messages.is_empty() {
+                provider_event_seen = true;
+                last_event_at = Some(Instant::now());
+                successful_body_prefix.clear();
+            }
+            for message in messages {
+                let events = crate::protocol::bedrock::decode_stream_event(
+                    &model,
+                    &message,
+                    &mut builder,
+                    &mut state,
+                )
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        error,
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+                for event in events {
+                    let terminal = matches!(event, StreamEvent::Finished(_));
+                    yield event;
+                    if terminal {
+                        terminal_seen = true;
+                        break 'read;
+                    }
+                }
+            }
+        }
+
+        if !terminal_seen {
+            decoder.finish().map_err(|error| {
+                annotate_stream_failure(
+                    AiError::Decode(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                )
+            })?;
+            let mut final_events = Vec::new();
+            crate::protocol::bedrock::finish_stream(&mut builder, &mut state, &mut final_events)
+                .map_err(|error| {
+                    annotate_stream_failure(
+                        error,
+                        &builder,
+                        first_body_chunk,
+                        started_at,
+                        last_event_at,
+                    )
+                })?;
+            for event in final_events {
+                let terminal = matches!(event, StreamEvent::Finished(_));
+                yield event;
+                terminal_seen |= terminal;
+            }
+        }
+        if !terminal_seen && !provider_event_seen {
+            if let Some(error) = provider_error_from_success_body(&successful_body_prefix) {
+                Err(annotate_stream_failure(
+                    AiError::Provider(error),
+                    &builder,
+                    first_body_chunk,
+                    started_at,
+                    last_event_at,
+                ))?;
+            }
+        }
+    };
+    let sanitized = raw_event_stream
+        .map(move |event| event.map_err(|error| sanitize_ai_error(&diagnostic_redactor, error)));
+    crate::stream::guard(sanitized)
+}
+
 async fn stream_http(
     http: reqwest::Client,
     request: HttpStreamRequest,
@@ -475,7 +653,7 @@ async fn stream_http(
         tool_definitions,
         pre_send_diagnostics,
         buffer_ambiguous_compatibility_content,
-        diagnostic_redactor,
+        mut diagnostic_redactor,
     } = request;
     let lifecycle_feedback = parts.streaming
         && model.spec.protocol == Protocol::OpenAiChat
@@ -488,6 +666,28 @@ async fn stream_http(
     }
     let request_body =
         prepare_request_body(model.endpoint.runtime, &mut headers, parts.body.clone()).await;
+    if matches!(&model.endpoint.auth, crate::auth::Auth::RequestSigner(_)) {
+        let resolved = crate::auth::resolve_headers_for_request(
+            &model.endpoint.auth,
+            http::Method::POST,
+            parts.url.clone(),
+            request_body.clone(),
+            headers.clone(),
+        )
+        .await
+        .map_err(AiError::Auth)?;
+        diagnostic_redactor = resolved.redactor;
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
+        let mut current_key = None;
+        for (key, value) in resolved.headers {
+            if let Some(key) = key {
+                current_key = Some(key.clone());
+                headers.insert(key, value);
+            } else if let Some(key) = &current_key {
+                headers.append(key.clone(), value);
+            }
+        }
+    }
 
     // 3. Send the HTTP request
     let builder = http
@@ -520,6 +720,7 @@ async fn stream_http(
         let request_id = res
             .headers()
             .get("x-request-id")
+            .or_else(|| res.headers().get("x-amzn-requestid"))
             .or_else(|| res.headers().get("request-id"))
             .and_then(|h| h.to_str().ok())
             .map(String::from);
@@ -570,6 +771,7 @@ async fn stream_http(
         let retryable = matches!(
             status,
             http::StatusCode::REQUEST_TIMEOUT
+                | http::StatusCode::INTERNAL_SERVER_ERROR
                 | http::StatusCode::TOO_MANY_REQUESTS
                 | http::StatusCode::BAD_GATEWAY
                 | http::StatusCode::SERVICE_UNAVAILABLE
@@ -603,6 +805,19 @@ async fn stream_http(
         })
         .flatten();
     let model_clone = model.clone();
+    if parts.streaming && model.spec.protocol == Protocol::BedrockConverse {
+        return Ok(bedrock_response_stream(
+            res,
+            model_clone,
+            tool_definitions,
+            pre_send_diagnostics,
+            buffer_ambiguous_compatibility_content,
+            diagnostic_redactor,
+            stream_initial_timeout,
+            stream_idle_timeout,
+            stream_deadline,
+        ));
+    }
     if parts.streaming {
         let byte_stream = res.bytes_stream();
         let diags = pre_send_diagnostics;
@@ -774,6 +989,7 @@ async fn stream_http(
                                 Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
                             }
                             .map_err(|error| {
                                 annotate_stream_failure(
@@ -867,6 +1083,7 @@ async fn stream_http(
                                 Protocol::OpenAiChat => crate::protocol::openai_chat::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::AnthropicMessages => crate::protocol::anthropic::decode_stream_event(&model_clone, &sse, &mut builder),
                                 Protocol::OpenAiResponses => crate::protocol::openai_responses::decode_stream_event(&model_clone, &sse, &mut builder),
+                                Protocol::BedrockConverse => unreachable!("Bedrock uses AWS Event Stream, not SSE"),
                             }
                             .map_err(|error| {
                                 annotate_stream_failure(
@@ -1369,6 +1586,7 @@ impl AiClient {
             Protocol::OpenAiResponses => {
                 crate::protocol::openai_responses::build_request(model, &req)?
             }
+            Protocol::BedrockConverse => crate::protocol::bedrock::build_request(model, &req)?,
         };
 
         // Pre-send Lossy diagnostics (capability drops computed in `build_request`)
@@ -1394,21 +1612,28 @@ impl AiClient {
             headers.insert(k.clone(), v.clone());
         }
 
-        let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
-            .await
-            .map_err(AiError::Auth)?;
-        let mut diagnostic_redactor = resolved_headers.redactor;
-        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
-
-        let mut current_key = None;
-        for (key, value) in resolved_headers.headers {
-            if let Some(key) = key {
-                current_key = Some(key.clone());
-                headers.insert(key, value);
-            } else if let Some(key) = &current_key {
-                headers.append(key.clone(), value);
+        // Request-aware signers (SigV4) must run after body encoding, so the
+        // exact body and final header set are covered. Ordinary auth remains
+        // resolved here so the Responses WebSocket path can use it directly.
+        let request_aware_signer =
+            matches!(&model.endpoint.auth, crate::auth::Auth::RequestSigner(_));
+        let mut diagnostic_redactor = CredentialRedactor::default();
+        if !request_aware_signer {
+            let resolved_headers = crate::auth::resolve_headers(&model.endpoint.auth)
+                .await
+                .map_err(AiError::Auth)?;
+            diagnostic_redactor = resolved_headers.redactor;
+            let mut current_key = None;
+            for (key, value) in resolved_headers.headers {
+                if let Some(key) = key {
+                    current_key = Some(key.clone());
+                    headers.insert(key, value);
+                } else if let Some(key) = &current_key {
+                    headers.append(key.clone(), value);
+                }
             }
         }
+        diagnostic_redactor.include_header_values(&model.endpoint.default_headers);
 
         let fallback_request = HttpStreamRequest {
             model: model.clone(),
@@ -1430,6 +1655,7 @@ impl AiClient {
             model.endpoint.transport,
             crate::types::EndpointTransport::WebSocketPreferred
         ) && model.spec.protocol == Protocol::OpenAiResponses
+            && !request_aware_signer
             && fallback_request.parts.streaming
         {
             let session_key = req.session_id.as_deref().filter(|id| !id.is_empty());

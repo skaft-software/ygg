@@ -105,6 +105,7 @@ impl HttpError {
                 // gateways. The agent only invokes this before any generated
                 // bytes, so replaying the POST is safe there.
                 http::StatusCode::REQUEST_TIMEOUT
+                    | http::StatusCode::INTERNAL_SERVER_ERROR
                     | http::StatusCode::TOO_MANY_REQUESTS
                     | http::StatusCode::BAD_GATEWAY
                     | http::StatusCode::SERVICE_UNAVAILABLE
@@ -525,7 +526,7 @@ mod tests {
             body_snippet: None,
             retryable: true,
         };
-        assert!(!err_500.is_safe_to_retry());
+        assert!(err_500.is_safe_to_retry());
     }
 
     #[test]

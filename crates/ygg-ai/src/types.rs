@@ -109,6 +109,8 @@ pub enum Protocol {
     OpenAiChat,
     /// Anthropic Messages protocol.
     AnthropicMessages,
+    /// Amazon Bedrock Converse/ConverseStream protocol.
+    BedrockConverse,
 }
 
 /// Preferred transport for streaming provider responses.

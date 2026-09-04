@@ -2,7 +2,7 @@
 
 ## Canonical model
 
-`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages. Provider DTOs do not cross the crate boundary.
+`ygg-ai` exposes provider-independent `Request`, `Message`, `AssistantPart`, `Usage`, `Response`, and `StreamEvent` types. Protocol codecs translate these values to and from OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Amazon Bedrock Converse. Provider DTOs do not cross the crate boundary.
 
 ## Capability and reasoning model
 
@@ -71,6 +71,10 @@ The response builder enforces absolute limits before appending:
 - 100,000 events;
 - 1,024 indexed parts;
 - protocol SSE event/body and timeout limits in the transport layer.
+
+Bedrock ConverseStream is decoded as incremental AWS EventStream frames rather
+than SSE. Both frame CRCs are verified before its bounded JSON payload is
+interpreted.
 
 Transport timeouts are phase-specific rather than one short request timer:
 connection establishment remains bounded separately, `Endpoint::timeout` covers

@@ -56,6 +56,29 @@ pub(crate) fn register_environment_endpoints_at_base_url(
     Ok(())
 }
 
+/// Register every unique route endpoint with an authentication strategy owned by
+/// a private credential lifecycle (AWS request signing or subscription OAuth).
+pub(crate) fn register_private_endpoints_at_base_url(
+    catalog: &mut ModelCatalog,
+    declaration: &ProviderDeclaration,
+    auth: Auth,
+    base_url: &url::Url,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    for route in declaration.routes {
+        let route_base_url = base_url.join(route.base_path)?;
+        register_endpoint(
+            catalog,
+            declaration,
+            route,
+            auth.clone(),
+            route_base_url,
+            timeout,
+        )?;
+    }
+    Ok(())
+}
+
 /// Register a declared endpoint with a privately owned authentication strategy.
 fn register_endpoint(
     catalog: &mut ModelCatalog,
@@ -205,7 +228,10 @@ fn static_model_capabilities(model: &StaticModelPreset) -> Capabilities {
         }),
         responses_lite: false,
         agent_delegation: None,
-        structured_output: model.protocol != Protocol::OpenAiChat,
+        structured_output: !matches!(
+            model.protocol,
+            Protocol::OpenAiChat | Protocol::BedrockConverse
+        ),
         deferred_tool_loading: false,
     }
 }
@@ -366,6 +392,32 @@ mod tests {
                 "cloudflare-workers-ai/@cf/openai/gpt-oss-120b".into(),
             ))
             .is_ok());
+    }
+
+    #[test]
+    fn private_auth_static_models_use_the_declared_bedrock_endpoint() {
+        use crate::providers::contract::BEDROCK;
+
+        let mut catalog = ModelCatalog::default();
+        let base_url = url::Url::parse(BEDROCK.base_url).unwrap();
+        register_private_endpoints_at_base_url(
+            &mut catalog,
+            &BEDROCK,
+            Auth::bearer("test-signer-secret"),
+            &base_url,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        register_static_models(&mut catalog, &BEDROCK).unwrap();
+
+        let model = catalog
+            .resolve(&ModelId(
+                "bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0".into(),
+            ))
+            .expect("Bedrock static model");
+        assert_eq!(model.spec.protocol, Protocol::BedrockConverse);
+        assert!(!model.spec.capabilities.structured_output);
+        assert_eq!(model.endpoint.id.0, "bedrock");
     }
 
     #[test]

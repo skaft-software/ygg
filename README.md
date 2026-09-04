@@ -324,6 +324,29 @@ export CLOUDFLARE_API_KEY='...'
 ygg --model cloudflare-ai-gateway/claude-sonnet-4-5
 ```
 
+Amazon Bedrock uses SigV4 with the standard bounded AWS credential chain: an
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` pair (and optional session token),
+the selected `AWS_PROFILE`, or ECS/EC2 instance metadata. Select a region with
+`AWS_REGION` (or `YGG_BEDROCK_REGION`); model availability still depends on the
+account and region.
+
+```sh
+export AWS_REGION=us-east-1
+ygg --model 'bedrock/anthropic.claude-3-7-sonnet-20250219-v1:0'
+```
+
+Azure OpenAI routes configured deployments through the Responses API. Set an
+API key plus either a resource name or endpoint and the deployment name.
+`AZURE_OPENAI_API_VERSION` is optional and defaults to the bundled preview
+version.
+
+```sh
+export AZURE_OPENAI_API_KEY='...'
+export AZURE_OPENAI_RESOURCE='my-resource' # or AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com/
+export AZURE_OPENAI_DEPLOYMENT='my-gpt-deployment'
+ygg --model azure-openai/my-gpt-deployment
+```
+
 ChatGPT subscription users can use the hosted device flow instead of manually managing an API key:
 
 ```sh
@@ -598,8 +621,9 @@ For untrusted repositories, use a container, VM, or restricted account; see
 | OpenAI Responses | ✓ | ✓ | ✓ | ✓ | ✓ |
 | OpenAI Chat Completions | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Anthropic Messages | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Amazon Bedrock Converse | ✓ | ✓ | — | ✓ | — |
 
-Built-in provider presets include OpenAI, Anthropic, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, OpenCode Zen, Mistral, Cloudflare Workers AI, and Cloudflare AI Gateway. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
+Built-in provider presets include OpenAI, Anthropic, Amazon Bedrock, Azure OpenAI, OpenRouter, DeepSeek, Groq, Cerebras, xAI, Together AI, Fireworks AI, NVIDIA, Hugging Face, Moonshot AI, Xiaomi, MiniMax, OpenCode Zen, Mistral, Cloudflare Workers AI, and Cloudflare AI Gateway. Custom OpenAI-compatible endpoints cover local servers such as llama.cpp, vLLM, SGLang, LM Studio, and compatible gateways.
 
 Capability handling is model-specific. ygg validates modalities, tool use, structured output, output limits, and reasoning before sending a request. When a custom endpoint reports an exact reasoning control—off-only, binary on/off, or named levels—the picker and request wire values follow that metadata exactly.
 

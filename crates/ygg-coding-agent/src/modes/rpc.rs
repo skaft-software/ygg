@@ -393,6 +393,7 @@ fn protocol_name(protocol: &Protocol) -> &'static str {
         Protocol::OpenAiResponses => "openai-responses",
         Protocol::OpenAiChat => "openai-completions",
         Protocol::AnthropicMessages => "anthropic-messages",
+        Protocol::BedrockConverse => "bedrock-converse",
     }
 }
 

@@ -2,7 +2,7 @@
 
 use serde::Serialize;
 
-use crate::error::AiError;
+use crate::error::{AiError, ConfigError};
 use crate::stream::{ResponseBuilder, StreamEvent};
 use crate::types::{CacheCompatibility, CacheRetention, Request};
 
@@ -57,10 +57,41 @@ pub(crate) fn cache_control(
 }
 
 pub(crate) mod anthropic;
+pub(crate) mod bedrock;
 pub(crate) mod openai_chat;
 pub(crate) mod openai_responses;
 
 pub(crate) mod sse;
+
+/// Resolves a protocol path while preserving the narrowly allowed version query
+/// attached to an endpoint base URL. Azure's versioned API uses this shape;
+/// the catalog validates that the query cannot contain credentials.
+pub(crate) fn endpoint_url(base_url: &url::Url, path: &str) -> Result<url::Url, ConfigError> {
+    let query = base_url.query().map(str::to_owned);
+    let mut url = base_url
+        .join(path)
+        .map_err(|error| ConfigError::Parse(error.to_string()))?;
+    url.set_query(query.as_deref());
+    Ok(url)
+}
+
+#[cfg(test)]
+mod endpoint_url_tests {
+    use super::endpoint_url;
+
+    #[test]
+    fn preserves_the_single_version_query_when_resolving_a_codec_path() {
+        let base = url::Url::parse(
+            "https://enterprise-resource.openai.azure.com/openai/?api-version=2025-04-01-preview",
+        )
+        .unwrap();
+        let url = endpoint_url(&base, "responses").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://enterprise-resource.openai.azure.com/openai/responses?api-version=2025-04-01-preview"
+        );
+    }
+}
 
 #[cfg(test)]
 mod cross_protocol_tests;

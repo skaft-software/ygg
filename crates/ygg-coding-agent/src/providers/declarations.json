@@ -870,6 +870,86 @@
       "compatibility": "cloudflare",
       "pricing": "cloudflare_ai_gateway",
       "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "BEDROCK",
+      "id": "bedrock",
+      "name": "Amazon Bedrock",
+      "base_url": "https://bedrock-runtime.us-east-1.amazonaws.com/",
+      "authentication": {
+        "kind": "aws",
+        "variables": [
+          "AWS_ACCESS_KEY_ID",
+          "AWS_SECRET_ACCESS_KEY",
+          "AWS_PROFILE",
+          "AWS_REGION"
+        ]
+      },
+      "runtime_configuration": "aws_bedrock",
+      "model_discovery": {
+        "kind": "static"
+      },
+      "static_models": "bedrock",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "bedrock",
+          "protocol": "bedrock_converse",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "aws_sigv4",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "default",
+      "pricing": "reference",
+      "discovery_capabilities": "default"
+    },
+    {
+      "const_name": "AZURE_OPENAI",
+      "id": "azure-openai",
+      "name": "Azure OpenAI",
+      "base_url": "https://azure.openai.com/openai/?api-version=2025-04-01-preview",
+      "authentication": {
+        "kind": "environment",
+        "variables": [
+          "AZURE_OPENAI_API_KEY"
+        ]
+      },
+      "runtime_configuration": "azure_openai",
+      "model_discovery": {
+        "kind": "none"
+      },
+      "static_models": "none",
+      "inventory_cache": "supplemental",
+      "routes": [
+        {
+          "endpoint_id": "azure-openai",
+          "protocol": "openai_responses",
+          "transport": "http",
+          "body_encoding": "identity",
+          "auth_presentation": "header",
+          "auth_header": "api-key",
+          "responses_profile": "default"
+        }
+      ],
+      "route_rules": [
+        {
+          "kind": "default",
+          "route": 0
+        }
+      ],
+      "extra_headers": [],
+      "compatibility": "openai",
+      "pricing": "reference",
+      "discovery_capabilities": "gpt_vision_fallback"
     }
   ]
 }
