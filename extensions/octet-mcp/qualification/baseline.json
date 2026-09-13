@@ -1,0 +1,2330 @@
+{
+  "schema": "octet.mcp.qualification.v1",
+  "issue": {
+    "number": 179,
+    "url": "https://github.com/skaft-software/octet/issues/179",
+    "title": "Feature: support remote Streamable HTTP MCP servers in octet-mcp",
+    "body_sha256": "77569c5299561619b0ce3cb9247f58471a34d9f43d599666f8e4d3011cb6ea50",
+    "mutability": "Issue text is mutable; original Wix reproduction remains historical, not a current live result."
+  },
+  "bounds": {
+    "max_file_bytes": 131072,
+    "max_sources": 64,
+    "max_matrix_rows": 48,
+    "max_journeys": 24,
+    "max_release_gates": 12,
+    "max_string_bytes": 4096
+  },
+  "baseline_policy": {
+    "scope": "First-class MCP client qualification, not a Shopify adapter. Preserve actual baseline-supported resources and standard elicitation and explicitly distinguish protocol optionals not exposed by baseline.",
+    "public_protocol": "2026-07-28",
+    "schema_path": "schema/2026-07-28/schema.ts",
+    "specification_path": "docs/specification/2026-07-28",
+    "codex_mode_caveat": "Pinned Codex defaults to legacy; modern mode is under-development opt-in. Public protocol requirements and Codex implementation evidence are distinct, neither is blanket conformance proof.",
+    "status_meaning": {
+      "implemented": "Present for the specifically described pinned-snapshot scope; not a release/live pass.",
+      "partial": "Some source behavior exists but substantive gaps or known defects remain.",
+      "missing": "No usable implementation of the described behavior in pinned Octet; optional rows may correctly remain unsupported.",
+      "needs-live-evidence": "Product/endpoint qualification cannot be established from source or controlled fixtures."
+    },
+    "evidence_rule": "Tests listed in source were inspected, not run here. Parent may append candidate evidence/update current_octet assessments after actual runs; retain immutable input snapshot and upstream scope.",
+    "security_rule": "Preserve exact endpoint trust, host-derived owner fences, fail-closed tool policy and no ambiguous automatic action replay even where upstream retry guidance is more permissive."
+  },
+  "baselines": {
+    "CODEX": {
+      "repository": "openai/codex",
+      "commit": "6baa076eb692b73ede097b4870dc45692c7556d9",
+      "commit_date": "2026-09-10"
+    },
+    "MCP": {
+      "repository": "modelcontextprotocol/modelcontextprotocol",
+      "commit": "aa8ce049f089f92618340190d4ece141f663310d",
+      "commit_date": "2026-09-08"
+    },
+    "OCTET": {
+      "repository": "skaft-software/octet",
+      "commit": "207dccc6dcd8999db9cc6b41f87e4e86448d02aa",
+      "assessment": "Input snapshot, before the implementation stack; not a statement about later working-tree edits."
+    },
+    "RMCP": {
+      "version": "3.2.0",
+      "archive_url": "https://static.crates.io/crates/rmcp/rmcp-3.2.0.crate",
+      "archive_sha256": "42b6914fac0be956fe704a38239c3f44a9f841d1b06a5713d2f638065593f5b5",
+      "locked_by": "C-LOCK",
+      "inspection": "Read verified archive in memory only; no dependency installation or extraction."
+    }
+  },
+  "sources": [
+    {
+      "id": "C-MODE",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/protocol_mode.rs",
+      "git_blob_sha1": "656ba8f6e97eb2fb6ccd433827e17642f9daf028",
+      "sha256": "c472aa882c4c66a1d5b1459d4836a1ed507e1c9ecbb86b63b22c7444f0b62cd1",
+      "line_ranges": [
+        [
+          9,
+          49
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/protocol_mode.rs",
+      "finding": "Legacy is the default; modern selects Auto discovery with a 2025-06-18 fallback. Stdio additionally requires its explicit protocol marker."
+    },
+    {
+      "id": "C-FLAGS",
+      "baseline": "CODEX",
+      "path": "codex-rs/features/src/lib.rs",
+      "git_blob_sha1": "1a31316b79aedece3666507d57a10fc60ce71aa6",
+      "sha256": "f52a1c2ce33ffed3fb32610d4a3bf5f273207dd8f24e0733f62a20d2deab4981",
+      "line_ranges": [
+        [
+          1309,
+          1326
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/features/src/lib.rs",
+      "finding": "mcp_2026_07_28 and coordinated OAuth refresh are UnderDevelopment and default disabled."
+    },
+    {
+      "id": "C-DEPENDENCY",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/Cargo.toml",
+      "git_blob_sha1": "c3c0f07db320b1ce683072b265a7e35c6dda9640",
+      "sha256": "047b6ef35b37114f1900932d3c503f9f9b4f9d15f297e51f0f4334a25b04528b",
+      "line_ranges": [
+        [
+          35,
+          46
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/Cargo.toml",
+      "finding": "The client enables rmcp auth, client, async-rw, child-process and Streamable HTTP features; this is not evidence that every SDK feature is exposed by Codex."
+    },
+    {
+      "id": "C-LOCK",
+      "baseline": "CODEX",
+      "path": "codex-rs/Cargo.lock",
+      "git_blob_sha1": "5394382df26fd0b6146847283417551e23ddbf37",
+      "sha256": "81eb29f6276d5b3d1b39f1588a26059dadfbba717952247efeb8a575f271f569",
+      "line_ranges": [
+        [
+          12937,
+          12941
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/Cargo.lock",
+      "finding": "rmcp 3.2.0 registry archive checksum pins the delegated protocol implementation."
+    },
+    {
+      "id": "C-CLIENT",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/rmcp_client.rs",
+      "git_blob_sha1": "004f55d0cf94e5c102283ae830d3743259cc2648",
+      "sha256": "3691064efb920eb41df540a56547bb9ad75453f819ab93071e6b2da09e3e8a4e",
+      "line_ranges": [
+        [
+          431,
+          461
+        ],
+        [
+          505,
+          590
+        ],
+        [
+          667,
+          785
+        ],
+        [
+          789,
+          901
+        ],
+        [
+          933,
+          963
+        ],
+        [
+          1333,
+          1498
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/rmcp_client.rs",
+      "finding": "Typed tool and resource operations, bearer/header/OAuth transports, custom requests, modern MRTR selection, disabled SDK response cache, legacy session-expiry recovery; transient operation retries are limited to tools/list."
+    },
+    {
+      "id": "C-CAPS",
+      "baseline": "CODEX",
+      "path": "codex-rs/codex-mcp/src/rmcp_client.rs",
+      "git_blob_sha1": "60f204e034ec41eb6009cfffc949b1b16469ef54",
+      "sha256": "666e96c622042d1a133cb290a39dd2389f0f889e020c9a8baeebf5581868472f",
+      "line_ranges": [
+        [
+          1054,
+          1080
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/codex-mcp/src/rmcp_client.rs",
+      "finding": "Constructs default client capabilities, adds elicitation and selected extensions; does not advertise roots or sampling."
+    },
+    {
+      "id": "C-RESOURCES",
+      "baseline": "CODEX",
+      "path": "codex-rs/codex-mcp/src/connection_manager/resources.rs",
+      "git_blob_sha1": "c84cc6b43f97383497cb9a03ea91cc06f56e40da",
+      "sha256": "afb055a96bf3fc1d637ecc5ffd253554a73075d0d9f4917bd1861a5d215a0294",
+      "line_ranges": [
+        [
+          22,
+          68
+        ],
+        [
+          119,
+          157
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/codex-mcp/src/connection_manager/resources.rs",
+      "finding": "Product connection manager lists paginated resources/templates and reads resources, not just an unused SDK declaration."
+    },
+    {
+      "id": "C-HANDLER",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/logging_client_handler.rs",
+      "git_blob_sha1": "98887d749011085803c6539e611429bc0e578c0f",
+      "sha256": "4cd0a7019faeafabe3c8125ec996f67e986e01b262a57b3ef1f0b5a87fc43e81",
+      "line_ranges": [
+        [
+          40,
+          141
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/logging_client_handler.rs",
+      "finding": "Forwards elicitation to the user callback and receives progress/log/list-change notifications. It does not implement sampling or application roots; prompt-list logging is not a prompts UI."
+    },
+    {
+      "id": "C-ELICITATION",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/elicitation_client_service.rs",
+      "git_blob_sha1": "497ca0652d0c82d800ac75bc29d0acfca686499a",
+      "sha256": "e39d87ebc3e66defab230cc7f16852fa4c104abfd9b2b10d924312e476431d03",
+      "line_ranges": [
+        [
+          195,
+          294
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/elicitation_client_service.rs",
+      "finding": "Handles standard elicitation plus explicitly enabled OpenAI forms/user verification, delegates remaining requests to the ordinary handler."
+    },
+    {
+      "id": "C-MRTR",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/tool_input.rs",
+      "git_blob_sha1": "ffda73988dfc6a0ec4c9a87ab81375ecbf22544c",
+      "sha256": "a140e1c94972f9b763a31c8b031f9fe7f333383f56f440fb7f23b2deaf89d8d4",
+      "line_ranges": [
+        [
+          39,
+          163
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/tool_input.rs",
+      "finding": "Drives bounded input-required rounds, constructs input responses and retains opaque request state; this is a semantic continuation, not a blind transport retry."
+    },
+    {
+      "id": "C-DISCOVERY-TEST",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/tests/mcp_2026_discovery.rs",
+      "git_blob_sha1": "1495438d75efb9989cba066a04c014ddbae20632",
+      "sha256": "4ebc666b88e208fafc21bf778e7551c5879de0637bc60c01d11ccce6b543c220",
+      "line_ranges": [
+        [
+          116,
+          179
+        ],
+        [
+          643,
+          750
+        ],
+        [
+          977,
+          1020
+        ],
+        [
+          1128,
+          1424
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/tests/mcp_2026_discovery.rs",
+      "finding": "Fixtures assert self-contained metadata, standard/custom headers and invalid header-schema exclusion, correlated version evidence and bounded legacy fallback. Test source was inspected, not executed."
+    },
+    {
+      "id": "C-MRTR-TEST",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/tests/mcp_2026_mrtr.rs",
+      "git_blob_sha1": "5d86e92219cb96db749fe43d143921a991496329",
+      "sha256": "807f7c0b93d85becffce7794fa08d1693a927cc395a3791b16a4d690ab4742d8",
+      "line_ranges": [
+        [
+          222,
+          320
+        ],
+        [
+          480,
+          562
+        ],
+        [
+          655,
+          736
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/tests/mcp_2026_mrtr.rs",
+      "finding": "Fixtures drive form/URL elicitation, resources/read and opaque state-only rounds. Test source is not an Octet result."
+    },
+    {
+      "id": "C-AUTH-DISCOVERY",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/auth_status.rs",
+      "git_blob_sha1": "479ae184f4e8cde560dad75d33c0837d63b1cb55",
+      "sha256": "f2e437e2c5d4e512a75314758f4163464ea67accfef6c8dcc9d9f90755deb280",
+      "line_ranges": [
+        [
+          181,
+          250
+        ],
+        [
+          827,
+          900
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/auth_status.rs",
+      "finding": "Delegates authorization discovery to AuthorizationManager and includes protected-resource metadata challenge coverage; ordinary legacy mode allows absent issuer metadata."
+    },
+    {
+      "id": "C-AUTH-TEST",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/tests/mcp_2026_oauth_discovery.rs",
+      "git_blob_sha1": "a26dc7fbee6fc6563ad6f244c389efce8032f49f",
+      "sha256": "9ea4f2bb8fcaa3eb03daadbc2e8a922714b056b80beca5acf27b146dc045fd71",
+      "line_ranges": [
+        [
+          81,
+          103
+        ],
+        [
+          261,
+          280
+        ],
+        [
+          477,
+          527
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/tests/mcp_2026_oauth_discovery.rs",
+      "finding": "Checks authorization requests exclude resource headers; legacy GET-first discovery, missing-issuer compatibility and explicit issuer mismatch rejection."
+    },
+    {
+      "id": "C-REGISTRATION",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/oauth_client_registration.rs",
+      "git_blob_sha1": "d9de5e21f7129f06b09ee66079f4bda8fdb7a4aa",
+      "sha256": "2420e339645a9fd55b76a83a791e01b0fd646b4f10798397e70bed85ec4d87d2",
+      "line_ranges": [
+        [
+          43,
+          134
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/oauth_client_registration.rs",
+      "finding": "Advertised CIMD is selected only for supported public-client authentication and loopback callback shape; DCR remains fallback and explicit modes exist."
+    },
+    {
+      "id": "C-LOGIN",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/perform_oauth_login.rs",
+      "git_blob_sha1": "22577db9e6d1fc14729ad0806046002e23dff7c5",
+      "sha256": "0e4afce9022eb1f92edfdae5a5503cc050f75aaba2fffc56be2985a5397a5831",
+      "line_ranges": [
+        [
+          759,
+          791
+        ],
+        [
+          824,
+          863
+        ],
+        [
+          1055,
+          1110
+        ],
+        [
+          1167,
+          1288
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/perform_oauth_login.rs",
+      "finding": "Browser callback validates issuer before code exchange; supports pre-registered client, stores issuer even without refresh token. Legacy missing-issuer allowance is explicit."
+    },
+    {
+      "id": "C-REDIRECT",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/http_client_redirect.rs",
+      "git_blob_sha1": "5d8cfee05f889421aa003bc37bae074d4c1a1475",
+      "sha256": "b09c1a1b507619c8c904bb23d32e5cd8b89664a04c10ce417502c9a0b04c93b5",
+      "line_ranges": [
+        [
+          40,
+          54
+        ],
+        [
+          106,
+          139
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/http_client_redirect.rs",
+      "finding": "Redirects are bounded to original origin and a shared timeout; some POST redirects become bodyless GET. Octet may remain stricter rather than copy this policy."
+    },
+    {
+      "id": "C-ENTERPRISE",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/ema_exchange.rs",
+      "git_blob_sha1": "7b6131653a9727c4a667c3a086557199bd33f595",
+      "sha256": "5d096fc8d0694beba6cb6647000eead0d41b606f87e5bb8aaee6a587f6317a77",
+      "line_ranges": [
+        [
+          48,
+          149
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/ema_exchange.rs",
+      "finding": "Explicitly trusted IdP credential exchanges an ID-JAG assertion for a resource-bound MCP bearer; no implicit interactive login or resource discovery in this primitive."
+    },
+    {
+      "id": "C-ENTERPRISE-LOGIN",
+      "baseline": "CODEX",
+      "path": "codex-rs/rmcp-client/src/enterprise_oauth_login.rs",
+      "git_blob_sha1": "3ee6c6cc3206f9aaa51016496979f0c04d0a9742",
+      "sha256": "70d1885cd5bb4b9f4a705960d62fc1c3e6636f6933023b8886180518b1a69e20",
+      "line_ranges": [
+        [
+          99,
+          180
+        ]
+      ],
+      "url": "https://github.com/openai/codex/blob/6baa076eb692b73ede097b4870dc45692c7556d9/codex-rs/rmcp-client/src/enterprise_oauth_login.rs",
+      "finding": "Enterprise logout invalidates concurrent login generations and credential persistence revalidates current account/configuration under a lock."
+    },
+    {
+      "id": "M-CHANGELOG",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/changelog.mdx",
+      "git_blob_sha1": "424b2653ee392eaaede97ec07d35771ad6216c35",
+      "sha256": "b327e576f4c96b34e92f338f8ffefc35e13d0e953ab76bdb3aab342d104c8e53",
+      "line_ranges": [
+        [
+          10,
+          67
+        ],
+        [
+          69,
+          99
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/changelog.mdx",
+      "finding": "Removes initialization, protocol sessions, resumability and server requests; adds stateless metadata, discovery, subscriptions, MRTR, headers, cache hints and wider schemas. Roots, sampling, logging and DCR are deprecated, not all removed."
+    },
+    {
+      "id": "M-SCHEMA",
+      "baseline": "MCP",
+      "path": "schema/2026-07-28/schema.ts",
+      "git_blob_sha1": "9b55feeb412bc3ae877f2eac10b5c01ba29a2eed",
+      "sha256": "742750af0bb8c716e7030c4977c992b55d1adc4407e9e66997db5846baedc2cd",
+      "line_ranges": [
+        [
+          63,
+          103
+        ],
+        [
+          584,
+          610
+        ],
+        [
+          678,
+          697
+        ],
+        [
+          716,
+          792
+        ],
+        [
+          1081,
+          1114
+        ],
+        [
+          1809,
+          1849
+        ],
+        [
+          1973,
+          2040
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/schema/2026-07-28/schema.ts",
+      "finding": "Normative TypeScript message shapes: required request metadata/result discriminator; input-required state; capabilities; cache hints; arbitrary JSON structured output and general schema keywords."
+    },
+    {
+      "id": "M-VERSION",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/versioning.mdx",
+      "git_blob_sha1": "fcfea9f0a150923ffd6637ff53fadc8240eefedf",
+      "sha256": "bc02f271700bdecd88034f2d7801eb09110a71d65876487378d94e48dfeb90dc",
+      "line_ranges": [
+        [
+          41,
+          78
+        ],
+        [
+          126,
+          180
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/versioning.mdx",
+      "finding": "Request-scoped version selection, modern errors and transport-specific dual-era interoperability; discovery is mandatory for servers, optional for clients."
+    },
+    {
+      "id": "M-DISCOVER",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/server/discover.mdx",
+      "git_blob_sha1": "f6fc1acf974819d99338d2be25ad953fcb9e57a6",
+      "sha256": "3fe1f5b5f1528014216b1e49cc3363b3c689c36bcb80a6957ddca6a04cea409c",
+      "line_ranges": [
+        [
+          7,
+          108
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/server/discover.mdx",
+      "finding": "server/discover returns supportedVersions/capabilities plus optional metadata identity/instructions and cache hints; serverInfo is not security authority."
+    },
+    {
+      "id": "M-STDIO",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/transports/stdio.mdx",
+      "git_blob_sha1": "b03ac10081d7a7a92516b5b074e4c843bc75d473",
+      "sha256": "6fd49766c40dc093d1f5993ab584bad0a06cbb496c2d3019c50f8fe3c8171e57",
+      "line_ranges": [
+        [
+          33,
+          83
+        ],
+        [
+          87,
+          147
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/transports/stdio.mdx",
+      "finding": "Modern servers do not send JSON-RPC requests. Dual-era stdio probes discovery and falls back on a non-modern error or bounded silence; cancellation/shutdown remain transport-specific."
+    },
+    {
+      "id": "M-HTTP",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/transports/streamable-http.mdx",
+      "git_blob_sha1": "7b9813d67a9d8b90a496a6c251193a70ce79c657",
+      "sha256": "22574bf11e004068493787203ce92be1162107cad717bcb805a15780d4fa69c9",
+      "line_ranges": [
+        [
+          70,
+          157
+        ],
+        [
+          233,
+          293
+        ],
+        [
+          356,
+          409
+        ],
+        [
+          467,
+          544
+        ],
+        [
+          650,
+          707
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/transports/streamable-http.mdx",
+      "finding": "POST JSON/SSE, per-request headers and safe parameter mirroring, stream-close cancellation; modern mode has no Mcp-Session-Id, GET/DELETE session lifecycle or Last-Event-ID."
+    },
+    {
+      "id": "M-MRTR",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/patterns/mrtr.mdx",
+      "git_blob_sha1": "a66d667094e73a65a202ed512bd4d398676c9287",
+      "sha256": "a8671eb2a0d292c0dcbae19666ff4fc3d97f294ce8107e9f38259cc5a02a066b",
+      "line_ranges": [
+        [
+          185,
+          257
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/patterns/mrtr.mdx",
+      "finding": "Input-required is allowed on tools/call, resources/read and prompts/get only; retry uses new ID and exact opaque state, confined to original operation."
+    },
+    {
+      "id": "M-SUBSCRIPTIONS",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/patterns/subscriptions.mdx",
+      "git_blob_sha1": "0349e28be419632e1498a3924a8ed0ba2b85d363",
+      "sha256": "8333cbc3280cad293e96b4a20c3200face8e185ebf58f1c4a51c35bb96654abd",
+      "line_ranges": [
+        [
+          7,
+          61
+        ],
+        [
+          83,
+          162
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/patterns/subscriptions.mdx",
+      "finding": "subscriptions/listen opts into filters, requires first acknowledgment and subscriptionId demultiplexing, and is re-established after reconnect."
+    },
+    {
+      "id": "M-CANCEL",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/patterns/cancellation.mdx",
+      "git_blob_sha1": "b8db4c83d989bfe662eb47d74539c1cc19e4bf97",
+      "sha256": "396030784a4af9b734a1c8d4faed13b31077e4a3a1f03c9c1f2048ec52794ba4",
+      "line_ranges": [
+        [
+          35,
+          82
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/patterns/cancellation.mdx",
+      "finding": "Modern HTTP closes response stream; stdio sends cancellation notification; late responses and bounded maximum timeouts remain explicit."
+    },
+    {
+      "id": "M-CACHE",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/server/utilities/caching.mdx",
+      "git_blob_sha1": "577c5ff54f46c2fc6bd29c10f6ddd07f81f180f0",
+      "sha256": "ca416e94b40c067de638bb101541969f2b956b33e9695761032ddc06245d514d",
+      "line_ranges": [
+        [
+          11,
+          37
+        ],
+        [
+          41,
+          101
+        ],
+        [
+          147,
+          169
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/server/utilities/caching.mdx",
+      "finding": "Cacheable results carry ttlMs/cacheScope; caching is optional and private reuse is bound to authorization context; MRTR continuations cannot be cached."
+    },
+    {
+      "id": "M-TOOLS",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/server/tools.mdx",
+      "git_blob_sha1": "449020f54a6582122607b4869129bec5f1035f37",
+      "sha256": "ed550806a58eb7744b858fb9f26001aa5e55dac9e2babe88317cc81d9d4c490d",
+      "line_ranges": [
+        [
+          62,
+          73
+        ],
+        [
+          280,
+          307
+        ],
+        [
+          334,
+          408
+        ],
+        [
+          451,
+          515
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/server/tools.mdx",
+      "finding": "Catalogs may vary by authorization, not connection; schema/header rules, resource links/embedded resources and arbitrary JSON structured content are not tools-only text."
+    },
+    {
+      "id": "M-AUTH",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/authorization/index.mdx",
+      "git_blob_sha1": "10ab7a9b92fb534fae6af4b20a96477ddb250d6e",
+      "sha256": "99e7eeaecad5381649e6dca98cb5b47f314bdda9f1d8cd989299e5fe143a913e",
+      "line_ranges": [
+        [
+          97,
+          134
+        ],
+        [
+          190,
+          222
+        ],
+        [
+          254,
+          309
+        ],
+        [
+          325,
+          405
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/authorization/index.mdx",
+      "finding": "Issuer-bound callbacks, resource indicators, bearer tokens, optional refresh issuance and scope-challenge/step-up handling."
+    },
+    {
+      "id": "M-AUTH-DISCOVERY",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/authorization/authorization-server-discovery.mdx",
+      "git_blob_sha1": "8b50bf19e4ab38950c4dc50b7f18960a6ab809be",
+      "sha256": "2d80118a0187d16f0122e64e6092c49f13d901c650f69712dce1a241a08cfb1d",
+      "line_ranges": [
+        [
+          27,
+          94
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/authorization/authorization-server-discovery.mdx",
+      "finding": "Both challenge and path/root well-known protected-resource discovery; ordered OAuth/OIDC issuer discovery; exact issuer validation and separate registration state."
+    },
+    {
+      "id": "M-REGISTRATION",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/authorization/client-registration.mdx",
+      "git_blob_sha1": "c489145b0a683d592028d8407e5c6461f331b5b0",
+      "sha256": "912365f0c2b859269d25a3e868580d3f222dd94c80dbc5c3b18024bec1e7daff",
+      "line_ranges": [
+        [
+          7,
+          41
+        ],
+        [
+          138,
+          202
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/authorization/client-registration.mdx",
+      "finding": "Pre-registration, advertised CIMD, deprecated DCR fallback with application_type; client credentials keyed to issuing authorization server."
+    },
+    {
+      "id": "M-AUTH-SECURITY",
+      "baseline": "MCP",
+      "path": "docs/specification/2026-07-28/basic/authorization/security-considerations.mdx",
+      "git_blob_sha1": "b45830c74d4801c04605943b50a86eb17de52025",
+      "sha256": "9b62204a9ff17eb1de8c270975759f0d0c191a3534b8d1ba3939e5948ed08f3f",
+      "line_ranges": [
+        [
+          19,
+          59
+        ],
+        [
+          118,
+          131
+        ]
+      ],
+      "url": "https://github.com/modelcontextprotocol/modelcontextprotocol/blob/aa8ce049f089f92618340190d4ece141f663310d/docs/specification/2026-07-28/basic/authorization/security-considerations.mdx",
+      "finding": "PKCE S256 and metadata support checks, secure storage, token audience/resource separation and no token passthrough."
+    },
+    {
+      "id": "O-README",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/README.md",
+      "git_blob_sha1": "e2422c42368e2215d1534e7425a9dc26cd951b65",
+      "sha256": "fe1e30c4f635f8e8c07f400a1cb4390c55cb98da9cf5434985396af097dd1486",
+      "line_ranges": [
+        [
+          66,
+          86
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/README.md",
+      "finding": "Shipped snapshot: local stdio, blocked experimental HTTP, no stock OAuth/resources/prompts/sampling/elicitation."
+    },
+    {
+      "id": "O-REFERENCE",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/REFERENCE.md",
+      "git_blob_sha1": "92c148385238aabb0305cdc43068df127e88df4c",
+      "sha256": "b42e1a361ad76e725f13c8daeb7047c563614a288ec8f00ee351d03bcf0f4470",
+      "line_ranges": [
+        [
+          38,
+          54
+        ],
+        [
+          69,
+          134
+        ],
+        [
+          305,
+          338
+        ],
+        [
+          340,
+          431
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/REFERENCE.md",
+      "finding": "Nine retained defects, inert owner-only gate, unavailable stock credentials, legacy framing/recovery, policy, catalogs/media, semantic presentation and fixture-only tests."
+    },
+    {
+      "id": "O-PROTOCOL",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/octet_mcp/protocol.py",
+      "git_blob_sha1": "8c9d2af18ca4f6c7d879bb12209d9f5f460d1fa5",
+      "sha256": "9ad6116c3df828a7bacce3818311a91305f6252abea2949b29d67656b521a53d",
+      "line_ranges": [
+        [
+          112,
+          120
+        ],
+        [
+          358,
+          410
+        ],
+        [
+          795,
+          845
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/octet_mcp/protocol.py",
+      "finding": "Offers 2025-06-18 and only 2025-03-26/2024-11-05 alternatives, initialize/initialized, empty client capabilities and rejects all reverse server requests."
+    },
+    {
+      "id": "O-HTTP",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/octet_mcp/streamable_http.py",
+      "git_blob_sha1": "4814180037e38a4a619702bc84088b84d7f96d92",
+      "sha256": "1578aa9efbd2da266e785fd7ecce89f3b71d5eb2976bfd3734a9de84efcd2e5e",
+      "line_ranges": [
+        [
+          184,
+          253
+        ],
+        [
+          807,
+          886
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/octet_mcp/streamable_http.py",
+      "finding": "Initializes legacy HTTP sessions, lists tools and routes legacy notifications/cancellation; not modern stateless lifecycle."
+    },
+    {
+      "id": "O-CATALOG",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/octet_mcp/catalog.py",
+      "git_blob_sha1": "858e632728983abc23d52cc1c6a7b264df5cc0d3",
+      "sha256": "ddabdbc0c78a5268b1004b49ab341e5afe60991b813e5a2724fcef625c464c56",
+      "line_ranges": [
+        [
+          100,
+          155
+        ],
+        [
+          185,
+          237
+        ],
+        [
+          304,
+          350
+        ],
+        [
+          369,
+          501
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/octet_mcp/catalog.py",
+      "finding": "Conservative annotation policy, schema vocabulary filter/basic validation and text/image/audio result lowering; arbitrary structured JSON already serializes, but full schema semantics and resource content are not supported."
+    },
+    {
+      "id": "O-EXTENSIONS",
+      "baseline": "OCTET",
+      "path": "docs/extensions.md",
+      "git_blob_sha1": "d1c51804dae8496cf367c01abd29dd0c7953f39e",
+      "sha256": "b983101b85ce450ce02885c965f1129fd92aca960be3cbca592636c0ea49f4c8",
+      "line_ranges": [
+        [
+          179,
+          189
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/docs/extensions.md",
+      "finding": "API 0.3 does not imply dynamic tools, legacy UI/brokers or image/audio support. MCP wire and host extension API are separate."
+    },
+    {
+      "id": "O-LEGACY",
+      "baseline": "OCTET",
+      "path": "docs/extensions/legacy-authoring.md",
+      "git_blob_sha1": "9d5e4c7e2e7b63c275a3e89e4e71cb02e299c711",
+      "sha256": "9ed9d5a7ee8e9740afad859a9e2fe5c66058167e5701f06cdf53ee12d8a2d562",
+      "line_ranges": [
+        [
+          483,
+          542
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/docs/extensions/legacy-authoring.md",
+      "finding": "Coding product offers no approvals/secrets broker; resource ownership must come from host, and input cancellation is fail-closed."
+    },
+    {
+      "id": "O-STDIO-TEST",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/tests/test_protocol.py",
+      "git_blob_sha1": "5508377e0eea50694b50908442a56706bfbbd44c",
+      "sha256": "1f0b7f8867a17e38889818e4a6f7ca0ca97082165a83e2477d39e820b32eda07",
+      "line_ranges": [
+        [
+          38,
+          101
+        ],
+        [
+          140,
+          198
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/tests/test_protocol.py",
+      "finding": "Existing real subprocess, cancellation, timeout/no replay and bounded descendant shutdown regressions; not executed by baseline author."
+    },
+    {
+      "id": "O-HTTP-TEST",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/tests/test_streamable_http.py",
+      "git_blob_sha1": "bd3e69bdcadb2d65386c1867f85b583698c1023f",
+      "sha256": "4fb2778fe3e6c1abfd9a6b67a9b94315899a1a8dea555739b951ceaf531f23f4",
+      "line_ranges": [
+        [
+          273,
+          338
+        ],
+        [
+          374,
+          492
+        ],
+        [
+          625,
+          673
+        ],
+        [
+          744,
+          772
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/tests/test_streamable_http.py",
+      "finding": "Existing deterministic loopback legacy session/bearer/resume/no-replay/no-adapter fixtures; not production or OAuth qualification."
+    },
+    {
+      "id": "O-MANAGER-TEST",
+      "baseline": "OCTET",
+      "path": "extensions/octet-mcp/tests/test_manager.py",
+      "git_blob_sha1": "503b12f272ff87e0cb514b922138571cea94d3ab",
+      "sha256": "6af03ddf310636bda9acc9647d79b0de0eb9be943f11f3f1557b73e18127fcab",
+      "line_ranges": [
+        [
+          57,
+          146
+        ],
+        [
+          175,
+          232
+        ]
+      ],
+      "url": "https://github.com/skaft-software/octet/blob/207dccc6dcd8999db9cc6b41f87e4e86448d02aa/extensions/octet-mcp/tests/test_manager.py",
+      "finding": "Existing media/catalog epochs, no replay and pre-worker experimental gate fixtures."
+    },
+    {
+      "id": "R-HANDLER",
+      "baseline": "RMCP",
+      "path": "src/handler/client.rs",
+      "sha256": "819baa1322c4c6458e4b8f92bfd6c9146e305d2e3f27420a1f39c6b5e57f7907",
+      "archive_sha256": "42b6914fac0be956fe704a38239c3f44a9f841d1b06a5713d2f638065593f5b5",
+      "line_ranges": [
+        [
+          97,
+          112
+        ]
+      ],
+      "url": "https://docs.rs/crate/rmcp/3.2.0/source/src/handler/client.rs",
+      "finding": "Default sampling is method-not-found; roots default to an empty list. Codex does not advertise either capability or replace these with model/workspace integration."
+    },
+    {
+      "id": "R-CLIENT",
+      "baseline": "RMCP",
+      "path": "src/service/client.rs",
+      "sha256": "6cef7f5b935922efeff379d56954f1735ea4268046ded332916930aa58bf9c99",
+      "archive_sha256": "42b6914fac0be956fe704a38239c3f44a9f841d1b06a5713d2f638065593f5b5",
+      "line_ranges": [
+        [
+          1174,
+          1215
+        ],
+        [
+          1901,
+          2052
+        ]
+      ],
+      "url": "https://docs.rs/crate/rmcp/3.2.0/source/src/service/client.rs",
+      "finding": "SDK supports subscriptions/listen and prompts/get/MRTR helpers; availability in this dependency is not proof the Codex wrapper/product exposes them."
+    }
+  ],
+  "matrix": [
+    {
+      "id": "MCP-001",
+      "feature": "Explicit local stdio configuration and resident lifecycle",
+      "scope": "baseline-supported",
+      "codex_support": "Supported local child/executor transports; exact Codex launch syntax is not the parity contract.",
+      "public_mcp_requirement": "Stdio process framing, stderr, cancellation and EOF shutdown remain supported.",
+      "current_octet": {
+        "status": "implemented",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-STDIO",
+          "O-STDIO-TEST",
+          "O-REFERENCE"
+        ],
+        "assessment": "Verify shipped stdio; do not rebuild it or add installation/ambient discovery. Real subprocess fixture evidence still needs a candidate run."
+      },
+      "journeys": [
+        "J-STDIO",
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-STDIO",
+        "G-PRODUCT"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-002",
+      "feature": "Dual-era protocol selection and compatibility",
+      "scope": "baseline-supported-conditional",
+      "codex_support": "Legacy default; 2026 mode is under-development opt-in; stdio additionally opts in. Modern fallback includes server-selected 2025-11-25.",
+      "public_mcp_requirement": "Modern requests select a version per request; recognized modern errors must not cause blind legacy downgrade.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-MODE",
+          "C-FLAGS",
+          "C-DISCOVERY-TEST",
+          "M-VERSION",
+          "M-STDIO",
+          "M-HTTP",
+          "O-PROTOCOL"
+        ],
+        "assessment": "Only legacy 2025-06-18/2025-03-26/2024-11-05 accepted. Need era-specific negotiation, bounded probes, modern-error handling and 2025-11-25 compatibility, not a constant substitution."
+      },
+      "journeys": [
+        "J-VERSION",
+        "J-HTTP"
+      ],
+      "release_gates": [
+        "G-2026"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-003",
+      "feature": "Stateless server discovery and per-request metadata",
+      "scope": "baseline-supported-conditional",
+      "codex_support": "2026 mode drives server/discover and SDK self-contained requests; not the default mode.",
+      "public_mcp_requirement": "No initialize/initialized in modern mode. Required protocolVersion/clientCapabilities in _meta, optional client/server identity; discover returns supportedVersions/capabilities/cache hints.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-DISCOVERY-TEST",
+          "M-DISCOVER",
+          "M-SCHEMA",
+          "M-CHANGELOG",
+          "O-PROTOCOL",
+          "O-HTTP"
+        ],
+        "assessment": "Implement modern startup and request construction, identity/capability parsing and resultType validation. Do not confuse protocol discovery at an explicit endpoint with ambient server discovery."
+      },
+      "journeys": [
+        "J-VERSION"
+      ],
+      "release_gates": [
+        "G-2026"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-004",
+      "feature": "HTTP method/name/parameter headers",
+      "scope": "baseline-supported-conditional",
+      "codex_support": "Modern fixture asserts standard headers and rejects invalid x-mcp-header schemas.",
+      "public_mcp_requirement": "Mcp-Method, Mcp-Name, matching MCP-Protocol-Version/_meta, safe Mcp-Param-* mirroring and sentinel Base64 encoding required.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-DISCOVERY-TEST",
+          "M-HTTP",
+          "M-TOOLS",
+          "O-HTTP",
+          "O-CATALOG"
+        ],
+        "assessment": "Retain and validate x-mcp-header schema annotations, case-insensitive uniqueness/static property reachability and allowed primitives; omit absent/null, encode Unicode/control/sentinel/edge whitespace. No arbitrary credential header invention."
+      },
+      "journeys": [
+        "J-HEADERS"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-HTTP"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-005",
+      "feature": "Streamable HTTP POST with JSON and SSE responses",
+      "scope": "baseline-supported",
+      "codex_support": "Typed StreamableHttpClientTransport with auth, bounded startup and response handling.",
+      "public_mcp_requirement": "Both application/json and text/event-stream; notifications receive bodyless 202; correlate request-scoped SSE, reject invalid frames.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "C-DISCOVERY-TEST",
+          "M-HTTP",
+          "O-HTTP-TEST",
+          "O-REFERENCE"
+        ],
+        "assessment": "Experimental legacy implementation exists, but nine defects and missing modern semantics block production. A loopback response is not internet/TLS qualification."
+      },
+      "journeys": [
+        "J-HTTP",
+        "J-ISOLATION",
+        "J-RECOVERY"
+      ],
+      "release_gates": [
+        "G-HTTP",
+        "G-2026",
+        "G-LIVE"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-006",
+      "feature": "Legacy session IDs, expiration and fresh-session recovery",
+      "scope": "baseline-supported",
+      "codex_support": "Legacy session-expired 404 is classified separately and reinitializes a serialized replacement transport.",
+      "public_mcp_requirement": "2025-era session/GET/DELETE/resume behavior is legacy only. Modern 404 method-not-found is not session expiration.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-HTTP",
+          "O-HTTP-TEST",
+          "O-REFERENCE"
+        ],
+        "assessment": "Legacy session identity and 404 recovery exist experimentally; qualify owner/auth isolation, teardown and optional stream behavior. Must not mint/forward session or resume state in 2026 mode."
+      },
+      "journeys": [
+        "J-HTTP",
+        "J-RECOVERY",
+        "J-ISOLATION"
+      ],
+      "release_gates": [
+        "G-HTTP",
+        "G-2026",
+        "G-AUTH"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-007",
+      "feature": "Cancellation, retries, timeouts and non-replay",
+      "scope": "baseline-supported",
+      "codex_support": "Retries transient tools/list; has legacy session-expiry recovery and elicitation-aware timeouts, not unconditional tool retries.",
+      "public_mcp_requirement": "Modern HTTP cancel closes stream; stdio uses notifications/cancelled. Broken modern streams cannot resume; any newly authorized retry uses a new ID.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-CANCEL",
+          "M-HTTP",
+          "O-STDIO-TEST",
+          "O-HTTP-TEST"
+        ],
+        "assessment": "Keep stricter Octet prohibition on automatic ambiguous tool replay. Separate explicit MRTR continuation, safe catalog retry, legacy event resume and modern stream loss; retain one end-to-end deadline and tombstone late replies."
+      },
+      "journeys": [
+        "J-STDIO",
+        "J-RECOVERY",
+        "J-ELICITATION"
+      ],
+      "release_gates": [
+        "G-STDIO",
+        "G-HTTP",
+        "G-2026"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-008",
+      "feature": "Subscription notification model",
+      "scope": "public-required",
+      "codex_support": "rmcp SDK offers listen with acknowledgment; reviewed Codex wrapper exposes no first-class listen method and ordinary list-change callbacks only log. Do not infer product support from SDK.",
+      "public_mcp_requirement": "subscriptions/listen replaces standalone GET and resources/subscribe/unsubscribe. Filter acknowledgment, subscriptionId demultiplexing and cancellation/re-establishment are core patterns.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "R-CLIENT",
+          "C-CLIENT",
+          "C-HANDLER",
+          "M-SUBSCRIPTIONS",
+          "O-PROTOCOL"
+        ],
+        "assessment": "Need bounded long-lived POST-response subscriptions, acknowledgment validation, owner/ID routing and re-establishment. Legacy tools/list_changed callback alone is insufficient."
+      },
+      "journeys": [
+        "J-CATALOG",
+        "J-RECOVERY"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-009",
+      "feature": "Tool catalogs, pagination and pinned call schemas",
+      "scope": "baseline-supported",
+      "codex_support": "Typed tools/list and call plus product catalog snapshots.",
+      "public_mcp_requirement": "Bounded pagination; modern catalogs may vary by authorization but not connection.",
+      "current_octet": {
+        "status": "implemented",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-TOOLS",
+          "O-MANAGER-TEST",
+          "O-REFERENCE"
+        ],
+        "assessment": "Existing bounded/cycle-checked legacy catalogs, transactional dynamic registration and epoch-pinned schemas should be verified unchanged. Modern freshness/authorization behavior belongs to MCP-010."
+      },
+      "journeys": [
+        "J-STDIO",
+        "J-CATALOG"
+      ],
+      "release_gates": [
+        "G-STDIO",
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-010",
+      "feature": "Catalog freshness and cache authorization partition",
+      "scope": "public-required",
+      "codex_support": "Codex explicitly disables rmcp response caching/stale-on-error, preserving product snapshots. Do not require enabling SDK caching for parity.",
+      "public_mcp_requirement": "Cacheable results include ttlMs/cacheScope. Caching optional; private reuse stays in same authorization context and MRTR continuations cannot be cached.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-CACHE",
+          "M-TOOLS",
+          "O-REFERENCE"
+        ],
+        "assessment": "Existing epochs are not 2026 cache semantics. Handle cache hints/missing legacy fields and ensure catalog invalidation across owner/token changes; choosing no response cache is valid."
+      },
+      "journeys": [
+        "J-CATALOG",
+        "J-ISOLATION"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-HTTP"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-011",
+      "feature": "General tool schemas and structured JSON output",
+      "scope": "baseline-supported",
+      "codex_support": "Uses rmcp typed tool/results; input arguments must remain objects. Wider wire types do not prove full provider-side JSON Schema conformance.",
+      "public_mcp_requirement": "Input root remains object, with composition/conditional/$ref/$defs keywords; outputSchema and structuredContent can describe any JSON value.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-SCHEMA",
+          "M-TOOLS",
+          "O-CATALOG"
+        ],
+        "assessment": "Octet already serializes arbitrary structured JSON, but filters schema vocabulary and validates only a basic subset. Need bounded reference/composition semantics and lossless contract handling or explicit rejection; never silently weaken validation."
+      },
+      "journeys": [
+        "J-HEADERS",
+        "J-CATALOG"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-012",
+      "feature": "Text, image/audio and resource-bearing tool results",
+      "scope": "baseline-supported",
+      "codex_support": "Typed CallToolResult retains MCP content; resource APIs are exposed separately. Verify per-frontend rendering rather than infer all model modalities.",
+      "public_mcp_requirement": "Ordered text/image/audio/resource links/embedded resources, structuredContent and isError are distinct result channels.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "C-RESOURCES",
+          "M-TOOLS",
+          "O-CATALOG",
+          "O-MANAGER-TEST"
+        ],
+        "assessment": "Text/image/audio/artifacts and bounded structured data exist. Embedded resources/resource links are rejected; schema-less structured data is metadata only. Qualify provenance, model visibility and artifact ownership; do not claim all content parity."
+      },
+      "journeys": [
+        "J-STDIO",
+        "J-CATALOG",
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-SURFACES",
+        "G-PRODUCT"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-013",
+      "feature": "Resources and resource templates",
+      "scope": "baseline-supported",
+      "codex_support": "Product manager and rmcp wrapper implement resources/list, resources/templates/list and resources/read, including modern read MRTR.",
+      "public_mcp_requirement": "Optional server capability, but genuinely supported by chosen Codex baseline.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-RESOURCES",
+          "C-CLIENT",
+          "C-MRTR-TEST",
+          "M-MRTR",
+          "O-README"
+        ],
+        "assessment": "Must implement first-class bounded resource/template discovery/read and content conversion with owner fences. Cannot exclude resources merely because initial Octet bridge was tools-only."
+      },
+      "journeys": [
+        "J-CATALOG",
+        "J-ELICITATION"
+      ],
+      "release_gates": [
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-014",
+      "feature": "Prompt catalog/get and completions",
+      "scope": "protocol-optional-baseline-unsupported",
+      "codex_support": "No typed prompts/list, prompts/get or completion product surface in reviewed rmcp wrapper/connection manager; generic custom requests and SDK get_prompt are not first-class support.",
+      "public_mcp_requirement": "Optional server prompts/completions; prompts/get uses MRTR when implemented.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-CLIENT",
+          "C-HANDLER",
+          "R-CLIENT",
+          "M-MRTR",
+          "M-SCHEMA",
+          "O-README"
+        ],
+        "assessment": "Do not advertise prompts/completions. Keep visible in matrix as protocol optional, not a proven Codex product parity gap; reconsider only with specific exposed call-site evidence."
+      },
+      "journeys": [
+        "J-OPTIONAL"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-015",
+      "feature": "Form-mode elicitation",
+      "scope": "baseline-supported",
+      "codex_support": "Standard elicitation callback and form-mode MRTR fixture genuinely execute the client-side exchange.",
+      "public_mcp_requirement": "Optional capability; 2026 inputRequests carries elicitation/create, not reverse JSON-RPC requests.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-ELICITATION",
+          "C-MRTR-TEST",
+          "C-CAPS",
+          "M-MRTR",
+          "O-PROTOCOL",
+          "O-LEGACY"
+        ],
+        "assessment": "Need host-correlated user input/schema validation, accept/decline/cancel, bounded pending requests and headless denial. Form fields are not permission grants and must not collect secrets."
+      },
+      "journeys": [
+        "J-ELICITATION",
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-016",
+      "feature": "URL-mode elicitation and manual out-of-band interaction",
+      "scope": "baseline-supported",
+      "codex_support": "Standard URL mode is exercised alongside form mode; optional custom OpenAI verification is separate.",
+      "public_mcp_requirement": "2026 removes elicitationId/elicitation-complete; retry of original MRTR operation learns outcome.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-MRTR-TEST",
+          "C-ELICITATION",
+          "M-CHANGELOG",
+          "O-README"
+        ],
+        "assessment": "Need explicit manual URL interaction, provenance and cancellation without auto-navigation/login or promoting server URL to trusted authority. Not equivalent to MCP transport OAuth."
+      },
+      "journeys": [
+        "J-ELICITATION",
+        "J-AUTH-LIFECYCLE"
+      ],
+      "release_gates": [
+        "G-SURFACES",
+        "G-AUTH"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-017",
+      "feature": "Bounded multi-round-trip continuation",
+      "scope": "baseline-supported-conditional",
+      "codex_support": "Modern tools/call and resources/read drive input-required rounds, including state-only and metadata-bearing replies.",
+      "public_mcp_requirement": "Validate resultType; input-required only on eligible methods; preserve opaque requestState exactly, use new ID, do not leak state across concurrent calls.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-MRTR",
+          "C-MRTR-TEST",
+          "M-MRTR",
+          "M-SCHEMA",
+          "O-CATALOG"
+        ],
+        "assessment": "Without explicit resultType handling, current lowerer can reduce input-required to empty successful content. Add discriminator validation, capability-checked input handlers, bounded rounds/bytes/time and state-only backoff; no blind replay."
+      },
+      "journeys": [
+        "J-ELICITATION",
+        "J-RECOVERY"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-SURFACES"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-018",
+      "feature": "Sampling/createMessage",
+      "scope": "protocol-optional-baseline-unsupported",
+      "codex_support": "Capabilities do not advertise sampling; handler inherits method-not-found. SDK sampling types do not supply Codex model-session integration.",
+      "public_mcp_requirement": "Optional and deprecated, not removed, in 2026; modern interaction would use MRTR.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-CAPS",
+          "C-HANDLER",
+          "R-HANDLER",
+          "M-CHANGELOG",
+          "M-SCHEMA",
+          "O-README"
+        ],
+        "assessment": "Do not add unsolicited model invocation or advertise sampling. Unsupported is not a parity defect for this exposed baseline; maintain explicit refusal tests."
+      },
+      "journeys": [
+        "J-OPTIONAL"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-019",
+      "feature": "Roots/list",
+      "scope": "protocol-optional-baseline-unsupported",
+      "codex_support": "Not advertised; default SDK handler returns empty roots, not a Codex workspace-root integration.",
+      "public_mcp_requirement": "Optional and deprecated in 2026; roots/list_changed removed.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-CAPS",
+          "C-HANDLER",
+          "R-HANDLER",
+          "M-CHANGELOG",
+          "O-README"
+        ],
+        "assessment": "No ambient workspace disclosure or advertised roots capability. Keep separate from internal Codex capability-root terminology."
+      },
+      "journeys": [
+        "J-OPTIONAL"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-020",
+      "feature": "Progress and diagnostic notifications",
+      "scope": "baseline-supported",
+      "codex_support": "Logging handler receives progress/log/change notifications; receiving is not catalog invalidation or a prompt UI.",
+      "public_mcp_requirement": "Modern request-scoped notifications and per-request logLevel; logging is deprecated, logging/setLevel and ping removed.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-HANDLER",
+          "M-CHANGELOG",
+          "M-HTTP",
+          "O-PROTOCOL",
+          "O-REFERENCE"
+        ],
+        "assessment": "Retain bounded numeric/redacted presentation. Add modern request/subscription correlation and no-unrequested-logging behavior; do not carry legacy heartbeat/log methods into modern mode."
+      },
+      "journeys": [
+        "J-HTTP",
+        "J-CATALOG",
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-2026",
+        "G-PRODUCT"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-021",
+      "feature": "Unauthenticated and bearer/explicit-header remote access",
+      "scope": "baseline-supported",
+      "codex_support": "Constructors support unauthenticated, bearer and configured headers plus OAuth. Octet need not copy secret-bearing Codex configuration syntax.",
+      "public_mcp_requirement": "HTTP may be unauthenticated or authenticated; credentials remain endpoint/resource-bound, never URL query tokens.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-CLIENT",
+          "M-AUTH",
+          "O-REFERENCE",
+          "O-HTTP-TEST"
+        ],
+        "assessment": "Unauth path and narrow request-scoped bearer adapter exist experimentally; stock runtime has no provider. Need first-class owner-bound credential plumbing while retaining no ambient secret/env/header inheritance."
+      },
+      "journeys": [
+        "J-HTTP",
+        "J-AUTH-LIFECYCLE",
+        "J-SHOPIFY-BASE",
+        "J-SHOPIFY-UCP"
+      ],
+      "release_gates": [
+        "G-HTTP",
+        "G-AUTH",
+        "G-LIVE"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-022",
+      "feature": "OAuth protected-resource and authorization-server discovery",
+      "scope": "baseline-supported",
+      "codex_support": "AuthorizationManager handles protected-resource challenges; tests separate OAuth discovery from starting an MCP protocol session and strip resource headers.",
+      "public_mcp_requirement": "Support WWW-Authenticate resource_metadata then path/root RFC9728, OAuth RFC8414/OIDC ordered discovery and exact issuer validation.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-AUTH-DISCOVERY",
+          "C-AUTH-TEST",
+          "M-AUTH-DISCOVERY",
+          "O-REFERENCE"
+        ],
+        "assessment": "401/403 generic parking is not auth discovery. Implement bounded untrusted metadata traversal, origin/resource/issuer validation and no credential forwarding to discovery destinations; preserve explicit endpoint trust."
+      },
+      "journeys": [
+        "J-AUTH-DISCOVERY"
+      ],
+      "release_gates": [
+        "G-AUTH",
+        "G-HTTP"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-023",
+      "feature": "OAuth PKCE, callback and consent lifecycle",
+      "scope": "baseline-supported",
+      "codex_support": "Interactive browser callback/code exchange, pre-registered client and issuer validation are implemented.",
+      "public_mcp_requirement": "OAuth 2.1, S256 PKCE support checks, exact redirect/state and optional-present iss validation before code exchange, resource indicators.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-LOGIN",
+          "M-AUTH",
+          "M-AUTH-SECURITY",
+          "O-REFERENCE"
+        ],
+        "assessment": "Need first-class manually authorized login/cancel/expiry callback flow bound to active host owner; never model-driven login or code/token data in tools, logs, sessions or this matrix."
+      },
+      "journeys": [
+        "J-AUTH-DISCOVERY",
+        "J-AUTH-LIFECYCLE",
+        "J-WIX"
+      ],
+      "release_gates": [
+        "G-AUTH",
+        "G-LIVE"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-024",
+      "feature": "Client registration: pre-registered, CIMD and legacy DCR",
+      "scope": "baseline-supported",
+      "codex_support": "Supports configured client ID, Auto/Cimd/Dcr selection and advertised public-client CIMD with validated callback; DCR fallback.",
+      "public_mcp_requirement": "Prefer existing pre-registration, then advertised CIMD; DCR deprecated fallback requires appropriate application_type, and credentials bind to issuer.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-REGISTRATION",
+          "C-LOGIN",
+          "M-REGISTRATION",
+          "O-REFERENCE"
+        ],
+        "assessment": "Need all supported registration journeys; DCR-only or static bearer integration is not full baseline auth. Octet CIMD needs its own reviewed HTTPS metadata identity; never reuse Codex client ID."
+      },
+      "journeys": [
+        "J-AUTH-DISCOVERY",
+        "J-AUTH-LIFECYCLE"
+      ],
+      "release_gates": [
+        "G-AUTH"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-025",
+      "feature": "Credential ownership, issuer/resource binding, refresh and logout",
+      "scope": "baseline-supported",
+      "codex_support": "Stored issuer and managed OAuth credentials/refresh; separate under-development coordinated refresh mode; enterprise logout uses generation fencing.",
+      "public_mcp_requirement": "Separate authorization-server registration state; audience/resource indicators, private token storage and no assumption a refresh token exists; appropriate scope challenge handling.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-CLIENT",
+          "C-FLAGS",
+          "C-LOGIN",
+          "C-ENTERPRISE-LOGIN",
+          "M-AUTH",
+          "M-AUTH-DISCOVERY",
+          "M-REGISTRATION",
+          "O-REFERENCE"
+        ],
+        "assessment": "Implement secure stock store/provider, refresh rotation/rejection and logout/relogin, concurrent refresh fences and endpoint/owner/account isolation. Missing issuer allowance in Codex legacy mode is not permission to weaken current MCP requirements."
+      },
+      "journeys": [
+        "J-AUTH-LIFECYCLE",
+        "J-ISOLATION",
+        "J-WIX"
+      ],
+      "release_gates": [
+        "G-AUTH",
+        "G-HTTP",
+        "G-LIVE"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-026",
+      "feature": "Fail-closed tool action policy",
+      "scope": "octet-safety-invariant",
+      "codex_support": "Codex user-interaction machinery is not Octet authorization. Parity must preserve Octet host enforcement.",
+      "public_mcp_requirement": "Tools security requires treating annotations as untrusted and allowing human denial of sensitive actions.",
+      "current_octet": {
+        "status": "implemented",
+        "source_evidence": [
+          "M-TOOLS",
+          "O-CATALOG",
+          "O-LEGACY",
+          "O-REFERENCE"
+        ],
+        "assessment": "Only exact uncontradicted readOnlyHint true bypasses extra policy. Unknown/destructive remains denied without negotiated host approval. #383 is separate; public/authenticated reachability never approves a write. Positive approved-write journey stays blocked until host issuance exists."
+      },
+      "journeys": [
+        "J-STDIO",
+        "J-ELICITATION",
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-PRODUCT",
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-027",
+      "feature": "Remote transport/owner safety and bounded cleanup",
+      "scope": "octet-safety-invariant",
+      "codex_support": "Pinned upstream limits/redirect behavior are reference evidence, not a substitute for Octet resource ownership and stricter network policy.",
+      "public_mcp_requirement": "Untrusted network/metadata/auth channels require confidentiality, safe validation and bounded transport work.",
+      "current_octet": {
+        "status": "partial",
+        "source_evidence": [
+          "C-REDIRECT",
+          "M-AUTH-SECURITY",
+          "O-REFERENCE",
+          "O-HTTP-TEST"
+        ],
+        "assessment": "Retained nine-defect ledger remains release-blocking until each remediation has targeted evidence. Production cannot be unlocked by fixture count or protocol constant changes."
+      },
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP",
+        "J-RECOVERY"
+      ],
+      "release_gates": [
+        "G-HTTP"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-028",
+      "feature": "First-class product setup/status and frontend ownership",
+      "scope": "octet-product-qualification",
+      "codex_support": "Parity means equivalent usable client journeys, not embedding MCP into the Octet kernel or copying Codex UI.",
+      "public_mcp_requirement": "MCP transport is independent from host extension API/frontend.",
+      "current_octet": {
+        "status": "needs-live-evidence",
+        "source_evidence": [
+          "O-REFERENCE",
+          "O-EXTENSIONS",
+          "O-LEGACY",
+          "O-MANAGER-TEST"
+        ],
+        "assessment": "Existing /mcp lifecycle, semantic state and API 0.2 artifacts have deterministic fixtures. Need shipped candidate TUI/Serve/headless evidence, owner switching and inert installation; do not retag API 0.3."
+      },
+      "journeys": [
+        "J-PRODUCT"
+      ],
+      "release_gates": [
+        "G-PRODUCT"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-029",
+      "feature": "Deprecated standalone HTTP+SSE transport",
+      "scope": "protocol-optional-baseline-unsupported",
+      "codex_support": "Reviewed constructors/build features expose stdio and Streamable HTTP, not retired transport-sse-client. SSE POST response tests are not standalone SSE support.",
+      "public_mcp_requirement": "2024 HTTP+SSE is deprecated; optional backward compatibility must be distinguished from ordinary Streamable HTTP SSE.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-DEPENDENCY",
+          "C-CLIENT",
+          "M-HTTP",
+          "O-README"
+        ],
+        "assessment": "Keep explicit unsupported diagnostic; do not infer a legacy endpoint-event adapter is required from Codex Streamable HTTP filenames."
+      },
+      "journeys": [
+        "J-OPTIONAL"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-030",
+      "feature": "Tasks and additional protocol extensions",
+      "scope": "protocol-optional-baseline-unsupported",
+      "codex_support": "SDK types/default callbacks and generic custom requests exist, but no first-class public tasks operation is established in reviewed wrapper.",
+      "public_mcp_requirement": "Tasks moved out of core into io.modelcontextprotocol/tasks; extensions are explicitly advertised, not implied by protocol version.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-CLIENT",
+          "R-CLIENT",
+          "M-CHANGELOG",
+          "M-SCHEMA",
+          "O-PROTOCOL"
+        ],
+        "assessment": "Keep core capability set honest; no task/background execution promises from merely recognizing extensions metadata."
+      },
+      "journeys": [
+        "J-OPTIONAL"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-031",
+      "feature": "Enterprise-managed authorization extension",
+      "scope": "baseline-extension-conditional",
+      "codex_support": "Actual ID-JAG resource-token exchange and issuer/account/generation-bound enterprise login/logout primitives are present.",
+      "public_mcp_requirement": "Not mandatory core authorization; an additional enterprise authorization mechanism with separate trust/policy configuration.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-ENTERPRISE",
+          "C-ENTERPRISE-LOGIN",
+          "M-AUTH",
+          "O-REFERENCE"
+        ],
+        "assessment": "Retained baseline-supported conditional surface, not silently called unsupported upstream. Requires separate substantive implementation and authorized enterprise evidence before claiming this capability or unqualified entire-Codex parity. Not needed to prove unauthenticated Shopify."
+      },
+      "journeys": [
+        "J-ENTERPRISE"
+      ],
+      "release_gates": [
+        "G-AUTH",
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    },
+    {
+      "id": "MCP-032",
+      "feature": "Codex-specific forms/user verification and app extensions",
+      "scope": "baseline-extension-conditional",
+      "codex_support": "Capability-checked OpenAI forms and user-verification requests are implemented; generic app metadata can be advertised. This does not establish all GUI app support in all Codex frontends.",
+      "public_mcp_requirement": "Non-core extension contracts; standard form/URL elicitation remains independently required for baseline parity.",
+      "current_octet": {
+        "status": "missing",
+        "source_evidence": [
+          "C-ELICITATION",
+          "C-CAPS",
+          "M-SCHEMA",
+          "O-README"
+        ],
+        "assessment": "Inventory explicitly, do not mislabel as protocol-mandatory or implemented Octet capability. OpenAI-native verification/app behavior is not a substitute for standard elicitation and would need separately scoped host/UI work if claimed."
+      },
+      "journeys": [
+        "J-OPTIONAL",
+        "J-ELICITATION"
+      ],
+      "release_gates": [
+        "G-CLAIM"
+      ],
+      "qualification": "not-run"
+    }
+  ],
+  "journeys": [
+    {
+      "id": "J-STDIO",
+      "kind": "deterministic-and-product",
+      "target": "Existing reviewed local stdio server, not newly installed software",
+      "steps": [
+        "Run existing real subprocess suite; initialize/list/call/refresh/restart/stop.",
+        "Exercise pagination, epochs, text/structured/media, cancellation/timeout/crash and descendant shutdown.",
+        "Verify unchanged behavior through the actual candidate host with a reviewed already-installed server."
+      ],
+      "required_evidence": [
+        "Candidate commit/build/package hashes, command, platform and exact test names/outcomes.",
+        "Owner-fenced tool/result trace and process-cleanup observation; no secrets."
+      ],
+      "result": "not-run",
+      "blocker": "Candidate runs belong to implementing parent; no tests executed by source-baseline author."
+    },
+    {
+      "id": "J-VERSION",
+      "kind": "deterministic",
+      "target": "Pinned modern, legacy and dual-era controlled fixtures",
+      "steps": [
+        "Verify 2024-11-05/2025-03-26/2025-06-18/2025-11-25 legacy compatibility without advertising unsupported semantics.",
+        "Modern stdio and HTTP discover return JSON/SSE, with/without serverInfo; all requests carry required _meta; no initialize on modern wire.",
+        "Probe error/silence, modern -32020/-32021/-32022, valid/invalid supported lists and mismatched IDs; auth rejection cannot manufacture downgrade."
+      ],
+      "required_evidence": [
+        "Wire transcripts recording selected era/version and explicit fallback reason.",
+        "Negative fixtures for unknown resultType, capabilities, unsupported version and per-request isolation."
+      ],
+      "result": "not-run",
+      "blocker": "Modern lifecycle and 2025-11-25 compatibility are missing in the pinned Octet snapshot."
+    },
+    {
+      "id": "J-HEADERS",
+      "kind": "deterministic",
+      "target": "2026 HTTP header/schema controlled fixtures",
+      "steps": [
+        "Verify method/name/version body-header equivalence and x-mcp-header on static nested properties.",
+        "Reject duplicate/invalid annotation names, arrays/$ref/composition placement and unsupported primitives without exposing invalid tools.",
+        "Verify Unicode/control/sentinel/leading whitespace encoding, optional absent/null and safe integer limits; schema change forces safe refresh."
+      ],
+      "required_evidence": [
+        "Captured headers and schema acceptance/rejection without secret values.",
+        "Proof malformed header schema cannot inject Authorization or arbitrary HTTP fields."
+      ],
+      "result": "not-run",
+      "blocker": "No modern header schema pipeline in pinned Octet."
+    },
+    {
+      "id": "J-HTTP",
+      "kind": "deterministic",
+      "target": "Loopback-only controlled legacy/modern JSON and SSE fixtures",
+      "steps": [
+        "Single messages, accepted content types/202, notifications and terminal response identity.",
+        "Legacy session establishment/change/expiry/termination versus modern no-session/no-resume/no-GET lifecycle.",
+        "Malformed/truncated UTF-8/JSON/SSE/chunks/Content-Length, empty event IDs and request-scoped control-message flood."
+      ],
+      "required_evidence": [
+        "Focused test IDs and redacted bounded wire observations; no passing count alone.",
+        "Aggregate byte/event/thread/time limits through all error/resume/auth paths."
+      ],
+      "result": "not-run",
+      "blocker": "Nine legacy safety defects plus missing modern semantics; fixtures alone never satisfy G-LIVE."
+    },
+    {
+      "id": "J-ISOLATION",
+      "kind": "deterministic-security",
+      "target": "Controlled DNS/network doubles and two independently host-derived owners",
+      "steps": [
+        "Rebinding/private/link-local address rejection, reviewed-address pinning and TLS hostname verification.",
+        "No cross-owner/endpoint/issuer/token/session/catalog/SSE identity reuse; generation and account switches retire stale authority.",
+        "DNS and socket cancellation/shutdown bounds, fanout caps, non-resettable aggregate budgets and startup absolute deadline."
+      ],
+      "required_evidence": [
+        "One targeted evidence item for every D-HTTP-01 through D-HTTP-09.",
+        "Adversarial denial records prove no credentials, queries, raw logs or sensitive headers reach another destination/owner."
+      ],
+      "result": "not-run",
+      "blocker": "Retained ledger remains unqualified until fixes and targeted candidate tests are recorded."
+    },
+    {
+      "id": "J-CATALOG",
+      "kind": "deterministic-and-product",
+      "target": "Controlled tools/resources/templates catalogs",
+      "steps": [
+        "List paginated tools/resources/templates and read a selected resource, retaining exact endpoint/server provenance.",
+        "Validate general input/output schemas and all supported content parts; malicious descriptions stay data.",
+        "Exercise modern subscription acknowledgment/filter/ID routing, catalog changes, private authorization cache invalidation and reconnect."
+      ],
+      "required_evidence": [
+        "No silent omitted features; resource/template operations and content model visibility observed through host.",
+        "Bounded schema/reference tests and complete dynamic catalog/epoch outcomes."
+      ],
+      "result": "not-run",
+      "blocker": "Resources, subscriptions and wider content/schema semantics need implementation."
+    },
+    {
+      "id": "J-ELICITATION",
+      "kind": "deterministic-and-manual-product",
+      "target": "Reviewed server requesting standard form/URL input",
+      "steps": [
+        "Legacy reverse elicitation and modern tools/call/resources/read MRTR; accept/decline/cancel with host-derived parent owner.",
+        "Multiple input keys, state-only rounds, opaque Unicode/newline state, missing/unknown resultType and unsupported capabilities.",
+        "Manual URL opening/login only after owner consent; headless unavailable input denies; timeout/cancel cannot leak continuation to another owner."
+      ],
+      "required_evidence": [
+        "Exact terminal disposition, bounded round/byte/time count and state equality without recording sensitive state.",
+        "Proof no sampling/root request is advertised or fulfilled as model authority."
+      ],
+      "result": "not-run",
+      "blocker": "No stock elicitation/MRTR implementation in pinned Octet; no user/auth interactions authorized for this worker."
+    },
+    {
+      "id": "J-AUTH-DISCOVERY",
+      "kind": "deterministic-security",
+      "target": "Controlled protected resource + independent authorization/OIDC servers",
+      "steps": [
+        "401 challenge resource_metadata, path and root well-known fallback; OAuth/OIDC issuer paths in required order.",
+        "Exact issuer mismatch, resource binding, scopes, PKCE S256 metadata, redirects, malicious metadata and callback iss/state mismatches fail closed.",
+        "Pre-registered client, advertised CIMD and DCR fallback with native application_type; no resource Authorization/header values leak to discovery or another issuer."
+      ],
+      "required_evidence": [
+        "Captured request destinations, registration mode and denial classifications with all secrets removed.",
+        "No fallback to legacy protocol merely because authentication failed."
+      ],
+      "result": "not-run",
+      "blocker": "Stock OAuth/discovery/registration are missing; vendor 404 documentation lookups are not auth evidence."
+    },
+    {
+      "id": "J-AUTH-LIFECYCLE",
+      "kind": "manual-live-plus-deterministic",
+      "target": "Explicitly authorized generic remote resource and user-held OAuth account",
+      "steps": [
+        "Owner initiates login and manual browser consent; code exchange, resource-bound token use and supported scopes.",
+        "Cancel/deny/expired/wrong callback; restart with secure store; no-refresh-token grant and refresh rotation/failure.",
+        "Revocation/logout/relogin, concurrent refresh, changed issuer/account/owner and insufficient_scope; never replay ambiguous action."
+      ],
+      "required_evidence": [
+        "Dated sanitized session reference, endpoint/issuer identity, candidate hashes, registration mode and auth/session/recovery outcomes.",
+        "No tokens, codes, PKCE verifier, cookies or account identifiers in committed evidence."
+      ],
+      "result": "not-run",
+      "blocker": "Requires implementing client, approved credential store/identity and human authorization. Do not run automatically."
+    },
+    {
+      "id": "J-RECOVERY",
+      "kind": "deterministic-and-manual-live",
+      "target": "Controlled failures plus harmless calls on an authorized remote server",
+      "steps": [
+        "Cancel/timeout/disconnect before and after request transmission, with progress and delayed terminal responses.",
+        "Legacy SSE cursor resume without re-POST and legacy session-expired 404; modern request loss uses no Last-Event-ID/session headers.",
+        "Bound catalog retry/backoff/429, no unsafe automatic tools/call retry, generation retirement and fresh modern subscription after reconnect."
+      ],
+      "required_evidence": [
+        "Request ID/method counts and terminal ambiguity; prove no duplicate tool side effect.",
+        "Bounds survive every transport and authentication branch."
+      ],
+      "result": "not-run",
+      "blocker": "Modern/remote safety and authenticated real session evidence remain open."
+    },
+    {
+      "id": "J-SHOPIFY-BASE",
+      "kind": "manual-live-unauthenticated",
+      "target": "https://{explicit-reviewed-shop-domain}/api/mcp",
+      "steps": [
+        "Connect through generic octet-mcp configuration with auth omitted, not a Shopify-only adapter.",
+        "Observe actual era/version/catalog; run only an approved harmless read with required policy and record output provenance.",
+        "Observe cancellation/reconnect where safely reproducible; stop without purchase/cart mutation or customer login."
+      ],
+      "required_evidence": [
+        "Exact user-selected storefront endpoint, dated sanitized session/build references and observed tool names/version/transport.",
+        "Record authentication_required rather than adding credentials if the public endpoint challenges."
+      ],
+      "result": "not-run",
+      "blocker": "No storefront supplied and no endpoint calls authorized. This is the requested unauthenticated storefront journey, not OAuth proof."
+    },
+    {
+      "id": "J-SHOPIFY-UCP",
+      "kind": "manual-live-unauthenticated",
+      "target": "https://{explicit-reviewed-shop-domain}/api/ucp/mcp",
+      "steps": [
+        "Qualify separately through the same generic client with auth omitted.",
+        "Observe UCP MCP discovery/catalog and harmless authorized read; do not substitute ordinary /api/mcp results or non-MCP UCP metadata.",
+        "Keep cart/checkout/order/payment mutations blocked without separate approval."
+      ],
+      "required_evidence": [
+        "Independent exact endpoint and sanitized session record, observed protocol and supported tool journey."
+      ],
+      "result": "not-run",
+      "blocker": "No storefront supplied or endpoint calls authorized; /api/mcp success cannot mark this path passed."
+    },
+    {
+      "id": "J-WIX",
+      "kind": "manual-live-authenticated-original-issue",
+      "target": "https://mcp.wix.com/mcp",
+      "steps": [
+        "Retain original #179 remote setup goal; use current native Octet config rather than treating historical mcpServers syntax as new compatibility requirement.",
+        "User manually authorizes required Wix account flow, then list and invoke one harmless appropriately approved operation.",
+        "Observe supported token/session expiry, reconnect/cancel and logout/revocation without leaking account data."
+      ],
+      "required_evidence": [
+        "Authenticated dated session and candidate hashes; actual endpoint protocol/auth mode/scopes and result/cancellation outcomes.",
+        "If Wix has changed or account access is unavailable, record the exact blocker; never replace with unauthenticated Shopify evidence."
+      ],
+      "result": "not-run",
+      "blocker": "Historical issue endpoint only; current service/auth/account behavior unverified. No login or endpoint calls authorized."
+    },
+    {
+      "id": "J-CUSTOMER-OAUTH",
+      "kind": "manual-live-authenticated-separate",
+      "target": "Explicit customer-account resource selected and authorized by its owner; not inferred from storefront paths",
+      "steps": [
+        "First demonstrate the generic OAuth client; separately review the customer resource, issuer and scopes.",
+        "Manual customer authorization and one harmless customer operation, followed by token lifecycle/owner isolation.",
+        "Prove storefront public access or Wix transport login cannot authorize customer order/account/cart/checkout operations."
+      ],
+      "required_evidence": [
+        "Separate customer-resource/issuer binding and sanitized session; no PII, account identifiers or secrets."
+      ],
+      "result": "not-run",
+      "blocker": "Separate account/endpoint/permission required. Not satisfied by either public Shopify route; no customer feature is claimed."
+    },
+    {
+      "id": "J-PRODUCT",
+      "kind": "product-release",
+      "target": "Version-matched Octet host + octet-mcp, TUI/Serve/headless",
+      "steps": [
+        "Validate reviewed config/inert installation and explicit enablement; rejected remote gate causes no credential lookup/DNS/workers.",
+        "Observe first-class /mcp status/list/show/refresh/restart/stop and reconnect snapshots across each frontend.",
+        "Test owner/generation switch, fail-closed unknown/destructive policy, immutable output/media and teardown; positive approved writes require #383 capability first."
+      ],
+      "required_evidence": [
+        "Host/package hashes, frontend, OS, command, owner-fenced sanitized snapshot/session references and terminal outcomes.",
+        "Matching package/build/release checks; no assumptions from an SDK type or manifest version."
+      ],
+      "result": "not-run",
+      "blocker": "No candidate product/frontend journeys run by baseline author; inherited API 0.2 remains intentional."
+    },
+    {
+      "id": "J-OPTIONAL",
+      "kind": "deterministic-negative",
+      "target": "Protocol optional/unsupported and non-core extension requests",
+      "steps": [
+        "Ensure prompts/completions/sampling/roots/tasks/legacy standalone SSE are not advertised as implemented.",
+        "Unhandled requests/required capabilities fail explicitly without model invocation, ambient file disclosure or forged UI authority.",
+        "Keep baseline-supported proprietary extensions separately inventoried; do not turn dependency method availability into a product claim."
+      ],
+      "required_evidence": [
+        "Capability advertisement and safe unsupported outcomes; exclusions remain visible by stable row ID."
+      ],
+      "result": "not-run",
+      "blocker": "Does not waive resources or standard form/URL elicitation, which the baseline actually exposes."
+    },
+    {
+      "id": "J-ENTERPRISE",
+      "kind": "manual-live-conditional-plus-deterministic",
+      "target": "Separately approved enterprise IdP and MCP resource authorization server",
+      "steps": [
+        "Configured enterprise trust and client identities, manual IdP consent, ID-JAG exchange and resource-bound bearer.",
+        "Reject issuer/audience/resource/scope mismatch, stale account/configuration and logout-racing persistence.",
+        "Keep enterprise credentials distinct from ordinary/customer OAuth."
+      ],
+      "required_evidence": [
+        "Sanitized organization-authorized evidence for the conditional feature; exact trust/issuer boundaries without account/credential data."
+      ],
+      "result": "not-run",
+      "blocker": "Not implemented in Octet snapshot. Requires separately authorized enterprise setup; no organizational account actions allowed here."
+    }
+  ],
+  "retained_http_defects": [
+    {
+      "id": "D-HTTP-01",
+      "title": "DNS rebinding / HTTPS SSRF",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Validate all resolved addresses and pin connections to approved public addresses while preserving TLS hostname verification; test rebinding and private/link-local targets.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-02",
+      "title": "Cross-owner credential/session state",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Partition all credential, protocol session, cursor/catalog and continuation state by exact resource plus host-derived owner/generation; retire on change.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-03",
+      "title": "DNS workers outlive cancellation/shutdown",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Use cancellable/isolated bounded resolution with observable cleanup; no orphan DNS work may escape process/owner shutdown.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-04",
+      "title": "Buffered SSE peer-identity confusion",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Validate originating request/session/owner before dispatching every buffered event and reject foreign terminal/control messages.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-05",
+      "title": "Unbounded control-message fanout",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Bound reverse/control message scheduling, queues and threads; rejected overflow remains a bounded error.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-06",
+      "title": "Resettable aggregate budgets",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Carry one byte/event/request/time accounting scope across redirects/auth/discovery/SSE/resume/recovery; no fresh per-path allowance.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-07",
+      "title": "Accepted truncated framing",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Reject short Content-Length/chunks/SSE/JSON/UTF-8 and unterminated frames; never mistake truncated content for terminal success.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-08",
+      "title": "Incorrect empty SSE event-ID cursor",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "Legacy empty id resets cursor, not old-ID reuse; modern mode ignores/removes resume machinery entirely.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    },
+    {
+      "id": "D-HTTP-09",
+      "title": "Escapable startup deadline",
+      "status": "partial",
+      "source": "O-REFERENCE",
+      "acceptance": "One absolute deadline spans credentials/DNS/connect/TLS/handshake/catalog and all retries; no stage resets it.",
+      "journeys": [
+        "J-ISOLATION",
+        "J-HTTP"
+      ],
+      "gate": "G-HTTP",
+      "remediation_evidence": []
+    }
+  ],
+  "release_gates": [
+    {
+      "id": "G-SOURCE",
+      "claim": "Reproducible qualification baseline",
+      "status": "open",
+      "requires": [
+        "Immutable upstream commit/path/blob/SHA-256 references and verified locked rmcp archive.",
+        "Matrix IDs/references/bounds valid; any baseline refresh is explicit, with reviewed semantic delta."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-STDIO",
+      "claim": "No local stdio regression",
+      "status": "open",
+      "requires": [
+        "Candidate existing package tests pass and real subprocess cleanup/catalog/media/cancellation evidence is retained.",
+        "Existing local-stdio computer-use backends remain independent from remote transport gate."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-HTTP",
+      "claim": "Production remote transport safety",
+      "status": "open",
+      "requires": [
+        "All nine D-HTTP entries have substantive fixes and targeted regression evidence.",
+        "TLS/DNS/network/owner isolation, framing, global budgets, concurrency and shutdown qualify for both supported eras.",
+        "Experimental opt-in never substitutes for this gate."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-2026",
+      "claim": "2026-07-28 protocol compatibility",
+      "status": "open",
+      "requires": [
+        "MCP-002/003/004/007/008/010/011/017/020 modern semantics implemented and controlled tests pass.",
+        "Recognized modern error/fallback differences versus pinned Codex are explicitly resolved, not blindly copied.",
+        "No unsupported capabilities advertised and no ambiguous tool action replay."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-AUTH",
+      "claim": "First-class supported authorization",
+      "status": "open",
+      "requires": [
+        "Bearer/unauthenticated plus standard OAuth discovery, PKCE, issuer/resource binding, secure token lifecycle, pre-registered/CIMD/DCR journeys.",
+        "Manual authorized real-account auth evidence; no credential/body/metadata leakage.",
+        "Enterprise conditional feature must be qualified if claimed; otherwise visibly excluded from any qualified scope."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-SURFACES",
+      "claim": "Baseline-supported tools/resources/elicitation",
+      "status": "open",
+      "requires": [
+        "Resources/templates/read, ordered content and standard form/URL elicitation are included, not silently reduced to tools-only.",
+        "Modern MRTR/subscriptions and failure/cancel/owner routing observed through host.",
+        "Protocol-optional baseline-unexposed prompts/sampling/roots/tasks remain declared unsupported, not invented as passed."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-LIVE",
+      "claim": "Real remote issue acceptance",
+      "status": "open",
+      "requires": [
+        "Independent J-SHOPIFY-BASE and J-SHOPIFY-UCP evidence with auth omitted.",
+        "Authenticated original J-WIX remains required; changed/unavailable endpoint or account is an explicit blocker, not a pass.",
+        "J-AUTH-LIFECYCLE/J-RECOVERY run on authorized real services; customer OAuth is a separate J-CUSTOMER-OAUTH claim and cannot inherit storefront results."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-PRODUCT",
+      "claim": "Shipped first-class Octet client",
+      "status": "open",
+      "requires": [
+        "Version-matched host/package checks, actual TUI/Serve/headless lifecycle and result ownership evidence.",
+        "Fail-closed action policy remains enforced; absent #383 approvals means unsafe calls stay blocked.",
+        "Only remove production warnings/gate after every applicable safety/protocol/auth/product/live gate is qualified."
+      ],
+      "evidence": []
+    },
+    {
+      "id": "G-CLAIM",
+      "claim": "Truthful parity/release statement",
+      "status": "open",
+      "requires": [
+        "No full #179 acceptance from experimental code, unit tests alone, unauthenticated Shopify, or unrun auth/session journeys.",
+        "Keep all baseline-supported missing surfaces and conditional extension differences visible; a partial core subset cannot be called entire-Codex parity.",
+        "Non-core Codex product extensions are inventory, not an instruction to embed proprietary GUI/organization features in the kernel.",
+        "Record concrete blockers instead of changing missing/needs-live-evidence to implemented because a version field changed."
+      ],
+      "evidence": []
+    }
+  ],
+  "candidate_evidence": [],
+  "qualification_result": {
+    "status": "not-qualified",
+    "executed_journeys": [],
+    "production_http": false,
+    "full_codex_parity": false,
+    "notes": [
+      "Source and locked dependency were inspected read-only. No upstream or Octet tests, installs, live MCP endpoint calls, account authentication, credentials, commit/push or issue mutations were performed by baseline author.",
+      "Shopify routes are requested unauthenticated qualification targets, not observed endpoint behavior; no exact storefront was supplied. Vendor documentation lookups at guessed documentation paths returned 404 and are not evidence.",
+      "Original authenticated Wix and separate customer OAuth journeys remain unrun."
+    ]
+  }
+}
